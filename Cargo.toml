@@ -1,0 +1,8 @@
+[package]
+name = "ruddy-salsa"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+salsa = "0.26"
+unicode-ident = "1"
