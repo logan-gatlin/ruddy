@@ -1,3 +1,4 @@
+mod check;
 mod engine;
 mod lower;
 mod parser;

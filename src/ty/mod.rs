@@ -1,3 +1,5 @@
+pub mod store;
+
 use crate::lower::ir::QualifiedName;
 use crate::reporting::TextRange;
 
@@ -37,6 +39,7 @@ pub enum TypeKind {
     MetaTypeVariable(MetaTypeVariableId),
     Constructor(TypeConstructor),
     Application(TypeId, TypeId),
+    Forall(Vec<TypeBinder>, Vec<TraitPredicate>, TypeId),
     Error,
 }
 
