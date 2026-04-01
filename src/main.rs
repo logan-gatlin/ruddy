@@ -1,11 +1,4 @@
-mod engine;
-mod parser;
-mod reporting;
-
-pub use engine::Eng;
-pub use engine::Source;
-pub use parser::{lex_source, lex_text, parse_source, parse_text};
-pub use reporting::{Diagnostic, DiagnosticSeverity, TextRange, TextSize};
+use ruddy::{Eng, Source, parse_text};
 
 fn main() -> std::io::Result<()> {
     let path = "demo.hc";

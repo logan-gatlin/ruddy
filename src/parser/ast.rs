@@ -2,6 +2,8 @@ use crate::reporting::TextRange;
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub struct AstFile {
+    /// `Some` if this is a bundle root
+    pub bundle_name: Option<Identifier>,
     pub range: TextRange,
     pub statements: Vec<Statement>,
 }
@@ -88,13 +90,14 @@ pub enum Statement {
         name: Option<Identifier>,
         range: TextRange,
     },
-    Import {
-        paths: Vec<Literal>,
-        range: TextRange,
-    },
     Module {
         name: Option<Identifier>,
         body: Vec<Statement>,
+        range: TextRange,
+    },
+    ModuleRef {
+        name: Option<Identifier>,
+        in_loc: Option<Literal>,
         range: TextRange,
     },
     Let {
@@ -144,8 +147,8 @@ impl Statement {
     pub fn range(&self) -> TextRange {
         match self {
             Self::Bundle { range, .. }
-            | Self::Import { range, .. }
             | Self::Module { range, .. }
+            | Self::ModuleRef { range, .. }
             | Self::Let { range, .. }
             | Self::Do { range, .. }
             | Self::Use { range, .. }
@@ -431,10 +434,54 @@ pub enum BinaryOperator {
     GreaterEqual,
 }
 
+impl std::fmt::Display for BinaryOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Sequence => "[;]",
+                Self::And => "[and]",
+                Self::Or => "[or]",
+                Self::PipeRight => "[|>]",
+                Self::PlusPipe => "[+>]",
+                Self::StarPipe => "[*>]",
+                Self::Xor => "[xor]",
+                Self::ShiftRight => "[>>]",
+                Self::ShiftLeft => "[<<]",
+                Self::Add => "[+]",
+                Self::Subtract => "[-]",
+                Self::Multiply => "[*]",
+                Self::Divide => "[/]",
+                Self::Modulo => "[mod]",
+                Self::Equal => "[==]",
+                Self::NotEqual => "[!=]",
+                Self::Less => "[<]",
+                Self::LessEqual => "[<=]",
+                Self::Greater => "[>]",
+                Self::GreaterEqual => "[>=]",
+            }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
 pub enum UnaryOperator {
     Not,
     Negate,
+}
+
+impl std::fmt::Display for UnaryOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Not => "[not]",
+                Self::Negate => "[~]",
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
@@ -640,30 +687,92 @@ impl SExpr {
     }
 }
 
-pub trait AstVisitor {
-    fn visit_statement(&mut self, _statement: &Statement) {}
-    fn visit_expr(&mut self, _expr: &Expr) {}
-    fn visit_pattern(&mut self, _pattern: &Pattern) {}
-    fn visit_type_expr(&mut self, _type_expr: &TypeExpr) {}
-    fn visit_sexpr(&mut self, _sexpr: &SExpr) {}
+pub struct AstVisitor<'a> {
+    visit_statement: Box<dyn FnMut(&Statement) + 'a>,
+    visit_expr: Box<dyn FnMut(&Expr) + 'a>,
+    visit_pattern: Box<dyn FnMut(&Pattern) + 'a>,
+    visit_type_expr: Box<dyn FnMut(&TypeExpr) + 'a>,
+    visit_type_def: Box<dyn FnMut(&TypeDefinition) + 'a>,
+    visit_sexpr: Box<dyn FnMut(&SExpr) + 'a>,
+    enter_module: Box<dyn FnMut(&Identifier) + 'a>,
+    leave_module: Box<dyn FnMut() + 'a>,
+}
+
+impl Default for AstVisitor<'_> {
+    fn default() -> Self {
+        Self {
+            visit_statement: Box::new(|_| {}),
+            visit_expr: Box::new(|_| {}),
+            visit_pattern: Box::new(|_| {}),
+            visit_type_expr: Box::new(|_| {}),
+            visit_type_def: Box::new(|_| {}),
+            visit_sexpr: Box::new(|_| {}),
+            enter_module: Box::new(|_| {}),
+            leave_module: Box::new(|| {}),
+        }
+    }
+}
+
+impl<'a> AstVisitor<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn statement(mut self, stmt: impl FnMut(&Statement) + 'a) -> Self {
+        self.visit_statement = Box::new(stmt);
+        self
+    }
+    pub fn expr(mut self, expr: impl FnMut(&Expr) + 'a) -> Self {
+        self.visit_expr = Box::new(expr);
+        self
+    }
+    pub fn pattern(mut self, pattern: impl FnMut(&Pattern) + 'a) -> Self {
+        self.visit_pattern = Box::new(pattern);
+        self
+    }
+    pub fn type_expr(mut self, type_expr: impl FnMut(&TypeExpr) + 'a) -> Self {
+        self.visit_type_expr = Box::new(type_expr);
+        self
+    }
+    pub fn type_def(mut self, type_def: impl FnMut(&TypeDefinition) + 'a) -> Self {
+        self.visit_type_def = Box::new(type_def);
+        self
+    }
+    pub fn sexpr(mut self, sexpr: impl FnMut(&SExpr) + 'a) -> Self {
+        self.visit_sexpr = Box::new(sexpr);
+        self
+    }
+    pub fn enter_module(mut self, enter: impl FnMut(&Identifier) + 'a) -> Self {
+        self.enter_module = Box::new(enter);
+        self
+    }
+    pub fn leave_module(mut self, leave: impl FnMut() + 'a) -> Self {
+        self.leave_module = Box::new(leave);
+        self
+    }
 }
 
 impl AstFile {
-    pub fn walk(&self, visitor: &mut impl AstVisitor) {
+    pub fn walk(&self, visitor: &mut AstVisitor) {
         for statement in &self.statements {
             walk_statement(statement, visitor);
         }
     }
 }
 
-pub fn walk_statement(statement: &Statement, visitor: &mut impl AstVisitor) {
-    visitor.visit_statement(statement);
+pub fn walk_statement(statement: &Statement, visitor: &mut AstVisitor) {
+    (visitor.visit_statement)(statement);
 
     match statement {
-        Statement::Bundle { .. } | Statement::Import { .. } | Statement::TraitAlias { .. } => {}
-        Statement::Module { body, .. } => {
+        Statement::Bundle { .. } | Statement::TraitAlias { .. } | Statement::ModuleRef { .. } => {}
+        Statement::Module { name, body, .. } => {
+            if let Some(name) = name {
+                (visitor.enter_module)(name);
+            }
             for nested in body {
                 walk_statement(nested, visitor);
+            }
+            if name.is_some() {
+                (visitor.leave_module)();
             }
         }
         Statement::Let { kind, .. } => match kind {
@@ -711,8 +820,8 @@ pub fn walk_statement(statement: &Statement, visitor: &mut impl AstVisitor) {
     }
 }
 
-pub fn walk_pattern(pattern: &Pattern, visitor: &mut impl AstVisitor) {
-    visitor.visit_pattern(pattern);
+pub fn walk_pattern(pattern: &Pattern, visitor: &mut AstVisitor) {
+    (visitor.visit_pattern)(pattern);
 
     match pattern {
         Pattern::Constructor { argument, .. }
@@ -746,8 +855,8 @@ pub fn walk_pattern(pattern: &Pattern, visitor: &mut impl AstVisitor) {
     }
 }
 
-pub fn walk_type_expr(type_expr: &TypeExpr, visitor: &mut impl AstVisitor) {
-    visitor.visit_type_expr(type_expr);
+pub fn walk_type_expr(type_expr: &TypeExpr, visitor: &mut AstVisitor) {
+    (visitor.visit_type_expr)(type_expr);
 
     match type_expr {
         TypeExpr::Forall {
@@ -781,8 +890,8 @@ pub fn walk_type_expr(type_expr: &TypeExpr, visitor: &mut impl AstVisitor) {
     }
 }
 
-pub fn walk_expr(expr: &Expr, visitor: &mut impl AstVisitor) {
-    visitor.visit_expr(expr);
+pub fn walk_expr(expr: &Expr, visitor: &mut AstVisitor) {
+    (visitor.visit_expr)(expr);
 
     match expr {
         Expr::Let {
@@ -873,8 +982,8 @@ pub fn walk_expr(expr: &Expr, visitor: &mut impl AstVisitor) {
     }
 }
 
-pub fn walk_sexpr(sexpr: &SExpr, visitor: &mut impl AstVisitor) {
-    visitor.visit_sexpr(sexpr);
+pub fn walk_sexpr(sexpr: &SExpr, visitor: &mut AstVisitor) {
+    (visitor.visit_sexpr)(sexpr);
 
     if let SExpr::List { items, .. } = sexpr {
         for item in items {
@@ -883,7 +992,8 @@ pub fn walk_sexpr(sexpr: &SExpr, visitor: &mut impl AstVisitor) {
     }
 }
 
-fn walk_type_definition(definition: &TypeDefinition, visitor: &mut impl AstVisitor) {
+fn walk_type_definition(definition: &TypeDefinition, visitor: &mut AstVisitor) {
+    (visitor.visit_type_def)(definition);
     match definition {
         TypeDefinition::Expr(expr) => walk_type_expr(expr, visitor),
         TypeDefinition::Struct { members, .. } => {

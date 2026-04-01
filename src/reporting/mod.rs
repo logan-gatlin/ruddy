@@ -1,3 +1,5 @@
+use crate::engine::Source;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::Update)]
 pub struct TextSize(u32);
 
@@ -28,35 +30,80 @@ impl From<u32> for TextSize {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, salsa::Update)]
-pub struct TextRange {
-    pub start: TextSize,
-    pub length: TextSize,
+pub enum TextRange {
+    Located {
+        source: Source,
+        start: TextSize,
+        length: TextSize,
+    },
+    #[default]
+    Generated,
 }
 
 impl TextRange {
-    pub const fn new(start: TextSize, length: TextSize) -> Self {
-        Self { start, length }
+    pub fn new(source: Source, start: TextSize, length: TextSize) -> Self {
+        Self::Located {
+            source,
+            start,
+            length,
+        }
     }
 
-    pub fn from_bounds(start: TextSize, end: TextSize) -> Self {
+    pub fn from_bounds(source: Source, start: TextSize, end: TextSize) -> Self {
         let length = TextSize::new(end.as_u32().saturating_sub(start.as_u32()));
-        Self { start, length }
+        Self::Located {
+            source,
+            start,
+            length,
+        }
     }
 
-    pub fn empty(at: TextSize) -> Self {
-        Self::new(at, TextSize::ZERO)
+    pub fn empty(source: Source, at: TextSize) -> Self {
+        Self::new(source, at, TextSize::ZERO)
     }
 
-    pub fn end(self) -> TextSize {
-        TextSize::new(self.start.as_u32().saturating_add(self.length.as_u32()))
+    pub const fn generated() -> Self {
+        Self::Generated
     }
 
-    pub fn len(self) -> u32 {
-        self.length.as_u32()
+    pub fn source(self) -> Option<Source> {
+        match self {
+            Self::Located { source, .. } => Some(source),
+            Self::Generated => None,
+        }
     }
 
-    pub fn is_empty(self) -> bool {
-        self.length == TextSize::ZERO
+    pub fn start(self) -> Option<TextSize> {
+        match self {
+            Self::Located { start, .. } => Some(start),
+            Self::Generated => None,
+        }
+    }
+
+    pub fn end(self) -> Option<TextSize> {
+        match self {
+            Self::Located { start, length, .. } => Some(TextSize::new(
+                start.as_u32().saturating_add(length.as_u32()),
+            )),
+            Self::Generated => None,
+        }
+    }
+
+    pub fn len(self) -> Option<u32> {
+        match self {
+            Self::Located { length, .. } => Some(length.as_u32()),
+            Self::Generated => None,
+        }
+    }
+
+    pub fn is_empty(self) -> Option<bool> {
+        self.len().map(|length| length == 0)
+    }
+
+    pub fn text(&self, source: &str) -> Option<String> {
+        let start = self.start()?.as_usize();
+        let end = self.end()?.as_usize();
+        source.get(start..end).map(ToOwned::to_owned)
     }
 }
 

@@ -1,13 +1,13 @@
 use salsa::Setter as _;
 
 use crate::engine::{Eng, Source};
-use crate::parser::lex_diagnostics;
-use crate::parser::token::{Keyword, Punct, TokenKind};
+use crate::parser::token::{Keyword, Operator, Punct, TokenKind};
+use crate::parser::{lex_diagnostics, AstVisitor};
 use crate::reporting::TextSize;
 
 use super::{
-    AstVisitor, Expr, LetStatementKind, Pattern, Statement, lex_source, parse_diagnostics,
-    parse_source, parse_text,
+    lex_source, parse_diagnostics, parse_source, parse_text, Expr, LetStatementKind, NameRef,
+    PathRoot, Pattern, Statement,
 };
 
 #[test]
@@ -38,6 +38,56 @@ fn lex_query_tracks_source_contents() {
 }
 
 #[test]
+fn lex_query_allows_kebab_case_identifiers() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "kebab_case.hc".to_owned(),
+        "let foo-bar = baz-qux".to_owned(),
+    );
+
+    let lexed = lex_source(&db, source);
+    assert_eq!(
+        lexed
+            .tokens
+            .iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TokenKind::Keyword(Keyword::Let),
+            TokenKind::Ident,
+            TokenKind::Punct(Punct::Equals),
+            TokenKind::Ident,
+            TokenKind::EndOfFile,
+        ]
+    );
+
+    assert!(lex_diagnostics(&db, source).is_empty());
+}
+
+#[test]
+fn lex_query_treats_edge_hyphens_as_minus_tokens() {
+    let db = Eng::default();
+    let source = Source::new(&db, "kebab_edges.hc".to_owned(), "-foo foo-".to_owned());
+
+    let lexed = lex_source(&db, source);
+    assert_eq!(
+        lexed
+            .tokens
+            .iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TokenKind::Operator(Operator::Minus),
+            TokenKind::Ident,
+            TokenKind::Ident,
+            TokenKind::Operator(Operator::Minus),
+            TokenKind::EndOfFile,
+        ]
+    );
+}
+
+#[test]
 fn parse_query_depends_on_lex_query() {
     let mut db = Eng::default();
     let source = Source::new(&db, "test.hc".to_owned(), "bundle demo".to_owned());
@@ -51,6 +101,80 @@ fn parse_query_depends_on_lex_query() {
     let second = parse_source(&db, source);
     assert_ne!(first.ast.range, second.ast.range);
     assert_eq!(second.ast.statements.len(), 0);
+}
+
+#[test]
+fn parse_query_sets_bundle_name_from_top_declaration() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_name.hc".to_owned(),
+        "bundle demo\nlet value = 1".to_owned(),
+    );
+
+    let parsed = parse_source(&db, source);
+    let declared_name = match parsed.ast.statements.first() {
+        Some(Statement::Bundle { name, .. }) => name.clone(),
+        _ => None,
+    };
+
+    assert_eq!(parsed.ast.bundle_name, declared_name);
+    assert!(parse_diagnostics(&db, source).is_empty());
+}
+
+#[test]
+fn parse_query_reports_non_top_bundle_declaration() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_position.hc".to_owned(),
+        [
+            "bundle demo",
+            "let value = 1",
+            "bundle later",
+            "module M =",
+            "bundle nested",
+            "end",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    let declared_name = match parsed.ast.statements.first() {
+        Some(Statement::Bundle { name, .. }) => name.clone(),
+        _ => None,
+    };
+
+    assert_eq!(parsed.ast.bundle_name, declared_name);
+
+    let diagnostics = parse_diagnostics(&db, source);
+    let misplaced_bundle_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("bundle declaration must be the first statement in the file")
+        })
+        .count();
+    assert_eq!(misplaced_bundle_diagnostics, 2);
+}
+
+#[test]
+fn parse_query_keeps_bundle_name_none_without_top_declaration() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "no_bundle_root.hc".to_owned(),
+        "let value = 1\nbundle late".to_owned(),
+    );
+
+    let parsed = parse_source(&db, source);
+    assert_eq!(parsed.ast.bundle_name, None);
+    assert!(parse_diagnostics(&db, source).iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle declaration must be the first statement in the file")
+    }));
 }
 
 #[test]
@@ -81,11 +205,9 @@ fn parse_query_reports_missing_end() {
 
     let parsed = parse_source(&db, source);
     assert_eq!(parsed.ast.statements.len(), 1);
-    assert!(
-        parse_diagnostics(&db, source)
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("expected `end`"))
-    );
+    assert!(parse_diagnostics(&db, source)
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected `end`")));
 }
 
 #[test]
@@ -158,6 +280,31 @@ fn parse_text_api_matches_direct_query_result() {
 }
 
 #[test]
+fn parser_outputs_ranges_with_source_origin() {
+    let db = Eng::default();
+    let source = Source::new(&db, "origin.hc".to_owned(), "bundle demo\nlet =".to_owned());
+
+    let lexed = lex_source(&db, source);
+    assert!(lexed
+        .tokens
+        .iter()
+        .all(|token| token.range.source() == Some(source)));
+
+    let parsed = parse_source(&db, source);
+    assert_eq!(parsed.ast.range.source(), Some(source));
+
+    let lex_diags = lex_diagnostics(&db, source);
+    assert!(lex_diags
+        .iter()
+        .all(|diagnostic| diagnostic.range.source() == Some(source)));
+
+    let parse_diags = parse_diagnostics(&db, source);
+    assert!(parse_diags
+        .iter()
+        .all(|diagnostic| diagnostic.range.source() == Some(source)));
+}
+
+#[test]
 fn parse_query_conforms_to_broad_program_shape() {
     let db = Eng::default();
     let source = Source::new(
@@ -165,7 +312,7 @@ fn parse_query_conforms_to_broad_program_shape() {
         "conformance.hc".to_owned(),
         [
             "bundle demo",
-            "import \"std/core\", \"std/math\",",
+            "module m in \"m.hc\"",
             "module Main =",
             "use root::std::core as Core",
             "type Option : a = | Some a | None",
@@ -190,6 +337,100 @@ fn parse_query_conforms_to_broad_program_shape() {
 }
 
 #[test]
+fn parse_query_accepts_bundle_use_shorthand() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "use_bundle_shorthand.hc".to_owned(),
+        [
+            "bundle demo",
+            "use bundle",
+            "let value = use bundle as Root in Root::std::core",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+
+    let Some(Statement::Use {
+        target: Some(NameRef::Path(path)),
+        ..
+    }) = parsed.ast.statements.get(1)
+    else {
+        panic!("expected module-level `use bundle` statement");
+    };
+    assert_eq!(path.root, PathRoot::Bundle);
+    assert!(path.segments.is_empty());
+
+    let Some(Statement::Let {
+        kind:
+            LetStatementKind::PatternBinding {
+                value:
+                    Expr::Use {
+                        target: Some(NameRef::Path(path)),
+                        ..
+                    },
+                ..
+            },
+        ..
+    }) = parsed.ast.statements.get(2)
+    else {
+        panic!("expected expression-level `use bundle` expression");
+    };
+    assert_eq!(path.root, PathRoot::Bundle);
+    assert!(path.segments.is_empty());
+
+    assert!(parse_diagnostics(&db, source).is_empty());
+}
+
+#[test]
+fn parse_query_keeps_bundle_prefixed_use_paths() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "use_bundle_prefixed_path.hc".to_owned(),
+        [
+            "bundle demo",
+            "use bundle::M as RootMod",
+            "let value = use bundle::M as LocalMod in LocalMod::value",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+
+    let Some(Statement::Use {
+        target: Some(NameRef::Path(path)),
+        ..
+    }) = parsed.ast.statements.get(1)
+    else {
+        panic!("expected module-level `use bundle::M` statement");
+    };
+    assert_eq!(path.root, PathRoot::Bundle);
+    assert_eq!(path.segments.len(), 1);
+
+    let Some(Statement::Let {
+        kind:
+            LetStatementKind::PatternBinding {
+                value:
+                    Expr::Use {
+                        target: Some(NameRef::Path(path)),
+                        ..
+                    },
+                ..
+            },
+        ..
+    }) = parsed.ast.statements.get(2)
+    else {
+        panic!("expected expression-level `use bundle::M` expression");
+    };
+    assert_eq!(path.root, PathRoot::Bundle);
+    assert_eq!(path.segments.len(), 1);
+
+    assert!(parse_diagnostics(&db, source).is_empty());
+}
+
+#[test]
 fn parse_query_recovers_after_lex_and_parse_errors() {
     let db = Eng::default();
     let source = Source::new(
@@ -202,16 +443,12 @@ fn parse_query_recovers_after_lex_and_parse_errors() {
     assert_eq!(parsed.ast.statements.len(), 4);
     let mut merged = lex_diagnostics(&db, source);
     merged.extend(parse_diagnostics(&db, source));
-    assert!(
-        merged
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("unexpected character"))
-    );
-    assert!(
-        merged
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("expected statement"))
-    );
+    assert!(merged
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("unexpected character")));
+    assert!(merged
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected statement")));
 }
 
 #[test]
@@ -282,22 +519,6 @@ fn parse_query_builds_typed_ast_nodes() {
     ));
 }
 
-#[derive(Default)]
-struct CountingVisitor {
-    statement_count: usize,
-    expr_count: usize,
-}
-
-impl AstVisitor for CountingVisitor {
-    fn visit_statement(&mut self, _statement: &Statement) {
-        self.statement_count += 1;
-    }
-
-    fn visit_expr(&mut self, _expr: &Expr) {
-        self.expr_count += 1;
-    }
-}
-
 #[test]
 fn parse_query_ast_is_traversable() {
     let db = Eng::default();
@@ -308,11 +529,16 @@ fn parse_query_ast_is_traversable() {
     );
 
     let parsed = parse_source(&db, source);
-    let mut visitor = CountingVisitor::default();
+    let mut statement_count = 0;
+    let mut expr_count = 0;
+    let mut visitor = AstVisitor::new()
+        .statement(|_| statement_count += 1)
+        .expr(|_| expr_count += 1);
     parsed.ast.walk(&mut visitor);
+    drop(visitor);
 
-    assert!(visitor.statement_count >= 3);
-    assert!(visitor.expr_count >= 3);
+    assert!(statement_count >= 3);
+    assert!(expr_count >= 3);
 }
 
 #[test]
@@ -328,7 +554,10 @@ fn parse_query_randomized_inputs_do_not_panic() {
 
         let parsed = parse_source(&db, source);
         assert!(!parsed.tokens.is_empty());
-        assert_eq!(parsed.ast.range.end(), TextSize::from_usize(text.len()));
+        assert_eq!(
+            parsed.ast.range.end(),
+            Some(TextSize::from_usize(text.len()))
+        );
     }
 }
 

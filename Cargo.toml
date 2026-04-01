@@ -1,5 +1,9 @@
+[workspace]
+members = ["lsp"]
+resolver = "2"
+
 [package]
-name = "ruddy-salsa"
+name = "ruddy"
 version = "0.1.0"
 edition = "2024"
 

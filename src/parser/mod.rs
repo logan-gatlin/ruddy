@@ -57,7 +57,7 @@ impl ParsedSource {
 #[salsa::tracked]
 pub fn lex_source(db: &dyn salsa::Database, source: Source) -> LexedSource {
     let contents = source.contents(db);
-    let tokens = lexer::lex(db, contents);
+    let tokens = lexer::lex(db, source, contents);
     LexedSource::new(tokens)
 }
 
@@ -66,7 +66,7 @@ pub fn parse_source(db: &dyn salsa::Database, source: Source) -> ParsedSource {
     let source_len = TextSize::from_usize(source.contents(db).len());
     let lexed = lex_source(db, source);
     let tokens = lexed.tokens;
-    let parsed_file = grammar::parse_file(db, &tokens, source_len);
+    let parsed_file = grammar::parse_file(db, source, &tokens, source_len);
     ParsedSource::new(tokens, parsed_file.file)
 }
 

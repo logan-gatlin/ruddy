@@ -11,11 +11,10 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 
 ## Program Structure
 ```bnf
+<bundle_root_file> ::= <bundle_declaration> <file>
 <file> ::= <statement>*
 
-<statement> ::= <bundle_declaration>
-              | <import_statement>
-              | <module_statement>
+<statement> ::= <module_statement>
               | <let_statement>
               | <do_statement>
               | <use_statement>
@@ -25,13 +24,14 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
               | <wasm_statement>
 
 <bundle_declaration> ::= "bundle" <ident>
-<import_statement>   ::= "import" <string> ("," <string>)* ","?
+
 <module_statement>   ::= "module" <ident> "=" <statement>* "end"
+              | "module" <ident> ("as" <string>)?
 
 <let_statement> ::= "let" <pattern> "=" <expr>
                   | "let" "|" <ident> "=" (<ident> | <path>)
 <do_statement>  ::= "do" <expr>
-<use_statement> ::= "use" (<ident> | <path>) ("as" <ident>)?
+<use_statement> ::= "use" (<ident> | <path> | "bundle") ("as" <ident>)?
 
 <type_statement>         ::= <nominal_type_statement> | <alias_type_statement>
 <nominal_type_statement> ::= "type" <ident> <type_params>? "=" <type_def>
@@ -57,7 +57,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 <wasm_statement> ::= "wasm" "=>" (<wasm_declaration> | "(" <wasm_declaration>* ")")
 ```
 
-- `bundle` and `import` are regular statements and can appear anywhere statements are allowed.
+- `bundle` are regular statements and can appear anywhere statements are allowed.
 - Statements in `<file>` and `module ... end` are not separated by semicolons.
 - Top-level statements are part of the bundle scope; a `module ... end` wrapper is optional.
 - CLI bundle compilation requires the root file to start with `bundle <name>`.
@@ -129,7 +129,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
          | <seq_expr>
 
 <let_expr>   ::= "let" <pattern> "=" <expr> "in" <expr>
-<use_expr>   ::= "use" (<ident> | <path>) ("as" <ident>)? "in" <expr>
+<use_expr>   ::= "use" (<ident> | <path> | "bundle") ("as" <ident>)? "in" <expr>
 <fn_expr>    ::= "fn" <parameter>* "=>" <expr>
                | "fn" <match_arm>+
 <if_expr>    ::= "if" <expr> "then" <expr> "else" <expr>
@@ -275,7 +275,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 ```bnf
 <ident> ::= <bare_ident> | <bracketed_ident>
 
-<bare_ident> ::= <xid_start> <xid_continue>*
+<bare_ident> ::= <xid_start> <xid_continue>* ("-" <xid_start> <xid_continue>*)*
 <bracketed_ident> ::= "[" <bracketed_ident_text> "]"
 
 <path> ::= "root" "::" <path_segment> ("::" <path_segment>)*
@@ -286,7 +286,8 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 ```
 
 - `<xid_start>` and `<xid_continue>` use Unicode XID character classes.
-- `root` and `bundle` are reserved keywords and appear in path prefix forms only.
+- Bare identifiers support kebab-style segments (`foo-bar-baz`); leading/trailing `-` remain separate operator tokens.
+- `root` and `bundle` are reserved keywords; `bundle` is also allowed as a standalone `use` target.
 - Bracketed identifiers may contain operator-like text (examples: `[+]`, `[ + ]`, `[not]`).
 
 ### Literals
@@ -334,7 +335,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 
 ### Keywords and operators
 - Reserved keywords:
-  - `bundle`, `import`, `module`, `end`
+  - `bundle`, `module`, `end`
   - `let`, `do`, `use`, `as`, `in`
   - `type`, `trait`, `impl`, `for`, `where`
   - `fn`, `if`, `then`, `else`, `match`, `with`
@@ -372,6 +373,7 @@ Associativity:
 - Internally, resolved paths use `major::minor`, where `major` is the bundle name and `minor` is the declaration path inside that bundle.
 - `root::...` is fully qualified.
 - `bundle::...` is bundle-qualified and anchored at the current bundle root.
+- `use bundle` is shorthand for `use root::<current_bundle_name>`.
 - Free paths (no prefix) resolve relative to current module scope first, then through `use`, then as absolute `<bundle>::...`.
 - Module-level `use` applies to following statements in the same module.
 - Expression-level `use ... in ...` applies only in its `in` body.

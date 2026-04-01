@@ -3,7 +3,6 @@ use crate::reporting::TextRange;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
 pub enum Keyword {
     Bundle,
-    Import,
     Module,
     End,
     Let,

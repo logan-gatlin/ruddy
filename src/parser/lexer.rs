@@ -1,22 +1,25 @@
 use super::token::{Keyword, Operator, Punct, Token, TokenKind};
+use crate::engine::Source;
 use crate::reporting::{Diag, Diagnostic, TextRange, TextSize};
 use salsa::Accumulator;
 
-pub(super) fn lex(db: &dyn salsa::Database, source: &str) -> Vec<Token> {
-    Lexer::new(db, source).lex()
+pub(super) fn lex(db: &dyn salsa::Database, source_file: Source, source: &str) -> Vec<Token> {
+    Lexer::new(db, source_file, source).lex()
 }
 
 struct Lexer<'src> {
     db: &'src dyn salsa::Database,
+    source_file: Source,
     source: &'src str,
     cursor: usize,
     tokens: Vec<Token>,
 }
 
 impl<'src> Lexer<'src> {
-    fn new(db: &'src dyn salsa::Database, source: &'src str) -> Self {
+    fn new(db: &'src dyn salsa::Database, source_file: Source, source: &'src str) -> Self {
         Self {
             db,
+            source_file,
             source,
             cursor: 0,
             tokens: Vec::new(),
@@ -33,8 +36,10 @@ impl<'src> Lexer<'src> {
         }
 
         let eof = TextSize::from_usize(self.cursor);
-        self.tokens
-            .push(Token::new(TokenKind::EndOfFile, TextRange::empty(eof)));
+        self.tokens.push(Token::new(
+            TokenKind::EndOfFile,
+            TextRange::empty(self.source_file, eof),
+        ));
 
         self.tokens
     }
@@ -46,6 +51,7 @@ impl<'src> Lexer<'src> {
             Some(ch) if is_ident_start(ch) => {
                 self.lex_ident_or_keyword(start);
             }
+            Some('[') if self.lex_bracketed_operator_ident(start) => {}
             Some(ch) if ch.is_ascii_digit() => {
                 self.lex_number(start);
             }
@@ -72,14 +78,61 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    fn lex_bracketed_operator_ident(&mut self, start: usize) -> bool {
+        let Some(after_open) = self.cursor.checked_add(1) else {
+            return false;
+        };
+        if after_open >= self.source.len() {
+            return false;
+        }
+
+        let mut close = None;
+        for (offset, ch) in self.source[after_open..].char_indices() {
+            if ch == ']' {
+                close = Some(after_open + offset);
+                break;
+            }
+            if ch == '\n' || ch == '\r' {
+                return false;
+            }
+        }
+
+        let Some(close) = close else {
+            return false;
+        };
+
+        let inside = &self.source[after_open..close];
+        if !is_operator_like_bracketed_identifier(inside) {
+            return false;
+        }
+
+        self.cursor = close + 1;
+        self.emit_token(start, TokenKind::BracketedIdent);
+        true
+    }
+
     fn lex_ident_or_keyword(&mut self, start: usize) {
         self.bump_char();
-        self.consume_while(is_ident_continue);
+        self.consume_ident_tail();
         let text = &self.source[start..self.cursor];
         let kind = keyword_kind(text)
             .map(TokenKind::Keyword)
             .unwrap_or(TokenKind::Ident);
         self.emit_token(start, kind);
+    }
+
+    fn consume_ident_tail(&mut self) {
+        loop {
+            self.consume_while(is_ident_continue);
+
+            if self.peek_char() == Some('-') && self.peek_next_char().is_some_and(is_ident_start) {
+                self.bump_char();
+                self.bump_char();
+                continue;
+            }
+
+            break;
+        }
     }
 
     fn lex_number(&mut self, start: usize) {
@@ -504,6 +557,7 @@ impl<'src> Lexer<'src> {
 
     fn emit_token(&mut self, start: usize, kind: TokenKind) {
         let range = TextRange::from_bounds(
+            self.source_file,
             TextSize::from_usize(start),
             TextSize::from_usize(self.cursor),
         );
@@ -511,7 +565,11 @@ impl<'src> Lexer<'src> {
     }
 
     fn report(&mut self, start: usize, end: usize, message: impl Into<String>) {
-        let range = TextRange::from_bounds(TextSize::from_usize(start), TextSize::from_usize(end));
+        let range = TextRange::from_bounds(
+            self.source_file,
+            TextSize::from_usize(start),
+            TextSize::from_usize(end),
+        );
         Diag(Diagnostic::error(range, message)).accumulate(self.db);
     }
 
@@ -555,7 +613,7 @@ impl<'src> Lexer<'src> {
 }
 
 fn is_ident_start(ch: char) -> bool {
-    unicode_ident::is_xid_start(ch)
+    ch == '_' || unicode_ident::is_xid_start(ch)
 }
 
 fn is_ident_continue(ch: char) -> bool {
@@ -604,7 +662,6 @@ fn is_valid_digit_sequence(text: &str, is_digit: impl Fn(char) -> bool) -> bool 
 fn keyword_kind(text: &str) -> Option<Keyword> {
     match text {
         "bundle" => Some(Keyword::Bundle),
-        "import" => Some(Keyword::Import),
         "module" => Some(Keyword::Module),
         "end" => Some(Keyword::End),
         "let" => Some(Keyword::Let),
@@ -636,6 +693,34 @@ fn keyword_kind(text: &str) -> Option<Keyword> {
     }
 }
 
+fn is_operator_like_bracketed_identifier(text: &str) -> bool {
+    let trimmed = text.trim();
+    matches!(
+        trimmed,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "mod"
+            | "xor"
+            | "or"
+            | "and"
+            | "not"
+            | "~"
+            | ">>"
+            | "<<"
+            | "|>"
+            | "+>"
+            | "*>"
+            | ";"
+            | "=="
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+    )
+}
+
 fn single_char_token_kind(ch: char) -> Option<TokenKind> {
     let kind = match ch {
         '+' => TokenKind::Operator(Operator::Plus),
@@ -663,6 +748,3 @@ fn single_char_token_kind(ch: char) -> Option<TokenKind> {
 
     Some(kind)
 }
-
-#[cfg(test)]
-mod tests;

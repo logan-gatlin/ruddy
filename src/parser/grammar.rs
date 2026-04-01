@@ -1,5 +1,6 @@
 use super::ast;
 use super::token::{Keyword, Operator, Punct, Token, TokenKind};
+use crate::engine::Source;
 use crate::reporting::{Diag, Diagnostic, TextRange, TextSize};
 use salsa::Accumulator;
 
@@ -9,10 +10,11 @@ pub(super) struct ParseResult {
 
 pub(super) fn parse_file(
     db: &dyn salsa::Database,
+    source: Source,
     tokens: &[Token],
     source_len: TextSize,
 ) -> ParseResult {
-    let mut parser = Parser::new(db, tokens, source_len);
+    let mut parser = Parser::new(db, source, tokens, source_len);
     let file = parser.parse_file();
     parser.finish(file)
 }
@@ -102,15 +104,22 @@ impl ExprStop {
 struct Parser<'a> {
     tokens: &'a [Token],
     db: &'a dyn salsa::Database,
+    source: Source,
     source_len: TextSize,
     pos: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(db: &'a dyn salsa::Database, tokens: &'a [Token], source_len: TextSize) -> Self {
+    fn new(
+        db: &'a dyn salsa::Database,
+        source: Source,
+        tokens: &'a [Token],
+        source_len: TextSize,
+    ) -> Self {
         Self {
             db,
             tokens,
+            source,
             source_len,
             pos: 0,
         }
@@ -122,9 +131,19 @@ impl<'a> Parser<'a> {
 
     fn parse_file(&mut self) -> ast::AstFile {
         let mut statements = Vec::new();
+        let mut bundle_name = None;
 
         while !self.at_eof() {
-            if let Some(statement) = self.parse_statement() {
+            let is_file_top = statements.is_empty();
+            if let Some(statement) = self.parse_statement(is_file_top) {
+                if is_file_top
+                    && let ast::Statement::Bundle {
+                        name: declared_name,
+                        ..
+                    } = &statement
+                {
+                    bundle_name = declared_name.clone();
+                }
                 statements.push(statement);
             } else {
                 let error_start = self.pos;
@@ -135,15 +154,15 @@ impl<'a> Parser<'a> {
         }
 
         ast::AstFile {
-            range: TextRange::new(TextSize::ZERO, self.source_len),
+            bundle_name,
+            range: TextRange::new(self.source, TextSize::ZERO, self.source_len),
             statements,
         }
     }
 
-    fn parse_statement(&mut self) -> Option<ast::Statement> {
+    fn parse_statement(&mut self, allow_bundle_declaration: bool) -> Option<ast::Statement> {
         match self.current_keyword() {
-            Some(Keyword::Bundle) => Some(self.parse_bundle_declaration()),
-            Some(Keyword::Import) => Some(self.parse_import_statement()),
+            Some(Keyword::Bundle) => Some(self.parse_bundle_declaration(allow_bundle_declaration)),
             Some(Keyword::Module) => Some(self.parse_module_statement()),
             Some(Keyword::Let) => Some(self.parse_let_statement()),
             Some(Keyword::Do) => Some(self.parse_do_statement()),
@@ -156,8 +175,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_bundle_declaration(&mut self) -> ast::Statement {
+    fn parse_bundle_declaration(&mut self, allow_bundle_declaration: bool) -> ast::Statement {
         let start = self.pos;
+        if !allow_bundle_declaration {
+            self.error_current("bundle declaration must be the first statement in the file");
+        }
         self.bump();
         let name = self.expect_ident_node("bundle name");
         ast::Statement::Bundle {
@@ -166,53 +188,44 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_import_statement(&mut self) -> ast::Statement {
-        let start = self.pos;
-        self.bump();
-
-        let mut paths = Vec::new();
-        if let Some(first_path) = self.expect_string_literal_node("import path") {
-            paths.push(first_path);
-
-            while self.eat_punct(Punct::Comma) {
-                if let Some(path) = self.eat_string_literal_node() {
-                    paths.push(path);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        ast::Statement::Import {
-            paths,
-            range: self.range_from(start),
-        }
-    }
-
     fn parse_module_statement(&mut self) -> ast::Statement {
         let start = self.pos;
         self.bump();
         let name = self.expect_ident_node("module name");
-        self.expect_punct(Punct::Equals, "expected `=` after module name");
+        // Inline module
+        if self.eat_punct(Punct::Equals) {
+            let mut body = Vec::new();
+            while !self.at_eof() && !self.at_keyword(Keyword::End) {
+                if let Some(statement) = self.parse_statement(false) {
+                    body.push(statement);
+                } else {
+                    let error_start = self.pos;
+                    self.error_current("expected statement in module body");
+                    self.recover_statement();
+                    body.push(ast::Statement::Error(self.error_node(error_start)));
+                }
+            }
 
-        let mut body = Vec::new();
-        while !self.at_eof() && !self.at_keyword(Keyword::End) {
-            if let Some(statement) = self.parse_statement() {
-                body.push(statement);
-            } else {
-                let error_start = self.pos;
-                self.error_current("expected statement in module body");
-                self.recover_statement();
-                body.push(ast::Statement::Error(self.error_node(error_start)));
+            self.expect_keyword(Keyword::End, "expected `end` to close module statement");
+
+            ast::Statement::Module {
+                name,
+                body,
+                range: self.range_from(start),
             }
         }
-
-        self.expect_keyword(Keyword::End, "expected `end` to close module statement");
-
-        ast::Statement::Module {
-            name,
-            body,
-            range: self.range_from(start),
+        // Module reference
+        else {
+            let in_loc = if self.eat_keyword(Keyword::In) {
+                self.eat_string_literal_node()
+            } else {
+                None
+            };
+            ast::Statement::ModuleRef {
+                name,
+                in_loc,
+                range: self.range_from(start),
+            }
         }
     }
 
@@ -261,7 +274,7 @@ impl<'a> Parser<'a> {
     fn parse_use_statement(&mut self) -> ast::Statement {
         let start = self.pos;
         self.bump();
-        let target = self.expect_ident_or_path_node("identifier or path in use statement");
+        let target = self.expect_use_target_node("use statement");
         let alias = if self.eat_keyword(Keyword::As) {
             self.expect_ident_node("use alias name")
         } else {
@@ -1048,7 +1061,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.bump();
 
-        let target = self.expect_ident_or_path_node("identifier or path in use expression");
+        let target = self.expect_use_target_node("use expression");
         let alias = if self.eat_keyword(Keyword::As) {
             self.expect_ident_node("use expression alias name")
         } else {
@@ -1742,9 +1755,16 @@ impl<'a> Parser<'a> {
 
     fn reached_expr_boundary(&self, boundary: ExprBoundary) -> bool {
         match boundary {
-            ExprBoundary::Statement => self
-                .current_keyword()
-                .is_some_and(is_statement_boundary_keyword),
+            ExprBoundary::Statement => {
+                if self.at_keyword(Keyword::Bundle)
+                    && matches!(self.peek_kind(1), Some(TokenKind::Operator(Operator::PathSep)))
+                {
+                    false
+                } else {
+                    self.current_keyword()
+                        .is_some_and(is_statement_boundary_keyword)
+                }
+            }
             ExprBoundary::ImplItem => self.current_keyword().is_some_and(|keyword| {
                 matches!(keyword, Keyword::Let | Keyword::Type | Keyword::End)
             }),
@@ -1911,6 +1931,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn expect_use_target_node(&mut self, context: &str) -> Option<ast::NameRef> {
+        if let Some(target) = self.parse_use_target() {
+            Some(target)
+        } else {
+            self.error_current(format!("expected identifier, path, or `bundle` in {context}"));
+            None
+        }
+    }
+
+    fn parse_use_target(&mut self) -> Option<ast::NameRef> {
+        if self.at_keyword(Keyword::Bundle)
+            && !matches!(self.peek_kind(1), Some(TokenKind::Operator(Operator::PathSep)))
+        {
+            let start = self.pos;
+            self.bump();
+            return Some(ast::NameRef::Path(ast::Path {
+                root: ast::PathRoot::Bundle,
+                segments: Vec::new(),
+                range: self.range_from(start),
+            }));
+        }
+
+        self.parse_ident_or_path()
+    }
+
     fn parse_ident_or_path(&mut self) -> Option<ast::NameRef> {
         let checkpoint = self.pos;
         if let Some(path) = self.eat_path() {
@@ -2053,15 +2098,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_string_literal_node(&mut self, context: &str) -> Option<ast::Literal> {
-        if let Some(literal) = self.eat_string_literal_node() {
-            Some(literal)
-        } else {
-            self.error_current(format!("expected string literal for {context}"));
-            None
-        }
-    }
-
     fn at_keyword(&self, keyword: Keyword) -> bool {
         matches!(self.current_kind(), TokenKind::Keyword(current) if current == keyword)
     }
@@ -2156,7 +2192,7 @@ impl<'a> Parser<'a> {
 
     fn current_range(&self) -> TextRange {
         if self.at_eof() {
-            TextRange::empty(self.source_len)
+            TextRange::empty(self.source, self.source_len)
         } else {
             self.current_token().range
         }
@@ -2185,23 +2221,30 @@ impl<'a> Parser<'a> {
         let end = if self.pos > start_pos {
             self.tokens
                 .get(self.pos - 1)
-                .map(|token| token.range.end())
+                .and_then(|token| token.range.end())
                 .unwrap_or(self.source_len)
         } else {
             start
         };
-        TextRange::from_bounds(start, end)
+        TextRange::from_bounds(self.source, start, end)
     }
 
     fn position_start(&self, pos: usize) -> TextSize {
         self.tokens
             .get(pos)
-            .map(|token| token.range.start)
+            .and_then(|token| token.range.start())
             .unwrap_or(self.source_len)
     }
 
     fn merge_ranges(&self, left: TextRange, right: TextRange) -> TextRange {
-        TextRange::from_bounds(left.start, right.end())
+        match (left.source(), left.start(), right.source(), right.end()) {
+            (Some(left_source), Some(start), Some(right_source), Some(end))
+                if left_source == right_source =>
+            {
+                TextRange::from_bounds(left_source, start, end)
+            }
+            _ => TextRange::generated(),
+        }
     }
 }
 
@@ -2209,7 +2252,6 @@ fn is_statement_start_keyword(keyword: Keyword) -> bool {
     matches!(
         keyword,
         Keyword::Bundle
-            | Keyword::Import
             | Keyword::Module
             | Keyword::Let
             | Keyword::Do
