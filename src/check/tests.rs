@@ -1,7 +1,10 @@
+use crate::engine::{Eng, Source};
+use crate::resolver::FailingResolver;
 use crate::ty::store::TypeStore;
+use crate::ty::typed_ir as tir;
 use crate::ty::*;
 
-use super::{UnificationError, UnificationTable};
+use super::{UnificationError, UnificationTable, check_text};
 
 // ---------------------------------------------------------------------------
 // TypeStore tests
@@ -541,4 +544,138 @@ fn unify_with_kind_inference() {
     };
     assert_eq!(*store.get_kind(*from), Kind::Type);
     assert_eq!(*store.get_kind(*to), Kind::Type);
+}
+
+// ---------------------------------------------------------------------------
+// HM inference / checker integration
+// ---------------------------------------------------------------------------
+
+fn typed_binding_expr_by_name<'a>(module: &'a tir::Module, name: &str) -> Option<&'a tir::Expr> {
+    module.statements.iter().find_map(|statement| {
+        let tir::Statement::Let {
+            kind:
+                tir::LetStatementKind::PatternBinding {
+                    pattern:
+                        tir::Pattern {
+                            kind:
+                                tir::PatternKind::Binding {
+                                    name: crate::lower::ir::ResolvedName::Global(path),
+                                },
+                            ..
+                        },
+                    value,
+                },
+            ..
+        } = statement
+        else {
+            return None;
+        };
+
+        if path.text() == name {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+#[test]
+fn infer_identity_is_polymorphic() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_identity.hc".to_owned(),
+        [
+            "bundle demo",
+            "let id = fn x => x",
+            "let a = id 1",
+            "let b = id true",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+
+    let a_expr = typed_binding_expr_by_name(module, "demo::a").expect("missing binding demo::a");
+    let b_expr = typed_binding_expr_by_name(module, "demo::b").expect("missing binding demo::b");
+
+    assert_eq!(
+        checked.type_store.get_type(a_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked.type_store.get_type(b_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn infer_reports_if_condition_type_mismatch() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_if_mismatch.hc".to_owned(),
+        ["bundle demo", "let x = if 1 then 2 else 3"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("type mismatch")),
+        "expected type mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn infer_sum_constructors_and_match() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_sum_match.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Option: a = | Some a | None",
+            "let some = Option::Some 1",
+            "let unwrapped = match some with",
+            "  | Option::Some x => x",
+            "  | Option::None => 0",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let unwrapped = typed_binding_expr_by_name(module, "demo::unwrapped")
+        .expect("missing binding demo::unwrapped");
+
+    assert_eq!(
+        checked.type_store.get_type(unwrapped.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
 }

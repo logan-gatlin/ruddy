@@ -1,0 +1,1645 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::lower::ir as lir;
+use crate::reporting::{Diagnostic, TextRange};
+use crate::ty::store::TypeStore;
+use crate::ty::typed_ir as tir;
+use crate::ty::{
+    KindId, MetaTypeVariableId, TypeBinder, TypeBinderId, TypeConstructor, TypeId, TypeKind,
+    TypeScheme,
+};
+
+use super::{UnificationError, UnificationTable};
+
+#[derive(Debug)]
+pub struct CheckResult {
+    pub source: tir::Source,
+    pub diagnostics: Vec<Diagnostic>,
+    pub type_store: TypeStore,
+}
+
+pub fn check_lowered_source(lowered: &lir::LoweredSource) -> CheckResult {
+    Checker::new().check_source(lowered)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BinderKey {
+    Local(lir::LocalId),
+    Global(String),
+}
+
+#[derive(Clone)]
+struct BoundVar {
+    key: BinderKey,
+    ty: TypeId,
+    range: TextRange,
+}
+
+#[derive(Clone, Default)]
+struct LocalEnv {
+    terms: HashMap<lir::LocalId, TypeScheme>,
+}
+
+#[derive(Default)]
+struct TypeExprEnv {
+    locals: HashMap<lir::LocalId, TypeId>,
+}
+
+struct Checker {
+    store: TypeStore,
+    table: UnificationTable,
+    diagnostics: Vec<Diagnostic>,
+    global_terms: HashMap<String, TypeScheme>,
+    named_type_constructors: HashMap<String, TypeId>,
+    next_type_binder: u32,
+}
+
+impl Checker {
+    fn new() -> Self {
+        Self {
+            store: TypeStore::new(),
+            table: UnificationTable::new(),
+            diagnostics: Vec::new(),
+            global_terms: HashMap::new(),
+            named_type_constructors: HashMap::new(),
+            next_type_binder: 0,
+        }
+    }
+
+    fn check_source(mut self, lowered: &lir::LoweredSource) -> CheckResult {
+        let modules = lowered
+            .modules
+            .iter()
+            .map(|module| self.check_module(module))
+            .collect();
+
+        let mut source = tir::Source {
+            root_module: lowered.root_module.clone(),
+            modules,
+        };
+
+        self.zonk_source(&mut source);
+
+        CheckResult {
+            source,
+            diagnostics: self.diagnostics,
+            type_store: self.store,
+        }
+    }
+
+    fn check_module(&mut self, module: &lir::LoweredModule) -> tir::Module {
+        let statements = module
+            .statements
+            .iter()
+            .map(|statement| self.check_statement(statement))
+            .collect();
+
+        tir::Module {
+            path: module.path.clone(),
+            source_name: module.source_name.clone(),
+            range: module.range,
+            statements,
+            exports: module.exports.clone(),
+        }
+    }
+
+    fn check_statement(&mut self, statement: &lir::Statement) -> tir::Statement {
+        match statement {
+            lir::Statement::ModuleDecl {
+                name,
+                module,
+                range,
+            } => tir::Statement::ModuleDecl {
+                name: name.clone(),
+                module: module.clone(),
+                range: *range,
+            },
+            lir::Statement::Let { kind, range } => self.check_let_statement(kind, *range),
+            lir::Statement::Type {
+                name,
+                params,
+                kind,
+                range,
+            } => {
+                self.check_type_statement(name, params, kind, *range);
+                tir::Statement::Type {
+                    name: name.clone(),
+                    params: params.clone(),
+                    kind: kind.clone(),
+                    range: *range,
+                }
+            }
+            lir::Statement::Trait {
+                name,
+                params,
+                items,
+                range,
+            } => tir::Statement::Trait {
+                name: name.clone(),
+                params: params.clone(),
+                items: items.clone(),
+                range: *range,
+            },
+            lir::Statement::TraitAlias {
+                name,
+                target,
+                range,
+            } => tir::Statement::TraitAlias {
+                name: name.clone(),
+                target: target.clone(),
+                range: *range,
+            },
+            lir::Statement::Impl {
+                trait_ref,
+                for_types,
+                items,
+                range,
+            } => tir::Statement::Impl {
+                trait_ref: trait_ref.clone(),
+                for_types: for_types.clone(),
+                items: items.clone(),
+                range: *range,
+            },
+            lir::Statement::Wasm {
+                declarations,
+                range,
+            } => tir::Statement::Wasm {
+                declarations: declarations.clone(),
+                range: *range,
+            },
+            lir::Statement::Error(error) => tir::Statement::Error(error.clone()),
+        }
+    }
+
+    fn check_let_statement(
+        &mut self,
+        kind: &lir::LetStatementKind,
+        range: TextRange,
+    ) -> tir::Statement {
+        match kind {
+            lir::LetStatementKind::PatternBinding { pattern, value } => {
+                let mut locals = LocalEnv::default();
+                let keys = collect_pattern_binders(pattern);
+                let prebound = self.prebind_keys(&mut locals, &keys);
+                let snapshot = self.table.type_var_count();
+
+                let typed_value = self.infer_expr(value, &mut locals);
+                let (typed_pattern, bound_vars) =
+                    self.check_pattern(pattern, typed_value.ty, &locals, &prebound);
+
+                for bound in bound_vars {
+                    let scheme = self.generalize_type(bound.ty, snapshot, bound.range);
+                    self.insert_scheme_for_key(&mut locals, &bound.key, scheme, bound.range);
+                }
+
+                tir::Statement::Let {
+                    kind: tir::LetStatementKind::PatternBinding {
+                        pattern: typed_pattern,
+                        value: typed_value,
+                    },
+                    range,
+                }
+            }
+            lir::LetStatementKind::ConstructorAlias { alias, target } => {
+                if let (Some(alias), Some(target)) = (alias, target) {
+                    let alias_key = alias.text();
+                    let target_key = target.text();
+                    if let Some(target_scheme) = self.global_terms.get(&target_key).cloned() {
+                        self.global_terms.insert(alias_key, target_scheme);
+                    } else {
+                        self.error(
+                            target.range,
+                            format!(
+                                "failed to resolve constructor alias target `{}` during type checking",
+                                target_key
+                            ),
+                        );
+                    }
+                }
+
+                tir::Statement::Let {
+                    kind: tir::LetStatementKind::ConstructorAlias {
+                        alias: alias.clone(),
+                        target: target.clone(),
+                    },
+                    range,
+                }
+            }
+        }
+    }
+
+    fn check_type_statement(
+        &mut self,
+        name: &lir::QualifiedName,
+        params: &[lir::TypeBinder],
+        kind: &lir::TypeStatementKind,
+        range: TextRange,
+    ) {
+        let _decl_ctor = self.ensure_named_type_constructor(name, Some(params.len()), range);
+
+        let (scheme_binders, mut type_env, param_types) = self.build_type_param_env(params);
+        let head_ty = self.instantiate_type_head(name, &param_types, range, Some(params.len()));
+
+        match kind {
+            lir::TypeStatementKind::Alias { value } => {
+                let alias_ty = self.lower_type_expr(value, &mut type_env);
+                self.expect_type_kind(type_expr_range(value), alias_ty);
+            }
+            lir::TypeStatementKind::Nominal { definition } => match definition {
+                lir::TypeDefinition::Struct { members, .. } => {
+                    for member in members {
+                        match member {
+                            lir::RecordTypeMember::Field { ty, range, .. }
+                            | lir::RecordTypeMember::Spread { ty, range } => {
+                                let member_ty = self.lower_type_expr(ty, &mut type_env);
+                                self.expect_type_kind(*range, member_ty);
+                            }
+                        }
+                    }
+                }
+                lir::TypeDefinition::Sum { variants, .. } => {
+                    for variant in variants {
+                        let Some(variant_name) = &variant.name else {
+                            continue;
+                        };
+
+                        let variant_ty = if let Some(argument) = &variant.argument {
+                            let argument_ty = self.lower_type_expr(argument, &mut type_env);
+                            self.expect_type_kind(type_expr_range(argument), argument_ty);
+                            self.store.mk_arrow(argument_ty, head_ty)
+                        } else {
+                            head_ty
+                        };
+
+                        let scheme = TypeScheme {
+                            binders: scheme_binders.clone(),
+                            predicates: Vec::new(),
+                            body: variant_ty,
+                            range: variant.range,
+                        };
+                        self.global_terms.insert(variant_name.text(), scheme);
+                    }
+                }
+                lir::TypeDefinition::Opaque { representation } => {
+                    let repr_ty = self.lower_type_expr(representation, &mut type_env);
+                    self.expect_type_kind(type_expr_range(representation), repr_ty);
+                }
+            },
+        }
+    }
+
+    fn build_type_param_env(
+        &mut self,
+        params: &[lir::TypeBinder],
+    ) -> (Vec<TypeBinder>, TypeExprEnv, Vec<TypeId>) {
+        let mut binders = Vec::with_capacity(params.len());
+        let mut env = TypeExprEnv::default();
+        let mut param_tys = Vec::with_capacity(params.len());
+
+        for param in params {
+            let binder_id = self.fresh_type_binder_id();
+            let kind = self.store.kind_type();
+            let binder = TypeBinder {
+                id: binder_id,
+                name: param.name.clone(),
+                kind,
+                range: param.range,
+            };
+            let rigid = self.store.mk_rigid(binder_id, kind);
+            binders.push(binder);
+            env.locals.insert(param.id, rigid);
+            param_tys.push(rigid);
+        }
+
+        (binders, env, param_tys)
+    }
+
+    fn instantiate_type_head(
+        &mut self,
+        name: &lir::QualifiedName,
+        params: &[TypeId],
+        range: TextRange,
+        expected_arity: Option<usize>,
+    ) -> TypeId {
+        let mut head = self.ensure_named_type_constructor(name, expected_arity, range);
+
+        for index in 0..params.len() {
+            let remaining = params.len().saturating_sub(index + 1);
+            let result_kind = self.kind_for_arity(remaining);
+            head = self.store.mk_application(head, params[index], result_kind);
+        }
+
+        head
+    }
+
+    fn infer_expr(&mut self, expr: &lir::Expr, locals: &mut LocalEnv) -> tir::Expr {
+        match expr {
+            lir::Expr::Let {
+                pattern,
+                value,
+                body,
+                range,
+            } => {
+                let mut scoped = locals.clone();
+                let keys = collect_pattern_binders(pattern);
+                let prebound = self.prebind_keys(&mut scoped, &keys);
+                let snapshot = self.table.type_var_count();
+
+                let typed_value = self.infer_expr(value, &mut scoped);
+                let (typed_pattern, bound_vars) =
+                    self.check_pattern(pattern, typed_value.ty, &scoped, &prebound);
+
+                for bound in bound_vars {
+                    let scheme = self.generalize_type(bound.ty, snapshot, bound.range);
+                    self.insert_scheme_for_key(&mut scoped, &bound.key, scheme, bound.range);
+                }
+
+                let typed_body = self.infer_expr(body, &mut scoped);
+                let result_ty = typed_body.ty;
+
+                tir::Expr {
+                    kind: tir::ExprKind::Let {
+                        pattern: typed_pattern,
+                        value: Box::new(typed_value),
+                        body: Box::new(typed_body),
+                    },
+                    ty: result_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Function {
+                params,
+                body,
+                range,
+            } => {
+                let mut function_locals = locals.clone();
+                let mut typed_params = Vec::with_capacity(params.len());
+                let mut parameter_types = Vec::with_capacity(params.len());
+
+                for param in params {
+                    let param_ty = self.fresh_type_meta();
+                    let (typed_param, bound_vars) =
+                        self.check_pattern(param, param_ty, &function_locals, &HashMap::new());
+                    for bound in bound_vars {
+                        let scheme = self.mono_scheme(bound.ty, bound.range);
+                        self.insert_scheme_for_key(
+                            &mut function_locals,
+                            &bound.key,
+                            scheme,
+                            bound.range,
+                        );
+                    }
+                    typed_params.push(typed_param);
+                    parameter_types.push(param_ty);
+                }
+
+                let typed_body = self.infer_expr(body, &mut function_locals);
+
+                let mut fn_ty = typed_body.ty;
+                for parameter_ty in parameter_types.into_iter().rev() {
+                    fn_ty = self.store.mk_arrow(parameter_ty, fn_ty);
+                }
+
+                tir::Expr {
+                    kind: tir::ExprKind::Function {
+                        params: typed_params,
+                        body: Box::new(typed_body),
+                    },
+                    ty: fn_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                range,
+            } => {
+                let typed_condition = self.infer_expr(condition, locals);
+                let bool_ty = self.bool_type();
+                self.constrain_types(*range, typed_condition.ty, bool_ty);
+
+                let typed_then = self.infer_expr(then_branch, locals);
+                let typed_else = self.infer_expr(else_branch, locals);
+                self.constrain_types(*range, typed_then.ty, typed_else.ty);
+
+                tir::Expr {
+                    kind: tir::ExprKind::If {
+                        condition: Box::new(typed_condition),
+                        then_branch: Box::new(typed_then.clone()),
+                        else_branch: Box::new(typed_else),
+                    },
+                    ty: typed_then.ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Match {
+                scrutinee,
+                arms,
+                range,
+            } => {
+                let typed_scrutinee = self.infer_expr(scrutinee, locals);
+                let result_ty = self.fresh_type_meta();
+                let mut typed_arms = Vec::with_capacity(arms.len());
+
+                if arms.is_empty() {
+                    self.error(*range, "match expression must have at least one arm");
+                }
+
+                for arm in arms {
+                    let mut arm_locals = locals.clone();
+                    let (typed_pattern, bound_vars) = self.check_pattern(
+                        &arm.pattern,
+                        typed_scrutinee.ty,
+                        &arm_locals,
+                        &HashMap::new(),
+                    );
+                    for bound in bound_vars {
+                        let scheme = self.mono_scheme(bound.ty, bound.range);
+                        self.insert_scheme_for_key(
+                            &mut arm_locals,
+                            &bound.key,
+                            scheme,
+                            bound.range,
+                        );
+                    }
+
+                    let typed_body = self.infer_expr(&arm.body, &mut arm_locals);
+                    self.constrain_types(arm.range, typed_body.ty, result_ty);
+
+                    typed_arms.push(tir::MatchArm {
+                        pattern: typed_pattern,
+                        body: typed_body,
+                        range: arm.range,
+                    });
+                }
+
+                tir::Expr {
+                    kind: tir::ExprKind::Match {
+                        scrutinee: Box::new(typed_scrutinee),
+                        arms: typed_arms,
+                    },
+                    ty: result_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Apply {
+                callee,
+                argument,
+                range,
+            } => {
+                let typed_callee = self.infer_expr(callee, locals);
+                let typed_argument = self.infer_expr(argument, locals);
+                let result_ty = self.fresh_type_meta();
+                let expected_callee_ty = self.store.mk_arrow(typed_argument.ty, result_ty);
+                self.constrain_types(*range, typed_callee.ty, expected_callee_ty);
+
+                tir::Expr {
+                    kind: tir::ExprKind::Apply {
+                        callee: Box::new(typed_callee),
+                        argument: Box::new(typed_argument),
+                    },
+                    ty: result_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::FieldAccess { expr, field, range } => {
+                let typed_expr = self.infer_expr(expr, locals);
+                self.error(
+                    *range,
+                    "field access is not yet supported by the HM checker",
+                );
+                let ty = self.error_type();
+
+                tir::Expr {
+                    kind: tir::ExprKind::FieldAccess {
+                        expr: Box::new(typed_expr),
+                        field: field.clone(),
+                    },
+                    ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Name(name) => {
+                let ty = self.instantiate_name(name, locals);
+                tir::Expr {
+                    kind: tir::ExprKind::Name(name.clone()),
+                    ty,
+                    range: resolved_name_range(name),
+                }
+            }
+            lir::Expr::Literal(literal) => tir::Expr {
+                kind: tir::ExprKind::Literal(literal.clone()),
+                ty: self.literal_type(literal),
+                range: literal.range,
+            },
+            lir::Expr::Unit { range } => tir::Expr {
+                kind: tir::ExprKind::Unit,
+                ty: self.unit_type(),
+                range: *range,
+            },
+            lir::Expr::Tuple { elements, range } => {
+                let typed_elements = elements
+                    .iter()
+                    .map(|element| self.infer_expr(element, locals))
+                    .collect::<Vec<_>>();
+                let element_types = typed_elements
+                    .iter()
+                    .map(|element| element.ty)
+                    .collect::<Vec<_>>();
+                let tuple_ty = self.store.mk_tuple(&element_types);
+
+                tir::Expr {
+                    kind: tir::ExprKind::Tuple {
+                        elements: typed_elements,
+                    },
+                    ty: tuple_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Array { elements, range } => {
+                let element_ty = self.fresh_type_meta();
+                let array_ty = self.array_type(element_ty);
+                let mut typed_elements = Vec::with_capacity(elements.len());
+
+                for element in elements {
+                    match element {
+                        lir::ArrayElement::Item(item) => {
+                            let typed_item = self.infer_expr(item, locals);
+                            self.constrain_types(expr_range(item), typed_item.ty, element_ty);
+                            typed_elements.push(tir::ArrayElement::Item(typed_item));
+                        }
+                        lir::ArrayElement::Spread { expr, range } => {
+                            let typed_expr = self.infer_expr(expr, locals);
+                            self.constrain_types(*range, typed_expr.ty, array_ty);
+                            typed_elements.push(tir::ArrayElement::Spread {
+                                expr: typed_expr,
+                                range: *range,
+                            });
+                        }
+                    }
+                }
+
+                tir::Expr {
+                    kind: tir::ExprKind::Array {
+                        elements: typed_elements,
+                    },
+                    ty: array_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Record { fields, range } => {
+                self.error(
+                    *range,
+                    "record expressions are not yet supported by the HM checker",
+                );
+
+                let mut typed_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let typed_value = self.infer_expr(&field.value, locals);
+                    typed_fields.push(tir::RecordField {
+                        name: field.name.clone(),
+                        separator: field.separator,
+                        value: typed_value,
+                        range: field.range,
+                    });
+                }
+
+                tir::Expr {
+                    kind: tir::ExprKind::Record {
+                        fields: typed_fields,
+                    },
+                    ty: self.error_type(),
+                    range: *range,
+                }
+            }
+            lir::Expr::InlineWasm {
+                result_type,
+                locals: wasm_locals,
+                instructions,
+                range,
+            } => {
+                let mut type_env = TypeExprEnv::default();
+                let result_ty = self.lower_type_expr(result_type, &mut type_env);
+                self.expect_type_kind(type_expr_range(result_type), result_ty);
+
+                tir::Expr {
+                    kind: tir::ExprKind::InlineWasm {
+                        result_type: result_ty,
+                        locals: wasm_locals.clone(),
+                        instructions: instructions.clone(),
+                    },
+                    ty: result_ty,
+                    range: *range,
+                }
+            }
+            lir::Expr::Error(error) => tir::Expr {
+                kind: tir::ExprKind::Error(error.clone()),
+                ty: self.error_type(),
+                range: error.range,
+            },
+        }
+    }
+
+    fn check_pattern(
+        &mut self,
+        pattern: &lir::Pattern,
+        expected: TypeId,
+        locals: &LocalEnv,
+        prebound: &HashMap<BinderKey, TypeId>,
+    ) -> (tir::Pattern, Vec<BoundVar>) {
+        match pattern {
+            lir::Pattern::Constructor {
+                constructor,
+                argument,
+                range,
+            } => {
+                let ctor_ty = self.instantiate_constructor(constructor);
+                let argument_ty = self.fresh_type_meta();
+                let result_ty = self.fresh_type_meta();
+                let expected_ctor_ty = self.store.mk_arrow(argument_ty, result_ty);
+                self.constrain_types(*range, ctor_ty, expected_ctor_ty);
+                self.constrain_types(*range, expected, result_ty);
+
+                let (typed_argument, bound) =
+                    self.check_pattern(argument, argument_ty, locals, prebound);
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Constructor {
+                            constructor: constructor.clone(),
+                            argument: Box::new(typed_argument),
+                        },
+                        ty: expected,
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::ConstructorName { constructor, range } => {
+                let ctor_ty = self.instantiate_constructor(constructor);
+                self.constrain_types(*range, expected, ctor_ty);
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::ConstructorName {
+                            constructor: constructor.clone(),
+                        },
+                        ty: expected,
+                        range: *range,
+                    },
+                    Vec::new(),
+                )
+            }
+            lir::Pattern::Binding { name, range } => {
+                let key = binder_key_from_name(name);
+                let mut bound = Vec::new();
+
+                if let Some(key) = key {
+                    let binding_ty = if let Some(prebound_ty) = prebound.get(&key) {
+                        self.constrain_types(*range, *prebound_ty, expected);
+                        *prebound_ty
+                    } else {
+                        expected
+                    };
+
+                    bound.push(BoundVar {
+                        key,
+                        ty: binding_ty,
+                        range: *range,
+                    });
+                } else if let lir::ResolvedName::Error { name, .. } = name {
+                    self.error(*range, format!("failed to type-check binding `{name}`"));
+                }
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Binding { name: name.clone() },
+                        ty: expected,
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::Hole { range } => (
+                tir::Pattern {
+                    kind: tir::PatternKind::Hole,
+                    ty: expected,
+                    range: *range,
+                },
+                Vec::new(),
+            ),
+            lir::Pattern::Annotated { pattern, ty, range } => {
+                let mut type_env = TypeExprEnv::default();
+                let annotation = self.lower_type_expr(ty, &mut type_env);
+                self.expect_type_kind(type_expr_range(ty), annotation);
+                self.constrain_types(*range, expected, annotation);
+
+                let (typed_pattern, bound) =
+                    self.check_pattern(pattern, annotation, locals, prebound);
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Annotated {
+                            pattern: Box::new(typed_pattern),
+                            annotation,
+                        },
+                        ty: expected,
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::Literal(literal) => {
+                let literal_ty = self.literal_type(literal);
+                self.constrain_types(literal.range, expected, literal_ty);
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Literal(literal.clone()),
+                        ty: expected,
+                        range: literal.range,
+                    },
+                    Vec::new(),
+                )
+            }
+            lir::Pattern::Tuple { elements, range } => {
+                let mut element_types = Vec::with_capacity(elements.len());
+                for _ in elements {
+                    element_types.push(self.fresh_type_meta());
+                }
+
+                let tuple_ty = self.store.mk_tuple(&element_types);
+                self.constrain_types(*range, expected, tuple_ty);
+
+                let mut typed_elements = Vec::with_capacity(elements.len());
+                let mut bound = Vec::new();
+                for (element, element_ty) in elements.iter().zip(element_types.into_iter()) {
+                    let (typed_element, mut element_bound) =
+                        self.check_pattern(element, element_ty, locals, prebound);
+                    typed_elements.push(typed_element);
+                    bound.append(&mut element_bound);
+                }
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Tuple {
+                            elements: typed_elements,
+                        },
+                        ty: expected,
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::Array { elements, range } => {
+                let element_ty = self.fresh_type_meta();
+                let array_ty = self.array_type(element_ty);
+                self.constrain_types(*range, expected, array_ty);
+
+                let mut typed_elements = Vec::with_capacity(elements.len());
+                let mut bound = Vec::new();
+
+                for element in elements {
+                    match element {
+                        lir::ArrayPatternElement::Item(item) => {
+                            let (typed_item, mut item_bound) =
+                                self.check_pattern(item, element_ty, locals, prebound);
+                            typed_elements.push(tir::ArrayPatternElement::Item(typed_item));
+                            bound.append(&mut item_bound);
+                        }
+                        lir::ArrayPatternElement::Rest { binding, range } => {
+                            let mut typed_binding = None;
+
+                            if let Some(binding_name) = binding {
+                                if let Some(key) = binder_key_from_name(binding_name) {
+                                    let binding_ty = if let Some(prebound_ty) = prebound.get(&key) {
+                                        self.constrain_types(*range, *prebound_ty, array_ty);
+                                        *prebound_ty
+                                    } else {
+                                        array_ty
+                                    };
+
+                                    bound.push(BoundVar {
+                                        key,
+                                        ty: binding_ty,
+                                        range: *range,
+                                    });
+                                    typed_binding = Some(binding_name.clone());
+                                }
+                            }
+
+                            typed_elements.push(tir::ArrayPatternElement::Rest {
+                                binding: typed_binding,
+                                range: *range,
+                            });
+                        }
+                    }
+                }
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Array {
+                            elements: typed_elements,
+                        },
+                        ty: expected,
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::Record { fields, range } => {
+                self.error(
+                    *range,
+                    "record patterns are not yet supported by the HM checker",
+                );
+                let mut typed_fields = Vec::with_capacity(fields.len());
+                let mut bound = Vec::new();
+
+                for field in fields {
+                    let typed_value = if let Some(value) = &field.value {
+                        let value_ty = self.fresh_type_meta();
+                        let (typed_value, mut value_bound) =
+                            self.check_pattern(value, value_ty, locals, prebound);
+                        bound.append(&mut value_bound);
+                        Some(typed_value)
+                    } else {
+                        None
+                    };
+
+                    typed_fields.push(tir::RecordPatternField {
+                        name: field.name.clone(),
+                        value: typed_value,
+                        range: field.range,
+                    });
+                }
+
+                (
+                    tir::Pattern {
+                        kind: tir::PatternKind::Record {
+                            fields: typed_fields,
+                        },
+                        ty: self.error_type(),
+                        range: *range,
+                    },
+                    bound,
+                )
+            }
+            lir::Pattern::Error(error) => (
+                tir::Pattern {
+                    kind: tir::PatternKind::Error(error.clone()),
+                    ty: self.error_type(),
+                    range: error.range,
+                },
+                Vec::new(),
+            ),
+        }
+    }
+
+    fn instantiate_name(&mut self, name: &lir::ResolvedName, locals: &LocalEnv) -> TypeId {
+        match name {
+            lir::ResolvedName::Local { id, name, range } => {
+                if let Some(scheme) = locals.terms.get(id).cloned() {
+                    self.instantiate_scheme(&scheme)
+                } else {
+                    self.error(*range, format!("unbound local name `{name}`"));
+                    self.error_type()
+                }
+            }
+            lir::ResolvedName::Global(path) => {
+                let key = path.text();
+                if let Some(scheme) = self.global_terms.get(&key).cloned() {
+                    self.instantiate_scheme(&scheme)
+                } else {
+                    self.error(path.range, format!("unbound global name `{key}`"));
+                    self.error_type()
+                }
+            }
+            lir::ResolvedName::Error { name, range } => {
+                self.error(*range, format!("failed to resolve name `{name}`"));
+                self.error_type()
+            }
+        }
+    }
+
+    fn instantiate_constructor(&mut self, constructor: &lir::QualifiedName) -> TypeId {
+        let key = constructor.text();
+        if let Some(scheme) = self.global_terms.get(&key).cloned() {
+            self.instantiate_scheme(&scheme)
+        } else {
+            self.error(
+                constructor.range,
+                format!("unknown constructor `{key}` in pattern"),
+            );
+            self.error_type()
+        }
+    }
+
+    fn instantiate_scheme(&mut self, scheme: &TypeScheme) -> TypeId {
+        if scheme.binders.is_empty() {
+            return scheme.body;
+        }
+
+        let mut substitution = HashMap::with_capacity(scheme.binders.len());
+        for binder in &scheme.binders {
+            let kind = self.table.zonk_kind(&mut self.store, binder.kind);
+            let (_, meta) = self.table.fresh_type_var(&mut self.store, kind);
+            substitution.insert(binder.id, meta);
+        }
+
+        self.substitute_rigid_type(scheme.body, &substitution)
+    }
+
+    fn substitute_rigid_type(
+        &mut self,
+        ty: TypeId,
+        substitution: &HashMap<TypeBinderId, TypeId>,
+    ) -> TypeId {
+        let resolved = self.table.shallow_resolve_type(&self.store, ty);
+        let ty_data = self.store.get_type(resolved).clone();
+
+        match ty_data.kind {
+            TypeKind::RigidTypeVariable(id) => substitution.get(&id).copied().unwrap_or(resolved),
+            TypeKind::MetaTypeVariable(_) | TypeKind::Constructor(_) | TypeKind::Error => resolved,
+            TypeKind::Application(func, arg) => {
+                let sub_func = self.substitute_rigid_type(func, substitution);
+                let sub_arg = self.substitute_rigid_type(arg, substitution);
+                let sub_kind = self.table.zonk_kind(&mut self.store, ty_data.kind_id);
+                if sub_func == func && sub_arg == arg {
+                    resolved
+                } else {
+                    self.store.mk_application(sub_func, sub_arg, sub_kind)
+                }
+            }
+            TypeKind::Forall(binders, predicates, body) => {
+                let mut inner_substitution = substitution.clone();
+                for binder in &binders {
+                    inner_substitution.remove(&binder.id);
+                }
+
+                let sub_body = self.substitute_rigid_type(body, &inner_substitution);
+                let sub_predicates = predicates
+                    .iter()
+                    .map(|predicate| crate::ty::TraitPredicate {
+                        trait_ref: predicate.trait_ref.clone(),
+                        arguments: predicate
+                            .arguments
+                            .iter()
+                            .map(|&argument| {
+                                self.substitute_rigid_type(argument, &inner_substitution)
+                            })
+                            .collect(),
+                        range: predicate.range,
+                    })
+                    .collect::<Vec<_>>();
+
+                if sub_body == body && sub_predicates == predicates {
+                    resolved
+                } else {
+                    self.store.mk_forall(binders, sub_predicates, sub_body)
+                }
+            }
+        }
+    }
+
+    fn generalize_type(&mut self, ty: TypeId, threshold: usize, range: TextRange) -> TypeScheme {
+        let zonked_ty = self.table.zonk_type(&mut self.store, ty);
+        let mut vars = HashSet::new();
+        self.collect_unsolved_metas(zonked_ty, &mut vars);
+
+        let mut vars = vars
+            .into_iter()
+            .filter(|var| (var.0 as usize) >= threshold)
+            .collect::<Vec<_>>();
+        vars.sort_by_key(|var| var.0);
+
+        let mut binders = Vec::with_capacity(vars.len());
+        let mut substitution = HashMap::with_capacity(vars.len());
+
+        for var in vars {
+            if self.table.probe_type_var(var).is_some() {
+                continue;
+            }
+
+            let kind = self
+                .table
+                .zonk_kind(&mut self.store, self.table.type_var_kind(var));
+            let binder_id = self.fresh_type_binder_id();
+            binders.push(TypeBinder {
+                id: binder_id,
+                name: format!("t{}", binder_id.0),
+                kind,
+                range,
+            });
+            substitution.insert(var, self.store.mk_rigid(binder_id, kind));
+        }
+
+        let body = self.substitute_meta_type(zonked_ty, &substitution);
+
+        TypeScheme {
+            binders,
+            predicates: Vec::new(),
+            body,
+            range,
+        }
+    }
+
+    fn collect_unsolved_metas(&self, ty: TypeId, vars: &mut HashSet<MetaTypeVariableId>) {
+        let resolved = self.table.shallow_resolve_type(&self.store, ty);
+        match &self.store.get_type(resolved).kind {
+            TypeKind::MetaTypeVariable(var) => {
+                if self.table.probe_type_var(*var).is_none() {
+                    vars.insert(*var);
+                }
+            }
+            TypeKind::Application(func, arg) => {
+                self.collect_unsolved_metas(*func, vars);
+                self.collect_unsolved_metas(*arg, vars);
+            }
+            TypeKind::Forall(_, predicates, body) => {
+                self.collect_unsolved_metas(*body, vars);
+                for predicate in predicates {
+                    for argument in &predicate.arguments {
+                        self.collect_unsolved_metas(*argument, vars);
+                    }
+                }
+            }
+            TypeKind::Constructor(_) | TypeKind::RigidTypeVariable(_) | TypeKind::Error => {}
+        }
+    }
+
+    fn substitute_meta_type(
+        &mut self,
+        ty: TypeId,
+        substitution: &HashMap<MetaTypeVariableId, TypeId>,
+    ) -> TypeId {
+        let resolved = self.table.shallow_resolve_type(&self.store, ty);
+        let ty_data = self.store.get_type(resolved).clone();
+
+        match ty_data.kind {
+            TypeKind::MetaTypeVariable(var) => substitution.get(&var).copied().unwrap_or(resolved),
+            TypeKind::Constructor(_) | TypeKind::RigidTypeVariable(_) | TypeKind::Error => resolved,
+            TypeKind::Application(func, arg) => {
+                let sub_func = self.substitute_meta_type(func, substitution);
+                let sub_arg = self.substitute_meta_type(arg, substitution);
+                if sub_func == func && sub_arg == arg {
+                    resolved
+                } else {
+                    let sub_kind = self.table.zonk_kind(&mut self.store, ty_data.kind_id);
+                    self.store.mk_application(sub_func, sub_arg, sub_kind)
+                }
+            }
+            TypeKind::Forall(binders, predicates, body) => {
+                let sub_body = self.substitute_meta_type(body, substitution);
+                let sub_predicates = predicates
+                    .iter()
+                    .map(|predicate| crate::ty::TraitPredicate {
+                        trait_ref: predicate.trait_ref.clone(),
+                        arguments: predicate
+                            .arguments
+                            .iter()
+                            .map(|&argument| self.substitute_meta_type(argument, substitution))
+                            .collect(),
+                        range: predicate.range,
+                    })
+                    .collect::<Vec<_>>();
+
+                if sub_body == body && sub_predicates == predicates {
+                    resolved
+                } else {
+                    self.store.mk_forall(binders, sub_predicates, sub_body)
+                }
+            }
+        }
+    }
+
+    fn lower_type_expr(&mut self, type_expr: &lir::TypeExpr, env: &mut TypeExprEnv) -> TypeId {
+        match type_expr {
+            lir::TypeExpr::Forall {
+                params,
+                body,
+                constraints,
+                range,
+            } => {
+                let mut added_ids = Vec::with_capacity(params.len());
+                let mut binders = Vec::with_capacity(params.len());
+
+                for param in params {
+                    let kind = self.store.kind_type();
+                    let binder_id = self.fresh_type_binder_id();
+                    let binder = TypeBinder {
+                        id: binder_id,
+                        name: param.name.clone(),
+                        kind,
+                        range: param.range,
+                    };
+                    let rigid = self.store.mk_rigid(binder_id, kind);
+                    env.locals.insert(param.id, rigid);
+                    added_ids.push(param.id);
+                    binders.push(binder);
+                }
+
+                let body_ty = self.lower_type_expr(body, env);
+                self.expect_type_kind(type_expr_range(body), body_ty);
+
+                let predicates = constraints
+                    .iter()
+                    .map(|constraint| crate::ty::TraitPredicate {
+                        trait_ref: constraint.trait_ref.clone(),
+                        arguments: constraint
+                            .args
+                            .iter()
+                            .map(|argument| self.lower_type_expr(argument, env))
+                            .collect(),
+                        range: constraint.range,
+                    })
+                    .collect::<Vec<_>>();
+
+                for id in added_ids {
+                    env.locals.remove(&id);
+                }
+
+                let ty = self.store.mk_forall(binders, predicates, body_ty);
+                self.expect_type_kind(*range, ty);
+                ty
+            }
+            lir::TypeExpr::Function {
+                param,
+                result,
+                range,
+            } => {
+                let param_ty = self.lower_type_expr(param, env);
+                let result_ty = self.lower_type_expr(result, env);
+                self.expect_type_kind(type_expr_range(param), param_ty);
+                self.expect_type_kind(type_expr_range(result), result_ty);
+                let fn_ty = self.store.mk_arrow(param_ty, result_ty);
+                self.expect_type_kind(*range, fn_ty);
+                fn_ty
+            }
+            lir::TypeExpr::Apply {
+                callee,
+                argument,
+                range,
+            } => {
+                let callee_ty = self.lower_type_expr(callee, env);
+                let argument_ty = self.lower_type_expr(argument, env);
+                let (_, result_kind) = self.table.fresh_kind_var(&mut self.store);
+
+                let argument_kind = self.store.get_type(argument_ty).kind_id;
+                let expected_callee_kind = self.store.kind_arrow(argument_kind, result_kind);
+                let callee_kind = self.store.get_type(callee_ty).kind_id;
+                self.constrain_kinds(*range, callee_kind, expected_callee_kind);
+
+                self.store
+                    .mk_application(callee_ty, argument_ty, result_kind)
+            }
+            lir::TypeExpr::Name { name } => self.lower_type_name(name, env),
+            lir::TypeExpr::Hole { .. } => self.fresh_type_meta(),
+            lir::TypeExpr::Tuple { elements, .. } => {
+                let element_tys = elements
+                    .iter()
+                    .map(|element| {
+                        let element_ty = self.lower_type_expr(element, env);
+                        self.expect_type_kind(type_expr_range(element), element_ty);
+                        element_ty
+                    })
+                    .collect::<Vec<_>>();
+                self.store.mk_tuple(&element_tys)
+            }
+            lir::TypeExpr::Unit { .. } => self.unit_type(),
+            lir::TypeExpr::Array { .. } => self.array_constructor_type(),
+            lir::TypeExpr::Error(_) => self.error_type(),
+        }
+    }
+
+    fn lower_type_name(&mut self, name: &lir::ResolvedName, env: &TypeExprEnv) -> TypeId {
+        match name {
+            lir::ResolvedName::Local { id, name, range } => {
+                if let Some(ty) = env.locals.get(id).copied() {
+                    ty
+                } else {
+                    self.error(*range, format!("unknown type parameter `{name}`"));
+                    self.error_type()
+                }
+            }
+            lir::ResolvedName::Global(path) => {
+                self.ensure_named_type_constructor(path, None, path.range)
+            }
+            lir::ResolvedName::Error { name, range } => {
+                self.error(*range, format!("failed to resolve type name `{name}`"));
+                self.error_type()
+            }
+        }
+    }
+
+    fn ensure_named_type_constructor(
+        &mut self,
+        path: &lir::QualifiedName,
+        expected_arity: Option<usize>,
+        range: TextRange,
+    ) -> TypeId {
+        let key = path.text();
+        if let Some(existing) = self.named_type_constructors.get(&key).copied() {
+            if let Some(arity) = expected_arity {
+                let expected_kind = self.kind_for_arity(arity);
+                let existing_kind = self.store.get_type(existing).kind_id;
+                self.constrain_kinds(range, existing_kind, expected_kind);
+            }
+            return existing;
+        }
+
+        let kind = if let Some(arity) = expected_arity {
+            self.kind_for_arity(arity)
+        } else {
+            let (_, kind_var) = self.table.fresh_kind_var(&mut self.store);
+            kind_var
+        };
+
+        let ty = self
+            .store
+            .mk_constructor(TypeConstructor::Named(path.clone()), kind);
+        self.named_type_constructors.insert(key, ty);
+        ty
+    }
+
+    fn kind_for_arity(&mut self, arity: usize) -> KindId {
+        let kind_type = self.store.kind_type();
+        let mut kind = kind_type;
+        for _ in 0..arity {
+            kind = self.store.kind_arrow(kind_type, kind);
+        }
+        kind
+    }
+
+    fn prebind_keys(
+        &mut self,
+        locals: &mut LocalEnv,
+        keys: &[(BinderKey, TextRange)],
+    ) -> HashMap<BinderKey, TypeId> {
+        let mut seen = HashSet::new();
+        let mut map = HashMap::new();
+
+        for (key, range) in keys {
+            if !seen.insert(key.clone()) {
+                self.error(*range, "duplicate binding in pattern");
+                continue;
+            }
+
+            let ty = self.fresh_type_meta();
+            let scheme = self.mono_scheme(ty, *range);
+            self.insert_scheme_for_key(locals, key, scheme, *range);
+            map.insert(key.clone(), ty);
+        }
+
+        map
+    }
+
+    fn insert_scheme_for_key(
+        &mut self,
+        locals: &mut LocalEnv,
+        key: &BinderKey,
+        scheme: TypeScheme,
+        range: TextRange,
+    ) {
+        match key {
+            BinderKey::Local(id) => {
+                locals.terms.insert(*id, scheme);
+            }
+            BinderKey::Global(name) => {
+                if name.is_empty() {
+                    self.error(range, "cannot bind unnamed global term");
+                    return;
+                }
+                self.global_terms.insert(name.clone(), scheme);
+            }
+        }
+    }
+
+    fn constrain_types(&mut self, range: TextRange, expected: TypeId, found: TypeId) {
+        if let Err(error) = self.table.unify_types(&self.store, expected, found) {
+            self.error(range, self.unification_message(error));
+        }
+    }
+
+    fn constrain_kinds(&mut self, range: TextRange, expected: KindId, found: KindId) {
+        if let Err(error) = self.table.unify_kinds(&self.store, expected, found) {
+            self.error(range, self.unification_message(error));
+        }
+    }
+
+    fn expect_type_kind(&mut self, range: TextRange, ty: TypeId) {
+        let kind = self.store.get_type(ty).kind_id;
+        let type_kind = self.store.kind_type();
+        self.constrain_kinds(range, kind, type_kind);
+    }
+
+    fn unification_message(&self, error: UnificationError) -> String {
+        match error {
+            UnificationError::TypeMismatch { .. } => "type mismatch".to_owned(),
+            UnificationError::KindMismatch { .. } => "kind mismatch".to_owned(),
+            UnificationError::OccursCheck { .. } => "infinite type detected".to_owned(),
+            UnificationError::KindOccursCheck { .. } => "infinite kind detected".to_owned(),
+        }
+    }
+
+    fn literal_type(&mut self, literal: &lir::Literal) -> TypeId {
+        let k = self.store.kind_type();
+        let ctor = match literal.value {
+            lir::LiteralValue::Integer(_) => TypeConstructor::Integer,
+            lir::LiteralValue::Natural(_) => TypeConstructor::Natural,
+            lir::LiteralValue::Real(_) => TypeConstructor::Real,
+            lir::LiteralValue::String(_) | lir::LiteralValue::FormatString(_) => {
+                TypeConstructor::String
+            }
+            lir::LiteralValue::Glyph(_) => TypeConstructor::Glyph,
+            lir::LiteralValue::Bool(_) => TypeConstructor::Bool,
+        };
+        self.store.mk_constructor(ctor, k)
+    }
+
+    fn unit_type(&mut self) -> TypeId {
+        let k = self.store.kind_type();
+        self.store.mk_constructor(TypeConstructor::UNIT, k)
+    }
+
+    fn bool_type(&mut self) -> TypeId {
+        let k = self.store.kind_type();
+        self.store.mk_constructor(TypeConstructor::Bool, k)
+    }
+
+    fn array_constructor_type(&mut self) -> TypeId {
+        let kind = self.kind_for_arity(1);
+        self.store.mk_constructor(TypeConstructor::Array, kind)
+    }
+
+    fn array_type(&mut self, element_ty: TypeId) -> TypeId {
+        let result_kind = self.store.kind_type();
+        let ctor = self.array_constructor_type();
+        self.store.mk_application(ctor, element_ty, result_kind)
+    }
+
+    fn fresh_type_meta(&mut self) -> TypeId {
+        let kind = self.store.kind_type();
+        let (_, ty) = self.table.fresh_type_var(&mut self.store, kind);
+        ty
+    }
+
+    fn fresh_type_binder_id(&mut self) -> TypeBinderId {
+        let id = TypeBinderId(self.next_type_binder);
+        self.next_type_binder = self.next_type_binder.saturating_add(1);
+        id
+    }
+
+    fn error_type(&mut self) -> TypeId {
+        self.store.mk_error()
+    }
+
+    fn mono_scheme(&self, ty: TypeId, range: TextRange) -> TypeScheme {
+        TypeScheme {
+            binders: Vec::new(),
+            predicates: Vec::new(),
+            body: ty,
+            range,
+        }
+    }
+
+    fn error(&mut self, range: TextRange, message: impl Into<String>) {
+        self.diagnostics.push(Diagnostic::error(range, message));
+    }
+
+    fn zonk_source(&mut self, source: &mut tir::Source) {
+        for module in &mut source.modules {
+            for statement in &mut module.statements {
+                self.zonk_statement(statement);
+            }
+        }
+    }
+
+    fn zonk_statement(&mut self, statement: &mut tir::Statement) {
+        match statement {
+            tir::Statement::Let { kind, .. } => match kind {
+                tir::LetStatementKind::PatternBinding { pattern, value } => {
+                    self.zonk_pattern(pattern);
+                    self.zonk_expr(value);
+                }
+                tir::LetStatementKind::ConstructorAlias { .. } => {}
+            },
+            tir::Statement::ModuleDecl { .. }
+            | tir::Statement::Type { .. }
+            | tir::Statement::Trait { .. }
+            | tir::Statement::TraitAlias { .. }
+            | tir::Statement::Impl { .. }
+            | tir::Statement::Wasm { .. }
+            | tir::Statement::Error(_) => {}
+        }
+    }
+
+    fn zonk_expr(&mut self, expr: &mut tir::Expr) {
+        expr.ty = self.table.zonk_type(&mut self.store, expr.ty);
+        match &mut expr.kind {
+            tir::ExprKind::Let {
+                pattern,
+                value,
+                body,
+            } => {
+                self.zonk_pattern(pattern);
+                self.zonk_expr(value);
+                self.zonk_expr(body);
+            }
+            tir::ExprKind::Function { params, body } => {
+                for param in params {
+                    self.zonk_pattern(param);
+                }
+                self.zonk_expr(body);
+            }
+            tir::ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.zonk_expr(condition);
+                self.zonk_expr(then_branch);
+                self.zonk_expr(else_branch);
+            }
+            tir::ExprKind::Match { scrutinee, arms } => {
+                self.zonk_expr(scrutinee);
+                for arm in arms {
+                    self.zonk_pattern(&mut arm.pattern);
+                    self.zonk_expr(&mut arm.body);
+                }
+            }
+            tir::ExprKind::Apply { callee, argument } => {
+                self.zonk_expr(callee);
+                self.zonk_expr(argument);
+            }
+            tir::ExprKind::FieldAccess { expr, .. } => {
+                self.zonk_expr(expr);
+            }
+            tir::ExprKind::Tuple { elements } => {
+                for element in elements {
+                    self.zonk_expr(element);
+                }
+            }
+            tir::ExprKind::Array { elements } => {
+                for element in elements {
+                    match element {
+                        tir::ArrayElement::Item(item) => self.zonk_expr(item),
+                        tir::ArrayElement::Spread { expr, .. } => self.zonk_expr(expr),
+                    }
+                }
+            }
+            tir::ExprKind::Record { fields } => {
+                for field in fields {
+                    self.zonk_expr(&mut field.value);
+                }
+            }
+            tir::ExprKind::InlineWasm { result_type, .. } => {
+                *result_type = self.table.zonk_type(&mut self.store, *result_type);
+            }
+            tir::ExprKind::Name(_)
+            | tir::ExprKind::Literal(_)
+            | tir::ExprKind::Unit
+            | tir::ExprKind::Error(_) => {}
+        }
+    }
+
+    fn zonk_pattern(&mut self, pattern: &mut tir::Pattern) {
+        pattern.ty = self.table.zonk_type(&mut self.store, pattern.ty);
+        match &mut pattern.kind {
+            tir::PatternKind::Constructor { argument, .. } => self.zonk_pattern(argument),
+            tir::PatternKind::Annotated {
+                pattern,
+                annotation,
+            } => {
+                self.zonk_pattern(pattern);
+                *annotation = self.table.zonk_type(&mut self.store, *annotation);
+            }
+            tir::PatternKind::Tuple { elements } => {
+                for element in elements {
+                    self.zonk_pattern(element);
+                }
+            }
+            tir::PatternKind::Array { elements } => {
+                for element in elements {
+                    if let tir::ArrayPatternElement::Item(item) = element {
+                        self.zonk_pattern(item);
+                    }
+                }
+            }
+            tir::PatternKind::Record { fields } => {
+                for field in fields {
+                    if let Some(value) = &mut field.value {
+                        self.zonk_pattern(value);
+                    }
+                }
+            }
+            tir::PatternKind::ConstructorName { .. }
+            | tir::PatternKind::Binding { .. }
+            | tir::PatternKind::Hole
+            | tir::PatternKind::Literal(_)
+            | tir::PatternKind::Error(_) => {}
+        }
+    }
+}
+
+fn collect_pattern_binders(pattern: &lir::Pattern) -> Vec<(BinderKey, TextRange)> {
+    let mut binders = Vec::new();
+    collect_pattern_binders_into(pattern, &mut binders);
+    binders
+}
+
+fn collect_pattern_binders_into(pattern: &lir::Pattern, binders: &mut Vec<(BinderKey, TextRange)>) {
+    match pattern {
+        lir::Pattern::Constructor { argument, .. } => {
+            collect_pattern_binders_into(argument, binders);
+        }
+        lir::Pattern::ConstructorName { .. }
+        | lir::Pattern::Literal(_)
+        | lir::Pattern::Hole { .. } => {}
+        lir::Pattern::Binding { name, range } => {
+            if let Some(key) = binder_key_from_name(name) {
+                binders.push((key, *range));
+            }
+        }
+        lir::Pattern::Annotated { pattern, .. } => {
+            collect_pattern_binders_into(pattern, binders);
+        }
+        lir::Pattern::Tuple { elements, .. } => {
+            for element in elements {
+                collect_pattern_binders_into(element, binders);
+            }
+        }
+        lir::Pattern::Array { elements, .. } => {
+            for element in elements {
+                match element {
+                    lir::ArrayPatternElement::Item(item) => {
+                        collect_pattern_binders_into(item, binders);
+                    }
+                    lir::ArrayPatternElement::Rest { binding, range } => {
+                        if let Some(binding) = binding
+                            && let Some(key) = binder_key_from_name(binding)
+                        {
+                            binders.push((key, *range));
+                        }
+                    }
+                }
+            }
+        }
+        lir::Pattern::Record { fields, .. } => {
+            for field in fields {
+                if let Some(value) = &field.value {
+                    collect_pattern_binders_into(value, binders);
+                }
+            }
+        }
+        lir::Pattern::Error(_) => {}
+    }
+}
+
+fn binder_key_from_name(name: &lir::ResolvedName) -> Option<BinderKey> {
+    match name {
+        lir::ResolvedName::Local { id, .. } => Some(BinderKey::Local(*id)),
+        lir::ResolvedName::Global(path) => Some(BinderKey::Global(path.text())),
+        lir::ResolvedName::Error { .. } => None,
+    }
+}
+
+fn resolved_name_range(name: &lir::ResolvedName) -> TextRange {
+    match name {
+        lir::ResolvedName::Global(path) => path.range,
+        lir::ResolvedName::Local { range, .. } | lir::ResolvedName::Error { range, .. } => *range,
+    }
+}
+
+fn expr_range(expr: &lir::Expr) -> TextRange {
+    match expr {
+        lir::Expr::Let { range, .. }
+        | lir::Expr::Function { range, .. }
+        | lir::Expr::If { range, .. }
+        | lir::Expr::Match { range, .. }
+        | lir::Expr::Apply { range, .. }
+        | lir::Expr::FieldAccess { range, .. }
+        | lir::Expr::Unit { range }
+        | lir::Expr::Tuple { range, .. }
+        | lir::Expr::Array { range, .. }
+        | lir::Expr::Record { range, .. }
+        | lir::Expr::InlineWasm { range, .. } => *range,
+        lir::Expr::Name(name) => resolved_name_range(name),
+        lir::Expr::Literal(literal) => literal.range,
+        lir::Expr::Error(error) => error.range,
+    }
+}
+
+fn type_expr_range(type_expr: &lir::TypeExpr) -> TextRange {
+    match type_expr {
+        lir::TypeExpr::Forall { range, .. }
+        | lir::TypeExpr::Function { range, .. }
+        | lir::TypeExpr::Apply { range, .. }
+        | lir::TypeExpr::Hole { range }
+        | lir::TypeExpr::Tuple { range, .. }
+        | lir::TypeExpr::Unit { range }
+        | lir::TypeExpr::Array { range } => *range,
+        lir::TypeExpr::Name { name } => resolved_name_range(name),
+        lir::TypeExpr::Error(error) => error.range,
+    }
+}

@@ -1,3 +1,5 @@
+//! Allocation-backed storage for canonical types and kinds.
+
 use super::{
     Kind, KindId, MetaTypeVariableId, TraitPredicate, Type, TypeBinder, TypeBinderId,
     TypeConstructor, TypeId, TypeKind,
@@ -12,12 +14,16 @@ use crate::reporting::TextRange;
 /// and zonking produces fresh allocations.
 #[derive(Debug)]
 pub struct TypeStore {
+    /// Append-only arena of canonical type nodes.
     types: Vec<Type>,
+    /// Append-only arena of kind nodes.
     kinds: Vec<Kind>,
+    /// Cached id of the pre-allocated [`Kind::Type`] node.
     kind_type: KindId,
 }
 
 impl TypeStore {
+    /// Create an empty store and pre-allocate [`Kind::Type`].
     pub fn new() -> Self {
         let mut store = Self {
             types: Vec::new(),
@@ -30,30 +36,40 @@ impl TypeStore {
 
     // --- Raw allocation ---
 
+    /// Push a type node into the arena and return its stable id.
     pub fn alloc_type(&mut self, ty: Type) -> TypeId {
         let id = TypeId(self.types.len() as u32);
         self.types.push(ty);
         id
     }
 
+    /// Push a kind node into the arena and return its stable id.
     pub fn alloc_kind(&mut self, kind: Kind) -> KindId {
         let id = KindId(self.kinds.len() as u32);
         self.kinds.push(kind);
         id
     }
 
+    /// Borrow a type by id.
+    ///
+    /// Panics if `id` was not allocated by this store.
     pub fn get_type(&self, id: TypeId) -> &Type {
         &self.types[id.0 as usize]
     }
 
+    /// Borrow a kind by id.
+    ///
+    /// Panics if `id` was not allocated by this store.
     pub fn get_kind(&self, id: KindId) -> &Kind {
         &self.kinds[id.0 as usize]
     }
 
+    /// Total number of allocated type nodes.
     pub fn type_count(&self) -> usize {
         self.types.len()
     }
 
+    /// Total number of allocated kind nodes.
     pub fn kind_count(&self) -> usize {
         self.kinds.len()
     }
@@ -172,6 +188,7 @@ impl TypeStore {
 }
 
 impl Default for TypeStore {
+    /// Equivalent to [`TypeStore::new`].
     fn default() -> Self {
         Self::new()
     }

@@ -79,6 +79,11 @@ impl UnificationTable {
         self.kind_solutions[var.0 as usize]
     }
 
+    /// Number of allocated meta type variables.
+    pub fn type_var_count(&self) -> usize {
+        self.type_solutions.len()
+    }
+
     /// Get the kind of a meta type variable.
     pub fn type_var_kind(&self, var: MetaTypeVariableId) -> KindId {
         self.type_var_kinds[var.0 as usize]
@@ -126,6 +131,7 @@ impl UnificationTable {
     /// `Forall` types are never unified directly — the bidirectional checker
     /// handles them via subsumption (skolemization + instantiation). Attempting
     /// to unify two `Forall` types returns [`UnificationError::TypeMismatch`].
+    /// Expects `a` and `b` to have already successfully unified kinds.
     pub fn unify_types(
         &mut self,
         store: &TypeStore,
@@ -138,6 +144,10 @@ impl UnificationTable {
         if a == b {
             return Ok(());
         }
+
+        let a_ty_kind = store.get_type(a).kind_id;
+        let b_ty_kind = store.get_type(b).kind_id;
+        self.unify_kinds(store, a_ty_kind, b_ty_kind)?;
 
         let a_kind = store.get_type(a).kind.clone();
         let b_kind = store.get_type(b).kind.clone();
