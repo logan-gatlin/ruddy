@@ -364,6 +364,7 @@ pub enum Pattern {
     },
     Record {
         fields: Vec<RecordPatternField>,
+        open: bool,
         range: TextRange,
     },
     Error(ErrorNode),

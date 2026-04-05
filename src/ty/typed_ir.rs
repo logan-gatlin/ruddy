@@ -115,6 +115,7 @@ pub enum PatternKind {
     },
     Record {
         fields: Vec<RecordPatternField>,
+        open: bool,
     },
     Error(lir::ErrorNode),
 }

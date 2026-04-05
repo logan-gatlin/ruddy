@@ -7,10 +7,7 @@ mod resolver;
 pub mod ty;
 mod wasm;
 
-pub use check::{
-    CheckedSource, check_diagnostics, check_diagnostics_fs, check_lowered, check_text,
-    check_text_fs,
-};
+pub use check::{CheckedSource, check_diagnostics, check_lowered, check_text, check_text_fs};
 pub use engine::{Eng, Source};
 pub use lower::{lower_diagnostics, lower_diagnostics_fs, lower_source, lower_text, lower_text_fs};
 pub use parser::{

@@ -33,32 +33,30 @@ impl Resolver for TestResolver {
 }
 
 fn lowered_binding_expr_by_name<'a>(module: &'a LoweredModule, name: &'a str) -> Option<&'a Expr> {
-    module
-        .statements
-        .iter()
-        .find_map(|statement| {
-            let Statement::Let {
-                kind:
-                    LetStatementKind::PatternBinding {
-                        pattern: Pattern::Binding {
+    module.statements.iter().find_map(|statement| {
+        let Statement::Let {
+            kind:
+                LetStatementKind::PatternBinding {
+                    pattern:
+                        Pattern::Binding {
                             name: ResolvedName::Global(path),
                             ..
                         },
-                        value,
-                        ..
-                    },
-                ..
-            } = statement
-            else {
-                return None;
-            };
+                    value,
+                    ..
+                },
+            ..
+        } = statement
+        else {
+            return None;
+        };
 
-            if path.text() == name {
-                Some(value)
-            } else {
-                None
-            }
-        })
+        if path.text() == name {
+            Some(value)
+        } else {
+            None
+        }
+    })
 }
 
 fn expect_integer_literal(literal: &Literal, expected: i64) {
@@ -243,9 +241,11 @@ fn expr_use_does_not_leak_opened_modules() {
     }
 
     let diagnostics = lower_diagnostics::<TestResolver>(&db, source);
-    assert!(diagnostics
-        .iter()
-        .any(|diag| diag.message.contains("failed to resolve term name `value`")));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("failed to resolve term name `value`"))
+    );
 }
 
 #[test]
@@ -272,9 +272,11 @@ fn expr_use_alias_does_not_persist_to_statements() {
         .expect("missing root lowered module");
 
     let diagnostics = lower_diagnostics::<TestResolver>(&db, source);
-    assert!(diagnostics
-        .iter()
-        .all(|diag| !diag.message.contains("duplicate use alias `Alias`")));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diag| !diag.message.contains("duplicate use alias `Alias`"))
+    );
 
     let lowered_values: Vec<&Expr> = root
         .statements
@@ -885,12 +887,11 @@ fn lower_source_accumulator_does_not_duplicate_single_import_diagnostics() {
     );
 
     let resolver = super::resolver_registry::resolver_token::<TestResolver>(&db);
-    let diagnostics = super::query::lower_source::accumulated::<crate::reporting::Diag>(
-        &db, source, resolver,
-    )
-    .into_iter()
-    .map(|diag| diag.0.clone())
-    .collect::<Vec<_>>();
+    let diagnostics =
+        super::query::lower_source::accumulated::<crate::reporting::Diag>(&db, source, resolver)
+            .into_iter()
+            .map(|diag| diag.0.clone())
+            .collect::<Vec<_>>();
 
     let unresolved_count = diagnostics
         .iter()
@@ -1282,6 +1283,42 @@ fn underscore_pattern_lowers_to_hole_and_does_not_bind() {
         })
     ));
     assert!(!root.exports.terms.iter().any(|term| term.name == "_"));
+}
+
+#[test]
+fn record_pattern_open_marker_is_preserved() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "record_pattern_open.hc".to_owned(),
+        [
+            "bundle demo",
+            "let {x} = {x = 1}",
+            "let {x, ..} = {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let lowered = lower_text::<TestResolver>(&db, source);
+    let root = lowered
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing root lowered module");
+
+    let mut record_pattern_open_flags = Vec::new();
+    for statement in &root.statements {
+        if let Statement::Let {
+            kind: LetStatementKind::PatternBinding { pattern, .. },
+            ..
+        } = statement
+            && let Pattern::Record { open, .. } = pattern
+        {
+            record_pattern_open_flags.push(*open);
+        }
+    }
+
+    assert_eq!(record_pattern_open_flags, vec![false, true]);
 }
 
 #[test]

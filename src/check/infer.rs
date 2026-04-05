@@ -1,23 +1,41 @@
-use std::collections::{HashMap, HashSet};
+//! Internal HM inferencer/checker implementation.
+//!
+//! The checker consumes lowered IR (`crate::lower::ir`) and produces typed IR
+//! (`crate::ty::typed_ir`) by:
+//! - inferring expression and pattern types,
+//! - unifying constraints through [`super::UnificationTable`],
+//! - generalizing `let`-bound definitions into [`crate::ty::TypeScheme`], and
+//! - zonking solved meta-variables into stable output types.
+//!
+//! This first pass intentionally focuses on core HM inference.
+//! Trait solving and higher-ranked polymorphism are deferred for follow-up
+//! passes.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::lower::ir as lir;
 use crate::reporting::{Diagnostic, TextRange};
 use crate::ty::store::TypeStore;
 use crate::ty::typed_ir as tir;
 use crate::ty::{
-    KindId, MetaTypeVariableId, TypeBinder, TypeBinderId, TypeConstructor, TypeId, TypeKind,
-    TypeScheme,
+    KindId, MetaTypeVariableId, TraitPredicate, TypeBinder, TypeBinderId, TypeConstructor, TypeId,
+    TypeKind, TypeScheme,
 };
 
 use super::{UnificationError, UnificationTable};
 
+/// Full output of checking a lowered source.
 #[derive(Debug)]
 pub struct CheckResult {
+    /// Type-annotated IR after inference and zonking.
     pub source: tir::Source,
+    /// Diagnostics produced while checking.
     pub diagnostics: Vec<Diagnostic>,
+    /// Canonical type store backing all `TypeId`s in `source`.
     pub type_store: TypeStore,
 }
 
+/// Run HM checking over a lowered source graph.
 pub fn check_lowered_source(lowered: &lir::LoweredSource) -> CheckResult {
     Checker::new().check_source(lowered)
 }
@@ -49,7 +67,10 @@ struct Checker {
     store: TypeStore,
     table: UnificationTable,
     diagnostics: Vec<Diagnostic>,
+    deferred_predicates: Vec<TraitPredicate>,
     global_terms: HashMap<String, TypeScheme>,
+    alias_schemes: HashMap<String, TypeScheme>,
+    record_schemes: HashMap<String, TypeScheme>,
     named_type_constructors: HashMap<String, TypeId>,
     next_type_binder: u32,
 }
@@ -60,7 +81,10 @@ impl Checker {
             store: TypeStore::new(),
             table: UnificationTable::new(),
             diagnostics: Vec::new(),
+            deferred_predicates: Vec::new(),
             global_terms: HashMap::new(),
+            alias_schemes: HashMap::new(),
+            record_schemes: HashMap::new(),
             named_type_constructors: HashMap::new(),
             next_type_binder: 0,
         }
@@ -244,18 +268,72 @@ impl Checker {
             lir::TypeStatementKind::Alias { value } => {
                 let alias_ty = self.lower_type_expr(value, &mut type_env);
                 self.expect_type_kind(type_expr_range(value), alias_ty);
+
+                self.alias_schemes.insert(
+                    name.text(),
+                    TypeScheme {
+                        binders: scheme_binders,
+                        predicates: Vec::new(),
+                        body: alias_ty,
+                        range,
+                    },
+                );
             }
             lir::TypeStatementKind::Nominal { definition } => match definition {
                 lir::TypeDefinition::Struct { members, .. } => {
+                    let mut fields = BTreeMap::new();
+
                     for member in members {
                         match member {
-                            lir::RecordTypeMember::Field { ty, range, .. }
-                            | lir::RecordTypeMember::Spread { ty, range } => {
+                            lir::RecordTypeMember::Field { name, ty, range } => {
                                 let member_ty = self.lower_type_expr(ty, &mut type_env);
                                 self.expect_type_kind(*range, member_ty);
+
+                                let Some(name) = name.clone() else {
+                                    self.error(*range, "record field declaration is missing a name");
+                                    continue;
+                                };
+
+                                if let Some(existing) = fields.insert(name.clone(), member_ty) {
+                                    self.error(*range, format!("duplicate record field `{name}`"));
+                                    self.constrain_types(*range, existing, member_ty);
+                                }
+                            }
+                            lir::RecordTypeMember::Spread { ty, range } => {
+                                let spread_ty = self.lower_type_expr(ty, &mut type_env);
+                                self.expect_type_kind(*range, spread_ty);
+
+                                if let Some(spread_fields) =
+                                    self.collect_closed_record_fields(spread_ty, *range)
+                                {
+                                    for (name, member_ty) in spread_fields {
+                                        if let Some(existing) =
+                                            fields.insert(name.clone(), member_ty)
+                                        {
+                                            self.error(
+                                                *range,
+                                                format!(
+                                                    "record spread introduces duplicate field `{name}`"
+                                                ),
+                                            );
+                                            self.constrain_types(*range, existing, member_ty);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
+
+                    let record_ty = self.mk_closed_record_from_fields(&fields);
+                    self.record_schemes.insert(
+                        name.text(),
+                        TypeScheme {
+                            binders: scheme_binders.clone(),
+                            predicates: Vec::new(),
+                            body: record_ty,
+                            range,
+                        },
+                    );
                 }
                 lir::TypeDefinition::Sum { variants, .. } => {
                     for variant in variants {
@@ -380,6 +458,10 @@ impl Checker {
                     let param_ty = self.fresh_type_meta();
                     let (typed_param, bound_vars) =
                         self.check_pattern(param, param_ty, &function_locals, &HashMap::new());
+                    let parameter_ty = match &typed_param.kind {
+                        tir::PatternKind::Annotated { annotation, .. } => *annotation,
+                        _ => param_ty,
+                    };
                     for bound in bound_vars {
                         let scheme = self.mono_scheme(bound.ty, bound.range);
                         self.insert_scheme_for_key(
@@ -390,7 +472,7 @@ impl Checker {
                         );
                     }
                     typed_params.push(typed_param);
-                    parameter_types.push(param_ty);
+                    parameter_types.push(parameter_ty);
                 }
 
                 let typed_body = self.infer_expr(body, &mut function_locals);
@@ -489,10 +571,20 @@ impl Checker {
                 range,
             } => {
                 let typed_callee = self.infer_expr(callee, locals);
-                let typed_argument = self.infer_expr(argument, locals);
-                let result_ty = self.fresh_type_meta();
-                let expected_callee_ty = self.store.mk_arrow(typed_argument.ty, result_ty);
-                self.constrain_types(*range, typed_callee.ty, expected_callee_ty);
+                let opened_callee_ty =
+                    self.instantiate_outer_foralls_with_metas(typed_callee.ty, *range);
+
+                let (argument_ty, result_ty) =
+                    if let Some((argument_ty, result_ty)) = self.as_arrow_type(opened_callee_ty) {
+                        (argument_ty, result_ty)
+                    } else {
+                        let argument_ty = self.fresh_type_meta();
+                        let result_ty = self.fresh_type_meta();
+                        let expected_callee_ty = self.store.mk_arrow(argument_ty, result_ty);
+                        self.constrain_types(*range, opened_callee_ty, expected_callee_ty);
+                        (argument_ty, result_ty)
+                    };
+                let typed_argument = self.check_expr_against(argument, argument_ty, locals);
 
                 tir::Expr {
                     kind: tir::ExprKind::Apply {
@@ -505,18 +597,30 @@ impl Checker {
             }
             lir::Expr::FieldAccess { expr, field, range } => {
                 let typed_expr = self.infer_expr(expr, locals);
-                self.error(
-                    *range,
-                    "field access is not yet supported by the HM checker",
-                );
-                let ty = self.error_type();
+                let Some(field_name) = field.clone() else {
+                    self.error(*range, "field access is missing a field name");
+                    return tir::Expr {
+                        kind: tir::ExprKind::FieldAccess {
+                            expr: Box::new(typed_expr),
+                            field: field.clone(),
+                        },
+                        ty: self.error_type(),
+                        range: *range,
+                    };
+                };
+
+                let result_ty = self.fresh_type_meta();
+                let tail = self.fresh_row_meta();
+                let row = self.store.mk_row_extend(field_name, result_ty, tail);
+                let expected_record = self.store.mk_record(row);
+                self.constrain_types(*range, typed_expr.ty, expected_record);
 
                 tir::Expr {
                     kind: tir::ExprKind::FieldAccess {
                         expr: Box::new(typed_expr),
                         field: field.clone(),
                     },
-                    ty,
+                    ty: result_ty,
                     range: *range,
                 }
             }
@@ -589,14 +693,20 @@ impl Checker {
                 }
             }
             lir::Expr::Record { fields, range } => {
-                self.error(
-                    *range,
-                    "record expressions are not yet supported by the HM checker",
-                );
-
+                let mut field_types = BTreeMap::new();
                 let mut typed_fields = Vec::with_capacity(fields.len());
                 for field in fields {
                     let typed_value = self.infer_expr(&field.value, locals);
+
+                    if let Some(name) = field.name.clone() {
+                        if let Some(existing) = field_types.insert(name.clone(), typed_value.ty) {
+                            self.error(field.range, format!("duplicate record field `{name}`"));
+                            self.constrain_types(field.range, existing, typed_value.ty);
+                        }
+                    } else {
+                        self.error(field.range, "record field is missing a name");
+                    }
+
                     typed_fields.push(tir::RecordField {
                         name: field.name.clone(),
                         separator: field.separator,
@@ -609,7 +719,7 @@ impl Checker {
                     kind: tir::ExprKind::Record {
                         fields: typed_fields,
                     },
-                    ty: self.error_type(),
+                    ty: self.mk_closed_record_from_fields(&field_types),
                     range: *range,
                 }
             }
@@ -638,6 +748,123 @@ impl Checker {
                 ty: self.error_type(),
                 range: error.range,
             },
+        }
+    }
+
+    /// Bidirectional checking entrypoint used when an expected type is known.
+    ///
+    /// This enables predicative higher-rank checking:
+    /// - expected outer `forall` types are skolemized,
+    /// - inferred outer `forall` types are instantiated with fresh metas,
+    /// - resulting monotypes are unified.
+    fn check_expr_against(
+        &mut self,
+        expr: &lir::Expr,
+        expected: TypeId,
+        locals: &mut LocalEnv,
+    ) -> tir::Expr {
+        let expected_resolved = self.table.shallow_resolve_type(&self.store, expected);
+        if matches!(self.store.get_type(expected_resolved).kind, TypeKind::Forall(_, _, _)) {
+            let (skolemized, _) = self.skolemize_outer_foralls(expected_resolved, expr_range(expr));
+            let mut typed = self.check_expr_against(expr, skolemized, locals);
+            typed.ty = expected;
+            return typed;
+        }
+
+        if let lir::Expr::Function {
+            params,
+            body,
+            range,
+        } = expr
+            && let Some((parameter_types, result_ty)) =
+                self.split_function_type(expected_resolved, params.len())
+        {
+            let mut function_locals = locals.clone();
+            let mut typed_params = Vec::with_capacity(params.len());
+
+            for (param, parameter_ty) in params.iter().zip(parameter_types.into_iter()) {
+                let (typed_param, bound_vars) =
+                    self.check_pattern(param, parameter_ty, &function_locals, &HashMap::new());
+                for bound in bound_vars {
+                    let scheme = self.mono_scheme(bound.ty, bound.range);
+                    self.insert_scheme_for_key(
+                        &mut function_locals,
+                        &bound.key,
+                        scheme,
+                        bound.range,
+                    );
+                }
+                typed_params.push(typed_param);
+            }
+
+            let typed_body = self.check_expr_against(body, result_ty, &mut function_locals);
+
+            return tir::Expr {
+                kind: tir::ExprKind::Function {
+                    params: typed_params,
+                    body: Box::new(typed_body),
+                },
+                ty: expected,
+                range: *range,
+            };
+        }
+
+        let mut typed = self.infer_expr(expr, locals);
+        let diagnostic_count = self.diagnostics.len();
+        self.constrain_subsumption(expr_range(expr), typed.ty, expected);
+        if self.diagnostics.len() == diagnostic_count {
+            typed.ty = expected;
+        }
+        typed
+    }
+
+    fn split_function_type(&self, ty: TypeId, arity: usize) -> Option<(Vec<TypeId>, TypeId)> {
+        let mut params = Vec::with_capacity(arity);
+        let mut cursor = self.table.shallow_resolve_type(&self.store, ty);
+
+        for _ in 0..arity {
+            let Some((param, result)) = self.as_arrow_type(cursor) else {
+                return None;
+            };
+            params.push(param);
+            cursor = self.table.shallow_resolve_type(&self.store, result);
+        }
+
+        Some((params, cursor))
+    }
+
+    fn as_arrow_type(&self, ty: TypeId) -> Option<(TypeId, TypeId)> {
+        let ty = self.table.shallow_resolve_type(&self.store, ty);
+        let TypeKind::Application(partial, to) = self.store.get_type(ty).kind else {
+            return None;
+        };
+        let partial = self.table.shallow_resolve_type(&self.store, partial);
+        let TypeKind::Application(head, from) = self.store.get_type(partial).kind else {
+            return None;
+        };
+        let head = self.table.shallow_resolve_type(&self.store, head);
+        let TypeKind::Constructor(TypeConstructor::Arrow) = self.store.get_type(head).kind else {
+            return None;
+        };
+        Some((from, to))
+    }
+
+    fn type_contains_forall(&self, ty: TypeId) -> bool {
+        let ty = self.table.shallow_resolve_type(&self.store, ty);
+        match &self.store.get_type(ty).kind {
+            TypeKind::Forall(_, _, _) => true,
+            TypeKind::Application(func, arg) => {
+                self.type_contains_forall(*func) || self.type_contains_forall(*arg)
+            }
+            TypeKind::Record(row) => self.type_contains_forall(*row),
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.type_contains_forall(*field) || self.type_contains_forall(*tail)
+            }
+            TypeKind::MetaTypeVariable(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::Constructor(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => false,
         }
     }
 
@@ -696,12 +923,12 @@ impl Checker {
                 let mut bound = Vec::new();
 
                 if let Some(key) = key {
-                    let binding_ty = if let Some(prebound_ty) = prebound.get(&key) {
-                        self.constrain_types(*range, *prebound_ty, expected);
-                        *prebound_ty
-                    } else {
-                        expected
-                    };
+                    if let Some(prebound_ty) = prebound.get(&key) {
+                        if !self.type_contains_forall(expected) {
+                            self.constrain_subsumption(*range, *prebound_ty, expected);
+                        }
+                    }
+                    let binding_ty = expected;
 
                     bound.push(BoundVar {
                         key,
@@ -733,7 +960,7 @@ impl Checker {
                 let mut type_env = TypeExprEnv::default();
                 let annotation = self.lower_type_expr(ty, &mut type_env);
                 self.expect_type_kind(type_expr_range(ty), annotation);
-                self.constrain_types(*range, expected, annotation);
+                self.constrain_subsumption(*range, expected, annotation);
 
                 let (typed_pattern, bound) =
                     self.check_pattern(pattern, annotation, locals, prebound);
@@ -848,24 +1075,34 @@ impl Checker {
                     bound,
                 )
             }
-            lir::Pattern::Record { fields, range } => {
-                self.error(
-                    *range,
-                    "record patterns are not yet supported by the HM checker",
-                );
+            lir::Pattern::Record {
+                fields,
+                open,
+                range,
+            } => {
                 let mut typed_fields = Vec::with_capacity(fields.len());
                 let mut bound = Vec::new();
+                let mut field_types = BTreeMap::new();
 
                 for field in fields {
+                    let field_ty = self.fresh_type_meta();
                     let typed_value = if let Some(value) = &field.value {
-                        let value_ty = self.fresh_type_meta();
                         let (typed_value, mut value_bound) =
-                            self.check_pattern(value, value_ty, locals, prebound);
+                            self.check_pattern(value, field_ty, locals, prebound);
                         bound.append(&mut value_bound);
                         Some(typed_value)
                     } else {
                         None
                     };
+
+                    if let Some(name) = field.name.clone() {
+                        if let Some(existing) = field_types.insert(name.clone(), field_ty) {
+                            self.error(field.range, format!("duplicate record field `{name}` in pattern"));
+                            self.constrain_types(field.range, existing, field_ty);
+                        }
+                    } else {
+                        self.error(field.range, "record pattern field is missing a name");
+                    }
 
                     typed_fields.push(tir::RecordPatternField {
                         name: field.name.clone(),
@@ -874,12 +1111,22 @@ impl Checker {
                     });
                 }
 
+                let tail = if *open {
+                    self.fresh_row_meta()
+                } else {
+                    self.store.mk_row_empty()
+                };
+                let row = self.mk_row_from_fields(field_types, tail);
+                let record_ty = self.store.mk_record(row);
+                self.constrain_types(*range, expected, record_ty);
+
                 (
                     tir::Pattern {
                         kind: tir::PatternKind::Record {
                             fields: typed_fields,
+                            open: *open,
                         },
-                        ty: self.error_type(),
+                        ty: expected,
                         range: *range,
                     },
                     bound,
@@ -960,7 +1207,10 @@ impl Checker {
 
         match ty_data.kind {
             TypeKind::RigidTypeVariable(id) => substitution.get(&id).copied().unwrap_or(resolved),
-            TypeKind::MetaTypeVariable(_) | TypeKind::Constructor(_) | TypeKind::Error => resolved,
+            TypeKind::MetaTypeVariable(_)
+            | TypeKind::Constructor(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => resolved,
             TypeKind::Application(func, arg) => {
                 let sub_func = self.substitute_rigid_type(func, substitution);
                 let sub_arg = self.substitute_rigid_type(arg, substitution);
@@ -969,6 +1219,23 @@ impl Checker {
                     resolved
                 } else {
                     self.store.mk_application(sub_func, sub_arg, sub_kind)
+                }
+            }
+            TypeKind::Record(row) => {
+                let sub_row = self.substitute_rigid_type(row, substitution);
+                if sub_row == row {
+                    resolved
+                } else {
+                    self.store.mk_record(sub_row)
+                }
+            }
+            TypeKind::RowExtend { label, field, tail } => {
+                let sub_field = self.substitute_rigid_type(field, substitution);
+                let sub_tail = self.substitute_rigid_type(tail, substitution);
+                if sub_field == field && sub_tail == tail {
+                    resolved
+                } else {
+                    self.store.mk_row_extend(label, sub_field, sub_tail)
                 }
             }
             TypeKind::Forall(binders, predicates, body) => {
@@ -1056,6 +1323,13 @@ impl Checker {
                 self.collect_unsolved_metas(*func, vars);
                 self.collect_unsolved_metas(*arg, vars);
             }
+            TypeKind::Record(row) => {
+                self.collect_unsolved_metas(*row, vars);
+            }
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.collect_unsolved_metas(*field, vars);
+                self.collect_unsolved_metas(*tail, vars);
+            }
             TypeKind::Forall(_, predicates, body) => {
                 self.collect_unsolved_metas(*body, vars);
                 for predicate in predicates {
@@ -1064,7 +1338,10 @@ impl Checker {
                     }
                 }
             }
-            TypeKind::Constructor(_) | TypeKind::RigidTypeVariable(_) | TypeKind::Error => {}
+            TypeKind::Constructor(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => {}
         }
     }
 
@@ -1078,7 +1355,10 @@ impl Checker {
 
         match ty_data.kind {
             TypeKind::MetaTypeVariable(var) => substitution.get(&var).copied().unwrap_or(resolved),
-            TypeKind::Constructor(_) | TypeKind::RigidTypeVariable(_) | TypeKind::Error => resolved,
+            TypeKind::Constructor(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => resolved,
             TypeKind::Application(func, arg) => {
                 let sub_func = self.substitute_meta_type(func, substitution);
                 let sub_arg = self.substitute_meta_type(arg, substitution);
@@ -1087,6 +1367,23 @@ impl Checker {
                 } else {
                     let sub_kind = self.table.zonk_kind(&mut self.store, ty_data.kind_id);
                     self.store.mk_application(sub_func, sub_arg, sub_kind)
+                }
+            }
+            TypeKind::Record(row) => {
+                let sub_row = self.substitute_meta_type(row, substitution);
+                if sub_row == row {
+                    resolved
+                } else {
+                    self.store.mk_record(sub_row)
+                }
+            }
+            TypeKind::RowExtend { label, field, tail } => {
+                let sub_field = self.substitute_meta_type(field, substitution);
+                let sub_tail = self.substitute_meta_type(tail, substitution);
+                if sub_field == field && sub_tail == tail {
+                    resolved
+                } else {
+                    self.store.mk_row_extend(label, sub_field, sub_tail)
                 }
             }
             TypeKind::Forall(binders, predicates, body) => {
@@ -1181,6 +1478,12 @@ impl Checker {
                 argument,
                 range,
             } => {
+                if let Some(transparent_ty) =
+                    self.try_lower_transparent_type_application(type_expr, env)
+                {
+                    return transparent_ty;
+                }
+
                 let callee_ty = self.lower_type_expr(callee, env);
                 let argument_ty = self.lower_type_expr(argument, env);
                 let (_, result_kind) = self.table.fresh_kind_var(&mut self.store);
@@ -1223,13 +1526,93 @@ impl Checker {
                 }
             }
             lir::ResolvedName::Global(path) => {
-                self.ensure_named_type_constructor(path, None, path.range)
+                let key = path.text();
+                if let Some(scheme) = self.transparent_type_scheme(&key) {
+                    self.instantiate_scheme(&scheme)
+                } else {
+                    self.ensure_named_type_constructor(path, None, path.range)
+                }
             }
             lir::ResolvedName::Error { name, range } => {
                 self.error(*range, format!("failed to resolve type name `{name}`"));
                 self.error_type()
             }
         }
+    }
+
+    fn try_lower_transparent_type_application(
+        &mut self,
+        type_expr: &lir::TypeExpr,
+        env: &mut TypeExprEnv,
+    ) -> Option<TypeId> {
+        let (head, args) = collect_type_apply_chain(type_expr);
+        let lir::TypeExpr::Name { name } = head else {
+            return None;
+        };
+        let lir::ResolvedName::Global(path) = name else {
+            return None;
+        };
+
+        if args.is_empty() {
+            return None;
+        }
+
+        let key = path.text();
+        let scheme = self.transparent_type_scheme(&key)?;
+
+        let mut argument_types = Vec::with_capacity(args.len());
+        for argument in args {
+            let argument_ty = self.lower_type_expr(argument, env);
+            self.expect_type_kind(type_expr_range(argument), argument_ty);
+            argument_types.push(argument_ty);
+        }
+
+        if argument_types.len() > scheme.binders.len() {
+            self.error(
+                type_expr_range(type_expr),
+                format!(
+                    "type `{key}` expects {} type argument(s), found {}",
+                    scheme.binders.len(),
+                    argument_types.len()
+                ),
+            );
+            return Some(self.error_type());
+        }
+
+        while argument_types.len() < scheme.binders.len() {
+            argument_types.push(self.fresh_type_meta());
+        }
+
+        Some(self.instantiate_scheme_with_args(
+            &scheme,
+            &argument_types,
+            type_expr_range(type_expr),
+        ))
+    }
+
+    fn transparent_type_scheme(&self, key: &str) -> Option<TypeScheme> {
+        self.record_schemes
+            .get(key)
+            .cloned()
+            .or_else(|| self.alias_schemes.get(key).cloned())
+    }
+
+    fn instantiate_scheme_with_args(
+        &mut self,
+        scheme: &TypeScheme,
+        args: &[TypeId],
+        range: TextRange,
+    ) -> TypeId {
+        let mut substitution = HashMap::with_capacity(scheme.binders.len());
+
+        for (binder, argument) in scheme.binders.iter().zip(args.iter().copied()) {
+            let expected_kind = self.table.zonk_kind(&mut self.store, binder.kind);
+            let found_kind = self.store.get_type(argument).kind_id;
+            self.constrain_kinds(range, expected_kind, found_kind);
+            substitution.insert(binder.id, argument);
+        }
+
+        self.substitute_rigid_type(scheme.body, &substitution)
     }
 
     fn ensure_named_type_constructor(
@@ -1269,6 +1652,62 @@ impl Checker {
             kind = self.store.kind_arrow(kind_type, kind);
         }
         kind
+    }
+
+    fn fresh_row_meta(&mut self) -> TypeId {
+        let kind = self.store.kind_row();
+        let (_, ty) = self.table.fresh_type_var(&mut self.store, kind);
+        ty
+    }
+
+    fn mk_row_from_fields(&mut self, fields: BTreeMap<String, TypeId>, tail: TypeId) -> TypeId {
+        let mut row = tail;
+        for (name, ty) in fields.into_iter().rev() {
+            row = self.store.mk_row_extend(name, ty, row);
+        }
+        row
+    }
+
+    fn mk_closed_record_from_fields(&mut self, fields: &BTreeMap<String, TypeId>) -> TypeId {
+        let row_empty = self.store.mk_row_empty();
+        let row = self.mk_row_from_fields(fields.clone(), row_empty);
+        self.store.mk_record(row)
+    }
+
+    fn collect_closed_record_fields(
+        &mut self,
+        record_ty: TypeId,
+        range: TextRange,
+    ) -> Option<BTreeMap<String, TypeId>> {
+        let record_ty = self.table.shallow_resolve_type(&self.store, record_ty);
+        let record_kind = self.store.get_type(record_ty).kind.clone();
+
+        let TypeKind::Record(mut row) = record_kind else {
+            self.error(range, "record spread target must be a record type");
+            return None;
+        };
+
+        let mut fields = BTreeMap::new();
+
+        loop {
+            row = self.table.shallow_resolve_type(&self.store, row);
+            match self.store.get_type(row).kind.clone() {
+                TypeKind::RowEmpty | TypeKind::Error => break,
+                TypeKind::RowExtend { label, field, tail } => {
+                    if let Some(existing) = fields.insert(label.clone(), field) {
+                        self.error(range, format!("duplicate record field `{label}` in spread target"));
+                        self.constrain_types(range, existing, field);
+                    }
+                    row = tail;
+                }
+                _ => {
+                    self.error(range, "record spread target must be a closed record type");
+                    return None;
+                }
+            }
+        }
+
+        Some(fields)
     }
 
     fn prebind_keys(
@@ -1316,9 +1755,98 @@ impl Checker {
     }
 
     fn constrain_types(&mut self, range: TextRange, expected: TypeId, found: TypeId) {
-        if let Err(error) = self.table.unify_types(&self.store, expected, found) {
+        if let Err(error) = self.table.unify_types(&mut self.store, expected, found) {
             self.error(range, self.unification_message(error));
         }
+    }
+
+    fn constrain_subsumption(&mut self, range: TextRange, actual: TypeId, expected: TypeId) {
+        let instantiated_actual = self.instantiate_outer_foralls_with_metas(actual, range);
+        let (skolemized_expected, _) = self.skolemize_outer_foralls(expected, range);
+
+        if let (Some((actual_param, actual_result)), Some((expected_param, expected_result))) = (
+            self.as_arrow_type(instantiated_actual),
+            self.as_arrow_type(skolemized_expected),
+        ) {
+            // Function subsumption is contravariant in arguments and covariant
+            // in results.
+            self.constrain_subsumption(range, expected_param, actual_param);
+            self.constrain_subsumption(range, actual_result, expected_result);
+            return;
+        }
+
+        self.constrain_types(range, instantiated_actual, skolemized_expected);
+    }
+
+    fn instantiate_outer_foralls_with_metas(&mut self, ty: TypeId, _range: TextRange) -> TypeId {
+        let mut current = self.table.shallow_resolve_type(&self.store, ty);
+
+        loop {
+            let TypeKind::Forall(binders, predicates, body) = self.store.get_type(current).kind.clone()
+            else {
+                return current;
+            };
+
+            let mut substitution = HashMap::with_capacity(binders.len());
+            for binder in &binders {
+                let kind = self.table.zonk_kind(&mut self.store, binder.kind);
+                let (_, meta) = self.table.fresh_type_var(&mut self.store, kind);
+                substitution.insert(binder.id, meta);
+            }
+
+            self.defer_predicates_with_substitution(&predicates, &substitution);
+            current = self.substitute_rigid_type(body, &substitution);
+            current = self.table.shallow_resolve_type(&self.store, current);
+        }
+    }
+
+    fn skolemize_outer_foralls(
+        &mut self,
+        ty: TypeId,
+        _range: TextRange,
+    ) -> (TypeId, Vec<TypeBinderId>) {
+        let mut current = self.table.shallow_resolve_type(&self.store, ty);
+        let mut skolems = Vec::new();
+
+        loop {
+            let TypeKind::Forall(binders, predicates, body) = self.store.get_type(current).kind.clone()
+            else {
+                return (current, skolems);
+            };
+
+            let mut substitution = HashMap::with_capacity(binders.len());
+            for binder in &binders {
+                let kind = self.table.zonk_kind(&mut self.store, binder.kind);
+                let skolem_id = self.fresh_type_binder_id();
+                let skolem = self.store.mk_rigid(skolem_id, kind);
+                substitution.insert(binder.id, skolem);
+                skolems.push(skolem_id);
+            }
+
+            self.defer_predicates_with_substitution(&predicates, &substitution);
+            current = self.substitute_rigid_type(body, &substitution);
+            current = self.table.shallow_resolve_type(&self.store, current);
+        }
+    }
+
+    fn defer_predicates_with_substitution(
+        &mut self,
+        predicates: &[TraitPredicate],
+        substitution: &HashMap<TypeBinderId, TypeId>,
+    ) {
+        let deferred = predicates
+            .iter()
+            .map(|predicate| TraitPredicate {
+                trait_ref: predicate.trait_ref.clone(),
+                arguments: predicate
+                    .arguments
+                    .iter()
+                    .map(|&argument| self.substitute_rigid_type(argument, substitution))
+                    .collect(),
+                range: predicate.range,
+            })
+            .collect::<Vec<_>>();
+        self.deferred_predicates.extend(deferred);
     }
 
     fn constrain_kinds(&mut self, range: TextRange, expected: KindId, found: KindId) {
@@ -1526,7 +2054,7 @@ impl Checker {
                     }
                 }
             }
-            tir::PatternKind::Record { fields } => {
+            tir::PatternKind::Record { fields, .. } => {
                 for field in fields {
                     if let Some(value) = &mut field.value {
                         self.zonk_pattern(value);
@@ -1540,6 +2068,24 @@ impl Checker {
             | tir::PatternKind::Error(_) => {}
         }
     }
+}
+
+fn collect_type_apply_chain<'a>(
+    type_expr: &'a lir::TypeExpr,
+) -> (&'a lir::TypeExpr, Vec<&'a lir::TypeExpr>) {
+    let mut args_rev = Vec::new();
+    let mut cursor = type_expr;
+
+    while let lir::TypeExpr::Apply {
+        callee, argument, ..
+    } = cursor
+    {
+        args_rev.push(argument.as_ref());
+        cursor = callee.as_ref();
+    }
+
+    args_rev.reverse();
+    (cursor, args_rev)
 }
 
 fn collect_pattern_binders(pattern: &lir::Pattern) -> Vec<(BinderKey, TextRange)> {

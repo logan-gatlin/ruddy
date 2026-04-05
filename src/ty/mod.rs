@@ -66,6 +66,19 @@ pub enum TypeKind {
     Constructor(TypeConstructor),
     /// Type application (`func arg`), represented explicitly.
     Application(TypeId, TypeId),
+    /// Structural record type whose payload is a row.
+    Record(TypeId),
+    /// Empty row (`{}` at the row level).
+    RowEmpty,
+    /// Row extension by one labeled field.
+    RowExtend {
+        /// Field label being introduced.
+        label: String,
+        /// Type assigned to `label`.
+        field: TypeId,
+        /// Remaining row tail.
+        tail: TypeId,
+    },
     /// Explicit polymorphic type: `forall binders. predicates => body`.
     Forall(Vec<TypeBinder>, Vec<TraitPredicate>, TypeId),
     /// Sentinel used after type errors to suppress cascading diagnostics.
@@ -109,6 +122,8 @@ impl TypeConstructor {
 pub enum Kind {
     /// The kind of inhabited runtime types (`*` / `Type`).
     Type,
+    /// The kind of structural record rows.
+    Row,
     /// Kind function from one kind to another.
     Arrow(KindId, KindId),
     /// Inference variable at the kind level.

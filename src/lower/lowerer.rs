@@ -941,7 +941,11 @@ impl<'db> ModuleLowerer<'db> {
                     .collect(),
                 range: *range,
             },
-            ast::Pattern::Record { fields, range } => ir::Pattern::Record {
+            ast::Pattern::Record {
+                fields,
+                open,
+                range,
+            } => ir::Pattern::Record {
                 fields: fields
                     .iter()
                     .map(|field| {
@@ -973,6 +977,7 @@ impl<'db> ModuleLowerer<'db> {
                         }
                     })
                     .collect(),
+                open: *open,
                 range: *range,
             },
             ast::Pattern::Error(error) => ir::Pattern::Error(ir::ErrorNode { range: error.range }),
@@ -1104,7 +1109,11 @@ impl<'db> ModuleLowerer<'db> {
                     .collect(),
                 range: *range,
             },
-            ast::Pattern::Record { fields, range } => ir::Pattern::Record {
+            ast::Pattern::Record {
+                fields,
+                open,
+                range,
+            } => ir::Pattern::Record {
                 fields: fields
                     .iter()
                     .map(|field| {
@@ -1136,6 +1145,7 @@ impl<'db> ModuleLowerer<'db> {
                         }
                     })
                     .collect(),
+                open: *open,
                 range: *range,
             },
             ast::Pattern::Error(error) => ir::Pattern::Error(ir::ErrorNode { range: error.range }),
@@ -1999,23 +2009,34 @@ impl<'db> ModuleLowerer<'db> {
         let head = &segments[0];
 
         if let Some(path) = self.namespace_map(namespace).get(head) {
-            return Some(path.clone().extend(segments[1..].iter().cloned()).range(range));
+            return Some(
+                path.clone()
+                    .extend(segments[1..].iter().cloned())
+                    .range(range),
+            );
         }
 
         if let Some(alias_base) = lookup.module_aliases.get(head)
             && segments.len() > 1
         {
-            return Some(alias_base.clone().extend(segments[1..].iter().cloned()).range(range));
+            return Some(
+                alias_base
+                    .clone()
+                    .extend(segments[1..].iter().cloned())
+                    .range(range),
+            );
         }
 
         if namespace != Namespace::Module
             && let Some(module_base) = self.scope.modules.get(head)
             && segments.len() > 1
         {
-            return Some(module_base
-                .clone()
-                .extend(segments[1..].iter().cloned())
-                .range(range));
+            return Some(
+                module_base
+                    .clone()
+                    .extend(segments[1..].iter().cloned())
+                    .range(range),
+            );
         }
 
         if segments.len() == 1 {

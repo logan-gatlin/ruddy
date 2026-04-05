@@ -82,7 +82,11 @@ impl ScopeState {
                 path: path.clone(),
             })
             .collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.text().cmp(&b.path.text())));
+        entries.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.path.text().cmp(&b.path.text()))
+        });
         entries
     }
 

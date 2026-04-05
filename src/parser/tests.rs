@@ -231,6 +231,48 @@ fn parse_query_handles_phase_four_expressions() {
 }
 
 #[test]
+fn parse_record_patterns_track_open_marker() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "record_patterns.hc".to_owned(),
+        [
+            "bundle demo",
+            "let {x} = {x = 1}",
+            "let {x, ..} = {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    assert!(parse_diagnostics(&db, source).is_empty());
+
+    let closed_open = match parsed.ast.statements.get(1) {
+        Some(Statement::Let {
+            kind: LetStatementKind::PatternBinding { pattern, .. },
+            ..
+        }) => match pattern {
+            Pattern::Record { open, .. } => *open,
+            other => panic!("expected record pattern, got {other:?}"),
+        },
+        other => panic!("expected let statement, got {other:?}"),
+    };
+    assert!(!closed_open);
+
+    let open_open = match parsed.ast.statements.get(2) {
+        Some(Statement::Let {
+            kind: LetStatementKind::PatternBinding { pattern, .. },
+            ..
+        }) => match pattern {
+            Pattern::Record { open, .. } => *open,
+            other => panic!("expected record pattern, got {other:?}"),
+        },
+        other => panic!("expected let statement, got {other:?}"),
+    };
+    assert!(open_open);
+}
+
+#[test]
 fn parse_query_handles_inline_wasm_forms() {
     let db = Eng::default();
     let source = Source::new(

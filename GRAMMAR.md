@@ -210,7 +210,8 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 <pat_array_elem>      ::= <pattern>
                         | ".." <ident>?
 
-<pat_field_list> ::= <pat_field> ("," <pat_field>)* ","?
+<pat_field_list> ::= <pat_field> ("," <pat_field>)* ("," "..")? ","?
+                   | ".."
 <pat_field>      ::= <ident> ("=" <pattern>)?
 ```
 
@@ -219,6 +220,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 - Type annotation binds tighter than constructor application: `Ctor x : T` means `Ctor (x : T)`.
 - At most one `: <type_expr>` annotation is allowed per pattern node.
 - Rest elements (`..name?`) are syntactically allowed anywhere in array patterns; positional validation is a later semantic pass.
+- Record patterns are closed by default (`{x}`), and become open only with an explicit rest marker (`{x, ..}`).
 
 ## S-Expressions (inline wasm)
 ```bnf

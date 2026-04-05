@@ -4,7 +4,7 @@ use crate::ty::store::TypeStore;
 use crate::ty::typed_ir as tir;
 use crate::ty::*;
 
-use super::{UnificationError, UnificationTable, check_text};
+use super::{check_text, UnificationError, UnificationTable};
 
 // ---------------------------------------------------------------------------
 // TypeStore tests
@@ -121,7 +121,7 @@ fn unify_same_type() {
     let k = store.kind_type();
     let int = store.mk_constructor(TypeConstructor::Integer, k);
 
-    assert!(table.unify_types(&store, int, int).is_ok());
+    assert!(table.unify_types(&mut store, int, int).is_ok());
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn unify_meta_with_constructor() {
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let (var, meta) = table.fresh_type_var(&mut store, k);
 
-    assert!(table.unify_types(&store, meta, int).is_ok());
+    assert!(table.unify_types(&mut store, meta, int).is_ok());
     assert_eq!(table.probe_type_var(var), Some(int));
 }
 
@@ -145,7 +145,7 @@ fn unify_constructor_with_meta() {
     let (var, meta) = table.fresh_type_var(&mut store, k);
 
     // Reversed order compared to the test above.
-    assert!(table.unify_types(&store, int, meta).is_ok());
+    assert!(table.unify_types(&mut store, int, meta).is_ok());
     assert_eq!(table.probe_type_var(var), Some(int));
 }
 
@@ -157,7 +157,7 @@ fn unify_two_metas() {
     let (var_a, meta_a) = table.fresh_type_var(&mut store, k);
     let (_var_b, meta_b) = table.fresh_type_var(&mut store, k);
 
-    assert!(table.unify_types(&store, meta_a, meta_b).is_ok());
+    assert!(table.unify_types(&mut store, meta_a, meta_b).is_ok());
     // One of them should point to the other.
     assert_eq!(table.probe_type_var(var_a), Some(meta_b));
 }
@@ -175,7 +175,7 @@ fn unify_application_pairwise() {
     let arrow_a = store.mk_arrow(int, meta);
     let arrow_b = store.mk_arrow(int, bool_ty);
 
-    assert!(table.unify_types(&store, arrow_a, arrow_b).is_ok());
+    assert!(table.unify_types(&mut store, arrow_a, arrow_b).is_ok());
     // ?a should be solved to Bool.
     assert_eq!(table.probe_type_var(var), Some(bool_ty));
 }
@@ -188,7 +188,7 @@ fn unify_mismatch_different_constructors() {
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let bool_ty = store.mk_constructor(TypeConstructor::Bool, k);
 
-    let result = table.unify_types(&store, int, bool_ty);
+    let result = table.unify_types(&mut store, int, bool_ty);
     assert!(matches!(result, Err(UnificationError::TypeMismatch { .. })));
 }
 
@@ -200,8 +200,31 @@ fn unify_mismatch_arrow_vs_constructor() {
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let arrow = store.mk_arrow(int, int);
 
-    let result = table.unify_types(&store, arrow, int);
+    let result = table.unify_types(&mut store, arrow, int);
     assert!(matches!(result, Err(UnificationError::TypeMismatch { .. })));
+}
+
+#[test]
+fn unify_meta_with_forall_is_rejected_predicatively() {
+    let mut store = TypeStore::new();
+    let mut table = UnificationTable::new();
+    let k = store.kind_type();
+    let (var, meta) = table.fresh_type_var(&mut store, k);
+
+    let binder_id = TypeBinderId(0);
+    let binder = TypeBinder {
+        id: binder_id,
+        name: "a".to_owned(),
+        kind: k,
+        range: crate::reporting::TextRange::Generated,
+    };
+    let a = store.mk_rigid(binder_id, k);
+    let body = store.mk_arrow(a, a);
+    let poly = store.mk_forall(vec![binder], Vec::new(), body);
+
+    let result = table.unify_types(&mut store, meta, poly);
+    assert!(matches!(result, Err(UnificationError::TypeMismatch { .. })));
+    assert_eq!(table.probe_type_var(var), None);
 }
 
 #[test]
@@ -215,7 +238,7 @@ fn occurs_check_direct() {
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let infinite = store.mk_arrow(meta, int);
 
-    let result = table.unify_types(&store, meta, infinite);
+    let result = table.unify_types(&mut store, meta, infinite);
     assert!(matches!(result, Err(UnificationError::OccursCheck { .. })));
 }
 
@@ -228,13 +251,13 @@ fn occurs_check_indirect() {
     let (_, meta_b) = table.fresh_type_var(&mut store, k);
 
     // ?a ~ ?b  (OK)
-    assert!(table.unify_types(&store, meta_a, meta_b).is_ok());
+    assert!(table.unify_types(&mut store, meta_a, meta_b).is_ok());
 
     // Now ?b ~ (?a -> Int) — since ?a -> ?b, this is ?b ~ (?b -> Int).
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let infinite = store.mk_arrow(meta_a, int);
 
-    let result = table.unify_types(&store, meta_b, infinite);
+    let result = table.unify_types(&mut store, meta_b, infinite);
     assert!(matches!(result, Err(UnificationError::OccursCheck { .. })));
 }
 
@@ -246,8 +269,8 @@ fn error_absorbs_mismatch() {
     let int = store.mk_constructor(TypeConstructor::Integer, k);
     let err = store.mk_error();
 
-    assert!(table.unify_types(&store, err, int).is_ok());
-    assert!(table.unify_types(&store, int, err).is_ok());
+    assert!(table.unify_types(&mut store, err, int).is_ok());
+    assert!(table.unify_types(&mut store, int, err).is_ok());
 }
 
 #[test]
@@ -257,7 +280,7 @@ fn unify_rigid_same() {
     let k = store.kind_type();
     let a = store.mk_rigid(TypeBinderId(0), k);
 
-    assert!(table.unify_types(&store, a, a).is_ok());
+    assert!(table.unify_types(&mut store, a, a).is_ok());
 }
 
 #[test]
@@ -268,7 +291,7 @@ fn unify_rigid_different() {
     let a = store.mk_rigid(TypeBinderId(0), k);
     let b = store.mk_rigid(TypeBinderId(1), k);
 
-    let result = table.unify_types(&store, a, b);
+    let result = table.unify_types(&mut store, a, b);
     assert!(matches!(result, Err(UnificationError::TypeMismatch { .. })));
 }
 
@@ -347,7 +370,7 @@ fn zonk_solved_meta() {
     let (_, meta) = table.fresh_type_var(&mut store, k);
 
     // ?a = Int
-    assert!(table.unify_types(&store, meta, int).is_ok());
+    assert!(table.unify_types(&mut store, meta, int).is_ok());
 
     // Build F(?a) = ?a -> ?a
     let arrow = store.mk_arrow(meta, meta);
@@ -400,8 +423,8 @@ fn zonk_chain() {
     let (_, meta_b) = table.fresh_type_var(&mut store, k);
 
     // ?a = ?b, ?b = Int
-    assert!(table.unify_types(&store, meta_a, meta_b).is_ok());
-    assert!(table.unify_types(&store, meta_b, int).is_ok());
+    assert!(table.unify_types(&mut store, meta_a, meta_b).is_ok());
+    assert!(table.unify_types(&mut store, meta_b, int).is_ok());
 
     let zonked = table.zonk_type(&mut store, meta_a);
 
@@ -459,8 +482,8 @@ fn shallow_resolve_follows_chain() {
     let (_, meta_b) = table.fresh_type_var(&mut store, k);
 
     // ?a -> ?b -> Int
-    assert!(table.unify_types(&store, meta_a, meta_b).is_ok());
-    assert!(table.unify_types(&store, meta_b, int).is_ok());
+    assert!(table.unify_types(&mut store, meta_a, meta_b).is_ok());
+    assert!(table.unify_types(&mut store, meta_b, int).is_ok());
 
     let resolved = table.shallow_resolve_type(&store, meta_a);
     assert_eq!(resolved, int);
@@ -494,7 +517,7 @@ fn unify_nested_arrows_then_zonk() {
     // (?a -> ?b) ~ (Int -> Bool)
     let lhs = store.mk_arrow(meta_a, meta_b);
     let rhs = store.mk_arrow(int, bool_ty);
-    assert!(table.unify_types(&store, lhs, rhs).is_ok());
+    assert!(table.unify_types(&mut store, lhs, rhs).is_ok());
 
     // Zonking the metas directly should yield the solved types.
     let za = table.zonk_type(&mut store, meta_a);
@@ -677,5 +700,527 @@ fn infer_sum_constructors_and_match() {
     assert_eq!(
         checked.type_store.get_type(unwrapped.ty).kind,
         TypeKind::Constructor(TypeConstructor::Integer)
+    );
+}
+
+#[test]
+fn infer_record_field_access_is_polymorphic() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_record_field_access.hc".to_owned(),
+        [
+            "bundle demo",
+            "let get = fn r => r.x",
+            "let a = get {x = 1, y = true}",
+            "let b = get {x = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+
+    let a_expr = typed_binding_expr_by_name(module, "demo::a").expect("missing binding demo::a");
+    let b_expr = typed_binding_expr_by_name(module, "demo::b").expect("missing binding demo::b");
+
+    assert_eq!(
+        checked.type_store.get_type(a_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked.type_store.get_type(b_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn closed_record_pattern_rejects_extra_fields() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_closed_record_pattern.hc".to_owned(),
+        [
+            "bundle demo",
+            "let pick = fn r => match r with",
+            "  | {x} => x",
+            "let value = pick {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("type mismatch")),
+        "expected a type mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn open_record_pattern_accepts_extra_fields() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_open_record_pattern.hc".to_owned(),
+        [
+            "bundle demo",
+            "let pick = fn r => match r with",
+            "  | {x, ..} => x",
+            "let value = pick {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let value_expr =
+        typed_binding_expr_by_name(module, "demo::value").expect("missing binding demo::value");
+
+    assert_eq!(
+        checked.type_store.get_type(value_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+}
+
+#[test]
+fn adding_unrelated_record_type_does_not_change_existing_inference() {
+    let db = Eng::default();
+
+    let base = Source::new(
+        &db,
+        "hm_record_stability_base.hc".to_owned(),
+        [
+            "bundle demo",
+            "let get = fn r => r.x",
+            "let a = get {x = 1}",
+        ]
+        .join("\n"),
+    );
+
+    let extended = Source::new(
+        &db,
+        "hm_record_stability_extended.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Other: t = {x: t}",
+            "let get = fn r => r.x",
+            "let a = get {x = 1}",
+        ]
+        .join("\n"),
+    );
+
+    let checked_base = check_text::<FailingResolver>(&db, base);
+    let checked_extended = check_text::<FailingResolver>(&db, extended);
+
+    assert!(
+        checked_base.diagnostics.is_empty(),
+        "expected no diagnostics in base program, got: {:?}",
+        checked_base.diagnostics
+    );
+    assert!(
+        checked_extended.diagnostics.is_empty(),
+        "expected no diagnostics in extended program, got: {:?}",
+        checked_extended.diagnostics
+    );
+
+    let base_module = checked_base
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked base root module");
+    let extended_module = checked_extended
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked extended root module");
+
+    let base_a = typed_binding_expr_by_name(base_module, "demo::a").expect("missing base demo::a");
+    let extended_a =
+        typed_binding_expr_by_name(extended_module, "demo::a").expect("missing extended demo::a");
+
+    assert_eq!(
+        checked_base.type_store.get_type(base_a.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked_extended.type_store.get_type(extended_a.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+}
+
+#[test]
+fn struct_spread_declarations_are_checked_as_closed_records() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_record_spread_decl.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Base: a = {x: a}",
+            "type Pair: a b = {..Base a, y: b}",
+            "let get = fn r => r.y",
+            "let value = get {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let value_expr =
+        typed_binding_expr_by_name(module, "demo::value").expect("missing binding demo::value");
+
+    assert_eq!(
+        checked.type_store.get_type(value_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn alias_types_are_transparent_in_record_spreads() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_alias_record_spread_decl.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Base: a = {x: a}",
+            "type ~Alias: a = Base a",
+            "type Pair: a b = {..Alias a, y: b}",
+            "let get = fn r => r.y",
+            "let value = get {x = 1, y = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let value_expr =
+        typed_binding_expr_by_name(module, "demo::value").expect("missing binding demo::value");
+
+    assert_eq!(
+        checked.type_store.get_type(value_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn alias_type_application_reports_too_many_arguments() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_alias_arity_mismatch.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~Pair: a b = (a, b)",
+            "type ~Bad = Pair _ _ _",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expects 2 type argument(s), found 3")),
+        "expected alias arity diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn trait_and_impl_statements_are_carried_without_solver_diagnostics() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_trait_surface_passthrough.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Flag = | Flag",
+            "trait Keep: a =",
+            "  let keep: a -> a",
+            "end",
+            "impl Keep Flag =",
+            "  let keep = fn x => x",
+            "end",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn where_constraints_are_carried_without_solver_diagnostics() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_where_constraint_passthrough.hc".to_owned(),
+        [
+            "bundle demo",
+            "trait Keep: a =",
+            "  let keep: a -> a",
+            "end",
+            "type ~Poly = for a in a where Keep a",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn infer_annotated_polymorphic_binding_supports_distinct_instantiations() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_annotated_binding.hc".to_owned(),
+        [
+            "bundle demo",
+            "let id: for a in a -> a = fn x => x",
+            "let a = id 1",
+            "let b = id true",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+
+    let a_expr = typed_binding_expr_by_name(module, "demo::a").expect("missing binding demo::a");
+    let b_expr = typed_binding_expr_by_name(module, "demo::b").expect("missing binding demo::b");
+
+    assert_eq!(
+        checked.type_store.get_type(a_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked.type_store.get_type(b_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn infer_rank2_argument_accepts_lambda_via_contextual_checking() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_rank2_argument.hc".to_owned(),
+        [
+            "bundle demo",
+            "let use_int = fn (f: for a in a -> a) => f 1",
+            "let use_bool = fn (f: for a in a -> a) => f true",
+            "let a = use_int (fn x => x)",
+            "let b = use_bool (fn x => x)",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+
+    let a_expr = typed_binding_expr_by_name(module, "demo::a").expect("missing binding demo::a");
+    let b_expr = typed_binding_expr_by_name(module, "demo::b").expect("missing binding demo::b");
+
+    assert_eq!(
+        checked.type_store.get_type(a_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked.type_store.get_type(b_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
+fn infer_nested_rankn_annotation_round_trips() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_rank3_shape.hc".to_owned(),
+        [
+            "bundle demo",
+            "let rank3: for r in ((for a in a -> a) -> r) -> r = fn k => k (fn x => x)",
+            "let value = rank3 (fn g => g 1)",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let value_expr =
+        typed_binding_expr_by_name(module, "demo::value").expect("missing binding demo::value");
+
+    assert_eq!(
+        checked.type_store.get_type(value_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+}
+
+#[test]
+fn term_level_forall_constraints_are_carried_without_solver_diagnostics() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_term_constraints_passthrough.hc".to_owned(),
+        [
+            "bundle demo",
+            "trait Keep: a =",
+            "  let keep: a -> a",
+            "end",
+            "let id: for a in a -> a where Keep a = fn x => x",
+            "let value = id 1",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn monomorphic_function_is_rejected_where_polymorphic_argument_is_required() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_mono_rejected.hc".to_owned(),
+        [
+            "bundle demo",
+            "let consumer = fn (f: for a in a -> a) => (f 1, f true)",
+            "let mono: () -> () = fn x => x",
+            "let bad = consumer mono",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("type mismatch")),
+        "expected type mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn incompatible_polymorphic_annotation_is_rejected() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hrp_incompatible_poly.hc".to_owned(),
+        [
+            "bundle demo",
+            "let id: for a in a -> a = fn x => x",
+            "let bad: for a in a -> (a, a) = id",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("type mismatch")),
+        "expected type mismatch diagnostic, got: {:?}",
+        checked.diagnostics
     );
 }

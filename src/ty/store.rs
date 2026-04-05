@@ -20,17 +20,21 @@ pub struct TypeStore {
     kinds: Vec<Kind>,
     /// Cached id of the pre-allocated [`Kind::Type`] node.
     kind_type: KindId,
+    /// Cached id of the pre-allocated [`Kind::Row`] node.
+    kind_row: KindId,
 }
 
 impl TypeStore {
-    /// Create an empty store and pre-allocate [`Kind::Type`].
+    /// Create an empty store and pre-allocate [`Kind::Type`] and [`Kind::Row`].
     pub fn new() -> Self {
         let mut store = Self {
             types: Vec::new(),
             kinds: Vec::new(),
             kind_type: KindId(0),
+            kind_row: KindId(0),
         };
         store.kind_type = store.alloc_kind(Kind::Type);
+        store.kind_row = store.alloc_kind(Kind::Row);
         store
     }
 
@@ -81,6 +85,11 @@ impl TypeStore {
         self.kind_type
     }
 
+    /// The kind `Row` used by structural record rows.
+    pub fn kind_row(&self) -> KindId {
+        self.kind_row
+    }
+
     /// Allocate the kind `from -> to`.
     pub fn kind_arrow(&mut self, from: KindId, to: KindId) -> KindId {
         self.alloc_kind(Kind::Arrow(from, to))
@@ -114,6 +123,45 @@ impl TypeStore {
         let arrow = self.mk_constructor(TypeConstructor::Arrow, k2);
         let partial = self.mk_application(arrow, from, k1);
         self.mk_application(partial, to, k)
+    }
+
+    /// Build a structural record type from a row.
+    pub fn mk_record(&mut self, row: TypeId) -> TypeId {
+        let k_type = self.kind_type;
+        self.alloc_type(Type {
+            kind: TypeKind::Record(row),
+            kind_id: k_type,
+            range: TextRange::Generated,
+        })
+    }
+
+    /// Build the empty row.
+    pub fn mk_row_empty(&mut self) -> TypeId {
+        let k_row = self.kind_row;
+        self.alloc_type(Type {
+            kind: TypeKind::RowEmpty,
+            kind_id: k_row,
+            range: TextRange::Generated,
+        })
+    }
+
+    /// Build a row-extension node.
+    pub fn mk_row_extend(
+        &mut self,
+        label: impl Into<String>,
+        field: TypeId,
+        tail: TypeId,
+    ) -> TypeId {
+        let k_row = self.kind_row;
+        self.alloc_type(Type {
+            kind: TypeKind::RowExtend {
+                label: label.into(),
+                field,
+                tail,
+            },
+            kind_id: k_row,
+            range: TextRange::Generated,
+        })
     }
 
     /// Allocate an unsolved meta-variable type.

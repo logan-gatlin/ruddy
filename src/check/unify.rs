@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::ty::store::TypeStore;
 use crate::ty::{
     Kind, KindId, KindVariableId, MetaTypeVariableId, TraitPredicate, TypeBinder, TypeId, TypeKind,
@@ -131,10 +133,10 @@ impl UnificationTable {
     /// `Forall` types are never unified directly — the bidirectional checker
     /// handles them via subsumption (skolemization + instantiation). Attempting
     /// to unify two `Forall` types returns [`UnificationError::TypeMismatch`].
-    /// Expects `a` and `b` to have already successfully unified kinds.
+    /// Also enforces kind compatibility before structural type unification.
     pub fn unify_types(
         &mut self,
-        store: &TypeStore,
+        store: &mut TypeStore,
         a: TypeId,
         b: TypeId,
     ) -> Result<(), UnificationError> {
@@ -176,6 +178,17 @@ impl UnificationTable {
                 self.unify_types(store, a1, a2)
             }
 
+            // Record wrappers unify on their row payload.
+            (TypeKind::Record(row1), TypeKind::Record(row2)) => {
+                self.unify_types(store, *row1, *row2)
+            }
+
+            // Row structures unify with row-polymorphic logic.
+            (TypeKind::RowEmpty, TypeKind::RowEmpty)
+            | (TypeKind::RowExtend { .. }, TypeKind::RowExtend { .. })
+            | (TypeKind::RowExtend { .. }, TypeKind::RowEmpty)
+            | (TypeKind::RowEmpty, TypeKind::RowExtend { .. }) => self.unify_rows(store, a, b),
+
             // Rigid variables must be identical (already handled by a == b above,
             // but included for clarity).
             (TypeKind::RigidTypeVariable(v1), TypeKind::RigidTypeVariable(v2)) if v1 == v2 => {
@@ -202,11 +215,141 @@ impl UnificationTable {
         var: MetaTypeVariableId,
         ty: TypeId,
     ) -> Result<(), UnificationError> {
+        // Predicative restriction: inference metas range over monotypes only.
+        // Solving `?a := forall ...` (or any type containing a `forall`) would
+        // enable impredicative instantiation.
+        if self.is_forall_type(store, ty) {
+            return Err(UnificationError::TypeMismatch {
+                expected: ty,
+                found: ty,
+            });
+        }
+
         if self.occurs_in_type(store, var, ty) {
             return Err(UnificationError::OccursCheck { var, ty });
         }
         self.type_solutions[var.0 as usize] = Some(ty);
         Ok(())
+    }
+
+    fn unify_rows(
+        &mut self,
+        store: &mut TypeStore,
+        a: TypeId,
+        b: TypeId,
+    ) -> Result<(), UnificationError> {
+        let a = self.shallow_resolve_type(store, a);
+        let b = self.shallow_resolve_type(store, b);
+
+        if a == b {
+            return Ok(());
+        }
+
+        let a_kind = store.get_type(a).kind.clone();
+        let b_kind = store.get_type(b).kind.clone();
+
+        match (&a_kind, &b_kind) {
+            (TypeKind::MetaTypeVariable(var), _) => return self.solve_type_var(store, *var, b),
+            (_, TypeKind::MetaTypeVariable(var)) => return self.solve_type_var(store, *var, a),
+            (TypeKind::Error, _) | (_, TypeKind::Error) => return Ok(()),
+            _ => {}
+        }
+
+        let mut fields_a = BTreeMap::new();
+        let mut fields_b = BTreeMap::new();
+        let tail_a = self.collect_row_fields(store, a, &mut fields_a)?;
+        let tail_b = self.collect_row_fields(store, b, &mut fields_b)?;
+
+        let shared = fields_a
+            .keys()
+            .filter(|label| fields_b.contains_key(*label))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for label in shared {
+            let field_a = fields_a
+                .remove(&label)
+                .expect("shared field should exist in left row map");
+            let field_b = fields_b
+                .remove(&label)
+                .expect("shared field should exist in right row map");
+            self.unify_types(store, field_a, field_b)?;
+        }
+
+        let tail_a = tail_a.unwrap_or_else(|| store.mk_row_empty());
+        let tail_b = tail_b.unwrap_or_else(|| store.mk_row_empty());
+
+        let extras_a_empty = fields_a.is_empty();
+        let extras_b_empty = fields_b.is_empty();
+
+        match (extras_a_empty, extras_b_empty) {
+            (true, true) => self.unify_types(store, tail_a, tail_b),
+            (false, true) => {
+                let resolved_tail_b = self.shallow_resolve_type(store, tail_b);
+                if matches!(store.get_type(resolved_tail_b).kind, TypeKind::RowEmpty) {
+                    Err(UnificationError::TypeMismatch {
+                        expected: a,
+                        found: b,
+                    })
+                } else {
+                    let rest = self.mk_row_from_fields(store, fields_a, tail_a);
+                    self.unify_types(store, tail_b, rest)
+                }
+            }
+            (true, false) => {
+                let resolved_tail_a = self.shallow_resolve_type(store, tail_a);
+                if matches!(store.get_type(resolved_tail_a).kind, TypeKind::RowEmpty) {
+                    Err(UnificationError::TypeMismatch {
+                        expected: a,
+                        found: b,
+                    })
+                } else {
+                    let rest = self.mk_row_from_fields(store, fields_b, tail_b);
+                    self.unify_types(store, tail_a, rest)
+                }
+            }
+            (false, false) => {
+                let (_, fresh_tail) = self.fresh_type_var(store, store.kind_row());
+                let rhs_for_a = self.mk_row_from_fields(store, fields_b, fresh_tail);
+                let rhs_for_b = self.mk_row_from_fields(store, fields_a, fresh_tail);
+                self.unify_types(store, tail_a, rhs_for_a)?;
+                self.unify_types(store, tail_b, rhs_for_b)
+            }
+        }
+    }
+
+    fn collect_row_fields(
+        &mut self,
+        store: &mut TypeStore,
+        row: TypeId,
+        fields: &mut BTreeMap<String, TypeId>,
+    ) -> Result<Option<TypeId>, UnificationError> {
+        let row = self.shallow_resolve_type(store, row);
+        let row_data = store.get_type(row).kind.clone();
+
+        match row_data {
+            TypeKind::RowEmpty | TypeKind::Error => Ok(None),
+            TypeKind::RowExtend { label, field, tail } => {
+                if let Some(existing) = fields.insert(label, field) {
+                    self.unify_types(store, existing, field)?;
+                }
+                self.collect_row_fields(store, tail, fields)
+            }
+            _ => Ok(Some(row)),
+        }
+    }
+
+    fn mk_row_from_fields(
+        &mut self,
+        store: &mut TypeStore,
+        fields: BTreeMap<String, TypeId>,
+        tail: TypeId,
+    ) -> TypeId {
+        let mut row = tail;
+        for (label, field) in fields.into_iter().rev() {
+            row = store.mk_row_extend(label, field, row);
+        }
+        row
     }
 
     /// Check whether `var` occurs anywhere inside `ty` (would create infinite
@@ -218,6 +361,11 @@ impl UnificationTable {
             TypeKind::Application(f, a) => {
                 self.occurs_in_type(store, var, *f) || self.occurs_in_type(store, var, *a)
             }
+            TypeKind::Record(row) => self.occurs_in_type(store, var, *row),
+            TypeKind::RowEmpty => false,
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.occurs_in_type(store, var, *field) || self.occurs_in_type(store, var, *tail)
+            }
             TypeKind::Forall(_, preds, body) => {
                 self.occurs_in_type(store, var, *body)
                     || preds.iter().any(|p| {
@@ -228,6 +376,11 @@ impl UnificationTable {
             }
             TypeKind::Constructor(_) | TypeKind::RigidTypeVariable(_) | TypeKind::Error => false,
         }
+    }
+
+    fn is_forall_type(&self, store: &TypeStore, ty: TypeId) -> bool {
+        let ty = self.shallow_resolve_type(store, ty);
+        matches!(store.get_type(ty).kind, TypeKind::Forall(_, _, _))
     }
 
     // --- Kind unification ---
@@ -253,7 +406,7 @@ impl UnificationTable {
             (Kind::Variable(var), _) => self.solve_kind_var(store, *var, b),
             (_, Kind::Variable(var)) => self.solve_kind_var(store, *var, a),
 
-            (Kind::Type, Kind::Type) => Ok(()),
+            (Kind::Type, Kind::Type) | (Kind::Row, Kind::Row) => Ok(()),
 
             (Kind::Arrow(from1, to1), Kind::Arrow(from2, to2)) => {
                 let (from1, to1, from2, to2) = (*from1, *to1, *from2, *to2);
@@ -292,7 +445,7 @@ impl UnificationTable {
             Kind::Arrow(from, to) => {
                 self.occurs_in_kind(store, var, *from) || self.occurs_in_kind(store, var, *to)
             }
-            Kind::Type | Kind::Error => false,
+            Kind::Type | Kind::Row | Kind::Error => false,
         }
     }
 
@@ -309,6 +462,7 @@ impl UnificationTable {
             TypeKind::MetaTypeVariable(_)
             | TypeKind::Constructor(_)
             | TypeKind::RigidTypeVariable(_)
+            | TypeKind::RowEmpty
             | TypeKind::Error => resolved,
 
             TypeKind::Application(f, a) => {
@@ -319,6 +473,25 @@ impl UnificationTable {
                 } else {
                     let zk = self.zonk_kind(store, type_data.kind_id);
                     store.mk_application(zf, za, zk)
+                }
+            }
+
+            TypeKind::Record(row) => {
+                let zrow = self.zonk_type(store, row);
+                if zrow == row {
+                    resolved
+                } else {
+                    store.mk_record(zrow)
+                }
+            }
+
+            TypeKind::RowExtend { label, field, tail } => {
+                let zfield = self.zonk_type(store, field);
+                let ztail = self.zonk_type(store, tail);
+                if zfield == field && ztail == tail {
+                    resolved
+                } else {
+                    store.mk_row_extend(label, zfield, ztail)
                 }
             }
 
@@ -361,7 +534,7 @@ impl UnificationTable {
         let kind_data = store.get_kind(resolved).clone();
 
         match kind_data {
-            Kind::Variable(_) | Kind::Type | Kind::Error => resolved,
+            Kind::Variable(_) | Kind::Type | Kind::Row | Kind::Error => resolved,
             Kind::Arrow(from, to) => {
                 let zfrom = self.zonk_kind(store, from);
                 let zto = self.zonk_kind(store, to);

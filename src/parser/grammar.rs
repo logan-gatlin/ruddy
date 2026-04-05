@@ -924,8 +924,17 @@ impl<'a> Parser<'a> {
             self.bump();
 
             let mut fields = Vec::new();
+            let mut open = false;
             if !self.eat_punct(Punct::RBrace) {
                 loop {
+                    if self.eat_operator(Operator::Spread) {
+                        open = true;
+                        if !self.at_punct(Punct::RBrace) {
+                            self.error_current("`..` must be the final element in a record pattern");
+                        }
+                        break;
+                    }
+
                     let field_start = self.pos;
                     let name = self.expect_ident_node("record pattern field");
                     let value = if self.eat_punct(Punct::Equals) {
@@ -957,6 +966,7 @@ impl<'a> Parser<'a> {
 
             return Some(ast::Pattern::Record {
                 fields,
+                open,
                 range: self.range_from(start),
             });
         }
@@ -1757,7 +1767,10 @@ impl<'a> Parser<'a> {
         match boundary {
             ExprBoundary::Statement => {
                 if self.at_keyword(Keyword::Bundle)
-                    && matches!(self.peek_kind(1), Some(TokenKind::Operator(Operator::PathSep)))
+                    && matches!(
+                        self.peek_kind(1),
+                        Some(TokenKind::Operator(Operator::PathSep))
+                    )
                 {
                     false
                 } else {
@@ -1935,14 +1948,19 @@ impl<'a> Parser<'a> {
         if let Some(target) = self.parse_use_target() {
             Some(target)
         } else {
-            self.error_current(format!("expected identifier, path, or `bundle` in {context}"));
+            self.error_current(format!(
+                "expected identifier, path, or `bundle` in {context}"
+            ));
             None
         }
     }
 
     fn parse_use_target(&mut self) -> Option<ast::NameRef> {
         if self.at_keyword(Keyword::Bundle)
-            && !matches!(self.peek_kind(1), Some(TokenKind::Operator(Operator::PathSep)))
+            && !matches!(
+                self.peek_kind(1),
+                Some(TokenKind::Operator(Operator::PathSep))
+            )
         {
             let start = self.pos;
             self.bump();
