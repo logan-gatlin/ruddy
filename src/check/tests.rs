@@ -4,7 +4,7 @@ use crate::ty::store::TypeStore;
 use crate::ty::typed_ir as tir;
 use crate::ty::*;
 
-use super::{check_text, UnificationError, UnificationTable};
+use super::{UnificationError, UnificationTable, check_text};
 
 // ---------------------------------------------------------------------------
 // TypeStore tests
@@ -672,7 +672,7 @@ fn infer_sum_constructors_and_match() {
         "hm_sum_match.hc".to_owned(),
         [
             "bundle demo",
-            "type Option: a = | Some a | None",
+            "type Option = fn a => | Some a | None",
             "let some = Option::Some 1",
             "let unwrapped = match some with",
             "  | Option::Some x => x",
@@ -828,7 +828,7 @@ fn adding_unrelated_record_type_does_not_change_existing_inference() {
         "hm_record_stability_extended.hc".to_owned(),
         [
             "bundle demo",
-            "type Other: t = {x: t}",
+            "type Other = fn t => {x: t}",
             "let get = fn r => r.x",
             "let a = get {x = 1}",
         ]
@@ -884,8 +884,8 @@ fn struct_spread_declarations_are_checked_as_closed_records() {
         "hm_record_spread_decl.hc".to_owned(),
         [
             "bundle demo",
-            "type Base: a = {x: a}",
-            "type Pair: a b = {..Base a, y: b}",
+            "type Base = fn a => {x: a}",
+            "type Pair = fn a b => {..Base a, y: b}",
             "let get = fn r => r.y",
             "let value = get {x = 1, y = true}",
         ]
@@ -922,9 +922,9 @@ fn alias_types_are_transparent_in_record_spreads() {
         "hm_alias_record_spread_decl.hc".to_owned(),
         [
             "bundle demo",
-            "type Base: a = {x: a}",
-            "type ~Alias: a = Base a",
-            "type Pair: a b = {..Alias a, y: b}",
+            "type Base = fn a => {x: a}",
+            "type ~Alias = fn a => Base a",
+            "type Pair = fn a b => {..Alias a, y: b}",
             "let get = fn r => r.y",
             "let value = get {x = 1, y = true}",
         ]
@@ -961,7 +961,7 @@ fn alias_type_application_reports_too_many_arguments() {
         "hm_alias_arity_mismatch.hc".to_owned(),
         [
             "bundle demo",
-            "type ~Pair: a b = (a, b)",
+            "type ~Pair = fn a b => (a, b)",
             "type ~Bad = Pair _ _ _",
         ]
         .join("\n"),
@@ -973,6 +973,364 @@ fn alias_type_application_reports_too_many_arguments() {
             .message
             .contains("expects 2 type argument(s), found 3")),
         "expected alias arity diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn bare_alias_annotation_reports_kind_mismatch() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "core_bundle_alias_annotation_kind_mismatch.hc".to_owned(),
+        ["bundle core", "type ~Id = fn a => a", "let a : Id = ()"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected kind mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn bare_alias_name_is_a_first_class_constructor() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_alias_bare_name_constructor.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~Id = fn a => a",
+            "type ~Lift :: Type -> Type = Id",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn alias_partial_application_stays_higher_kinded() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_alias_partial_application.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~Const = fn a b => a",
+            "type ~Left = Const ()",
+            "type ~Use = Left ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn hk_alias_with_explicit_marker_type_params_checks() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_alias_explicit_markers.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~Compose = fn (f :: Type -> Type) (g :: Type -> Type) a => f (g a)",
+            "type ~MaybeUnit = Compose [] [] ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn hk_binders_without_markers_are_inferred_in_type_aliases() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_alias_inferred_binders.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~MapLike = fn f a b => (a -> b) -> f a -> f b",
+            "type ~Use = MapLike [] () ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn opaque_nominal_partial_application_infers_higher_kind() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_opaque_nominal_partial_apply.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Result = fn a b => | Ok a | Err b",
+            "type Option = Result ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn opaque_nominal_partial_application_can_be_used_downstream() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_opaque_nominal_partial_apply_use.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Result = fn a b => | Ok a | Err b",
+            "type Option = Result ()",
+            "type ~Use = Option ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn opaque_nominal_partial_application_accepts_matching_declared_kind() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_opaque_nominal_declared_kind_ok.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Result = fn a b => | Ok a | Err b",
+            "type Option :: Type -> Type = Result ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn opaque_nominal_can_wrap_first_class_type_lambda() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_opaque_nominal_type_lambda.hc".to_owned(),
+        ["bundle demo", "type Id = (fn a => a)", "type ~Use = Id ()"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn forall_hk_marker_bindings_type_check() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_forall_hk_marker.hc".to_owned(),
+        [
+            "bundle demo",
+            "let idf: for a (f :: Type -> Type) in f a -> f a = fn x => x",
+            "let value = idf [1]",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn applying_non_constructor_at_type_level_reports_kind_mismatch() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_kind_mismatch_non_constructor.hc".to_owned(),
+        ["bundle demo", "type ~Bad = fn a => Integer a"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected kind mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn unconstrained_alias_binder_kinds_default_to_type() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_unconstrained_defaults_to_type.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~K = fn f => f",
+            "type ~Good = K Integer",
+            "type ~Bad = K []",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected kind mismatch diagnostic from `K []`, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn unconstrained_opaque_nominal_binder_kinds_default_to_type() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_hk_opaque_nominal_unconstrained_defaults_to_type.hc".to_owned(),
+        [
+            "bundle demo",
+            "type K = fn f => f",
+            "type ~Good = K ()",
+            "type ~Bad = K []",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected kind mismatch diagnostic from `K []`, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn type_lambda_application_beta_reduces() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_type_lambda_beta_reduce.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~IdUnit = (fn a => a) ()",
+            "let value: IdUnit = ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn declaration_kind_mismatches_are_reported() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_decl_kind_mismatch.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Option :: Type = fn a => | Some a | None",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected declaration kind mismatch diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn opaque_nominal_declared_kind_mismatches_are_reported() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_opaque_nominal_decl_kind_mismatch.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Result = fn a b => | Ok a | Err b",
+            "type Option :: Type = Result ()",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind mismatch")),
+        "expected declaration kind mismatch diagnostic, got: {:?}",
         checked.diagnostics
     );
 }

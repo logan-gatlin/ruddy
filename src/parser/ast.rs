@@ -31,6 +31,45 @@ pub struct Identifier {
     pub range: TextRange,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+pub struct TypeBinder {
+    pub name: Identifier,
+    pub kind: Option<KindExpr>,
+    pub range: TextRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+pub enum KindExpr {
+    Type {
+        range: TextRange,
+    },
+    Row {
+        range: TextRange,
+    },
+    Grouped {
+        inner: Box<KindExpr>,
+        range: TextRange,
+    },
+    Arrow {
+        param: Box<KindExpr>,
+        result: Box<KindExpr>,
+        range: TextRange,
+    },
+    Error(ErrorNode),
+}
+
+impl KindExpr {
+    pub fn range(&self) -> TextRange {
+        match self {
+            Self::Type { range }
+            | Self::Row { range }
+            | Self::Grouped { range, .. }
+            | Self::Arrow { range, .. } => *range,
+            Self::Error(error) => error.range,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update)]
 pub enum PathRoot {
     Relative,
@@ -115,7 +154,7 @@ pub enum Statement {
     },
     Type {
         name: Option<Identifier>,
-        params: Vec<Identifier>,
+        declared_kind: Option<KindExpr>,
         kind: TypeStatementKind,
         range: TextRange,
     },
@@ -182,6 +221,11 @@ pub enum TypeStatementKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub enum TypeDefinition {
+    Lambda {
+        params: Vec<TypeBinder>,
+        body: Box<TypeDefinition>,
+        range: TextRange,
+    },
     Struct {
         members: Vec<RecordTypeMember>,
         range: TextRange,
@@ -196,7 +240,9 @@ pub enum TypeDefinition {
 impl TypeDefinition {
     pub fn range(&self) -> TextRange {
         match self {
-            Self::Struct { range, .. } | Self::Sum { range, .. } => *range,
+            Self::Lambda { range, .. } | Self::Struct { range, .. } | Self::Sum { range, .. } => {
+                *range
+            }
             Self::Expr(expr) => expr.range(),
         }
     }
@@ -280,9 +326,14 @@ impl ImplItem {
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub enum TypeExpr {
     Forall {
-        params: Vec<Identifier>,
+        params: Vec<TypeBinder>,
         body: Box<TypeExpr>,
         constraints: Vec<TraitConstraint>,
+        range: TextRange,
+    },
+    Lambda {
+        params: Vec<TypeBinder>,
+        body: Box<TypeExpr>,
         range: TextRange,
     },
     Function {
@@ -317,6 +368,7 @@ impl TypeExpr {
     pub fn range(&self) -> TextRange {
         match self {
             Self::Forall { range, .. }
+            | Self::Lambda { range, .. }
             | Self::Function { range, .. }
             | Self::Apply { range, .. }
             | Self::Grouped { range, .. }
@@ -870,6 +922,7 @@ pub fn walk_type_expr(type_expr: &TypeExpr, visitor: &mut AstVisitor) {
                 }
             }
         }
+        TypeExpr::Lambda { body, .. } => walk_type_expr(body, visitor),
         TypeExpr::Function { param, result, .. } => {
             walk_type_expr(param, visitor);
             walk_type_expr(result, visitor);
@@ -996,6 +1049,7 @@ pub fn walk_sexpr(sexpr: &SExpr, visitor: &mut AstVisitor) {
 fn walk_type_definition(definition: &TypeDefinition, visitor: &mut AstVisitor) {
     (visitor.visit_type_def)(definition);
     match definition {
+        TypeDefinition::Lambda { body, .. } => walk_type_definition(body, visitor),
         TypeDefinition::Expr(expr) => walk_type_expr(expr, visitor),
         TypeDefinition::Struct { members, .. } => {
             for member in members {

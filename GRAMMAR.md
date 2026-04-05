@@ -34,14 +34,14 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 <use_statement> ::= "use" (<ident> | <path> | "bundle") ("as" <ident>)?
 
 <type_statement>         ::= <nominal_type_statement> | <alias_type_statement>
-<nominal_type_statement> ::= "type" <ident> <type_params>? "=" <type_def>
-<alias_type_statement>   ::= "type" "~" <ident> <type_params>? "=" <type_expr>
+<nominal_type_statement> ::= "type" <ident> ("::" <kind_expr>)? "=" <type_def>
+<alias_type_statement>   ::= "type" "~" <ident> ("::" <kind_expr>)? "=" <type_expr>
 
 <trait_statement>      ::= <trait_def_statement> | <trait_alias_statement>
-<trait_def_statement>  ::= "trait" <ident> <type_params>? "=" <trait_item_decl>* "end"
+<trait_def_statement>  ::= "trait" <ident> <trait_params>? "=" <trait_item_decl>* "end"
 <trait_alias_statement> ::= "trait" "~" <ident> "=" (<ident> | <path>)
 
-<type_params> ::= ":" <ident>+
+<trait_params> ::= ":" <ident>+
 
 <impl_statement> ::= "impl" (<ident> | <path>) <type_expr> ("," <type_expr>)* ","? "=" <impl_item_def>* "end"
 
@@ -68,7 +68,10 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 ```bnf
 <type_def> ::= <record_type_def>
              | <sum_type_def>
+             | <type_def_lambda>
              | <type_expr>
+
+<type_def_lambda> ::= "fn" <type_lambda_param>+ "=>" <type_def>
 
 <record_type_def>  ::= "{" <struct_member_list>? "}"
 <struct_member_list> ::= <struct_member> ("," <struct_member>)* ","?
@@ -82,8 +85,9 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 <variant>      ::= <ident> <type_expr>?
 ```
 
-- `type Name ... = <type_def>` defines a nominal named type.
-- `type ~Name ... = <type_expr>` defines a structural type alias.
+- `type Name = <type_def>` defines a nominal named type.
+- `type ~Name = <type_expr>` defines a structural type alias.
+- Top-level type lambdas live on the right-hand side: `type Name = fn a => ...`.
 - `trait Name ... = ... end` defines a trait.
 - `trait ~Alias = <ident|path>` defines a trait alias.
 - Recursive type aliases are rejected.
@@ -92,11 +96,17 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 ## Type Expressions
 ```bnf
 <type_expr> ::= <type_forall_expr>
+              | <type_lambda_expr>
               | <type_fn_expr>
 
-<type_forall_expr> ::= "for" <ident>+
+<type_forall_expr> ::= "for" <type_lambda_param>+
                        "in" <type_expr>
                        ("where" <trait_constraint_list>)?
+
+<type_lambda_expr> ::= "fn" <type_lambda_param>+ "=>" <type_expr>
+
+<type_lambda_param> ::= <ident>
+                      | "(" <ident> "::" <kind_expr> ")"
 
 <trait_constraint_list> ::= <trait_constraint> ("," <trait_constraint>)* ","?
 <trait_constraint>      ::= (<ident> | <path>) <type_atom>*
@@ -112,12 +122,21 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
               | "[" "]"
 
 <type_tuple_elems> ::= <type_expr> "," (<type_expr> ("," <type_expr>)*)? ","?
+
+<kind_expr> ::= <kind_atom> ("->" <kind_expr>)?
+
+<kind_atom> ::= "Type"
+              | "Row"
+              | "(" <kind_expr> ")"
 ```
 
 - Type application is left-associative: `A B C` means `(A B) C`.
 - `->` is right-associative: `A -> B -> C` means `A -> (B -> C)`.
+- Kind arrows are right-associative: `Type -> Type -> Row` means `Type -> (Type -> Row)`.
 - `(T)` is grouping.
 - `(T,)` is a 1-tuple.
+- Annotated `for` binders and annotated type-lambda binders must be parenthesized.
+- `Type` and `Row` are contextual kind names only inside `<kind_expr>`.
 
 ## Expressions
 ```bnf

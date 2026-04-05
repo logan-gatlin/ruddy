@@ -64,6 +64,8 @@ pub enum TypeKind {
     MetaTypeVariable(MetaTypeVariableId),
     /// Saturated or unsaturated type constructor.
     Constructor(TypeConstructor),
+    /// First-class unary type lambda.
+    Lambda(TypeBinder, TypeId),
     /// Type application (`func arg`), represented explicitly.
     Application(TypeId, TypeId),
     /// Structural record type whose payload is a row.

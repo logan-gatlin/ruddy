@@ -294,7 +294,7 @@ impl<'a> Parser<'a> {
 
         let is_alias = self.eat_punct(Punct::Tilde);
         let name = self.expect_ident_node("type name");
-        let params = self.parse_type_params_opt();
+        let declared_kind = self.parse_kind_annotation_opt();
         self.expect_punct(Punct::Equals, "expected `=` in type statement");
 
         let kind = if is_alias {
@@ -309,7 +309,7 @@ impl<'a> Parser<'a> {
 
         ast::Statement::Type {
             name,
-            params,
+            declared_kind,
             kind,
             range: self.range_from(start),
         }
@@ -516,13 +516,151 @@ impl<'a> Parser<'a> {
         params
     }
 
+    fn parse_kind_annotation_opt(&mut self) -> Option<ast::KindExpr> {
+        if self.eat_operator(Operator::PathSep) {
+            Some(self.parse_kind_expr())
+        } else {
+            None
+        }
+    }
+
+    fn parse_kind_expr(&mut self) -> ast::KindExpr {
+        let mut expr = if let Some(expr) = self.parse_kind_atom() {
+            expr
+        } else {
+            let error_start = self.pos;
+            self.error_current("expected kind expression");
+            return ast::KindExpr::Error(self.error_node(error_start));
+        };
+
+        if self.eat_operator(Operator::Arrow) {
+            let result = self.parse_kind_expr();
+            let range = self.merge_ranges(expr.range(), result.range());
+            expr = ast::KindExpr::Arrow {
+                param: Box::new(expr),
+                result: Box::new(result),
+                range,
+            };
+        }
+
+        expr
+    }
+
+    fn parse_kind_atom(&mut self) -> Option<ast::KindExpr> {
+        if self.at_ident_token() {
+            let identifier = self.eat_ident_node()?;
+            return match self.identifier_text(&identifier).as_deref() {
+                Some("Type") => Some(ast::KindExpr::Type {
+                    range: identifier.range,
+                }),
+                Some("Row") => Some(ast::KindExpr::Row {
+                    range: identifier.range,
+                }),
+                _ => {
+                    self.error_current("expected kind expression");
+                    Some(ast::KindExpr::Error(ast::ErrorNode::new(identifier.range)))
+                }
+            };
+        }
+
+        if self.at_punct(Punct::LParen) {
+            let start = self.pos;
+            self.bump();
+            let inner = self.parse_kind_expr();
+            self.expect_punct(Punct::RParen, "expected `)` to close kind expression");
+            return Some(ast::KindExpr::Grouped {
+                inner: Box::new(inner),
+                range: self.range_from(start),
+            });
+        }
+
+        None
+    }
+
+    fn type_binder_starts(&self) -> bool {
+        self.at_ident_token() || self.at_punct(Punct::LParen)
+    }
+
+    fn parse_type_binders(&mut self, context: &str) -> Vec<ast::TypeBinder> {
+        let mut params = Vec::new();
+
+        if let Some(param) = self.parse_type_binder(context) {
+            params.push(param);
+        } else {
+            self.error_current(format!("expected identifier for {context}"));
+            return params;
+        }
+
+        while self.type_binder_starts() {
+            if let Some(param) = self.parse_type_binder(context) {
+                params.push(param);
+            } else {
+                break;
+            }
+        }
+
+        params
+    }
+
+    fn parse_type_binder(&mut self, context: &str) -> Option<ast::TypeBinder> {
+        if self.at_ident_token() {
+            let start = self.pos;
+            let name = self.expect_ident_node(context)?;
+            return Some(ast::TypeBinder {
+                name,
+                kind: None,
+                range: self.range_from(start),
+            });
+        }
+
+        if !self.at_punct(Punct::LParen) {
+            return None;
+        }
+
+        let start = self.pos;
+        self.bump();
+        let name = self.expect_ident_node(context)?;
+        let kind = if self.eat_operator(Operator::PathSep) {
+            Some(self.parse_kind_expr())
+        } else {
+            self.error_current("expected `::` in annotated type binder");
+            None
+        };
+        self.expect_punct(Punct::RParen, "expected `)` to close annotated type binder");
+
+        Some(ast::TypeBinder {
+            name,
+            kind,
+            range: self.range_from(start),
+        })
+    }
+
     fn parse_type_def(&mut self) -> ast::TypeDefinition {
-        if self.at_punct(Punct::LBrace) {
+        if self.at_keyword(Keyword::Fn) {
+            self.parse_type_def_lambda()
+        } else if self.at_punct(Punct::LBrace) {
             self.parse_record_type_def()
         } else if self.at_punct(Punct::Pipe) {
             self.parse_sum_type_def()
         } else {
             ast::TypeDefinition::Expr(self.parse_type_expr())
+        }
+    }
+
+    fn parse_type_def_lambda(&mut self) -> ast::TypeDefinition {
+        let start = self.pos;
+        self.bump();
+        let params = self.parse_type_binders("type lambda parameter");
+        self.expect_operator(
+            Operator::FatArrow,
+            "expected `=>` in type definition lambda",
+        );
+        let body = self.parse_type_def();
+
+        ast::TypeDefinition::Lambda {
+            params,
+            body: Box::new(body),
+            range: self.range_from(start),
         }
     }
 
@@ -607,6 +745,8 @@ impl<'a> Parser<'a> {
     fn parse_type_expr(&mut self) -> ast::TypeExpr {
         if self.at_keyword(Keyword::For) {
             self.parse_type_forall_expr()
+        } else if self.at_keyword(Keyword::Fn) {
+            self.parse_type_expr_lambda()
         } else {
             self.parse_type_fn_expr()
         }
@@ -616,13 +756,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.bump();
 
-        let mut params = Vec::new();
-        if let Some(param) = self.expect_ident_node("forall type parameter") {
-            params.push(param);
-        }
-        while let Some(param) = self.eat_ident_node() {
-            params.push(param);
-        }
+        let params = self.parse_type_binders("forall type parameter");
 
         self.expect_keyword(Keyword::In, "expected `in` in forall type expression");
         let body = self.parse_type_expr();
@@ -637,6 +771,20 @@ impl<'a> Parser<'a> {
             params,
             body: Box::new(body),
             constraints,
+            range: self.range_from(start),
+        }
+    }
+
+    fn parse_type_expr_lambda(&mut self) -> ast::TypeExpr {
+        let start = self.pos;
+        self.bump();
+        let params = self.parse_type_binders("type lambda parameter");
+        self.expect_operator(Operator::FatArrow, "expected `=>` in type lambda");
+        let body = self.parse_type_expr();
+
+        ast::TypeExpr::Lambda {
+            params,
+            body: Box::new(body),
             range: self.range_from(start),
         }
     }
@@ -930,7 +1078,9 @@ impl<'a> Parser<'a> {
                     if self.eat_operator(Operator::Spread) {
                         open = true;
                         if !self.at_punct(Punct::RBrace) {
-                            self.error_current("`..` must be the final element in a record pattern");
+                            self.error_current(
+                                "`..` must be the final element in a record pattern",
+                            );
                         }
                         break;
                     }
@@ -2082,6 +2232,10 @@ impl<'a> Parser<'a> {
             self.current_kind(),
             TokenKind::Ident | TokenKind::BracketedIdent
         )
+    }
+
+    fn identifier_text(&self, identifier: &ast::Identifier) -> Option<String> {
+        identifier.range.text(self.source.contents(self.db))
     }
 
     fn eat_ident_node(&mut self) -> Option<ast::Identifier> {

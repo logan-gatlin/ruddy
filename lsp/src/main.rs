@@ -5,7 +5,7 @@ use ruddy::{
     Diagnostic as RuddyDiagnostic, DiagnosticSeverity as RuddyDiagnosticSeverity, Eng, Source,
     TextRange, check_text_fs, lower_diagnostics_fs, parse_text,
     ty::store::TypeStore,
-    ty::{TypeBinderId, TypeConstructor, TypeId, TypeKind},
+    ty::{Kind, KindId, TypeBinderId, TypeConstructor, TypeId, TypeKind},
     typed_ir as tir,
 };
 use tokio::sync::Mutex;
@@ -1059,6 +1059,15 @@ impl<'store> TypeFormatter<'store> {
             };
         }
 
+        if let TypeKind::Lambda(_, _) = &self.store.get_type(ty).kind {
+            let text = self.format_lambda_type(ty);
+            return if min_precedence > 0 {
+                format!("({text})")
+            } else {
+                text
+            };
+        }
+
         let (head, args) = self.decompose_application(ty);
         if let TypeKind::Constructor(TypeConstructor::Arrow) = &self.store.get_type(head).kind
             && args.len() == 2
@@ -1119,22 +1128,10 @@ impl<'store> TypeFormatter<'store> {
         predicates: &[ruddy::ty::TraitPredicate],
         body: TypeId,
     ) -> String {
-        let mut previous_bindings = Vec::with_capacity(binders.len());
-        let mut binder_names = Vec::with_capacity(binders.len());
-
-        for (index, binder) in binders.iter().enumerate() {
-            let name = if binder.name.is_empty() {
-                format!("t{index}")
-            } else {
-                binder.name.clone()
-            };
-
-            previous_bindings.push((binder.id, self.binder_names.insert(binder.id, name.clone())));
-            binder_names.push(name);
-        }
+        let (binder_names, previous_bindings) = self.enter_binders(binders);
 
         let body_text = self.format_type_prec(body, 0);
-        let constraint_prefix = if predicates.is_empty() {
+        let constraint_suffix = if predicates.is_empty() {
             String::new()
         } else {
             let constraints = predicates
@@ -1142,24 +1139,26 @@ impl<'store> TypeFormatter<'store> {
                 .map(|predicate| self.format_predicate(predicate))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{constraints} => ")
+            format!(" where {constraints}")
         };
 
-        for (binder_id, previous) in previous_bindings {
-            if let Some(previous_name) = previous {
-                self.binder_names.insert(binder_id, previous_name);
-            } else {
-                self.binder_names.remove(&binder_id);
-            }
-        }
+        self.leave_binders(previous_bindings);
 
         let quantifier_prefix = if binder_names.is_empty() {
             String::new()
         } else {
-            format!("forall {}. ", binder_names.join(" "))
+            format!("for {} in ", binder_names.join(" "))
         };
 
-        format!("{quantifier_prefix}{constraint_prefix}{body_text}")
+        format!("{quantifier_prefix}{body_text}{constraint_suffix}")
+    }
+
+    fn format_lambda_type(&mut self, ty: TypeId) -> String {
+        let (binders, body) = self.collect_lambda_chain(ty);
+        let (binder_names, previous_bindings) = self.enter_binders(&binders);
+        let body_text = self.format_type_prec(body, 0);
+        self.leave_binders(previous_bindings);
+        format!("fn {} => {body_text}", binder_names.join(" "))
     }
 
     fn format_predicate(&mut self, predicate: &ruddy::ty::TraitPredicate) -> String {
@@ -1198,6 +1197,7 @@ impl<'store> TypeFormatter<'store> {
             TypeKind::Forall(binders, predicates, body) => {
                 self.format_forall_type(binders, predicates, *body)
             }
+            TypeKind::Lambda(_, _) => self.format_lambda_type(ty),
             TypeKind::Error => "<error>".to_owned(),
             TypeKind::Application(_, _) => unreachable!("application should be decomposed first"),
         }
@@ -1264,6 +1264,80 @@ impl<'store> TypeFormatter<'store> {
 
         arguments.reverse();
         (head, arguments)
+    }
+
+    fn collect_lambda_chain(&self, ty: TypeId) -> (Vec<ruddy::ty::TypeBinder>, TypeId) {
+        let mut binders = Vec::new();
+        let mut body = ty;
+
+        while let TypeKind::Lambda(binder, next_body) = &self.store.get_type(body).kind {
+            binders.push(binder.clone());
+            body = *next_body;
+        }
+
+        (binders, body)
+    }
+
+    fn enter_binders(
+        &mut self,
+        binders: &[ruddy::ty::TypeBinder],
+    ) -> (Vec<String>, Vec<(TypeBinderId, Option<String>)>) {
+        let mut previous_bindings = Vec::with_capacity(binders.len());
+        let mut binder_names = Vec::with_capacity(binders.len());
+
+        for (index, binder) in binders.iter().enumerate() {
+            let name = if binder.name.is_empty() {
+                format!("t{index}")
+            } else {
+                binder.name.clone()
+            };
+
+            previous_bindings.push((binder.id, self.binder_names.insert(binder.id, name.clone())));
+            binder_names.push(self.format_binder_text(&name, binder.kind));
+        }
+
+        (binder_names, previous_bindings)
+    }
+
+    fn leave_binders(&mut self, previous_bindings: Vec<(TypeBinderId, Option<String>)>) {
+        for (binder_id, previous) in previous_bindings {
+            if let Some(previous_name) = previous {
+                self.binder_names.insert(binder_id, previous_name);
+            } else {
+                self.binder_names.remove(&binder_id);
+            }
+        }
+    }
+
+    fn format_binder_text(&self, name: &str, kind: KindId) -> String {
+        if matches!(self.store.get_kind(kind), Kind::Type) {
+            name.to_owned()
+        } else {
+            format!("({name} :: {})", self.format_kind(kind))
+        }
+    }
+
+    fn format_kind(&self, kind: KindId) -> String {
+        self.format_kind_prec(kind, 0)
+    }
+
+    fn format_kind_prec(&self, kind: KindId, min_precedence: u8) -> String {
+        match self.store.get_kind(kind) {
+            Kind::Type => "Type".to_owned(),
+            Kind::Row => "Row".to_owned(),
+            Kind::Variable(var) => format!("?k{}", var.0),
+            Kind::Error => "<kind error>".to_owned(),
+            Kind::Arrow(from, to) => {
+                let from = self.format_kind_prec(*from, 1);
+                let to = self.format_kind_prec(*to, 0);
+                let text = format!("{from} -> {to}");
+                if min_precedence > 0 {
+                    format!("({text})")
+                } else {
+                    text
+                }
+            }
+        }
     }
 }
 
@@ -1401,8 +1475,8 @@ mod tests {
         let uri = Url::parse("file:///tmp/type_hover_record.hc").expect("valid uri");
         let text = ["bundle demo", "let get = fn r => r.x"].join("\n");
 
-        let hover =
-            collect_type_hover(&uri, &text, Position::new(1, 5)).expect("expected hover information");
+        let hover = collect_type_hover(&uri, &text, Position::new(1, 5))
+            .expect("expected hover information");
 
         let HoverContents::Markup(content) = hover.contents else {
             panic!("expected markdown hover content");
@@ -1412,6 +1486,53 @@ mod tests {
             content.value.contains("{x:"),
             "expected record type in hover content, got: {}",
             content.value
+        );
+    }
+
+    #[test]
+    fn format_type_for_hover_uses_type_lambda_surface_syntax() {
+        let mut store = TypeStore::new();
+        let kind = store.kind_type();
+        let binder = ruddy::ty::TypeBinder {
+            id: TypeBinderId(0),
+            name: "a".to_owned(),
+            kind,
+            range: TextRange::Generated,
+        };
+        let rigid = store.mk_rigid(binder.id, kind);
+        let lambda = store.mk_lambda(binder, rigid);
+
+        assert_eq!(format_type_for_hover(&store, lambda), "fn a => a");
+    }
+
+    #[test]
+    fn format_type_for_hover_uses_kind_annotations_in_forall_binders() {
+        let mut store = TypeStore::new();
+        let type_kind = store.kind_type();
+        let higher_kind = store.kind_arrow(type_kind, type_kind);
+
+        let f_binder = ruddy::ty::TypeBinder {
+            id: TypeBinderId(0),
+            name: "f".to_owned(),
+            kind: higher_kind,
+            range: TextRange::Generated,
+        };
+        let a_binder = ruddy::ty::TypeBinder {
+            id: TypeBinderId(1),
+            name: "a".to_owned(),
+            kind: type_kind,
+            range: TextRange::Generated,
+        };
+
+        let f = store.mk_rigid(f_binder.id, higher_kind);
+        let a = store.mk_rigid(a_binder.id, type_kind);
+        let fa = store.mk_application(f, a, type_kind);
+        let arrow = store.mk_arrow(fa, fa);
+        let ty = store.mk_forall(vec![f_binder, a_binder], Vec::new(), arrow);
+
+        assert_eq!(
+            format_type_for_hover(&store, ty),
+            "for (f :: Type -> Type) a in f a -> f a"
         );
     }
 

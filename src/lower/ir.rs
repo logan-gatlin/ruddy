@@ -87,7 +87,24 @@ pub struct LocalId(pub u32);
 pub struct TypeBinder {
     pub id: LocalId,
     pub name: String,
+    pub kind_annotation: Option<KindExpr>,
     pub range: TextRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+pub enum KindExpr {
+    Type {
+        range: TextRange,
+    },
+    Row {
+        range: TextRange,
+    },
+    Arrow {
+        param: Box<KindExpr>,
+        result: Box<KindExpr>,
+        range: TextRange,
+    },
+    Error(ErrorNode),
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::Update)]
@@ -104,7 +121,7 @@ pub enum ResolvedName {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
 pub struct ErrorNode {
     pub range: TextRange,
 }
@@ -122,7 +139,7 @@ pub enum Statement {
     },
     Type {
         name: QualifiedName,
-        params: Vec<TypeBinder>,
+        declared_kind: Option<KindExpr>,
         kind: TypeStatementKind,
         range: TextRange,
     },
@@ -170,6 +187,11 @@ pub enum TypeStatementKind {
 
 #[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum TypeDefinition {
+    Lambda {
+        params: Vec<TypeBinder>,
+        body: Box<TypeDefinition>,
+        range: TextRange,
+    },
     Struct {
         members: Vec<RecordTypeMember>,
         range: TextRange,
@@ -238,6 +260,11 @@ pub enum TypeExpr {
         params: Vec<TypeBinder>,
         body: Box<TypeExpr>,
         constraints: Vec<TraitConstraint>,
+        range: TextRange,
+    },
+    Lambda {
+        params: Vec<TypeBinder>,
+        body: Box<TypeExpr>,
         range: TextRange,
     },
     Function {

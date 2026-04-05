@@ -230,7 +230,7 @@ impl<'db> ModuleLowerer<'db> {
             }
             ast::Statement::Type {
                 name,
-                params,
+                declared_kind,
                 kind,
                 range,
             } => {
@@ -267,13 +267,15 @@ impl<'db> ModuleLowerer<'db> {
                 );
 
                 let mut type_env = TypeEnv::new();
-                let lowered_params = self.lower_type_params(params, &mut type_env);
                 let opened_modules = self.opened_modules.clone();
                 let module_aliases = self.module_aliases.clone();
                 let lookup = LookupContext {
                     opened_modules: &opened_modules,
                     module_aliases: &module_aliases,
                 };
+                let lowered_declared_kind = declared_kind
+                    .as_ref()
+                    .map(|kind| self.lower_kind_expr(kind));
 
                 let lowered_kind = match kind {
                     ast::TypeStatementKind::Alias { value } => ir::TypeStatementKind::Alias {
@@ -293,7 +295,7 @@ impl<'db> ModuleLowerer<'db> {
 
                 Some(ir::Statement::Type {
                     name: type_path,
-                    params: lowered_params,
+                    declared_kind: lowered_declared_kind,
                     kind: lowered_kind,
                     range: *range,
                 })
@@ -323,7 +325,7 @@ impl<'db> ModuleLowerer<'db> {
                 );
 
                 let mut type_env = TypeEnv::new();
-                let lowered_params = self.lower_type_params(params, &mut type_env);
+                let lowered_params = self.lower_plain_type_params(params, &mut type_env);
                 let opened_modules = self.opened_modules.clone();
                 let module_aliases = self.module_aliases.clone();
                 let lookup = LookupContext {
@@ -1166,19 +1168,7 @@ impl<'db> ModuleLowerer<'db> {
                 range,
             } => {
                 type_env.push_scope();
-                let params = params
-                    .iter()
-                    .filter_map(|param| {
-                        let name = self.identifier_text_non_hole(param, "type parameter")?;
-                        let id = self.next_local();
-                        type_env.bind_local(name.clone(), id);
-                        Some(ir::TypeBinder {
-                            id,
-                            name,
-                            range: param.range,
-                        })
-                    })
-                    .collect();
+                let params = self.lower_type_binders(params, type_env);
 
                 let body = Box::new(self.lower_type_expr(body, lookup, type_env));
                 let constraints = constraints
@@ -1206,6 +1196,22 @@ impl<'db> ModuleLowerer<'db> {
                     params,
                     body,
                     constraints,
+                    range: *range,
+                }
+            }
+            ast::TypeExpr::Lambda {
+                params,
+                body,
+                range,
+            } => {
+                type_env.push_scope();
+                let params = self.lower_type_binders(params, type_env);
+                let body = Box::new(self.lower_type_expr(body, lookup, type_env));
+                type_env.pop_scope();
+
+                ir::TypeExpr::Lambda {
+                    params,
+                    body,
                     range: *range,
                 }
             }
@@ -1265,6 +1271,22 @@ impl<'db> ModuleLowerer<'db> {
         type_env: &mut TypeEnv,
     ) -> ir::TypeDefinition {
         match definition {
+            ast::TypeDefinition::Lambda {
+                params,
+                body,
+                range,
+            } => {
+                type_env.push_scope();
+                let params = self.lower_type_binders(params, type_env);
+                let body = Box::new(self.lower_type_definition(body, type_path, lookup, type_env));
+                type_env.pop_scope();
+
+                ir::TypeDefinition::Lambda {
+                    params,
+                    body,
+                    range: *range,
+                }
+            }
             ast::TypeDefinition::Struct { members, range } => ir::TypeDefinition::Struct {
                 members: members
                     .iter()
@@ -1611,7 +1633,7 @@ impl<'db> ModuleLowerer<'db> {
         ir::LiteralValue::FormatString(segments)
     }
 
-    fn lower_type_params(
+    fn lower_plain_type_params(
         &mut self,
         params: &[ast::Identifier],
         type_env: &mut TypeEnv,
@@ -1625,10 +1647,52 @@ impl<'db> ModuleLowerer<'db> {
                 Some(ir::TypeBinder {
                     id,
                     name,
+                    kind_annotation: None,
                     range: param.range,
                 })
             })
             .collect()
+    }
+
+    fn lower_type_binders(
+        &mut self,
+        params: &[ast::TypeBinder],
+        type_env: &mut TypeEnv,
+    ) -> Vec<ir::TypeBinder> {
+        params
+            .iter()
+            .filter_map(|param| {
+                let name = self.identifier_text_non_hole(&param.name, "type parameter")?;
+                let id = self.next_local();
+                type_env.bind_local(name.clone(), id);
+                Some(ir::TypeBinder {
+                    id,
+                    name,
+                    kind_annotation: param.kind.as_ref().map(|kind| self.lower_kind_expr(kind)),
+                    range: param.range,
+                })
+            })
+            .collect()
+    }
+
+    fn lower_kind_expr(&mut self, kind_expr: &ast::KindExpr) -> ir::KindExpr {
+        match kind_expr {
+            ast::KindExpr::Type { range } => ir::KindExpr::Type { range: *range },
+            ast::KindExpr::Row { range } => ir::KindExpr::Row { range: *range },
+            ast::KindExpr::Grouped { inner, .. } => self.lower_kind_expr(inner),
+            ast::KindExpr::Arrow {
+                param,
+                result,
+                range,
+            } => ir::KindExpr::Arrow {
+                param: Box::new(self.lower_kind_expr(param)),
+                result: Box::new(self.lower_kind_expr(result)),
+                range: *range,
+            },
+            ast::KindExpr::Error(error) => {
+                ir::KindExpr::Error(ir::ErrorNode { range: error.range })
+            }
+        }
     }
 
     fn bind_global(&mut self, identifier: &ast::Identifier) -> ir::ResolvedName {

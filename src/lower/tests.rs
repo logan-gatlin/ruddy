@@ -1,7 +1,8 @@
 use crate::engine::{Eng, Source};
 use crate::lower::ir::{
-    Expr, FormatStringSegment, LetStatementKind, Literal, LiteralValue, LoweredModule, Pattern,
-    ResolvedName, Statement, TypeExpr, TypeStatementKind, WasmTopLevelDeclaration,
+    Expr, FormatStringSegment, KindExpr, LetStatementKind, Literal, LiteralValue, LoweredModule,
+    Pattern, ResolvedName, Statement, TypeDefinition, TypeExpr, TypeStatementKind,
+    WasmTopLevelDeclaration,
 };
 use crate::lower::{lower_diagnostics, lower_text};
 use crate::resolver::Resolver;
@@ -1183,6 +1184,107 @@ fn underscore_type_expression_lowers_to_hole() {
         .expect("missing lowered type alias");
 
     assert!(matches!(ty_value, TypeExpr::Hole { .. }));
+}
+
+#[test]
+fn kind_annotations_and_type_lambdas_are_preserved_in_lowered_ir() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "lower_type_lambdas.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Option :: Type -> Type = fn a => | Some a | None",
+            "type ~Compose = fn (f :: Type -> Type) (g :: Type -> Type) a => f (g a)",
+            "type ~Poly = for a (f :: Type -> Type) in f a -> f a",
+        ]
+        .join("\n"),
+    );
+
+    let lowered = lower_text::<TestResolver>(&db, source);
+    let root = lowered
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing root lowered module");
+
+    let Statement::Type {
+        declared_kind: Some(KindExpr::Arrow { .. }),
+        kind: TypeStatementKind::Nominal { definition },
+        ..
+    } = &root.statements[0]
+    else {
+        panic!("expected lowered nominal type with declared kind");
+    };
+    let TypeDefinition::Lambda { params, .. } = definition else {
+        panic!("expected lowered nominal definition lambda");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(params[0].kind_annotation.is_none());
+
+    let Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Lambda { params, .. },
+            },
+        ..
+    } = &root.statements[1]
+    else {
+        panic!("expected lowered alias lambda");
+    };
+    assert_eq!(params.len(), 3);
+    assert!(matches!(
+        params[0].kind_annotation,
+        Some(KindExpr::Arrow { .. })
+    ));
+    assert!(matches!(
+        params[1].kind_annotation,
+        Some(KindExpr::Arrow { .. })
+    ));
+    assert!(params[2].kind_annotation.is_none());
+
+    let Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Forall { params, .. },
+            },
+        ..
+    } = &root.statements[2]
+    else {
+        panic!("expected lowered forall alias");
+    };
+    assert_eq!(params.len(), 2);
+    assert!(params[0].kind_annotation.is_none());
+    assert!(matches!(
+        params[1].kind_annotation,
+        Some(KindExpr::Arrow { .. })
+    ));
+}
+
+#[test]
+fn malformed_kind_annotations_emit_lower_diagnostics() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "lower_bad_kinds.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~BadFor = for a :: Type in a",
+            "type ~BadKind = fn (f :: Type ->) => f",
+        ]
+        .join("\n"),
+    );
+
+    let diagnostics = lower_diagnostics::<TestResolver>(&db, source);
+    assert!(diagnostics.iter().any(|diag| {
+        diag.message
+            .contains("expected `in` in forall type expression")
+    }));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| { diag.message.contains("expected kind expression") })
+    );
 }
 
 #[test]

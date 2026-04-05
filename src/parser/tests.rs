@@ -2,12 +2,12 @@ use salsa::Setter as _;
 
 use crate::engine::{Eng, Source};
 use crate::parser::token::{Keyword, Operator, Punct, TokenKind};
-use crate::parser::{lex_diagnostics, AstVisitor};
+use crate::parser::{AstVisitor, lex_diagnostics};
 use crate::reporting::TextSize;
 
 use super::{
-    lex_source, parse_diagnostics, parse_source, parse_text, Expr, LetStatementKind, NameRef,
-    PathRoot, Pattern, Statement,
+    Expr, KindExpr, LetStatementKind, NameRef, PathRoot, Pattern, Statement, TypeDefinition,
+    TypeExpr, TypeStatementKind, lex_source, parse_diagnostics, parse_source, parse_text,
 };
 
 #[test]
@@ -185,7 +185,7 @@ fn parse_query_handles_phase_three_declarations() {
         "demo.hc".to_owned(),
         [
             "bundle demo",
-            "type Option : a = | Some a | None",
+            "type Option = fn a => | Some a | None",
             "trait Eq : a = let eq : a -> a -> bool end",
             "impl Eq Option a = let eq = fn x y => true type Item = bool end",
             "let Some value : Option a = input",
@@ -199,15 +199,141 @@ fn parse_query_handles_phase_three_declarations() {
 }
 
 #[test]
+fn parse_query_accepts_kind_annotations_and_type_lambdas() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "type_lambdas.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Option :: Type -> Type = fn a => | Some a | None",
+            "type ~Compose = fn (f :: Type -> Type) (g :: Type -> Type) a => f (g a)",
+            "type ~Poly = for a (f :: Type -> Type) in f a -> f a",
+            "type ~Applied = (fn a => a) []",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    assert!(parse_diagnostics(&db, source).is_empty());
+
+    let Some(Statement::Type {
+        declared_kind: Some(KindExpr::Arrow { .. }),
+        kind: TypeStatementKind::Nominal { definition },
+        ..
+    }) = parsed.ast.statements.get(1)
+    else {
+        panic!("expected second statement to be a nominal type with a declared kind");
+    };
+
+    let TypeDefinition::Lambda { params, .. } = definition else {
+        panic!("expected nominal definition lambda");
+    };
+    assert_eq!(params.len(), 1);
+    assert!(params[0].kind.is_none());
+
+    let Some(Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Lambda { params, .. },
+            },
+        ..
+    }) = parsed.ast.statements.get(2)
+    else {
+        panic!("expected third statement to be a type lambda alias");
+    };
+
+    assert_eq!(params.len(), 3);
+    assert!(matches!(params[0].kind, Some(KindExpr::Arrow { .. })));
+    assert!(matches!(params[1].kind, Some(KindExpr::Arrow { .. })));
+    assert!(params[2].kind.is_none());
+
+    let Some(Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Forall { params, .. },
+            },
+        ..
+    }) = parsed.ast.statements.get(3)
+    else {
+        panic!("expected fourth statement to be a forall alias");
+    };
+    assert_eq!(params.len(), 2);
+    assert!(params[0].kind.is_none());
+    assert!(matches!(params[1].kind, Some(KindExpr::Arrow { .. })));
+
+    let Some(Statement::Type {
+        kind: TypeStatementKind::Alias {
+            value: TypeExpr::Apply { .. },
+        },
+        ..
+    }) = parsed.ast.statements.get(4)
+    else {
+        panic!("expected fifth statement to be a type lambda application");
+    };
+}
+
+#[test]
+fn parse_query_rejects_unparenthesized_annotated_binders() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bad_unparenthesized_binders.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~BadFor = for a :: Type in a",
+            "type ~BadFn = fn a :: Type => a",
+        ]
+        .join("\n"),
+    );
+
+    let diagnostics = parse_diagnostics(&db, source);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("expected `in` in forall type expression")
+    }));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("expected `=>` in type lambda") })
+    );
+}
+
+#[test]
+fn parse_query_rejects_malformed_kind_expressions() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bad_kind_exprs.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Option :: Type -> = fn a => | Some a | None",
+            "type ~Bad = fn (f :: (Type ->)) => f",
+        ]
+        .join("\n"),
+    );
+
+    let diagnostics = parse_diagnostics(&db, source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.message.contains("expected kind expression") })
+    );
+}
+
+#[test]
 fn parse_query_reports_missing_end() {
     let db = Eng::default();
     let source = Source::new(&db, "demo.hc".to_owned(), "module M = let x = 1".to_owned());
 
     let parsed = parse_source(&db, source);
     assert_eq!(parsed.ast.statements.len(), 1);
-    assert!(parse_diagnostics(&db, source)
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("expected `end`")));
+    assert!(
+        parse_diagnostics(&db, source)
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected `end`"))
+    );
 }
 
 #[test]
@@ -327,23 +453,29 @@ fn parser_outputs_ranges_with_source_origin() {
     let source = Source::new(&db, "origin.hc".to_owned(), "bundle demo\nlet =".to_owned());
 
     let lexed = lex_source(&db, source);
-    assert!(lexed
-        .tokens
-        .iter()
-        .all(|token| token.range.source() == Some(source)));
+    assert!(
+        lexed
+            .tokens
+            .iter()
+            .all(|token| token.range.source() == Some(source))
+    );
 
     let parsed = parse_source(&db, source);
     assert_eq!(parsed.ast.range.source(), Some(source));
 
     let lex_diags = lex_diagnostics(&db, source);
-    assert!(lex_diags
-        .iter()
-        .all(|diagnostic| diagnostic.range.source() == Some(source)));
+    assert!(
+        lex_diags
+            .iter()
+            .all(|diagnostic| diagnostic.range.source() == Some(source))
+    );
 
     let parse_diags = parse_diagnostics(&db, source);
-    assert!(parse_diags
-        .iter()
-        .all(|diagnostic| diagnostic.range.source() == Some(source)));
+    assert!(
+        parse_diags
+            .iter()
+            .all(|diagnostic| diagnostic.range.source() == Some(source))
+    );
 }
 
 #[test]
@@ -357,8 +489,8 @@ fn parse_query_conforms_to_broad_program_shape() {
             "module m in \"m.hc\"",
             "module Main =",
             "use root::std::core as Core",
-            "type Option : a = | Some a | None",
-            "type ~Pair : a b = (a, b)",
+            "type Option = fn a => | Some a | None",
+            "type ~Pair = fn a b => (a, b)",
             "trait Show : a = let show : a -> [] end",
             "trait ~Display = root::std::core::Show",
             "impl Show Option a = let show = fn v => v type Item = [] end",
@@ -485,12 +617,16 @@ fn parse_query_recovers_after_lex_and_parse_errors() {
     assert_eq!(parsed.ast.statements.len(), 4);
     let mut merged = lex_diagnostics(&db, source);
     merged.extend(parse_diagnostics(&db, source));
-    assert!(merged
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("unexpected character")));
-    assert!(merged
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("expected statement")));
+    assert!(
+        merged
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unexpected character"))
+    );
+    assert!(
+        merged
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected statement"))
+    );
 }
 
 #[test]

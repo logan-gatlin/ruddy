@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::ty::store::TypeStore;
 use crate::ty::{
-    Kind, KindId, KindVariableId, MetaTypeVariableId, TraitPredicate, TypeBinder, TypeId, TypeKind,
+    Kind, KindId, KindVariableId, MetaTypeVariableId, TraitPredicate, TypeBinder, TypeBinderId,
+    TypeId, TypeKind,
 };
 
 /// Describes why two types or kinds could not be unified.
@@ -76,24 +77,20 @@ impl UnificationTable {
         self.type_solutions[var.0 as usize]
     }
 
-    /// Look up the current solution for a kind variable.
-    pub fn probe_kind_var(&self, var: KindVariableId) -> Option<KindId> {
-        self.kind_solutions[var.0 as usize]
-    }
-
     /// Number of allocated meta type variables.
     pub fn type_var_count(&self) -> usize {
         self.type_solutions.len()
     }
 
+    /// Look up the current solution for a kind variable.
+    #[cfg(test)]
+    pub fn probe_kind_var(&self, var: KindVariableId) -> Option<KindId> {
+        self.kind_solutions[var.0 as usize]
+    }
+
     /// Get the kind of a meta type variable.
     pub fn type_var_kind(&self, var: MetaTypeVariableId) -> KindId {
         self.type_var_kinds[var.0 as usize]
-    }
-
-    /// Whether a meta type variable has been solved.
-    pub fn is_type_var_solved(&self, var: MetaTypeVariableId) -> bool {
-        self.type_solutions[var.0 as usize].is_some()
     }
 
     // --- Shallow resolution ---
@@ -169,6 +166,15 @@ impl UnificationTable {
                         found: b,
                     })
                 }
+            }
+
+            (TypeKind::Lambda(binder1, body1), TypeKind::Lambda(binder2, body2)) => {
+                let (binder1, body1, binder2, body2) =
+                    (binder1.clone(), *body1, binder2.clone(), *body2);
+                self.unify_kinds(store, binder1.kind, binder2.kind)?;
+                let shared = store.mk_rigid(binder1.id, binder1.kind);
+                let aligned_body2 = self.substitute_rigid_binder(store, body2, binder2.id, shared);
+                self.unify_types(store, body1, aligned_body2)
             }
 
             // Applications unify pairwise.
@@ -358,6 +364,7 @@ impl UnificationTable {
         let ty = self.shallow_resolve_type(store, ty);
         match &store.get_type(ty).kind {
             TypeKind::MetaTypeVariable(v) => *v == var,
+            TypeKind::Lambda(_, body) => self.occurs_in_type(store, var, *body),
             TypeKind::Application(f, a) => {
                 self.occurs_in_type(store, var, *f) || self.occurs_in_type(store, var, *a)
             }
@@ -465,6 +472,21 @@ impl UnificationTable {
             | TypeKind::RowEmpty
             | TypeKind::Error => resolved,
 
+            TypeKind::Lambda(binder, body) => {
+                let zbody = self.zonk_type(store, body);
+                let zbinder = TypeBinder {
+                    id: binder.id,
+                    name: binder.name.clone(),
+                    kind: self.zonk_kind(store, binder.kind),
+                    range: binder.range,
+                };
+                if zbody == body && zbinder == binder {
+                    resolved
+                } else {
+                    store.mk_lambda(zbinder, zbody)
+                }
+            }
+
             TypeKind::Application(f, a) => {
                 let zf = self.zonk_type(store, f);
                 let za = self.zonk_type(store, a);
@@ -542,6 +564,92 @@ impl UnificationTable {
                     resolved
                 } else {
                     store.kind_arrow(zfrom, zto)
+                }
+            }
+        }
+    }
+
+    fn substitute_rigid_binder(
+        &mut self,
+        store: &mut TypeStore,
+        ty: TypeId,
+        target: TypeBinderId,
+        replacement: TypeId,
+    ) -> TypeId {
+        let resolved = self.shallow_resolve_type(store, ty);
+        let type_data = store.get_type(resolved).clone();
+
+        match type_data.kind {
+            TypeKind::RigidTypeVariable(id) if id == target => replacement,
+            TypeKind::MetaTypeVariable(_)
+            | TypeKind::Constructor(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => resolved,
+            TypeKind::Lambda(binder, body) => {
+                if binder.id == target {
+                    return resolved;
+                }
+
+                let sub_body = self.substitute_rigid_binder(store, body, target, replacement);
+                if sub_body == body {
+                    resolved
+                } else {
+                    store.mk_lambda(binder, sub_body)
+                }
+            }
+            TypeKind::Application(func, arg) => {
+                let sub_func = self.substitute_rigid_binder(store, func, target, replacement);
+                let sub_arg = self.substitute_rigid_binder(store, arg, target, replacement);
+                if sub_func == func && sub_arg == arg {
+                    resolved
+                } else {
+                    let sub_kind = self.zonk_kind(store, type_data.kind_id);
+                    store.mk_application(sub_func, sub_arg, sub_kind)
+                }
+            }
+            TypeKind::Record(row) => {
+                let sub_row = self.substitute_rigid_binder(store, row, target, replacement);
+                if sub_row == row {
+                    resolved
+                } else {
+                    store.mk_record(sub_row)
+                }
+            }
+            TypeKind::RowExtend { label, field, tail } => {
+                let sub_field = self.substitute_rigid_binder(store, field, target, replacement);
+                let sub_tail = self.substitute_rigid_binder(store, tail, target, replacement);
+                if sub_field == field && sub_tail == tail {
+                    resolved
+                } else {
+                    store.mk_row_extend(label, sub_field, sub_tail)
+                }
+            }
+            TypeKind::Forall(binders, predicates, body) => {
+                if binders.iter().any(|binder| binder.id == target) {
+                    return resolved;
+                }
+
+                let sub_body = self.substitute_rigid_binder(store, body, target, replacement);
+                let sub_predicates = predicates
+                    .iter()
+                    .map(|predicate| TraitPredicate {
+                        trait_ref: predicate.trait_ref.clone(),
+                        arguments: predicate
+                            .arguments
+                            .iter()
+                            .map(|&argument| {
+                                self.substitute_rigid_binder(store, argument, target, replacement)
+                            })
+                            .collect(),
+                        range: predicate.range,
+                    })
+                    .collect::<Vec<_>>();
+
+                if sub_body == body && sub_predicates == predicates {
+                    resolved
+                } else {
+                    store.mk_forall(binders, sub_predicates, sub_body)
                 }
             }
         }

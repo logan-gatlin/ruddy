@@ -39,7 +39,7 @@ pub enum Statement {
     },
     Type {
         name: lir::QualifiedName,
-        params: Vec<lir::TypeBinder>,
+        declared_kind: Option<lir::KindExpr>,
         kind: lir::TypeStatementKind,
         range: TextRange,
     },

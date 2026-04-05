@@ -106,6 +106,16 @@ impl TypeStore {
         })
     }
 
+    /// Allocate a unary type lambda.
+    pub fn mk_lambda(&mut self, binder: TypeBinder, body: TypeId) -> TypeId {
+        let kind_id = self.kind_arrow(binder.kind, self.get_type(body).kind_id);
+        self.alloc_type(Type {
+            kind: TypeKind::Lambda(binder, body),
+            kind_id,
+            range: TextRange::Generated,
+        })
+    }
+
     /// Allocate a type application `func arg` with the given result kind.
     pub fn mk_application(&mut self, func: TypeId, arg: TypeId, result_kind: KindId) -> TypeId {
         self.alloc_type(Type {
