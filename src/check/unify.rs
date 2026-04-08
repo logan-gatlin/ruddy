@@ -222,9 +222,9 @@ impl UnificationTable {
         ty: TypeId,
     ) -> Result<(), UnificationError> {
         // Predicative restriction: inference metas range over monotypes only.
-        // Solving `?a := forall ...` (or any type containing a `forall`) would
-        // enable impredicative instantiation.
-        if self.is_forall_type(store, ty) {
+        // Solving `?a := forall ...` or into any nested polymorphic position
+        // would enable impredicative instantiation.
+        if self.contains_forall_type(store, ty) {
             return Err(UnificationError::TypeMismatch {
                 expected: ty,
                 found: ty,
@@ -385,9 +385,24 @@ impl UnificationTable {
         }
     }
 
-    fn is_forall_type(&self, store: &TypeStore, ty: TypeId) -> bool {
+    fn contains_forall_type(&self, store: &TypeStore, ty: TypeId) -> bool {
         let ty = self.shallow_resolve_type(store, ty);
-        matches!(store.get_type(ty).kind, TypeKind::Forall(_, _, _))
+        match &store.get_type(ty).kind {
+            TypeKind::Forall(_, _, _) => true,
+            TypeKind::Lambda(_, body) => self.contains_forall_type(store, *body),
+            TypeKind::Application(func, arg) => {
+                self.contains_forall_type(store, *func) || self.contains_forall_type(store, *arg)
+            }
+            TypeKind::Record(row) => self.contains_forall_type(store, *row),
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.contains_forall_type(store, *field) || self.contains_forall_type(store, *tail)
+            }
+            TypeKind::MetaTypeVariable(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::Constructor(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => false,
+        }
     }
 
     // --- Kind unification ---

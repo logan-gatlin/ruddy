@@ -8,8 +8,8 @@
 //! - zonking solved meta-variables into stable output types.
 //!
 //! This first pass intentionally focuses on core HM inference.
-//! Trait solving and higher-ranked polymorphism are deferred for follow-up
-//! passes.
+//! Trait solving is deferred, while predicative higher-ranked polymorphism is
+//! handled during inference via outer `forall` skolemization/instantiation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -72,6 +72,7 @@ struct Checker {
     alias_schemes: HashMap<String, TypeScheme>,
     record_schemes: HashMap<String, TypeScheme>,
     named_type_constructors: HashMap<String, TypeId>,
+    declaration_type_transparency_depth: usize,
     next_type_binder: u32,
 }
 
@@ -86,6 +87,7 @@ impl Checker {
             alias_schemes: HashMap::new(),
             record_schemes: HashMap::new(),
             named_type_constructors: HashMap::new(),
+            declaration_type_transparency_depth: 0,
             next_type_binder: 0,
         }
     }
@@ -203,13 +205,13 @@ impl Checker {
         match kind {
             lir::LetStatementKind::PatternBinding { pattern, value } => {
                 let mut locals = LocalEnv::default();
-                let keys = collect_pattern_binders(pattern);
+                let keys = pattern.collect_binders();
                 let prebound = self.prebind_keys(&mut locals, &keys);
                 let snapshot = self.table.type_var_count();
 
                 let typed_value = self.infer_expr(value, &mut locals);
                 let (typed_pattern, bound_vars) =
-                    self.check_pattern(pattern, typed_value.ty, &locals, &prebound);
+                    self.check_pattern(pattern, typed_value.ty, &prebound);
 
                 for bound in bound_vars {
                     let scheme = self.generalize_type(bound.ty, snapshot, bound.range);
@@ -261,7 +263,7 @@ impl Checker {
     ) {
         match kind {
             lir::TypeStatementKind::Alias { value } => {
-                let (params, body) = peel_type_expr_lambdas(value);
+                let (params, body) = value.peel_lambdas();
                 let (decl_binders, mut type_env, _) = self.build_type_binder_env(&params);
                 let alias_ty = self.lower_type_expr(body, &mut type_env);
                 let alias_kind = self.store.get_type(alias_ty).kind_id;
@@ -288,35 +290,35 @@ impl Checker {
                 );
             }
             lir::TypeStatementKind::Nominal { definition } => {
-                let (params, definition) = peel_type_definition_lambdas(definition);
+                let (params, definition) = definition.peel_lambdas();
                 let (decl_binders, mut type_env, param_types) = self.build_type_binder_env(&params);
 
-                match definition {
+                self.with_declaration_type_transparency(|this| match definition {
                     lir::TypeDefinition::Lambda { .. } => {
                         unreachable!("leading lambdas are peeled")
                     }
                     lir::TypeDefinition::Struct { members, .. } => {
-                        let body_result_kind = self.store.kind_type();
+                        let body_result_kind = this.store.kind_type();
                         let computed_head_kind =
-                            self.declaration_head_kind(&decl_binders, body_result_kind);
+                            this.declaration_head_kind(&decl_binders, body_result_kind);
 
                         if let Some(declared_kind) = declared_kind {
-                            let declared_kind = self.lower_kind_expr(declared_kind);
-                            self.constrain_kinds(range, computed_head_kind, declared_kind);
+                            let declared_kind = this.lower_kind_expr(declared_kind);
+                            this.constrain_kinds(range, computed_head_kind, declared_kind);
                         }
 
-                        self.ensure_named_type_constructor(name, Some(computed_head_kind), range);
+                        this.ensure_named_type_constructor(name, Some(computed_head_kind), range);
 
                         let mut fields = BTreeMap::new();
 
                         for member in members {
                             match member {
                                 lir::RecordTypeMember::Field { name, ty, range } => {
-                                    let member_ty = self.lower_type_expr(ty, &mut type_env);
-                                    self.expect_type_kind(*range, member_ty);
+                                    let member_ty = this.lower_type_expr(ty, &mut type_env);
+                                    this.expect_type_kind(*range, member_ty);
 
                                     let Some(name) = name.clone() else {
-                                        self.error(
+                                        this.error(
                                             *range,
                                             "record field declaration is missing a name",
                                         );
@@ -324,31 +326,31 @@ impl Checker {
                                     };
 
                                     if let Some(existing) = fields.insert(name.clone(), member_ty) {
-                                        self.error(
+                                        this.error(
                                             *range,
                                             format!("duplicate record field `{name}`"),
                                         );
-                                        self.constrain_types(*range, existing, member_ty);
+                                        this.constrain_types(*range, existing, member_ty);
                                     }
                                 }
                                 lir::RecordTypeMember::Spread { ty, range } => {
-                                    let spread_ty = self.lower_type_expr(ty, &mut type_env);
-                                    self.expect_type_kind(*range, spread_ty);
+                                    let spread_ty = this.lower_type_expr(ty, &mut type_env);
+                                    this.expect_type_kind(*range, spread_ty);
 
                                     if let Some(spread_fields) =
-                                        self.collect_closed_record_fields(spread_ty, *range)
+                                        this.collect_closed_record_fields(spread_ty, *range)
                                     {
                                         for (name, member_ty) in spread_fields {
                                             if let Some(existing) =
                                                 fields.insert(name.clone(), member_ty)
                                             {
-                                                self.error(
+                                                this.error(
                                                     *range,
                                                     format!(
                                                         "record spread introduces duplicate field `{name}`"
                                                     ),
                                                 );
-                                                self.constrain_types(*range, existing, member_ty);
+                                                this.constrain_types(*range, existing, member_ty);
                                             }
                                         }
                                     }
@@ -356,12 +358,32 @@ impl Checker {
                             }
                         }
 
-                        let record_ty = self.mk_closed_record_from_fields(&fields);
-                        let scheme_binders = self.finalize_decl_binders(&decl_binders);
+                        let record_ty = this.mk_closed_record_from_fields(&fields);
+                        let scheme_binders = this.finalize_decl_binders(&decl_binders);
                         let final_head_kind =
-                            self.declaration_head_kind(&scheme_binders, body_result_kind);
-                        self.ensure_named_type_constructor(name, Some(final_head_kind), range);
-                        self.record_schemes.insert(
+                            this.declaration_head_kind(&scheme_binders, body_result_kind);
+                        this.ensure_named_type_constructor(name, Some(final_head_kind), range);
+
+                        let nominal_ty = this.instantiate_type_head(
+                            name,
+                            &param_types,
+                            range,
+                            Some(final_head_kind),
+                        );
+                        let constructor_ty = this.store.mk_arrow(
+                            record_ty,
+                            nominal_ty,
+                        );
+                        this.global_terms.insert(
+                            name.text(),
+                            TypeScheme {
+                                binders: scheme_binders.clone(),
+                                predicates: Vec::new(),
+                                body: constructor_ty,
+                                range,
+                            },
+                        );
+                        this.record_schemes.insert(
                             name.text(),
                             TypeScheme {
                                 binders: scheme_binders,
@@ -372,17 +394,17 @@ impl Checker {
                         );
                     }
                     lir::TypeDefinition::Sum { variants, .. } => {
-                        let body_result_kind = self.store.kind_type();
+                        let body_result_kind = this.store.kind_type();
                         let computed_head_kind =
-                            self.declaration_head_kind(&decl_binders, body_result_kind);
+                            this.declaration_head_kind(&decl_binders, body_result_kind);
 
                         if let Some(declared_kind) = declared_kind {
-                            let declared_kind = self.lower_kind_expr(declared_kind);
-                            self.constrain_kinds(range, computed_head_kind, declared_kind);
+                            let declared_kind = this.lower_kind_expr(declared_kind);
+                            this.constrain_kinds(range, computed_head_kind, declared_kind);
                         }
 
-                        self.ensure_named_type_constructor(name, Some(computed_head_kind), range);
-                        let head_ty = self.instantiate_type_head(
+                        this.ensure_named_type_constructor(name, Some(computed_head_kind), range);
+                        let head_ty = this.instantiate_type_head(
                             name,
                             &param_types,
                             range,
@@ -397,9 +419,9 @@ impl Checker {
                             };
 
                             let variant_ty = if let Some(argument) = &variant.argument {
-                                let argument_ty = self.lower_type_expr(argument, &mut type_env);
-                                self.expect_type_kind(type_expr_range(argument), argument_ty);
-                                self.store.mk_arrow(argument_ty, head_ty)
+                                let argument_ty = this.lower_type_expr(argument, &mut type_env);
+                                this.expect_type_kind(argument.range(), argument_ty);
+                                this.store.mk_arrow(argument_ty, head_ty)
                             } else {
                                 head_ty
                             };
@@ -407,13 +429,13 @@ impl Checker {
                             variant_entries.push((variant_name.text(), variant_ty, variant.range));
                         }
 
-                        let scheme_binders = self.finalize_decl_binders(&decl_binders);
+                        let scheme_binders = this.finalize_decl_binders(&decl_binders);
                         let final_head_kind =
-                            self.declaration_head_kind(&scheme_binders, body_result_kind);
-                        self.ensure_named_type_constructor(name, Some(final_head_kind), range);
+                            this.declaration_head_kind(&scheme_binders, body_result_kind);
+                        this.ensure_named_type_constructor(name, Some(final_head_kind), range);
 
                         for (variant_name, variant_ty, variant_range) in variant_entries {
-                            self.global_terms.insert(
+                            this.global_terms.insert(
                                 variant_name,
                                 TypeScheme {
                                     binders: scheme_binders.clone(),
@@ -426,38 +448,58 @@ impl Checker {
                     }
                     lir::TypeDefinition::Opaque { representation } => {
                         let (_, provisional_result_kind) =
-                            self.table.fresh_kind_var(&mut self.store);
+                            this.table.fresh_kind_var(&mut this.store);
                         let provisional_head_kind =
-                            self.declaration_head_kind(&decl_binders, provisional_result_kind);
-                        self.ensure_named_type_constructor(
+                            this.declaration_head_kind(&decl_binders, provisional_result_kind);
+                        this.ensure_named_type_constructor(
                             name,
                             Some(provisional_head_kind),
                             range,
                         );
 
-                        let repr_ty = self.lower_type_expr(representation, &mut type_env);
-                        let representation_kind = self.store.get_type(repr_ty).kind_id;
-                        self.constrain_kinds(
-                            type_expr_range(representation),
+                        let repr_ty = this.lower_type_expr(representation, &mut type_env);
+                        let representation_kind = this.store.get_type(repr_ty).kind_id;
+                        this.constrain_kinds(
+                            representation.range(),
                             provisional_result_kind,
                             representation_kind,
                         );
 
                         let computed_head_kind =
-                            self.declaration_head_kind(&decl_binders, representation_kind);
+                            this.declaration_head_kind(&decl_binders, representation_kind);
                         if let Some(declared_kind) = declared_kind {
-                            let declared_kind = self.lower_kind_expr(declared_kind);
-                            self.constrain_kinds(range, computed_head_kind, declared_kind);
+                            let declared_kind = this.lower_kind_expr(declared_kind);
+                            this.constrain_kinds(range, computed_head_kind, declared_kind);
                         }
 
-                        let scheme_binders = self.finalize_decl_binders(&decl_binders);
+                        let scheme_binders = this.finalize_decl_binders(&decl_binders);
                         let finalized_body_result_kind =
-                            self.default_unresolved_kind_to_type(representation_kind);
+                            this.default_unresolved_kind_to_type(representation_kind);
                         let final_head_kind =
-                            self.declaration_head_kind(&scheme_binders, finalized_body_result_kind);
-                        self.ensure_named_type_constructor(name, Some(final_head_kind), range);
+                            this.declaration_head_kind(&scheme_binders, finalized_body_result_kind);
+                        this.ensure_named_type_constructor(name, Some(final_head_kind), range);
+
+                        let nominal_ty = this.instantiate_type_head(
+                            name,
+                            &param_types,
+                            range,
+                            Some(final_head_kind),
+                        );
+                        let constructor_ty = this.store.mk_arrow(
+                            repr_ty,
+                            nominal_ty,
+                        );
+                        this.global_terms.insert(
+                            name.text(),
+                            TypeScheme {
+                                binders: scheme_binders,
+                                predicates: Vec::new(),
+                                body: constructor_ty,
+                                range,
+                            },
+                        );
                     }
-                }
+                });
             }
         }
     }
@@ -469,6 +511,20 @@ impl Checker {
         let mut env = TypeExprEnv::default();
         let (binders, _, param_tys) = self.bind_type_binders(params, &mut env);
         (binders, env, param_tys)
+    }
+
+    fn with_declaration_type_transparency<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.declaration_type_transparency_depth += 1;
+        let result = f(self);
+        self.declaration_type_transparency_depth -= 1;
+        result
+    }
+
+    fn declaration_type_transparency_enabled(&self) -> bool {
+        self.declaration_type_transparency_depth > 0
     }
 
     fn instantiate_type_head(
@@ -582,13 +638,13 @@ impl Checker {
                 range,
             } => {
                 let mut scoped = locals.clone();
-                let keys = collect_pattern_binders(pattern);
+                let keys = pattern.collect_binders();
                 let prebound = self.prebind_keys(&mut scoped, &keys);
                 let snapshot = self.table.type_var_count();
 
                 let typed_value = self.infer_expr(value, &mut scoped);
                 let (typed_pattern, bound_vars) =
-                    self.check_pattern(pattern, typed_value.ty, &scoped, &prebound);
+                    self.check_pattern(pattern, typed_value.ty, &prebound);
 
                 for bound in bound_vars {
                     let scheme = self.generalize_type(bound.ty, snapshot, bound.range);
@@ -620,7 +676,7 @@ impl Checker {
                 for param in params {
                     let param_ty = self.fresh_type_meta();
                     let (typed_param, bound_vars) =
-                        self.check_pattern(param, param_ty, &function_locals, &HashMap::new());
+                        self.check_pattern(param, param_ty, &HashMap::new());
                     let parameter_ty = match &typed_param.kind {
                         tir::PatternKind::Annotated { annotation, .. } => *annotation,
                         _ => param_ty,
@@ -693,12 +749,8 @@ impl Checker {
 
                 for arm in arms {
                     let mut arm_locals = locals.clone();
-                    let (typed_pattern, bound_vars) = self.check_pattern(
-                        &arm.pattern,
-                        typed_scrutinee.ty,
-                        &arm_locals,
-                        &HashMap::new(),
-                    );
+                    let (typed_pattern, bound_vars) =
+                        self.check_pattern(&arm.pattern, typed_scrutinee.ty, &HashMap::new());
                     for bound in bound_vars {
                         let scheme = self.mono_scheme(bound.ty, bound.range);
                         self.insert_scheme_for_key(
@@ -734,8 +786,9 @@ impl Checker {
                 range,
             } => {
                 let typed_callee = self.infer_expr(callee, locals);
-                let opened_callee_ty =
-                    self.instantiate_outer_foralls_with_metas(typed_callee.ty, *range);
+                // Instantiate outer `forall`s at each use-site so repeated calls
+                // get fresh quantifier instantiations.
+                let opened_callee_ty = self.instantiate_type_for_use(typed_callee.ty, *range);
 
                 let (argument_ty, result_ty) =
                     if let Some((argument_ty, result_ty)) = self.as_arrow_type(opened_callee_ty) {
@@ -792,7 +845,7 @@ impl Checker {
                 tir::Expr {
                     kind: tir::ExprKind::Name(name.clone()),
                     ty,
-                    range: resolved_name_range(name),
+                    range: name.range(),
                 }
             }
             lir::Expr::Literal(literal) => tir::Expr {
@@ -833,7 +886,7 @@ impl Checker {
                     match element {
                         lir::ArrayElement::Item(item) => {
                             let typed_item = self.infer_expr(item, locals);
-                            self.constrain_types(expr_range(item), typed_item.ty, element_ty);
+                            self.constrain_types(item.range(), typed_item.ty, element_ty);
                             typed_elements.push(tir::ArrayElement::Item(typed_item));
                         }
                         lir::ArrayElement::Spread { expr, range } => {
@@ -894,7 +947,7 @@ impl Checker {
             } => {
                 let mut type_env = TypeExprEnv::default();
                 let result_ty = self.lower_type_expr(result_type, &mut type_env);
-                self.expect_type_kind(type_expr_range(result_type), result_ty);
+                self.expect_type_kind(result_type.range(), result_ty);
 
                 tir::Expr {
                     kind: tir::ExprKind::InlineWasm {
@@ -931,7 +984,9 @@ impl Checker {
             self.store.get_type(expected_resolved).kind,
             TypeKind::Forall(_, _, _)
         ) {
-            let (skolemized, _) = self.skolemize_outer_foralls(expected_resolved, expr_range(expr));
+            // Expected polymorphism is checked via skolemization per use-site to
+            // preserve predicativity.
+            let (skolemized, _) = self.skolemize_outer_foralls(expected_resolved, expr.range());
             let mut typed = self.check_expr_against(expr, skolemized, locals);
             typed.ty = expected;
             return typed;
@@ -950,7 +1005,7 @@ impl Checker {
 
             for (param, parameter_ty) in params.iter().zip(parameter_types.into_iter()) {
                 let (typed_param, bound_vars) =
-                    self.check_pattern(param, parameter_ty, &function_locals, &HashMap::new());
+                    self.check_pattern(param, parameter_ty, &HashMap::new());
                 for bound in bound_vars {
                     let scheme = self.mono_scheme(bound.ty, bound.range);
                     self.insert_scheme_for_key(
@@ -977,7 +1032,7 @@ impl Checker {
 
         let mut typed = self.infer_expr(expr, locals);
         let diagnostic_count = self.diagnostics.len();
-        self.constrain_subsumption(expr_range(expr), typed.ty, expected);
+        self.constrain_poly_subsumption(expr.range(), typed.ty, expected);
         if self.diagnostics.len() == diagnostic_count {
             typed.ty = expected;
         }
@@ -989,9 +1044,7 @@ impl Checker {
         let mut cursor = self.table.shallow_resolve_type(&self.store, ty);
 
         for _ in 0..arity {
-            let Some((param, result)) = self.as_arrow_type(cursor) else {
-                return None;
-            };
+            let (param, result) = self.as_arrow_type(cursor)?;
             params.push(param);
             cursor = self.table.shallow_resolve_type(&self.store, result);
         }
@@ -1039,7 +1092,6 @@ impl Checker {
         &mut self,
         pattern: &lir::Pattern,
         expected: TypeId,
-        locals: &LocalEnv,
         prebound: &HashMap<BinderKey, TypeId>,
     ) -> (tir::Pattern, Vec<BoundVar>) {
         match pattern {
@@ -1055,8 +1107,7 @@ impl Checker {
                 self.constrain_types(*range, ctor_ty, expected_ctor_ty);
                 self.constrain_types(*range, expected, result_ty);
 
-                let (typed_argument, bound) =
-                    self.check_pattern(argument, argument_ty, locals, prebound);
+                let (typed_argument, bound) = self.check_pattern(argument, argument_ty, prebound);
 
                 (
                     tir::Pattern {
@@ -1086,14 +1137,14 @@ impl Checker {
                 )
             }
             lir::Pattern::Binding { name, range } => {
-                let key = binder_key_from_name(name);
+                let key = name.binder_key();
                 let mut bound = Vec::new();
 
                 if let Some(key) = key {
-                    if let Some(prebound_ty) = prebound.get(&key) {
-                        if !self.type_contains_forall(expected) {
-                            self.constrain_subsumption(*range, *prebound_ty, expected);
-                        }
+                    if let Some(prebound_ty) = prebound.get(&key)
+                        && !self.type_contains_forall(expected)
+                    {
+                        self.constrain_poly_subsumption(*range, *prebound_ty, expected);
                     }
                     let binding_ty = expected;
 
@@ -1126,11 +1177,13 @@ impl Checker {
             lir::Pattern::Annotated { pattern, ty, range } => {
                 let mut type_env = TypeExprEnv::default();
                 let annotation = self.lower_type_expr(ty, &mut type_env);
-                self.expect_type_kind(type_expr_range(ty), annotation);
-                self.constrain_subsumption(*range, expected, annotation);
+                self.expect_type_kind(ty.range(), annotation);
+                // Subsumption is the boundary for annotated patterns, so
+                // polymorphic annotations are checked without forcing
+                // monomorphization.
+                self.constrain_poly_subsumption(*range, expected, annotation);
 
-                let (typed_pattern, bound) =
-                    self.check_pattern(pattern, annotation, locals, prebound);
+                let (typed_pattern, bound) = self.check_pattern(pattern, annotation, prebound);
 
                 (
                     tir::Pattern {
@@ -1170,7 +1223,7 @@ impl Checker {
                 let mut bound = Vec::new();
                 for (element, element_ty) in elements.iter().zip(element_types.into_iter()) {
                     let (typed_element, mut element_bound) =
-                        self.check_pattern(element, element_ty, locals, prebound);
+                        self.check_pattern(element, element_ty, prebound);
                     typed_elements.push(typed_element);
                     bound.append(&mut element_bound);
                 }
@@ -1198,29 +1251,29 @@ impl Checker {
                     match element {
                         lir::ArrayPatternElement::Item(item) => {
                             let (typed_item, mut item_bound) =
-                                self.check_pattern(item, element_ty, locals, prebound);
+                                self.check_pattern(item, element_ty, prebound);
                             typed_elements.push(tir::ArrayPatternElement::Item(typed_item));
                             bound.append(&mut item_bound);
                         }
                         lir::ArrayPatternElement::Rest { binding, range } => {
                             let mut typed_binding = None;
 
-                            if let Some(binding_name) = binding {
-                                if let Some(key) = binder_key_from_name(binding_name) {
-                                    let binding_ty = if let Some(prebound_ty) = prebound.get(&key) {
-                                        self.constrain_types(*range, *prebound_ty, array_ty);
-                                        *prebound_ty
-                                    } else {
-                                        array_ty
-                                    };
+                            if let Some(binding_name) = binding
+                                && let Some(key) = binding_name.binder_key()
+                            {
+                                let binding_ty = if let Some(prebound_ty) = prebound.get(&key) {
+                                    self.constrain_types(*range, *prebound_ty, array_ty);
+                                    *prebound_ty
+                                } else {
+                                    array_ty
+                                };
 
-                                    bound.push(BoundVar {
-                                        key,
-                                        ty: binding_ty,
-                                        range: *range,
-                                    });
-                                    typed_binding = Some(binding_name.clone());
-                                }
+                                bound.push(BoundVar {
+                                    key,
+                                    ty: binding_ty,
+                                    range: *range,
+                                });
+                                typed_binding = Some(binding_name.clone());
                             }
 
                             typed_elements.push(tir::ArrayPatternElement::Rest {
@@ -1255,7 +1308,7 @@ impl Checker {
                     let field_ty = self.fresh_type_meta();
                     let typed_value = if let Some(value) = &field.value {
                         let (typed_value, mut value_bound) =
-                            self.check_pattern(value, field_ty, locals, prebound);
+                            self.check_pattern(value, field_ty, prebound);
                         bound.append(&mut value_bound);
                         Some(typed_value)
                     } else {
@@ -1317,7 +1370,8 @@ impl Checker {
         match name {
             lir::ResolvedName::Local { id, name, range } => {
                 if let Some(scheme) = locals.terms.get(id).cloned() {
-                    self.instantiate_scheme(&scheme)
+                    let typed = self.instantiate_scheme(&scheme);
+                    self.instantiate_type_for_use(typed, *range)
                 } else {
                     self.error(*range, format!("unbound local name `{name}`"));
                     self.error_type()
@@ -1326,7 +1380,8 @@ impl Checker {
             lir::ResolvedName::Global(path) => {
                 let key = path.text();
                 if let Some(scheme) = self.global_terms.get(&key).cloned() {
-                    self.instantiate_scheme(&scheme)
+                    let typed = self.instantiate_scheme(&scheme);
+                    self.instantiate_type_for_use(typed, path.range)
                 } else {
                     self.error(path.range, format!("unbound global name `{key}`"));
                     self.error_type()
@@ -1342,7 +1397,8 @@ impl Checker {
     fn instantiate_constructor(&mut self, constructor: &lir::QualifiedName) -> TypeId {
         let key = constructor.text();
         if let Some(scheme) = self.global_terms.get(&key).cloned() {
-            self.instantiate_scheme(&scheme)
+            let typed = self.instantiate_scheme(&scheme);
+            self.instantiate_type_for_use(typed, constructor.range)
         } else {
             self.error(
                 constructor.range,
@@ -1350,6 +1406,12 @@ impl Checker {
             );
             self.error_type()
         }
+    }
+
+    fn instantiate_type_for_use(&mut self, ty: TypeId, range: TextRange) -> TypeId {
+        // Freshly instantiate outer `forall`s for each term usage to avoid
+        // accidentally sharing polymorphic identity across call-sites.
+        self.instantiate_outer_foralls_with_metas(ty, range)
     }
 
     fn instantiate_scheme(&mut self, scheme: &TypeScheme) -> TypeId {
@@ -1610,7 +1672,7 @@ impl Checker {
                 let (binders, added_ids, _) = self.bind_type_binders(params, env);
 
                 let body_ty = self.lower_type_expr(body, env);
-                self.expect_type_kind(type_expr_range(body), body_ty);
+                self.expect_type_kind(body.range(), body_ty);
 
                 let predicates = constraints
                     .iter()
@@ -1655,8 +1717,8 @@ impl Checker {
             } => {
                 let param_ty = self.lower_type_expr(param, env);
                 let result_ty = self.lower_type_expr(result, env);
-                self.expect_type_kind(type_expr_range(param), param_ty);
-                self.expect_type_kind(type_expr_range(result), result_ty);
+                self.expect_type_kind(param.range(), param_ty);
+                self.expect_type_kind(result.range(), result_ty);
                 let fn_ty = self.store.mk_arrow(param_ty, result_ty);
                 self.expect_type_kind(*range, fn_ty);
                 fn_ty
@@ -1683,7 +1745,7 @@ impl Checker {
                     .iter()
                     .map(|element| {
                         let element_ty = self.lower_type_expr(element, env);
-                        self.expect_type_kind(type_expr_range(element), element_ty);
+                        self.expect_type_kind(element.range(), element_ty);
                         element_ty
                     })
                     .collect::<Vec<_>>();
@@ -1709,8 +1771,12 @@ impl Checker {
                 let key = path.text();
                 if let Some(scheme) = self.alias_type_scheme(&key) {
                     self.scheme_to_type_lambda(&scheme)
-                } else if let Some(scheme) = self.record_type_scheme(&key) {
-                    self.instantiate_scheme(&scheme)
+                } else if self.declaration_type_transparency_enabled() {
+                    if let Some(scheme) = self.record_type_scheme(&key) {
+                        self.instantiate_scheme(&scheme)
+                    } else {
+                        self.ensure_named_type_constructor(path, None, path.range)
+                    }
                 } else {
                     self.ensure_named_type_constructor(path, None, path.range)
                 }
@@ -1727,7 +1793,7 @@ impl Checker {
         type_expr: &lir::TypeExpr,
         env: &mut TypeExprEnv,
     ) -> Option<TypeId> {
-        let (head, args) = collect_type_apply_chain(type_expr);
+        let (head, args) = type_expr.collect_apply_chain();
         let lir::TypeExpr::Name { name } = head else {
             return None;
         };
@@ -1751,7 +1817,7 @@ impl Checker {
 
             if argument_types.len() > expected_arity {
                 self.error(
-                    type_expr_range(type_expr),
+                    type_expr.range(),
                     format!(
                         "type `{key}` expects {} type argument(s), found {}",
                         expected_arity,
@@ -1762,10 +1828,14 @@ impl Checker {
             }
 
             for argument_ty in argument_types {
-                head_ty = self.apply_type(head_ty, argument_ty, type_expr_range(type_expr));
+                head_ty = self.apply_type(head_ty, argument_ty, type_expr.range());
             }
 
             return Some(head_ty);
+        }
+
+        if !self.declaration_type_transparency_enabled() {
+            return None;
         }
 
         let scheme = self.record_type_scheme(&key)?;
@@ -1778,7 +1848,7 @@ impl Checker {
 
         if argument_types.len() > scheme.binders.len() {
             self.error(
-                type_expr_range(type_expr),
+                type_expr.range(),
                 format!(
                     "type `{key}` expects {} type argument(s), found {}",
                     scheme.binders.len(),
@@ -1794,11 +1864,7 @@ impl Checker {
             argument_types.push(self.fresh_type_meta_with_kind(kind));
         }
 
-        Some(self.instantiate_scheme_with_args(
-            &scheme,
-            &argument_types,
-            type_expr_range(type_expr),
-        ))
+        Some(self.instantiate_scheme_with_args(&scheme, &argument_types, type_expr.range()))
     }
 
     fn alias_type_scheme(&self, key: &str) -> Option<TypeScheme> {
@@ -2018,8 +2084,14 @@ impl Checker {
         }
     }
 
-    fn constrain_subsumption(&mut self, range: TextRange, actual: TypeId, expected: TypeId) {
-        let instantiated_actual = self.instantiate_outer_foralls_with_metas(actual, range);
+    /// Constrain subtype relation between `actual` and `expected` under predicative
+    /// higher-rank rules:
+    /// - instantiate outer `forall`s in the source (`actual`) side with fresh metas,
+    /// - skolemize outer `forall`s in the target (`expected`) side,
+    /// - recurse through function arrows contravariantly on parameters and
+    ///   covariantly on results.
+    fn constrain_poly_subsumption(&mut self, range: TextRange, actual: TypeId, expected: TypeId) {
+        let instantiated_actual = self.instantiate_type_for_use(actual, range);
         let (skolemized_expected, _) = self.skolemize_outer_foralls(expected, range);
 
         if let (Some((actual_param, actual_result)), Some((expected_param, expected_result))) = (
@@ -2028,8 +2100,8 @@ impl Checker {
         ) {
             // Function subsumption is contravariant in arguments and covariant
             // in results.
-            self.constrain_subsumption(range, expected_param, actual_param);
-            self.constrain_subsumption(range, actual_result, expected_result);
+            self.constrain_poly_subsumption(range, expected_param, actual_param);
+            self.constrain_poly_subsumption(range, actual_result, expected_result);
             return;
         }
 
@@ -2333,161 +2405,167 @@ impl Checker {
     }
 }
 
-fn collect_type_apply_chain<'a>(
-    type_expr: &'a lir::TypeExpr,
-) -> (&'a lir::TypeExpr, Vec<&'a lir::TypeExpr>) {
-    let mut args_rev = Vec::new();
-    let mut cursor = type_expr;
+impl lir::TypeExpr {
+    fn collect_apply_chain(&self) -> (&lir::TypeExpr, Vec<&lir::TypeExpr>) {
+        let mut args_rev = Vec::new();
+        let mut cursor = self;
 
-    while let lir::TypeExpr::Apply {
-        callee, argument, ..
-    } = cursor
-    {
-        args_rev.push(argument.as_ref());
-        cursor = callee.as_ref();
-    }
-
-    args_rev.reverse();
-    (cursor, args_rev)
-}
-
-fn peel_type_expr_lambdas<'a>(
-    type_expr: &'a lir::TypeExpr,
-) -> (Vec<lir::TypeBinder>, &'a lir::TypeExpr) {
-    let mut params = Vec::new();
-    let mut cursor = type_expr;
-
-    while let lir::TypeExpr::Lambda {
-        params: lambda_params,
-        body,
-        ..
-    } = cursor
-    {
-        params.extend(lambda_params.iter().cloned());
-        cursor = body.as_ref();
-    }
-
-    (params, cursor)
-}
-
-fn peel_type_definition_lambdas<'a>(
-    definition: &'a lir::TypeDefinition,
-) -> (Vec<lir::TypeBinder>, &'a lir::TypeDefinition) {
-    let mut params = Vec::new();
-    let mut cursor = definition;
-
-    while let lir::TypeDefinition::Lambda {
-        params: lambda_params,
-        body,
-        ..
-    } = cursor
-    {
-        params.extend(lambda_params.iter().cloned());
-        cursor = body.as_ref();
-    }
-
-    (params, cursor)
-}
-
-fn collect_pattern_binders(pattern: &lir::Pattern) -> Vec<(BinderKey, TextRange)> {
-    let mut binders = Vec::new();
-    collect_pattern_binders_into(pattern, &mut binders);
-    binders
-}
-
-fn collect_pattern_binders_into(pattern: &lir::Pattern, binders: &mut Vec<(BinderKey, TextRange)>) {
-    match pattern {
-        lir::Pattern::Constructor { argument, .. } => {
-            collect_pattern_binders_into(argument, binders);
+        while let lir::TypeExpr::Apply {
+            callee, argument, ..
+        } = cursor
+        {
+            args_rev.push(argument.as_ref());
+            cursor = callee.as_ref();
         }
-        lir::Pattern::ConstructorName { .. }
-        | lir::Pattern::Literal(_)
-        | lir::Pattern::Hole { .. } => {}
-        lir::Pattern::Binding { name, range } => {
-            if let Some(key) = binder_key_from_name(name) {
-                binders.push((key, *range));
+
+        args_rev.reverse();
+        (cursor, args_rev)
+    }
+
+    fn peel_lambdas(&self) -> (Vec<lir::TypeBinder>, &lir::TypeExpr) {
+        let mut params = Vec::new();
+        let mut cursor = self;
+
+        while let lir::TypeExpr::Lambda {
+            params: lambda_params,
+            body,
+            ..
+        } = cursor
+        {
+            params.extend(lambda_params.iter().cloned());
+            cursor = body.as_ref();
+        }
+
+        (params, cursor)
+    }
+
+    fn range(&self) -> TextRange {
+        match self {
+            lir::TypeExpr::Forall { range, .. }
+            | lir::TypeExpr::Lambda { range, .. }
+            | lir::TypeExpr::Function { range, .. }
+            | lir::TypeExpr::Apply { range, .. }
+            | lir::TypeExpr::Hole { range }
+            | lir::TypeExpr::Tuple { range, .. }
+            | lir::TypeExpr::Unit { range }
+            | lir::TypeExpr::Array { range } => *range,
+            lir::TypeExpr::Name { name } => name.range(),
+            lir::TypeExpr::Error(error) => error.range,
+        }
+    }
+}
+
+impl lir::TypeDefinition {
+    fn peel_lambdas(&self) -> (Vec<lir::TypeBinder>, &lir::TypeDefinition) {
+        let mut params = Vec::new();
+        let mut cursor = self;
+
+        while let lir::TypeDefinition::Lambda {
+            params: lambda_params,
+            body,
+            ..
+        } = cursor
+        {
+            params.extend(lambda_params.iter().cloned());
+            cursor = body.as_ref();
+        }
+
+        (params, cursor)
+    }
+}
+
+impl lir::Pattern {
+    fn collect_binders(&self) -> Vec<(BinderKey, TextRange)> {
+        let mut binders = Vec::new();
+        self.collect_bindings_into(&mut binders);
+        binders
+    }
+
+    fn collect_bindings_into(&self, binders: &mut Vec<(BinderKey, TextRange)>) {
+        match self {
+            lir::Pattern::Constructor { argument, .. } => {
+                argument.collect_bindings_into(binders);
             }
-        }
-        lir::Pattern::Annotated { pattern, .. } => {
-            collect_pattern_binders_into(pattern, binders);
-        }
-        lir::Pattern::Tuple { elements, .. } => {
-            for element in elements {
-                collect_pattern_binders_into(element, binders);
+            lir::Pattern::ConstructorName { .. }
+            | lir::Pattern::Literal(_)
+            | lir::Pattern::Hole { .. } => {}
+            lir::Pattern::Binding { name, range } => {
+                if let Some(key) = name.binder_key() {
+                    binders.push((key, *range));
+                }
             }
-        }
-        lir::Pattern::Array { elements, .. } => {
-            for element in elements {
-                match element {
-                    lir::ArrayPatternElement::Item(item) => {
-                        collect_pattern_binders_into(item, binders);
-                    }
-                    lir::ArrayPatternElement::Rest { binding, range } => {
-                        if let Some(binding) = binding
-                            && let Some(key) = binder_key_from_name(binding)
-                        {
-                            binders.push((key, *range));
+            lir::Pattern::Annotated { pattern, .. } => {
+                pattern.collect_bindings_into(binders);
+            }
+            lir::Pattern::Tuple { elements, .. } => {
+                for element in elements {
+                    element.collect_bindings_into(binders);
+                }
+            }
+            lir::Pattern::Array { elements, .. } => {
+                for element in elements {
+                    match element {
+                        lir::ArrayPatternElement::Item(item) => {
+                            item.collect_bindings_into(binders);
+                        }
+                        lir::ArrayPatternElement::Rest { binding, range } => {
+                            if let Some(binding) = binding
+                                && let Some(key) = binding.binder_key()
+                            {
+                                binders.push((key, *range));
+                            }
                         }
                     }
                 }
             }
-        }
-        lir::Pattern::Record { fields, .. } => {
-            for field in fields {
-                if let Some(value) = &field.value {
-                    collect_pattern_binders_into(value, binders);
+            lir::Pattern::Record { fields, .. } => {
+                for field in fields {
+                    if let Some(value) = &field.value {
+                        value.collect_bindings_into(binders);
+                    }
                 }
             }
+            lir::Pattern::Error(_) => {}
         }
-        lir::Pattern::Error(_) => {}
     }
 }
 
-fn binder_key_from_name(name: &lir::ResolvedName) -> Option<BinderKey> {
-    match name {
-        lir::ResolvedName::Local { id, .. } => Some(BinderKey::Local(*id)),
-        lir::ResolvedName::Global(path) => Some(BinderKey::Global(path.text())),
-        lir::ResolvedName::Error { .. } => None,
+impl lir::ResolvedName {
+    fn binder_key(&self) -> Option<BinderKey> {
+        match self {
+            lir::ResolvedName::Local { id, .. } => Some(BinderKey::Local(*id)),
+            lir::ResolvedName::Global(path) => Some(BinderKey::Global(path.text())),
+            lir::ResolvedName::Error { .. } => None,
+        }
+    }
+
+    fn range(&self) -> TextRange {
+        match self {
+            lir::ResolvedName::Global(path) => path.range,
+            lir::ResolvedName::Local { range, .. } | lir::ResolvedName::Error { range, .. } => {
+                *range
+            }
+        }
     }
 }
 
-fn resolved_name_range(name: &lir::ResolvedName) -> TextRange {
-    match name {
-        lir::ResolvedName::Global(path) => path.range,
-        lir::ResolvedName::Local { range, .. } | lir::ResolvedName::Error { range, .. } => *range,
-    }
-}
-
-fn expr_range(expr: &lir::Expr) -> TextRange {
-    match expr {
-        lir::Expr::Let { range, .. }
-        | lir::Expr::Function { range, .. }
-        | lir::Expr::If { range, .. }
-        | lir::Expr::Match { range, .. }
-        | lir::Expr::Apply { range, .. }
-        | lir::Expr::FieldAccess { range, .. }
-        | lir::Expr::Unit { range }
-        | lir::Expr::Tuple { range, .. }
-        | lir::Expr::Array { range, .. }
-        | lir::Expr::Record { range, .. }
-        | lir::Expr::InlineWasm { range, .. } => *range,
-        lir::Expr::Name(name) => resolved_name_range(name),
-        lir::Expr::Literal(literal) => literal.range,
-        lir::Expr::Error(error) => error.range,
-    }
-}
-
-fn type_expr_range(type_expr: &lir::TypeExpr) -> TextRange {
-    match type_expr {
-        lir::TypeExpr::Forall { range, .. }
-        | lir::TypeExpr::Lambda { range, .. }
-        | lir::TypeExpr::Function { range, .. }
-        | lir::TypeExpr::Apply { range, .. }
-        | lir::TypeExpr::Hole { range }
-        | lir::TypeExpr::Tuple { range, .. }
-        | lir::TypeExpr::Unit { range }
-        | lir::TypeExpr::Array { range } => *range,
-        lir::TypeExpr::Name { name } => resolved_name_range(name),
-        lir::TypeExpr::Error(error) => error.range,
+impl lir::Expr {
+    fn range(&self) -> TextRange {
+        match self {
+            lir::Expr::Let { range, .. }
+            | lir::Expr::Function { range, .. }
+            | lir::Expr::If { range, .. }
+            | lir::Expr::Match { range, .. }
+            | lir::Expr::Apply { range, .. }
+            | lir::Expr::FieldAccess { range, .. }
+            | lir::Expr::Unit { range }
+            | lir::Expr::Tuple { range, .. }
+            | lir::Expr::Array { range, .. }
+            | lir::Expr::Record { range, .. }
+            | lir::Expr::InlineWasm { range, .. } => *range,
+            lir::Expr::Name(name) => name.range(),
+            lir::Expr::Literal(literal) => literal.range,
+            lir::Expr::Error(error) => error.range,
+        }
     }
 }
