@@ -1,12 +1,16 @@
 use super::ast;
 use super::token::{Keyword, Operator, Punct, Token, TokenKind};
 use crate::engine::Source;
+use crate::parser::BundleDependencySource;
 use crate::reporting::{Diag, Diagnostic, TextRange, TextSize};
 use salsa::Accumulator;
+use semver::{Version, VersionReq};
 
 pub(super) struct ParseResult {
     pub file: ast::AstFile,
 }
+
+const DEFAULT_BUNDLE_VERSION_TEXT: &str = "0.0.0";
 
 pub(super) fn parse_file(
     db: &dyn salsa::Database,
@@ -107,6 +111,7 @@ struct Parser<'a> {
     source: Source,
     source_len: TextSize,
     pos: usize,
+    last_bundle_declaration_metadata: Option<ast::BundleMetadata>,
 }
 
 impl<'a> Parser<'a> {
@@ -122,6 +127,7 @@ impl<'a> Parser<'a> {
             source,
             source_len,
             pos: 0,
+            last_bundle_declaration_metadata: None,
         }
     }
 
@@ -132,6 +138,7 @@ impl<'a> Parser<'a> {
     fn parse_file(&mut self) -> ast::AstFile {
         let mut statements = Vec::new();
         let mut bundle_name = None;
+        let mut bundle_metadata = None;
 
         while !self.at_eof() {
             let is_file_top = statements.is_empty();
@@ -143,6 +150,7 @@ impl<'a> Parser<'a> {
                     } = &statement
                 {
                     bundle_name = declared_name.clone();
+                    bundle_metadata = self.last_bundle_declaration_metadata.clone();
                 }
                 statements.push(statement);
             } else {
@@ -155,12 +163,14 @@ impl<'a> Parser<'a> {
 
         ast::AstFile {
             bundle_name,
+            bundle_metadata,
             range: TextRange::new(self.source, TextSize::ZERO, self.source_len),
             statements,
         }
     }
 
     fn parse_statement(&mut self, allow_bundle_declaration: bool) -> Option<ast::Statement> {
+        self.last_bundle_declaration_metadata = None;
         match self.current_keyword() {
             Some(Keyword::Bundle) => Some(self.parse_bundle_declaration(allow_bundle_declaration)),
             Some(Keyword::Module) => Some(self.parse_module_statement()),
@@ -182,10 +192,349 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let name = self.expect_ident_node("bundle name");
-        ast::Statement::Bundle {
-            name,
-            range: self.range_from(start),
+        let raw_metadata = if self.eat_keyword(Keyword::With) {
+            if let Some(payload) = self.parse_sexpr() {
+                Some(payload)
+            } else {
+                self.error_current(
+                    "expected S-expression metadata payload after `with` in bundle declaration",
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let range = self.range_from(start);
+        self.last_bundle_declaration_metadata =
+            Some(self.normalize_bundle_metadata_payload(range, raw_metadata));
+        ast::Statement::Bundle { name, range }
+    }
+
+    fn normalize_bundle_metadata_payload(
+        &mut self,
+        declaration_range: TextRange,
+        raw: Option<ast::SExpr>,
+    ) -> ast::BundleMetadata {
+        let mut version = None;
+        let mut saw_version_entry = false;
+        let mut version_entries = 0usize;
+        let mut dependencies_entries = 0usize;
+        let mut metadata_entries = 0usize;
+        let mut dependencies = Vec::new();
+        let mut metadata = Vec::new();
+
+        if let Some(payload) = raw.as_ref()
+            && let Some(entries) = self.sexpr_list_items(payload)
+        {
+            for entry in entries {
+                let Some(entry_items) = self.sexpr_list_items(entry) else {
+                    self.error_at(
+                        entry.range(),
+                        "bundle metadata entry must be a list form `(key ...)`",
+                    );
+                    continue;
+                };
+
+                let Some((head, tail)) = entry_items.split_first() else {
+                    self.error_at(entry.range(), "bundle metadata entry must not be empty");
+                    continue;
+                };
+
+                let Some(key) = self.bundle_metadata_entry_key(head) else {
+                    self.error_at(head.range(), "bundle metadata key must be an identifier");
+                    continue;
+                };
+
+                match key.as_str() {
+                    "version" => {
+                        version_entries += 1;
+                        if version_entries > 1 {
+                            self.warn_at(
+                                entry.range(),
+                                "duplicate `version` metadata entry; last valid value wins",
+                            );
+                        }
+
+                        saw_version_entry = true;
+                        if let Some(parsed_version) =
+                            self.parse_bundle_version_metadata(entry, tail)
+                        {
+                            version = Some(parsed_version);
+                        }
+                    }
+                    "dependencies" => {
+                        dependencies_entries += 1;
+                        if dependencies_entries > 1 {
+                            self.warn_at(
+                                entry.range(),
+                                "duplicate `dependencies` metadata entry; concatenating entries",
+                            );
+                        }
+                        for dependency in tail {
+                            if let Some(dependency) = self.parse_bundle_dependency(dependency) {
+                                dependencies.push(dependency);
+                            }
+                        }
+                    }
+                    "metadata" => {
+                        metadata_entries += 1;
+                        if metadata_entries > 1 {
+                            self.warn_at(
+                                entry.range(),
+                                "duplicate `metadata` metadata entry; concatenating entries",
+                            );
+                        }
+                        metadata.extend(tail.iter().cloned());
+                    }
+                    _ => self.warn_at(
+                        entry.range(),
+                        format!("unknown bundle metadata key `{key}`"),
+                    ),
+                }
+            }
+
+            if !saw_version_entry {
+                self.error_at(
+                    payload.range(),
+                    format!(
+                        "bundle metadata requires `(version \"...\")`; defaulting to `{DEFAULT_BUNDLE_VERSION_TEXT}`"
+                    ),
+                );
+            }
         }
+
+        let range = raw
+            .as_ref()
+            .map(ast::SExpr::range)
+            .unwrap_or(declaration_range);
+
+        ast::BundleMetadata {
+            range,
+            raw,
+            version: version.unwrap_or_else(default_bundle_version),
+            dependencies,
+            metadata,
+        }
+    }
+
+    fn bundle_metadata_entry_key(&self, node: &ast::SExpr) -> Option<String> {
+        let ast::SExpr::Atom {
+            kind: ast::SExprAtomKind::Ident,
+            range,
+        } = node
+        else {
+            return None;
+        };
+
+        range.text(self.source.contents(self.db))
+    }
+
+    fn parse_bundle_version_metadata(
+        &mut self,
+        entry: &ast::SExpr,
+        args: &[ast::SExpr],
+    ) -> Option<Version> {
+        if args.len() != 1 {
+            self.error_at(
+                entry.range(),
+                "bundle metadata `version` must have shape `(version \"<value>\")`",
+            );
+            return None;
+        }
+
+        let value = &args[0];
+        let parsed = self.parse_sexpr_string_literal(value, "bundle metadata `version` value")?;
+
+        match Version::parse(&parsed) {
+            Ok(version) => Some(version),
+            Err(error) => {
+                self.error_at(
+                    value.range(),
+                    format!("bundle metadata `version` must be a valid semver version: {error}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn parse_bundle_dependency(
+        &mut self,
+        dependency: &ast::SExpr,
+    ) -> Option<ast::BundleDependency> {
+        let Some(items) = self.sexpr_list_items(dependency) else {
+            self.error_at(
+                dependency.range(),
+                "bundle dependency entry must be a list form `(dep <name> \"<version-req>\" ((path|git) \"...\")?)`",
+            );
+            return None;
+        };
+
+        let Some((head, args)) = items.split_first() else {
+            self.error_at(
+                dependency.range(),
+                "bundle dependency entry must not be empty",
+            );
+            return None;
+        };
+
+        let Some(head_text) = self.bundle_metadata_entry_key(head) else {
+            self.error_at(
+                head.range(),
+                "bundle dependency entry head must be an identifier",
+            );
+            return None;
+        };
+
+        if head_text != "dep" {
+            self.error_at(
+                head.range(),
+                format!("expected bundle dependency entry head `dep`, found `{head_text}`"),
+            );
+            return None;
+        }
+
+        if args.len() < 2 {
+            self.error_at(
+                dependency.range(),
+                "bundle dependency entry must have shape `(dep <name> \"<version-req>\" ((path|git) \"...\")?)`",
+            );
+            return None;
+        }
+
+        let Some(name) = self.bundle_metadata_entry_key(&args[0]) else {
+            self.error_at(
+                args[0].range(),
+                "bundle dependency name must be an identifier",
+            );
+            return None;
+        };
+
+        let version_text =
+            self.parse_sexpr_string_literal(&args[1], "bundle dependency version requirement")?;
+
+        let version = match VersionReq::parse(&version_text) {
+            Ok(version) => version,
+            Err(error) => {
+                self.error_at(
+                    args[1].range(),
+                    format!(
+                        "bundle dependency version requirement must be a valid semver requirement: {error}"
+                    ),
+                );
+                return None;
+            }
+        };
+
+        let mut source = BundleDependencySource::default();
+        let mut has_source_errors = false;
+
+        if args.len() == 3 {
+            let source_node = &args[2];
+            if let Some(parsed_source) = self.parse_bundle_dependency_source(source_node) {
+                source = parsed_source;
+            } else {
+                has_source_errors = true;
+            }
+        } else if args.len() > 3 {
+            self.error_at(
+                dependency.range(),
+                "bundle dependency entry has too many arguments; expected `(dep <name> \"<version-req>\" ((path|git) \"...\")?)`",
+            );
+            has_source_errors = true;
+        }
+
+        if has_source_errors {
+            return None;
+        }
+
+        Some(ast::BundleDependency {
+            range: dependency.range(),
+            name,
+            version,
+            source,
+        })
+    }
+
+    fn parse_bundle_dependency_source(
+        &mut self,
+        source: &ast::SExpr,
+    ) -> Option<ast::BundleDependencySource> {
+        let Some(items) = self.sexpr_list_items(source) else {
+            self.error_at(
+                source.range(),
+                "bundle dependency source must be a list form `(path \"...\")` or `(git \"...\")`",
+            );
+            return None;
+        };
+
+        let Some((head, args)) = items.split_first() else {
+            self.error_at(source.range(), "bundle dependency source must not be empty");
+            return None;
+        };
+
+        let Some(kind) = self.bundle_metadata_entry_key(head) else {
+            self.error_at(
+                head.range(),
+                "bundle dependency source key must be an identifier",
+            );
+            return None;
+        };
+
+        if args.len() != 1 {
+            self.error_at(
+                source.range(),
+                format!("bundle dependency `{kind}` source must have shape `({kind} \"...\")`"),
+            );
+            return None;
+        }
+
+        let value = match kind.as_str() {
+            "path" => {
+                self.parse_sexpr_string_literal(&args[0], "bundle dependency `path` source value")?
+            }
+            "git" => {
+                self.parse_sexpr_string_literal(&args[0], "bundle dependency `git` source value")?
+            }
+            _ => {
+                self.error_at(
+                    head.range(),
+                    format!("bundle dependency source must be `path` or `git`, found `{kind}`"),
+                );
+                return None;
+            }
+        };
+
+        match kind.as_str() {
+            "path" => Some(ast::BundleDependencySource::Path(value)),
+            "git" => Some(ast::BundleDependencySource::Git(value)),
+            _ => None,
+        }
+    }
+
+    fn parse_sexpr_string_literal(&mut self, value: &ast::SExpr, context: &str) -> Option<String> {
+        let ast::SExpr::Atom {
+            kind: ast::SExprAtomKind::String,
+            range,
+        } = value
+        else {
+            self.error_at(value.range(), format!("{context} must be a string literal"));
+            return None;
+        };
+
+        let Some(raw_text) = range.text(self.source.contents(self.db)) else {
+            self.error_at(value.range(), format!("failed to read {context} literal"));
+            return None;
+        };
+
+        let Some(parsed) = decode_string_literal(&raw_text) else {
+            self.error_at(
+                value.range(),
+                format!("failed to decode {context} string literal"),
+            );
+            return None;
+        };
+
+        Some(parsed)
     }
 
     fn parse_module_statement(&mut self) -> ast::Statement {
@@ -2009,6 +2358,13 @@ impl<'a> Parser<'a> {
         None
     }
 
+    fn sexpr_list_items<'s>(&self, sexpr: &'s ast::SExpr) -> Option<&'s [ast::SExpr]> {
+        match sexpr {
+            ast::SExpr::List { items, .. } => Some(items),
+            _ => None,
+        }
+    }
+
     fn parse_sexpr_path(&mut self) -> Option<ast::SExpr> {
         let checkpoint = self.pos;
         let start = self.pos;
@@ -2381,7 +2737,15 @@ impl<'a> Parser<'a> {
     }
 
     fn error_current(&mut self, message: impl Into<String>) {
-        Diag(Diagnostic::error(self.current_range(), message)).accumulate(self.db);
+        self.error_at(self.current_range(), message);
+    }
+
+    fn error_at(&mut self, range: TextRange, message: impl Into<String>) {
+        Diag(Diagnostic::error(range, message)).accumulate(self.db);
+    }
+
+    fn warn_at(&mut self, range: TextRange, message: impl Into<String>) {
+        Diag(Diagnostic::warning(range, message)).accumulate(self.db);
     }
 
     fn error_node(&self, start_pos: usize) -> ast::ErrorNode {
@@ -2437,4 +2801,55 @@ fn is_statement_start_keyword(keyword: Keyword) -> bool {
 
 fn is_statement_boundary_keyword(keyword: Keyword) -> bool {
     is_statement_start_keyword(keyword) || keyword == Keyword::End
+}
+
+fn default_bundle_version() -> Version {
+    Version::new(0, 0, 0)
+}
+
+fn decode_string_literal(raw: &str) -> Option<String> {
+    let content = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = content.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        let escape = chars.next()?;
+        match escape {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+
+                let mut digits = String::new();
+                while let Some(peek) = chars.peek().copied() {
+                    if peek == '}' {
+                        break;
+                    }
+                    digits.push(peek);
+                    chars.next();
+                }
+
+                if chars.next()? != '}' || digits.is_empty() {
+                    return None;
+                }
+
+                let value = u32::from_str_radix(&digits, 16).ok()?;
+                out.push(char::from_u32(value)?);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(out)
 }

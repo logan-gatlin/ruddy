@@ -10,3 +10,4 @@ edition = "2024"
 [dependencies]
 salsa = "0.26"
 unicode-ident = "1"
+semver = "1"

@@ -23,7 +23,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
               | <impl_statement>
               | <wasm_statement>
 
-<bundle_declaration> ::= "bundle" <ident>
+<bundle_declaration> ::= "bundle" <ident> ("with" <sexpr>)?
 
 <module_statement>   ::= "module" <ident> "=" <statement>* "end"
               | "module" <ident> ("as" <string>)?
@@ -60,9 +60,15 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 - `bundle` are regular statements and can appear anywhere statements are allowed.
 - Statements in `<file>` and `module ... end` are not separated by semicolons.
 - Top-level statements are part of the bundle scope; a `module ... end` wrapper is optional.
-- CLI bundle compilation requires the root file to start with `bundle <name>`.
+- CLI bundle compilation requires the root file to start with `bundle <name>` (with optional `with (...)` metadata payload).
 - A bundle may only be declared once across the entire import graph.
 - `compile_source` accepts files without a `bundle` declaration and uses implicit bundle name `_`.
+- Bundle metadata payloads use S-expression entries such as `(version "1.2.3")`.
+- Known top-level metadata keys are `version`, `dependencies`, and `metadata`.
+- `version` is required when `with (...)` is present; values are parsed as semantic versions and missing/invalid values default to `0.0.0` with diagnostics.
+- `dependencies` entries use the structured `dep` form: `(dep <name> "<version-req>")`, `(dep <name> "<version-req>" (path "<path>"))`, or `(dep <name> "<version-req>" (git "<repo-url>"))`.
+- Bundle version uses exact semver (`Version`) and dependency versions use semver requirements (`VersionReq`).
+- Unknown top-level metadata keys are accepted with warnings.
 
 ## Type Definitions
 ```bnf

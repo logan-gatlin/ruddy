@@ -1,11 +1,43 @@
 use crate::reporting::TextRange;
+use semver::{Version, VersionReq};
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub struct AstFile {
     /// `Some` if this is a bundle root
     pub bundle_name: Option<Identifier>,
+    /// Normalized metadata for the top-level bundle declaration.
+    pub bundle_metadata: Option<BundleMetadata>,
     pub range: TextRange,
     pub statements: Vec<Statement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+pub struct BundleMetadata {
+    pub range: TextRange,
+    /// Raw payload from `bundle ... with (...)`, if present.
+    pub raw: Option<SExpr>,
+    /// Normalized required bundle version.
+    pub version: Version,
+    /// Normalized dependency forms from `(dependencies ...)`.
+    pub dependencies: Vec<BundleDependency>,
+    /// Normalized arbitrary metadata forms from `(metadata ...)`.
+    pub metadata: Vec<SExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+pub struct BundleDependency {
+    pub range: TextRange,
+    pub name: String,
+    pub version: VersionReq,
+    pub source: BundleDependencySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, salsa::Update)]
+pub enum BundleDependencySource {
+    Path(String),
+    Git(String),
+    #[default]
+    Managed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]

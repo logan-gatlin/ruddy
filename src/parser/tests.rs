@@ -1,9 +1,10 @@
 use salsa::Setter as _;
+use semver::{Version, VersionReq};
 
 use crate::engine::{Eng, Source};
 use crate::parser::token::{Keyword, Operator, Punct, TokenKind};
-use crate::parser::{AstVisitor, lex_diagnostics};
-use crate::reporting::TextSize;
+use crate::parser::{AstVisitor, BundleDependencySource, lex_diagnostics};
+use crate::reporting::{DiagnosticSeverity, TextSize};
 
 use super::{
     Expr, KindExpr, LetStatementKind, NameRef, PathRoot, Pattern, Statement, TypeDefinition,
@@ -119,6 +120,15 @@ fn parse_query_sets_bundle_name_from_top_declaration() {
     };
 
     assert_eq!(parsed.ast.bundle_name, declared_name);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing normalized bundle metadata");
+    assert_eq!(metadata.version, Version::new(0, 0, 0));
+    assert!(metadata.raw.is_none());
+    assert!(metadata.dependencies.is_empty());
+    assert!(metadata.metadata.is_empty());
     assert!(parse_diagnostics(&db, source).is_empty());
 }
 
@@ -160,6 +170,302 @@ fn parse_query_reports_non_top_bundle_declaration() {
 }
 
 #[test]
+fn parse_query_bundle_with_metadata_populates_ast_file_metadata() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata.hc".to_owned(),
+        [
+            "bundle demo with (",
+            "(version \"1.2.3\")",
+            "(dependencies",
+            "(dep core \"^1.0\")",
+            "(dep util \"~2.4\" (path \"../util\"))",
+            "(dep auth \">=1,<2\" (git \"https://example/repo.git\"))",
+            ")",
+            ")",
+            "let value = 1",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(1, 2, 3));
+    assert!(metadata.raw.is_some());
+    assert_eq!(metadata.dependencies.len(), 3);
+    assert_eq!(metadata.dependencies[0].name, "core");
+    assert_eq!(
+        metadata.dependencies[0].version,
+        VersionReq::parse("^1.0").expect("failed to parse semver requirement")
+    );
+    assert_eq!(
+        metadata.dependencies[0].source,
+        BundleDependencySource::Managed
+    );
+    assert_eq!(metadata.dependencies[1].name, "util");
+    assert_eq!(
+        metadata.dependencies[1].source,
+        super::BundleDependencySource::Path("../util".to_owned())
+    );
+    assert_eq!(metadata.dependencies[2].name, "auth");
+    assert_eq!(
+        metadata.dependencies[2].source,
+        super::BundleDependencySource::Git("https://example/repo.git".to_owned())
+    );
+    assert!(metadata.metadata.is_empty());
+    assert!(parse_diagnostics(&db, source).is_empty());
+}
+
+#[test]
+fn parse_query_bundle_with_missing_version_reports_error_and_defaults() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_missing_version.hc".to_owned(),
+        "bundle demo with ((dependencies (dep core)))".to_owned(),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(0, 0, 0));
+    assert_eq!(metadata.dependencies.len(), 0);
+    assert!(parse_diagnostics(&db, source).iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle metadata requires `(version \"...\")`")
+    }));
+}
+
+#[test]
+fn parse_query_bundle_with_invalid_version_reports_error_and_defaults() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_invalid_version.hc".to_owned(),
+        "bundle demo with ((version 123))".to_owned(),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(0, 0, 0));
+    assert!(parse_diagnostics(&db, source).iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle metadata `version` value must be a string literal")
+    }));
+}
+
+#[test]
+fn parse_query_bundle_with_unparseable_semver_version_reports_error_and_defaults() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_unparseable_version.hc".to_owned(),
+        "bundle demo with ((version \"not-semver\"))".to_owned(),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(0, 0, 0));
+    assert!(parse_diagnostics(&db, source).iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle metadata `version` must be a valid semver version")
+    }));
+}
+
+#[test]
+fn parse_query_bundle_with_unknown_metadata_key_emits_warning() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_unknown_key.hc".to_owned(),
+        "bundle demo with ((version \"1.0.0\") (tooling true))".to_owned(),
+    );
+
+    let diagnostics = parse_diagnostics(&db, source);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic
+                .message
+                .contains("unknown bundle metadata key `tooling`")
+    }));
+}
+
+#[test]
+fn parse_query_bundle_with_duplicate_metadata_entries_merges_with_warnings() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_duplicates.hc".to_owned(),
+        [
+            "bundle demo with (",
+            "(version \"1.0.0\")",
+            "(dependencies (dep core \"^1.0\"))",
+            "(version \"2.0.0\")",
+            "(dependencies (dep util \"~2.4\"))",
+            "(metadata (ci true))",
+            "(metadata (owner \"team\"))",
+            ")",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(2, 0, 0));
+    assert_eq!(metadata.dependencies.len(), 2);
+    assert_eq!(metadata.metadata.len(), 2);
+
+    let diagnostics = parse_diagnostics(&db, source);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic
+                .message
+                .contains("duplicate `version` metadata entry")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic
+                .message
+                .contains("duplicate `dependencies` metadata entry")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic
+                .message
+                .contains("duplicate `metadata` metadata entry")
+    }));
+}
+
+#[test]
+fn parse_query_uses_top_bundle_metadata_when_later_bundle_declarations_exist() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_top_only.hc".to_owned(),
+        [
+            "bundle demo with ((version \"1.0.0\"))",
+            "let value = 1",
+            "bundle later with ((version \"9.9.9\"))",
+            "module M =",
+            "bundle nested with ((version \"8.8.8\"))",
+            "end",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+    assert_eq!(metadata.version, Version::new(1, 0, 0));
+
+    let diagnostics = parse_diagnostics(&db, source);
+    let misplaced_bundle_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("bundle declaration must be the first statement in the file")
+        })
+        .count();
+    assert_eq!(misplaced_bundle_diagnostics, 2);
+}
+
+#[test]
+fn parse_query_malformed_dependencies_are_reported_and_dropped() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "bundle_metadata_bad_dependencies.hc".to_owned(),
+        [
+            "bundle demo with (",
+            "(version \"1.0.0\")",
+            "(dependencies",
+            "(dep missing-version)",
+            "(dep bad-req \"not-a-requirement\")",
+            "(dep bad-source \"^1.0\" (svn \"https://example.com/repo\"))",
+            "(dep bad-path \"^1.0\" (path 123))",
+            "(dep too-many \"^1.0\" (path \"../a\") (git \"https://example.com/repo\"))",
+            "(dep good \"^1.2\" (git \"https://example.com/ok\"))",
+            ")",
+            ")",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    let metadata = parsed
+        .ast
+        .bundle_metadata
+        .as_ref()
+        .expect("missing parsed bundle metadata");
+
+    assert_eq!(metadata.dependencies.len(), 1);
+    let dependency = &metadata.dependencies[0];
+    assert_eq!(dependency.name, "good");
+    assert_eq!(
+        dependency.version,
+        VersionReq::parse("^1.2").expect("failed to parse semver requirement")
+    );
+    assert_eq!(
+        dependency.source,
+        super::BundleDependencySource::Git("https://example.com/ok".to_owned())
+    );
+
+    let diagnostics = parse_diagnostics(&db, source);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle dependency entry must have shape")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle dependency version requirement must be a valid semver requirement")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle dependency source must be `path` or `git`")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle dependency `path` source value must be a string literal")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("bundle dependency entry has too many arguments")
+    }));
+}
+
+#[test]
 fn parse_query_keeps_bundle_name_none_without_top_declaration() {
     let db = Eng::default();
     let source = Source::new(
@@ -170,6 +476,7 @@ fn parse_query_keeps_bundle_name_none_without_top_declaration() {
 
     let parsed = parse_source(&db, source);
     assert_eq!(parsed.ast.bundle_name, None);
+    assert!(parsed.ast.bundle_metadata.is_none());
     assert!(parse_diagnostics(&db, source).iter().any(|diagnostic| {
         diagnostic
             .message
