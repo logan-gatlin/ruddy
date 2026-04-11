@@ -4,7 +4,7 @@ use crate::ty::store::TypeStore;
 use crate::ty::typed_ir as tir;
 use crate::ty::*;
 
-use super::{UnificationError, UnificationTable, check_text};
+use super::{check_text, UnificationError, UnificationTable};
 
 // ---------------------------------------------------------------------------
 // TypeStore tests
@@ -846,6 +846,48 @@ fn infer_record_field_access_is_polymorphic() {
 }
 
 #[test]
+fn infer_anonymous_record_annotations() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_anonymous_record_annotations.hc".to_owned(),
+        [
+            "bundle demo",
+            "let get: for a in {value: a} -> a = fn r => r.value",
+            "let a = get {value = 1}",
+            "let b = get {value = true}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+
+    let a_expr = typed_binding_expr_by_name(module, "demo::a").expect("missing binding demo::a");
+    let b_expr = typed_binding_expr_by_name(module, "demo::b").expect("missing binding demo::b");
+
+    assert_eq!(
+        checked.type_store.get_type(a_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+    assert_eq!(
+        checked.type_store.get_type(b_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Bool)
+    );
+}
+
+#[test]
 fn closed_record_pattern_rejects_extra_fields() {
     let db = Eng::default();
     let source = Source::new(
@@ -1054,6 +1096,71 @@ fn alias_types_are_transparent_in_record_spreads() {
 }
 
 #[test]
+fn nominal_record_spread_is_allowed_inside_type_aliases() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_alias_nominal_record_spread_decl.hc".to_owned(),
+        [
+            "bundle demo",
+            "type A = {a: (), b: ()}",
+            "type ~B = {c: (), d: (), ..A}",
+            "let s = {a = (), b = (), c = (), d = ()}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn named_record_spread_piercing_recurses_through_named_types() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_named_record_spread_recursive_piercing.hc".to_owned(),
+        [
+            "bundle demo",
+            "type A = {}",
+            "type B = A",
+            "type C = {..A, ..B}",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn cyclic_named_record_spread_piercing_terminates() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_named_record_spread_recursive_cycle.hc".to_owned(),
+        ["bundle demo", "type A = A", "type B = {..A}"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("record spread target must be a record type")),
+        "expected record spread type diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
 fn opaque_type_constructor_blocking_structural_construction() {
     let db = Eng::default();
     let source = Source::new(
@@ -1104,9 +1211,9 @@ fn existing_sum_variants_still_work() {
         "hm_opaque_sum_variants_still_work.hc".to_owned(),
         [
             "bundle demo",
-            "type Result = | Nil | Cons Int",
-            "let a: Result = Nil",
-            "let b: Result = Cons 1",
+            "type Result = fn a => | Nil | Cons a",
+            "let a = Result::Nil",
+            "let b = Result::Cons 1",
         ]
         .join("\n"),
     );

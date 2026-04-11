@@ -987,8 +987,6 @@ impl<'a> Parser<'a> {
     fn parse_type_def(&mut self) -> ast::TypeDefinition {
         if self.at_keyword(Keyword::Fn) {
             self.parse_type_def_lambda()
-        } else if self.at_punct(Punct::LBrace) {
-            self.parse_record_type_def()
         } else if self.at_punct(Punct::Pipe) {
             self.parse_sum_type_def()
         } else {
@@ -1013,7 +1011,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_record_type_def(&mut self) -> ast::TypeDefinition {
+    fn parse_record_type_expr(&mut self) -> ast::TypeExpr {
         let start = self.pos;
         self.bump();
 
@@ -1050,11 +1048,11 @@ impl<'a> Parser<'a> {
 
             self.expect_punct(
                 Punct::RBrace,
-                "expected `}` to close record type definition",
+                "expected `}` to close record type",
             );
         }
 
-        ast::TypeDefinition::Struct {
+        ast::TypeExpr::Record {
             members,
             range: self.range_from(start),
         }
@@ -1228,11 +1226,16 @@ impl<'a> Parser<'a> {
             || self.at_keyword(Keyword::Bundle)
             || self.at_punct(Punct::LParen)
             || self.at_punct(Punct::LBracket)
+            || self.at_punct(Punct::LBrace)
     }
 
     fn parse_type_atom(&mut self) -> Option<ast::TypeExpr> {
         if let Some(name) = self.parse_ident_or_path() {
             return Some(ast::TypeExpr::Name(name));
+        }
+
+        if self.at_punct(Punct::LBrace) {
+            return Some(self.parse_record_type_expr());
         }
 
         if self.at_punct(Punct::LParen) {

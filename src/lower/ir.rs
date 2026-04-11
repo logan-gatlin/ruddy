@@ -277,6 +277,10 @@ pub enum TypeExpr {
         argument: Box<TypeExpr>,
         range: TextRange,
     },
+    Record {
+        members: Vec<RecordTypeMember>,
+        range: TextRange,
+    },
     Name {
         name: ResolvedName,
     },

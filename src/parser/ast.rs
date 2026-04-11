@@ -379,6 +379,10 @@ pub enum TypeExpr {
         range: TextRange,
     },
     Name(NameRef),
+    Record {
+        members: Vec<RecordTypeMember>,
+        range: TextRange,
+    },
     Grouped {
         inner: Box<TypeExpr>,
         range: TextRange,
@@ -403,6 +407,7 @@ impl TypeExpr {
             | Self::Lambda { range, .. }
             | Self::Function { range, .. }
             | Self::Apply { range, .. }
+            | Self::Record { range, .. }
             | Self::Grouped { range, .. }
             | Self::Tuple { range, .. }
             | Self::Unit { range }
@@ -964,6 +969,15 @@ pub fn walk_type_expr(type_expr: &TypeExpr, visitor: &mut AstVisitor) {
         } => {
             walk_type_expr(callee, visitor);
             walk_type_expr(argument, visitor);
+        }
+        TypeExpr::Record { members, .. } => {
+            for member in members {
+                match member {
+                    RecordTypeMember::Field { ty, .. } | RecordTypeMember::Spread { ty, .. } => {
+                        walk_type_expr(ty, visitor);
+                    }
+                }
+            }
         }
         TypeExpr::Grouped { inner, .. } => walk_type_expr(inner, visitor),
         TypeExpr::Tuple { elements, .. } => {

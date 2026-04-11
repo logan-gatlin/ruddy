@@ -282,15 +282,25 @@ impl UnificationTable {
             self.unify_types(store, field_a, field_b)?;
         }
 
-        let tail_a = tail_a.unwrap_or_else(|| store.mk_row_empty());
-        let tail_b = tail_b.unwrap_or_else(|| store.mk_row_empty());
-
         let extras_a_empty = fields_a.is_empty();
         let extras_b_empty = fields_b.is_empty();
 
         match (extras_a_empty, extras_b_empty) {
-            (true, true) => self.unify_types(store, tail_a, tail_b),
+            (true, true) => match (tail_a, tail_b) {
+                (None, None) => Ok(()),
+                (Some(tail_a), Some(tail_b)) => self.unify_types(store, tail_a, tail_b),
+                (Some(tail_a), None) => {
+                    let empty = store.mk_row_empty();
+                    self.unify_types(store, tail_a, empty)
+                }
+                (None, Some(tail_b)) => {
+                    let empty = store.mk_row_empty();
+                    self.unify_types(store, empty, tail_b)
+                }
+            },
             (false, true) => {
+                let tail_a = tail_a.unwrap_or_else(|| store.mk_row_empty());
+                let tail_b = tail_b.unwrap_or_else(|| store.mk_row_empty());
                 let resolved_tail_b = self.shallow_resolve_type(store, tail_b);
                 if matches!(store.get_type(resolved_tail_b).kind, TypeKind::RowEmpty) {
                     Err(UnificationError::TypeMismatch {
@@ -303,6 +313,8 @@ impl UnificationTable {
                 }
             }
             (true, false) => {
+                let tail_a = tail_a.unwrap_or_else(|| store.mk_row_empty());
+                let tail_b = tail_b.unwrap_or_else(|| store.mk_row_empty());
                 let resolved_tail_a = self.shallow_resolve_type(store, tail_a);
                 if matches!(store.get_type(resolved_tail_a).kind, TypeKind::RowEmpty) {
                     Err(UnificationError::TypeMismatch {
@@ -315,6 +327,8 @@ impl UnificationTable {
                 }
             }
             (false, false) => {
+                let tail_a = tail_a.unwrap_or_else(|| store.mk_row_empty());
+                let tail_b = tail_b.unwrap_or_else(|| store.mk_row_empty());
                 let (_, fresh_tail) = self.fresh_type_var(store, store.kind_row());
                 let rhs_for_a = self.mk_row_from_fields(store, fields_b, fresh_tail);
                 let rhs_for_b = self.mk_row_from_fields(store, fields_a, fresh_tail);

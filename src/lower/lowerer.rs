@@ -1247,6 +1247,10 @@ impl<'db> ModuleLowerer<'db> {
                     }
                 }
             }
+            ast::TypeExpr::Record { members, range } => ir::TypeExpr::Record {
+                members: self.lower_record_type_members(members, lookup, type_env),
+                range: *range,
+            },
             ast::TypeExpr::Grouped { inner, .. } => self.lower_type_expr(inner, lookup, type_env),
             ast::TypeExpr::Tuple { elements, range } => ir::TypeExpr::Tuple {
                 elements: elements
@@ -1260,6 +1264,46 @@ impl<'db> ModuleLowerer<'db> {
             ast::TypeExpr::Error(error) => {
                 ir::TypeExpr::Error(ir::ErrorNode { range: error.range })
             }
+        }
+    }
+
+    fn lower_record_type_members(
+        &mut self,
+        members: &[ast::RecordTypeMember],
+        lookup: &LookupContext,
+        type_env: &mut TypeEnv,
+    ) -> Vec<ir::RecordTypeMember> {
+        members
+            .iter()
+            .map(|member| match member {
+                ast::RecordTypeMember::Field { name, ty, range } => ir::RecordTypeMember::Field {
+                    name: name.as_ref().and_then(|name| self.identifier_text(name)),
+                    ty: self.lower_type_expr(ty, lookup, type_env),
+                    range: *range,
+                },
+                ast::RecordTypeMember::Spread { ty, range } => ir::RecordTypeMember::Spread {
+                    ty: self.lower_type_expr(ty, lookup, type_env),
+                    range: *range,
+                },
+            })
+            .collect()
+    }
+
+    fn lower_nominal_record_definition(
+        &mut self,
+        type_expr: &ast::TypeExpr,
+        lookup: &LookupContext,
+        type_env: &mut TypeEnv,
+    ) -> Option<ir::TypeDefinition> {
+        match type_expr {
+            ast::TypeExpr::Record { members, range } => Some(ir::TypeDefinition::Struct {
+                members: self.lower_record_type_members(members, lookup, type_env),
+                range: *range,
+            }),
+            ast::TypeExpr::Grouped { inner, .. } => {
+                self.lower_nominal_record_definition(inner, lookup, type_env)
+            }
+            _ => None,
         }
     }
 
@@ -1288,24 +1332,7 @@ impl<'db> ModuleLowerer<'db> {
                 }
             }
             ast::TypeDefinition::Struct { members, range } => ir::TypeDefinition::Struct {
-                members: members
-                    .iter()
-                    .map(|member| match member {
-                        ast::RecordTypeMember::Field { name, ty, range } => {
-                            ir::RecordTypeMember::Field {
-                                name: name.as_ref().and_then(|name| self.identifier_text(name)),
-                                ty: self.lower_type_expr(ty, lookup, type_env),
-                                range: *range,
-                            }
-                        }
-                        ast::RecordTypeMember::Spread { ty, range } => {
-                            ir::RecordTypeMember::Spread {
-                                ty: self.lower_type_expr(ty, lookup, type_env),
-                                range: *range,
-                            }
-                        }
-                    })
-                    .collect(),
+                members: self.lower_record_type_members(members, lookup, type_env),
                 range: *range,
             },
             ast::TypeDefinition::Sum { variants, range } => {
@@ -1356,9 +1383,11 @@ impl<'db> ModuleLowerer<'db> {
                     range: *range,
                 }
             }
-            ast::TypeDefinition::Expr(expr) => ir::TypeDefinition::Opaque {
-                representation: self.lower_type_expr(expr, lookup, type_env),
-            },
+            ast::TypeDefinition::Expr(expr) => self
+                .lower_nominal_record_definition(expr, lookup, type_env)
+                .unwrap_or_else(|| ir::TypeDefinition::Opaque {
+                    representation: self.lower_type_expr(expr, lookup, type_env),
+                }),
         }
     }
 

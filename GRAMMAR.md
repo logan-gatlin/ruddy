@@ -72,14 +72,13 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 
 ## Type Definitions
 ```bnf
-<type_def> ::= <record_type_def>
-             | <sum_type_def>
+<type_def> ::= <sum_type_def>
              | <type_def_lambda>
              | <type_expr>
 
 <type_def_lambda> ::= "fn" <type_lambda_param>+ "=>" <type_def>
 
-<record_type_def>  ::= "{" <struct_member_list>? "}"
+<record_type_expr> ::= "{" <struct_member_list>? "}"
 <struct_member_list> ::= <struct_member> ("," <struct_member>)* ","?
 
 <struct_member> ::= <field_decl>
@@ -122,6 +121,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 
 <type_atom> ::= <ident>
               | <path>
+              | <record_type_expr>
               | "(" ")"
               | "(" <type_expr> ")"
               | "(" <type_tuple_elems> ")"

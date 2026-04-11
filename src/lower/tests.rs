@@ -1,7 +1,8 @@
 use crate::engine::{Eng, Source};
 use crate::lower::ir::{
     Expr, FormatStringSegment, KindExpr, LetStatementKind, Literal, LiteralValue, LoweredModule,
-    Pattern, ResolvedName, Statement, TypeDefinition, TypeExpr, TypeStatementKind,
+    Pattern, RecordTypeMember, ResolvedName, Statement, TypeDefinition, TypeExpr,
+    TypeStatementKind,
     WasmTopLevelDeclaration,
 };
 use crate::lower::{lower_diagnostics, lower_text};
@@ -1258,6 +1259,92 @@ fn kind_annotations_and_type_lambdas_are_preserved_in_lowered_ir() {
     assert!(matches!(
         params[1].kind_annotation,
         Some(KindExpr::Arrow { .. })
+    ));
+}
+
+#[test]
+fn anonymous_record_type_exprs_are_preserved_in_lowered_ir() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "lower_record_type_exprs.hc".to_owned(),
+        [
+            "bundle demo",
+            "type Box = fn a => {value: a}",
+            "type ~Pair = {left: _, right: _}",
+            "let value : {inner: {item: _}, ..{extra: _}} = ()",
+        ]
+        .join("\n"),
+    );
+
+    let lowered = lower_text::<TestResolver>(&db, source);
+    let diagnostics = lower_diagnostics::<TestResolver>(&db, source);
+    assert!(
+        diagnostics.is_empty(),
+        "expected no lowering diagnostics, got: {diagnostics:?}"
+    );
+
+    let root = lowered
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing root lowered module");
+
+    let Statement::Type {
+        kind: TypeStatementKind::Nominal { definition },
+        ..
+    } = &root.statements[0]
+    else {
+        panic!("expected first statement to be a nominal type");
+    };
+    let TypeDefinition::Lambda { body, .. } = definition else {
+        panic!("expected nominal record type to keep its lambda wrapper");
+    };
+    assert!(matches!(body.as_ref(), TypeDefinition::Struct { .. }));
+
+    let Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Record { members, .. },
+            },
+        ..
+    } = &root.statements[1]
+    else {
+        panic!("expected second statement to be a record type alias");
+    };
+    assert_eq!(members.len(), 2);
+    assert!(matches!(members[0], RecordTypeMember::Field { .. }));
+    assert!(matches!(members[1], RecordTypeMember::Field { .. }));
+
+    let Statement::Let {
+        kind:
+            LetStatementKind::PatternBinding {
+                pattern:
+                    Pattern::Annotated {
+                        ty: TypeExpr::Record { members, .. },
+                        ..
+                    },
+                ..
+            },
+        ..
+    } = &root.statements[2]
+    else {
+        panic!("expected third statement to be an annotated binding with a record type");
+    };
+    assert_eq!(members.len(), 2);
+    assert!(matches!(
+        &members[0],
+        RecordTypeMember::Field {
+            ty: TypeExpr::Record { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &members[1],
+        RecordTypeMember::Spread {
+            ty: TypeExpr::Record { .. },
+            ..
+        }
     ));
 }
 

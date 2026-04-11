@@ -1,4 +1,4 @@
-use ruddy::{Eng, Source, parse_text};
+use ruddy::{check_text_fs, Eng, Source};
 
 fn main() -> std::io::Result<()> {
     let path = "demo.hc";
@@ -6,8 +6,8 @@ fn main() -> std::io::Result<()> {
 
     let db = Eng::default();
     let source = Source::new(&db, path.to_owned(), contents);
-    let parsed = parse_text(&db, source);
+    let checked = check_text_fs(&db, source);
 
-    println!("{parsed:#?}");
+    println!("{checked:#?}");
     Ok(())
 }

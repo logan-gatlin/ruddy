@@ -7,8 +7,9 @@ use crate::parser::{AstVisitor, BundleDependencySource, lex_diagnostics};
 use crate::reporting::{DiagnosticSeverity, TextSize};
 
 use super::{
-    Expr, KindExpr, LetStatementKind, NameRef, PathRoot, Pattern, Statement, TypeDefinition,
-    TypeExpr, TypeStatementKind, lex_source, parse_diagnostics, parse_source, parse_text,
+    Expr, KindExpr, LetStatementKind, NameRef, PathRoot, Pattern, RecordTypeMember, Statement,
+    TypeDefinition, TypeExpr, TypeStatementKind, lex_source, parse_diagnostics, parse_source,
+    parse_text,
 };
 
 #[test]
@@ -578,6 +579,69 @@ fn parse_query_accepts_kind_annotations_and_type_lambdas() {
     else {
         panic!("expected fifth statement to be a type lambda application");
     };
+}
+
+#[test]
+fn parse_query_accepts_anonymous_record_type_exprs() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "record_type_exprs.hc".to_owned(),
+        [
+            "bundle demo",
+            "type ~Pair = {left: _, right: _}",
+            "let value : {inner: {item: _}, ..{extra: _}} = ()",
+        ]
+        .join("\n"),
+    );
+
+    let parsed = parse_source(&db, source);
+    assert!(parse_diagnostics(&db, source).is_empty());
+
+    let Some(Statement::Type {
+        kind:
+            TypeStatementKind::Alias {
+                value: TypeExpr::Record { members, .. },
+            },
+        ..
+    }) = parsed.ast.statements.get(1)
+    else {
+        panic!("expected second statement to be a record type alias");
+    };
+    assert_eq!(members.len(), 2);
+    assert!(matches!(members[0], RecordTypeMember::Field { .. }));
+    assert!(matches!(members[1], RecordTypeMember::Field { .. }));
+
+    let Some(Statement::Let {
+        kind:
+            LetStatementKind::PatternBinding {
+                pattern:
+                    Pattern::Annotated {
+                        ty: TypeExpr::Record { members, .. },
+                        ..
+                    },
+                ..
+            },
+        ..
+    }) = parsed.ast.statements.get(2)
+    else {
+        panic!("expected third statement to be an annotated binding with a record type");
+    };
+    assert_eq!(members.len(), 2);
+    assert!(matches!(
+        &members[0],
+        RecordTypeMember::Field {
+            ty: TypeExpr::Record { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &members[1],
+        RecordTypeMember::Spread {
+            ty: TypeExpr::Record { .. },
+            ..
+        }
+    ));
 }
 
 #[test]

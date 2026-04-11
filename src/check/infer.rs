@@ -71,6 +71,7 @@ struct Checker {
     global_terms: HashMap<String, TypeScheme>,
     alias_schemes: HashMap<String, TypeScheme>,
     record_schemes: HashMap<String, TypeScheme>,
+    opaque_schemes: HashMap<String, TypeScheme>,
     named_type_constructors: HashMap<String, TypeId>,
     declaration_type_transparency_depth: usize,
     next_type_binder: u32,
@@ -86,6 +87,7 @@ impl Checker {
             global_terms: HashMap::new(),
             alias_schemes: HashMap::new(),
             record_schemes: HashMap::new(),
+            opaque_schemes: HashMap::new(),
             named_type_constructors: HashMap::new(),
             declaration_type_transparency_depth: 0,
             next_type_binder: 0,
@@ -309,55 +311,7 @@ impl Checker {
 
                         this.ensure_named_type_constructor(name, Some(computed_head_kind), range);
 
-                        let mut fields = BTreeMap::new();
-
-                        for member in members {
-                            match member {
-                                lir::RecordTypeMember::Field { name, ty, range } => {
-                                    let member_ty = this.lower_type_expr(ty, &mut type_env);
-                                    this.expect_type_kind(*range, member_ty);
-
-                                    let Some(name) = name.clone() else {
-                                        this.error(
-                                            *range,
-                                            "record field declaration is missing a name",
-                                        );
-                                        continue;
-                                    };
-
-                                    if let Some(existing) = fields.insert(name.clone(), member_ty) {
-                                        this.error(
-                                            *range,
-                                            format!("duplicate record field `{name}`"),
-                                        );
-                                        this.constrain_types(*range, existing, member_ty);
-                                    }
-                                }
-                                lir::RecordTypeMember::Spread { ty, range } => {
-                                    let spread_ty = this.lower_type_expr(ty, &mut type_env);
-                                    this.expect_type_kind(*range, spread_ty);
-
-                                    if let Some(spread_fields) =
-                                        this.collect_closed_record_fields(spread_ty, *range)
-                                    {
-                                        for (name, member_ty) in spread_fields {
-                                            if let Some(existing) =
-                                                fields.insert(name.clone(), member_ty)
-                                            {
-                                                this.error(
-                                                    *range,
-                                                    format!(
-                                                        "record spread introduces duplicate field `{name}`"
-                                                    ),
-                                                );
-                                                this.constrain_types(*range, existing, member_ty);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
+                        let fields = this.lower_record_type_members(members, &mut type_env);
                         let record_ty = this.mk_closed_record_from_fields(&fields);
                         let scheme_binders = this.finalize_decl_binders(&decl_binders);
                         let final_head_kind =
@@ -488,6 +442,15 @@ impl Checker {
                         let constructor_ty = this.store.mk_arrow(
                             repr_ty,
                             nominal_ty,
+                        );
+                        this.opaque_schemes.insert(
+                            name.text(),
+                            TypeScheme {
+                                binders: scheme_binders.clone(),
+                                predicates: Vec::new(),
+                                body: repr_ty,
+                                range,
+                            },
                         );
                         this.global_terms.insert(
                             name.text(),
@@ -1738,6 +1701,10 @@ impl Checker {
                 let argument_ty = self.lower_type_expr(argument, env);
                 self.apply_type(callee_ty, argument_ty, *range)
             }
+            lir::TypeExpr::Record { members, .. } => {
+                let fields = self.lower_record_type_members(members, env);
+                self.mk_closed_record_from_fields(&fields)
+            }
             lir::TypeExpr::Name { name } => self.lower_type_name(name, env),
             lir::TypeExpr::Hole { .. } => self.fresh_type_meta(),
             lir::TypeExpr::Tuple { elements, .. } => {
@@ -1875,6 +1842,14 @@ impl Checker {
         self.record_schemes.get(key).cloned()
     }
 
+    fn pierceable_named_type_scheme(&self, key: &str) -> Option<TypeScheme> {
+        self.record_schemes
+            .get(key)
+            .or_else(|| self.opaque_schemes.get(key))
+            .or_else(|| self.alias_schemes.get(key))
+            .cloned()
+    }
+
     fn scheme_to_type_lambda(&mut self, scheme: &TypeScheme) -> TypeId {
         scheme
             .binders
@@ -1995,17 +1970,135 @@ impl Checker {
         self.store.mk_record(row)
     }
 
+    fn lower_record_type_members(
+        &mut self,
+        members: &[lir::RecordTypeMember],
+        env: &mut TypeExprEnv,
+    ) -> BTreeMap<String, TypeId> {
+        let mut fields = BTreeMap::new();
+
+        for member in members {
+            match member {
+                lir::RecordTypeMember::Field { name, ty, range } => {
+                    let member_ty = self.lower_type_expr(ty, env);
+                    self.expect_type_kind(*range, member_ty);
+
+                    let Some(name) = name.clone() else {
+                        self.error(*range, "record field is missing a name");
+                        continue;
+                    };
+
+                    if let Some(existing) = fields.insert(name.clone(), member_ty) {
+                        self.error(*range, format!("duplicate record field `{name}`"));
+                        self.constrain_types(*range, existing, member_ty);
+                    }
+                }
+                lir::RecordTypeMember::Spread { ty, range } => {
+                    let spread_ty = self.lower_type_expr(ty, env);
+                    self.expect_type_kind(*range, spread_ty);
+
+                    if let Some(spread_fields) = self.collect_closed_record_fields(spread_ty, *range)
+                    {
+                        for (name, member_ty) in spread_fields {
+                            if let Some(existing) = fields.insert(name.clone(), member_ty) {
+                                self.error(
+                                    *range,
+                                    format!("record spread introduces duplicate field `{name}`"),
+                                );
+                                self.constrain_types(*range, existing, member_ty);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fields
+    }
+
+    fn collect_type_apply_chain(&self, ty: TypeId) -> (TypeId, Vec<TypeId>) {
+        let mut args_rev = Vec::new();
+        let mut current = self.table.shallow_resolve_type(&self.store, ty);
+
+        while let TypeKind::Application(func, arg) = self.store.get_type(current).kind {
+            args_rev.push(arg);
+            current = self.table.shallow_resolve_type(&self.store, func);
+        }
+
+        args_rev.reverse();
+        (current, args_rev)
+    }
+
+    fn try_expand_declaration_record_type(
+        &mut self,
+        ty: TypeId,
+        range: TextRange,
+    ) -> Option<TypeId> {
+        let mut visited_named_types = HashSet::new();
+        let mut current = self.table.shallow_resolve_type(&self.store, ty);
+
+        loop {
+            let current_kind = self.store.get_type(current).kind.clone();
+            if matches!(current_kind, TypeKind::Record(_) | TypeKind::Error) {
+                return Some(current);
+            }
+
+            let (head, mut args) = self.collect_type_apply_chain(current);
+            let TypeKind::Constructor(TypeConstructor::Named(path)) =
+                self.store.get_type(head).kind.clone()
+            else {
+                return None;
+            };
+
+            let key = path.text();
+            if !visited_named_types.insert(key.clone()) {
+                return Some(current);
+            }
+
+            let scheme = self.pierceable_named_type_scheme(&key)?;
+
+            if args.len() > scheme.binders.len() {
+                self.error(
+                    range,
+                    format!(
+                        "type `{key}` expects {} type argument(s), found {}",
+                        scheme.binders.len(),
+                        args.len()
+                    ),
+                );
+                return Some(self.error_type());
+            }
+
+            while args.len() < scheme.binders.len() {
+                let binder = &scheme.binders[args.len()];
+                let kind = self.default_unresolved_kind_to_type(binder.kind);
+                args.push(self.fresh_type_meta_with_kind(kind));
+            }
+
+            current = self.instantiate_scheme_with_args(&scheme, &args, range);
+            current = self.table.shallow_resolve_type(&self.store, current);
+        }
+    }
+
     fn collect_closed_record_fields(
         &mut self,
         record_ty: TypeId,
         range: TextRange,
     ) -> Option<BTreeMap<String, TypeId>> {
-        let record_ty = self.table.shallow_resolve_type(&self.store, record_ty);
-        let record_kind = self.store.get_type(record_ty).kind.clone();
+        let mut record_ty = self.table.shallow_resolve_type(&self.store, record_ty);
+        if !matches!(self.store.get_type(record_ty).kind, TypeKind::Record(_))
+            && let Some(expanded) = self.try_expand_declaration_record_type(record_ty, range)
+        {
+            record_ty = self.table.shallow_resolve_type(&self.store, expanded);
+        }
 
-        let TypeKind::Record(mut row) = record_kind else {
-            self.error(range, "record spread target must be a record type");
-            return None;
+        let mut row = match self.store.get_type(record_ty).kind.clone() {
+            TypeKind::Record(row) => row,
+            TypeKind::Error => return None,
+            _ => {
+                self.error(range, "record spread target must be a record type");
+                return None;
+            }
         };
 
         let mut fields = BTreeMap::new();
@@ -2445,6 +2538,7 @@ impl lir::TypeExpr {
             | lir::TypeExpr::Lambda { range, .. }
             | lir::TypeExpr::Function { range, .. }
             | lir::TypeExpr::Apply { range, .. }
+            | lir::TypeExpr::Record { range, .. }
             | lir::TypeExpr::Hole { range }
             | lir::TypeExpr::Tuple { range, .. }
             | lir::TypeExpr::Unit { range }
