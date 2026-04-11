@@ -96,7 +96,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 - `trait Name ... = ... end` defines a trait.
 - `trait ~Alias = <ident|path>` defines a trait alias.
 - Recursive type aliases are rejected.
-- Recursive nominal definitions are allowed only for sum types (`| ...`).
+- Recursive nominal definitions are allowed only for sum types (`| ...`) and only when at least one variant is acyclic.
 
 ## Type Expressions
 ```bnf

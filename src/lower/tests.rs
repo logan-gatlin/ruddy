@@ -2,8 +2,7 @@ use crate::engine::{Eng, Source};
 use crate::lower::ir::{
     Expr, FormatStringSegment, KindExpr, LetStatementKind, Literal, LiteralValue, LoweredModule,
     Pattern, RecordTypeMember, ResolvedName, Statement, TypeDefinition, TypeExpr,
-    TypeStatementKind,
-    WasmTopLevelDeclaration,
+    TypeStatementKind, WasmTopLevelDeclaration,
 };
 use crate::lower::{lower_diagnostics, lower_text};
 use crate::resolver::Resolver;

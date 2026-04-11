@@ -73,6 +73,7 @@ struct Checker {
     record_schemes: HashMap<String, TypeScheme>,
     opaque_schemes: HashMap<String, TypeScheme>,
     named_type_constructors: HashMap<String, TypeId>,
+    type_declarations: HashMap<String, lir::TypeStatementKind>,
     declaration_type_transparency_depth: usize,
     next_type_binder: u32,
 }
@@ -89,12 +90,15 @@ impl Checker {
             record_schemes: HashMap::new(),
             opaque_schemes: HashMap::new(),
             named_type_constructors: HashMap::new(),
+            type_declarations: HashMap::new(),
             declaration_type_transparency_depth: 0,
             next_type_binder: 0,
         }
     }
 
     fn check_source(mut self, lowered: &lir::LoweredSource) -> CheckResult {
+        self.index_type_declarations(lowered);
+
         let modules = lowered
             .modules
             .iter()
@@ -113,6 +117,243 @@ impl Checker {
             diagnostics: self.diagnostics,
             type_store: self.store,
         }
+    }
+
+    fn index_type_declarations(&mut self, lowered: &lir::LoweredSource) {
+        self.type_declarations.clear();
+
+        for module in &lowered.modules {
+            for statement in &module.statements {
+                if let lir::Statement::Type { name, kind, .. } = statement {
+                    self.type_declarations.insert(name.text(), kind.clone());
+                }
+            }
+        }
+    }
+
+    fn validate_type_recursion(
+        &mut self,
+        name: &lir::QualifiedName,
+        kind: &lir::TypeStatementKind,
+        range: TextRange,
+    ) {
+        let target_name = name.text();
+        let mut memo = HashMap::new();
+        let mut in_progress = HashSet::new();
+
+        match kind {
+            lir::TypeStatementKind::Alias { value } => {
+                if self.type_expr_reaches_target(value, &target_name, &mut memo, &mut in_progress) {
+                    self.error(
+                        range,
+                        format!("recursive type alias `{target_name}` is not allowed"),
+                    );
+                }
+            }
+            lir::TypeStatementKind::Nominal { definition } => {
+                let (_, base_definition) = definition.peel_lambdas();
+                match base_definition {
+                    lir::TypeDefinition::Sum { variants, .. } => {
+                        let has_acyclic_variant = variants.iter().any(|variant| {
+                            !self.sum_variant_reaches_target(
+                                variant,
+                                &target_name,
+                                &mut memo,
+                                &mut in_progress,
+                            )
+                        });
+
+                        if !has_acyclic_variant {
+                            self.error(
+                                range,
+                                format!(
+                                    "recursive sum type `{target_name}` must contain at least one variant without a cyclical reference"
+                                ),
+                            );
+                        }
+                    }
+                    lir::TypeDefinition::Struct { .. }
+                    | lir::TypeDefinition::Opaque { .. }
+                    | lir::TypeDefinition::Lambda { .. } => {
+                        if self.type_definition_reaches_target(
+                            definition,
+                            &target_name,
+                            &mut memo,
+                            &mut in_progress,
+                        ) {
+                            self.error(
+                                range,
+                                format!(
+                                    "recursive nominal type `{target_name}` is only allowed for sum definitions"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn type_statement_kind_reaches_target(
+        &self,
+        kind: &lir::TypeStatementKind,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        match kind {
+            lir::TypeStatementKind::Alias { value } => {
+                self.type_expr_reaches_target(value, target_name, memo, in_progress)
+            }
+            lir::TypeStatementKind::Nominal { definition } => {
+                self.type_definition_reaches_target(definition, target_name, memo, in_progress)
+            }
+        }
+    }
+
+    fn type_definition_reaches_target(
+        &self,
+        definition: &lir::TypeDefinition,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        match definition {
+            lir::TypeDefinition::Lambda { body, .. } => {
+                self.type_definition_reaches_target(body, target_name, memo, in_progress)
+            }
+            lir::TypeDefinition::Struct { members, .. } => members.iter().any(|member| {
+                self.record_member_reaches_target(member, target_name, memo, in_progress)
+            }),
+            lir::TypeDefinition::Sum { variants, .. } => variants.iter().any(|variant| {
+                self.sum_variant_reaches_target(variant, target_name, memo, in_progress)
+            }),
+            lir::TypeDefinition::Opaque { representation } => {
+                self.type_expr_reaches_target(representation, target_name, memo, in_progress)
+            }
+        }
+    }
+
+    fn sum_variant_reaches_target(
+        &self,
+        variant: &lir::SumVariant,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        variant.argument.as_ref().is_some_and(|argument| {
+            self.type_expr_reaches_target(argument, target_name, memo, in_progress)
+        })
+    }
+
+    fn record_member_reaches_target(
+        &self,
+        member: &lir::RecordTypeMember,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        match member {
+            lir::RecordTypeMember::Field { ty, .. } | lir::RecordTypeMember::Spread { ty, .. } => {
+                self.type_expr_reaches_target(ty, target_name, memo, in_progress)
+            }
+        }
+    }
+
+    fn type_expr_reaches_target(
+        &self,
+        type_expr: &lir::TypeExpr,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        match type_expr {
+            lir::TypeExpr::Forall {
+                body, constraints, ..
+            } => {
+                self.type_expr_reaches_target(body, target_name, memo, in_progress)
+                    || constraints.iter().any(|constraint| {
+                        constraint.args.iter().any(|arg| {
+                            self.type_expr_reaches_target(arg, target_name, memo, in_progress)
+                        })
+                    })
+            }
+            lir::TypeExpr::Lambda { body, .. } => {
+                self.type_expr_reaches_target(body, target_name, memo, in_progress)
+            }
+            lir::TypeExpr::Function { param, result, .. } => {
+                self.type_expr_reaches_target(param, target_name, memo, in_progress)
+                    || self.type_expr_reaches_target(result, target_name, memo, in_progress)
+            }
+            lir::TypeExpr::Apply {
+                callee, argument, ..
+            } => {
+                self.type_expr_reaches_target(callee, target_name, memo, in_progress)
+                    || self.type_expr_reaches_target(argument, target_name, memo, in_progress)
+            }
+            lir::TypeExpr::Record { members, .. } => members.iter().any(|member| {
+                self.record_member_reaches_target(member, target_name, memo, in_progress)
+            }),
+            lir::TypeExpr::Name { name } => match name {
+                lir::ResolvedName::Global(path) => {
+                    let key = path.text();
+                    self.global_type_name_reaches_target(&key, target_name, memo, in_progress)
+                }
+                lir::ResolvedName::Local { .. } | lir::ResolvedName::Error { .. } => false,
+            },
+            lir::TypeExpr::Hole { .. }
+            | lir::TypeExpr::Unit { .. }
+            | lir::TypeExpr::Array { .. }
+            | lir::TypeExpr::Error(_) => false,
+            lir::TypeExpr::Tuple { elements, .. } => elements.iter().any(|element| {
+                self.type_expr_reaches_target(element, target_name, memo, in_progress)
+            }),
+        }
+    }
+
+    fn global_type_name_reaches_target(
+        &self,
+        name: &str,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        if name == target_name {
+            return true;
+        }
+
+        self.declaration_reaches_target(name, target_name, memo, in_progress)
+    }
+
+    fn declaration_reaches_target(
+        &self,
+        declaration_name: &str,
+        target_name: &str,
+        memo: &mut HashMap<String, bool>,
+        in_progress: &mut HashSet<String>,
+    ) -> bool {
+        if declaration_name == target_name {
+            return true;
+        }
+
+        if let Some(cached) = memo.get(declaration_name) {
+            return *cached;
+        }
+
+        if !in_progress.insert(declaration_name.to_owned()) {
+            return false;
+        }
+
+        let reaches_target = self
+            .type_declarations
+            .get(declaration_name)
+            .is_some_and(|kind| {
+                self.type_statement_kind_reaches_target(kind, target_name, memo, in_progress)
+            });
+
+        in_progress.remove(declaration_name);
+        memo.insert(declaration_name.to_owned(), reaches_target);
+        reaches_target
     }
 
     fn check_module(&mut self, module: &lir::LoweredModule) -> tir::Module {
@@ -263,6 +504,8 @@ impl Checker {
         kind: &lir::TypeStatementKind,
         range: TextRange,
     ) {
+        self.validate_type_recursion(name, kind, range);
+
         match kind {
             lir::TypeStatementKind::Alias { value } => {
                 let (params, body) = value.peel_lambdas();
@@ -324,10 +567,7 @@ impl Checker {
                             range,
                             Some(final_head_kind),
                         );
-                        let constructor_ty = this.store.mk_arrow(
-                            record_ty,
-                            nominal_ty,
-                        );
+                        let constructor_ty = this.store.mk_arrow(record_ty, nominal_ty);
                         this.global_terms.insert(
                             name.text(),
                             TypeScheme {
@@ -439,10 +679,7 @@ impl Checker {
                             range,
                             Some(final_head_kind),
                         );
-                        let constructor_ty = this.store.mk_arrow(
-                            repr_ty,
-                            nominal_ty,
-                        );
+                        let constructor_ty = this.store.mk_arrow(repr_ty, nominal_ty);
                         this.opaque_schemes.insert(
                             name.text(),
                             TypeScheme {
@@ -476,10 +713,7 @@ impl Checker {
         (binders, env, param_tys)
     }
 
-    fn with_declaration_type_transparency<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    fn with_declaration_type_transparency<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.declaration_type_transparency_depth += 1;
         let result = f(self);
         self.declaration_type_transparency_depth -= 1;
@@ -1997,7 +2231,8 @@ impl Checker {
                     let spread_ty = self.lower_type_expr(ty, env);
                     self.expect_type_kind(*range, spread_ty);
 
-                    if let Some(spread_fields) = self.collect_closed_record_fields(spread_ty, *range)
+                    if let Some(spread_fields) =
+                        self.collect_closed_record_fields(spread_ty, *range)
                     {
                         for (name, member_ty) in spread_fields {
                             if let Some(existing) = fields.insert(name.clone(), member_ty) {

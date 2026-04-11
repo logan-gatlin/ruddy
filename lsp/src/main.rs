@@ -5,7 +5,7 @@ use ruddy::{
     Diagnostic as RuddyDiagnostic, DiagnosticSeverity as RuddyDiagnosticSeverity, Eng, Source,
     TextRange, check_text_fs, lower_diagnostics_fs, parse_text,
     ty::store::TypeStore,
-    ty::{Kind, KindId, TypeBinderId, TypeConstructor, TypeId, TypeKind},
+    ty::{Kind, KindId, MetaTypeVariableId, TypeBinderId, TypeConstructor, TypeId, TypeKind},
     typed_ir as tir,
 };
 use tokio::sync::Mutex;
@@ -1035,6 +1035,7 @@ fn format_type_for_hover(store: &TypeStore, ty: TypeId) -> String {
 struct TypeFormatter<'store> {
     store: &'store TypeStore,
     binder_names: HashMap<TypeBinderId, String>,
+    meta_names: HashMap<MetaTypeVariableId, String>,
 }
 
 impl<'store> TypeFormatter<'store> {
@@ -1042,11 +1043,219 @@ impl<'store> TypeFormatter<'store> {
         Self {
             store,
             binder_names: HashMap::new(),
+            meta_names: HashMap::new(),
         }
     }
 
     fn format_type(&mut self, ty: TypeId) -> String {
-        self.format_type_prec(ty, 0)
+        self.meta_names.clear();
+
+        let implicit_meta_binders = self.collect_implicit_meta_binders(ty);
+        if implicit_meta_binders.is_empty() {
+            return self.format_type_prec(ty, 0);
+        }
+
+        let mut used_names = self.collect_bound_names(ty);
+        let mut next_name_index = 0usize;
+        let mut binder_texts = Vec::with_capacity(implicit_meta_binders.len());
+
+        for (meta_var, kind) in &implicit_meta_binders {
+            let name = self.next_fresh_meta_name(&mut used_names, &mut next_name_index);
+            binder_texts.push(self.format_binder_text(&name, *kind));
+            self.meta_names.insert(*meta_var, name);
+        }
+
+        let body_text = self.format_type_prec(ty, 0);
+
+        for (meta_var, _) in implicit_meta_binders {
+            self.meta_names.remove(&meta_var);
+        }
+
+        format!("for {} in {body_text}", binder_texts.join(" "))
+    }
+
+    fn collect_implicit_meta_binders(&self, ty: TypeId) -> Vec<(MetaTypeVariableId, KindId)> {
+        let mut binders = Vec::new();
+        let mut seen_meta_vars = HashSet::new();
+        let mut visited_types = HashSet::new();
+        self.collect_implicit_meta_binders_inner(
+            ty,
+            &mut visited_types,
+            &mut seen_meta_vars,
+            &mut binders,
+        );
+        binders
+    }
+
+    fn collect_implicit_meta_binders_inner(
+        &self,
+        ty: TypeId,
+        visited_types: &mut HashSet<TypeId>,
+        seen_meta_vars: &mut HashSet<MetaTypeVariableId>,
+        binders: &mut Vec<(MetaTypeVariableId, KindId)>,
+    ) {
+        if !visited_types.insert(ty) {
+            return;
+        }
+
+        let node = self.store.get_type(ty);
+        match &node.kind {
+            TypeKind::MetaTypeVariable(var) => {
+                if seen_meta_vars.insert(*var) {
+                    binders.push((*var, node.kind_id));
+                }
+            }
+            TypeKind::Application(func, argument) => {
+                self.collect_implicit_meta_binders_inner(
+                    *func,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+                self.collect_implicit_meta_binders_inner(
+                    *argument,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+            }
+            TypeKind::Lambda(_, body) => {
+                self.collect_implicit_meta_binders_inner(
+                    *body,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+            }
+            TypeKind::Record(row) => {
+                self.collect_implicit_meta_binders_inner(
+                    *row,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+            }
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.collect_implicit_meta_binders_inner(
+                    *field,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+                self.collect_implicit_meta_binders_inner(
+                    *tail,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+            }
+            TypeKind::Forall(_, predicates, body) => {
+                for predicate in predicates {
+                    for argument in &predicate.arguments {
+                        self.collect_implicit_meta_binders_inner(
+                            *argument,
+                            visited_types,
+                            seen_meta_vars,
+                            binders,
+                        );
+                    }
+                }
+                self.collect_implicit_meta_binders_inner(
+                    *body,
+                    visited_types,
+                    seen_meta_vars,
+                    binders,
+                );
+            }
+            TypeKind::Constructor(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => {}
+        }
+    }
+
+    fn collect_bound_names(&self, ty: TypeId) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let mut visited_types = HashSet::new();
+        self.collect_bound_names_inner(ty, &mut visited_types, &mut names);
+        names
+    }
+
+    fn collect_bound_names_inner(
+        &self,
+        ty: TypeId,
+        visited_types: &mut HashSet<TypeId>,
+        names: &mut HashSet<String>,
+    ) {
+        if !visited_types.insert(ty) {
+            return;
+        }
+
+        match &self.store.get_type(ty).kind {
+            TypeKind::Forall(binders, predicates, body) => {
+                for binder in binders {
+                    if !binder.name.is_empty() {
+                        names.insert(binder.name.clone());
+                    }
+                }
+                for predicate in predicates {
+                    for argument in &predicate.arguments {
+                        self.collect_bound_names_inner(*argument, visited_types, names);
+                    }
+                }
+                self.collect_bound_names_inner(*body, visited_types, names);
+            }
+            TypeKind::Lambda(binder, body) => {
+                if !binder.name.is_empty() {
+                    names.insert(binder.name.clone());
+                }
+                self.collect_bound_names_inner(*body, visited_types, names);
+            }
+            TypeKind::Application(func, argument) => {
+                self.collect_bound_names_inner(*func, visited_types, names);
+                self.collect_bound_names_inner(*argument, visited_types, names);
+            }
+            TypeKind::Record(row) => {
+                self.collect_bound_names_inner(*row, visited_types, names);
+            }
+            TypeKind::RowExtend { field, tail, .. } => {
+                self.collect_bound_names_inner(*field, visited_types, names);
+                self.collect_bound_names_inner(*tail, visited_types, names);
+            }
+            TypeKind::Constructor(_)
+            | TypeKind::RigidTypeVariable(_)
+            | TypeKind::MetaTypeVariable(_)
+            | TypeKind::RowEmpty
+            | TypeKind::Error => {}
+        }
+    }
+
+    fn next_fresh_meta_name(
+        &self,
+        used_names: &mut HashSet<String>,
+        next_name_index: &mut usize,
+    ) -> String {
+        loop {
+            let candidate = self.meta_name_from_index(*next_name_index);
+            *next_name_index += 1;
+            if used_names.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+
+    fn meta_name_from_index(&self, mut index: usize) -> String {
+        let mut chars = Vec::new();
+        loop {
+            let remainder = index % 26;
+            chars.push((b'a' + remainder as u8) as char);
+            if index < 26 {
+                break;
+            }
+            index = (index / 26) - 1;
+        }
+
+        chars.iter().rev().collect()
     }
 
     fn format_type_prec(&mut self, ty: TypeId, min_precedence: u8) -> String {
@@ -1189,7 +1398,11 @@ impl<'store> TypeFormatter<'store> {
                 .get(binder_id)
                 .cloned()
                 .unwrap_or_else(|| format!("t{}", binder_id.0)),
-            TypeKind::MetaTypeVariable(var) => format!("?{}", var.0),
+            TypeKind::MetaTypeVariable(var) => self
+                .meta_names
+                .get(var)
+                .cloned()
+                .unwrap_or_else(|| format!("?{}", var.0)),
             TypeKind::Record(row) => self.format_record_type(*row),
             TypeKind::RowEmpty | TypeKind::RowExtend { .. } => {
                 format!("row {{{}}}", self.format_row_contents(ty))
@@ -1503,6 +1716,16 @@ mod tests {
         let lambda = store.mk_lambda(binder, rigid);
 
         assert_eq!(format_type_for_hover(&store, lambda), "fn a => a");
+    }
+
+    #[test]
+    fn format_type_for_hover_quantifies_unresolved_meta_variables() {
+        let mut store = TypeStore::new();
+        let kind = store.kind_type();
+        let meta = store.mk_meta(MetaTypeVariableId(1), kind);
+        let arrow = store.mk_arrow(meta, meta);
+
+        assert_eq!(format_type_for_hover(&store, arrow), "for a in a -> a");
     }
 
     #[test]

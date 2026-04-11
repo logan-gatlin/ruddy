@@ -4,7 +4,7 @@ use crate::ty::store::TypeStore;
 use crate::ty::typed_ir as tir;
 use crate::ty::*;
 
-use super::{check_text, UnificationError, UnificationTable};
+use super::{UnificationError, UnificationTable, check_text};
 
 // ---------------------------------------------------------------------------
 // TypeStore tests
@@ -1156,6 +1156,107 @@ fn cyclic_named_record_spread_piercing_terminates() {
             .message
             .contains("record spread target must be a record type")),
         "expected record spread type diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn recursive_type_alias_is_rejected() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_recursive_alias_rejected.hc".to_owned(),
+        ["bundle demo", "type ~Loop = Loop"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("recursive type alias `demo::Loop` is not allowed")),
+        "expected recursive alias diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn recursive_nominal_struct_is_rejected() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_recursive_struct_rejected.hc".to_owned(),
+        ["bundle demo", "type Node = {next: Node}"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("recursive nominal type `demo::Node` is only allowed for sum definitions")),
+        "expected recursive nominal struct diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn recursive_nominal_opaque_is_rejected() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_recursive_opaque_rejected.hc".to_owned(),
+        ["bundle demo", "type Loop = Loop -> ()"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("recursive nominal type `demo::Loop` is only allowed for sum definitions")),
+        "expected recursive nominal opaque diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn recursive_sum_without_acyclic_variant_is_rejected() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_recursive_sum_without_base_rejected.hc".to_owned(),
+        ["bundle demo", "type Loop = | Again Loop"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(
+                "recursive sum type `demo::Loop` must contain at least one variant without a cyclical reference"
+            )),
+        "expected recursive sum guard diagnostic, got: {:?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn recursive_sum_with_acyclic_variant_is_allowed() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_recursive_sum_with_base_allowed.hc".to_owned(),
+        [
+            "bundle demo",
+            "type List = | Nil | Cons List",
+            "let value = List::Nil",
+        ]
+        .join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
         checked.diagnostics
     );
 }

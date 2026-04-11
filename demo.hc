@@ -1,3 +1,3 @@
 bundle demo
 
-type D = D
+let a = fn a => a

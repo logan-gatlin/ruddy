@@ -1,4 +1,4 @@
-use ruddy::{check_text_fs, Eng, Source};
+use ruddy::{Eng, Source, check_text_fs};
 
 fn main() -> std::io::Result<()> {
     let path = "demo.hc";

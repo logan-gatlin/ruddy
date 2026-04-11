@@ -1046,10 +1046,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            self.expect_punct(
-                Punct::RBrace,
-                "expected `}` to close record type",
-            );
+            self.expect_punct(Punct::RBrace, "expected `}` to close record type");
         }
 
         ast::TypeExpr::Record {
