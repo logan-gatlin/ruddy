@@ -647,7 +647,6 @@ pub enum Expr {
         range: TextRange,
     },
     InlineWasm {
-        result_type: TypeExpr,
         body: Option<SExpr>,
         range: TextRange,
     },
@@ -1070,10 +1069,7 @@ pub fn walk_expr(expr: &Expr, visitor: &mut AstVisitor) {
                 walk_expr(&field.value, visitor);
             }
         }
-        Expr::InlineWasm {
-            result_type, body, ..
-        } => {
-            walk_type_expr(result_type, visitor);
+        Expr::InlineWasm { body, .. } => {
             if let Some(body) = body {
                 walk_sexpr(body, visitor);
             }

@@ -2154,23 +2154,28 @@ impl<'a> Parser<'a> {
             "expected `(` to start inline wasm expression",
         );
         self.expect_keyword(Keyword::Wasm, "expected `wasm` in inline wasm expression");
-        self.expect_punct(Punct::Colon, "expected `:` in inline wasm expression");
-        let result_type = self.parse_type_expr();
-        self.expect_punct(Punct::RParen, "expected `)` after inline wasm signature");
-        self.expect_operator(
-            Operator::FatArrow,
-            "expected `=>` in inline wasm expression",
+        let body_start = self.pos;
+        let mut items = Vec::new();
+        while !self.at_eof() && !self.at_punct(Punct::RParen) {
+            if let Some(item) = self.parse_sexpr_item() {
+                items.push(item);
+            } else {
+                let error_start = self.pos;
+                self.error_current("expected S-expression item in inline wasm expression");
+                self.bump();
+                items.push(ast::SExpr::Error(self.error_node(error_start)));
+            }
+        }
+        let body = Some(ast::SExpr::List {
+            items,
+            range: self.range_from(body_start),
+        });
+        self.expect_punct(
+            Punct::RParen,
+            "expected `)` to close inline wasm expression",
         );
 
-        let body = if let Some(sexpr) = self.parse_sexpr() {
-            Some(sexpr)
-        } else {
-            self.error_current("expected S-expression body in inline wasm expression");
-            None
-        };
-
         ast::Expr::InlineWasm {
-            result_type,
             body,
             range: self.range_from(start),
         }
@@ -2204,7 +2209,6 @@ impl<'a> Parser<'a> {
     fn is_inline_wasm_expr_start(&self) -> bool {
         self.at_punct(Punct::LParen)
             && matches!(self.peek_kind(1), Some(TokenKind::Keyword(Keyword::Wasm)))
-            && self.peek_punct(2, Punct::Colon)
     }
 
     fn make_binary_expr(

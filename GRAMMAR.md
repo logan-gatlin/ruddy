@@ -192,7 +192,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
               | "[" <array_elem_list>? "]"
               | "{" <field_def_list>? "}"
 
-<inline_wasm_expr> ::= "(" "wasm" ":" <type_expr> ")" "=>" <sexpr>
+<inline_wasm_expr> ::= "(" "wasm" <sexpr_item>* ")"
 
 <tuple_expr_elems> ::= <expr> "," (<expr> ("," <expr>)*)? ","?
 
@@ -278,7 +278,7 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
                  | "(" "result" <wasm_type>+ ")"
                  | "(" "local" (<sexpr_symbol_ident> <wasm_type>)+ ")"
 
-<inline_wasm_body> ::= "(" <local_decl>* <instruction>* ")"
+<inline_wasm_stream> ::= <local_decl>* <instruction>*
 <local_decl>       ::= "(" "local" (<sexpr_symbol_ident> <wasm_type>)+ ")"
 
 <instruction> ::= <sexpr_ident> <sexpr_item>*
@@ -291,7 +291,8 @@ Semantic validation (name resolution, recursion legality, import graph checks, e
 ```
 
 - Instruction streams are flat (token-by-token), not nested WAT-style instruction trees.
-- In `(wasm : ...) => (...)` expressions, only `(local ...)` declarations are valid before instructions.
+- In `(wasm ...)` expressions, only `(local ...)` declarations are valid before instructions.
+- Inline wasm expression result types are inferred from surrounding type constraints.
 - `wasm =>` accepts either a single `<wasm_declaration>` or a parenthesized list of declarations, and the list form may be empty (`wasm => ()`).
 - Memory limits use 32-bit page counts; when a maximum is present, it must be `>=` the initial size.
 - The first token of each instruction is an opcode identifier (for example `get`, `call`, `struct.new`, `i32.add`).

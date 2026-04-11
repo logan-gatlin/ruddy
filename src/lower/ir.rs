@@ -415,7 +415,6 @@ pub enum Expr {
         range: TextRange,
     },
     InlineWasm {
-        result_type: TypeExpr,
         locals: Vec<WasmTypedBinding>,
         instructions: Vec<WasmInstructionNode>,
         range: TextRange,

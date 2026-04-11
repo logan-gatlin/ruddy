@@ -723,18 +723,9 @@ impl<'db> ModuleLowerer<'db> {
                     .collect(),
                 range: *range,
             },
-            ast::Expr::InlineWasm {
-                result_type,
-                body,
-                range,
-            } => {
-                let lookup = LookupContext {
-                    opened_modules: &env.opened_modules,
-                    module_aliases: &env.module_aliases,
-                };
+            ast::Expr::InlineWasm { body, range } => {
                 let (locals, instructions) = self.lower_inline_wasm_expression(body, *range);
                 ir::Expr::InlineWasm {
-                    result_type: self.lower_type_expr(result_type, &lookup, type_env),
                     locals,
                     instructions,
                     range: *range,

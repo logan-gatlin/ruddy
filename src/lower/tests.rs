@@ -1572,7 +1572,7 @@ fn inline_wasm_local_declarations_are_order_sensitive() {
         "inline_wasm_locals.hc".to_owned(),
         [
             "bundle demo",
-            "let value = (wasm : i32) => (local.get $x (local $x i32) local.get $x)",
+            "let value = (wasm local.get $x (local $x i32) local.get $x)",
         ]
         .join("\n"),
     );
@@ -1632,7 +1632,7 @@ fn wasm_symbolic_operands_require_dollar_prefix() {
     let source = Source::new(
         &db,
         "wasm_dollar_refs.hc".to_owned(),
-        ["bundle demo", "let value = (wasm : i32) => (call helper)"].join("\n"),
+        ["bundle demo", "let value = (wasm call helper)"].join("\n"),
     );
 
     let diagnostics = lower_diagnostics::<TestResolver>(&db, source);

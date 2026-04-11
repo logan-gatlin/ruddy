@@ -777,7 +777,7 @@ fn parse_query_handles_inline_wasm_forms() {
         "wasm.hc".to_owned(),
         [
             "bundle demo",
-            "let add_one = (wasm : i32) => (i32.add (local.get $x) 1)",
+            "let add_one = (wasm local.get $x i32.const 1 i32.add)",
             "wasm => ((func $f (param $x i32) (result i32) local.get $x))",
         ]
         .join("\n"),

@@ -1137,18 +1137,14 @@ impl Checker {
                 }
             }
             lir::Expr::InlineWasm {
-                result_type,
                 locals: wasm_locals,
                 instructions,
                 range,
             } => {
-                let mut type_env = TypeExprEnv::default();
-                let result_ty = self.lower_type_expr(result_type, &mut type_env);
-                self.expect_type_kind(result_type.range(), result_ty);
+                let result_ty = self.fresh_type_meta();
 
                 tir::Expr {
                     kind: tir::ExprKind::InlineWasm {
-                        result_type: result_ty,
                         locals: wasm_locals.clone(),
                         instructions: instructions.clone(),
                     },
@@ -2684,9 +2680,7 @@ impl Checker {
                     self.zonk_expr(&mut field.value);
                 }
             }
-            tir::ExprKind::InlineWasm { result_type, .. } => {
-                *result_type = self.table.zonk_type(&mut self.store, *result_type);
-            }
+            tir::ExprKind::InlineWasm { .. } => {}
             tir::ExprKind::Name(_)
             | tir::ExprKind::Literal(_)
             | tir::ExprKind::Unit

@@ -765,6 +765,37 @@ fn infer_reports_if_condition_type_mismatch() {
 }
 
 #[test]
+fn infer_inline_wasm_type_from_context() {
+    let db = Eng::default();
+    let source = Source::new(
+        &db,
+        "hm_inline_wasm_infer.hc".to_owned(),
+        ["bundle demo", "let value = if true then (wasm) else 0"].join("\n"),
+    );
+
+    let checked = check_text::<FailingResolver>(&db, source);
+    assert!(
+        checked.diagnostics.is_empty(),
+        "expected no checker diagnostics, got: {:?}",
+        checked.diagnostics
+    );
+
+    let module = checked
+        .source
+        .modules
+        .iter()
+        .find(|module| module.path.text() == "demo")
+        .expect("missing checked root module");
+    let value_expr =
+        typed_binding_expr_by_name(module, "demo::value").expect("missing binding demo::value");
+
+    assert_eq!(
+        checked.type_store.get_type(value_expr.ty).kind,
+        TypeKind::Constructor(TypeConstructor::Integer)
+    );
+}
+
+#[test]
 fn infer_sum_constructors_and_match() {
     let db = Eng::default();
     let source = Source::new(

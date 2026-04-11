@@ -188,7 +188,6 @@ pub enum ExprKind {
         fields: Vec<RecordField>,
     },
     InlineWasm {
-        result_type: TypeId,
         locals: Vec<lir::WasmTypedBinding>,
         instructions: Vec<lir::WasmInstructionNode>,
     },
