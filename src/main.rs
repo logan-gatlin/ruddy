@@ -6,13 +6,13 @@ pub mod tracking;
 
 use std::process::ExitCode;
 
-use symbol::{BundleId, Mint};
+use symbol::{Bundle, Mint, Version};
 use tracking::{FileManager, Span};
 
 const DEMO_PATH: &str = "demo.hc";
 
-/// The demo is a single bundle, so it gets the first id.
-const DEMO_BUNDLE: BundleId = BundleId::new(0);
+const DEMO_BUNDLE: &str = "demo";
+const DEMO_VERSION: Version = Version::new(0, 1, 0);
 
 fn main() -> ExitCode {
     let source = match std::fs::read_to_string(DEMO_PATH) {
@@ -37,7 +37,8 @@ fn main() -> ExitCode {
 
     // The mint lives as long as the symbols it hands out, which for a driver
     // means the rest of the run.
-    let mint: Mint = Mint::new(DEMO_BUNDLE, "demo");
+    let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
+    let mint = Mint::new(bundle);
     let built = ir::build(&mint, parsed.stmts);
 
     println!("\n== ir ==\n");

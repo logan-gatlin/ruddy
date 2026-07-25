@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 indexmap = "2"
+semver = "1.0.28"

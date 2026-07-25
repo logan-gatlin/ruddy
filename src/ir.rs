@@ -290,12 +290,18 @@ impl Builder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parse, symbol::BundleId, token::lex, tracking::FileID};
+    use crate::{
+        parse,
+        symbol::{Bundle, Version},
+        token::lex,
+        tracking::FileID,
+    };
 
-    /// A mint for the builder to hold on to. Leaked rather than shared, so
-    /// that each build gets an empty one once the builder starts minting.
-    fn dummy_mint() -> &'static Mint {
-        Box::leak(Box::new(Mint::new(BundleId::new(0), "test")))
+    /// A mint for the builder to hold on to. Fresh per build, so that one
+    /// test's symbols cannot show up in another's once lowering starts
+    /// minting.
+    fn dummy_mint() -> Mint {
+        Mint::new(Bundle::new("test", Version::new(0, 0, 0)).expect("valid bundle"))
     }
 
     fn build_src(src: &str) -> Output {
@@ -305,7 +311,7 @@ mod tests {
             "unexpected parse errors: {:#?}",
             parsed.errors
         );
-        build(dummy_mint(), parsed.stmts)
+        build(&dummy_mint(), parsed.stmts)
     }
 
     fn term_fields<'a>(out: &'a Output, name: &str) -> &'a IndexMap<String, Field<Term>> {
@@ -396,7 +402,7 @@ mod tests {
 
     #[test]
     fn displays_empty_program_as_nothing() {
-        assert_eq!(build(dummy_mint(), Vec::new()).program.to_string(), "");
+        assert_eq!(build(&dummy_mint(), Vec::new()).program.to_string(), "");
     }
 
     #[test]
