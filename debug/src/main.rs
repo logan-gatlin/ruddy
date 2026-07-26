@@ -4,14 +4,9 @@
 //! compiler changes; `cargo run -p ruddy-debug` serves the same thing without
 //! the supervision.
 
-mod docs;
-mod server;
-mod snapshot;
-mod stage;
-mod watch;
-mod wire;
-
 use std::{env, path::PathBuf, process::ExitCode};
+
+use ruddy_debug::{docs, server};
 
 const DEFAULT_PORT: u16 = 7878;
 

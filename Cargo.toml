@@ -2,9 +2,11 @@
 name = "ruddy"
 version = "0.1.0"
 edition = "2024"
+# `tests/` is the workspace's test crate, not this package's integration tests.
+autotests = false
 
 [workspace]
-members = ["debug"]
+members = ["debug", "tests"]
 
 [dependencies]
 indexmap = "2"

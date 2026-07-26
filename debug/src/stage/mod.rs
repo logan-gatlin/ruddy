@@ -65,6 +65,9 @@ pub const REGISTRY: &[(&str, Builder)] = &[
 pub struct Ids(u32);
 
 impl Ids {
+    // A counter, not an iterator: it never runs out, so there is nothing for
+    // `Iterator::next` to return `None` for.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u32 {
         let id = self.0;
         self.0 += 1;
