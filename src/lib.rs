@@ -3,3 +3,4 @@ pub mod parse;
 pub mod symbol;
 pub mod token;
 pub mod tracking;
+pub mod types;
