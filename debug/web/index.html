@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ruddy-debug</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>&#128029;</text></svg>"
+    />
+  </head>
+  <body>
+    <header id="titlebar">
+      <span class="brand">ruddy<span class="brand-dim">-debug</span></span>
+
+      <button id="doc-button" class="chip" title="Switch document (Ctrl+P)">
+        <span id="doc-name">…</span>
+        <span class="caret">▾</span>
+      </button>
+
+      <label class="chip bundle" title="Bundle identity — an input to symbol mangling">
+        <input id="bundle-name" size="6" spellcheck="false" />
+        <span class="at">@</span>
+        <input id="bundle-version" size="5" spellcheck="false" />
+      </label>
+
+      <span id="timings" class="timings"></span>
+
+      <span class="spacer"></span>
+
+      <button id="follow" class="chip toggle" title="Follow the caret (Ctrl+.)">follow</button>
+      <button id="split" class="chip toggle" title="Split panels (Ctrl+B)">split</button>
+      <span id="link" class="chip status" title="Connection to the debug server">…</span>
+    </header>
+
+    <main id="workbench">
+      <section id="editor-pane"></section>
+      <div id="drag" title="Drag to resize"></div>
+      <section id="panes"></section>
+    </main>
+
+    <footer id="diagnostics"></footer>
+
+    <div id="overlay" hidden>
+      <div class="dialog">
+        <input id="overlay-input" spellcheck="false" autocomplete="off" placeholder="document…" />
+        <ul id="overlay-list"></ul>
+        <div class="dialog-hint">↑↓ choose · ⏎ open · type a new name to create · esc cancel</div>
+      </div>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

@@ -35,6 +35,8 @@ pub enum ExprKind {
     Ident {
         name: Tracked<String>,
     },
+    /// A natural number literal, already read from its digits by the lexer.
+    Natural(u128),
     Unit,
 }
 
@@ -111,6 +113,7 @@ impl std::fmt::Display for ExprKind {
             ExprKind::Function { args, body } => write_function(f, args, &body.tracked),
             ExprKind::Struct(fields) => write_struct(f, fields),
             ExprKind::Ident { name } => f.write_str(&name.tracked),
+            ExprKind::Natural(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
         }
     }
@@ -310,7 +313,11 @@ impl Parser {
             self.peek(),
             Some(tok) if matches!(
                 tok.tracked,
-                Kind::Identifier(_) | Kind::Fn | Kind::LeftBrace | Kind::LeftParen
+                Kind::Identifier(_)
+                    | Kind::Natural(_)
+                    | Kind::Fn
+                    | Kind::LeftBrace
+                    | Kind::LeftParen
             )
         )
     }
@@ -341,6 +348,10 @@ impl Parser {
                 let name = span.track(name.clone());
                 self.advance();
                 Some(span.track(ExprKind::Ident { name }))
+            }
+            &Kind::Natural(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Natural(value)))
             }
             // An empty / unrecognized expression position parses as unit and
             // consumes nothing, leaving recovery to the caller.
@@ -688,6 +699,29 @@ mod tests {
             parse_one("let c = f fn x => x y"),
             "let c = f (fn x => x y)"
         );
+    }
+
+    #[test]
+    fn naturals_are_atoms() {
+        assert_eq!(parse_one("let n = 0"), "let n = 0");
+        // An atom, so it takes part in application on either side and never
+        // needs parentheses of its own.
+        assert_eq!(parse_one("let a = f 1 2"), "let a = f 1 2");
+        assert_eq!(parse_one("let b = 1 f"), "let b = 1 f");
+        assert_eq!(parse_one("let c = f (g 3)"), "let c = f (g 3)");
+        assert_eq!(parse_one("let d = fn x => 7"), "let d = fn x => 7");
+        assert_eq!(
+            parse_one("let e = { width: 3, height: 4 }"),
+            "let e = { width: 3, height: 4 }"
+        );
+    }
+
+    #[test]
+    fn naturals_are_terms_only() {
+        // There is no type-level natural, so a literal in type position is the
+        // unexpected token it looks like rather than a silently accepted one.
+        let out = parse(lex("type T = 42", FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt, fmt::Write as _};
 
 use indexmap::IndexSet;
 use semver::Prerelease;
+use twox_hash::XxHash3_64;
 
 pub use semver::Version;
 
@@ -78,7 +79,7 @@ struct Data {
     /// `None` places the symbol directly at the top level of the bundle, which
     /// is a real position in the tree rather than a missing one.
     parent: Option<Module>,
-    /// Present exactly when the symbol is local.
+    /// Present when the symbol is local.
     disambiguator: Option<u32>,
 }
 
@@ -93,7 +94,10 @@ pub struct Mint {
     bundle: Bundle,
     names: IndexSet<String>,
     symbols: Vec<Data>,
-    /// The one symbol at each global path. Locals are absent by construction.
+    /// The one symbol at each global path. Not a symbol table for callers to
+    /// resolve names against — deciding what a name means belongs to whoever
+    /// owns the scopes. This is the guard that keeps two global symbols from
+    /// sharing a path, and so keeps their manglings distinct.
     globals: HashMap<(Option<Module>, Namespace, Name), Symbol>,
     /// The next disambiguator for each local path.
     locals: HashMap<(Option<Module>, Namespace, Name), u32>,
@@ -209,15 +213,11 @@ impl Bundle {
 }
 
 impl BundleHash {
-    /// FNV-1a, hand-rolled because it has to give the same answer in every run
-    /// and every tool; the standard library's hasher is explicitly not stable.
+    /// XXH3-64, whose output is pinned by its specification rather than by
+    /// whatever the standard library happens to do this release; the answer has
+    /// to be the same in every run and every tool.
     fn of(canonical: &str) -> Self {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in canonical.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Self(hash)
+        Self(XxHash3_64::oneshot(canonical.as_bytes()))
     }
 }
 
@@ -326,18 +326,6 @@ impl Mint {
             parent,
             disambiguator: Some(disambiguator),
         })
-    }
-
-    /// Find the global symbol at a path. Locals are never found this way; they
-    /// are reachable only through the symbol handed out when they were minted.
-    pub fn lookup(
-        &self,
-        parent: Option<Module>,
-        namespace: Namespace,
-        name: &str,
-    ) -> Option<Symbol> {
-        let name = Name(self.names.get_index_of(name)? as u32);
-        self.globals.get(&(parent, namespace, name)).copied()
     }
 
     /// The name the symbol was minted from, as written in the source.
@@ -752,6 +740,13 @@ mod tests {
     }
 
     #[test]
+    fn the_fingerprint_is_pinned() {
+        // A fingerprint is only worth anything if every build of every tool
+        // agrees on it, so a hash that quietly changed under us is a break.
+        assert_eq!(bundle("app").hash(), BundleHash(0x574e_1a3d_35e8_cad8));
+    }
+
+    #[test]
     fn rejects_names_it_could_not_round_trip() {
         assert!(Bundle::new("", Version::new(1, 0, 0)).is_none());
         assert!(Bundle::new("1app", Version::new(1, 0, 0)).is_none());
@@ -792,7 +787,6 @@ mod tests {
 
         // The redeclaration hands back the declaration it collides with.
         assert_eq!(m.global(None, Namespace::Terms, "map"), Err(first));
-        assert_eq!(m.lookup(None, Namespace::Terms, "map"), Some(first));
         assert!(m.is_global(first));
     }
 
@@ -820,21 +814,21 @@ mod tests {
         assert_ne!(top, nested);
         assert_eq!(m.parent(top), None);
         assert_eq!(m.parent(nested), Some(util));
-        // Declaring in a module does not collide with the top level.
-        assert_eq!(m.lookup(None, Namespace::Terms, "x"), Some(top));
-        assert_eq!(m.lookup(Some(util), Namespace::Terms, "x"), Some(nested));
+        // Each is a repeat only of its own scope, so neither path is taken by
+        // the other.
+        assert_eq!(m.global(None, Namespace::Terms, "x"), Err(top));
+        assert_eq!(m.global(Some(util), Namespace::Terms, "x"), Err(nested));
     }
 
     #[test]
-    fn locals_are_never_looked_up() {
+    fn locals_do_not_occupy_a_global_path() {
         let mut m = mint();
         let local = m.local(None, Namespace::Terms, "x");
 
-        assert_eq!(m.lookup(None, Namespace::Terms, "x"), None);
-        // And minting a global afterwards is unaffected by the local.
+        // A local never takes the path, so the global is still free.
         let global = m.global(None, Namespace::Terms, "x").unwrap();
         assert_ne!(local, global);
-        assert_eq!(m.lookup(None, Namespace::Terms, "x"), Some(global));
+        assert_ne!(m.mangle(local), m.mangle(global));
     }
 
     #[test]

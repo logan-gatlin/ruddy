@@ -1,0 +1,706 @@
+/* Density over decoration: this is a surface for reading code, so everything is
+   monospace, rows are short, and colour is spent only where it carries data. */
+
+:root {
+  --bg: #14161a;
+  --bg-panel: #181b21;
+  --bg-raised: #1e222a;
+  --line: #272c35;
+  --line-soft: #20242c;
+  --fg: #d7dae0;
+  --fg-dim: #8a92a0;
+  --fg-faint: #5d6470;
+
+  --accent: #57a5ff;
+  --accent-bg: rgba(87, 165, 255, 0.2);
+  --symbol: #ffb454;
+  --symbol-bg: rgba(255, 180, 84, 0.16);
+  --error: #ff6b6b;
+  --error-bg: rgba(255, 107, 107, 0.14);
+  --ok: #6fcf97;
+
+  --keyword: #c792ea;
+  --punct: #7f8896;
+  --ident: #d7dae0;
+  --number: #f78c6c;
+  --unlexed: #ff6b6b;
+
+  --row: 20px;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --size: 12.5px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #fbfbfc;
+    --bg-panel: #ffffff;
+    --bg-raised: #f1f3f6;
+    --line: #dde1e8;
+    --line-soft: #e8ebf0;
+    --fg: #1f2430;
+    --fg-dim: #5f6878;
+    --fg-faint: #98a1b0;
+    --accent: #0b64d0;
+    --accent-bg: rgba(11, 100, 208, 0.14);
+    --symbol: #a35b00;
+    --symbol-bg: rgba(214, 138, 0, 0.18);
+    --error: #c92a2a;
+    --error-bg: rgba(201, 42, 42, 0.1);
+    --ok: #1e7f4f;
+    --keyword: #7c3aed;
+    --punct: #6b7280;
+    --ident: #1f2430;
+    --number: #b4531a;
+    --unlexed: #c92a2a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--size) / 1.55 var(--mono);
+  overflow: hidden;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+/* ── title bar ─────────────────────────────────────────────────────────── */
+
+#titlebar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: none;
+  height: 30px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+  white-space: nowrap;
+}
+
+.brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.brand-dim {
+  color: var(--fg-faint);
+  font-weight: 400;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.chip {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-raised);
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.chip:hover {
+  color: var(--fg);
+  border-color: var(--fg-faint);
+}
+.chip .caret {
+  color: var(--fg-faint);
+}
+.chip.toggle.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.chip.status {
+  cursor: default;
+}
+.chip.status.live {
+  color: var(--ok);
+}
+.chip.status.down {
+  color: var(--error);
+  border-color: var(--error);
+}
+.chip.status.busy {
+  color: var(--symbol);
+  border-color: var(--symbol);
+}
+
+.bundle {
+  cursor: text;
+}
+.bundle input {
+  border: 0;
+  background: transparent;
+  outline: none;
+  padding: 0;
+}
+.bundle .at {
+  color: var(--fg-faint);
+}
+
+.timings {
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.timings b {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+.timings .slow {
+  color: var(--symbol);
+}
+
+/* ── workbench ─────────────────────────────────────────────────────────── */
+
+#workbench {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+#editor-pane {
+  width: 46%;
+  min-width: 220px;
+  display: flex;
+  min-height: 0;
+  background: var(--bg);
+}
+
+#drag {
+  flex: none;
+  width: 4px;
+  cursor: col-resize;
+  background: var(--line-soft);
+}
+#drag:hover {
+  background: var(--accent);
+}
+
+#panes {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-left: 1px solid var(--line);
+}
+
+/* ── editor ────────────────────────────────────────────────────────────── */
+
+.editor {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.editor .gutter {
+  flex: none;
+  width: 46px;
+  overflow: hidden;
+  background: var(--bg);
+  border-right: 1px solid var(--line-soft);
+  user-select: none;
+}
+/* Gutter rows hold no text: CSS numbers them, so inserting or deleting a line
+   renumbers the file without touching a single row's contents. */
+.editor .gutter-inner {
+  padding: 6px 8px 6px 0;
+  text-align: right;
+  color: var(--fg-faint);
+  counter-reset: line;
+  will-change: transform;
+}
+.editor .gutter-inner div {
+  min-height: 1.55em;
+}
+.editor .gutter-inner div::before {
+  counter-increment: line;
+  content: counter(line);
+}
+.editor .gutter-inner .bad {
+  color: var(--error);
+  font-weight: 600;
+}
+.editor .gutter-inner .here {
+  color: var(--fg-dim);
+}
+
+/* The code column clips; the highlight layer does not. A layer that clipped
+   itself would move its own clip box when scrolled and go blank past the first
+   screenful. */
+.editor .code {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.editor pre.hl,
+.editor textarea {
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  font: inherit;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.editor pre.hl {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: max-content;
+  min-width: 100%;
+  pointer-events: none;
+  will-change: transform;
+}
+/* One element per line, so an edit rewrites only the lines it touched. The
+   min-height keeps an empty line exactly one line box tall. */
+.editor pre.hl .ln {
+  min-height: 1.55em;
+}
+
+.editor textarea {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  outline: none;
+  overflow: auto;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--accent);
+}
+.editor textarea::selection {
+  background: rgba(128, 128, 128, 0.3);
+}
+
+/* token classes, painted from the real token stream */
+.hl .keyword {
+  color: var(--keyword);
+}
+.hl .ident {
+  color: var(--ident);
+}
+.hl .punct {
+  color: var(--punct);
+}
+.hl .number {
+  color: var(--number);
+}
+.hl .unlexed {
+  color: var(--unlexed);
+}
+
+.hl .sel {
+  background: var(--accent-bg);
+  border-radius: 2px;
+}
+.hl .sym {
+  background: var(--symbol-bg);
+  border-radius: 2px;
+}
+.hl .hov {
+  background: rgba(128, 128, 128, 0.18);
+  border-radius: 2px;
+}
+.hl .diag {
+  text-decoration: underline wavy var(--error);
+  text-underline-offset: 3px;
+}
+.hl .rel {
+  text-decoration: underline dotted var(--fg-dim);
+  text-underline-offset: 3px;
+}
+
+/* ── panes ─────────────────────────────────────────────────────────────── */
+
+.pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+}
+.pane + .pane {
+  border-top: 1px solid var(--line);
+}
+
+.pane-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  height: 26px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Tabs are separated chips rather than words in a row: a stage and its summary
+   are both text, and without an edge between them the bar reads as one string. */
+/* The tabs give way before the controls do: a filter box pushed off the edge is
+   worse than a tab strip you have to scroll. */
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  height: 19px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-raised);
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.tab:hover {
+  color: var(--fg);
+  border-color: var(--fg-faint);
+}
+.tab.on {
+  color: var(--fg);
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.tab .count {
+  color: var(--fg-faint);
+  padding-left: 5px;
+  border-left: 1px solid var(--line);
+}
+.tab.on .count {
+  border-left-color: var(--accent);
+  color: var(--fg-dim);
+}
+.tab.bad,
+.tab.bad .count {
+  color: var(--error);
+}
+.tab.bad {
+  border-color: var(--error);
+}
+.tab .key {
+  color: var(--fg-faint);
+  font-size: 0.85em;
+}
+.tab.on .key {
+  color: var(--accent);
+}
+
+.pane-bar .grow {
+  flex: 1 1 8px;
+  min-width: 8px;
+}
+
+.views {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.views button {
+  border: 0;
+  background: var(--bg-raised);
+  color: var(--fg-faint);
+  padding: 0 5px;
+  height: 18px;
+  cursor: pointer;
+}
+.views button.on {
+  background: var(--accent);
+  color: #0b1017;
+}
+
+.filter {
+  flex: none;
+  width: 104px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-raised);
+  outline: none;
+}
+.filter:focus {
+  border-color: var(--accent);
+}
+
+.rows {
+  flex: 1;
+  overflow: auto;
+  padding: 3px 0 10px;
+}
+
+.summary {
+  color: var(--fg-faint);
+  padding: 0 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--row);
+  padding-right: 8px;
+  cursor: default;
+  white-space: pre;
+}
+.row:hover {
+  background: rgba(128, 128, 128, 0.09);
+}
+.row.sel {
+  background: var(--accent-bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.row.sym {
+  background: var(--symbol-bg);
+}
+.row.sym.sel {
+  background: var(--accent-bg);
+  box-shadow:
+    inset 2px 0 0 var(--accent),
+    inset -2px 0 0 var(--symbol);
+}
+.row.dim {
+  opacity: 0.28;
+}
+.row.bad .label {
+  color: var(--error);
+}
+
+.twisty {
+  flex: none;
+  width: 10px;
+  color: var(--fg-faint);
+  cursor: pointer;
+  user-select: none;
+}
+.twisty.leaf {
+  visibility: hidden;
+}
+
+.label {
+  color: var(--fg);
+  flex: none;
+}
+.text {
+  color: var(--fg-dim);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row.gen .text::after {
+  content: " ⟨generated⟩";
+  color: var(--fg-faint);
+  font-style: italic;
+}
+.col {
+  flex: none;
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pos {
+  flex: none;
+  color: var(--fg-faint);
+  font-size: 0.9em;
+}
+
+pre.raw {
+  margin: 0;
+  padding: 6px 10px;
+  white-space: pre;
+  color: var(--fg-dim);
+}
+pre.raw .hi {
+  color: var(--fg);
+}
+
+.pane-note {
+  padding: 8px 10px;
+  color: var(--fg-faint);
+}
+.pane-note.bad {
+  color: var(--error);
+}
+.pane-note b {
+  color: var(--fg);
+}
+.pane-note pre {
+  margin: 6px 0 0;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+}
+
+/* ── diagnostics ───────────────────────────────────────────────────────── */
+
+#diagnostics {
+  flex: none;
+  max-height: 26vh;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+
+.diag-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  height: var(--row);
+  padding: 0 8px;
+  cursor: pointer;
+  white-space: pre;
+}
+.diag-row:hover {
+  background: rgba(128, 128, 128, 0.1);
+}
+.diag-row.on {
+  background: var(--error-bg);
+}
+.diag-row .mark {
+  color: var(--error);
+  flex: none;
+}
+.diag-row .at {
+  color: var(--fg-faint);
+  flex: none;
+  min-width: 52px;
+}
+.diag-row .from {
+  color: var(--fg-faint);
+  flex: none;
+  min-width: 48px;
+}
+.diag-row .msg {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.diag-row .code {
+  color: var(--fg-faint);
+  flex: none;
+}
+.diag-row .rel {
+  color: var(--fg-faint);
+}
+
+.clean {
+  padding: 0 8px;
+  height: var(--row);
+  line-height: var(--row);
+  color: var(--ok);
+}
+
+.banner {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--error-bg);
+  color: var(--error);
+}
+.banner pre {
+  margin: 4px 0 0;
+  max-height: 18vh;
+  overflow: auto;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+}
+
+/* ── document switcher ─────────────────────────────────────────────────── */
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  z-index: 10;
+}
+#overlay[hidden] {
+  display: none;
+}
+
+.dialog {
+  width: min(460px, 90vw);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg-panel);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.dialog input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-raised);
+  outline: none;
+}
+.dialog ul {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  max-height: 40vh;
+  overflow: auto;
+}
+.dialog li {
+  display: flex;
+  gap: 8px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+.dialog li.on {
+  background: var(--accent-bg);
+}
+.dialog li .meta {
+  margin-left: auto;
+  color: var(--fg-faint);
+}
+.dialog li .new {
+  color: var(--ok);
+}
+.dialog-hint {
+  padding: 4px 10px;
+  border-top: 1px solid var(--line);
+  color: var(--fg-faint);
+  font-size: 0.9em;
+}

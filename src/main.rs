@@ -1,13 +1,11 @@
-pub mod ir;
-pub mod parse;
-pub mod symbol;
-pub mod token;
-pub mod tracking;
-
 use std::process::ExitCode;
 
-use symbol::{Bundle, Mint, Version};
-use tracking::{FileManager, Span};
+use ruddy::{
+    ir, parse,
+    symbol::{Bundle, Mint, Version},
+    token,
+    tracking::{FileManager, Span},
+};
 
 const DEMO_PATH: &str = "demo.hc";
 
@@ -38,11 +36,11 @@ fn main() -> ExitCode {
     // The mint lives as long as the symbols it hands out, which for a driver
     // means the rest of the run.
     let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
-    let mint = Mint::new(bundle);
-    let built = ir::build(&mint, parsed.stmts);
+    let mut mint = Mint::new(bundle);
+    let built = ir::build(&mut mint, parsed.stmts);
 
     println!("\n== ir ==\n");
-    println!("{}", built.program);
+    println!("{}", built.program.display(&mint));
 
     let errors = lexed.errors.len() + parsed.errors.len() + built.errors.len();
     if errors == 0 {
@@ -52,13 +50,33 @@ fn main() -> ExitCode {
 
     eprintln!("\n{errors} error(s):");
     for err in &lexed.errors {
-        report(&source, err.span, "unrecognized character");
+        report(
+            &source,
+            err.span,
+            match err.kind {
+                token::ErrorKind::Unrecognized => "unrecognized character",
+                token::ErrorKind::MalformedNatural => "malformed natural number",
+                token::ErrorKind::NaturalTooLarge => "natural number is too large",
+            },
+        );
     }
     for err in &parsed.errors {
         report(&source, err.span, "unexpected token");
     }
     for err in &built.errors {
-        report(&source, err.span, "duplicate name");
+        match &err.kind {
+            ir::ErrorKind::Undefined { namespace } => {
+                report(&source, err.span, &format!("undefined {namespace}"));
+            }
+            ir::ErrorKind::Duplicate {
+                namespace,
+                previous,
+            } => {
+                report(&source, err.span, &format!("duplicate {namespace}"));
+                report(&source, *previous, "  first defined here");
+            }
+            ir::ErrorKind::DuplicateField => report(&source, err.span, "duplicate field"),
+        }
     }
     ExitCode::FAILURE
 }
