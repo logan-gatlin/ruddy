@@ -12,6 +12,12 @@ type Pairs = List Pair
 
 let after = id point
 
+let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x
+
+let n = fst { x: 1, y: 2 }
+
+type Endo = fn t => t -> t
+
 let count = 42
 
 let scaled = compose id id 4096

@@ -3,9 +3,13 @@ use std::fmt;
 use indexmap::IndexMap;
 
 use crate::{
-    parse::{self, Expr, ExprKind, Stmt, StmtKind, write_grouped},
+    parse::{
+        self, write_apply, write_arrow, write_project, Expr, ExprKind, Grouped, Prec, Stmt,
+        StmtKind,
+    },
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked},
+    types::Prim,
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +24,10 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct Decl<T> {
     pub name_span: Span,
+    /// The written type the definition is to be checked against, when it was
+    /// ascribed one. Always `None` for a `type` declaration: that *is* a type,
+    /// so there is nothing to check it against.
+    pub annotation: Option<Type>,
     pub value: T,
 }
 
@@ -37,6 +45,14 @@ pub enum TermKind {
         body: Box<Term>,
     },
     Struct(IndexMap<String, Field<Term>>),
+    /// Reading one field out of a struct. The name stays a string for the
+    /// reason [`Field`]'s keys do: it is a label scoped to whichever struct
+    /// turns out to be on the left, not a path anything can refer to, so there
+    /// is no symbol to resolve it to and nothing here can fail to resolve.
+    Project {
+        base: Box<Term>,
+        field: Tracked<String>,
+    },
     Ident(Symbol),
     /// A natural number literal. It carries no symbol: a literal names nothing,
     /// so there is nothing for the mint to hand out.
@@ -50,17 +66,21 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    Unit,
     Apply {
         func: Box<Type>,
         arg: Box<Type>,
     },
-    Fn {
+    Lambda {
         arg: Tracked<Symbol>,
         body: Box<Type>,
     },
     Struct(IndexMap<String, Field<Type>>),
+    Arrow {
+        from: Box<Type>,
+        to: Box<Type>,
+    },
     Ident(Symbol),
+    Prim(Prim),
     Error,
 }
 
@@ -134,8 +154,8 @@ struct Binding {
 }
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
-/// needs both, and going through one wrapper keeps [`write_grouped`] — which
-/// takes a `&dyn Display` — usable unchanged.
+/// needs both, and going through one wrapper is what lets the node implement
+/// [`Grouped`] and so share the parser's grouping rules unchanged.
 struct Show<'a, T> {
     node: &'a T,
     mint: &'a Mint,
@@ -174,8 +194,11 @@ impl<'a, T> Show<'a, T> {
 impl fmt::Display for Show<'_, Program> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Terms and types live in separate maps, so the original interleaving
-        // in the source is not recoverable; types are printed first, each group
-        // in the order it was declared.
+        // in the source is not recoverable — but there is nothing to recover,
+        // because lowering hoists types the same way this prints them: every
+        // type in declaration order, then every term. Printing in the order the
+        // builder lowers in is what makes a printed program re-lower into the
+        // one it was printed from.
         let mut first = true;
         for (symbol, decl) in &self.node.types {
             if !first {
@@ -194,14 +217,43 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
-            write!(
-                f,
-                "let {} = {}",
-                self.mint.name(*symbol),
-                self.wrap(&decl.value.tracked)
-            )?;
+            write!(f, "let {}", self.mint.name(*symbol))?;
+            if let Some(annotation) = &decl.annotation {
+                write!(f, " : {}", self.wrap(&annotation.tracked))?;
+            }
+            write!(f, " = {}", self.wrap(&decl.value.tracked))?;
         }
         Ok(())
+    }
+}
+
+/// The IR prints as surface syntax, so it groups by the surface grammar's rules
+/// — the same [`Prec`] ladder the parse tree's printer reads.
+impl Grouped for Show<'_, TermKind> {
+    fn prec(&self) -> Prec {
+        match self.node {
+            TermKind::Fn { .. } => Prec::Lambda,
+            TermKind::Apply { .. } => Prec::Apply,
+            TermKind::Project { .. }
+            | TermKind::Struct(_)
+            | TermKind::Ident(_)
+            | TermKind::Natural(_)
+            | TermKind::Unit
+            | TermKind::Error => Prec::Atom,
+        }
+    }
+}
+
+impl Grouped for Show<'_, TypeKind> {
+    fn prec(&self) -> Prec {
+        match self.node {
+            TypeKind::Lambda { .. } => Prec::Lambda,
+            TypeKind::Arrow { .. } => Prec::Arrow,
+            TypeKind::Apply { .. } => Prec::Apply,
+            TypeKind::Struct(_) | TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {
+                Prec::Atom
+            }
+        }
     }
 }
 
@@ -213,17 +265,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             TermKind::Natural(value) => write!(f, "{value}"),
             TermKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, TermKind::Fn { .. }),
-                    &self.wrap(&func.tracked),
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(arg.tracked, TermKind::Apply { .. } | TermKind::Fn { .. }),
-                    &self.wrap(&arg.tracked),
-                )
+                write_apply(f, &self.wrap(&func.tracked), &self.wrap(&arg.tracked))
             }
             // Lowering curries multi-argument functions, so a nested `fn` per
             // argument is printed rather than the surface `fn a b => ...`.
@@ -234,6 +276,9 @@ impl fmt::Display for Show<'_, TermKind> {
                 self.wrap(&body.tracked)
             ),
             TermKind::Struct(fields) => write_struct(f, self.mint, fields),
+            TermKind::Project { base, field } => {
+                write_project(f, &self.wrap(&base.tracked), &field.tracked)
+            }
         }
     }
 }
@@ -241,23 +286,16 @@ impl fmt::Display for Show<'_, TermKind> {
 impl fmt::Display for Show<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
-            TypeKind::Unit => f.write_str("()"),
             TypeKind::Error => f.write_str("<error>"),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
+            TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, TypeKind::Fn { .. }),
-                    &self.wrap(&func.tracked),
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(arg.tracked, TypeKind::Apply { .. } | TypeKind::Fn { .. }),
-                    &self.wrap(&arg.tracked),
-                )
+                write_apply(f, &self.wrap(&func.tracked), &self.wrap(&arg.tracked))
             }
-            TypeKind::Fn { arg, body } => write!(
+            TypeKind::Arrow { from, to } => {
+                write_arrow(f, &self.wrap(&from.tracked), &self.wrap(&to.tracked))
+            }
+            TypeKind::Lambda { arg, body } => write!(
                 f,
                 "fn {} => {}",
                 self.mint.name(arg.tracked),
@@ -307,34 +345,48 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         terms: IndexMap::new(),
         types: IndexMap::new(),
     };
+    // Split before lowering rather than lowering in the order written: every
+    // type is declared before any term is looked at, so a term can name a type
+    // written anywhere in the program. Each group keeps the order it was
+    // written in, so a type can still only name a type declared above it and a
+    // term only a term above it — the hoist is between the groups, not inside
+    // them.
+    let mut types = Vec::new();
+    let mut terms = Vec::new();
     for stmt in stmts {
         match stmt.tracked {
-            StmtKind::Let { name, body } => {
-                // The body is lowered before the name is bound, so a definition
-                // cannot see itself and there is no recursion to resolve.
-                let value = b.term(body.tracked);
-                if let Some(symbol) = b.declare(Namespace::Terms, &name) {
-                    program.terms.insert(
-                        symbol,
-                        Decl {
-                            name_span: name.span,
-                            value,
-                        },
-                    );
-                }
-            }
-            StmtKind::Type { name, body } => {
-                let value = b.ty(body);
-                if let Some(symbol) = b.declare(Namespace::Types, &name) {
-                    program.types.insert(
-                        symbol,
-                        Decl {
-                            name_span: name.span,
-                            value,
-                        },
-                    );
-                }
-            }
+            StmtKind::Type { name, body } => types.push((name, body)),
+            StmtKind::Let { name, ty, body } => terms.push((name, ty, body)),
+        }
+    }
+    for (name, body) in types {
+        let value = b.ty(body);
+        if let Some(symbol) = b.declare(Namespace::Types, &name) {
+            program.types.insert(
+                symbol,
+                Decl {
+                    name_span: name.span,
+                    annotation: None,
+                    value,
+                },
+            );
+        }
+    }
+    for (name, ty, body) in terms {
+        // Annotation and body are lowered in the order they were written, and
+        // the body before the name is bound, so a definition cannot see itself
+        // and there is no recursion to resolve.
+        let annotation = ty.map(|ty| b.ty(ty));
+        let value = b.term(body.tracked);
+        if let Some(symbol) = b.declare(Namespace::Terms, &name) {
+            program.terms.insert(
+                symbol,
+                Decl {
+                    name_span: name.span,
+                    annotation,
+                    value,
+                },
+            );
         }
     }
     Output {
@@ -457,6 +509,13 @@ impl Builder<'_> {
             ExprKind::Struct(fields) => span.track(TermKind::Struct(
                 self.fields(fields, |b, value| b.term(value)),
             )),
+            ExprKind::Project { base, field } => {
+                let base = self.term(*base);
+                span.track(TermKind::Project {
+                    base: Box::new(base),
+                    field,
+                })
+            }
         }
     }
 
@@ -466,18 +525,26 @@ impl Builder<'_> {
     fn ty(&mut self, ty: parse::Type) -> Type {
         let span = ty.span;
         match ty.tracked {
-            parse::TypeKind::Unit => span.track(TypeKind::Unit),
+            parse::TypeKind::Unit => span.track(TypeKind::Prim(Prim::Unit)),
+            // A declaration is looked for before a primitive, so a `type Nat`
+            // of one's own shadows the built-in rather than colliding with a
+            // declaration nobody wrote. Types being hoisted, every term sees
+            // such a declaration wherever it was written; a type sees only the
+            // ones above it, and reaches the built-in otherwise.
             parse::TypeKind::Ident { name } => match self.types.get(&name.tracked) {
                 Some(symbol) => span.track(TypeKind::Ident(symbol)),
-                None => {
-                    self.error(
-                        name.span,
-                        ErrorKind::Undefined {
-                            namespace: Namespace::Types,
-                        },
-                    );
-                    span.track(TypeKind::Error)
-                }
+                None => match Prim::from_name(&name.tracked) {
+                    Some(prim) => span.track(TypeKind::Prim(prim)),
+                    None => {
+                        self.error(
+                            name.span,
+                            ErrorKind::Undefined {
+                                namespace: Namespace::Types,
+                            },
+                        );
+                        span.track(TypeKind::Error)
+                    }
+                },
             },
             parse::TypeKind::Apply { func, arg } => {
                 let func = self.ty(*func);
@@ -487,7 +554,7 @@ impl Builder<'_> {
                     arg: Box::new(arg),
                 })
             }
-            parse::TypeKind::Function { args, body } => {
+            parse::TypeKind::Lambda { args, body } => {
                 let mark = self.types.mark();
                 let mut bound = Vec::with_capacity(args.len());
                 for arg in args {
@@ -500,7 +567,7 @@ impl Builder<'_> {
                 self.types.release(mark);
                 bound.into_iter().rev().fold(body, |body, arg| {
                     let span = arg.span.merge(body.span);
-                    span.track(TypeKind::Fn {
+                    span.track(TypeKind::Lambda {
                         arg,
                         body: Box::new(body),
                     })
@@ -508,6 +575,14 @@ impl Builder<'_> {
             }
             parse::TypeKind::Struct(fields) => {
                 span.track(TypeKind::Struct(self.fields(fields, |b, ty| b.ty(ty))))
+            }
+            parse::TypeKind::Arrow { from, to } => {
+                let from = self.ty(*from);
+                let to = self.ty(*to);
+                span.track(TypeKind::Arrow {
+                    from: Box::new(from),
+                    to: Box::new(to),
+                })
             }
         }
     }

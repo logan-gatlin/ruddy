@@ -137,6 +137,86 @@ fn a_natural_reaches_every_stage() {
     assert_eq!(class.value, "number");
 }
 
+/// The three forms phase 0 adds, in one line, checked through every panel
+/// that renders them. A stage that stopped matching on one of them would
+/// fail to compile; this is the check that it renders it too.
+#[test]
+fn the_surface_prerequisites_reach_every_stage() {
+    let source = "let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x\n";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let labelled = |id: &str, label: &str| -> Vec<String> {
+        let stage = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .expect("the stage is registered");
+        nodes(stage)
+            .into_iter()
+            .filter(|node| node.label == label)
+            .map(|node| node.text.clone())
+            .collect()
+    };
+
+    for id in ["ast", "ir"] {
+        // The ascription is a child of the declaration in both trees, and the
+        // node carrying it is the arrow's own: one node, labelled with its role
+        // and its kind, rather than a wrapper repeating the type below it.
+        assert_eq!(
+            labelled(id, "Ascribed Arrow"),
+            ["{ x: Nat, y: Nat } -> Nat"],
+            "{id}"
+        );
+        assert_eq!(labelled(id, "Arrow"), [] as [&str; 0], "{id}");
+        assert_eq!(labelled(id, "Project"), ["p.x"], "{id}");
+        assert_eq!(labelled(id, "Field"), ["x"], "{id}");
+    }
+
+    // `Nat` is an ordinary identifier until lowering, which is the one
+    // place the two trees are meant to differ.
+    assert_eq!(labelled("ir", "Prim"), ["Nat", "Nat", "Nat"]);
+    assert_eq!(labelled("tokens", "Arrow"), ["->"]);
+    assert_eq!(labelled("tokens", "Dot"), ["."]);
+}
+
+/// `()` is punctuation in the surface syntax and a primitive in the IR, so
+/// the two trees say different things about the same three characters —
+/// which is the sort of difference the panels exist to show.
+#[test]
+fn unit_is_a_type_node_in_the_ast_and_a_primitive_in_the_ir() {
+    let snapshot = snapshot("type T = ()\nlet u : () = ()\n");
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    // Every node rendering `()`, by label — the text is `()` by construction,
+    // so only the label says anything.
+    let labels = |id: &str| -> Vec<String> {
+        let stage = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .expect("the stage is registered");
+        nodes(stage)
+            .into_iter()
+            .filter(|node| node.text == "()")
+            .map(|node| node.label.clone())
+            .collect()
+    };
+
+    // Two type positions and one term; the parse tree calls all three Unit.
+    assert_eq!(labels("ast"), ["Unit", "Ascribed Unit", "Unit"]);
+    // Lowering keeps the unit value and folds the unit type into `Prim`.
+    assert_eq!(labels("ir"), ["Prim", "Ascribed Prim", "Unit"]);
+}
+
 #[test]
 fn a_bad_literal_is_a_diagnostic_of_its_own() {
     let codes = |source: &str| {
@@ -146,10 +226,17 @@ fn a_bad_literal_is_a_diagnostic_of_its_own() {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>()
     };
-    assert_eq!(codes("let n = 1x\n"), ["malformed-natural"]);
+    // The lexer emits no token for a literal it rejected, so the `let` is left
+    // with no body — which the parser reports where the body would have gone,
+    // just before the characters the lexer is complaining about, rather than
+    // standing a `()` in for it.
+    assert_eq!(
+        codes("let n = 1x\n"),
+        ["unexpected-token", "malformed-natural"]
+    );
     assert_eq!(
         codes(&format!("let n = {}0\n", u128::MAX)),
-        ["natural-too-large"]
+        ["unexpected-token", "natural-too-large"]
     );
 }
 

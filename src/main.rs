@@ -82,11 +82,15 @@ fn main() -> ExitCode {
 }
 
 /// Print a single diagnostic as `path:line:col: message: "snippet"`, resolving
-/// the span's byte offset back to a human-readable position in the source.
+/// the span's byte offset back to a human-readable position in the source. A
+/// span with no width covers no characters to quote: it marks where something
+/// the parser needed would have gone, so it is named rather than quoted.
 fn report(source: &str, span: Span, message: &str) {
     let (line, col) = line_col(source, span.start);
-    let snippet = source.get(span.start..span.end()).unwrap_or("<eof>");
-    eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: {snippet:?}");
+    match source.get(span.start..span.end()) {
+        Some("") | None => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: end of input"),
+        Some(snippet) => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: {snippet:?}"),
+    }
 }
 
 /// Convert a byte offset into a 1-based `(line, column)` pair.

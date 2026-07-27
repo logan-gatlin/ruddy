@@ -15,3 +15,4 @@ mod parse;
 mod snapshot;
 mod symbol;
 mod token;
+mod types;

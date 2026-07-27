@@ -11,6 +11,8 @@ pub type Stmt = Tracked<StmtKind>;
 pub enum StmtKind {
     Let {
         name: Tracked<String>,
+        /// The written type, when the definition was ascribed one.
+        ty: Option<Type>,
         body: Tracked<Expr>,
     },
     Type {
@@ -32,10 +34,13 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
     Struct(IndexMap<Tracked<String>, Expr>),
+    Project {
+        base: Box<Expr>,
+        field: Tracked<String>,
+    },
     Ident {
         name: Tracked<String>,
     },
-    /// A natural number literal, already read from its digits by the lexer.
     Natural(u128),
     Unit,
 }
@@ -49,7 +54,11 @@ pub enum TypeKind {
         arg: Box<Type>,
     },
     Struct(IndexMap<Tracked<String>, Type>),
-    Function {
+    Arrow {
+        from: Box<Type>,
+        to: Box<Type>,
+    },
+    Lambda {
         args: Vec<Tracked<String>>,
         body: Box<Type>,
     },
@@ -76,13 +85,41 @@ struct Parser {
     errors: Vec<Error>,
 }
 
+/// How tightly a printed node binds. Grouping is dropped rather than recorded,
+/// so the printers reconstruct it from this alone: one table per node kind
+/// ([`Grouped`]) and one rule per position ([`write_apply`] and friends), which
+/// is what keeps the AST printer and the IR printer from drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Prec {
+    /// `fn a => body` — the body extends as far right as it can, so a lambda
+    /// needs parentheses anywhere anything may follow it.
+    Lambda,
+    /// `from -> to`.
+    Arrow,
+    /// `func arg`.
+    Apply,
+    /// A form nothing can be appended to: a name, a literal, `()`, a braced
+    /// struct, or a projection off one of those.
+    Atom,
+}
+
+/// A node a printer has to parenthesize by precedence. Implemented by the four
+/// node kinds that print as surface syntax — two here and two in the IR.
+pub(crate) trait Grouped: std::fmt::Display {
+    fn prec(&self) -> Prec;
+}
+
 impl std::fmt::Display for StmtKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence
             // the doubled `.tracked` to reach the `ExprKind`.
-            StmtKind::Let { name, body } => {
-                write!(f, "let {} = {}", name.tracked, body.tracked.tracked)
+            StmtKind::Let { name, ty, body } => {
+                write!(f, "let {}", name.tracked)?;
+                if let Some(ty) = ty {
+                    write!(f, " : {}", ty.tracked)?;
+                }
+                write!(f, " = {}", body.tracked.tracked)
             }
             StmtKind::Type { name, body } => {
                 write!(f, "type {} = {}", name.tracked, body.tracked)
@@ -91,27 +128,38 @@ impl std::fmt::Display for StmtKind {
     }
 }
 
+impl Grouped for ExprKind {
+    fn prec(&self) -> Prec {
+        match self {
+            ExprKind::Function { .. } => Prec::Lambda,
+            ExprKind::Apply { .. } => Prec::Apply,
+            ExprKind::Project { .. }
+            | ExprKind::Struct(_)
+            | ExprKind::Ident { .. }
+            | ExprKind::Natural(_)
+            | ExprKind::Unit => Prec::Atom,
+        }
+    }
+}
+
+impl Grouped for TypeKind {
+    fn prec(&self) -> Prec {
+        match self {
+            TypeKind::Lambda { .. } => Prec::Lambda,
+            TypeKind::Arrow { .. } => Prec::Arrow,
+            TypeKind::Apply { .. } => Prec::Apply,
+            TypeKind::Struct(_) | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
+        }
+    }
+}
+
 impl std::fmt::Display for ExprKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExprKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, ExprKind::Function { .. }),
-                    &func.tracked,
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(
-                        arg.tracked,
-                        ExprKind::Apply { .. } | ExprKind::Function { .. }
-                    ),
-                    &arg.tracked,
-                )
-            }
+            ExprKind::Apply { func, arg } => write_apply(f, &func.tracked, &arg.tracked),
             ExprKind::Function { args, body } => write_function(f, args, &body.tracked),
             ExprKind::Struct(fields) => write_struct(f, fields),
+            ExprKind::Project { base, field } => write_project(f, &base.tracked, &field.tracked),
             ExprKind::Ident { name } => f.write_str(&name.tracked),
             ExprKind::Natural(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
@@ -122,23 +170,9 @@ impl std::fmt::Display for ExprKind {
 impl std::fmt::Display for TypeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TypeKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, TypeKind::Function { .. }),
-                    &func.tracked,
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(
-                        arg.tracked,
-                        TypeKind::Apply { .. } | TypeKind::Function { .. }
-                    ),
-                    &arg.tracked,
-                )
-            }
-            TypeKind::Function { args, body } => write_function(f, args, &body.tracked),
+            TypeKind::Apply { func, arg } => write_apply(f, &func.tracked, &arg.tracked),
+            TypeKind::Arrow { from, to } => write_arrow(f, &from.tracked, &to.tracked),
+            TypeKind::Lambda { args, body } => write_function(f, args, &body.tracked),
             TypeKind::Struct(fields) => write_struct(f, fields),
             TypeKind::Ident { name } => f.write_str(&name.tracked),
             TypeKind::Unit => f.write_str("()"),
@@ -146,11 +180,44 @@ impl std::fmt::Display for TypeKind {
     }
 }
 
+/// Render `func arg`. A lambda on the left would swallow the argument into its
+/// own body, and anything that keeps consuming to its right would swallow
+/// whatever follows the argument.
+pub(crate) fn write_apply(
+    f: &mut std::fmt::Formatter<'_>,
+    func: &impl Grouped,
+    arg: &impl Grouped,
+) -> std::fmt::Result {
+    write_grouped(f, func.prec() < Prec::Apply, func)?;
+    f.write_str(" ")?;
+    write_grouped(f, arg.prec() < Prec::Atom, arg)
+}
+
+/// Render `from -> to`. The arrow is right-associative, so only the left side
+/// can ever need grouping.
+pub(crate) fn write_arrow(
+    f: &mut std::fmt::Formatter<'_>,
+    from: &impl Grouped,
+    to: &impl Grouped,
+) -> std::fmt::Result {
+    write_grouped(f, from.prec() < Prec::Apply, from)?;
+    write!(f, " -> {to}")
+}
+
+/// Render `base.field`. Projection binds tighter than everything that follows a
+/// space, so only the forms that extend rightward need grouping.
+pub(crate) fn write_project(
+    f: &mut std::fmt::Formatter<'_>,
+    base: &impl Grouped,
+    field: &str,
+) -> std::fmt::Result {
+    write_grouped(f, base.prec() < Prec::Atom, base)?;
+    write!(f, ".{field}")
+}
+
 /// Render `body`, wrapping it in parentheses when leaving them off would make
-/// the printed source re-parse as a different tree. Grouping is not recorded in
-/// the AST, so the printer has to reconstruct it from the shape of the node.
-/// Shared with the IR printer, which emits the same surface syntax.
-pub(crate) fn write_grouped(
+/// the printed source re-parse as a different tree.
+fn write_grouped(
     f: &mut std::fmt::Formatter<'_>,
     parens: bool,
     body: &dyn std::fmt::Display,
@@ -240,61 +307,76 @@ impl Parser {
         self.errors.push(Error { span });
     }
 
-    /// Consume the next token if it is the same variant as `want`, ignoring any
-    /// payload. Records an error and consumes nothing on mismatch or EOF.
-    fn eat(&mut self, want: &Kind) -> Option<Token> {
+    /// The zero-width position just past the last token, so that running out of
+    /// input has somewhere to point.
+    fn eof_span(&self) -> Span {
+        match self.toks.last() {
+            Some(tok) => tok.span.file_id.span(tok.span.end(), 0),
+            None => Span::default(),
+        }
+    }
+
+    /// Report the next token — or the end of input — as one that cannot be used
+    /// here, and fail. Every path that gives up goes through this: a production
+    /// that returned `None` quietly would drop the statement it was parsing and
+    /// leave the run looking successful.
+    fn unexpected<T>(&mut self) -> Option<T> {
         let span = match self.peek() {
-            Some(tok) if std::mem::discriminant(&tok.tracked) == std::mem::discriminant(want) => {
-                return self.advance();
-            }
             Some(tok) => tok.span,
-            None => return None,
+            None => self.eof_span(),
         };
         self.error(span);
         None
     }
 
+    /// Consume the next token if it is the same variant as `want`, ignoring any
+    /// payload. Records an error and consumes nothing on mismatch or EOF.
+    fn eat(&mut self, want: &Kind) -> Option<Token> {
+        match self.eat_if(want) {
+            Some(tok) => Some(tok),
+            None => self.unexpected(),
+        }
+    }
+
     fn ident(&mut self) -> Option<Tracked<String>> {
-        let (span, name) = match self.peek() {
+        let name = match self.peek() {
             Some(tok) => match &tok.tracked {
-                Kind::Identifier(name) => (tok.span, Some(name.clone())),
-                _ => (tok.span, None),
+                Kind::Identifier(name) => Some(tok.span.track(name.clone())),
+                _ => None,
             },
-            None => return None,
+            None => None,
         };
         match name {
             Some(name) => {
                 self.advance();
-                Some(span.track(name))
+                Some(name)
             }
-            None => {
-                self.error(span);
-                None
-            }
+            None => self.unexpected(),
         }
     }
 
     fn stmt(&mut self) -> Option<Stmt> {
-        let tok = self.peek()?;
-        match &tok.tracked {
-            Kind::Let => self.let_stmt(),
-            Kind::Type => self.type_stmt(),
-            _ => {
-                let span = tok.span;
-                self.error(span);
-                None
-            }
+        match self.peek().map(|tok| &tok.tracked) {
+            Some(Kind::Let) => self.let_stmt(),
+            Some(Kind::Type) => self.type_stmt(),
+            _ => self.unexpected(),
         }
     }
 
+    /// `let <name> [: <type>] = <expr>`. The ascription is optional: without it
+    /// the definition's type is whatever is inferred for its body.
     fn let_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance()?; // `let`
         let name = self.ident()?;
+        let ty = match self.eat_if(&Kind::Colon) {
+            Some(_) => Some(self.type_expr()?),
+            None => None,
+        };
         self.eat(&Kind::Equal)?;
         let expr = self.expr()?;
         let body = expr.span.track(expr);
         let span = kw.span.merge(body.span);
-        Some(span.track(StmtKind::Let { name, body }))
+        Some(span.track(StmtKind::Let { name, ty, body }))
     }
 
     fn type_stmt(&mut self) -> Option<Stmt> {
@@ -325,9 +407,9 @@ impl Parser {
     /// Application binds tighter than nothing and is left-associative, ML-style:
     /// `f x y` parses as `(f x) y`.
     fn expr(&mut self) -> Option<Expr> {
-        let mut func = self.atom()?;
+        let mut func = self.projection()?;
         while self.at_expr_atom() {
-            let arg = self.atom()?;
+            let arg = self.projection()?;
             let span = func.span.merge(arg.span);
             func = span.track(ExprKind::Apply {
                 func: Box::new(func),
@@ -337,8 +419,26 @@ impl Parser {
         Some(func)
     }
 
+    /// `<atom>.<field>*` — postfix projection, left-associative. It sits under
+    /// application rather than beside it so that `f p.x` reads as `f (p.x)`,
+    /// which is what reaching into a record before passing it along looks like.
+    fn projection(&mut self) -> Option<Expr> {
+        let mut base = self.atom()?;
+        while self.eat_if(&Kind::Dot).is_some() {
+            let field = self.ident()?;
+            let span = base.span.merge(field.span);
+            base = span.track(ExprKind::Project {
+                base: Box::new(base),
+                field,
+            });
+        }
+        Some(base)
+    }
+
     fn atom(&mut self) -> Option<Expr> {
-        let tok = self.peek()?;
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
         let span = tok.span;
         match &tok.tracked {
             Kind::Fn => self.function_expr(),
@@ -353,9 +453,8 @@ impl Parser {
                 self.advance();
                 Some(span.track(ExprKind::Natural(value)))
             }
-            // An empty / unrecognized expression position parses as unit and
-            // consumes nothing, leaving recovery to the caller.
-            _ => Some(span.track(ExprKind::Unit)),
+            // Nothing here begins an expression
+            _ => self.unexpected(),
         }
     }
 
@@ -443,9 +542,25 @@ impl Parser {
         )
     }
 
+    /// `<app> [-> <type>]` — the arrow binds looser than type application, so
+    /// `F A -> G B` is one arrow between two applications, and is
+    /// right-associative, so `A -> B -> C` is `A -> (B -> C)`.
+    fn type_expr(&mut self) -> Option<Type> {
+        let from = self.type_app()?;
+        if self.eat_if(&Kind::Arrow).is_none() {
+            return Some(from);
+        }
+        let to = self.type_expr()?;
+        let span = from.span.merge(to.span);
+        Some(span.track(TypeKind::Arrow {
+            from: Box::new(from),
+            to: Box::new(to),
+        }))
+    }
+
     /// Type application is left-associative, like term application: `F A B`
     /// parses as `(F A) B`.
-    fn type_expr(&mut self) -> Option<Type> {
+    fn type_app(&mut self) -> Option<Type> {
         let mut func = self.type_atom()?;
         while self.at_type_atom() {
             let arg = self.type_atom()?;
@@ -459,7 +574,9 @@ impl Parser {
     }
 
     fn type_atom(&mut self) -> Option<Type> {
-        let tok = self.peek()?;
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
         let span = tok.span;
         match &tok.tracked {
             Kind::Fn => self.function_type(),
@@ -470,7 +587,9 @@ impl Parser {
                 self.advance();
                 Some(span.track(TypeKind::Ident { name }))
             }
-            _ => Some(span.track(TypeKind::Unit)),
+            // As in [`atom`](Self::atom): a type position with no type in it is
+            // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
+            _ => self.unexpected(),
         }
     }
 
@@ -481,7 +600,7 @@ impl Parser {
         let args = self.function_args()?;
         let body = self.type_expr()?;
         let span = kw.span.merge(body.span);
-        Some(span.track(TypeKind::Function {
+        Some(span.track(TypeKind::Lambda {
             args,
             body: Box::new(body),
         }))

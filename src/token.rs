@@ -17,6 +17,9 @@ pub enum Kind {
     Fn,
     Equal,
     FatArrow,
+    /// `->`, the function type arrow. Distinct from [`FatArrow`](Kind::FatArrow),
+    /// which introduces a lambda body.
+    Arrow,
     Colon,
     Comma,
     Dot,
@@ -68,6 +71,7 @@ impl std::fmt::Display for Kind {
             Kind::Fn => f.write_str("fn"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
+            Kind::Arrow => f.write_str("->"),
             Kind::Colon => f.write_str(":"),
             Kind::Comma => f.write_str(","),
             Kind::Dot => f.write_str("."),
@@ -100,6 +104,21 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 2).track(Kind::FatArrow));
                 } else {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
+                }
+            }
+            // `-` begins nothing on its own — there is no subtraction and no
+            // negative literal — so the only thing it can be is the head of an
+            // arrow, and a lone one is reported where it was written.
+            '-' => {
+                chars.next();
+                if let Some(&(_, '>')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::Arrow));
+                } else {
+                    errors.push(Error {
+                        span: file_id.span(start, 1),
+                        kind: ErrorKind::Unrecognized,
+                    });
                 }
             }
             ':' => {

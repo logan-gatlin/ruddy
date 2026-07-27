@@ -71,6 +71,15 @@ fn decl_node<T>(
     if let Some(index) = cx.symbols.get(&symbol) {
         node = node.symbol(*index);
     }
+    // Only a term is ever ascribed one, so this child is simply absent on a
+    // `type` declaration rather than empty. Labelled the way the AST panel
+    // labels the same thing: the role on the type's own node, not a wrapper
+    // repeating its text and span.
+    if let Some(annotation) = &decl.annotation {
+        let mut ascribed = type_node(ids, cx, mint, annotation);
+        ascribed.label = format!("Ascribed {}", ascribed.label);
+        node = node.child(ascribed);
+    }
     node.child(value(ids, cx, mint, &decl.value))
 }
 
@@ -119,6 +128,14 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
             .child(bound)
             .child(term_node(ids, cx, mint, body))
         }
+        // The field names no symbol, so its node is a plain leaf — the one
+        // place in the term tree where an identifier-looking thing is not one.
+        TermKind::Project { base, field } => Node {
+            label: "Project".into(),
+            ..node
+        }
+        .child(term_node(ids, cx, mint, base))
+        .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
         TermKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -138,10 +155,6 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
 fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", ty.tracked.display(mint).to_string()).at(ty.span);
     match &ty.tracked {
-        TypeKind::Unit => Node {
-            label: "Unit".into(),
-            ..node
-        },
         TypeKind::Error => Node {
             label: "Error".into(),
             ..node
@@ -155,13 +168,25 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             cx,
             *symbol,
         ),
+        // A primitive is resolved from its spelling rather than from the name
+        // table, so there is no symbol to cross-highlight it by.
+        TypeKind::Prim(_) => Node {
+            label: "Prim".into(),
+            ..node
+        },
         TypeKind::Apply { func, arg } => Node {
             label: "Apply".into(),
             ..node
         }
         .child(type_node(ids, cx, mint, func))
         .child(type_node(ids, cx, mint, arg)),
-        TypeKind::Fn { arg, body } => {
+        TypeKind::Arrow { from, to } => Node {
+            label: "Arrow".into(),
+            ..node
+        }
+        .child(type_node(ids, cx, mint, from))
+        .child(type_node(ids, cx, mint, to)),
+        TypeKind::Lambda { arg, body } => {
             let bound = with_symbol(
                 Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
                 cx,

@@ -67,6 +67,33 @@ fn a_literal_too_large_to_hold_is_rejected() {
 }
 
 #[test]
+fn lexes_the_two_arrows_apart() {
+    assert!(matches!(kinds("->")[..], [Kind::Arrow]));
+    assert!(matches!(kinds("=>")[..], [Kind::FatArrow]));
+    assert!(matches!(
+        kinds("A -> B")[..],
+        [Kind::Identifier(_), Kind::Arrow, Kind::Identifier(_)]
+    ));
+
+    let out = lex("A -> B", FileID::GENERATED);
+    assert_eq!(out.tokens[1].span.start, 2);
+    assert_eq!(out.tokens[1].span.width, 2);
+}
+
+#[test]
+fn a_lone_minus_is_unrecognized() {
+    // Nothing else in the grammar starts with `-`, so the head of a
+    // half-written arrow is reported at the `-` itself.
+    let out = errors("A - B");
+    assert_eq!(out.len(), 1, "errors: {out:#?}");
+    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].span.start, 2);
+    assert_eq!(out[0].span.width, 1);
+    // The names on either side are still lexed.
+    assert_eq!(lex("A - B", FileID::GENERATED).tokens.len(), 2);
+}
+
+#[test]
 fn an_unrecognized_character_is_still_its_own_error() {
     let out = errors("@");
     assert_eq!(out.len(), 1, "errors: {out:#?}");

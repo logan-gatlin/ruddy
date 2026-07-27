@@ -70,6 +70,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Fn => "Fn",
         Kind::Equal => "Equal",
         Kind::FatArrow => "FatArrow",
+        Kind::Arrow => "Arrow",
         Kind::Colon => "Colon",
         Kind::Comma => "Comma",
         Kind::Dot => "Dot",
@@ -91,6 +92,7 @@ pub fn class(kind: &Kind) -> &'static str {
         Kind::Natural(_) => "number",
         Kind::Equal
         | Kind::FatArrow
+        | Kind::Arrow
         | Kind::Colon
         | Kind::Comma
         | Kind::Dot

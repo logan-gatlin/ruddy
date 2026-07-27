@@ -49,14 +49,25 @@ pub fn build(cx: &Cx) -> Stage {
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
     let node = Node::new(ids.next(), "", stmt.tracked.to_string()).at(stmt.span);
     match &stmt.tracked {
-        StmtKind::Let { name, body } => Node {
-            label: "Let".into(),
-            ..node
+        StmtKind::Let { name, ty, body } => {
+            let mut let_node = Node {
+                label: "Let".into(),
+                ..node
+            }
+            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            // The ascription sits between the name and the body, where it was
+            // written; a `let` without one simply has one child fewer. Its role
+            // goes on the type's own node rather than on a wrapper around it: a
+            // wrapper would carry the same text and the same span one row up.
+            if let Some(ty) = ty {
+                let mut ascribed = type_node(ids, ty);
+                ascribed.label = format!("Ascribed {}", ascribed.label);
+                let_node = let_node.child(ascribed);
+            }
+            // `body` is a `Tracked<Expr>` wrapped around an `Expr` that is
+            // itself `Tracked`, hence the doubled hop to reach the node.
+            let_node.child(expr_node(ids, &body.tracked))
         }
-        .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span))
-        // `body` is a `Tracked<Expr>` wrapped around an `Expr` that is itself
-        // `Tracked`, hence the doubled hop to reach the node.
-        .child(expr_node(ids, &body.tracked)),
         StmtKind::Type { name, body } => Node {
             label: "Type".into(),
             ..node
@@ -97,6 +108,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             .at(name.span)
             .child(expr_node(ids, value))
         })),
+        // The field is a label rather than a name, so its node carries the span
+        // it was written at and no symbol.
+        ExprKind::Project { base, field } => Node {
+            label: "Project".into(),
+            ..node
+        }
+        .child(expr_node(ids, base))
+        .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
         ExprKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node
@@ -122,7 +141,7 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         }
         .child(type_node(ids, func))
         .child(type_node(ids, arg)),
-        TypeKind::Function { args, body } => Node {
+        TypeKind::Lambda { args, body } => Node {
             label: "Function".into(),
             ..node
         }
@@ -144,6 +163,12 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             .at(name.span)
             .child(type_node(ids, value))
         })),
+        TypeKind::Arrow { from, to } => Node {
+            label: "Arrow".into(),
+            ..node
+        }
+        .child(type_node(ids, from))
+        .child(type_node(ids, to)),
         TypeKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node
