@@ -56,26 +56,6 @@ pub enum Ty {
     /// known about the fields not named, and, with no fields and a closed
     /// tail, unit.
     ///
-    /// The surface language spells the empty struct two ways, `()` and `{}`,
-    /// and both lower here. Unit is not a separate type: it is the struct that
-    /// carries no information — every field absent — which is what unit means
-    /// anywhere it appears, and giving it its own variant would buy a second
-    /// way to say the same thing plus a unification arm to keep the two
-    /// agreeing.
-    ///
-    /// The cost is that the compiler answers in `{}` where the user may have
-    /// written `()` — a mismatch against `()` reports ``found `{}` ``, and the
-    /// debugger's IR tab shows `{}` beside an AST tab still showing `()`. That
-    /// is accepted, not overlooked. Printing the empty struct as `()` would
-    /// hide from the reader that unit and the empty record are one type, which
-    /// is the thing worth learning about this language; `{}` is real surface
-    /// syntax that re-lowers to exactly the type it was printed from, so the
-    /// output stays something the user could have written. That claim is about
-    /// `{}` and about closed rows generally, and it stops there: an open or
-    /// optional row prints in surface notation but not in a form that re-reads
-    /// as itself, because a `..'a` and an `x?:` name identities the syntax has
-    /// no way to write down. See `tests/src/ui.rs`.
-    ///
     /// `rest` is one of the row-shaped types: [`Ty::Empty`] for a struct whose
     /// fields are all listed, a [`Ty::Var`] for one that may have more,
     /// [`Ty::Undecided`] where a failure abandoned the question, another
