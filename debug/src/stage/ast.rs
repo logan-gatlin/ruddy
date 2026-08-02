@@ -7,23 +7,17 @@ use ruddy::parse::{Expr, ExprKind, Stmt, StmtKind, Type, TypeKind};
 
 use crate::{
     print,
-    stage::{Cx, Ids},
-    wire::{Node, Stage, View},
+    stage::{Cx, Ids, Spec},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(stmts) = cx.stmts else {
-        return crate::stage::skipped("ast", "AST", View::Tree, "parsing did not run");
+        return crate::stage::skipped(spec, "parsing did not run");
     };
 
     let mut ids = Ids::default();
     let nodes: Vec<Node> = stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)).collect();
-
-    let display = stmts
-        .iter()
-        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
 
     let (lets, types) = stmts
         .iter()
@@ -33,17 +27,10 @@ pub fn build(cx: &Cx) -> Stage {
         });
 
     Stage {
-        id: "ast",
-        title: "AST",
-        view: View::Tree,
-        status: cx.status(),
-        summary: format!("{types} type · {lets} let"),
         micros: cx.micros.parse,
         nodes,
-        text: None,
-        display,
         debug: format!("{stmts:#?}"),
-        annotates: None,
+        ..spec.stage(cx.status(), format!("{types} type · {lets} let"))
     }
 }
 

@@ -13,7 +13,7 @@ use ruddy::{
     tracking::Tracked,
 };
 
-use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project};
+use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project, write_struct};
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
 /// the node and [`fmt::Display`] are foreign to this crate.
@@ -72,7 +72,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write_apply(f, &Ast(&func.tracked), &Ast(&arg.tracked))
             }
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
-            ExprKind::Struct(fields) => write_struct(f, fields, |value| Ast(&value.tracked)),
+            ExprKind::Struct(fields) => write_struct(f, pairs(fields)),
             ExprKind::Project { base, field } => {
                 write_project(f, &Ast(&base.tracked), &field.tracked)
             }
@@ -87,7 +87,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             TypeKind::Arrow { from, to } => write_arrow(f, &Ast(&from.tracked), &Ast(&to.tracked)),
-            TypeKind::Struct(fields) => write_struct(f, fields, |value| Ast(&value.tracked)),
+            TypeKind::Struct(fields) => write_struct(f, pairs(fields)),
             TypeKind::Ident { name } => f.write_str(&name.tracked),
             TypeKind::Unit => f.write_str("()"),
         }
@@ -124,28 +124,16 @@ fn write_function(
     write!(f, " => {body}")
 }
 
-/// Render a `{ name: value, ... }` literal, shared by struct expressions and
-/// struct types (the values differ, but the shape is identical). Unlike the
-/// IR's equivalent the name is part of the key, spans and all.
-fn write_struct<V>(
-    f: &mut fmt::Formatter<'_>,
+/// The fields of a struct as [`write_struct`] wants them. Unlike the IR's, this
+/// tree keeps the name in the key, spans and all, so both halves of a pair have
+/// to be unwrapped before the shared printer sees them.
+fn pairs<V>(
     fields: &IndexMap<Tracked<String>, Tracked<V>>,
-    show: impl Fn(&Tracked<V>) -> Ast<'_, V>,
-) -> fmt::Result
+) -> impl Iterator<Item = (&String, Ast<'_, V>)>
 where
     for<'a> Ast<'a, V>: fmt::Display,
 {
-    // As in the IR's printer: no fields, no padding.
-    if fields.is_empty() {
-        return f.write_str("{}");
-    }
-
-    f.write_str("{ ")?;
-    for (i, (name, value)) in fields.iter().enumerate() {
-        if i > 0 {
-            f.write_str(", ")?;
-        }
-        write!(f, "{}: {}", name.tracked, show(value))?;
-    }
-    f.write_str(" }")
+    fields
+        .iter()
+        .map(|(name, value)| (&name.tracked, Ast(&value.tracked)))
 }

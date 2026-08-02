@@ -8,24 +8,21 @@
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
 
-use ruddy::{ir::Term, types::Ty};
-
 use crate::{
-    stage::{Cx, Ids},
-    wire::{Node, Stage, View},
+    stage::{Cx, Ids, Spec, Trace},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let (Some(program), Some(mint)) = (cx.program, cx.mint) else {
-        return crate::stage::skipped("types", "Types", View::Tree, "lowering did not run");
+        return crate::stage::skipped(spec, "lowering did not run");
     };
     let Some(output) = cx.inference else {
-        return crate::stage::skipped("types", "Types", View::Tree, "inference did not run");
+        return crate::stage::skipped(spec, "inference did not run");
     };
 
     let mut ids = Ids::default();
     let mut nodes = Vec::new();
-    let mut display = String::new();
 
     // Aliases first, then schemes — the order the program prints in, and the
     // order inference solved them in.
@@ -41,7 +38,6 @@ pub fn build(cx: &Cx) -> Stage {
         if let Some(index) = cx.symbols.get(symbol) {
             node = node.symbol(*index);
         }
-        display.push_str(&format!("type {} = {ty}\n", mint.name(*symbol)));
         nodes.push(node);
     }
     for (symbol, scheme) in &output.schemes {
@@ -56,117 +52,60 @@ pub fn build(cx: &Cx) -> Stage {
         if let Some(index) = cx.symbols.get(symbol) {
             node = node.symbol(*index);
         }
-        display.push_str(&format!("let {} : {scheme}\n", mint.name(*symbol)));
         nodes.push(node);
     }
 
     Stage {
-        id: "types",
-        title: "Types",
-        view: View::Tree,
-        status: cx.status(),
-        summary: format!("{} schemes", output.schemes.len()),
         micros: cx.micros.infer,
         nodes,
-        text: None,
-        display,
         debug: format!("{output:#?}"),
-        annotates: None,
+        ..spec.stage(cx.status(), format!("{} schemes", output.schemes.len()))
     }
 }
 
 /// The inferred types as badges on the IR tab. Nodes here carry the *IR
 /// stage's* ids — that is the whole contract: the page looks each id up among
 /// the rows it already renders and paints this node's text beside them.
-pub fn annotate(cx: &Cx) -> Stage {
-    let stage = |nodes: Vec<Node>, summary: String, status| Stage {
-        id: "types-ir",
-        title: "Types",
-        view: View::Tree,
-        status,
-        summary,
-        micros: 0,
-        nodes,
-        text: None,
-        display: String::new(),
-        debug: String::new(),
-        annotates: Some("ir"),
-    };
-
+///
+/// The ids come from the [`Trace`] the IR stage published as it built those
+/// rows, so this stage neither rebuilds them nor mirrors their shape: it has
+/// nothing to be wrong about.
+pub fn annotate(spec: &Spec, cx: &Cx, trace: &Trace) -> Stage {
     let Some(program) = cx.program else {
-        return crate::stage::skipped("types-ir", "Types", View::Tree, "lowering did not run");
+        return crate::stage::skipped(spec, "lowering did not run");
     };
     let Some(output) = cx.inference else {
-        return crate::stage::skipped("types-ir", "Types", View::Tree, "inference did not run");
+        return crate::stage::skipped(spec, "inference did not run");
     };
 
-    // Rebuild the IR stage to learn its node ids. Same input, same builder,
-    // same counter — so the ids match the tab the page renders, without the
-    // two stages sharing any state.
-    let ir = super::ir::build(cx);
-    let mut nodes = Vec::new();
-
-    for (node, (symbol, _)) in ir.nodes.iter().zip(&program.types) {
-        if let Some(ty) = output.aliases.get(symbol) {
-            nodes.push(Node::new(node.id, "", ty.to_string()));
-        }
-    }
-    for (node, (symbol, decl)) in ir
-        .nodes
+    // A declaration row wears what its definition means as a whole — an
+    // unfolded alias, or a scheme — in the order the IR stage renders them.
+    let aliases = program
+        .types
+        .keys()
+        .map(|symbol| output.aliases.get(symbol).map(|ty| ty.to_string()));
+    let schemes = program
+        .terms
+        .keys()
+        .map(|symbol| output.schemes.get(symbol).map(|scheme| scheme.to_string()));
+    let mut nodes: Vec<Node> = trace
+        .decls
         .iter()
-        .skip(program.types.len())
-        .zip(&program.terms)
-    {
-        // The declaration row wears the scheme; the subterms their own types.
-        if let Some(scheme) = output.schemes.get(symbol) {
-            nodes.push(Node::new(node.id, "", scheme.to_string()));
-        }
-        if let Some(value) = node.children.last() {
-            badge_term(&mut nodes, value, &decl.value);
-        }
-    }
+        .zip(aliases.chain(schemes))
+        .filter_map(|(id, text)| Some(Node::new(*id, "", text?)))
+        .collect();
+
+    // Every other row is a term, wearing the type inference gave it.
+    nodes.extend(
+        trace
+            .terms
+            .iter()
+            .map(|(id, ty)| Node::new(*id, "", ty.to_string())),
+    );
 
     let summary = format!("{} annotations", nodes.len());
-    stage(nodes, summary, cx.status())
-}
-
-/// Walk an IR stage node and the term it was built from in lockstep, emitting
-/// one badge per term row. The child layout mirrored here is the one
-/// [`ir::term_node`](super::ir) lays down; the `if let`s make a drift between
-/// the two a missing badge rather than a panic.
-fn badge_term(out: &mut Vec<Node>, node: &Node, term: &Term) {
-    out.push(Node::new(node.id, "", term.ty.to_string()));
-    match &term.kind {
-        ruddy::ir::TermKind::Apply { func, arg } => {
-            if let [func_node, arg_node] = node.children.as_slice() {
-                badge_term(out, func_node, func);
-                badge_term(out, arg_node, arg);
-            }
-        }
-        ruddy::ir::TermKind::Fn { body, .. } => {
-            if let [arg_node, body_node] = node.children.as_slice() {
-                // The argument has no term of its own to carry a type, but the
-                // lambda's arrow knows it.
-                if let Ty::Arrow(from, _) = &*term.ty {
-                    out.push(Node::new(arg_node.id, "", from.to_string()));
-                }
-                badge_term(out, body_node, body);
-            }
-        }
-        ruddy::ir::TermKind::Project { base, .. } => {
-            if let Some(base_node) = node.children.first() {
-                badge_term(out, base_node, base);
-            }
-        }
-        ruddy::ir::TermKind::Struct(fields) => {
-            for (wrapper, field) in node.children.iter().zip(fields.values()) {
-                if let Some(value_node) = wrapper.children.first() {
-                    badge_term(out, value_node, &field.value);
-                }
-            }
-        }
-        ruddy::ir::TermKind::Ident(_)
-        | ruddy::ir::TermKind::Natural(_)
-        | ruddy::ir::TermKind::Error => {}
+    Stage {
+        nodes,
+        ..spec.stage(cx.status(), summary)
     }
 }

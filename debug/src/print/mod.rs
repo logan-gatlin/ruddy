@@ -68,6 +68,31 @@ pub fn write_arrow(
     write!(f, " -> {to}")
 }
 
+/// Render a `{ name: value, ... }` literal, shared by every position one can
+/// appear in: struct expressions and struct types, in either tree. The two trees
+/// reach the name and the value differently — one off a spanned key, the other
+/// off the map's key and a field — so the pairs arrive already rendered.
+pub fn write_struct<K: fmt::Display, V: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    fields: impl IntoIterator<Item = (K, V)>,
+) -> fmt::Result {
+    let mut fields = fields.into_iter().peekable();
+    // The empty struct is unit, which reads as `{}` — the padding a struct with
+    // fields gets would only be two spaces around nothing.
+    if fields.peek().is_none() {
+        return f.write_str("{}");
+    }
+
+    f.write_str("{ ")?;
+    for (i, (name, value)) in fields.enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{name}: {value}")?;
+    }
+    f.write_str(" }")
+}
+
 /// Render `base.field`. Projection binds tighter than everything that follows a
 /// space, so only the forms that extend rightward need grouping.
 pub fn write_project(f: &mut fmt::Formatter<'_>, base: &impl Grouped, field: &str) -> fmt::Result {

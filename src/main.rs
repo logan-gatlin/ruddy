@@ -5,7 +5,6 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
-    types::Ty,
 };
 
 const DEMO_PATH: &str = "demo.hc";
@@ -84,33 +83,10 @@ fn main() -> ExitCode {
             ir::ErrorKind::DuplicateField => report(&source, err.span, "duplicate field"),
         }
     }
+    // Inference words its own errors, so that this driver and the debugger's
+    // diagnostic strip cannot describe the same program differently.
     for err in &inferred.errors {
-        match &err.kind {
-            inference::ErrorKind::Mismatch { expected, actual } => report(
-                &source,
-                err.span,
-                &format!("type mismatch: expected `{expected}`, found `{actual}`"),
-            ),
-            inference::ErrorKind::Recursive => report(&source, err.span, "recursive type"),
-            // A base that is still a variable means inference never learned
-            // enough, which asks for an annotation rather than a different
-            // base — the message has to say which problem it is.
-            inference::ErrorKind::NotAStruct { base } => match **base {
-                Ty::Var(_) => report(
-                    &source,
-                    err.span,
-                    "cannot infer the type being projected from; annotate it",
-                ),
-                _ => report(
-                    &source,
-                    err.span,
-                    &format!("cannot project a field out of `{base}`"),
-                ),
-            },
-            inference::ErrorKind::MissingField { base } => {
-                report(&source, err.span, &format!("no such field on `{base}`"))
-            }
-        }
+        report(&source, err.span, &err.kind.to_string());
     }
     ExitCode::FAILURE
 }

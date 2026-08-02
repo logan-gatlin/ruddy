@@ -14,7 +14,7 @@ use ruddy::{
     tracking::Tracked,
 };
 
-use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project};
+use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project, write_struct};
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
 /// needs both, and going through one wrapper is what lets the node implement
@@ -61,6 +61,25 @@ impl<'a, T> Show<'a, T> {
             node: node.kind(),
             mint: self.mint,
         }
+    }
+
+    /// The fields of a struct as [`write_struct`] wants them. Unlike the parse
+    /// tree's, the name comes from the map key, so the field's own span is not
+    /// printed.
+    fn pairs<F: Node>(
+        &self,
+        fields: &'a IndexMap<String, Field<F>>,
+    ) -> impl Iterator<Item = (&'a String, Show<'a, F::Kind>)> {
+        let mint = self.mint;
+        fields.iter().map(move |(name, field)| {
+            (
+                name,
+                Show {
+                    node: field.value.kind(),
+                    mint,
+                },
+            )
+        })
     }
 }
 
@@ -144,7 +163,7 @@ impl fmt::Display for Show<'_, TermKind> {
                 self.mint.name(arg.tracked),
                 self.show(&**body)
             ),
-            TermKind::Struct(fields) => write_struct(f, self.mint, fields),
+            TermKind::Struct(fields) => write_struct(f, self.pairs(fields)),
             TermKind::Project { base, field } => {
                 write_project(f, &self.show(&**base), &field.tracked)
             }
@@ -159,7 +178,7 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
-            TypeKind::Struct(fields) => write_struct(f, self.mint, fields),
+            TypeKind::Struct(fields) => write_struct(f, self.pairs(fields)),
         }
     }
 }
@@ -182,38 +201,4 @@ pub fn term<'a>(kind: &'a TermKind, mint: &'a Mint) -> impl fmt::Display + 'a {
 /// Render one type, the [`term`] counterpart.
 pub fn ty<'a>(kind: &'a TypeKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
-}
-
-/// Render a `{ name: value, ... }` literal. Unlike the parser's equivalent the
-/// name comes from the map key, so the field's own span is not printed.
-fn write_struct<T>(
-    f: &mut fmt::Formatter<'_>,
-    mint: &Mint,
-    fields: &IndexMap<String, Field<T>>,
-) -> fmt::Result
-where
-    T: Node,
-    for<'a> Show<'a, T::Kind>: fmt::Display,
-{
-    // The empty struct is unit, which reads as `{}` — the padding a struct with
-    // fields gets would only be two spaces around nothing.
-    if fields.is_empty() {
-        return f.write_str("{}");
-    }
-
-    f.write_str("{ ")?;
-    for (i, (name, field)) in fields.iter().enumerate() {
-        if i > 0 {
-            f.write_str(", ")?;
-        }
-        write!(
-            f,
-            "{name}: {}",
-            Show {
-                node: field.value.kind(),
-                mint
-            }
-        )?;
-    }
-    f.write_str(" }")
 }

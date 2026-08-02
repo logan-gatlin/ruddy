@@ -1,8 +1,8 @@
 //! The JSON contract between the server and the page.
 //!
-//! Every stage the debugger renders — today tokens, AST, IR, types and
-//! symbols; tomorrow assembly — is serialized into the same [`Stage`] of
-//! [`Node`]s. The page derives tabs, filtering and cross-highlighting from this
+//! Every stage the debugger renders — today tokens, AST, IR, constraints, the
+//! solve, types and symbols; tomorrow assembly — is serialized into the same
+//! [`Stage`] of [`Node`]s. The page derives tabs, filtering and cross-highlighting from this
 //! shape alone, so a new stage costs a backend file and nothing else.
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,14 @@ pub struct Stage {
     pub id: &'static str,
     pub title: &'static str,
     pub view: View,
+    /// A regular expression over this stage's row text, naming the runs that
+    /// mean the same thing wherever they appear — a solver variable, say.
+    /// Hovering one lights every other occurrence in the panel.
+    ///
+    /// The pattern lives here rather than in the page because the notation is
+    /// the stage's: the page matches what it is given without knowing what a
+    /// match means. `None` for a stage whose text names nothing twice.
+    pub highlight: Option<&'static str>,
     pub status: Status,
     /// Shown next to the tab title, e.g. `3 types · 5 terms`.
     pub summary: String,
@@ -51,18 +59,17 @@ pub struct Stage {
     pub nodes: Vec<Node>,
     /// Populated for [`View::Text`] stages only.
     pub text: Option<String>,
-    /// The compiler's own `Display` output, verbatim.
-    pub display: String,
     /// `{:#?}`, so a field the renderer has not learned about yet is still
-    /// visible the moment it exists.
+    /// visible the moment it exists. This is the panel's `raw` view.
     pub debug: String,
     /// When set, this stage decorates another stage's rows instead of owning a
     /// tab of its own.
     pub annotates: Option<&'static str>,
 }
 
-/// `Text` has no producer yet; it is part of the contract so that a stage
-/// emitting assembly can be added without changing the wire format or the page.
+/// How a panel renders its nodes. `Text` has no producer yet; it is part of the
+/// contract so that a stage emitting assembly can be added without changing the
+/// wire format or the page.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
@@ -70,6 +77,9 @@ pub enum View {
     List,
     Tree,
     Text,
+    /// A timeline with a cursor: the nodes are a sequence the reader walks one
+    /// at a time rather than a shape they read all at once.
+    Steps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

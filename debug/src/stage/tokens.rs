@@ -6,13 +6,13 @@
 use ruddy::token::Kind;
 
 use crate::{
-    stage::{Cx, Ids},
-    wire::{Node, Stage, View},
+    stage::{Cx, Ids, Spec},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(tokens) = cx.tokens else {
-        return crate::stage::skipped("tokens", "Tokens", View::List, "lexing did not run");
+        return crate::stage::skipped(spec, "lexing did not run");
     };
 
     let mut ids = Ids::default();
@@ -31,27 +31,15 @@ pub fn build(cx: &Cx) -> Stage {
         })
         .collect();
 
-    let display = tokens
-        .iter()
-        .map(|token| token.tracked.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-
+    let summary = match nodes.len() {
+        1 => "1 token".to_string(),
+        n => format!("{n} tokens"),
+    };
     Stage {
-        id: "tokens",
-        title: "Tokens",
-        view: View::List,
-        status: cx.status(),
-        summary: match nodes.len() {
-            1 => "1 token".to_string(),
-            n => format!("{n} tokens"),
-        },
         micros: cx.micros.lex,
         nodes,
-        text: None,
-        display,
         debug: format!("{tokens:#?}"),
-        annotates: None,
+        ..spec.stage(cx.status(), summary)
     }
 }
 

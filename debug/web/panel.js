@@ -32,6 +32,7 @@ export function createPanes(root, app) {
   return {
     focusFilter: () => panes[app.state.pane]?.focusFilter(),
     selectTab: (n) => panes[app.state.pane]?.selectTab(n),
+    step: (to) => panes[app.state.pane]?.step(to),
   };
 }
 
@@ -64,6 +65,12 @@ function createPane(root, app, index) {
   let marked = new Set();
   let highlighted = new Set();
   let symbolised = new Set();
+  // The `.tok` elements currently lit, for the same reason.
+  let lit = new Set();
+  // Where the reader has got to in each stepped stage, by stage id. Per pane,
+  // because two panes showing one stage are two readers; kept across compiles,
+  // because an edit should not throw away where you were.
+  const cursors = new Map();
 
   pane.addEventListener("mousedown", () => (app.state.pane = index), true);
 
@@ -111,12 +118,19 @@ function createPane(root, app, index) {
   });
 
   rows.addEventListener("mouseover", (event) => {
+    lightTokens(event.target.closest(".tok")?.dataset.tok ?? null);
     const row = event.target.closest(".row");
     if (row) app.setHover(mark(row));
   });
-  rows.addEventListener("mouseleave", () => app.setHover(null));
+  rows.addEventListener("mouseleave", () => {
+    lightTokens(null);
+    app.setHover(null);
+  });
 
   rows.addEventListener("click", (event) => {
+    const nav = event.target.closest("[data-step]");
+    if (nav) return step(nav.dataset.step);
+
     const row = event.target.closest(".row");
     if (!row) return;
     if (event.target.closest(".twisty") && row.dataset.kids === "1") {
@@ -126,8 +140,48 @@ function createPane(root, app, index) {
       render();
       return;
     }
-    app.setSelection(mark(row));
+    // Read the row before moving the cursor: stepping re-renders, and the
+    // element this came from is gone with it.
+    const at = row.dataset.at;
+    const selection = mark(row);
+    if (at !== undefined) step(at, true);
+    app.setSelection(selection);
   });
+
+  /// Light every occurrence of one name in the rows on screen — the same
+  /// name, spelled the same way, wherever the stage's text uses it. Which runs
+  /// count as a name is the stage's `highlight` pattern; this knows only that
+  /// two matching strings are the same thing.
+  ///
+  /// Rows only, and only this pane's: a collapsed or filtered-out row has
+  /// nothing on screen to light, and it lights again the moment it is back.
+  function lightTokens(name) {
+    const wanted = new Set();
+    if (name != null) {
+      for (const el of rows.querySelectorAll(".tok")) {
+        if (el.dataset.tok === name) wanted.add(el);
+      }
+    }
+    for (const el of lit) if (!wanted.has(el)) el.classList.remove("tok-on");
+    for (const el of wanted) if (!lit.has(el)) el.classList.add("tok-on");
+    lit = wanted;
+  }
+
+  /// Move the cursor of a stepped stage. `to` is a signed delta, one of the
+  /// ends, or — with `absolute` — the step to stop in front of.
+  ///
+  /// The cursor sits *between* steps: everything before it has happened, and
+  /// the step at it is the one about to. So it runs to `length`, one past the
+  /// last step, which is the state the solve actually ended in.
+  function step(to, absolute = false) {
+    if (!stage || viewOf(app, stage) !== "steps") return;
+    const last = stage.nodes.length;
+    const at = cursors.get(stage.id) ?? 0;
+    const wanted =
+      to === "start" ? 0 : to === "end" ? last : absolute ? Number(to) : at + Number(to);
+    cursors.set(stage.id, Math.max(0, Math.min(last, wanted)));
+    render();
+  }
 
   function mark(row) {
     const start = row.dataset.start;
@@ -145,6 +199,7 @@ function createPane(root, app, index) {
     // gone with it.
     marked = new Set();
     highlighted = new Set();
+    lit = new Set();
 
     const snapshot = app.state.snapshot;
     if (!snapshot) {
@@ -157,10 +212,9 @@ function createPane(root, app, index) {
     renderTabs(snapshot);
     renderViews();
 
-    const view = app.state.views[stage.id] ?? "tree";
-    if (view !== "tree") {
-      const body = view === "display" ? stage.display : stage.debug;
-      rows.innerHTML = `<pre class="raw">${esc(body || "(empty)")}</pre>`;
+    const view = viewOf(app, stage);
+    if (view === "raw") {
+      rows.innerHTML = `<pre class="raw">${esc(stage.debug || "(empty)")}</pre>`;
       visible = [];
       return;
     }
@@ -176,6 +230,15 @@ function createPane(root, app, index) {
     if (stage.status === "skipped" || !stage.nodes.length) {
       const why = stage.status === "skipped" ? stage.summary : "nothing to show";
       rows.innerHTML = `<div class="pane-note">${esc(why)}</div>`;
+      visible = [];
+      return;
+    }
+
+    // A stepped stage is a timeline rather than a shape, so it owns the pane
+    // instead of going through the tree walk: none of the collapsing,
+    // filtering or caret-following below means anything to it.
+    if (view === "steps") {
+      renderSteps();
       visible = [];
       return;
     }
@@ -198,15 +261,110 @@ function createPane(root, app, index) {
     visible = [];
     walk(stage.nodes, 0, "", collapsed, query, visible);
 
-    rows.innerHTML = visible.map((row) => rowHtml(row, columns, app, badges)).join("");
+    const pattern = names(stage);
+    rows.innerHTML = visible.map((row) => rowHtml(row, columns, app, badges, pattern)).join("");
     rows.scrollTop = scroll;
     for (const [i, row] of visible.entries()) row.el = rows.children[i];
     markRows();
   }
 
+  /// The stepper: a cursor into the stage's steps, what is about to happen at
+  /// it, and the state everything before it built up.
+  ///
+  /// The two state panels are accumulated here rather than sent per step: a
+  /// step declares what it *added* to each — a `_bind`, an `_error` — and the
+  /// prefix up to the cursor is the state. That keeps the wire linear in the
+  /// number of steps instead of quadratic, and keeps this function ignorant of
+  /// what a binding or an error actually is.
+  function renderSteps() {
+    const steps = stage.nodes;
+    const at = Math.min(cursors.get(stage.id) ?? 0, steps.length);
+    cursors.set(stage.id, at);
+    const pattern = names(stage);
+
+    const solution = [];
+    const errors = [];
+    for (const done of steps.slice(0, at)) {
+      const bind = field(done, "_bind");
+      const failed = field(done, "_error");
+      if (bind !== undefined) solution.push(bind);
+      if (failed !== undefined) errors.push(failed);
+    }
+
+    const next = steps[at];
+    // Solving runs one definition at a time, and a step says which one it was
+    // solving. A rule wherever that changes is where one solve ends and the
+    // next begins — which the numbers alone never showed, since the timeline
+    // is continuous but the solves are not.
+    let solving = null;
+    const list = steps
+      .map((one, i) => {
+        const where = i < at ? "done" : i === at ? "at" : "ahead";
+        const depth = Number(field(one, "_depth") ?? 0);
+        const definition = field(one, "_def") ?? "";
+        // Not on the first row: the top of the list is already an edge.
+        const starts = i > 0 && definition !== solving ? " starts" : "";
+        solving = definition;
+        return (
+          `<div class="row step-row ${where}${starts}${one.error ? " bad" : ""}" data-at="${i}" ` +
+          `data-node="${one.id}" data-kids="0" data-key="" ` +
+          `data-start="${one.span ? one.span[0] : ""}" data-end="${one.span ? one.span[1] : ""}" ` +
+          `data-symbol="${one.symbol ?? ""}">` +
+          // The rule name is a fixed column and does not indent: eleven names
+          // read as a column only if they all start in the same place. What
+          // nests is the goal, so that is what carries the depth.
+          `<span class="label">${esc(one.label)}</span>` +
+          `<span class="text" style="margin-left:${depth * INDENT}px">` +
+          `${escNames(one.text, pattern)}</span>` +
+          `<span class="step-effect">${escNames(field(one, "_effect") ?? "", pattern)}</span>` +
+          `<span class="step-def">${esc(definition)}</span>` +
+          `</div>`
+        );
+      })
+      .join("");
+
+    const panel = (title, items, bad) =>
+      `<div class="step-panel"><div class="step-head">${title}</div>` +
+      (items.length
+        ? items
+            .map((item) => `<div class="step-item${bad}">${escNames(item, pattern)}</div>`)
+            .join("")
+        : `<div class="step-item none">nothing yet</div>`) +
+      `</div>`;
+
+    rows.innerHTML =
+      `<div class="stepper">` +
+      `<div class="step-bar">` +
+      `<button class="chip" data-step="start" title="Back to the start">⏮</button>` +
+      `<button class="chip" data-step="-1" title="Back one step">◀</button>` +
+      `<button class="chip" data-step="1" title="Forward one step">▶</button>` +
+      `<button class="chip" data-step="end" title="Run to the end">⏭</button>` +
+      `<span class="step-count">${at} of ${steps.length} applied</span>` +
+      `</div>` +
+      (next
+        ? `<div class="step-next"><span class="step-head">next</span>` +
+          `<span class="label">${esc(next.label)}</span>` +
+          `<span class="text">${escNames(next.text, pattern)}</span>` +
+          `<div class="step-why">${esc(field(next, "_rule") ?? "")}</div></div>`
+        : `<div class="step-next"><span class="step-head">next</span>` +
+          `<span class="step-why">nothing left; this is what the solve concluded</span></div>`) +
+      `<div class="step-body"><div class="step-list">${list}</div>` +
+      `<div class="step-state">${panel("solution", solution, "")}${panel("errors", errors, " bad")}</div>` +
+      `</div></div>`;
+
+    const list_el = rows.querySelector(".step-list");
+    const cursor = rows.querySelector(".step-row.at");
+    if (list_el && cursor) scrollIntoView(list_el, cursor);
+  }
+
   function renderTabs(snapshot) {
     // A stage that annotates another owns no tab; its content shows up as
     // badges on the stage it decorates.
+    //
+    // A tab is a selector and nothing more: its shortcut and its name. The
+    // summary belongs to whichever stage a pane is showing, and a tab strip is
+    // repeated once per pane — so putting it here printed every stage's count
+    // in every pane, twice over and about panes that were not showing them.
     tabs.innerHTML = snapshot.stages
       .filter((s) => !s.annotates)
       .map((s, i) => {
@@ -214,14 +372,17 @@ function createPane(root, app, index) {
         const bad = s.status === "panicked" ? " bad" : "";
         return `<button class="tab${on}${bad}" data-stage="${s.id}"><span class="key">${
           i + 1
-        }</span>${esc(s.title)}<span class="count">${esc(s.summary)}</span></button>`;
+        }</span>${esc(s.title)}</button>`;
       })
       .join("");
   }
 
   function renderViews() {
-    const current = app.state.views[stage.id] ?? "tree";
-    views.innerHTML = ["tree", "display", "raw"]
+    const current = viewOf(app, stage);
+    // A stage's own view, or the raw dump every stage has. Naming the first
+    // button after `stage.view` is what lets a list stage stop offering a
+    // "tree" it never rendered.
+    views.innerHTML = [stage.view, "raw"]
       .map(
         (view) =>
           `<button data-view="${view}" class="${view === current ? "on" : ""}">${view}</button>`,
@@ -281,6 +442,7 @@ function createPane(root, app, index) {
   return {
     render,
     mark: markRows,
+    step,
     focusFilter: () => filter.focus(),
     selectTab(n) {
       const snapshot = app.state.snapshot;
@@ -341,7 +503,51 @@ function columnsOf(stage) {
   return seen;
 }
 
-function rowHtml(row, columns, app, badges) {
+/// Which of a stage's two views is showing. Only `raw` is a deviation — every
+/// stage has one — so anything else means the view the stage was registered
+/// with, and a name left in storage by an older build falls back to it rather
+/// than to a blank pane.
+function viewOf(app, stage) {
+  return app.state.views[stage.id] === "raw" ? "raw" : stage.view;
+}
+
+/// One of a node's fields by name, or `undefined`. Absent and empty are
+/// different: a step with no `_bind` changed no binding, which is not the same
+/// as binding nothing.
+function field(node, name) {
+  return (node.fields ?? []).find((f) => f.name === name)?.value;
+}
+
+/// The stage's `highlight` pattern, compiled. A stage declares the notation it
+/// uses; a pattern this build cannot compile is treated as no pattern rather
+/// than as a broken panel, since the rest of the stage is still worth reading.
+function names(stage) {
+  if (!stage.highlight) return null;
+  try {
+    return new RegExp(stage.highlight, "g");
+  } catch {
+    return null;
+  }
+}
+
+/// Escape `text`, wrapping every run the pattern matches so it can be lit
+/// alongside its other occurrences. The name goes in the dataset verbatim:
+/// matching is string equality, and nothing here parses what it matched.
+function escNames(text, pattern) {
+  if (!pattern) return esc(text);
+  const source = String(text);
+  let out = "";
+  let last = 0;
+  for (const match of source.matchAll(pattern)) {
+    const name = esc(match[0]);
+    out += esc(source.slice(last, match.index));
+    out += `<span class="tok" data-tok="${name}">${name}</span>`;
+    last = match.index + match[0].length;
+  }
+  return out + esc(source.slice(last));
+}
+
+function rowHtml(row, columns, app, badges, pattern) {
   const { node, depth, kids, open, dim } = row;
   const twisty = kids ? (open ? "▾" : "▸") : "";
   const badge = badges?.get(node.id);
@@ -366,7 +572,7 @@ function rowHtml(row, columns, app, badges) {
     `style="padding-left:${8 + depth * INDENT}px">` +
     `<span class="twisty${kids ? "" : " leaf"}">${twisty}</span>` +
     `<span class="label">${esc(node.label)}</span>` +
-    `<span class="text">${esc(node.text)}</span>` +
+    `<span class="text">${escNames(node.text, pattern)}</span>` +
     cells +
     (badge ? `<span class="badge">${esc(badge)}</span>` : "") +
     `<span class="pos">${node.span ? esc(app.spanLabel(node.span)) : ""}</span>` +

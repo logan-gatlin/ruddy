@@ -8,7 +8,8 @@
 //! are lost.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::HashMap,
     panic::{self, AssertUnwindSafe},
     sync::Once,
     time::Instant,
@@ -19,11 +20,10 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Version},
     token,
     tracking::{FileManager, Span},
-    types::Ty,
 };
 
 use crate::{
-    stage::{self, Cx, Phases},
+    stage::{self, Build, Cx, Phases, Trace},
     wire::{CompileRequest, Diagnostic, Panic, Range, Related, Severity, Snapshot, line_starts},
 };
 
@@ -31,6 +31,10 @@ thread_local! {
     /// Filled by the panic hook on the thread that panicked, drained by
     /// [`guard`] immediately after `catch_unwind` returns.
     static LAST_PANIC: RefCell<Option<Panic>> = const { RefCell::new(None) };
+    /// Set while a [`guard`] is running. A panic outside one is not the
+    /// compiler's — it is a bug in the server, or a failed assertion in a test
+    /// — and has to reach the console the way it normally would.
+    static GUARDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The name the editor's buffer is registered under. It is never read from
@@ -128,12 +132,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(
-            inferred
-                .errors
-                .iter()
-                .map(|error| types_diagnostic(source, error)),
-        );
+        diagnostics.extend(inferred.errors.iter().map(types_diagnostic));
     }
 
     // Sorted by where the reader would look for them, then numbered, so a
@@ -156,14 +155,30 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         errored: !diagnostics.is_empty(),
     };
 
-    let stages = stage::REGISTRY
-        .iter()
-        .map(|(id, build)| {
-            guard(id, &mut panicked, || build(&cx)).unwrap_or_else(|| {
-                stage::panicked(id, stage::title_of(id), crate::wire::View::Tree)
-            })
-        })
-        .collect();
+    // In registry order, which is also dependency order: a stage that annotates
+    // another is registered after it, so the trace it reads is already there.
+    let mut traces: HashMap<&'static str, Trace> = HashMap::new();
+    let mut stages = Vec::with_capacity(stage::REGISTRY.len());
+    for spec in stage::REGISTRY {
+        let built = match spec.build {
+            Build::Panel(build) => guard(spec.id, &mut panicked, || build(spec, &cx)),
+            Build::Traced(build) => {
+                guard(spec.id, &mut panicked, || build(spec, &cx)).map(|(stage, trace)| {
+                    traces.insert(spec.id, trace);
+                    stage
+                })
+            }
+            Build::Annotator(build) => {
+                let empty = Trace::default();
+                let trace = spec
+                    .annotates
+                    .and_then(|id| traces.get(id))
+                    .unwrap_or(&empty);
+                guard(spec.id, &mut panicked, || build(spec, &cx, trace))
+            }
+        };
+        stages.push(built.unwrap_or_else(|| stage::panicked(spec)));
+    }
 
     Snapshot {
         revision: req.revision,
@@ -180,7 +195,10 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
 /// result. Only the first panic of a run is kept: the ones after it are usually
 /// the same bug seen from a stage that was handed nothing.
 pub fn guard<T>(stage: &str, slot: &mut Option<Panic>, f: impl FnOnce() -> T) -> Option<T> {
-    match panic::catch_unwind(AssertUnwindSafe(f)) {
+    let outer = GUARDING.replace(true);
+    let caught = panic::catch_unwind(AssertUnwindSafe(f));
+    GUARDING.set(outer);
+    match caught {
         Ok(value) => Some(value),
         Err(payload) => {
             let captured = LAST_PANIC.with(|last| last.borrow_mut().take());
@@ -212,12 +230,18 @@ fn message_of(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// Capture panics instead of letting them reach the console with a full
-/// backtrace nobody asked for. The default hook is replaced rather than
-/// chained: the same information reaches the page, which is where it is useful.
+/// backtrace nobody asked for. Only the ones a [`guard`] is around: the same
+/// information reaches the page, which is where it is useful. Anything else is
+/// nobody's compiler bug and falls through to the hook that was already there.
 pub fn install_hook() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        panic::set_hook(Box::new(|info| {
+        let outer = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !GUARDING.with(Cell::get) {
+                outer(info);
+                return;
+            }
             let panicked = Panic {
                 stage: String::new(),
                 message: info.payload_as_str().unwrap_or("panicked").to_string(),
@@ -291,45 +315,16 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
     }
 }
 
-fn types_diagnostic(source: &str, error: &inference::Error) -> Diagnostic {
-    let span = Some(error.span);
-    match &error.kind {
-        inference::ErrorKind::Mismatch { expected, actual } => raw(
-            "types",
-            "type-mismatch",
-            format!("type mismatch: expected `{expected}`, found `{actual}`"),
-            span,
-        ),
-        inference::ErrorKind::Recursive => raw(
-            "types",
-            "recursive-type",
-            format!("recursive type at {}", quote(source, error.span)),
-            span,
-        ),
-        // A base that is still a variable means inference never learned
-        // enough, which asks for an annotation rather than a different base —
-        // the message has to say which problem it is.
-        inference::ErrorKind::NotAStruct { base } => match **base {
-            Ty::Var(_) => raw(
-                "types",
-                "not-a-struct",
-                "cannot infer the type being projected from; annotate it".to_string(),
-                span,
-            ),
-            _ => raw(
-                "types",
-                "not-a-struct",
-                format!("cannot project a field out of `{base}`"),
-                span,
-            ),
-        },
-        inference::ErrorKind::MissingField { base } => raw(
-            "types",
-            "missing-field",
-            format!("no field {} on `{base}`", quote(source, error.span)),
-            span,
-        ),
-    }
+/// Inference words and codes its own errors, so the strip and the CLI driver
+/// cannot describe the same program differently, and a new [`inference::
+/// ErrorKind`] reaches both the moment it exists.
+fn types_diagnostic(error: &inference::Error) -> Diagnostic {
+    raw(
+        "types",
+        error.kind.code(),
+        error.kind.to_string(),
+        Some(error.span),
+    )
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Span>) -> Diagnostic {

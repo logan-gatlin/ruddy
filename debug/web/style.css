@@ -15,6 +15,7 @@
   --accent-bg: rgba(87, 165, 255, 0.2);
   --symbol: #ffb454;
   --symbol-bg: rgba(255, 180, 84, 0.16);
+  --tyvar: #5ccfc0;
   --error: #ff6b6b;
   --error-bg: rgba(255, 107, 107, 0.14);
   --ok: #6fcf97;
@@ -44,6 +45,7 @@
     --accent-bg: rgba(11, 100, 208, 0.14);
     --symbol: #a35b00;
     --symbol-bg: rgba(214, 138, 0, 0.18);
+    --tyvar: #0f766e;
     --error: #c92a2a;
     --error-bg: rgba(201, 42, 42, 0.1);
     --ok: #1e7f4f;
@@ -362,8 +364,8 @@ input {
   overflow: hidden;
 }
 
-/* Tabs are separated chips rather than words in a row: a stage and its summary
-   are both text, and without an edge between them the bar reads as one string. */
+/* Tabs are separated chips rather than words in a row: every one of them is a
+   name, and without an edge between them the bar reads as one string. */
 /* The tabs give way before the controls do: a filter box pushed off the edge is
    worse than a tab strip you have to scroll. */
 .tabs {
@@ -401,20 +403,8 @@ input {
   background: var(--accent-bg);
   border-color: var(--accent);
 }
-.tab .count {
-  color: var(--fg-faint);
-  padding-left: 5px;
-  border-left: 1px solid var(--line);
-}
-.tab.on .count {
-  border-left-color: var(--accent);
-  color: var(--fg-dim);
-}
-.tab.bad,
-.tab.bad .count {
-  color: var(--error);
-}
 .tab.bad {
+  color: var(--error);
   border-color: var(--error);
 }
 .tab .key {
@@ -526,6 +516,25 @@ input {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* A name the stage uses in more than one row — for the tabs that render types,
+   exactly the parts that are not concrete: `?4`, `?`, `'a`. Colouring them is
+   the same fact the hover uses, said without being asked: what is coloured is
+   what is standing in for something, and what is left dim is what the language
+   actually wrote.
+
+   Lit, it keeps its colour and gains the symbol halo a cross-highlighted row
+   wears, so hovering says "these are the same one" without also saying "this
+   is now a different kind of thing". No cursor of its own: hovering is the
+   whole interaction, and a click still selects the row under it. */
+.tok {
+  color: var(--tyvar);
+}
+.tok-on {
+  background: var(--symbol-bg);
+  box-shadow: 0 0 0 1px var(--symbol);
+  border-radius: 2px;
 }
 .row.gen .text::after {
   content: " ⟨generated⟩";
@@ -713,4 +722,148 @@ pre.raw .hi {
   border-top: 1px solid var(--line);
   color: var(--fg-faint);
   font-size: 0.9em;
+}
+
+/* ── the stepper ──────────────────────────────────────────────────────────
+   A stepped panel is a timeline, not a tree: it fills the pane itself and
+   scrolls in two places — the steps on the left, the state they built on the
+   right — so neither pushes the other off the screen. */
+.rows:has(.stepper) {
+  overflow: hidden;
+  padding: 0;
+}
+.stepper {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.step-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.step-count {
+  color: var(--fg-faint);
+  padding-left: 4px;
+}
+
+/* What is about to happen, said twice: the goal in the language's own
+   notation, and underneath it the rule in words. */
+.step-next {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+}
+.step-next .step-why {
+  flex-basis: 100%;
+  color: var(--fg-faint);
+}
+.step-head {
+  color: var(--accent);
+  text-transform: uppercase;
+  font-size: 0.85em;
+  letter-spacing: 0.06em;
+}
+
+.step-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.step-list {
+  /* Positioned so that a row's `offsetTop` is measured against this box: that
+     is what scrolling the cursor into view assumes. */
+  position: relative;
+  flex: 1;
+  overflow: auto;
+  padding: 3px 0 10px;
+}
+.step-state {
+  width: 38%;
+  min-width: 160px;
+  overflow: auto;
+  padding: 3px 0 10px;
+  border-left: 1px solid var(--line);
+}
+.step-panel + .step-panel {
+  margin-top: 8px;
+}
+.step-panel .step-head {
+  padding: 0 8px 2px;
+}
+.step-item {
+  padding: 0 8px;
+  min-height: var(--row);
+  line-height: var(--row);
+  /* Wraps rather than clips: a binding is the thing the panel exists to show,
+     and half of one is worse than two lines of one. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.step-item.bad {
+  color: var(--error);
+}
+.step-item.none {
+  color: var(--fg-faint);
+}
+
+/* Where the reader is: what has run is plain, what is next is marked the way a
+   selected row is, and what has not run yet recedes. No row numbers — the bar
+   counts the steps and the cursor says which one, so a third telling would only
+   take width off the goal. */
+.step-row.ahead {
+  opacity: 0.42;
+}
+/* Where one definition's solve ends and the next begins. In `--fg-faint`
+   rather than the `--line` that divides panes: this separates rows that are
+   otherwise identical in weight, so it has to carry against them rather than
+   recede the way a chrome edge does. A margin rather than a border alone, so
+   it does not eat a pixel of a fixed-height row, and so it still reads on the
+   row that is also the cursor. */
+.step-row.starts {
+  margin-top: 7px;
+  border-top: 1px solid var(--fg-faint);
+}
+
+/* The rule name is a column, not a word: there are eleven of them and they run
+   from `bind` to `mismatch`, so leaving each to its own width starts the goal
+   at a different place on every row and nothing lines up to be compared.
+   `min-width`, so a longer rule one day pushes the goal rather than losing its
+   own last letters. */
+.step-row .label {
+  min-width: 8ch;
+  padding-left: 8px;
+}
+/* What the step did, and which definition it was solving. Not the `.badge` an
+   annotator paints: that one is green whatever the row says, and half of these
+   are failures. */
+.step-effect {
+  flex: none;
+  /* The goal is what a reader is following; the effect is the gloss. It gets
+     the smaller share when the pane is narrow. */
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-dim);
+}
+.step-row.bad .step-effect {
+  color: var(--error);
+}
+.step-def {
+  flex: none;
+  color: var(--fg-faint);
+  font-size: 0.9em;
+  padding-left: 8px;
+}
+.step-row.at {
+  background: var(--accent-bg);
+  box-shadow: inset 2px 0 0 var(--accent);
 }

@@ -1,8 +1,11 @@
 //! Tests for [`ruddy_debug::snapshot`].
 
+use std::collections::HashMap;
+
 use ruddy_debug::{
     snapshot::{compile, guard, install_hook},
-    wire::{BundleSpec, CompileRequest, Node, Snapshot, Stage},
+    stage::REGISTRY,
+    wire::{BundleSpec, CompileRequest, Node, Snapshot, Stage, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -34,12 +37,45 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 fn every_stage_reports_on_the_demo() {
     let snapshot = snapshot(DEMO);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();
-    assert_eq!(ids, ["tokens", "ast", "ir", "types", "symbols", "types-ir"]);
+    assert_eq!(
+        ids,
+        [
+            "tokens",
+            "ast",
+            "ir",
+            "constraints",
+            "solve",
+            "types",
+            "symbols",
+            "types-ir"
+        ]
+    );
     assert_eq!(snapshot.revision, 3);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
         assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
     }
+
+    // The tab strip is the stages that annotate nothing, so the annotator at
+    // the end of the registry adds no second "Types" tab.
+    let titles: Vec<_> = snapshot
+        .stages
+        .iter()
+        .filter(|stage| stage.annotates.is_none())
+        .map(|stage| stage.title)
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "Tokens",
+            "AST",
+            "IR",
+            "Constraints",
+            "Solve",
+            "Types",
+            "Symbols"
+        ]
+    );
 }
 
 /// A span hygiene check on the compiler, not on the debugger: every offset
@@ -317,15 +353,85 @@ fn inferred_types_reach_the_panels() {
     assert!(texts.contains(&"'a -> 'a"), "{texts:?}");
 }
 
+/// Every row the IR stage renders a term on wears the type inference gave it.
+/// The badges used to come from a second walk that mirrored the IR's child
+/// layout by hand, so a change to one could silently stop the other; both now
+/// fall out of the same walk, and this is the check that they still line up
+/// across every shape a term can take.
+#[test]
+fn every_term_row_in_the_ir_wears_its_type() {
+    let snapshot = snapshot("let f : { x: Nat } -> Nat = fn p => p.x\nlet n = f { x: 1 }\n");
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+    let badges: HashMap<u32, &str> = stage("types-ir")
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.text.as_str()))
+        .collect();
+
+    // Labels no type node ever carries, so every row reached here is a term.
+    const TERMS: [&str; 5] = ["Apply", "Fn", "Project", "Natural", "Arg"];
+    let rows = nodes(stage("ir"));
+    let terms: Vec<&&Node> = rows
+        .iter()
+        .filter(|node| TERMS.contains(&node.label.as_str()))
+        .collect();
+    // `fn p => p.x`, its `p`, `p.x`, `f { x: 1 }` and the `1` inside it.
+    assert_eq!(terms.len(), 5, "{terms:#?}");
+    for node in &terms {
+        assert!(
+            badges.contains_key(&node.id),
+            "{} {:?} wears no type",
+            node.label,
+            node.text
+        );
+    }
+
+    let badge = |label: &str, text: &str| -> &str {
+        let node = rows
+            .iter()
+            .find(|node| node.label == label && node.text == text)
+            .unwrap_or_else(|| panic!("the IR renders no {label} {text:?}"));
+        badges[&node.id]
+    };
+    // The bound name has no term of its own to carry a type; the lambda's
+    // arrow is where it comes from.
+    assert_eq!(badge("Arg", "p"), "{ x: Nat }");
+    assert_eq!(badge("Project", "p.x"), "Nat");
+    assert_eq!(badge("Apply", "f { x: 1 }"), "Nat");
+    assert_eq!(badge("Natural", "1"), "Nat");
+}
+
+/// The strip's messages are inference's own words. They were a copy of the
+/// CLI driver's, and the two had already drifted apart on this very sentence —
+/// `tests/src/inference.rs` pins the other end of it.
 #[test]
 fn a_type_error_is_a_diagnostic() {
-    let snapshot = snapshot("let n : Nat = fn x => x\n");
-    let codes: Vec<_> = snapshot
+    let mismatch = snapshot("let n : Nat = fn x => x\n");
+    let codes: Vec<_> = mismatch
         .diagnostics
         .iter()
         .map(|diagnostic| diagnostic.code)
         .collect();
     assert_eq!(codes, ["type-mismatch"]);
+
+    let missing = snapshot("let f : { x: Nat } -> Nat = fn p => p.y\n");
+    let [diagnostic] = missing.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", missing.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "missing-field");
+    assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
 }
 
 #[test]
@@ -375,7 +481,13 @@ fn a_snapshot_survives_the_wire() {
     let json = serde_json::to_string(&snapshot).expect("serializes");
     let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
 
-    assert_eq!(back["stages"].as_array().expect("stages").len(), 6);
+    // Every registered stage reaches the page, annotators included: the count
+    // comes from the registry so that adding a stage cannot quietly leave one
+    // off the wire without also being noticed here.
+    assert_eq!(
+        back["stages"].as_array().expect("stages").len(),
+        REGISTRY.len()
+    );
     assert_eq!(back["stages"][0]["view"], "list");
     assert_eq!(back["stages"][1]["view"], "tree");
     assert!(back["line_starts"].as_array().expect("line starts").len() > 1);
@@ -414,4 +526,75 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
         .find(|stage| stage.id == "ir")
         .expect("ir stage");
     assert_eq!(ir.nodes.len(), 1);
+}
+
+/// The `Solve` tab is a timeline the page walks with a cursor, building its two
+/// state panels by appending each step's `_bind` and `_error` as it passes
+/// them. That only works if those fields appear exactly on the steps that
+/// changed something, and if a binding is only ever added — never rewritten,
+/// because stepping backwards is dropping the tail of the list.
+#[test]
+fn a_solver_step_declares_what_it_added_to_the_state() {
+    let snapshot = snapshot(
+        "let fst : { x: Nat } -> Nat = fn p => p.x\nlet miss : { x: Nat } -> Nat = fn p => p.y\n",
+    );
+    let stage = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve stage is registered");
+    assert!(matches!(stage.view, View::Steps), "{:?}", stage.view);
+    assert!(!stage.nodes.is_empty());
+
+    let field = |node: &Node, name: &str| {
+        node.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.clone())
+    };
+
+    let mut bound = Vec::new();
+    let mut failed = Vec::new();
+    for node in &stage.nodes {
+        // Everything the page reads off every step, on every step.
+        for name in ["_rule", "_effect", "_depth", "_def"] {
+            assert!(field(node, name).is_some(), "{} has no {name}", node.label);
+        }
+        let depth = field(node, "_depth").expect("a depth");
+        assert!(depth.parse::<u32>().is_ok(), "depth {depth:?}");
+
+        // A step that failed is the red one, and the only one carrying an
+        // error: the page paints from `error` and accumulates from `_error`,
+        // so the two cannot be allowed to disagree.
+        assert_eq!(
+            node.error,
+            field(node, "_error").is_some(),
+            "{} is {} but {} an error",
+            node.label,
+            if node.error { "red" } else { "not red" },
+            if node.error { "carries no" } else { "carries" },
+        );
+        if let Some(bind) = field(node, "_bind") {
+            bound.push(bind);
+        }
+        if let Some(error) = field(node, "_error") {
+            failed.push(error);
+        }
+    }
+
+    // Appended, never rewritten.
+    let mut once = bound.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), bound.len(), "{bound:?}");
+
+    // What the reader would have collected by the end is what inference
+    // reported: one error, said the same way in both places.
+    let reported: Vec<&str> = snapshot
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.stage == "types")
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(failed, reported);
 }

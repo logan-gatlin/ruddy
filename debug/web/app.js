@@ -375,9 +375,11 @@ function renderTitlebar() {
   const snapshot = state.snapshot;
   const errors = snapshot?.diagnostics.length ?? 0;
   const timings = (snapshot?.stages ?? [])
-    // An annotating stage does its work inside another compile phase; a
-    // second chip for it would double-count the same time.
-    .filter((stage) => !stage.annotates)
+    // One chip per phase, not per tab. A stage whose work happened inside
+    // another stage's phase — an annotator, or a second view of a phase's
+    // output — reports no time, and a second chip for it would be the same
+    // microseconds counted twice.
+    .filter((stage) => stage.micros > 0)
     .map((stage) => {
       const ms = stage.micros / 1000;
       const slow = ms > 5 ? " slow" : "";
@@ -526,6 +528,20 @@ function wireKeys() {
     }
     if (event.key === "/" && !typing) {
       panes.focusFilter();
+      return event.preventDefault();
+    }
+    // Stepping is the whole interaction of a stepped panel, so it gets the
+    // cheapest keys left. Held with Alt they work with the caret in the editor
+    // too — the way the diagnostic stepper's Ctrl+J does — because otherwise
+    // the binding is only as reliable as the reader's guess about what has
+    // focus, and guessing wrong types a `.` into their program. Shifted, they
+    // are the two ends: `<` and `>` sit on the same keys.
+    if ((event.key === "," || event.key === "<") && (event.altKey || !typing)) {
+      panes.step(event.shiftKey ? "start" : -1);
+      return event.preventDefault();
+    }
+    if ((event.key === "." || event.key === ">") && (event.altKey || !typing)) {
+      panes.step(event.shiftKey ? "end" : 1);
       return event.preventDefault();
     }
     if (event.key === "Escape") {

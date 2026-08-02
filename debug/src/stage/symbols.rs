@@ -10,13 +10,13 @@ use std::{collections::HashMap, time::Instant};
 use ruddy::symbol::{Mint, Symbol, demangle};
 
 use crate::{
-    stage::Cx,
-    wire::{Node, Stage, View},
+    stage::{Cx, Spec},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(mint) = cx.mint else {
-        return crate::stage::skipped("symbols", "Symbols", View::List, "lowering did not run");
+        return crate::stage::skipped(spec, "lowering did not run");
     };
 
     let started = Instant::now();
@@ -55,40 +55,20 @@ pub fn build(cx: &Cx) -> Stage {
         nodes.push(node);
     }
 
-    let display = nodes
-        .iter()
-        .map(|node| {
-            let mangled = node
-                .fields
-                .iter()
-                .find(|f| f.name == "mangled")
-                .map(|f| f.value.as_str())
-                .unwrap_or_default();
-            format!("{:<32} {}", node.text, mangled)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let summary = match broken {
         0 => format!("{} symbols", nodes.len()),
         n => format!("{} symbols · {n} demangle mismatch", nodes.len()),
     };
 
+    let status = match broken {
+        0 => cx.status(),
+        _ => crate::wire::Status::Partial,
+    };
     Stage {
-        id: "symbols",
-        title: "Symbols",
-        view: View::List,
-        status: match broken {
-            0 => cx.status(),
-            _ => crate::wire::Status::Partial,
-        },
-        summary,
         micros: started.elapsed().as_micros() as u64,
         nodes,
-        text: None,
-        display,
         debug: format!("{mint:#?}"),
-        annotates: None,
+        ..spec.stage(status, summary)
     }
 }
 
