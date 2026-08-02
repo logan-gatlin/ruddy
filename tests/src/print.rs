@@ -43,6 +43,10 @@ fn both_trees_render_a_struct_the_same_way() {
         "let n = { p: { q: 3 } }",
         "let v : { a: Nat } = { a: 1 }",
         "let f = fn r => { wrapped: r.x }",
+        // Open rows and optional fields: the `..` tail, named or not, and the
+        // `?` marker are one rendering rule too.
+        "let g : { a: Nat, ..r } -> Nat = fn p => p.a",
+        "let h : { a?: Nat, .. } -> Nat = fn p => p.a",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -139,5 +143,34 @@ fn a_type_reads_the_same_whichever_printer_reached_it() {
         let (written, inferred) = types_of(source);
         assert_eq!(written, expected, "{source}: as written");
         assert_eq!(inferred, expected, "{source}: as inferred");
+    }
+}
+
+/// A row's two spellings, one per reader: the annotation keeps the tail as it
+/// was written — `..`, or `..r` by name — while the scheme spells the
+/// variable the quantifier numbered it as. Everything before the tail is the
+/// same rule in both, which is what this pins.
+#[test]
+fn a_row_reads_as_written_and_as_quantified() {
+    for (source, written, inferred) in [
+        (
+            "let f : { x: Nat, .. } -> Nat = fn p => p.x",
+            "{ x: Nat, .. } -> Nat",
+            "{ x: Nat, ..'a } -> Nat",
+        ),
+        (
+            "let g : { x: Nat, ..r } -> { x: Nat, ..r } = fn p => p",
+            "{ x: Nat, ..r } -> { x: Nat, ..r }",
+            "{ x: Nat, ..'a } -> { x: Nat, ..'a }",
+        ),
+        (
+            "let h : { x?: Nat, y: Nat } -> Nat = fn r => r.y",
+            "{ x?: Nat, y: Nat } -> Nat",
+            "{ x?: Nat, y: Nat } -> Nat",
+        ),
+    ] {
+        let (as_written, as_inferred) = types_of(source);
+        assert_eq!(as_written, written, "{source}: as written");
+        assert_eq!(as_inferred, inferred, "{source}: as inferred");
     }
 }

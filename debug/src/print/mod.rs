@@ -18,7 +18,9 @@
 //! submodule therefore wraps a node before printing it, and it is the wrapper,
 //! not the node, that implements [`Grouped`].
 
-pub use ruddy::ui::{Grouped, Prec, write_apply, write_arrow, write_project, write_struct};
+pub use ruddy::ui::{
+    Grouped, Prec, write_apply, write_arrow, write_project, write_row, write_struct,
+};
 
 pub mod ast;
 pub mod ir;

@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{ErrorKind, Field, Output, Term, TermKind, Type, TypeKind, build},
+    ir::{ErrorKind, Field, Output, Term, TermKind, TypeField, TypeKind, build},
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
@@ -71,12 +71,12 @@ fn type_symbol(mint: &Mint, out: &Output, name: &str) -> Symbol {
         .unwrap_or_else(|| panic!("no type named {name}"))
 }
 
-fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, Field<Type>> {
+fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, TypeField> {
     let node = &out.program.types[&type_symbol(mint, out, name)]
         .value
         .tracked;
     match node {
-        TypeKind::Struct(fields) => fields,
+        TypeKind::Struct { fields, .. } => fields,
         other => panic!("expected a struct type, got {other:?}"),
     }
 }
@@ -380,7 +380,7 @@ fn unit_is_the_empty_struct() {
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
             .tracked,
-        TypeKind::Struct(ref fields) if fields.is_empty()
+        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
     assert_eq!(mint.symbols().count(), 1);
     assert_eq!(
@@ -395,7 +395,7 @@ fn unit_is_the_empty_struct() {
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
             .tracked,
-        TypeKind::Struct(ref fields) if fields.is_empty()
+        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
 
     // The unit *value* folds the same way: `()` the value and `()` the type
@@ -556,6 +556,48 @@ fn duplicate_type_fields_are_rejected() {
     let fields = type_fields(&mint, &out, "T");
     assert_eq!(fields.len(), 1);
     assert!(matches!(fields["a"].value.tracked, TypeKind::Ident(s) if mint.name(s) == "A"));
+}
+
+#[test]
+fn a_declared_type_must_be_closed() {
+    // A tail or an optional field stands for something a definition gets to
+    // decide, and a declaration decides for everyone: each `..` and `?` is
+    // refused, and the struct that carried it lowers to the error type.
+    for src in [
+        "type T = { x: Nat, .. }",
+        "type T = { x: Nat, ..r }",
+        "type T = { x?: Nat }",
+        "type T = { a: { b: Nat, .. } }",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+
+    // One report per marker, in source order.
+    let (_, out) = build_src("type T = { x?: Nat, y?: Nat, .. }");
+    assert_eq!(out.errors.len(), 3, "errors: {:#?}", out.errors);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
+        "errors: {:#?}",
+        out.errors
+    );
+
+    // A name that fails to resolve inside an open declaration is still its
+    // own report: fixing the `..` should not reveal it.
+    let (_, out) = build_src("type T = { x: Missing, .. }");
+    assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
+
+    // An annotation is where openness belongs, and it passes through whole.
+    let (_, out) = build_src("let f : { x?: Nat, ..r } -> Nat = fn p => p.x");
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
 #[test]

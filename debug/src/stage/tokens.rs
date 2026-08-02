@@ -6,7 +6,7 @@
 use ruddy::token::Kind;
 
 use crate::{
-    stage::{plural, Cx, Ids, Spec},
+    stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -56,6 +56,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Colon => "Colon",
         Kind::Comma => "Comma",
         Kind::Dot => "Dot",
+        Kind::DotDot => "DotDot",
+        Kind::Question => "Question",
         Kind::LeftBrace => "LeftBrace",
         Kind::RightBrace => "RightBrace",
         Kind::LeftParen => "LeftParen",
@@ -78,6 +80,8 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::Colon
         | Kind::Comma
         | Kind::Dot
+        | Kind::DotDot
+        | Kind::Question
         | Kind::LeftBrace
         | Kind::RightBrace
         | Kind::LeftParen

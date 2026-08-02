@@ -123,19 +123,32 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
-        TypeKind::Struct(fields) => Node {
-            label: "Struct".into(),
-            ..node
+        TypeKind::Struct { fields, tail } => {
+            let mut kids: Vec<Node> = fields
+                .iter()
+                .map(|(name, field)| {
+                    let mark = if field.optional { "?" } else { "" };
+                    Node::new(
+                        ids.next(),
+                        format!("{}{mark}:", name.tracked),
+                        print::ast::ty(&field.value.tracked).to_string(),
+                    )
+                    .at(name.span)
+                    .child(type_node(ids, &field.value))
+                })
+                .collect();
+            // The tail is a row of its own: it stands for the fields not
+            // named, so it is shown beside them rather than folded into one.
+            if let Some(tail) = tail {
+                let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
+                kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+            }
+            Node {
+                label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
         }
-        .children(fields.iter().map(|(name, value)| {
-            Node::new(
-                ids.next(),
-                format!("{}:", name.tracked),
-                print::ast::ty(&value.tracked).to_string(),
-            )
-            .at(name.span)
-            .child(type_node(ids, value))
-        })),
         TypeKind::Arrow { from, to } => Node {
             label: "Arrow".into(),
             ..node

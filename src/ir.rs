@@ -69,11 +69,39 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    Struct(IndexMap<String, Field<Type>>),
-    Arrow { from: Box<Type>, to: Box<Type> },
+    Struct {
+        fields: IndexMap<String, TypeField>,
+        /// The `..` tail, when the struct type was written open. Never
+        /// `Some` inside a `type` declaration — see
+        /// [`ErrorKind::OpenDeclaredType`].
+        tail: Option<Tail>,
+    },
+    Arrow {
+        from: Box<Type>,
+        to: Box<Type>,
+    },
     Ident(Symbol),
     Prim(Prim),
     Error,
+}
+
+/// One field of a struct type: the [`Field`] split of spans, plus whether the
+/// field was marked `?` — there or not, with this type when it is.
+#[derive(Debug, Clone)]
+pub struct TypeField {
+    pub name_span: Span,
+    pub optional: bool,
+    pub value: Type,
+}
+
+/// The `..` tail of a struct type. The name, when there is one, stays a
+/// string for the reason [`Field`]'s keys do: it is scoped to the one
+/// annotation it appears in, not a path anything can refer to, so there is no
+/// symbol to resolve it to and nothing here can fail to resolve.
+#[derive(Debug, Clone)]
+pub struct Tail {
+    pub span: Span,
+    pub name: Option<String>,
 }
 
 /// A struct field. The name is the map key rather than part of the value, so
@@ -115,6 +143,15 @@ pub enum ErrorKind {
     /// type reaches a shape one step in. A chain of bare names never reaches
     /// one, so there is nothing for the declaration to mean.
     Circular,
+    /// A `..` tail or a `?` field inside a `type` declaration, as in
+    /// `type t = { x: Nat, .. }`.
+    ///
+    /// What a declaration stands for is lowered once, before any definition,
+    /// and holds for all of them; a tail or an optional field stands for
+    /// something a definition gets to decide, so there is nothing for one to
+    /// mean here. Inference leans on the difference: an alias body mentions
+    /// no solver variable, which is what lets every walk stop at a name.
+    OpenDeclaredType,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +189,15 @@ struct Binding {
     symbol: Symbol,
     /// Where the name was written, so a repeat can point at what it repeats.
     span: Span,
+}
+
+/// Where a written type is being lowered from: the body of a `type`
+/// declaration, or an annotation on a definition. Only an annotation may be
+/// open; see [`ErrorKind::OpenDeclaredType`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Place {
+    Declaration,
+    Annotation,
 }
 
 impl TermKind {
@@ -200,7 +246,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         .map(|(name, _)| b.declare(Namespace::Types, name))
         .collect();
     for (symbol, (name, body)) in declared.into_iter().zip(types) {
-        let value = b.ty(body);
+        let value = b.ty(body, Place::Declaration);
         if let Some(symbol) = symbol {
             program.types.insert(
                 symbol,
@@ -232,7 +278,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // Annotation and body are lowered in the order they were written, and
         // the body before the name is bound, so a definition cannot see itself
         // and there is no recursion to resolve.
-        let annotation = ty.map(|ty| b.ty(ty));
+        let annotation = ty.map(|ty| b.ty(ty, Place::Annotation));
         let value = b.term(body.tracked);
         if let Some(symbol) = b.declare(Namespace::Terms, &name) {
             program.terms.insert(
@@ -410,13 +456,18 @@ impl Builder<'_> {
     /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
     /// The type language has no binder, so unlike [`term`](Self::term) this
     /// never pushes a scope: every name it resolves is a top-level declaration
-    /// or a primitive.
-    fn ty(&mut self, ty: parse::Type) -> Type {
+    /// or a primitive. A tail's name is not a binder either — it is scoped to
+    /// its annotation and resolved there by inference, so it passes through
+    /// here as the string it was written as.
+    fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         match ty.tracked {
             // As in [`term`](Self::term): the two surface spellings of the
             // empty struct, `()` and `{}`, meet here. See [`Ty::Struct`].
-            parse::TypeKind::Unit => span.track(TypeKind::Struct(Default::default())),
+            parse::TypeKind::Unit => span.track(TypeKind::Struct {
+                fields: Default::default(),
+                tail: None,
+            }),
             // A declaration is looked for before a primitive, so a `type Nat`
             // of one's own shadows the built-in rather than colliding with a
             // declaration nobody wrote. Types being hoisted, every term sees
@@ -437,12 +488,54 @@ impl Builder<'_> {
                     }
                 },
             },
-            parse::TypeKind::Struct(fields) => {
-                span.track(TypeKind::Struct(self.fields(fields, |b, ty| b.ty(ty))))
+            parse::TypeKind::Struct { fields, tail } => {
+                // The values are lowered before openness is judged, so a bad
+                // name inside an open declared type is still reported: the
+                // reader should not have to fix the `..` to be told about it.
+                let mut lowered = IndexMap::new();
+                for (name, field) in fields {
+                    let name_span = name.span;
+                    let value = self.ty(field.value, place);
+                    if lowered.contains_key(&name.tracked) {
+                        self.error(name_span, ErrorKind::DuplicateField);
+                        continue;
+                    }
+                    let field = TypeField {
+                        name_span,
+                        optional: field.optional,
+                        value,
+                    };
+                    lowered.insert(name.tracked, field);
+                }
+                // A declaration must be closed; see
+                // [`ErrorKind::OpenDeclaredType`]. Each `?` and the `..` is
+                // its own report, and the struct lowers to the error type,
+                // which absorbs — the `Circular` precedent.
+                if place == Place::Declaration {
+                    let offending: Vec<Span> = lowered
+                        .values()
+                        .filter(|field| field.optional)
+                        .map(|field| field.name_span)
+                        .chain(tail.as_ref().map(|tail| tail.span))
+                        .collect();
+                    if !offending.is_empty() {
+                        for span in offending {
+                            self.error(span, ErrorKind::OpenDeclaredType);
+                        }
+                        return span.track(TypeKind::Error);
+                    }
+                }
+                span.track(TypeKind::Struct {
+                    fields: lowered,
+                    tail: tail.map(|tail| Tail {
+                        span: tail.span,
+                        name: tail.name.map(|name| name.tracked),
+                    }),
+                })
             }
             parse::TypeKind::Arrow { from, to } => {
-                let from = self.ty(*from);
-                let to = self.ty(*to);
+                let from = self.ty(*from, place);
+                let to = self.ty(*to, place);
                 span.track(TypeKind::Arrow {
                     from: Box::new(from),
                     to: Box::new(to),

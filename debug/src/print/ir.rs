@@ -14,7 +14,9 @@ use ruddy::{
     tracking::Tracked,
 };
 
-use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project, write_struct};
+use crate::print::{
+    Grouped, Prec, write_apply, write_arrow, write_project, write_row, write_struct,
+};
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
 /// needs both, and going through one wrapper is what lets the node implement
@@ -139,7 +141,7 @@ impl Grouped for Show<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.node {
             TypeKind::Arrow { .. } => Prec::Arrow,
-            TypeKind::Struct(_) | TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {
+            TypeKind::Struct { .. } | TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {
                 Prec::Atom
             }
         }
@@ -178,7 +180,19 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
-            TypeKind::Struct(fields) => write_struct(f, self.pairs(fields)),
+            TypeKind::Struct { fields, tail } => {
+                let fields = fields
+                    .iter()
+                    .map(|(name, field)| (name, field.optional, self.show(&field.value)));
+                // The tail renders as what follows the `..`: a name, or
+                // nothing for the anonymous one. `write_row` writes the dots.
+                let tail = tail.as_ref().map(|tail| tail.name.as_deref().unwrap_or(""));
+                write_row(
+                    f,
+                    fields,
+                    tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+                )
+            }
         }
     }
 }

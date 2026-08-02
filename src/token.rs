@@ -20,6 +20,12 @@ pub enum Kind {
     Colon,
     Comma,
     Dot,
+    /// `..`, the tail of a struct type: the fields not named, absent when the
+    /// struct is written closed. Distinct from two [`Dot`](Kind::Dot)s the way
+    /// [`FatArrow`](Kind::FatArrow) is distinct from `=` then `>`.
+    DotDot,
+    /// `?`, marking a struct type's field as one that may or may not be there.
+    Question,
     LeftBrace,
     RightBrace,
     LeftParen,
@@ -99,7 +105,17 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 chars.next();
             }
             '.' => {
-                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Dot));
+                chars.next();
+                // `..` is a struct type's tail; a lone `.` is projection.
+                if let Some(&(_, '.')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::DotDot));
+                } else {
+                    tokens.push(file_id.span(start, 1).track(Kind::Dot));
+                }
+            }
+            '?' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Question));
                 chars.next();
             }
             '{' => {
