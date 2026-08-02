@@ -28,6 +28,14 @@ let scaled = compose id id 4096
 
 let sizes = { small: 0, large: 340282366920938463463374607431768211455 }
 
+let getx = fn p => p.x
+
+let dot = getx { x: 3, y: 4 }
+
+let open : { small: Nat, ..extra } -> Nat = fn s => s.small
+
+let opt : { label?: Nat, value: Nat, .. } -> Nat = fn r => r.value
+
 let bad = @
 
 let malformed = 12abc

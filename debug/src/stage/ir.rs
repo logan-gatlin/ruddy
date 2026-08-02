@@ -213,19 +213,32 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
         }
         .child(type_node(ids, cx, mint, from))
         .child(type_node(ids, cx, mint, to)),
-        TypeKind::Struct(fields) => Node {
-            label: "Struct".into(),
-            ..node
+        TypeKind::Struct { fields, tail } => {
+            let mut kids: Vec<Node> = fields
+                .iter()
+                .map(|(name, field)| {
+                    let mark = if field.optional { "?" } else { "" };
+                    Node::new(
+                        ids.next(),
+                        format!("{name}{mark}:"),
+                        print::ir::ty(&field.value.tracked, mint).to_string(),
+                    )
+                    .at(field.name_span)
+                    .child(type_node(ids, cx, mint, &field.value))
+                })
+                .collect();
+            // The tail is a row of its own: it stands for the fields not
+            // named, so it is shown beside them rather than folded into one.
+            if let Some(tail) = tail {
+                let name = tail.name.as_deref().unwrap_or("");
+                kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+            }
+            Node {
+                label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
         }
-        .children(fields.iter().map(|(name, field)| {
-            Node::new(
-                ids.next(),
-                format!("{name}:"),
-                print::ir::ty(&field.value.tracked, mint).to_string(),
-            )
-            .at(field.name_span)
-            .child(type_node(ids, cx, mint, &field.value))
-        })),
     }
 }
 

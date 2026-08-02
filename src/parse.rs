@@ -49,10 +49,37 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    Struct(IndexMap<TrackedString, Type>),
-    Arrow { from: Box<Type>, to: Box<Type> },
-    Ident { name: TrackedString },
+    Struct {
+        fields: IndexMap<TrackedString, TypeField>,
+        /// The `..` ending the field list, when the struct type was written
+        /// open. `None` means the type lists every field it allows.
+        tail: Option<Tail>,
+    },
+    Arrow {
+        from: Box<Type>,
+        to: Box<Type>,
+    },
+    Ident {
+        name: TrackedString,
+    },
     Unit,
+}
+
+/// One field of a struct type: its type, and whether it was marked `?` — a
+/// field that may or may not be there, with this type when it is.
+#[derive(Debug, Clone)]
+pub struct TypeField {
+    pub optional: bool,
+    pub value: Type,
+}
+
+/// The `..` tail of a struct type: what is said about the fields not named.
+/// Anonymous (`..`) when the rest may be anything; named (`..r`) when two
+/// tails in one annotation are to stand for the same rest.
+#[derive(Debug, Clone)]
+pub struct Tail {
+    pub span: Span,
+    pub name: Option<TrackedString>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,9 +264,23 @@ impl Parser {
     /// `<atom>.<field>*` — postfix projection, left-associative. It sits under
     /// application rather than beside it so that `f p.x` reads as `f (p.x)`,
     /// which is what reaching into a record before passing it along looks like.
+    ///
+    /// A `..` here is refused rather than left for whoever comes next. It is
+    /// one token, not two dots — the lexer decides that — and there is nothing
+    /// an expression can do with it, so `p..x` has no reading. Stopping
+    /// quietly would end the projection, end the application, and end the
+    /// `let` with a perfectly good `p` in it; the reader would be told
+    /// "unexpected token" about the line below and `a` would silently be
+    /// whatever `p` is.
     fn projection(&mut self) -> Option<Expr> {
         let mut base = self.atom()?;
-        while self.eat_if(&Kind::Dot).is_some() {
+        loop {
+            if matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::DotDot)) {
+                return self.unexpected();
+            }
+            if self.eat_if(&Kind::Dot).is_none() {
+                return Some(base);
+            }
             let field = self.ident()?;
             let span = base.span.merge(field.span);
             base = span.track(ExprKind::Project {
@@ -247,7 +288,6 @@ impl Parser {
                 field,
             });
         }
-        Some(base)
     }
 
     fn atom(&mut self) -> Option<Expr> {
@@ -381,20 +421,36 @@ impl Parser {
         }
     }
 
-    /// `{ <field>: <type>, <field>: <type>, ... }` with an optional trailing
-    /// comma.
+    /// `{ <field>[?]: <type>, ..., [..[<name>]] }` with an optional trailing
+    /// comma among the fields. The `?` marks a field that may or may not be
+    /// there; the `..` tail, when present, comes last — the fields it stands
+    /// for have no order among the named ones to claim — and takes no comma
+    /// after it.
     fn struct_type(&mut self) -> Option<Type> {
         let open = self.eat(&Kind::LeftBrace)?;
         let mut fields = IndexMap::new();
+        let mut tail = None;
 
         while !matches!(
             self.peek().map(|t| &t.tracked),
             Some(Kind::RightBrace) | None
         ) {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                let name = match self.peek().map(|t| &t.tracked) {
+                    Some(Kind::Identifier(_)) => Some(self.ident()?),
+                    _ => None,
+                };
+                let span = name
+                    .as_ref()
+                    .map_or(dots.span, |name| dots.span.merge(name.span));
+                tail = Some(Tail { span, name });
+                break;
+            }
             let name = self.ident()?;
+            let optional = self.eat_if(&Kind::Question).is_some();
             self.eat(&Kind::Colon)?;
-            let ty = self.type_expr()?;
-            fields.insert(name, ty);
+            let value = self.type_expr()?;
+            fields.insert(name, TypeField { optional, value });
 
             // A comma separates fields; its absence ends the field list.
             if self.eat_if(&Kind::Comma).is_none() {
@@ -404,7 +460,7 @@ impl Parser {
 
         let close = self.eat(&Kind::RightBrace)?;
         let span = open.span.merge(close.span);
-        Some(span.track(TypeKind::Struct(fields)))
+        Some(span.track(TypeKind::Struct { fields, tail }))
     }
 
     /// `( <type> )` — the type-level counterpart of

@@ -153,12 +153,22 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
             names_in(from, out);
             names_in(to, out);
         }
-        Ty::Struct(fields) => {
-            for ty in fields.values() {
-                names_in(ty, out);
+        Ty::Struct { fields, rest } => {
+            for field in fields.values() {
+                names_in(&field.ty, out);
             }
+            // A presence never holds a name, but the tail could only fail to
+            // be walked by accident; today it is a variable or empty, and
+            // either way there is nothing in it to find.
+            names_in(rest, out);
         }
-        Ty::Nat | Ty::Var(_) | Ty::Bound(_) | Ty::Undecided => {}
+        Ty::Nat
+        | Ty::Var(_)
+        | Ty::Bound(_)
+        | Ty::Undecided
+        | Ty::Present
+        | Ty::Absent
+        | Ty::Empty => {}
     }
 }
 

@@ -81,6 +81,42 @@ fn lexes_the_two_arrows_apart() {
 }
 
 #[test]
+fn lexes_the_two_dots_apart() {
+    assert!(matches!(kinds(".")[..], [Kind::Dot]));
+    assert!(matches!(kinds("..")[..], [Kind::DotDot]));
+    // Three dots are a tail and then a projection dot, which no production
+    // accepts side by side — the parser reports it, not the lexer.
+    assert!(matches!(kinds("...")[..], [Kind::DotDot, Kind::Dot]));
+    assert!(matches!(
+        kinds("p.x")[..],
+        [Kind::Identifier(_), Kind::Dot, Kind::Identifier(_)]
+    ));
+    assert!(matches!(
+        kinds("..r")[..],
+        [Kind::DotDot, Kind::Identifier(_)]
+    ));
+
+    let out = lex("{ a: A, .. }", FileID::GENERATED);
+    let dots = &out.tokens[5];
+    assert!(matches!(dots.tracked, Kind::DotDot));
+    assert_eq!(dots.span.start, 8);
+    assert_eq!(dots.span.width, 2);
+}
+
+#[test]
+fn lexes_the_optional_marker() {
+    assert!(matches!(
+        kinds("a?: A")[..],
+        [
+            Kind::Identifier(_),
+            Kind::Question,
+            Kind::Colon,
+            Kind::Identifier(_)
+        ]
+    ));
+}
+
+#[test]
 fn a_lone_minus_is_unrecognized() {
     // Nothing else in the grammar starts with `-`, so the head of a
     // half-written arrow is reported at the `-` itself.

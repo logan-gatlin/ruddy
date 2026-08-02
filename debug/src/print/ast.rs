@@ -13,7 +13,9 @@ use ruddy::{
     tracking::Tracked,
 };
 
-use crate::print::{Grouped, Prec, write_apply, write_arrow, write_project, write_struct};
+use crate::print::{
+    Grouped, Prec, write_apply, write_arrow, write_project, write_row, write_struct,
+};
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
 /// the node and [`fmt::Display`] are foreign to this crate.
@@ -23,7 +25,7 @@ impl Grouped for Ast<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             TypeKind::Arrow { .. } => Prec::Arrow,
-            TypeKind::Struct(_) | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
+            TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
         }
     }
 }
@@ -87,7 +89,21 @@ impl fmt::Display for Ast<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             TypeKind::Arrow { from, to } => write_arrow(f, &Ast(&from.tracked), &Ast(&to.tracked)),
-            TypeKind::Struct(fields) => write_struct(f, pairs(fields)),
+            TypeKind::Struct { fields, tail } => {
+                let fields = fields.iter().map(|(name, field)| {
+                    (&name.tracked, field.optional, Ast(&field.value.tracked))
+                });
+                // The tail renders as what follows the `..`: a name, or
+                // nothing for the anonymous one. `write_row` writes the dots.
+                let tail = tail
+                    .as_ref()
+                    .map(|tail| tail.name.as_ref().map_or("", |name| name.tracked.as_str()));
+                write_row(
+                    f,
+                    fields,
+                    tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+                )
+            }
             TypeKind::Ident { name } => f.write_str(&name.tracked),
             TypeKind::Unit => f.write_str("()"),
         }

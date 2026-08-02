@@ -30,17 +30,38 @@ pub struct Scheme {
     body: Rc<Ty>,
 }
 
+/// One field of a [`Ty::Struct`]: whether it is there, and what it is when it
+/// is.
+///
+/// `presence` is one of the presence-shaped types: [`Ty::Present`],
+/// [`Ty::Absent`], a [`Ty::Var`] while the solver is still deciding,
+/// [`Ty::Undecided`] where a failure abandoned the question or a reporter
+/// froze it, or a [`Ty::Bound`] once a scheme has quantified it. Never
+/// anything else — never a `Nat`, never an arrow — and nothing checks that,
+/// because nothing ever writes anything else into it.
+///
+/// When it resolves to [`Ty::Absent`], `ty` is meaningless and deliberately
+/// left unconstrained: a field that is not there has nothing to have a type.
+#[derive(Debug, Clone)]
+pub struct RowField {
+    pub presence: Rc<Ty>,
+    pub ty: Rc<Ty>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum Ty {
     Nat,
     Arrow(Rc<Ty>, Rc<Ty>),
-    /// A record of named fields, and — with no fields — unit.
+    /// A record of named fields — each with a presence — a tail saying what is
+    /// known about the fields not named, and, with no fields and a closed
+    /// tail, unit.
     ///
     /// The surface language spells the empty struct two ways, `()` and `{}`,
     /// and both lower here. Unit is not a separate type: it is the struct that
-    /// carries no information, which is what unit means anywhere it appears,
-    /// and giving it its own variant would buy a second way to say the same
-    /// thing plus a unification arm to keep the two agreeing.
+    /// carries no information — every field absent — which is what unit means
+    /// anywhere it appears, and giving it its own variant would buy a second
+    /// way to say the same thing plus a unification arm to keep the two
+    /// agreeing.
     ///
     /// The cost is that the compiler answers in `{}` where the user may have
     /// written `()` — a mismatch against `()` reports ``found `{}` ``, and the
@@ -49,8 +70,35 @@ pub enum Ty {
     /// hide from the reader that unit and the empty record are one type, which
     /// is the thing worth learning about this language; `{}` is real surface
     /// syntax that re-lowers to exactly the type it was printed from, so the
-    /// output stays something the user could have written.
-    Struct(IndexMap<String, Rc<Ty>>),
+    /// output stays something the user could have written. That claim is about
+    /// `{}` and about closed rows generally, and it stops there: an open or
+    /// optional row prints in surface notation but not in a form that re-reads
+    /// as itself, because a `..'a` and an `x?:` name identities the syntax has
+    /// no way to write down. See `tests/src/ui.rs`.
+    ///
+    /// `rest` is one of the row-shaped types: [`Ty::Empty`] for a struct whose
+    /// fields are all listed, a [`Ty::Var`] for one that may have more,
+    /// [`Ty::Undecided`] where a failure abandoned the question, another
+    /// [`Ty::Struct`] while a tail the solve bound to a row is waiting to be
+    /// spliced in, or a [`Ty::Bound`] once a scheme has quantified it. Never
+    /// anything else, for the same unenforced reason as
+    /// [`RowField::presence`].
+    Struct {
+        fields: IndexMap<String, RowField>,
+        rest: Rc<Ty>,
+    },
+    /// The presence of a field that is there. Not a type a term can have: it
+    /// lives only inside [`RowField::presence`], where a variable standing for
+    /// a presence resolves to it.
+    Present,
+    /// The presence of a field that is not there. Arises only from solving —
+    /// no literal and no written type puts one in a field map — when an open
+    /// row meets a closed one that lacks the field.
+    Absent,
+    /// The closed row tail: every field the struct does not name is absent.
+    /// Like [`Ty::Present`], not a type a term can have; it lives only in
+    /// [`Ty::Struct::rest`].
+    Empty,
     /// A declared type, held as the name it was written as rather than as what
     /// it stands for.
     ///
@@ -83,6 +131,17 @@ impl From<Prim> for Ty {
     fn from(value: Prim) -> Self {
         match value {
             Prim::Nat => Ty::Nat,
+        }
+    }
+}
+
+impl RowField {
+    /// A field that is definitely there: what a struct literal's fields are,
+    /// and what a written `name: Ty` field lowers to.
+    pub fn present(ty: Rc<Ty>) -> Self {
+        Self {
+            presence: Rc::new(Ty::Present),
+            ty,
         }
     }
 }

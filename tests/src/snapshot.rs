@@ -286,6 +286,69 @@ fn the_surface_prerequisites_reach_every_stage() {
     assert_eq!(labelled("tokens", "Dot"), ["."]);
 }
 
+/// The row forms — an optional field, and a named tail — checked through
+/// every panel that renders them: the tokens they lex to, the field and tail
+/// rows of both trees, the constraint the projection becomes, and the scheme
+/// the definition ends with.
+#[test]
+fn rows_reach_every_stage() {
+    let source = "let f : { x?: Nat, y: Nat, ..r } -> Nat = fn p => p.y\n";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .expect("the stage is registered")
+    };
+    let labelled = |id: &str, label: &str| -> Vec<String> {
+        nodes(stage(id))
+            .into_iter()
+            .filter(|node| node.label == label)
+            .map(|node| node.text.clone())
+            .collect()
+    };
+
+    assert_eq!(labelled("tokens", "DotDot"), [".."]);
+    assert_eq!(labelled("tokens", "Question"), ["?"]);
+
+    for id in ["ast", "ir"] {
+        // The optional field is a row of the struct's like any other, wearing
+        // its `?` in the label; the tail is a row of its own.
+        assert_eq!(labelled(id, "x?:"), ["Nat"], "{id}");
+        assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
+    }
+
+    // The projection's demand is an ordinary equality against an open row,
+    // and the Constraints tab shows it unsolved: the tail is still the
+    // variable the annotation lowered to.
+    let constraints: Vec<&str> = stage("constraints")
+        .nodes
+        .iter()
+        .flat_map(|group| &group.children)
+        .map(|node| node.text.as_str())
+        .collect();
+    assert!(
+        constraints.iter().any(|text| text.contains("..?")),
+        "{constraints:?}"
+    );
+
+    // The scheme spells the quantified tail with its letter and keeps the
+    // field optional — nothing in the body decided `x` either way.
+    let types: Vec<&str> = stage("types")
+        .nodes
+        .iter()
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(types, ["{ x?: Nat, y: Nat, ..'a } -> Nat"]);
+}
+
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps
 /// it that way — a term position and a type position both read back as `()`.
 /// Lowering folds both into the struct with no fields, so the IR reads every
@@ -582,6 +645,67 @@ fn a_type_error_is_a_diagnostic() {
     };
     assert_eq!(diagnostic.code, "missing-field");
     assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
+}
+
+/// The two complaints rows added reach the strip like every other, and the
+/// rule behind one of them reaches the Solve tab. A diagnostic the compiler
+/// can raise and the debugger cannot show is one nobody working on the
+/// compiler ever sees.
+#[test]
+fn a_row_error_reaches_the_strip_and_the_solve_tab() {
+    let repeated = snapshot("let h : { x: { y: Nat, ..r } } -> { ..r } = fn p => { y: {} }\n");
+    let [diagnostic] = repeated.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", repeated.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "repeated-field");
+    assert_eq!(
+        diagnostic.message,
+        "`..` covers only the fields a type does not already name, \
+         and here it would have to cover `y`"
+    );
+
+    // The step that refused the binding is red, labelled with its rule, and
+    // carries the same words the strip does.
+    let solve = repeated
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve stage is registered");
+    let overlap = solve
+        .nodes
+        .iter()
+        .find(|node| node.label == "overlap")
+        .expect("the refusal is a step");
+    assert!(overlap.error);
+    let field = |node: &Node, name: &str| {
+        node.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.clone())
+    };
+    assert_eq!(field(overlap, "_error"), Some(diagnostic.message.clone()));
+    assert_eq!(
+        field(overlap, "_rule"),
+        Some("the rest of a row cannot be a row naming a field the row already names".to_string())
+    );
+
+    let narrowed = snapshot("let f : { x?: Nat, .. } -> Nat = fn p => p.x\n");
+    let [diagnostic] = narrowed.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", narrowed.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "annotation-too-open");
+    // Spanned at the annotation, which is the text the reader has to change.
+    assert_eq!(diagnostic.span, Some([8, 30]));
+
+    let flat = snapshot("let n = 1\nlet bad = n.x\n");
+    let [diagnostic] = flat.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", flat.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "not-a-struct");
+    assert_eq!(
+        diagnostic.message,
+        "`Nat` is not a struct, so it has no fields to read"
+    );
 }
 
 #[test]

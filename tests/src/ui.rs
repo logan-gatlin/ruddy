@@ -9,13 +9,13 @@
 use std::{collections::HashSet, rc::Rc};
 
 use ruddy::{
-    inference::{Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Rule},
-    ir::ErrorKind as IrError,
+    inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Rule},
+    ir::{self, ErrorKind as IrError},
     parse,
     symbol::{Bundle, Mint, Namespace, Version},
-    token::ErrorKind as LexError,
-    tracking::Span,
-    types::Ty,
+    token::{self, ErrorKind as LexError},
+    tracking::{FileID, Span},
+    types::{RowField, Ty},
     ui,
 };
 
@@ -52,7 +52,11 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             all.push(("ir", kind.code(), kind.to_string()));
         }
     }
-    for kind in [IrError::DuplicateField, IrError::Circular] {
+    for kind in [
+        IrError::DuplicateField,
+        IrError::Circular,
+        IrError::OpenDeclaredType,
+    ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
 
@@ -62,10 +66,17 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             actual: Rc::new(Ty::Undecided),
         },
         TypeError::Recursive,
-        TypeError::NotAStruct { base: nat.clone() },
-        TypeError::UnknownBase,
         TypeError::MissingField {
             base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::ExtraField {
+            base: nat.clone(),
+            field: "x".to_string(),
+        },
+        TypeError::NotAStruct { base: nat.clone() },
+        TypeError::AnnotationTooOpen,
+        TypeError::RepeatedField {
             field: "x".to_string(),
         },
     ] {
@@ -80,15 +91,14 @@ const RULES: &[Rule] = &[
     Rule::Same,
     Rule::Bind,
     Rule::Occurs,
+    Rule::Overlap,
     Rule::Prim,
     Rule::Arrow,
     Rule::Struct,
+    Rule::Presence,
     Rule::Unfold,
     Rule::Assume,
     Rule::Mismatch,
-    Rule::Project,
-    Rule::Defer,
-    Rule::Stuck,
     Rule::Recover,
 ];
 
@@ -162,7 +172,7 @@ fn the_namespaces_are_spelled_apart() {
 }
 
 /// A constraint prints as what it demands, in the notation the Constraints tab
-/// shows it in. `~` is "must unify with"; a projection keeps its dot.
+/// shows it in. `~` is "must unify with".
 #[test]
 fn a_constraint_reads_as_what_it_demands() {
     let nat = Rc::new(Ty::Nat);
@@ -170,6 +180,7 @@ fn a_constraint_reads_as_what_it_demands() {
 
     let equal = Constraint {
         span,
+        base_span: None,
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
             actual: Rc::new(Ty::Var(0)),
@@ -178,14 +189,6 @@ fn a_constraint_reads_as_what_it_demands() {
     assert_eq!(equal.to_string(), "Nat ~ ?0");
     // The constraint prints as its kind, so the two cannot drift.
     assert_eq!(equal.to_string(), equal.kind.to_string());
-
-    let field = ConstraintKind::Field {
-        base: Rc::new(Ty::Var(1)),
-        base_span: span,
-        name: "x".to_string(),
-        result: nat,
-    };
-    assert_eq!(field.to_string(), "?1.x ~ Nat");
 }
 
 /// An effect is one line beside the rule that produced it. A failure says the
@@ -209,31 +212,60 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
     );
 }
 
+/// A printed type, put back through the compiler: lexed, parsed, lowered and
+/// inferred as part of a definition's annotation, and printed again from the
+/// scheme that came out. `prelude` declares any type the printed one names.
+///
+/// The type is planted in a field of the parameter, where the surface grammar
+/// can never want parentheses around it. So what comes back is the printed
+/// type verbatim inside a wrapper of a shape this function already knows,
+/// rather than a string the test would have to re-derive the grouping rules to
+/// predict — which would be the rules under test standing in as their own
+/// expectation.
+fn round_trip(prelude: &str, printed: &str) -> String {
+    let source = format!("{prelude}let f : {{ v: {printed} }} -> Nat = fn r => 1\n");
+    let lexed = token::lex(&source, FileID::GENERATED);
+    assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+
+    let bundle = Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
+    let inferred = inference::infer(&mint, &mut built.program);
+    assert!(
+        inferred.errors.is_empty(),
+        "{source}: {:#?}",
+        inferred.errors
+    );
+
+    let (symbol, _) = built.program.terms.last().expect("the definition");
+    let scheme = inferred.schemes[symbol].to_string();
+    scheme
+        .strip_prefix("{ v: ")
+        .and_then(|rest| rest.strip_suffix(" } -> Nat"))
+        .unwrap_or_else(|| panic!("{source}: unexpected scheme `{scheme}`"))
+        .to_string()
+}
+
 /// The writers that put the parentheses in, exercised through the one compiler
 /// type that prints as surface syntax directly. The debugger's tree printers go
 /// through the same four functions, so what holds here holds of a printed tree.
+///
+/// Each closed type here is printed *and* read back: the string goes through
+/// the lexer, the parser, lowering and inference, and has to come out spelling
+/// itself. String equality alone would only pin that the printer does not
+/// change; what is worth pinning is that what it prints is source, which is the
+/// whole claim a diagnostic quoting a type makes.
 #[test]
-fn a_printed_type_re_parses_as_the_type_it_was_printed_from() {
+fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let nat = Rc::new(Ty::Nat);
     let endo = Rc::new(Ty::Arrow(nat.clone(), nat.clone()));
 
-    // Right-associative: only the left side can ever need grouping, and the
-    // right side must not acquire any.
-    assert_eq!(
-        Ty::Arrow(endo.clone(), endo.clone()).to_string(),
-        "(Nat -> Nat) -> Nat -> Nat"
-    );
-
-    // The empty struct is unit, and prints as the one spelling this language
-    // has for it. See `Ty::Struct` for why it is `{}` and not `()`.
-    assert_eq!(Ty::Struct(Default::default()).to_string(), "{}");
-    assert_eq!(
-        Ty::Struct([("x".to_string(), endo)].into_iter().collect()).to_string(),
-        "{ x: Nat -> Nat }"
-    );
-
     // A declared type prints as its name and is an atom whatever it stands
-    // for, so the arrow behind this one leaks no parentheses through it.
+    // for, so the arrow behind this one leaks no parentheses through it. It
+    // needs a declaration to be read back, which the prelude supplies.
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let symbol = mint
         .global(None, Namespace::Types, "Endo")
@@ -242,8 +274,132 @@ fn a_printed_type_re_parses_as_the_type_it_was_printed_from() {
         symbol,
         name: "Endo".into(),
     });
-    assert_eq!(named.to_string(), "Endo");
-    assert_eq!(Ty::Arrow(named.clone(), named).to_string(), "Endo -> Endo");
+
+    for (prelude, ty, printed) in [
+        ("", nat.clone(), "Nat"),
+        // Right-associative: only the left side can ever need grouping, and
+        // the right side must not acquire any.
+        (
+            "",
+            Rc::new(Ty::Arrow(endo.clone(), endo.clone())),
+            "(Nat -> Nat) -> Nat -> Nat",
+        ),
+        // The empty struct is unit, and prints as the one spelling this
+        // language has for it. See `Ty::Struct` for why it is `{}` and not
+        // `()`.
+        (
+            "",
+            Rc::new(Ty::Struct {
+                fields: Default::default(),
+                rest: Rc::new(Ty::Empty),
+            }),
+            "{}",
+        ),
+        (
+            "",
+            Rc::new(Ty::Struct {
+                fields: [("x".to_string(), RowField::present(endo.clone()))]
+                    .into_iter()
+                    .collect(),
+                rest: Rc::new(Ty::Empty),
+            }),
+            "{ x: Nat -> Nat }",
+        ),
+        (
+            "type Endo = Nat -> Nat\n",
+            Rc::new(Ty::Arrow(named.clone(), named.clone())),
+            "Endo -> Endo",
+        ),
+    ] {
+        assert_eq!(ty.to_string(), printed);
+        assert_eq!(round_trip(prelude, printed), printed);
+    }
+}
+
+/// An open row prints in the surface notation too, and cannot be read back
+/// from it — so these are pinned as printing and nothing more.
+///
+/// Not an oversight in the printer. What a row's tail and a field's `?` stand
+/// for is an identity: `{ x: Nat, ..'a } -> { x: Nat, ..'a }` says the two
+/// tails are the *same* rest, and `..'a` is how that is spelled. The surface
+/// syntax has `..r`, which says the same thing by a name the writer chose —
+/// but a scheme has no names to offer, only numbers the quantifier handed out,
+/// so printing one back as `..r` would be inventing a name that was never
+/// written. `..` alone loses the identity, and `?` on a field is likewise a
+/// variable the syntax gives no way to name.
+///
+/// So the printed form is a faithful picture and not a re-readable one. Every
+/// reader of it is being shown a conclusion rather than handed something to
+/// compile, which is what makes that the right trade.
+#[test]
+fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
+    let nat = Rc::new(Ty::Nat);
+
+    // A row's tail prints in the surface spelling, after the fields; a
+    // quantified tail wears its letter and an undecided one has nothing to
+    // report. An open row with no fields still shows it is open.
+    assert_eq!(
+        Ty::Struct {
+            fields: [("x".to_string(), RowField::present(nat.clone()))]
+                .into_iter()
+                .collect(),
+            rest: Rc::new(Ty::Bound(0)),
+        }
+        .to_string(),
+        "{ x: Nat, ..'a }"
+    );
+    assert_eq!(
+        Ty::Struct {
+            fields: [("x".to_string(), RowField::present(nat.clone()))]
+                .into_iter()
+                .collect(),
+            rest: Rc::new(Ty::Undecided),
+        }
+        .to_string(),
+        "{ x: Nat, .. }"
+    );
+    assert_eq!(
+        Ty::Struct {
+            fields: Default::default(),
+            rest: Rc::new(Ty::Bound(0)),
+        }
+        .to_string(),
+        "{ ..'a }"
+    );
+
+    // A field's presence prints as its surface spelling too: certainly there
+    // is unmarked, undecided either way is `?`, and certainly absent is not
+    // part of what the type says at all.
+    assert_eq!(
+        Ty::Struct {
+            fields: [
+                (
+                    "x".to_string(),
+                    RowField {
+                        presence: Rc::new(Ty::Bound(0)),
+                        ty: nat.clone(),
+                    }
+                ),
+                (
+                    "y".to_string(),
+                    RowField {
+                        presence: Rc::new(Ty::Absent),
+                        ty: nat.clone(),
+                    }
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rc::new(Ty::Empty),
+        }
+        .to_string(),
+        "{ x?: Nat }"
+    );
+
+    // `{ x: Nat, .. }` does parse, and what it parses to is a row with a fresh
+    // tail of its own — not the one it was printed from. The string survives;
+    // the identity it was standing for does not.
+    assert_eq!(round_trip("", "{ x: Nat, .. }"), "{ x: Nat, ..'a }");
 }
 
 /// The note is held in [`ui`] rather than in either reporter, because both

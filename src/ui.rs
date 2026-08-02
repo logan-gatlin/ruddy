@@ -136,6 +136,8 @@ impl fmt::Display for Kind {
             Kind::Colon => f.write_str(":"),
             Kind::Comma => f.write_str(","),
             Kind::Dot => f.write_str("."),
+            Kind::DotDot => f.write_str(".."),
+            Kind::Question => f.write_str("?"),
             Kind::LeftBrace => f.write_str("{"),
             Kind::RightBrace => f.write_str("}"),
             Kind::LeftParen => f.write_str("("),
@@ -178,6 +180,7 @@ impl ir::ErrorKind {
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
             ir::ErrorKind::Circular => "circular-type",
+            ir::ErrorKind::OpenDeclaredType => "open-declared-type",
         }
     }
 }
@@ -196,6 +199,9 @@ impl fmt::Display for ir::ErrorKind {
             // does. Said as what the reader can change — give the type a shape
             // — rather than as the loop the compiler noticed.
             ir::ErrorKind::Circular => f.write_str("type defined only as another name"),
+            ir::ErrorKind::OpenDeclaredType => f.write_str(
+                "a declared type must list its fields exactly; `..` and `?` belong in annotations",
+            ),
         }
     }
 }
@@ -266,11 +272,14 @@ impl Grouped for Ty {
             // its name, and a name is one word however many arrows are behind
             // it.
             Ty::Nat
-            | Ty::Struct(_)
+            | Ty::Struct { .. }
             | Ty::Named { .. }
             | Ty::Var(_)
             | Ty::Bound(_)
-            | Ty::Undecided => Prec::Atom,
+            | Ty::Undecided
+            | Ty::Present
+            | Ty::Absent
+            | Ty::Empty => Prec::Atom,
         }
     }
 }
@@ -280,10 +289,18 @@ impl Grouped for Ty {
 /// print as what they mean: a quantified variable as `'a`, and an unsolved or
 /// undecided type as `?` — inference's way of saying it has nothing to report.
 ///
-/// The grouping and the braces come from [`write_arrow`] and [`write_struct`]
-/// below, which the debugger's two tree printers also write through. A type in
-/// a diagnostic and the same type on the debugger's IR tab are then the same
-/// string by construction rather than by two copies of the rule agreeing.
+/// The grouping comes from [`write_arrow`] and the braces from [`write_row`]
+/// below, both of which the debugger's two tree printers also write through.
+/// So the punctuation a type is written with is one rule rather than two
+/// copies of a rule agreeing: where a diagnostic puts a parenthesis, a comma
+/// or a `?`, the debugger's IR tab puts one too.
+///
+/// Not the whole string, though, and deliberately not. A tail is written by
+/// whoever knows what it stands for, and the two readers know different
+/// things: the IR tab is showing a type as it was written, so it spells a
+/// named tail `..r`, while a scheme is showing what the definition was
+/// inferred to be, so it spells the same tail `..'a`. `tests/src/print.rs`
+/// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -292,7 +309,33 @@ impl fmt::Display for Ty {
             // Unit falls out of this as `{}` rather than `()`, on purpose:
             // there is one type here, and one spelling for it. See
             // [`Ty::Struct`].
-            Ty::Struct(fields) => write_struct(f, fields),
+            //
+            // A field prints by what its presence resolved to: there for
+            // certain as `name: T`, absent not at all — a field that is not
+            // there is not part of what the type says — and anything still
+            // undecided as `name?: T`, the surface spelling for "may or may
+            // not be there". A tail prints after the fields as `..` and
+            // whatever stands for the rest: a quantified `..'a`, a solver
+            // variable's `..?3`, or nothing when the rest is undecided and
+            // there is nothing to report. A closed struct prints no tail,
+            // which is what makes this collapse to the old notation whenever
+            // nothing is open.
+            Ty::Struct { fields, rest } => {
+                let entries = fields
+                    .iter()
+                    .filter_map(|(name, field)| match &*field.presence {
+                        Ty::Absent => None,
+                        Ty::Present => Some((name, false, &field.ty)),
+                        _ => Some((name, true, &field.ty)),
+                    });
+                let tail = match &**rest {
+                    Ty::Empty => None,
+                    Ty::Undecided => Some(String::new()),
+                    open => Some(open.to_string()),
+                };
+                let tail = tail.as_ref().map(|tail| tail as &dyn fmt::Display);
+                write_row(f, entries, tail)
+            }
             // A declared type prints as what the user called it rather than as
             // what it stands for. It is shorter, it is what they wrote, and it
             // is the only way a type that names itself can be printed at all.
@@ -308,6 +351,14 @@ impl fmt::Display for Ty {
                 }
             }
             Ty::Undecided => f.write_str("?"),
+            // The presence and row constants never stand alone in a printed
+            // scheme — a field wears its presence as `?` or as nothing, and a
+            // closed tail prints as no tail at all. Where one does surface is
+            // the solver's own record: a step that binds a presence variable
+            // reads `?3 := absent`, and one that closes a row reads `?4 := ∅`.
+            Ty::Present => f.write_str("present"),
+            Ty::Absent => f.write_str("absent"),
+            Ty::Empty => f.write_str("∅"),
         }
     }
 }
@@ -330,15 +381,14 @@ impl Rule {
             Rule::Same => "same",
             Rule::Bind => "bind",
             Rule::Occurs => "occurs",
+            Rule::Overlap => "overlap",
             Rule::Prim => "prim",
             Rule::Arrow => "arrow",
             Rule::Struct => "struct",
+            Rule::Presence => "presence",
             Rule::Unfold => "unfold",
             Rule::Assume => "assume",
             Rule::Mismatch => "mismatch",
-            Rule::Project => "project",
-            Rule::Defer => "defer",
-            Rule::Stuck => "stuck",
             Rule::Recover => "recover",
         }
     }
@@ -354,15 +404,18 @@ impl fmt::Display for Rule {
             Rule::Same => "already the same thing on both sides",
             Rule::Bind => "a variable takes the type it is against",
             Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
+            Rule::Overlap => {
+                "the rest of a row cannot be a row naming a field the row already names"
+            }
             Rule::Prim => "the same primitive on both sides",
             Rule::Arrow => "two arrows: argument against argument, result against result",
-            Rule::Struct => "two structs: field against field, matched by name",
+            Rule::Struct => {
+                "two structs: shared fields field against field, the rest into the other's tail"
+            }
+            Rule::Presence => "whether the field is there must agree on both sides",
             Rule::Unfold => "a declared type stands for something; ask again about that",
             Rule::Assume => "these two are already being compared, so take them as equal",
             Rule::Mismatch => "no rule applies, so the two types cannot be made equal",
-            Rule::Project => "what is before the dot is a struct, so the field can be read off it",
-            Rule::Defer => "what is before the dot is still unknown; wait for another round",
-            Rule::Stuck => "nothing left will say what is before the dot",
             Rule::Recover => "the abandoned result becomes undecided, so nothing echoes it",
         })
     }
@@ -391,7 +444,6 @@ impl ConstraintKind {
     pub fn code(&self) -> &'static str {
         match self {
             ConstraintKind::Equal { .. } => "equal",
-            ConstraintKind::Field { .. } => "field",
         }
     }
 }
@@ -408,9 +460,6 @@ impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
-            ConstraintKind::Field {
-                base, name, result, ..
-            } => write!(f, "{base}.{name} ~ {result}"),
         }
     }
 }
@@ -422,9 +471,11 @@ impl inference::ErrorKind {
         match self {
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
-            inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
-            inference::ErrorKind::UnknownBase => "unknown-base",
             inference::ErrorKind::MissingField { .. } => "missing-field",
+            inference::ErrorKind::ExtraField { .. } => "extra-field",
+            inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
+            inference::ErrorKind::AnnotationTooOpen => "annotation-too-open",
+            inference::ErrorKind::RepeatedField { .. } => "repeated-field",
         }
     }
 }
@@ -439,15 +490,31 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::Recursive => {
                 f.write_str("this type would have to contain itself")
             }
-            inference::ErrorKind::NotAStruct { base } => {
-                write!(f, "`{base}` is not a struct, so it has no fields to read")
-            }
-            inference::ErrorKind::UnknownBase => f.write_str(
-                "cannot tell what this is, so its fields are unknown; write out its type",
-            ),
             inference::ErrorKind::MissingField { base, field } => {
                 write!(f, "no field `{field}` on `{base}`")
             }
+            inference::ErrorKind::ExtraField { base, field } => {
+                write!(f, "extra field `{field}`: the type `{base}` lists every field it allows")
+            }
+            // Only the type that is not a struct: what was asked of it is a
+            // shape the solver made up, and quoting that back would answer a
+            // question the reader did not ask.
+            inference::ErrorKind::NotAStruct { base } => {
+                write!(f, "`{base}` is not a struct, so it has no fields to read")
+            }
+            // Said as what the reader can change — the type they wrote — and
+            // not as the variable the solve bound, which is a thing the
+            // annotation stood for rather than anything on the page.
+            inference::ErrorKind::AnnotationTooOpen => f.write_str(
+                "this type promises a `..` or a `?` that the definition does not leave open: write the type it actually has"
+            ),
+            // Said as what `..` means rather than as the two rows that
+            // disagreed: neither of those is a type the reader wrote, and the
+            // field is the whole of what they can change.
+            inference::ErrorKind::RepeatedField { field } => write!(
+                f,
+                "`..` covers only the fields a type does not already name, and here it would have to cover `{field}`"
+            ),
         }
     }
 }
@@ -482,23 +549,50 @@ pub fn write_arrow(
 /// semantic type as well. The trees reach the name and the value differently —
 /// one off a spanned key, another off the map's key and a field — so the pairs
 /// arrive already rendered.
+///
+/// The wrapper over [`write_row`] for the positions that have no presence and
+/// no tail: struct expressions, whose fields are simply there.
 pub fn write_struct<K: fmt::Display, V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     fields: impl IntoIterator<Item = (K, V)>,
 ) -> fmt::Result {
+    let fields = fields.into_iter().map(|(name, value)| (name, false, value));
+    write_row(f, fields, None)
+}
+
+/// Render a `{ name: value, name?: value, ..tail }` row: fields, each possibly
+/// marked optional, and then whatever is known about the fields not named.
+///
+/// `tail` is what follows the `..` — a row variable's spelling, or nothing —
+/// and `None` means the row is closed and no `..` is written at all. The `..`
+/// itself is written here, so the callers agree on it by construction.
+pub fn write_row<K: fmt::Display, V: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    fields: impl IntoIterator<Item = (K, bool, V)>,
+    tail: Option<&dyn fmt::Display>,
+) -> fmt::Result {
     let mut fields = fields.into_iter().peekable();
     // The empty struct is unit, which reads as `{}` — the padding a struct with
     // fields gets would only be two spaces around nothing.
-    if fields.peek().is_none() {
+    if fields.peek().is_none() && tail.is_none() {
         return f.write_str("{}");
     }
 
     f.write_str("{ ")?;
-    for (i, (name, value)) in fields.enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (name, optional, value) in fields {
+        if !first {
             f.write_str(", ")?;
         }
-        write!(f, "{name}: {value}")?;
+        first = false;
+        let mark = if optional { "?" } else { "" };
+        write!(f, "{name}{mark}: {value}")?;
+    }
+    if let Some(tail) = tail {
+        if !first {
+            f.write_str(", ")?;
+        }
+        write!(f, "..{tail}")?;
     }
     f.write_str(" }")
 }

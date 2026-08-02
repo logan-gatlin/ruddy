@@ -62,6 +62,49 @@ fn struct_types() {
 }
 
 #[test]
+fn open_struct_types() {
+    // The `..` tail, anonymous and named, and with or without fields before
+    // it. The parser accepts the syntax anywhere a struct type can be
+    // written; that a `type` declaration must be closed is lowering's rule.
+    assert_eq!(
+        parse_one("let x : { a: A, .. } = y"),
+        "let x : { a: A, .. } = y"
+    );
+    assert_eq!(
+        parse_one("let x : { a: A, ..r } = y"),
+        "let x : { a: A, ..r } = y"
+    );
+    assert_eq!(parse_one("let x : { .. } = y"), "let x : { .. } = y");
+    assert_eq!(parse_one("let x : { ..r } = y"), "let x : { ..r } = y");
+}
+
+#[test]
+fn optional_struct_type_fields() {
+    assert_eq!(parse_one("let x : { a?: A } = y"), "let x : { a?: A } = y");
+    assert_eq!(
+        parse_one("let x : { a?: A, b: B, ..r } = y"),
+        "let x : { a?: A, b: B, ..r } = y"
+    );
+}
+
+#[test]
+fn a_tail_ends_the_field_list() {
+    // The tail stands for the fields not named, which have no order among
+    // the named ones to claim: nothing may follow it, not even a comma.
+    for src in [
+        "let x : { .., a: A } = y",
+        "let x : { a: A, ..r, } = y",
+        "let x : { a: A .. } = y",
+        "let x : { ..1 } = y",
+        "let x : { a? A } = y",
+        "let x : { a: A, ... } = y",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src} parsed without complaint");
+    }
+}
+
+#[test]
 fn functions() {
     assert_eq!(parse_one("let id = fn x => x"), "let id = fn x => x");
     // Body extends rightward over application.
@@ -249,6 +292,31 @@ fn a_projection_needs_a_field_name() {
     let out = parse(lex("let a = p.  let b = ()", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+}
+
+/// `..` belongs to a struct type and nowhere else, so meeting one where an
+/// expression is being read is an error rather than a place to stop.
+///
+/// Stopping was the bug: the projection ended cleanly at the `..`, so did the
+/// application, and so did the `let` — leaving a definition of `p` that
+/// parsed, and one "unexpected token" pointing at whatever followed. A
+/// truncated edit came out as a program that meant something else, and the
+/// complaint was about the wrong line.
+#[test]
+fn a_dot_dot_cannot_follow_an_expression() {
+    for src in [
+        "let a = p..x",
+        "let a = p...x",
+        "let a = p..",
+        "let a = 1 ..x",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without error");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+
+    // And the `..` a struct type is entitled to is untouched.
+    assert_eq!(parse_one("let x : { ..r } = y"), "let x : { ..r } = y");
 }
 
 /// Nothing is silently stood in for a missing expression or type: a position
