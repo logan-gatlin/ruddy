@@ -6,6 +6,7 @@
 use ruddy::parse::{Expr, ExprKind, Stmt, StmtKind, Type, TypeKind};
 
 use crate::{
+    print,
     stage::{Cx, Ids},
     wire::{Node, Stage, View},
 };
@@ -20,7 +21,7 @@ pub fn build(cx: &Cx) -> Stage {
 
     let display = stmts
         .iter()
-        .map(|stmt| stmt.tracked.to_string())
+        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -47,7 +48,7 @@ pub fn build(cx: &Cx) -> Stage {
 }
 
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
-    let node = Node::new(ids.next(), "", stmt.tracked.to_string()).at(stmt.span);
+    let node = Node::new(ids.next(), "", print::ast::stmt(&stmt.tracked).to_string()).at(stmt.span);
     match &stmt.tracked {
         StmtKind::Let { name, ty, body } => {
             let mut let_node = Node {
@@ -78,7 +79,7 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
 }
 
 fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
-    let node = Node::new(ids.next(), "", expr.tracked.to_string()).at(expr.span);
+    let node = Node::new(ids.next(), "", print::ast::expr(&expr.tracked).to_string()).at(expr.span);
     match &expr.tracked {
         ExprKind::Apply { func, arg } => Node {
             label: "Apply".into(),
@@ -103,7 +104,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             Node::new(
                 ids.next(),
                 format!("{}:", name.tracked),
-                value.tracked.to_string(),
+                print::ast::expr(&value.tracked).to_string(),
             )
             .at(name.span)
             .child(expr_node(ids, value))
@@ -133,23 +134,8 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
 }
 
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
-    let node = Node::new(ids.next(), "", ty.tracked.to_string()).at(ty.span);
+    let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
-        TypeKind::Apply { func, arg } => Node {
-            label: "Apply".into(),
-            ..node
-        }
-        .child(type_node(ids, func))
-        .child(type_node(ids, arg)),
-        TypeKind::Lambda { args, body } => Node {
-            label: "Function".into(),
-            ..node
-        }
-        .children(
-            args.iter()
-                .map(|arg| Node::new(ids.next(), "Arg", arg.tracked.clone()).at(arg.span)),
-        )
-        .child(type_node(ids, body)),
         TypeKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -158,7 +144,7 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             Node::new(
                 ids.next(),
                 format!("{}:", name.tracked),
-                value.tracked.to_string(),
+                print::ast::ty(&value.tracked).to_string(),
             )
             .at(name.span)
             .child(type_node(ids, value))

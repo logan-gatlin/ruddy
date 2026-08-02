@@ -375,6 +375,9 @@ function renderTitlebar() {
   const snapshot = state.snapshot;
   const errors = snapshot?.diagnostics.length ?? 0;
   const timings = (snapshot?.stages ?? [])
+    // An annotating stage does its work inside another compile phase; a
+    // second chip for it would double-count the same time.
+    .filter((stage) => !stage.annotates)
     .map((stage) => {
       const ms = stage.micros / 1000;
       const slow = ms > 5 ? " slow" : "";

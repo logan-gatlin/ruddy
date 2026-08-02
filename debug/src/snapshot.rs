@@ -15,10 +15,11 @@ use std::{
 };
 
 use ruddy::{
-    ir, parse,
+    inference, ir, parse,
     symbol::{Bundle, Mint, Namespace, Version},
     token,
     tracking::{FileManager, Span},
+    types::Ty,
 };
 
 use crate::{
@@ -80,12 +81,23 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     };
     let mut mint = Mint::new(bundle);
 
-    let built = parsed.as_ref().and_then(|parsed| {
+    let mut built = parsed.as_ref().and_then(|parsed| {
         let started = Instant::now();
         let out = guard("ir", &mut panicked, || {
             ir::build(&mut mint, parsed.stmts.clone())
         });
         micros.build = started.elapsed().as_micros() as u64;
+        out
+    });
+
+    // Inference mutates the program it types, so it borrows `built` mutably
+    // and finishes before any stage looks at either.
+    let inferred = built.as_mut().and_then(|built| {
+        let started = Instant::now();
+        let out = guard("types", &mut panicked, || {
+            inference::infer(&mut built.program)
+        });
+        micros.infer = started.elapsed().as_micros() as u64;
         out
     });
 
@@ -115,6 +127,14 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
                 .map(|error| ir_diagnostic(source, error)),
         );
     }
+    if let Some(inferred) = &inferred {
+        diagnostics.extend(
+            inferred
+                .errors
+                .iter()
+                .map(|error| types_diagnostic(source, error)),
+        );
+    }
 
     // Sorted by where the reader would look for them, then numbered, so a
     // diagnostic's id matches its position in the strip.
@@ -129,6 +149,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         tokens: lexed.as_ref().map(|lexed| lexed.tokens.as_slice()),
         stmts: parsed.as_ref().map(|parsed| parsed.stmts.as_slice()),
         program: built.as_ref().map(|built| &built.program),
+        inference: inferred.as_ref(),
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
@@ -266,6 +287,47 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
             "duplicate-field",
             format!("duplicate field {}", quote(source, error.span)),
             Some(error.span),
+        ),
+    }
+}
+
+fn types_diagnostic(source: &str, error: &inference::Error) -> Diagnostic {
+    let span = Some(error.span);
+    match &error.kind {
+        inference::ErrorKind::Mismatch { expected, actual } => raw(
+            "types",
+            "type-mismatch",
+            format!("type mismatch: expected `{expected}`, found `{actual}`"),
+            span,
+        ),
+        inference::ErrorKind::Recursive => raw(
+            "types",
+            "recursive-type",
+            format!("recursive type at {}", quote(source, error.span)),
+            span,
+        ),
+        // A base that is still a variable means inference never learned
+        // enough, which asks for an annotation rather than a different base —
+        // the message has to say which problem it is.
+        inference::ErrorKind::NotAStruct { base } => match **base {
+            Ty::Var(_) => raw(
+                "types",
+                "not-a-struct",
+                "cannot infer the type being projected from; annotate it".to_string(),
+                span,
+            ),
+            _ => raw(
+                "types",
+                "not-a-struct",
+                format!("cannot project a field out of `{base}`"),
+                span,
+            ),
+        },
+        inference::ErrorKind::MissingField { base } => raw(
+            "types",
+            "missing-field",
+            format!("no field {} on `{base}`", quote(source, error.span)),
+            span,
         ),
     }
 }

@@ -10,6 +10,7 @@ use ruddy::{
 };
 
 use crate::{
+    print,
     stage::{Cx, Ids},
     wire::{Node, Stage, View},
 };
@@ -47,7 +48,7 @@ pub fn build(cx: &Cx) -> Stage {
         micros: cx.micros.build,
         nodes,
         text: None,
-        display: program.display(mint).to_string(),
+        display: print::ir::program(program, mint).to_string(),
         debug: format!("{program:#?}"),
         annotates: None,
     }
@@ -84,12 +85,13 @@ fn decl_node<T>(
 }
 
 fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
-    let node = Node::new(ids.next(), "", term.tracked.display(mint).to_string()).at(term.span);
-    match &term.tracked {
-        TermKind::Unit => Node {
-            label: "Unit".into(),
-            ..node
-        },
+    let node = Node::new(
+        ids.next(),
+        "",
+        print::ir::term(&term.kind, mint).to_string(),
+    )
+    .at(term.span);
+    match &term.kind {
         TermKind::Error => Node {
             label: "Error".into(),
             ..node
@@ -144,7 +146,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
             Node::new(
                 ids.next(),
                 format!("{name}:"),
-                field.value.tracked.display(mint).to_string(),
+                print::ir::term(&field.value.kind, mint).to_string(),
             )
             .at(field.name_span)
             .child(term_node(ids, cx, mint, &field.value))
@@ -153,7 +155,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
 }
 
 fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
-    let node = Node::new(ids.next(), "", ty.tracked.display(mint).to_string()).at(ty.span);
+    let node = Node::new(ids.next(), "", print::ir::ty(&ty.tracked, mint).to_string()).at(ty.span);
     match &ty.tracked {
         TypeKind::Error => Node {
             label: "Error".into(),
@@ -174,31 +176,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             label: "Prim".into(),
             ..node
         },
-        TypeKind::Apply { func, arg } => Node {
-            label: "Apply".into(),
-            ..node
-        }
-        .child(type_node(ids, cx, mint, func))
-        .child(type_node(ids, cx, mint, arg)),
         TypeKind::Arrow { from, to } => Node {
             label: "Arrow".into(),
             ..node
         }
         .child(type_node(ids, cx, mint, from))
         .child(type_node(ids, cx, mint, to)),
-        TypeKind::Lambda { arg, body } => {
-            let bound = with_symbol(
-                Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
-                cx,
-                arg.tracked,
-            );
-            Node {
-                label: "Fn".into(),
-                ..node
-            }
-            .child(bound)
-            .child(type_node(ids, cx, mint, body))
-        }
         TypeKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -207,7 +190,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             Node::new(
                 ids.next(),
                 format!("{name}:"),
-                field.value.tracked.display(mint).to_string(),
+                print::ir::ty(&field.value.tracked, mint).to_string(),
             )
             .at(field.name_span)
             .child(type_node(ids, cx, mint, &field.value))

@@ -5,6 +5,7 @@
 //! can reach it.
 
 pub mod docs;
+pub mod print;
 pub mod server;
 pub mod snapshot;
 pub mod stage;

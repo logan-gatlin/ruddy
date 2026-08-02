@@ -6,9 +6,9 @@ let point = { x: origin, y: shift base }
 
 type Pair = { first: A, second: B }
 
-type Lambda = fn t => { value: t }
+type Boxed = { value: Nat }
 
-type Pairs = List Pair
+type Pairs = Pair -> Pair
 
 let after = id point
 
@@ -16,7 +16,7 @@ let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x
 
 let n = fst { x: 1, y: 2 }
 
-type Endo = fn t => t -> t
+type Endo = Nat -> Nat
 
 let count = 42
 

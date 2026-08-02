@@ -34,7 +34,7 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 fn every_stage_reports_on_the_demo() {
     let snapshot = snapshot(DEMO);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();
-    assert_eq!(ids, ["tokens", "ast", "ir", "symbols"]);
+    assert_eq!(ids, ["tokens", "ast", "ir", "types", "symbols", "types-ir"]);
     assert_eq!(snapshot.revision, 3);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
@@ -184,11 +184,14 @@ fn the_surface_prerequisites_reach_every_stage() {
     assert_eq!(labelled("tokens", "Dot"), ["."]);
 }
 
-/// `()` is punctuation in the surface syntax and a primitive in the IR, so
-/// the two trees say different things about the same three characters —
-/// which is the sort of difference the panels exist to show.
+/// `()` is one piece of punctuation in the surface syntax, and the AST keeps
+/// it that way — a term position and a type position both read back as `()`.
+/// Lowering folds both into the struct with no fields, so the IR reads every
+/// occurrence back as `{}` instead, regardless of which namespace it came
+/// from. The two trees therefore say different things about the same three
+/// characters — which is the sort of difference the panels exist to show.
 #[test]
-fn unit_is_a_type_node_in_the_ast_and_a_primitive_in_the_ir() {
+fn unit_is_the_empty_struct_in_the_ir() {
     let snapshot = snapshot("type T = ()\nlet u : () = ()\n");
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -196,9 +199,9 @@ fn unit_is_a_type_node_in_the_ast_and_a_primitive_in_the_ir() {
         snapshot.diagnostics
     );
 
-    // Every node rendering `()`, by label — the text is `()` by construction,
-    // so only the label says anything.
-    let labels = |id: &str| -> Vec<String> {
+    // Every node the source spelled `()`, by label and by how the stage renders
+    // it back — in the IR the two are no longer the same string.
+    let unit_nodes = |id: &str| -> Vec<(String, String)> {
         let stage = snapshot
             .stages
             .iter()
@@ -206,15 +209,31 @@ fn unit_is_a_type_node_in_the_ast_and_a_primitive_in_the_ir() {
             .expect("the stage is registered");
         nodes(stage)
             .into_iter()
-            .filter(|node| node.text == "()")
-            .map(|node| node.label.clone())
+            .filter(|node| node.text == "()" || node.text == "{}")
+            .map(|node| (node.label.clone(), node.text.clone()))
             .collect()
     };
 
-    // Two type positions and one term; the parse tree calls all three Unit.
-    assert_eq!(labels("ast"), ["Unit", "Ascribed Unit", "Unit"]);
-    // Lowering keeps the unit value and folds the unit type into `Prim`.
-    assert_eq!(labels("ir"), ["Prim", "Ascribed Prim", "Unit"]);
+    // Two type positions and one term; the parse tree calls all three Unit and
+    // renders all three as the punctuation they were written as.
+    assert_eq!(
+        unit_nodes("ast"),
+        [
+            ("Unit".into(), "()".into()),
+            ("Ascribed Unit".into(), "()".into()),
+            ("Unit".into(), "()".into()),
+        ] as [(String, String); 3]
+    );
+    // Lowering folds the unit value and the unit type alike into a fieldless
+    // `Struct`, which reads back as `{}` rather than as what was written.
+    assert_eq!(
+        unit_nodes("ir"),
+        [
+            ("Struct".into(), "{}".into()),
+            ("Ascribed Struct".into(), "{}".into()),
+            ("Struct".into(), "{}".into()),
+        ] as [(String, String); 3]
+    );
 }
 
 #[test]
@@ -252,6 +271,61 @@ fn a_duplicate_carries_the_definition_it_repeats() {
         .expect("the repeat is reported");
     assert_eq!(duplicate.related.len(), 1);
     assert_eq!(duplicate.related[0].span, Some([4, 5]));
+}
+
+/// The types stage reports what inference concluded, and the annotating
+/// stage carries the same conclusions keyed by the IR stage's own node ids.
+/// That keying is the whole contract behind `annotates`, and the page's badge
+/// painting is silently wrong rather than broken if it ever slips — which is
+/// why it is asserted here rather than left to the eye.
+#[test]
+fn inferred_types_reach_the_panels() {
+    let snapshot = snapshot("let id = fn x => x\n");
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+
+    let types = stage("types");
+    assert_eq!(types.annotates, None);
+    let scheme = nodes(types)
+        .into_iter()
+        .find(|node| node.label == "let id")
+        .expect("the definition has a row");
+    assert_eq!(scheme.text, "'a -> 'a");
+
+    let badges = stage("types-ir");
+    assert_eq!(badges.annotates, Some("ir"));
+    assert!(!badges.nodes.is_empty());
+    // Every badge decorates a row the IR stage actually renders.
+    let ir_ids: std::collections::HashSet<_> =
+        nodes(stage("ir")).into_iter().map(|node| node.id).collect();
+    for badge in &badges.nodes {
+        assert!(ir_ids.contains(&badge.id), "badge {} has no row", badge.id);
+    }
+    // The declaration row wears the scheme.
+    let texts: Vec<_> = badges.nodes.iter().map(|node| node.text.as_str()).collect();
+    assert!(texts.contains(&"'a -> 'a"), "{texts:?}");
+}
+
+#[test]
+fn a_type_error_is_a_diagnostic() {
+    let snapshot = snapshot("let n : Nat = fn x => x\n");
+    let codes: Vec<_> = snapshot
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect();
+    assert_eq!(codes, ["type-mismatch"]);
 }
 
 #[test]
@@ -301,7 +375,7 @@ fn a_snapshot_survives_the_wire() {
     let json = serde_json::to_string(&snapshot).expect("serializes");
     let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
 
-    assert_eq!(back["stages"].as_array().expect("stages").len(), 4);
+    assert_eq!(back["stages"].as_array().expect("stages").len(), 6);
     assert_eq!(back["stages"][0]["view"], "list");
     assert_eq!(back["stages"][1]["view"], "tree");
     assert!(back["line_starts"].as_array().expect("line starts").len() > 1);

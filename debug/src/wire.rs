@@ -1,7 +1,7 @@
 //! The JSON contract between the server and the page.
 //!
-//! Every stage the debugger renders — today tokens, AST, IR and symbols;
-//! tomorrow types or assembly — is serialized into the same [`Stage`] of
+//! Every stage the debugger renders — today tokens, AST, IR, types and
+//! symbols; tomorrow assembly — is serialized into the same [`Stage`] of
 //! [`Node`]s. The page derives tabs, filtering and cross-highlighting from this
 //! shape alone, so a new stage costs a backend file and nothing else.
 

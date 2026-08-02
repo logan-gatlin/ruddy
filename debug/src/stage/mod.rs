@@ -9,6 +9,7 @@ pub mod ast;
 pub mod ir;
 pub mod symbols;
 pub mod tokens;
+pub mod types;
 
 use std::collections::HashMap;
 
@@ -31,6 +32,7 @@ pub struct Cx<'a> {
     pub tokens: Option<&'a [Token]>,
     pub stmts: Option<&'a [Stmt]>,
     pub program: Option<&'a ruddy::ir::Program>,
+    pub inference: Option<&'a ruddy::inference::Output>,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -47,17 +49,22 @@ pub struct Phases {
     pub lex: u64,
     pub parse: u64,
     pub build: u64,
+    pub infer: u64,
 }
 
 /// What every stage is: one function from the compiler's output to a panel.
 pub type Builder = fn(&Cx) -> Stage;
 
-/// Every stage, in tab order. Adding a panel is one line here.
+/// Every stage, in tab order. Adding a panel is one line here. A stage that
+/// annotates another owns no tab, so its place in the list does not matter to
+/// the page; the annotators sit at the end to keep the tab order readable.
 pub const REGISTRY: &[(&str, Builder)] = &[
     ("tokens", tokens::build),
     ("ast", ast::build),
     ("ir", ir::build),
+    ("types", types::build),
     ("symbols", symbols::build),
+    ("types-ir", types::annotate),
 ];
 
 /// Hands out node ids that are unique within one stage.
@@ -127,6 +134,7 @@ pub fn title_of(id: &str) -> &'static str {
         "tokens" => "Tokens",
         "ast" => "AST",
         "ir" => "IR",
+        "types" | "types-ir" => "Types",
         "symbols" => "Symbols",
         _ => "Stage",
     }

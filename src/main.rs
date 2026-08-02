@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
 use ruddy::{
-    ir, parse,
+    inference, ir, parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
+    types::Ty,
 };
 
 const DEMO_PATH: &str = "demo.hc";
@@ -28,21 +29,26 @@ fn main() -> ExitCode {
     let lexed = token::lex(&source, file_id);
     let parsed = parse::parse(lexed.tokens);
 
-    println!("== {DEMO_PATH} ==\n");
-    for stmt in &parsed.stmts {
-        println!("{}", stmt.tracked);
-    }
+    // Neither the parse tree nor the lowered program is printed here. Rendering
+    // a tree back as surface syntax lives in the debugger, which this crate
+    // cannot depend on without a cycle — run `ruddy-debug` and open the AST or
+    // IR tab to read either one. What is left is what a compiler driver owes
+    // its caller regardless: the diagnostics below.
 
     // The mint lives as long as the symbols it hands out, which for a driver
     // means the rest of the run.
     let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
     let mut mint = Mint::new(bundle);
-    let built = ir::build(&mut mint, parsed.stmts);
+    let mut built = ir::build(&mut mint, parsed.stmts);
 
-    println!("\n== ir ==\n");
-    println!("{}", built.program.display(&mint));
+    // The lowered program is not printed here. Rendering the IR as surface
+    // syntax lives in the debugger, which this crate cannot depend on without a
+    // cycle — run `ruddy-debug` and open the IR tab to read it.
 
-    let errors = lexed.errors.len() + parsed.errors.len() + built.errors.len();
+    let inferred = inference::infer(&mut built.program);
+
+    let errors =
+        lexed.errors.len() + parsed.errors.len() + built.errors.len() + inferred.errors.len();
     if errors == 0 {
         println!("\nbuilt successfully with no errors");
         return ExitCode::SUCCESS;
@@ -76,6 +82,34 @@ fn main() -> ExitCode {
                 report(&source, *previous, "  first defined here");
             }
             ir::ErrorKind::DuplicateField => report(&source, err.span, "duplicate field"),
+        }
+    }
+    for err in &inferred.errors {
+        match &err.kind {
+            inference::ErrorKind::Mismatch { expected, actual } => report(
+                &source,
+                err.span,
+                &format!("type mismatch: expected `{expected}`, found `{actual}`"),
+            ),
+            inference::ErrorKind::Recursive => report(&source, err.span, "recursive type"),
+            // A base that is still a variable means inference never learned
+            // enough, which asks for an annotation rather than a different
+            // base — the message has to say which problem it is.
+            inference::ErrorKind::NotAStruct { base } => match **base {
+                Ty::Var(_) => report(
+                    &source,
+                    err.span,
+                    "cannot infer the type being projected from; annotate it",
+                ),
+                _ => report(
+                    &source,
+                    err.span,
+                    &format!("cannot project a field out of `{base}`"),
+                ),
+            },
+            inference::ErrorKind::MissingField { base } => {
+                report(&source, err.span, &format!("no such field on `{base}`"))
+            }
         }
     }
     ExitCode::FAILURE

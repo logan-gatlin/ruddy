@@ -10,6 +10,7 @@
 #![cfg(test)]
 
 mod docs;
+mod inference;
 mod ir;
 mod parse;
 mod snapshot;

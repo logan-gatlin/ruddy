@@ -185,17 +185,30 @@ function createPane(root, app, index) {
     const columns = stage.view === "list" ? columnsOf(stage) : [];
     const scroll = rows.scrollTop;
 
+    // Badges from every stage that annotates this one: the annotating stage's
+    // nodes carry this stage's ids, and each node's text is painted on the row
+    // with the matching id.
+    const badges = new Map();
+    for (const s of snapshot.stages) {
+      if (s.annotates === stage.id) {
+        for (const node of s.nodes) badges.set(node.id, node.text);
+      }
+    }
+
     visible = [];
     walk(stage.nodes, 0, "", collapsed, query, visible);
 
-    rows.innerHTML = visible.map((row) => rowHtml(row, columns, app)).join("");
+    rows.innerHTML = visible.map((row) => rowHtml(row, columns, app, badges)).join("");
     rows.scrollTop = scroll;
     for (const [i, row] of visible.entries()) row.el = rows.children[i];
     markRows();
   }
 
   function renderTabs(snapshot) {
+    // A stage that annotates another owns no tab; its content shows up as
+    // badges on the stage it decorates.
     tabs.innerHTML = snapshot.stages
+      .filter((s) => !s.annotates)
       .map((s, i) => {
         const on = s.id === stage.id ? " on" : "";
         const bad = s.status === "panicked" ? " bad" : "";
@@ -271,7 +284,8 @@ function createPane(root, app, index) {
     focusFilter: () => filter.focus(),
     selectTab(n) {
       const snapshot = app.state.snapshot;
-      const target = snapshot?.stages[n];
+      // Numbered the way the tab strip is: annotating stages have no tab.
+      const target = snapshot?.stages.filter((s) => !s.annotates)[n];
       if (!target) return;
       app.state.tabs[index] = target.id;
       app.save();
@@ -327,9 +341,10 @@ function columnsOf(stage) {
   return seen;
 }
 
-function rowHtml(row, columns, app) {
+function rowHtml(row, columns, app, badges) {
   const { node, depth, kids, open, dim } = row;
   const twisty = kids ? (open ? "▾" : "▸") : "";
+  const badge = badges?.get(node.id);
   const classes = ["row"];
   if (node.error) classes.push("bad");
   if (node.generated) classes.push("gen");
@@ -353,6 +368,7 @@ function rowHtml(row, columns, app) {
     `<span class="label">${esc(node.label)}</span>` +
     `<span class="text">${esc(node.text)}</span>` +
     cells +
+    (badge ? `<span class="badge">${esc(badge)}</span>` : "") +
     `<span class="pos">${node.span ? esc(app.spanLabel(node.span)) : ""}</span>` +
     `</div>`
   );

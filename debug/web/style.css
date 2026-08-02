@@ -543,6 +543,16 @@ input {
   color: var(--fg-faint);
   font-size: 0.9em;
 }
+/* A right-aligned annotation from a stage that decorates this one — today,
+   the inferred type painted on an IR row. */
+.badge {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ok);
+  font-size: 0.9em;
+}
 
 pre.raw {
   margin: 0;
