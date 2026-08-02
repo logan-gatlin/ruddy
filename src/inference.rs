@@ -163,6 +163,16 @@ pub enum Effect {
 #[derive(Debug, Clone)]
 pub struct Constraint {
     pub span: Span,
+    /// Where the base of a projection was written, when this is the demand a
+    /// projection makes of its base. A base that is not a struct at all is a
+    /// complaint about the base, not about the field name — which is what
+    /// `span` points at, being the only part of a projection the reader can
+    /// change when the struct simply lacks the field.
+    ///
+    /// Only that one demand can be wrong in two places, so only it carries a
+    /// second span; every other constraint has the one span its complaint
+    /// belongs at.
+    pub base_span: Option<Span>,
     pub kind: ConstraintKind,
 }
 
@@ -335,6 +345,16 @@ struct Solve<'a> {
     /// Two declarations, rather than two types, because a pair of declarations
     /// is the only pair that can come back round — see [`Solve::unfold`].
     assumed: Vec<(Symbol, Symbol)>,
+    /// [`Constraint::base_span`] of the goal as it arrived, and only of that
+    /// goal: [`Solve::unify`] takes it on the way in, so what a goal decomposes
+    /// into never sees it. Nothing under a projection's demand is about the
+    /// base — it is about a type nested inside one — so the base's span would
+    /// be pointing somewhere the reader cannot act on.
+    ///
+    /// Held beside the solve rather than passed down for the same reason: a
+    /// parameter every recursive call had to pass `None` to would read as
+    /// though the span were something the decomposition could use.
+    base_span: Option<Span>,
 }
 
 /// Assign a type to every term in the program, in place, and return the
@@ -414,6 +434,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             definition: *symbol,
             depth: 0,
             assumed: Vec::new(),
+            base_span: None,
         }
         .run(&generated);
 
@@ -873,8 +894,23 @@ impl Constrain<'_> {
     /// `expected, actual` pair got applications backwards and told the reader
     /// their annotation was the mistake.
     fn checks(&mut self, span: Span, actual: &Rc<Ty>, expected: &Rc<Ty>) {
+        self.checks_base(span, None, actual, expected);
+    }
+
+    /// [`checks`](Self::checks) for a demand two spans can be right for. See
+    /// [`Constraint::base_span`]: a projection asks one question with two ways
+    /// of failing, and which of them the solver arrives at decides which of the
+    /// two spans the reader is shown.
+    fn checks_base(
+        &mut self,
+        span: Span,
+        base_span: Option<Span>,
+        actual: &Rc<Ty>,
+        expected: &Rc<Ty>,
+    ) {
         self.out.push(Constraint {
             span,
+            base_span,
             kind: ConstraintKind::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
@@ -987,8 +1023,9 @@ impl Constrain<'_> {
                 self.table.note_lacks(&want);
                 let actual = base.ty.clone();
                 // The field name is the only thing the user can fix about a
-                // struct that does not have it.
-                self.checks(field.span, &actual, &want);
+                // struct that does not have it — and the base is the only
+                // thing they can fix about something that is not a struct.
+                self.checks_base(field.span, Some(base.span), &actual, &want);
                 result
             }
         };
@@ -1082,6 +1119,7 @@ impl Solve<'_> {
     fn run(&mut self, constraints: &[Constraint]) {
         for constraint in constraints {
             let ConstraintKind::Equal { expected, actual } = &constraint.kind;
+            self.base_span = constraint.base_span;
             self.unify(constraint.span, expected, actual);
         }
     }
@@ -1090,6 +1128,9 @@ impl Solve<'_> {
     /// cannot be. Failure leaves both sides as they were: the error is
     /// recorded once and the solve continues.
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
+        // Taken rather than read, so that this call is the only one it can
+        // reach: see [`Solve::base_span`].
+        let base_span = self.base_span.take();
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
         let goal = ConstraintKind::Equal {
@@ -1162,24 +1203,34 @@ impl Solve<'_> {
             // of as two types that cannot be made equal. Both directions,
             // since which side the demand landed on is decided by whoever
             // emitted the constraint.
+            //
+            // A projection is the one goal that came with somewhere else to
+            // say it: the base is what has no fields, so that is what the
+            // complaint underlines, while a struct that merely lacks the field
+            // is still about the name that was read.
             _ => {
-                let kind = match (&*lhs, &*rhs) {
-                    _ if self.demanded(&lhs) && fieldless(&rhs) => {
-                        ErrorKind::NotAStruct { base: rhs.clone() }
-                    }
-                    _ if self.demanded(&rhs) && fieldless(&lhs) => {
-                        ErrorKind::NotAStruct { base: lhs.clone() }
-                    }
-                    _ => ErrorKind::Mismatch {
-                        expected: lhs.clone(),
-                        actual: rhs.clone(),
+                let error = match (&*lhs, &*rhs) {
+                    _ if self.demanded(&lhs) && fieldless(&rhs) => Error {
+                        span: base_span.unwrap_or(span),
+                        kind: ErrorKind::NotAStruct { base: rhs.clone() },
+                    },
+                    _ if self.demanded(&rhs) && fieldless(&lhs) => Error {
+                        span: base_span.unwrap_or(span),
+                        kind: ErrorKind::NotAStruct { base: lhs.clone() },
+                    },
+                    _ => Error {
+                        span,
+                        kind: ErrorKind::Mismatch {
+                            expected: lhs.clone(),
+                            actual: rhs.clone(),
+                        },
                     },
                 };
                 self.fail(
                     span,
                     Rule::Mismatch,
                     goal,
-                    Error { span, kind },
+                    error,
                     &[lhs.clone(), rhs.clone()],
                 );
             }

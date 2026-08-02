@@ -492,21 +492,29 @@ impl Builder<'_> {
                 // The values are lowered before openness is judged, so a bad
                 // name inside an open declared type is still reported: the
                 // reader should not have to fix the `..` to be told about it.
-                let mut lowered = IndexMap::new();
-                for (name, field) in fields {
-                    let name_span = name.span;
-                    let value = self.ty(field.value, place);
-                    if lowered.contains_key(&name.tracked) {
-                        self.error(name_span, ErrorKind::DuplicateField);
-                        continue;
-                    }
-                    let field = TypeField {
-                        name_span,
-                        optional: field.optional,
-                        value,
-                    };
-                    lowered.insert(name.tracked, field);
-                }
+                //
+                // A type's field has a `?` to it that [`Field`] has no room
+                // for, so the mark rides down with the value and the pair is
+                // taken apart again here. Re-keying and repeats are the same
+                // question they are for a struct literal, and are asked in the
+                // one place that answers it.
+                let lowered: IndexMap<String, TypeField> = self
+                    .fields(fields, |b, field| {
+                        (field.optional, b.ty(field.value, place))
+                    })
+                    .into_iter()
+                    .map(|(name, field)| {
+                        let (optional, value) = field.value;
+                        (
+                            name,
+                            TypeField {
+                                name_span: field.name_span,
+                                optional,
+                                value,
+                            },
+                        )
+                    })
+                    .collect();
                 // A declaration must be closed; see
                 // [`ErrorKind::OpenDeclaredType`]. Each `?` and the `..` is
                 // its own report, and the struct lowers to the error type,

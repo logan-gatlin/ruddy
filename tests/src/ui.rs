@@ -180,6 +180,7 @@ fn a_constraint_reads_as_what_it_demands() {
 
     let equal = Constraint {
         span,
+        base_span: None,
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
             actual: Rc::new(Ty::Var(0)),

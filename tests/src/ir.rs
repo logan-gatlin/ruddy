@@ -548,14 +548,55 @@ fn duplicate_term_fields_are_rejected() {
     assert!(matches!(fields["x"].value.kind, TermKind::Ident(s) if mint.name(s) == "a"));
 }
 
+/// A repeat in a struct *type* is the same complaint, in the same place, as a
+/// repeat in a struct literal: the two are re-keyed by one piece of code, and a
+/// reader who has learned what the message means about a value should not have
+/// to learn it again about a type.
 #[test]
 fn duplicate_type_fields_are_rejected() {
-    let (mint, out) = build_src("type A = ()  type B = Nat  type T = { a: A, a: B }");
+    let src = "type A = ()  type B = Nat  type T = { a: A, a: B }";
+    let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 
+    // Reported at the offending repeat, not at the first occurrence.
+    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind("a: B").expect("the repeat")
+    );
+
+    // The first occurrence is the one that survives, spans and all.
     let fields = type_fields(&mint, &out, "T");
     assert_eq!(fields.len(), 1);
+    assert_eq!(
+        fields["a"].name_span.start,
+        src.find("a: A").expect("the first")
+    );
     assert!(matches!(fields["a"].value.tracked, TypeKind::Ident(s) if mint.name(s) == "A"));
+
+    // Annotations go the same way, and the `?` only they may carry rides
+    // through the re-keying with the field it was written on.
+    let src = "let f : { a?: Nat, a: Nat } -> Nat = fn p => p.a";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("a: Nat").expect("the repeat")
+    );
+
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+        .annotation
+        .clone()
+        .expect("the annotation");
+    let TypeKind::Arrow { from, .. } = annotation.tracked else {
+        panic!("expected an arrow, got {:?}", annotation.tracked);
+    };
+    let TypeKind::Struct { fields, .. } = from.tracked else {
+        panic!("expected a struct parameter");
+    };
+    assert_eq!(fields.len(), 1);
+    assert!(fields["a"].optional);
 }
 
 #[test]

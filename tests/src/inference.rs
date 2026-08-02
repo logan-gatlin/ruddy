@@ -941,6 +941,40 @@ fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
     }
 }
 
+/// The two ways a projection can be wrong are wrong in two different places.
+/// A struct that lacks the field is about the name that was read — see
+/// [`a_missing_field_names_the_struct`] — but something that is not a struct
+/// at all is about the base: renaming the field would leave it just as wrong,
+/// so the base is the term the reader has to change.
+#[test]
+fn a_projection_off_a_non_struct_is_reported_at_the_base() {
+    let src = "let n = 1\nlet bad = n.x";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "not-a-struct");
+    assert_eq!(error.span.start, src.find("n.x").expect("the base"));
+    assert_eq!(error.span.width, 1);
+
+    // Whatever stands to the left of the dot, not just a name: the complaint
+    // takes the base term's own span, so it points at an expression as
+    // readily as at a name.
+    let src = "let h = fn g => (fn z => g z).b";
+    let (mint, out, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "not-a-struct");
+    let TermKind::Fn { body, .. } = &term_decl(&mint, &out, "h").value.kind else {
+        panic!("expected a function");
+    };
+    let TermKind::Project { base, .. } = &body.kind else {
+        panic!("expected a projection");
+    };
+    assert_eq!(error.span, base.span);
+}
+
 /// A chain of projections off a base that failed is one complaint. The
 /// complaint recovers the field's type to `Ty::Undecided`, and every link
 /// after the first absorbs rather than echoes.
