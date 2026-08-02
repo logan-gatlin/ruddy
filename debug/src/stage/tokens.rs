@@ -6,13 +6,13 @@
 use ruddy::token::Kind;
 
 use crate::{
-    stage::{Cx, Ids},
-    wire::{Node, Stage, View},
+    stage::{plural, Cx, Ids, Spec},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(tokens) = cx.tokens else {
-        return crate::stage::skipped("tokens", "Tokens", View::List, "lexing did not run");
+        return crate::stage::skipped(spec, "lexing did not run");
     };
 
     let mut ids = Ids::default();
@@ -31,27 +31,12 @@ pub fn build(cx: &Cx) -> Stage {
         })
         .collect();
 
-    let display = tokens
-        .iter()
-        .map(|token| token.tracked.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-
+    let summary = plural(nodes.len(), "token");
     Stage {
-        id: "tokens",
-        title: "Tokens",
-        view: View::List,
-        status: cx.status(),
-        summary: match nodes.len() {
-            1 => "1 token".to_string(),
-            n => format!("{n} tokens"),
-        },
-        micros: cx.micros.lex,
+        micros: Some(cx.micros.lex),
         nodes,
-        text: None,
-        display,
         debug: format!("{tokens:#?}"),
-        annotates: None,
+        ..spec.stage(cx.status(), summary)
     }
 }
 
@@ -62,14 +47,12 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Let => "Let",
         Kind::In => "In",
         Kind::Type => "Type",
-        Kind::Trait => "Trait",
-        Kind::For => "For",
-        Kind::Impl => "Impl",
         Kind::End => "End",
         Kind::With => "With",
         Kind::Fn => "Fn",
         Kind::Equal => "Equal",
         Kind::FatArrow => "FatArrow",
+        Kind::Arrow => "Arrow",
         Kind::Colon => "Colon",
         Kind::Comma => "Comma",
         Kind::Dot => "Dot",
@@ -91,6 +74,7 @@ pub fn class(kind: &Kind) -> &'static str {
         Kind::Natural(_) => "number",
         Kind::Equal
         | Kind::FatArrow
+        | Kind::Arrow
         | Kind::Colon
         | Kind::Comma
         | Kind::Dot

@@ -7,16 +7,16 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use ruddy::symbol::{Mint, Symbol, demangle};
+use ruddy::symbol::{LOCAL_SEGMENT, Mint, Symbol, demangle};
 
 use crate::{
-    stage::Cx,
-    wire::{Node, Stage, View},
+    stage::{Cx, Spec, plural},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(mint) = cx.mint else {
-        return crate::stage::skipped("symbols", "Symbols", View::List, "lowering did not run");
+        return crate::stage::skipped(spec, "lowering did not run");
     };
 
     let started = Instant::now();
@@ -55,40 +55,21 @@ pub fn build(cx: &Cx) -> Stage {
         nodes.push(node);
     }
 
-    let display = nodes
-        .iter()
-        .map(|node| {
-            let mangled = node
-                .fields
-                .iter()
-                .find(|f| f.name == "mangled")
-                .map(|f| f.value.as_str())
-                .unwrap_or_default();
-            format!("{:<32} {}", node.text, mangled)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let counted = plural(nodes.len(), "symbol");
     let summary = match broken {
-        0 => format!("{} symbols", nodes.len()),
-        n => format!("{} symbols · {n} demangle mismatch", nodes.len()),
+        0 => counted,
+        n => format!("{counted} · {n} demangle mismatch"),
     };
 
+    let status = match broken {
+        0 => cx.status(),
+        _ => crate::wire::Status::Partial,
+    };
     Stage {
-        id: "symbols",
-        title: "Symbols",
-        view: View::List,
-        status: match broken {
-            0 => cx.status(),
-            _ => crate::wire::Status::Partial,
-        },
-        summary,
-        micros: started.elapsed().as_micros() as u64,
+        micros: Some(started.elapsed().as_micros() as u64),
         nodes,
-        text: None,
-        display,
         debug: format!("{mint:#?}"),
-        annotates: None,
+        ..spec.stage(status, summary)
     }
 }
 
@@ -98,6 +79,12 @@ pub fn build(cx: &Cx) -> Stage {
 /// does expose: the bundle, the path of names, and the namespace of the symbol
 /// itself. That is enough to catch a mangling or demangling that loses, adds,
 /// or reorders a component.
+///
+/// The rebuilt path puts a component carrying a disambiguator under
+/// [`LOCAL_SEGMENT`], the way [`Mint::path`] does — which makes this check the
+/// stricter one of the two: the mint only reports local-ness for the symbol
+/// itself, while a rebuilt path disagrees if the mangling dropped or invented a
+/// disambiguator anywhere along the chain.
 fn round_trip(mint: &Mint, symbol: Symbol, mangled: &str, path: &str) -> Result<(), String> {
     let Some(demangled) = demangle(mangled) else {
         return Err("did not demangle".to_string());
@@ -114,13 +101,15 @@ fn round_trip(mint: &Mint, symbol: Symbol, mangled: &str, path: &str) -> Result<
     if last.disambiguator.is_some() != mint.is_local(symbol) {
         return Err("scope changed".to_string());
     }
-    let names = demangled
-        .path
-        .iter()
-        .map(|component| component.name.as_str())
-        .collect::<Vec<_>>()
-        .join("::");
-    let rebuilt = format!("{}::{names}", mint.bundle().name());
+    let mut rebuilt = mint.bundle().name().to_string();
+    for component in &demangled.path {
+        if component.disambiguator.is_some() {
+            rebuilt.push_str("::");
+            rebuilt.push_str(LOCAL_SEGMENT);
+        }
+        rebuilt.push_str("::");
+        rebuilt.push_str(&component.name);
+    }
     match rebuilt == path {
         true => Ok(()),
         false => Err(format!("path became {rebuilt}")),

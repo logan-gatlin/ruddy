@@ -91,6 +91,7 @@ dependencies = [
 name = "ruddy-debug"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "ruddy",
  "serde",
  "serde_json",

@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
 use ruddy::{
-    ir, parse,
+    inference, ir, parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
+    ui,
 };
 
 const DEMO_PATH: &str = "demo.hc";
@@ -28,65 +29,61 @@ fn main() -> ExitCode {
     let lexed = token::lex(&source, file_id);
     let parsed = parse::parse(lexed.tokens);
 
-    println!("== {DEMO_PATH} ==\n");
-    for stmt in &parsed.stmts {
-        println!("{}", stmt.tracked);
-    }
+    // Neither the parse tree nor the lowered program is printed here. Rendering
+    // a tree back as surface syntax lives in the debugger, which this crate
+    // cannot depend on without a cycle — run `ruddy-debug` and open the AST or
+    // IR tab to read either one. What is left is what a compiler driver owes
+    // its caller regardless: the diagnostics below.
 
     // The mint lives as long as the symbols it hands out, which for a driver
     // means the rest of the run.
     let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
     let mut mint = Mint::new(bundle);
-    let built = ir::build(&mut mint, parsed.stmts);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    let inferred = inference::infer(&mint, &mut built.program);
 
-    println!("\n== ir ==\n");
-    println!("{}", built.program.display(&mint));
-
-    let errors = lexed.errors.len() + parsed.errors.len() + built.errors.len();
+    let errors =
+        lexed.errors.len() + parsed.errors.len() + built.errors.len() + inferred.errors.len();
     if errors == 0 {
-        println!("\nbuilt successfully with no errors");
+        println!("built successfully with no errors");
         return ExitCode::SUCCESS;
     }
 
-    eprintln!("\n{errors} error(s):");
+    // Every phase's errors are worded by `ruddy::ui` and printed here, so that
+    // this driver and the debugger's diagnostic strip cannot describe the same
+    // program differently. What is left to a reporter is layout: the order, the
+    // indentation, and how a span is quoted.
+    eprintln!("{errors} error(s):");
     for err in &lexed.errors {
-        report(
-            &source,
-            err.span,
-            match err.kind {
-                token::ErrorKind::Unrecognized => "unrecognized character",
-                token::ErrorKind::MalformedNatural => "malformed natural number",
-                token::ErrorKind::NaturalTooLarge => "natural number is too large",
-            },
-        );
+        report(&source, err.span, &err.kind.to_string());
     }
     for err in &parsed.errors {
-        report(&source, err.span, "unexpected token");
+        report(&source, err.span, &err.to_string());
     }
     for err in &built.errors {
-        match &err.kind {
-            ir::ErrorKind::Undefined { namespace } => {
-                report(&source, err.span, &format!("undefined {namespace}"));
-            }
-            ir::ErrorKind::Duplicate {
-                namespace,
-                previous,
-            } => {
-                report(&source, err.span, &format!("duplicate {namespace}"));
-                report(&source, *previous, "  first defined here");
-            }
-            ir::ErrorKind::DuplicateField => report(&source, err.span, "duplicate field"),
+        report(&source, err.span, &err.kind.to_string());
+        // A repeat is only legible next to what it repeats, so the definition
+        // that stands gets a line of its own, indented under the error.
+        if let ir::ErrorKind::Duplicate { previous, .. } = &err.kind {
+            report(&source, *previous, &format!("  {}", ui::FIRST_DEFINITION));
         }
+    }
+    for err in &inferred.errors {
+        report(&source, err.span, &err.kind.to_string());
     }
     ExitCode::FAILURE
 }
 
 /// Print a single diagnostic as `path:line:col: message: "snippet"`, resolving
-/// the span's byte offset back to a human-readable position in the source.
+/// the span's byte offset back to a human-readable position in the source. A
+/// span with no width covers no characters to quote: it marks where something
+/// the parser needed would have gone, so it is named rather than quoted.
 fn report(source: &str, span: Span, message: &str) {
     let (line, col) = line_col(source, span.start);
-    let snippet = source.get(span.start..span.end()).unwrap_or("<eof>");
-    eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: {snippet:?}");
+    match source.get(span.start..span.end()) {
+        Some("") | None => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: end of input"),
+        Some(snippet) => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: {snippet:?}"),
+    }
 }
 
 /// Convert a byte offset into a 1-based `(line, column)` pair.

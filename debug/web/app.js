@@ -83,6 +83,12 @@ const app = {
   /// Every source range that mentions one symbol, across every stage. This is
   /// what turns a click on an identifier into "show me this binding and all of
   /// its uses" everywhere at once.
+  ///
+  /// `node.symbol` and not `node.owner`: a node claims `symbol` only when its
+  /// own span is somewhere the name was written, which is the whole reason the
+  /// two fields are separate. A solve step is about a definition but is
+  /// spanned by a sub-expression, and painting that as an occurrence would
+  /// highlight `p.x` as a use of `fst`.
   spansOfSymbol(symbol) {
     const found = [];
     const visit = (nodes) => {
@@ -375,6 +381,16 @@ function renderTitlebar() {
   const snapshot = state.snapshot;
   const errors = snapshot?.diagnostics.length ?? 0;
   const timings = (snapshot?.stages ?? [])
+    // One chip per phase, not per tab. A stage whose work happened inside
+    // another stage's phase — an annotator, or a second view of a phase's
+    // output — carries no timing at all, and a second chip for it would be the
+    // same microseconds counted twice.
+    //
+    // Owning a phase is what the stage says, not what its number came out as:
+    // `micros > 0` read a measurement as that fact, and the measurement is
+    // truncated to whole microseconds, so a phase quick enough to round to zero
+    // lost its chip.
+    .filter((stage) => stage.micros !== null)
     .map((stage) => {
       const ms = stage.micros / 1000;
       const slow = ms > 5 ? " slow" : "";
@@ -523,6 +539,20 @@ function wireKeys() {
     }
     if (event.key === "/" && !typing) {
       panes.focusFilter();
+      return event.preventDefault();
+    }
+    // Stepping is the whole interaction of a stepped panel, so it gets the
+    // cheapest keys left. Held with Alt they work with the caret in the editor
+    // too — the way the diagnostic stepper's Ctrl+J does — because otherwise
+    // the binding is only as reliable as the reader's guess about what has
+    // focus, and guessing wrong types a `.` into their program. Shifted, they
+    // are the two ends: `<` and `>` sit on the same keys.
+    if ((event.key === "," || event.key === "<") && (event.altKey || !typing)) {
+      panes.step(event.shiftKey ? "start" : -1);
+      return event.preventDefault();
+    }
+    if ((event.key === "." || event.key === ">") && (event.altKey || !typing)) {
+      panes.step(event.shiftKey ? "end" : 1);
       return event.preventDefault();
     }
     if (event.key === "Escape") {

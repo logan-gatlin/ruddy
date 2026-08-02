@@ -5,6 +5,7 @@ use ruddy::{
     token::lex,
     tracking::FileID,
 };
+use ruddy_debug::print;
 
 #[test]
 fn parses_let_and_type() {
@@ -42,7 +43,7 @@ fn parse_print(src: &str) -> String {
         out.errors
     );
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
-    out.stmts[0].tracked.to_string()
+    print::ast::stmt(&out.stmts[0].tracked).to_string()
 }
 
 #[test]
@@ -78,11 +79,8 @@ fn functions() {
 
 #[test]
 fn zero_arg_functions_are_rejected() {
-    // Both term-level and type-level nullary functions are errors.
+    // A function binding nothing is an error, reported at the arrow.
     let out = parse(lex("let z = fn => y", FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-
-    let out = parse(lex("type Z = fn => Y", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 }
 
@@ -116,12 +114,17 @@ fn duplicate_fields_are_allowed() {
 }
 
 #[test]
-fn type_lambdas() {
-    assert_eq!(parse_one("type F = fn a => a"), "type F = fn a => a");
-    assert_eq!(
-        parse_one("type G = fn t => { x: t }"),
-        "type G = fn t => { x: t }"
-    );
+fn functions_are_terms_only() {
+    // The type language has no binder, so `fn` in type position is the
+    // unexpected token it looks like — just as a natural literal there is.
+    let out = parse(lex("type F = fn a => a", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(out.stmts.is_empty(), "stmts: {:#?}", out.stmts);
+
+    // Including in a nested type position, where the `fn` is all that is
+    // wrong with the statement around it.
+    let out = parse(lex("let x : fn a => a = ()", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 }
 
 #[test]
@@ -185,18 +188,12 @@ fn empty_parens_are_unit() {
 
 #[test]
 fn parens_group_types() {
+    // Redundant parentheses leave no trace, as in expressions.
+    assert_eq!(parse_one("type T = ((A))"), "type T = A");
+    assert_eq!(parse_one("type U = (A -> B)"), "type U = A -> B");
     assert_eq!(
-        parse_one("type M = Map (List K) V"),
-        "type M = Map (List K) V"
-    );
-    assert_eq!(parse_one("type N = (Map K) V"), "type N = Map K V");
-    assert_eq!(
-        parse_one("type F = (fn a => a) T"),
-        "type F = (fn a => a) T"
-    );
-    assert_eq!(
-        parse_one("type R = { items: List (Pair A B) }"),
-        "type R = { items: List (Pair A B) }"
+        parse_one("type R = { items: (A -> B) }"),
+        "type R = { items: A -> B }"
     );
 }
 
@@ -209,11 +206,120 @@ fn unmatched_closing_paren_is_an_error() {
 }
 
 #[test]
-fn type_application_is_left_associative() {
-    assert_eq!(parse_one("type M = Map K V"), "type M = Map K V");
-    // Type applications can appear as struct field types.
+fn arrows_are_right_associative() {
+    assert_eq!(parse_one("type F = A -> B"), "type F = A -> B");
+    // Right-associative, so the grouping on the right leaves no trace...
+    assert_eq!(parse_one("type G = A -> (B -> C)"), "type G = A -> B -> C");
+    assert_eq!(parse_one("type H = A -> B -> C"), "type H = A -> B -> C");
+    // ...and the one on the left is reconstructed, since without it the
+    // printed source would re-parse as the right-nested tree.
     assert_eq!(
-        parse_one("type R = { items: List T }"),
-        "type R = { items: List T }"
+        parse_one("type I = (A -> B) -> C"),
+        "type I = (A -> B) -> C"
     );
+    // Everything else is an atom, so it stands on either side unparenthesized.
+    assert_eq!(
+        parse_one("type M = { f: A -> B }"),
+        "type M = { f: A -> B }"
+    );
+    assert_eq!(parse_one("type N = () -> ()"), "type N = () -> ()");
+    assert_eq!(
+        parse_one("type O = { x: A } -> B"),
+        "type O = { x: A } -> B"
+    );
+}
+
+#[test]
+fn projection_binds_tighter_than_application() {
+    assert_eq!(parse_one("let a = p.x"), "let a = p.x");
+    // Left-associative, so a chain needs no parentheses.
+    assert_eq!(parse_one("let b = p.x.y"), "let b = p.x.y");
+    // `f p.x` is `f (p.x)`, not `(f p).x` — which is why the second form
+    // has to be written, and printed, with parentheses.
+    assert_eq!(parse_one("let c = f p.x"), "let c = f p.x");
+    assert_eq!(parse_one("let d = (f p).x"), "let d = (f p).x");
+    assert_eq!(parse_one("let e = f p.x q.y"), "let e = f p.x q.y");
+    // Any atom can be projected out of.
+    assert_eq!(parse_one("let g = { x: a }.x"), "let g = { x: a }.x");
+    assert_eq!(parse_one("let h = (fn p => p).x"), "let h = (fn p => p).x");
+}
+
+#[test]
+fn a_projection_needs_a_field_name() {
+    let out = parse(lex("let a = p.  let b = ()", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+}
+
+/// Nothing is silently stood in for a missing expression or type: a position
+/// with nothing usable in it is reported where it was written, so a truncated
+/// edit cannot pass for a program that happens to mean something else.
+#[test]
+fn a_missing_expression_or_type_is_reported() {
+    let errors = |src: &str| {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without error");
+        out
+    };
+
+    // A stray dot is not a projection out of unit.
+    errors("let a = .x");
+    // An ascription with no type in it is not an ascription of `()`.
+    errors("let b : = ()");
+    // Nor is a dangling arrow an arrow to `()`.
+    errors("type T = A ->  let y = ()");
+}
+
+/// Running out of input is reported too. A production that failed quietly at
+/// EOF would drop the definition it was parsing and leave the run looking
+/// successful; the error points at the end of the input, which is where the
+/// missing piece would have gone.
+#[test]
+fn end_of_input_is_reported_where_it_runs_out() {
+    for src in ["let a = p.", "let b :", "type T = A ->", "let c ="] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].span.start, src.len(), "{src:?}");
+        assert_eq!(out.errors[0].span.width, 0, "{src:?}");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+}
+
+#[test]
+fn a_let_may_be_ascribed_a_type() {
+    assert_eq!(parse_one("let x : A = y"), "let x : A = y");
+    assert_eq!(
+        parse_one("let f : A -> B = fn a => a"),
+        "let f : A -> B = fn a => a"
+    );
+    // The plan's witness for width subtyping, in one line.
+    assert_eq!(
+        parse_one("let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"),
+        "let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"
+    );
+    // Without an ascription nothing is printed where one would go.
+    assert_eq!(parse_one("let z = ()"), "let z = ()");
+}
+
+#[test]
+fn only_a_let_may_be_ascribed() {
+    // A `type` declaration is a type already; there is nothing to check it
+    // against, so the colon is the unexpected token it looks like.
+    let out = parse(lex("type T : K = ()", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "stmts: {:#?}", out.stmts);
+}
+
+#[test]
+fn types_do_not_apply() {
+    // With no type-level binder there is nothing a type could be applied to,
+    // so juxtaposition is not an application: `Map` is the whole type, and
+    // `K` is then a statement that cannot begin.
+    let out = parse(lex("type M = Map K", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+
+    // Inside a struct the juxtaposition has nowhere to go at all: the field
+    // list wants a comma or a brace where `T` is written.
+    let out = parse(lex("type R = { items: List T }", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "stmts: {:#?}", out.stmts);
 }

@@ -5,18 +5,25 @@
 //! symbol across all panels.
 
 use ruddy::{
+    inference,
     ir::{Decl, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
+    types::Ty,
 };
 
 use crate::{
-    stage::{Cx, Ids},
-    wire::{Node, Stage, View},
+    print,
+    stage::{Cx, Ids, Spec, Trace, plural},
+    wire::{Node, Stage},
 };
 
-pub fn build(cx: &Cx) -> Stage {
+/// The rows, and the [`Trace`] the stage annotating them reads. Both fall out
+/// of one walk: nothing else knows what shape this tree has, so nothing else
+/// can be wrong about it.
+pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
+    let mut trace = Trace::default();
     let (Some(program), Some(mint)) = (cx.program, cx.mint) else {
-        return crate::stage::skipped("ir", "IR", View::Tree, "lowering did not run");
+        return (crate::stage::skipped(spec, "lowering did not run"), trace);
     };
 
     let mut ids = Ids::default();
@@ -24,33 +31,36 @@ pub fn build(cx: &Cx) -> Stage {
 
     // Types first, then terms — the order `Program`'s own printer uses.
     for (symbol, decl) in &program.types {
-        nodes.push(decl_node(
-            &mut ids, cx, mint, "type", *symbol, decl, type_node,
-        ));
+        let node = decl_node(&mut ids, cx, mint, "type", *symbol, decl, type_node);
+        trace.decls.push(node.id);
+        nodes.push(node);
     }
     for (symbol, decl) in &program.terms {
-        nodes.push(decl_node(
-            &mut ids, cx, mint, "let", *symbol, decl, term_node,
-        ));
+        let node = decl_node(
+            &mut ids,
+            cx,
+            mint,
+            "let",
+            *symbol,
+            decl,
+            |ids, cx, mint, term| term_node(ids, cx, mint, term, &mut trace),
+        );
+        trace.decls.push(node.id);
+        nodes.push(node);
     }
 
-    Stage {
-        id: "ir",
-        title: "IR",
-        view: View::Tree,
-        status: cx.status(),
-        summary: format!(
-            "{} types · {} terms",
-            program.types.len(),
-            program.terms.len()
-        ),
-        micros: cx.micros.build,
+    let summary = format!(
+        "{} · {}",
+        plural(program.types.len(), "type"),
+        plural(program.terms.len(), "term")
+    );
+    let stage = Stage {
+        micros: Some(cx.micros.build),
         nodes,
-        text: None,
-        display: program.display(mint).to_string(),
         debug: format!("{program:#?}"),
-        annotates: None,
-    }
+        ..spec.stage(cx.status(), summary)
+    };
+    (stage, trace)
 }
 
 fn decl_node<T>(
@@ -60,7 +70,7 @@ fn decl_node<T>(
     keyword: &str,
     symbol: Symbol,
     decl: &Decl<T>,
-    value: impl Fn(&mut Ids, &Cx, &Mint, &T) -> Node,
+    value: impl FnOnce(&mut Ids, &Cx, &Mint, &T) -> Node,
 ) -> Node {
     let mut node = Node::new(
         ids.next(),
@@ -71,16 +81,30 @@ fn decl_node<T>(
     if let Some(index) = cx.symbols.get(&symbol) {
         node = node.symbol(*index);
     }
+    // Only a term is ever ascribed one, so this child is simply absent on a
+    // `type` declaration rather than empty. Labelled the way the AST panel
+    // labels the same thing: the role on the type's own node, not a wrapper
+    // repeating its text and span.
+    if let Some(annotation) = &decl.annotation {
+        let mut ascribed = type_node(ids, cx, mint, annotation);
+        ascribed.label = format!("Ascribed {}", ascribed.label);
+        node = node.child(ascribed);
+    }
     node.child(value(ids, cx, mint, &decl.value))
 }
 
-fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
-    let node = Node::new(ids.next(), "", term.tracked.display(mint).to_string()).at(term.span);
-    match &term.tracked {
-        TermKind::Unit => Node {
-            label: "Unit".into(),
-            ..node
-        },
+/// One row per term, and one trace entry alongside it: the id this row was
+/// given, and the type of the term it stands for. The stage that badges the IR
+/// reads those pairs rather than walking the tree a second time.
+fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace) -> Node {
+    let node = Node::new(
+        ids.next(),
+        "",
+        print::ir::term(&term.kind, mint).to_string(),
+    )
+    .at(term.span);
+    trace.terms.push((node.id, term.ty.clone()));
+    match &term.kind {
         TermKind::Error => Node {
             label: "Error".into(),
             ..node
@@ -104,44 +128,66 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term) -> Node {
             label: "Apply".into(),
             ..node
         }
-        .child(term_node(ids, cx, mint, func))
-        .child(term_node(ids, cx, mint, arg)),
+        .child(term_node(ids, cx, mint, func, trace))
+        .child(term_node(ids, cx, mint, arg, trace)),
         TermKind::Fn { arg, body } => {
             let bound = with_symbol(
                 Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
                 cx,
                 arg.tracked,
             );
+            // The bound name has no term of its own to carry a type, but the
+            // lambda's arrow knows it — through a declared type if that is
+            // what the annotation was, since a lambda checked against `Endo`
+            // has an argument as surely as one checked against `Nat -> Nat`.
+            let shape = cx
+                .inference
+                .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
+            if let Some(Ty::Arrow(from, _)) = shape.as_deref() {
+                trace.terms.push((bound.id, from.clone()));
+            }
             Node {
                 label: "Fn".into(),
                 ..node
             }
             .child(bound)
-            .child(term_node(ids, cx, mint, body))
+            .child(term_node(ids, cx, mint, body, trace))
         }
-        TermKind::Struct(fields) => Node {
-            label: "Struct".into(),
+        // The field names no symbol, so its node is a plain leaf — the one
+        // place in the term tree where an identifier-looking thing is not one.
+        TermKind::Project { base, field } => Node {
+            label: "Project".into(),
             ..node
         }
-        .children(fields.iter().map(|(name, field)| {
-            Node::new(
-                ids.next(),
-                format!("{name}:"),
-                field.value.tracked.display(mint).to_string(),
-            )
-            .at(field.name_span)
-            .child(term_node(ids, cx, mint, &field.value))
-        })),
+        .child(term_node(ids, cx, mint, base, trace))
+        .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
+        TermKind::Struct(fields) => {
+            // Built eagerly rather than through `children`: the closure a lazy
+            // iterator would need borrows the trace for as long as it lives.
+            let wrappers: Vec<Node> = fields
+                .iter()
+                .map(|(name, field)| {
+                    Node::new(
+                        ids.next(),
+                        format!("{name}:"),
+                        print::ir::term(&field.value.kind, mint).to_string(),
+                    )
+                    .at(field.name_span)
+                    .child(term_node(ids, cx, mint, &field.value, trace))
+                })
+                .collect();
+            Node {
+                label: "Struct".into(),
+                ..node
+            }
+            .children(wrappers)
+        }
     }
 }
 
 fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
-    let node = Node::new(ids.next(), "", ty.tracked.display(mint).to_string()).at(ty.span);
+    let node = Node::new(ids.next(), "", print::ir::ty(&ty.tracked, mint).to_string()).at(ty.span);
     match &ty.tracked {
-        TypeKind::Unit => Node {
-            label: "Unit".into(),
-            ..node
-        },
         TypeKind::Error => Node {
             label: "Error".into(),
             ..node
@@ -155,25 +201,18 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             cx,
             *symbol,
         ),
-        TypeKind::Apply { func, arg } => Node {
-            label: "Apply".into(),
+        // A primitive is resolved from its spelling rather than from the name
+        // table, so there is no symbol to cross-highlight it by.
+        TypeKind::Prim(_) => Node {
+            label: "Prim".into(),
+            ..node
+        },
+        TypeKind::Arrow { from, to } => Node {
+            label: "Arrow".into(),
             ..node
         }
-        .child(type_node(ids, cx, mint, func))
-        .child(type_node(ids, cx, mint, arg)),
-        TypeKind::Fn { arg, body } => {
-            let bound = with_symbol(
-                Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
-                cx,
-                arg.tracked,
-            );
-            Node {
-                label: "Fn".into(),
-                ..node
-            }
-            .child(bound)
-            .child(type_node(ids, cx, mint, body))
-        }
+        .child(type_node(ids, cx, mint, from))
+        .child(type_node(ids, cx, mint, to)),
         TypeKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node
@@ -182,7 +221,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             Node::new(
                 ids.next(),
                 format!("{name}:"),
-                field.value.tracked.display(mint).to_string(),
+                print::ir::ty(&field.value.tracked, mint).to_string(),
             )
             .at(field.name_span)
             .child(type_node(ids, cx, mint, &field.value))

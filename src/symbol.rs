@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, fmt::Write as _};
+use std::{collections::HashMap, fmt::Write as _};
 
 use indexmap::IndexSet;
 use semver::Prerelease;
@@ -6,9 +6,20 @@ use twox_hash::XxHash3_64;
 
 pub use semver::Version;
 
+use crate::ui::Path;
+
 /// Marks a string as one of our mangled names. Also guarantees the mangling
 /// starts with a character that is legal at the front of an identifier.
 pub const PREFIX: &str = "_R";
+
+/// The path segment standing in for the scope a local lives in.
+///
+/// A local has no canonical path — the lambda or `let` body it belongs to is
+/// not a module and has no name to spell — so every local of a given parent is
+/// shown under one anonymous segment rather than directly beside the globals it
+/// is not addressable alongside. Display only: the mangling distinguishes
+/// locals by disambiguator, and never emits a component for this.
+pub const LOCAL_SEGMENT: &str = "_";
 
 /// Tags introducing the parts of a mangled name that come before the path.
 /// All lowercase, and so disjoint from the uppercase namespace tags.
@@ -142,44 +153,6 @@ pub struct Demangled {
     pub path: Vec<Component>,
 }
 
-/// Renders a symbol as `bundle::module::name`. Kept separate from [`Symbol`]
-/// because printing one needs the mint that made it.
-struct DisplayPath<'a> {
-    mint: &'a Mint,
-    symbol: Symbol,
-}
-
-/// The canonical spelling of a bundle's identity. Bundle names cannot contain
-/// `@`, so this is one string per bundle and one bundle per string — which is
-/// what makes it safe to fingerprint.
-impl fmt::Display for Bundle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.name, self.version)
-    }
-}
-
-impl fmt::Display for Namespace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Namespace::Terms => f.write_str("term"),
-            Namespace::Types => f.write_str("type"),
-            Namespace::Modules => f.write_str("module"),
-        }
-    }
-}
-
-impl fmt::Display for DisplayPath<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The version is left out: this is for diagnostics, where it would be
-        // noise everywhere except the rare cross-version confusion.
-        f.write_str(&self.mint.bundle.name)?;
-        for symbol in self.mint.chain(self.symbol) {
-            write!(f, "::{}", self.mint.name(symbol))?;
-        }
-        Ok(())
-    }
-}
-
 impl Bundle {
     /// `name` must be ASCII: a letter followed by letters, digits, `_`, or `-`.
     ///
@@ -191,6 +164,9 @@ impl Bundle {
         if !valid_name(name) || !version.build.is_empty() {
             return None;
         }
+        // The same string [`Display for Bundle`](crate::ui) writes, and
+        // deliberately not that impl: the fingerprint reaches every mangled
+        // name in a build, so it must not follow a reworded display.
         let hash = BundleHash::of(&format!("{name}@{version}"));
         Some(Self {
             name: name.to_owned(),
@@ -368,10 +344,15 @@ impl Mint {
         })
     }
 
-    /// `bundle::module::name`, for diagnostics. Not unique: two locals can
-    /// share a path, which is exactly what [`mangle`](Self::mangle) is for.
-    pub fn path(&self, symbol: Symbol) -> impl fmt::Display + '_ {
-        DisplayPath { mint: self, symbol }
+    /// `bundle::module::name`, for diagnostics, with every local one segment
+    /// further in under [`LOCAL_SEGMENT`]: `demo::_::x` for the `x` bound by
+    /// `fn x => ...` at the top level of `demo`.
+    ///
+    /// Not unique, and not meant to be: two locals of the same parent share a
+    /// path, and a global genuinely named `_` reads like the marker. Telling
+    /// those apart is what [`mangle`](Self::mangle) is for.
+    pub fn path(&self, symbol: Symbol) -> Path<'_> {
+        Path::new(self, symbol)
     }
 
     /// The symbol's strictly ASCII name, unique against every other symbol in
@@ -423,7 +404,10 @@ impl Mint {
     }
 
     /// The symbols from the outermost containing module down to `symbol`.
-    fn chain(&self, symbol: Symbol) -> Vec<Symbol> {
+    /// Crate-visible so that [`Path`] can walk it; a caller outside wants
+    /// [`path`](Self::path) or [`mangle`](Self::mangle), which are the two
+    /// things a chain is ever walked for.
+    pub(crate) fn chain(&self, symbol: Symbol) -> Vec<Symbol> {
         let mut chain = vec![symbol];
         let mut parent = self.data(symbol).parent;
         while let Some(module) = parent {

@@ -7,7 +7,9 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
+    types::Prim,
 };
+use ruddy_debug::print;
 
 /// A mint for the builder to mint into. Fresh per build, so one test's
 /// symbols cannot show up in another's.
@@ -44,9 +46,7 @@ fn term_symbol(mint: &Mint, out: &Output, name: &str) -> Symbol {
 }
 
 fn term_value<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a TermKind {
-    &out.program.terms[&term_symbol(mint, out, name)]
-        .value
-        .tracked
+    &out.program.terms[&term_symbol(mint, out, name)].value.kind
 }
 
 /// The struct a definition evaluates to, looking through any lambdas
@@ -55,7 +55,7 @@ fn term_value<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a TermKind {
 fn term_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, Field<Term>> {
     let mut node = term_value(mint, out, name);
     while let TermKind::Fn { body, .. } = node {
-        node = &body.tracked;
+        node = &body.kind;
     }
     match node {
         TermKind::Struct(fields) => fields,
@@ -63,17 +63,18 @@ fn term_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<Str
     }
 }
 
-fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, Field<Type>> {
-    let symbol = *out
-        .program
+fn type_symbol(mint: &Mint, out: &Output, name: &str) -> Symbol {
+    *out.program
         .types
         .keys()
         .find(|symbol| mint.name(**symbol) == name)
-        .unwrap_or_else(|| panic!("no type named {name}"));
-    let mut node = &out.program.types[&symbol].value.tracked;
-    while let TypeKind::Fn { body, .. } = node {
-        node = &body.tracked;
-    }
+        .unwrap_or_else(|| panic!("no type named {name}"))
+}
+
+fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<String, Field<Type>> {
+    let node = &out.program.types[&type_symbol(mint, out, name)]
+        .value
+        .tracked;
     match node {
         TypeKind::Struct(fields) => fields,
         other => panic!("expected a struct type, got {other:?}"),
@@ -85,11 +86,11 @@ fn type_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<Str
 /// program — which is what makes the printer's parentheses trustworthy.
 fn display_program(src: &str) -> String {
     let (mint, out) = built(src);
-    let printed = out.program.display(&mint).to_string();
+    let printed = print::ir::program(&out.program, &mint).to_string();
 
     let (remint, relowered) = built(&printed);
     assert_eq!(
-        relowered.program.display(&remint).to_string(),
+        print::ir::program(&relowered.program, &remint).to_string(),
         printed,
         "printing {src:?} did not round-trip"
     );
@@ -103,10 +104,6 @@ fn displays_curried_functions() {
     assert_eq!(
         display_program("let k = fn f a b => f a b"),
         "let k = fn f => fn a => fn b => f a b"
-    );
-    assert_eq!(
-        display_program("type F = fn Pair a b => Pair a b"),
-        "type F = fn Pair => fn a => fn b => Pair a b"
     );
 }
 
@@ -125,10 +122,6 @@ fn displays_application_grouping() {
         display_program("let c = fn map => map fn x => x"),
         "let c = fn map => map (fn x => x)"
     );
-    assert_eq!(
-        display_program("type M = fn Map List K V => Map (List K) V"),
-        "type M = fn Map => fn List => fn K => fn V => Map (List K) V"
-    );
 }
 
 #[test]
@@ -137,10 +130,12 @@ fn displays_structs_and_unit() {
         display_program("let p = fn a b => { x: a, y: b }"),
         "let p = fn a => fn b => { x: a, y: b }"
     );
-    assert_eq!(display_program("let u = ()"), "let u = ()");
+    // `()` the value and `()` the type both lower to the struct with no
+    // fields, so both read back as `{}` rather than as what was written.
+    assert_eq!(display_program("let u = ()"), "let u = {}");
     assert_eq!(
-        display_program("type T = fn List A => { items: List A, next: () }"),
-        "type T = fn List => fn A => { items: List A, next: () }"
+        display_program("type T = { items: Nat, next: () }"),
+        "type T = { items: Nat, next: {} }"
     );
 }
 
@@ -184,10 +179,240 @@ fn a_natural_names_nothing() {
 }
 
 #[test]
+fn displays_arrows() {
+    // The arrow is right-associative, so nesting to the right needs no
+    // parentheses and the printer drops the ones that were written.
+    assert_eq!(
+        display_program("type F = Nat -> Nat -> Nat"),
+        "type F = Nat -> Nat -> Nat"
+    );
+    assert_eq!(
+        display_program("type G = Nat -> (Nat -> ())"),
+        "type G = Nat -> Nat -> {}"
+    );
+    // The one grouping the printer has to reconstruct: an arrow on the left
+    // of an arrow, which would otherwise re-parse as the right half of one.
+    assert_eq!(
+        display_program("type H = (Nat -> Nat) -> ()"),
+        "type H = (Nat -> Nat) -> {}"
+    );
+    // A struct is atomic on either side, and its fields are types in their
+    // own right.
+    assert_eq!(
+        display_program("type K = { f: Nat -> Nat, g: () -> Nat }"),
+        "type K = { f: Nat -> Nat, g: {} -> Nat }"
+    );
+    // A declaration reads the same as a primitive wherever a type may stand.
+    assert_eq!(
+        display_program("type A = ()  type B = A -> A"),
+        "type A = {}\ntype B = A -> A"
+    );
+}
+
+#[test]
+fn displays_projections() {
+    assert_eq!(
+        display_program("let a = fn p => p.x"),
+        "let a = fn p => p.x"
+    );
+    assert_eq!(
+        display_program("let b = fn p => p.x.y"),
+        "let b = fn p => p.x.y"
+    );
+    // Redundant grouping is gone; necessary grouping is reconstructed.
+    assert_eq!(
+        display_program("let c = fn f p => f p.x"),
+        "let c = fn f => fn p => f p.x"
+    );
+    assert_eq!(
+        display_program("let d = fn f p => (f p).x"),
+        "let d = fn f => fn p => (f p).x"
+    );
+    assert_eq!(
+        display_program("let e = fn a => { x: a }.x"),
+        "let e = fn a => { x: a }.x"
+    );
+}
+
+#[test]
+fn a_projected_field_is_a_label_and_not_a_name() {
+    // The field resolves to nothing, so an undefined name inside a
+    // projection can only ever be the base.
+    let (mint, out) = built("let a = fn p => p.x");
+
+    let mut node = term_value(&mint, &out, "a");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Project { base, field } = node else {
+        panic!("expected a projection, got {node:?}");
+    };
+    assert_eq!(field.tracked, "x");
+    // Written where it was written, so a diagnostic can point at the label
+    // rather than at the whole projection.
+    assert_eq!(field.span.start, 18);
+    assert_eq!(field.span.width, 1);
+    assert!(matches!(base.kind, TermKind::Ident(s) if mint.name(s) == "p"));
+
+    // A field name never has to resolve; only the base does.
+    let (_, out) = build_src("let b = q.x");
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, 8);
+}
+
+#[test]
+fn displays_ascriptions() {
+    assert_eq!(display_program("let x : () = ()"), "let x : {} = {}");
+    assert_eq!(
+        display_program("let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"),
+        "let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x"
+    );
+    // The annotation resolves in the type namespace, and a declaration is
+    // in scope for it exactly as it would be in a `type` body.
+    assert_eq!(
+        display_program("type T = ()  let u : T = ()"),
+        "type T = {}\nlet u : T = {}"
+    );
+    // Printing hoists types the way lowering does, so an interleaved program
+    // comes back in the order the builder saw it — and re-lowering the
+    // rendering, which `display_program` does, lands on the same program.
+    assert_eq!(
+        display_program("let u : T = ()  type T = ()"),
+        "type T = {}\nlet u : T = {}"
+    );
+    assert_eq!(
+        display_program("type A = ()  let x : B = ()  type B = A  let y : A = ()"),
+        "type A = {}\ntype B = A\nlet x : B = {}\nlet y : A = {}"
+    );
+}
+
+#[test]
+fn an_ascription_resolves_in_the_type_namespace() {
+    // A term of the same name is not what `: T` refers to.
+    let (_, out) = build_src("let T = ()  let u : T = ()");
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Types
+        }
+    ));
+
+    // A `type` declaration carries no annotation, and a `let` without one
+    // carries none either.
+    let (_, out) = built("type T = ()  let u = ()");
+    assert!(out.program.types.values().all(|d| d.annotation.is_none()));
+    assert!(out.program.terms.values().all(|d| d.annotation.is_none()));
+
+    let (mint, out) = built("type T = ()  let u : T = ()");
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "u")]
+        .annotation
+        .as_ref()
+        .expect("the ascription was lowered");
+    assert!(matches!(annotation.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+}
+
+#[test]
+fn primitives_are_resolved_from_their_spelling() {
+    // `Nat` needs no declaration and mints no symbol...
+    let (mint, out) = built("type T = Nat");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "T")]
+            .value
+            .tracked,
+        TypeKind::Prim(Prim::Nat)
+    ));
+    assert_eq!(mint.symbols().count(), 1);
+    assert_eq!(
+        display_program("type T = Nat -> Nat"),
+        "type T = Nat -> Nat"
+    );
+
+    // ...but a declaration of one's own is what the name then means.
+    let (mint, out) = built("type Nat = ()  type T = Nat");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "T")]
+            .value
+            .tracked,
+        TypeKind::Ident(_)
+    ));
+}
+
+/// Types are hoisted above terms and above each other: every type's name is
+/// bound before any type's body is read, so a declaration can name one written
+/// below it, and — the point of the ordering — can name itself.
+#[test]
+fn types_are_hoisted_above_terms_and_above_each_other() {
+    // A type above the declaration sees it, and a declaration of `Nat` beats
+    // the built-in wherever it is written.
+    let (mint, out) = built("type T = Nat  type Nat = ()");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "T")]
+            .value
+            .tracked,
+        TypeKind::Ident(_)
+    ));
+
+    // A term above it does, because every type is lowered first.
+    let (mint, out) = built("let u : Nat = ()  type Nat = ()");
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "u")]
+        .annotation
+        .as_ref()
+        .expect("the ascription was lowered");
+    assert!(matches!(annotation.tracked, TypeKind::Ident(_)));
+
+    // Which holds for a name of the program's own just the same.
+    let (mint, out) = built("let u : T = ()  type T = ()");
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "u")]
+        .annotation
+        .as_ref()
+        .expect("the ascription was lowered");
+    assert!(matches!(annotation.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+}
+
+#[test]
+fn unit_is_the_empty_struct() {
+    // The surface syntax spells it as punctuation, but the type it denotes
+    // is the struct with no fields — nothing the type language needs a node
+    // of its own to say.
+    let (mint, out) = built("type T = ()");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "T")]
+            .value
+            .tracked,
+        TypeKind::Struct(ref fields) if fields.is_empty()
+    ));
+    assert_eq!(mint.symbols().count(), 1);
+    assert_eq!(
+        display_program("type T = () -> ()  let u : () = ()"),
+        "type T = {} -> {}\nlet u : {} = {}"
+    );
+
+    // Punctuation is not a name, so — unlike `Nat` — no declaration can
+    // take the spelling and shadow it.
+    let (mint, out) = built("type Nat = ()  type T = ()");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "T")]
+            .value
+            .tracked,
+        TypeKind::Struct(ref fields) if fields.is_empty()
+    ));
+
+    // The unit *value* folds the same way: `()` the value and `()` the type
+    // are different things in different namespaces, but both lower to the
+    // struct with no fields.
+    let (mint, out) = built("let u = ()");
+    assert!(matches!(
+        term_value(&mint, &out, "u"),
+        TermKind::Struct(fields) if fields.is_empty()
+    ));
+}
+
+#[test]
 fn displays_types_before_terms() {
     assert_eq!(
         display_program("let x = ()  type T = { f: () }  let y = ()"),
-        "type T = { f: () }\nlet x = ()\nlet y = ()"
+        "type T = { f: {} }\nlet x = {}\nlet y = {}"
     );
 }
 
@@ -195,7 +420,7 @@ fn displays_types_before_terms() {
 fn displays_empty_program_as_nothing() {
     let mut mint = dummy_mint();
     let out = build(&mut mint, Vec::new());
-    assert_eq!(out.program.display(&mint).to_string(), "");
+    assert_eq!(print::ir::program(&out.program, &mint).to_string(), "");
 }
 
 #[test]
@@ -238,7 +463,10 @@ fn duplicate_definitions_keep_the_first() {
 
     // One symbol, and it still holds the first definition's body.
     assert_eq!(out.program.terms.len(), 1);
-    assert!(matches!(term_value(&mint, &out, "x"), TermKind::Unit));
+    assert!(matches!(
+        term_value(&mint, &out, "x"),
+        TermKind::Struct(fields) if fields.is_empty()
+    ));
 }
 
 #[test]
@@ -272,7 +500,7 @@ fn arguments_shadow_definitions_and_release() {
     };
     // The argument hides the definition for the length of the body...
     assert_ne!(arg.tracked, global);
-    assert!(matches!(body.tracked, TermKind::Ident(s) if s == arg.tracked));
+    assert!(matches!(body.kind, TermKind::Ident(s) if s == arg.tracked));
     // ...and the definition is back in scope afterwards.
     assert!(matches!(term_value(&mint, &out, "g"), TermKind::Ident(s) if *s == global));
 }
@@ -317,12 +545,12 @@ fn duplicate_term_fields_are_rejected() {
     let fields = term_fields(&mint, &out, "p");
     assert_eq!(fields.len(), 1);
     assert_eq!(fields["x"].name_span.start, 20);
-    assert!(matches!(fields["x"].value.tracked, TermKind::Ident(s) if mint.name(s) == "a"));
+    assert!(matches!(fields["x"].value.kind, TermKind::Ident(s) if mint.name(s) == "a"));
 }
 
 #[test]
 fn duplicate_type_fields_are_rejected() {
-    let (mint, out) = build_src("type T = fn A B => { a: A, a: B }");
+    let (mint, out) = build_src("type A = ()  type B = Nat  type T = { a: A, a: B }");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 
     let fields = type_fields(&mint, &out, "T");

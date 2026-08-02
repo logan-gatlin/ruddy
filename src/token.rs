@@ -9,14 +9,14 @@ pub enum Kind {
     Let,
     In,
     Type,
-    Trait,
-    For,
-    Impl,
     End,
     With,
     Fn,
     Equal,
     FatArrow,
+    /// `->`, the function type arrow. Distinct from [`FatArrow`](Kind::FatArrow),
+    /// which introduces a lambda body.
+    Arrow,
     Colon,
     Comma,
     Dot,
@@ -54,33 +54,6 @@ pub struct Output {
     pub errors: Vec<Error>,
 }
 
-impl std::fmt::Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Kind::Let => f.write_str("let"),
-            Kind::In => f.write_str("in"),
-            Kind::Type => f.write_str("type"),
-            Kind::Trait => f.write_str("trait"),
-            Kind::For => f.write_str("for"),
-            Kind::Impl => f.write_str("impl"),
-            Kind::End => f.write_str("end"),
-            Kind::With => f.write_str("with"),
-            Kind::Fn => f.write_str("fn"),
-            Kind::Equal => f.write_str("="),
-            Kind::FatArrow => f.write_str("=>"),
-            Kind::Colon => f.write_str(":"),
-            Kind::Comma => f.write_str(","),
-            Kind::Dot => f.write_str("."),
-            Kind::LeftBrace => f.write_str("{"),
-            Kind::RightBrace => f.write_str("}"),
-            Kind::LeftParen => f.write_str("("),
-            Kind::RightParen => f.write_str(")"),
-            Kind::Identifier(name) => f.write_str(name),
-            Kind::Natural(value) => write!(f, "{value}"),
-        }
-    }
-}
-
 pub fn lex(input: &str, file_id: FileID) -> Output {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
@@ -100,6 +73,21 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 2).track(Kind::FatArrow));
                 } else {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
+                }
+            }
+            // `-` begins nothing on its own — there is no subtraction and no
+            // negative literal — so the only thing it can be is the head of an
+            // arrow, and a lone one is reported where it was written.
+            '-' => {
+                chars.next();
+                if let Some(&(_, '>')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::Arrow));
+                } else {
+                    errors.push(Error {
+                        span: file_id.span(start, 1),
+                        kind: ErrorKind::Unrecognized,
+                    });
                 }
             }
             ':' => {
@@ -141,9 +129,6 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "let" => Kind::Let,
                     "in" => Kind::In,
                     "type" => Kind::Type,
-                    "trait" => Kind::Trait,
-                    "for" => Kind::For,
-                    "impl" => Kind::Impl,
                     "end" => Kind::End,
                     "with" => Kind::With,
                     "fn" => Kind::Fn,

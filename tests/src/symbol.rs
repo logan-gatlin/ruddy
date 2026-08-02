@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use ruddy::symbol::{
-    Bundle, Bundles, Clash, Component, Mint, Namespace, PREFIX, Version, demangle,
+    Bundle, Bundles, Clash, Component, LOCAL_SEGMENT, Mint, Namespace, PREFIX, Version, demangle,
 };
 
 /// Every mangling in these tests starts with this, for `app@1.0.0`.
@@ -119,6 +119,38 @@ fn locals_do_not_occupy_a_global_path() {
     let global = m.global(None, Namespace::Terms, "x").unwrap();
     assert_ne!(local, global);
     assert_ne!(m.mangle(local), m.mangle(global));
+}
+
+/// A local has no canonical path: nothing outside the body binding it can
+/// address the `x` in `fn x => ...`. Showing it as `app::x` claimed otherwise,
+/// and claimed the very path a top-level `let x` would occupy — a different
+/// symbol, which the same panel may be listing two rows away.
+#[test]
+fn a_local_is_shown_under_the_anonymous_segment() {
+    let mut m = mint();
+    let util = m.module(None, "util").unwrap();
+    let top = m.local(None, Namespace::Terms, "x");
+    let nested = m.local(Some(util), Namespace::Terms, "x");
+
+    assert_eq!(m.path(top).to_string(), format!("app::{LOCAL_SEGMENT}::x"));
+    assert_eq!(m.path(nested).to_string(), "app::util::_::x");
+
+    // The path the local was borrowing is still the global's, and now nothing
+    // else spells it.
+    let global = m.global(None, Namespace::Terms, "x").unwrap();
+    assert_eq!(m.path(global).to_string(), "app::x");
+    assert_ne!(m.path(top).to_string(), m.path(global).to_string());
+
+    // The segment is for reading, not for telling symbols apart: two locals of
+    // one parent still share a path, and the mangling is what separates them.
+    let another = m.local(None, Namespace::Terms, "x");
+    assert_eq!(m.path(another).to_string(), m.path(top).to_string());
+    assert_ne!(m.mangle(another), m.mangle(top));
+
+    // And it is display-only: no component is emitted for it, so a mangled
+    // local is exactly as long as it was.
+    assert_eq!(m.mangle(top), format!("{APP_PREFIX}V1xs0"));
+    assert_eq!(demangle(&m.mangle(top)).unwrap().path.len(), 1);
 }
 
 #[test]

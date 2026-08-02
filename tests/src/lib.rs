@@ -10,8 +10,13 @@
 #![cfg(test)]
 
 mod docs;
+mod inference;
 mod ir;
 mod parse;
+mod print;
 mod snapshot;
+mod stage;
 mod symbol;
 mod token;
+mod types;
+mod ui;

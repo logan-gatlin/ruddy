@@ -8,21 +8,23 @@
 //! are lost.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::HashMap,
     panic::{self, AssertUnwindSafe},
     sync::Once,
     time::Instant,
 };
 
 use ruddy::{
-    ir, parse,
-    symbol::{Bundle, Mint, Namespace, Version},
+    inference, ir, parse,
+    symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
+    ui,
 };
 
 use crate::{
-    stage::{self, Cx, Phases},
+    stage::{self, Build, Cx, Phases, Trace},
     wire::{CompileRequest, Diagnostic, Panic, Range, Related, Severity, Snapshot, line_starts},
 };
 
@@ -30,6 +32,10 @@ thread_local! {
     /// Filled by the panic hook on the thread that panicked, drained by
     /// [`guard`] immediately after `catch_unwind` returns.
     static LAST_PANIC: RefCell<Option<Panic>> = const { RefCell::new(None) };
+    /// Set while a [`guard`] is running. A panic outside one is not the
+    /// compiler's — it is a bug in the server, or a failed assertion in a test
+    /// — and has to reach the console the way it normally would.
+    static GUARDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The name the editor's buffer is registered under. It is never read from
@@ -80,7 +86,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     };
     let mut mint = Mint::new(bundle);
 
-    let built = parsed.as_ref().and_then(|parsed| {
+    let mut built = parsed.as_ref().and_then(|parsed| {
         let started = Instant::now();
         let out = guard("ir", &mut panicked, || {
             ir::build(&mut mint, parsed.stmts.clone())
@@ -89,20 +95,38 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         out
     });
 
+    // Inference mutates the program it types, so it borrows `built` mutably
+    // and finishes before any stage looks at either.
+    let inferred = built.as_mut().and_then(|built| {
+        let started = Instant::now();
+        let out = guard("types", &mut panicked, || {
+            inference::infer(&mint, &mut built.program)
+        });
+        micros.infer = started.elapsed().as_micros() as u64;
+        out
+    });
+
+    // Every phase words and codes its own errors in `ruddy::ui`, so the strip
+    // and the CLI driver cannot describe the same program differently, and a
+    // new error kind reaches both the moment it exists. What is added here is
+    // what only the strip has: the quoted snippet, and the second span a
+    // duplicate points back at.
     if let Some(lexed) = &lexed {
-        diagnostics.extend(
-            lexed
-                .errors
-                .iter()
-                .map(|error| lex_diagnostic(source, error)),
-        );
+        diagnostics.extend(lexed.errors.iter().map(|error| {
+            raw(
+                "lex",
+                error.kind.code(),
+                format!("{} {}", error.kind, quote(source, error.span)),
+                Some(error.span),
+            )
+        }));
     }
     if let Some(parsed) = &parsed {
         diagnostics.extend(parsed.errors.iter().map(|error| {
             raw(
                 "parse",
-                "unexpected-token",
-                format!("unexpected token {}", quote(source, error.span)),
+                error.code(),
+                format!("{error} {}", quote(source, error.span)),
                 Some(error.span),
             )
         }));
@@ -114,6 +138,16 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
                 .iter()
                 .map(|error| ir_diagnostic(source, error)),
         );
+    }
+    if let Some(inferred) = &inferred {
+        diagnostics.extend(inferred.errors.iter().map(|error| {
+            raw(
+                "types",
+                error.kind.code(),
+                error.kind.to_string(),
+                Some(error.span),
+            )
+        }));
     }
 
     // Sorted by where the reader would look for them, then numbered, so a
@@ -129,20 +163,37 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         tokens: lexed.as_ref().map(|lexed| lexed.tokens.as_slice()),
         stmts: parsed.as_ref().map(|parsed| parsed.stmts.as_slice()),
         program: built.as_ref().map(|built| &built.program),
+        inference: inferred.as_ref(),
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
         errored: !diagnostics.is_empty(),
     };
 
-    let stages = stage::REGISTRY
-        .iter()
-        .map(|(id, build)| {
-            guard(id, &mut panicked, || build(&cx)).unwrap_or_else(|| {
-                stage::panicked(id, stage::title_of(id), crate::wire::View::Tree)
-            })
-        })
-        .collect();
+    // In registry order, which is also dependency order: a stage that annotates
+    // another is registered after it, so the trace it reads is already there.
+    let mut traces: HashMap<&'static str, Trace> = HashMap::new();
+    let mut stages = Vec::with_capacity(stage::REGISTRY.len());
+    for spec in stage::REGISTRY {
+        let built = match spec.build {
+            Build::Panel(build) => guard(spec.id, &mut panicked, || build(spec, &cx)),
+            Build::Traced(build) => {
+                guard(spec.id, &mut panicked, || build(spec, &cx)).map(|(stage, trace)| {
+                    traces.insert(spec.id, trace);
+                    stage
+                })
+            }
+            Build::Annotator(build) => {
+                let empty = Trace::default();
+                let trace = spec
+                    .annotates
+                    .and_then(|id| traces.get(id))
+                    .unwrap_or(&empty);
+                guard(spec.id, &mut panicked, || build(spec, &cx, trace))
+            }
+        };
+        stages.push(built.unwrap_or_else(|| stage::panicked(spec)));
+    }
 
     Snapshot {
         revision: req.revision,
@@ -159,7 +210,10 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
 /// result. Only the first panic of a run is kept: the ones after it are usually
 /// the same bug seen from a stage that was handed nothing.
 pub fn guard<T>(stage: &str, slot: &mut Option<Panic>, f: impl FnOnce() -> T) -> Option<T> {
-    match panic::catch_unwind(AssertUnwindSafe(f)) {
+    let outer = GUARDING.replace(true);
+    let caught = panic::catch_unwind(AssertUnwindSafe(f));
+    GUARDING.set(outer);
+    match caught {
         Ok(value) => Some(value),
         Err(payload) => {
             let captured = LAST_PANIC.with(|last| last.borrow_mut().take());
@@ -191,12 +245,18 @@ fn message_of(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// Capture panics instead of letting them reach the console with a full
-/// backtrace nobody asked for. The default hook is replaced rather than
-/// chained: the same information reaches the page, which is where it is useful.
+/// backtrace nobody asked for. Only the ones a [`guard`] is around: the same
+/// information reaches the page, which is where it is useful. Anything else is
+/// nobody's compiler bug and falls through to the hook that was already there.
 pub fn install_hook() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        panic::set_hook(Box::new(|info| {
+        let outer = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !GUARDING.with(Cell::get) {
+                outer(info);
+                return;
+            }
             let panicked = Panic {
                 stage: String::new(),
                 message: info.payload_as_str().unwrap_or("panicked").to_string(),
@@ -211,63 +271,23 @@ pub fn install_hook() {
     });
 }
 
-fn lex_diagnostic(source: &str, error: &token::Error) -> Diagnostic {
-    let (code, what) = match error.kind {
-        token::ErrorKind::Unrecognized => ("unrecognized-character", "unrecognized character"),
-        token::ErrorKind::MalformedNatural => ("malformed-natural", "malformed natural number"),
-        token::ErrorKind::NaturalTooLarge => (
-            "natural-too-large",
-            "natural number too large to fit in 128 bits",
-        ),
-    };
-    raw(
-        "lex",
-        code,
-        format!("{what} {}", quote(source, error.span)),
-        Some(error.span),
-    )
-}
-
+/// Lowering's errors, which are the only ones with a second place to point at.
 fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
-    match &error.kind {
-        ir::ErrorKind::Undefined { namespace } => raw(
-            "ir",
-            match namespace {
-                Namespace::Types => "undefined-type",
-                _ => "undefined-term",
-            },
-            format!("undefined {namespace} {}", quote(source, error.span)),
-            Some(error.span),
-        ),
-        ir::ErrorKind::Duplicate {
-            namespace,
-            previous,
-        } => {
-            let mut diagnostic = raw(
-                "ir",
-                match namespace {
-                    Namespace::Types => "duplicate-type",
-                    _ => "duplicate-term",
-                },
-                format!("duplicate {namespace} {}", quote(source, error.span)),
-                Some(error.span),
-            );
-            // One diagnostic with two highlights, rather than the two loose
-            // lines the CLI prints: the repeat is only legible next to what it
-            // repeats.
-            diagnostic.related.push(Related {
-                span: range(*previous),
-                message: "first defined here".to_string(),
-            });
-            diagnostic
-        }
-        ir::ErrorKind::DuplicateField => raw(
-            "ir",
-            "duplicate-field",
-            format!("duplicate field {}", quote(source, error.span)),
-            Some(error.span),
-        ),
+    let mut diagnostic = raw(
+        "ir",
+        error.kind.code(),
+        format!("{} {}", error.kind, quote(source, error.span)),
+        Some(error.span),
+    );
+    // One diagnostic with two highlights, rather than the two loose lines the
+    // CLI prints: the repeat is only legible next to what it repeats.
+    if let ir::ErrorKind::Duplicate { previous, .. } = &error.kind {
+        diagnostic.related.push(Related {
+            span: range(*previous),
+            message: ui::FIRST_DEFINITION.to_string(),
+        });
     }
+    diagnostic
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Span>) -> Diagnostic {

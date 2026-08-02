@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 
 use crate::{
     token::{Kind, Token},
-    tracking::{Span, Tracked},
+    tracking::{Span, Tracked, TrackedString},
 };
 
 pub type Stmt = Tracked<StmtKind>;
@@ -10,11 +10,13 @@ pub type Stmt = Tracked<StmtKind>;
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let {
-        name: Tracked<String>,
+        name: TrackedString,
+        /// The written type, when the definition was ascribed one.
+        ty: Option<Type>,
         body: Tracked<Expr>,
     },
     Type {
-        name: Tracked<String>,
+        name: TrackedString,
         body: Type,
     },
 }
@@ -28,14 +30,17 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
     Function {
-        args: Vec<Tracked<String>>,
+        args: Vec<TrackedString>,
         body: Box<Expr>,
     },
-    Struct(IndexMap<Tracked<String>, Expr>),
-    Ident {
-        name: Tracked<String>,
+    Struct(IndexMap<TrackedString, Expr>),
+    Project {
+        base: Box<Expr>,
+        field: TrackedString,
     },
-    /// A natural number literal, already read from its digits by the lexer.
+    Ident {
+        name: TrackedString,
+    },
     Natural(u128),
     Unit,
 }
@@ -44,18 +49,9 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    Apply {
-        func: Box<Type>,
-        arg: Box<Type>,
-    },
-    Struct(IndexMap<Tracked<String>, Type>),
-    Function {
-        args: Vec<Tracked<String>>,
-        body: Box<Type>,
-    },
-    Ident {
-        name: Tracked<String>,
-    },
+    Struct(IndexMap<TrackedString, Type>),
+    Arrow { from: Box<Type>, to: Box<Type> },
+    Ident { name: TrackedString },
     Unit,
 }
 
@@ -74,120 +70,6 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
-}
-
-impl std::fmt::Display for StmtKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence
-            // the doubled `.tracked` to reach the `ExprKind`.
-            StmtKind::Let { name, body } => {
-                write!(f, "let {} = {}", name.tracked, body.tracked.tracked)
-            }
-            StmtKind::Type { name, body } => {
-                write!(f, "type {} = {}", name.tracked, body.tracked)
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ExprKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExprKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, ExprKind::Function { .. }),
-                    &func.tracked,
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(
-                        arg.tracked,
-                        ExprKind::Apply { .. } | ExprKind::Function { .. }
-                    ),
-                    &arg.tracked,
-                )
-            }
-            ExprKind::Function { args, body } => write_function(f, args, &body.tracked),
-            ExprKind::Struct(fields) => write_struct(f, fields),
-            ExprKind::Ident { name } => f.write_str(&name.tracked),
-            ExprKind::Natural(value) => write!(f, "{value}"),
-            ExprKind::Unit => f.write_str("()"),
-        }
-    }
-}
-
-impl std::fmt::Display for TypeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TypeKind::Apply { func, arg } => {
-                write_grouped(
-                    f,
-                    matches!(func.tracked, TypeKind::Function { .. }),
-                    &func.tracked,
-                )?;
-                f.write_str(" ")?;
-                write_grouped(
-                    f,
-                    matches!(
-                        arg.tracked,
-                        TypeKind::Apply { .. } | TypeKind::Function { .. }
-                    ),
-                    &arg.tracked,
-                )
-            }
-            TypeKind::Function { args, body } => write_function(f, args, &body.tracked),
-            TypeKind::Struct(fields) => write_struct(f, fields),
-            TypeKind::Ident { name } => f.write_str(&name.tracked),
-            TypeKind::Unit => f.write_str("()"),
-        }
-    }
-}
-
-/// Render `body`, wrapping it in parentheses when leaving them off would make
-/// the printed source re-parse as a different tree. Grouping is not recorded in
-/// the AST, so the printer has to reconstruct it from the shape of the node.
-/// Shared with the IR printer, which emits the same surface syntax.
-pub(crate) fn write_grouped(
-    f: &mut std::fmt::Formatter<'_>,
-    parens: bool,
-    body: &dyn std::fmt::Display,
-) -> std::fmt::Result {
-    match parens {
-        true => write!(f, "({body})"),
-        false => write!(f, "{body}"),
-    }
-}
-
-/// Render a `fn a b c => body` header shared by expression and type lambdas.
-fn write_function(
-    f: &mut std::fmt::Formatter<'_>,
-    args: &[Tracked<String>],
-    body: &dyn std::fmt::Display,
-) -> std::fmt::Result {
-    f.write_str("fn")?;
-    for arg in args {
-        write!(f, " {}", arg.tracked)?;
-    }
-    write!(f, " => {body}")
-}
-
-/// Render a `{ name: value, ... }` literal shared by struct expressions and
-/// struct types (the values differ, but the shape is identical).
-fn write_struct<V: std::fmt::Display>(
-    f: &mut std::fmt::Formatter<'_>,
-    fields: &IndexMap<Tracked<String>, Tracked<V>>,
-) -> std::fmt::Result {
-    f.write_str("{ ")?;
-    for (i, (name, value)) in fields.iter().enumerate() {
-        if i > 0 {
-            f.write_str(", ")?;
-        }
-        write!(f, "{}: {}", name.tracked, value.tracked)?;
-    }
-    f.write_str(" }")
 }
 
 pub fn parse(toks: Vec<Token>) -> Output {
@@ -240,61 +122,76 @@ impl Parser {
         self.errors.push(Error { span });
     }
 
-    /// Consume the next token if it is the same variant as `want`, ignoring any
-    /// payload. Records an error and consumes nothing on mismatch or EOF.
-    fn eat(&mut self, want: &Kind) -> Option<Token> {
+    /// The zero-width position just past the last token, so that running out of
+    /// input has somewhere to point.
+    fn eof_span(&self) -> Span {
+        match self.toks.last() {
+            Some(tok) => tok.span.file_id.span(tok.span.end(), 0),
+            None => Span::default(),
+        }
+    }
+
+    /// Report the next token — or the end of input — as one that cannot be used
+    /// here, and fail. Every path that gives up goes through this: a production
+    /// that returned `None` quietly would drop the statement it was parsing and
+    /// leave the run looking successful.
+    fn unexpected<T>(&mut self) -> Option<T> {
         let span = match self.peek() {
-            Some(tok) if std::mem::discriminant(&tok.tracked) == std::mem::discriminant(want) => {
-                return self.advance();
-            }
             Some(tok) => tok.span,
-            None => return None,
+            None => self.eof_span(),
         };
         self.error(span);
         None
     }
 
-    fn ident(&mut self) -> Option<Tracked<String>> {
-        let (span, name) = match self.peek() {
+    /// Consume the next token if it is the same variant as `want`, ignoring any
+    /// payload. Records an error and consumes nothing on mismatch or EOF.
+    fn eat(&mut self, want: &Kind) -> Option<Token> {
+        match self.eat_if(want) {
+            Some(tok) => Some(tok),
+            None => self.unexpected(),
+        }
+    }
+
+    fn ident(&mut self) -> Option<TrackedString> {
+        let name = match self.peek() {
             Some(tok) => match &tok.tracked {
-                Kind::Identifier(name) => (tok.span, Some(name.clone())),
-                _ => (tok.span, None),
+                Kind::Identifier(name) => Some(tok.span.track(name.clone())),
+                _ => None,
             },
-            None => return None,
+            None => None,
         };
         match name {
             Some(name) => {
                 self.advance();
-                Some(span.track(name))
+                Some(name)
             }
-            None => {
-                self.error(span);
-                None
-            }
+            None => self.unexpected(),
         }
     }
 
     fn stmt(&mut self) -> Option<Stmt> {
-        let tok = self.peek()?;
-        match &tok.tracked {
-            Kind::Let => self.let_stmt(),
-            Kind::Type => self.type_stmt(),
-            _ => {
-                let span = tok.span;
-                self.error(span);
-                None
-            }
+        match self.peek().map(|tok| &tok.tracked) {
+            Some(Kind::Let) => self.let_stmt(),
+            Some(Kind::Type) => self.type_stmt(),
+            _ => self.unexpected(),
         }
     }
 
+    /// `let <name> [: <type>] = <expr>`. The ascription is optional: without it
+    /// the definition's type is whatever is inferred for its body.
     fn let_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance()?; // `let`
         let name = self.ident()?;
+        let ty = match self.eat_if(&Kind::Colon) {
+            Some(_) => Some(self.type_expr()?),
+            None => None,
+        };
         self.eat(&Kind::Equal)?;
         let expr = self.expr()?;
         let body = expr.span.track(expr);
         let span = kw.span.merge(body.span);
-        Some(span.track(StmtKind::Let { name, body }))
+        Some(span.track(StmtKind::Let { name, ty, body }))
     }
 
     fn type_stmt(&mut self) -> Option<Stmt> {
@@ -325,9 +222,9 @@ impl Parser {
     /// Application binds tighter than nothing and is left-associative, ML-style:
     /// `f x y` parses as `(f x) y`.
     fn expr(&mut self) -> Option<Expr> {
-        let mut func = self.atom()?;
+        let mut func = self.projection()?;
         while self.at_expr_atom() {
-            let arg = self.atom()?;
+            let arg = self.projection()?;
             let span = func.span.merge(arg.span);
             func = span.track(ExprKind::Apply {
                 func: Box::new(func),
@@ -337,8 +234,26 @@ impl Parser {
         Some(func)
     }
 
+    /// `<atom>.<field>*` — postfix projection, left-associative. It sits under
+    /// application rather than beside it so that `f p.x` reads as `f (p.x)`,
+    /// which is what reaching into a record before passing it along looks like.
+    fn projection(&mut self) -> Option<Expr> {
+        let mut base = self.atom()?;
+        while self.eat_if(&Kind::Dot).is_some() {
+            let field = self.ident()?;
+            let span = base.span.merge(field.span);
+            base = span.track(ExprKind::Project {
+                base: Box::new(base),
+                field,
+            });
+        }
+        Some(base)
+    }
+
     fn atom(&mut self) -> Option<Expr> {
-        let tok = self.peek()?;
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
         let span = tok.span;
         match &tok.tracked {
             Kind::Fn => self.function_expr(),
@@ -353,9 +268,8 @@ impl Parser {
                 self.advance();
                 Some(span.track(ExprKind::Natural(value)))
             }
-            // An empty / unrecognized expression position parses as unit and
-            // consumes nothing, leaving recovery to the caller.
-            _ => Some(span.track(ExprKind::Unit)),
+            // Nothing here begins an expression
+            _ => self.unexpected(),
         }
     }
 
@@ -413,10 +327,10 @@ impl Parser {
         }))
     }
 
-    /// The `<arg>+ =>` header shared by expression and type functions: gather
-    /// the argument identifiers, then consume the `=>` arrow. A function must
-    /// bind at least one argument, so an empty list is a parse error.
-    fn function_args(&mut self) -> Option<Vec<Tracked<String>>> {
+    /// The `<arg>+ =>` header of a function: gather the argument identifiers,
+    /// then consume the `=>` arrow. A function must bind at least one argument,
+    /// so an empty list is a parse error.
+    fn function_args(&mut self) -> Option<Vec<TrackedString>> {
         let mut args = Vec::new();
         while matches!(self.peek().map(|t| &t.tracked), Some(Kind::Identifier(_))) {
             args.push(self.ident()?);
@@ -430,39 +344,30 @@ impl Parser {
         Some(args)
     }
 
-    /// Whether the next token can begin an atomic type — used to bound type
-    /// application the same way [`at_expr_atom`](Self::at_expr_atom) bounds
-    /// expression application.
-    fn at_type_atom(&self) -> bool {
-        matches!(
-            self.peek(),
-            Some(tok) if matches!(
-                tok.tracked,
-                Kind::Identifier(_) | Kind::Fn | Kind::LeftBrace | Kind::LeftParen
-            )
-        )
-    }
-
-    /// Type application is left-associative, like term application: `F A B`
-    /// parses as `(F A) B`.
+    /// `<atom> [-> <type>]` — the arrow is the only type operator, and it is
+    /// right-associative, so `A -> B -> C` is `A -> (B -> C)`.
     fn type_expr(&mut self) -> Option<Type> {
-        let mut func = self.type_atom()?;
-        while self.at_type_atom() {
-            let arg = self.type_atom()?;
-            let span = func.span.merge(arg.span);
-            func = span.track(TypeKind::Apply {
-                func: Box::new(func),
-                arg: Box::new(arg),
-            });
+        let from = self.type_atom()?;
+        if self.eat_if(&Kind::Arrow).is_none() {
+            return Some(from);
         }
-        Some(func)
+        let to = self.type_expr()?;
+        let span = from.span.merge(to.span);
+        Some(span.track(TypeKind::Arrow {
+            from: Box::new(from),
+            to: Box::new(to),
+        }))
     }
 
+    /// A name, a struct, a parenthesized type, or `()`. The type language has
+    /// no binder and no application: every name written here denotes a type
+    /// outright, never a function from types to types.
     fn type_atom(&mut self) -> Option<Type> {
-        let tok = self.peek()?;
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
         let span = tok.span;
         match &tok.tracked {
-            Kind::Fn => self.function_type(),
             Kind::LeftBrace => self.struct_type(),
             Kind::LeftParen => self.paren_type(),
             Kind::Identifier(name) => {
@@ -470,21 +375,10 @@ impl Parser {
                 self.advance();
                 Some(span.track(TypeKind::Ident { name }))
             }
-            _ => Some(span.track(TypeKind::Unit)),
+            // As in [`atom`](Self::atom): a type position with no type in it is
+            // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
+            _ => self.unexpected(),
         }
-    }
-
-    /// `fn <arg>* => <type>` — a type-level lambda, sharing the `fn` header
-    /// grammar with expression functions.
-    fn function_type(&mut self) -> Option<Type> {
-        let kw = self.advance()?; // `fn`
-        let args = self.function_args()?;
-        let body = self.type_expr()?;
-        let span = kw.span.merge(body.span);
-        Some(span.track(TypeKind::Function {
-            args,
-            body: Box::new(body),
-        }))
     }
 
     /// `{ <field>: <type>, <field>: <type>, ... }` with an optional trailing
