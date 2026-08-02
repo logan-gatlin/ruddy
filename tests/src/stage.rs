@@ -57,6 +57,36 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     }
 }
 
+/// The notation is shared, but how far one spelling reaches is not. A `?4` is
+/// one entry of the solver's one table, so it is the same variable in every
+/// row of the Constraints and Solve tabs. A scheme's `'a` is not: generalization
+/// numbers each definition's quantifiers from `'a` again, so `id : 'a -> 'a`
+/// and `k : 'a -> 'b -> 'a` share a spelling and nothing else — and the page
+/// matches on spelling alone, which is why the Types tab has to say so.
+#[test]
+fn only_the_types_tab_scopes_a_name_to_its_row() {
+    let scoped = |id: &str| {
+        REGISTRY
+            .iter()
+            .find(|spec| spec.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+            .scoped
+    };
+    assert!(scoped("types"));
+    assert!(!scoped("constraints"));
+    assert!(!scoped("solve"));
+
+    // A stage that highlights nothing has nothing to scope, so saying it does
+    // would be a claim with no reading.
+    for spec in REGISTRY {
+        assert!(
+            !spec.scoped || spec.highlight.is_some(),
+            "{} scopes a pattern it does not declare",
+            spec.id
+        );
+    }
+}
+
 /// A stage that skipped or panicked is still the same stage. `annotates` is
 /// what the page reads to decide whether a stage owns a tab at all, so losing
 /// it on those paths turns an annotator into a second, empty panel — exactly
@@ -69,6 +99,7 @@ fn a_stage_that_did_not_run_still_describes_itself() {
             assert_eq!(stage.title, spec.title, "{}", spec.id);
             assert_eq!(stage.annotates, spec.annotates, "{}", spec.id);
             assert_eq!(stage.highlight, spec.highlight, "{}", spec.id);
+            assert_eq!(stage.scoped, spec.scoped, "{}", spec.id);
         }
     }
     // Otherwise the loop above proves nothing about annotators.

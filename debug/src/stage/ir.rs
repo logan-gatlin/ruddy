@@ -12,7 +12,7 @@ use ruddy::{
 
 use crate::{
     print,
-    stage::{Cx, Ids, Spec, Trace},
+    stage::{Cx, Ids, Spec, Trace, plural},
     wire::{Node, Stage},
 };
 
@@ -49,12 +49,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
     }
 
     let summary = format!(
-        "{} types · {} terms",
-        program.types.len(),
-        program.terms.len()
+        "{} · {}",
+        plural(program.types.len(), "type"),
+        plural(program.terms.len(), "term")
     );
     let stage = Stage {
-        micros: cx.micros.build,
+        micros: Some(cx.micros.build),
         nodes,
         debug: format!("{program:#?}"),
         ..spec.stage(cx.status(), summary)

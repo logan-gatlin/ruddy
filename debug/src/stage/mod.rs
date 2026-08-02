@@ -66,6 +66,9 @@ pub struct Spec {
     /// The runs of this stage's row text that name the same thing wherever
     /// they appear, as a regular expression. See [`Stage::highlight`].
     pub highlight: Option<&'static str>,
+    /// Whether those runs only name the same thing within one row. See
+    /// [`Stage::scoped`].
+    pub scoped: bool,
     /// The stage whose rows this one paints badges onto. A stage naming another
     /// owns no tab of its own.
     pub annotates: Option<&'static str>,
@@ -114,6 +117,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "Tokens",
         view: View::List,
         highlight: None,
+        scoped: false,
         annotates: None,
         build: Build::Panel(tokens::build),
     },
@@ -122,6 +126,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "AST",
         view: View::Tree,
         highlight: None,
+        scoped: false,
         annotates: None,
         build: Build::Panel(ast::build),
     },
@@ -130,6 +135,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "IR",
         view: View::Tree,
         highlight: None,
+        scoped: false,
         annotates: None,
         build: Build::Traced(ir::build),
     },
@@ -139,6 +145,7 @@ pub const REGISTRY: &[Spec] = &[
         view: View::Tree,
         // A constraint set is read by following one variable through it.
         highlight: Some(VARIABLES),
+        scoped: false,
         annotates: None,
         build: Build::Panel(constraints::build),
     },
@@ -149,6 +156,7 @@ pub const REGISTRY: &[Spec] = &[
         // One variable followed through the solve is the whole point of
         // stepping it.
         highlight: Some(VARIABLES),
+        scoped: false,
         annotates: None,
         build: Build::Panel(solve::build),
     },
@@ -157,8 +165,12 @@ pub const REGISTRY: &[Spec] = &[
         title: "Types",
         view: View::Tree,
         // Schemes are mostly concrete, so the `'a`s are what the eye is
-        // looking for.
+        // looking for — but only inside one scheme. Generalization numbers
+        // each definition's quantifiers from `'a` again, so `id`'s `'a` and
+        // `k`'s `'a` are two unrelated variables that happen to be spelled
+        // the same, and lighting one from the other would say otherwise.
         highlight: Some(VARIABLES),
+        scoped: true,
         annotates: None,
         build: Build::Panel(types::build),
     },
@@ -167,6 +179,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "Symbols",
         view: View::List,
         highlight: None,
+        scoped: false,
         annotates: None,
         build: Build::Panel(symbols::build),
     },
@@ -175,6 +188,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "Types",
         view: View::Tree,
         highlight: None,
+        scoped: false,
         annotates: Some("ir"),
         build: Build::Annotator(types::annotate),
     },
@@ -216,14 +230,27 @@ impl Spec {
             title: self.title,
             view: self.view,
             highlight: self.highlight,
+            scoped: self.scoped,
             status,
             summary: summary.into(),
-            micros: 0,
+            micros: None,
             nodes: Vec::new(),
             text: None,
             debug: String::new(),
             annotates: self.annotates,
         }
+    }
+}
+
+/// `1 step`, `4 steps` — a count and its noun, agreeing. Every stage summary is
+/// a phrase a person reads off the pane bar, and "1 constraints" in a tool whose
+/// whole subject is getting the details right is a poor advertisement for it.
+/// Written once because four stages counted something and three of them had
+/// spelled this out again.
+pub fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        _ => format!("{count} {noun}s"),
     }
 }
 

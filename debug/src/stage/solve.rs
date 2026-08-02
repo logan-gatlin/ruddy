@@ -14,7 +14,7 @@
 use ruddy::inference::Effect;
 
 use crate::{
-    stage::{Cx, Ids, Spec},
+    stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -33,35 +33,43 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .steps
         .iter()
         .map(|step| {
+            let effect = step.effect.to_string();
             let mut node = Node::new(ids.next(), step.rule.code(), step.goal.to_string())
                 .at(step.span)
                 // What the rule does, in the compiler's own words rather than
                 // the page's: one wording, wherever it is read.
                 .field("_rule", step.rule.to_string())
-                .field("_effect", step.effect.to_string())
+                .field("_effect", effect.clone())
                 .field("_depth", step.depth.to_string())
                 .field("_def", mint.name(step.definition).to_string());
 
             // The two fields the page accumulates, present only on the steps
             // that changed something, so the page appends without deciding.
             match &step.effect {
-                Effect::Bound { var, ty } => node = node.field("_bind", format!("?{var} := {ty}")),
+                // The solution panel is the `_effect` column's bindings
+                // collected, so it says what that column says — the compiler's
+                // own `Display for Effect` — rather than spelling `?4 := Nat`
+                // a second time here. It had been spelled twice, identically,
+                // which is two places for one notation to change in.
+                Effect::Bound { .. } => node = node.field("_bind", effect),
                 Effect::Failed(kind) => node = node.field("_error", kind.to_string()).error(),
                 Effect::None | Effect::Decomposed => {}
             }
 
+            // `owner`, not `symbol`: a step is spanned by the sub-expression
+            // its constraint came from, which is nowhere the definition's name
+            // was written. Claiming it as an occurrence made clicking `fst`
+            // paint `p.x` in the editor as a use of `fst`.
             if let Some(index) = cx.symbols.get(&step.definition) {
-                node = node.symbol(*index);
+                node = node.owner(*index);
             }
             node
         })
         .collect();
 
-    // No time of its own: the inference phase is timed once, on `Types`.
-    let summary = match nodes.len() {
-        1 => "1 step".to_string(),
-        count => format!("{count} steps"),
-    };
+    // No time of its own: the inference phase is timed once, on `Types`, which
+    // is what leaving `micros` unset says.
+    let summary = plural(nodes.len(), "step");
     Stage {
         nodes,
         debug: format!("{:#?}", output.steps),

@@ -1,5 +1,7 @@
 //! Tests for [`ruddy::inference`].
 
+use std::rc::Rc;
+
 use ruddy::{
     inference::{self, Effect, ErrorKind, Rule},
     ir::{self, Decl, Term, TermKind},
@@ -96,6 +98,42 @@ fn term_decl<'a>(mint: &Mint, out: &'a ir::Output, name: &str) -> &'a Decl<Term>
     &out.program.terms[&symbol]
 }
 
+/// The type of every term in a definition's body, outermost first — the set
+/// the debugger paints onto the IR tab as badges.
+fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
+    let mut out = vec![term.ty.clone()];
+    match &term.kind {
+        TermKind::Apply { func, arg } => {
+            out.extend(body_tys(func));
+            out.extend(body_tys(arg));
+        }
+        TermKind::Fn { body, .. } => out.extend(body_tys(body)),
+        TermKind::Struct(fields) => {
+            for field in fields.values() {
+                out.extend(body_tys(&field.value));
+            }
+        }
+        TermKind::Project { base, .. } => out.extend(body_tys(base)),
+        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+    }
+    out
+}
+
+fn body_types(term: &Term) -> Vec<String> {
+    body_tys(term).iter().map(Rc::<Ty>::to_string).collect()
+}
+
+/// Whether a type still names one of the solver's variables anywhere inside
+/// it. `Ty::Undecided` does not count: it is a type, and it prints as one.
+fn mentions_a_variable(ty: &Ty) -> bool {
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
+        Ty::Struct(fields) => fields.values().any(|ty| mentions_a_variable(ty)),
+        Ty::Nat | Ty::Bound(_) | Ty::Undecided => false,
+    }
+}
+
 #[test]
 fn a_literal_is_a_nat() {
     let (mint, out, output) = inferred("let n = 1");
@@ -117,6 +155,48 @@ fn the_identity_generalizes() {
         panic!("expected a lambda");
     };
     assert_eq!(body.ty.to_string(), "'a");
+}
+
+/// Nothing downstream is given the solver's variable table, so nothing
+/// downstream can read a `?N`. Resolving the body against the substitution
+/// generalization happened to build covered only the variables the
+/// definition's own type mentions, and a body is larger than that — so a
+/// subterm came out spelled in a notation only the solver could read.
+#[test]
+fn no_subterm_keeps_a_solver_variable() {
+    // `a : Nat` mentions nothing of the argument's type, so the substitution
+    // generalization built for it is empty; the argument is still a lambda
+    // with a type of its own.
+    let (mint, out, output) = inferred("let k = fn x => fn y => x\nlet a = k 1 (fn z => z)");
+    assert_eq!(scheme(&mint, &output, "a"), "Nat");
+    assert_eq!(
+        body_types(&term_decl(&mint, &out, "a").value),
+        [
+            "Nat",
+            "('a -> 'a) -> Nat",
+            "Nat -> ('a -> 'a) -> Nat",
+            "Nat",
+            "'a -> 'a",
+            "'a",
+        ]
+    );
+
+    // The promise stated as the property it is, over a program that reaches
+    // every arm of the walk — errors, which recover, included.
+    let (_, out, _) = infer_src(
+        "type Endo = Nat -> Nat\n\
+         let id : Endo = fn x => x\n\
+         let k = fn x => fn y => x\n\
+         let a = k { p: id } (fn z => z)\n\
+         let b = a.p 1\n\
+         let bad = 1 1\n\
+         let worse = fn q => q.nope\n",
+    );
+    for decl in out.program.terms.values() {
+        for ty in body_tys(&decl.value) {
+            assert!(!mentions_a_variable(&ty), "{ty}");
+        }
+    }
 }
 
 #[test]
@@ -195,6 +275,142 @@ fn an_annotation_mismatch_is_one_error() {
     assert_eq!(expected.to_string(), "Nat");
 }
 
+/// An application's mismatch is worded from the function's side: what the
+/// parameter demands is the expectation and what was passed is the finding.
+/// Emission is the only place that can get this right — the solver decomposes
+/// structurally and swaps nothing — and getting it backwards named the user's
+/// annotation as the mistake and their mistake as the expectation.
+#[test]
+fn an_argument_mismatch_names_the_parameter_as_the_expectation() {
+    let (_, _, output) = infer_src("let f : Nat -> Nat = fn x => x\nlet y = f {}");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `Nat`, found `{}`"
+    );
+
+    let (_, _, output) =
+        infer_src("let f : { x: Nat } -> Nat = fn p => p.x\nlet y = f { x: 1, z: 2 }");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `{ x: Nat }`, found `{ x: Nat, z: Nat }`"
+    );
+
+    // The annotation path words its own mismatch the same way round, and did
+    // before: fixing applications must not have got there by swapping both.
+    let (_, _, output) = infer_src("let p : { x: Nat } = { x: 1, y: 2 }");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `{ x: Nat }`, found `{ x: Nat, y: Nat }`"
+    );
+
+    // The same wording when the function is not an arrow until the solver
+    // makes it one. Generation cannot see that coming, so this is the case
+    // that came out backwards — ``expected `{}`, found `Nat` `` — naming the
+    // parameter the first call had established as what the second call found.
+    let src = "let f = fn g => { a: g 1, b: g {} }";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `Nat`, found `{}`"
+    );
+    // And reported at the argument, not at the whole application: the
+    // argument is the part the reader can change.
+    assert_eq!(error.span.start, src.find("g {}").expect("the call") + 2);
+
+    // Applying something that is no function at all is the other complaint,
+    // and it reads the other way round: the call site is what demands an
+    // arrow, and the callee is what turned out not to be one.
+    //
+    // The demanded parameter prints as `?` rather than as the argument's type
+    // because it is a variable of its own. Writing the argument into the
+    // demanded arrow is what worded the mismatch above backwards, and it made
+    // this arrow's own specificity an accident of the argument being a
+    // literal: for `fn x => 1 x` the same mistake read `Nat -> ?` or `? -> ?`
+    // depending only on where else in the definition `x` was mentioned.
+    let (_, _, output) = infer_src("let bad = 1 1");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `? -> ?`, found `Nat`"
+    );
+}
+
+/// A term that failed to type is undecided, not polymorphic. Reporting without
+/// recovering left the abandoned variable unbound, generalization quantified
+/// it, and the scheme that came out fitted every later use — so one mistake
+/// silently licensed everything written on top of it.
+#[test]
+fn a_failed_definition_is_undecided_rather_than_polymorphic() {
+    let (mint, _, output) = infer_src("let bad = 1 1\nlet ok : Nat = bad\nlet ok2 = bad 5");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(scheme(&mint, &output, "bad"), "?");
+    assert_eq!(scheme(&mint, &output, "ok2"), "?");
+
+    // The same for a definition abandoned by a projection rather than by a
+    // mismatch: neither the base it never learned nor the result it never
+    // produced may come back quantified.
+    let (mint, _, output) = infer_src("let f = fn x => x.y\nlet g = f { y: 1 }");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(scheme(&mint, &output, "f"), "? -> ?");
+    assert_eq!(scheme(&mint, &output, "g"), "?");
+
+    // And for one abandoned by the occurs check. The call site says `f` is a
+    // function before the argument asks it to be its own argument, so that
+    // much of the shape survives what the occurs check abandons — what must
+    // not survive is a quantifier, which is the whole point.
+    let (mint, _, output) = infer_src("let t = fn f => f f");
+    assert_eq!(scheme(&mint, &output, "t"), "(? -> ?) -> ?");
+    assert!(
+        !scheme(&mint, &output, "t").contains('\''),
+        "a definition that failed to type came back quantified"
+    );
+}
+
+/// The occurs check failing is not a variable taking a type. A step naming
+/// `Rule::Bind` above an effect reading "recursive type" tells whoever is
+/// stepping through the solve the opposite of what happened.
+#[test]
+fn a_failed_occurs_check_is_a_rule_of_its_own() {
+    let (mint, _, output) = infer_src("let t = fn f => f f");
+    assert_eq!(
+        steps(&mint, &output, "t"),
+        [
+            // Being applied makes `f` a function, which is true and is bound.
+            "bind  ?1 -> ?2 ~ ?0 => ?0 := ?1 -> ?2",
+            // Only the argument asks `f` to be its own parameter.
+            "occurs  ?1 ~ ?1 -> ?2 => recursive type",
+            "recover  ?1 ~ ? => ?1 := ?",
+            "recover  ?2 ~ ? => ?2 := ?",
+        ]
+    );
+    // No step claims to have bound anything by the rule that failed. The bind
+    // above is a different step, which succeeded and says so; what must never
+    // appear is a failure labelled as one.
+    assert!(
+        output
+            .steps
+            .iter()
+            .filter(|step| matches!(step.effect, Effect::Failed(_)))
+            .all(|step| step.rule == Rule::Occurs),
+        "{:#?}",
+        output.steps
+    );
+}
+
 #[test]
 fn a_missing_field_names_the_struct() {
     let src = "let f : { x: Nat } -> Nat = fn p => p.y";
@@ -218,17 +434,137 @@ fn a_missing_field_names_the_struct() {
 fn an_unannotated_projection_asks_for_an_annotation() {
     // Unification can only equate a variable with a type it is given, and
     // nothing here gives it one: `p.x` says the base has an `x`, not what the
-    // base is. So this is an error, and the payload being a variable rather
-    // than a concrete type is what tells the reporter to suggest an
-    // annotation instead of naming what went wrong.
+    // base is. So this is an error — and a different one from projecting out
+    // of a type that is not a struct, because there is no type to name and the
+    // fix is an annotation rather than a different base.
     let (_, _, output) = infer_src("let f = fn p => p.x");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    let ErrorKind::NotAStruct { base } = &error.kind else {
-        panic!("expected a projection error: {:#?}", error.kind);
+    assert!(
+        matches!(error.kind, ErrorKind::UnknownBase),
+        "expected an unknown base: {:#?}",
+        error.kind
+    );
+    assert_eq!(
+        error.kind.to_string(),
+        "cannot infer the type being projected from; annotate it"
+    );
+}
+
+/// Whether a message names one of the solver's own variables.
+fn names_a_solver_index(message: &str) -> bool {
+    message
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'?' && pair[1].is_ascii_digit())
+}
+
+/// A diagnostic spells a type the way the scheme beside it spells the same
+/// type. An unsolved variable that reaches the reader as `?7` names the
+/// solver's bookkeeping rather than anything they wrote — and the index is a
+/// counter over the whole program, so it is not even a number they could count
+/// to. Resolving error payloads against an empty substitution left every one
+/// of them like that, beside a scheme calling the same type `'a`.
+#[test]
+fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
+    let src = "let g = fn x y => ({ p: x, q: y }).missing";
+    let (mint, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert!(matches!(**base, Ty::Var(_)), "base was {base}");
+    assert_eq!(
+        error.kind.to_string(),
+        "no field `missing` on `{ p: 'a, q: 'b }`"
+    );
+    assert_eq!(scheme(&mint, &output, "g"), "'a -> 'b -> ?");
+
+    // The counter runs over the whole program, so a definition solved after
+    // others is where an index shows through as something unplaceable.
+    let (_, _, output) = infer_src(&format!("let f = fn a b c => {{ p: a, q: b, r: c }}\n{src}"));
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "no field `missing` on `{ p: 'a, q: 'b }`"
+    );
+
+    // Every payload that carries a type, over every complaint that has one.
+    for src in [
+        "let h = fn g => (fn z => g z).b",
+        "let m = fn x y => ({ p: x, q: y }).missing",
+        "let n = fn x => x.a",
+        "let o = fn x => { a: x 1, b: x {} }",
+        "let p : Nat = fn a => a",
+        "let q = fn f => f f",
+    ] {
+        let (_, _, output) = infer_src(src);
+        for error in &output.errors {
+            let message = error.kind.to_string();
+            assert!(!names_a_solver_index(&message), "{src}: {message}");
+        }
+    }
+}
+
+/// Which of the two projection complaints an error is, is settled where the
+/// solver gives up — because giving up is itself what points the base at
+/// `Ty::Undecided`. Deriving the wording from the payload afterwards read the
+/// solver's own recovery as knowledge and told the reader about a type `?`
+/// they never wrote.
+#[test]
+fn a_projection_complaint_keeps_the_wording_it_was_reported_with() {
+    // Two stuck projections, and the first one recovered before the second was
+    // reported: both are still the actionable complaint, at both spans.
+    let src = "let r = fn x => (fn y => y.q) x.a";
+    let (_, _, output) = infer_src(src);
+    let wordings: Vec<String> = output
+        .errors
+        .iter()
+        .map(|error| format!("{}: {}", error.span.start, error.kind))
+        .collect();
+    assert_eq!(
+        wordings,
+        [
+            format!(
+                "{}: cannot infer the type being projected from; annotate it",
+                src.find("y.q").expect("the inner base")
+            ),
+            format!(
+                "{}: cannot infer the type being projected from; annotate it",
+                src.find("x.a").expect("the outer base")
+            ),
+        ]
+    );
+
+    // The other wording is for a base that really is a type, and it still says
+    // which type.
+    let (_, _, output) = infer_src("let n = 1\nlet bad = n.x");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "cannot project a field out of `Nat`"
+    );
+}
+
+/// A chain of projections off one unknown base is one complaint. Abandoning
+/// the first link points the second link's base at `Ty::Undecided`, and every
+/// link after that has nothing of its own to say: the type it would name is
+/// one the solver invented while recovering.
+#[test]
+fn a_projection_chain_complains_once() {
+    let (_, _, output) = infer_src("let r = fn x => x.a.b.c");
+    let messages: Vec<String> = output
+        .errors
+        .iter()
+        .map(|error| error.kind.to_string())
+        .collect();
+    assert_eq!(
+        messages,
+        ["cannot infer the type being projected from; annotate it"]
+    );
 }
 
 #[test]
@@ -387,16 +723,93 @@ fn a_failure_is_a_step_that_failed() {
 #[test]
 fn giving_up_on_a_goal_is_a_step_of_its_own() {
     // Nothing ever says what `p` is, so the projection is deferred, gives up,
-    // and points its result at `?`. That last part changes the solution, so it
-    // has to be a step: otherwise a reader watching the state would see `?1`
-    // acquire a value that no rule they were shown gave it.
+    // and points both the base it never learned and the result it cannot
+    // produce at `?`. That last part changes the solution, so it has to be a
+    // step: otherwise a reader watching the state would see `?1` acquire a
+    // value that no rule they were shown gave it.
     let (mint, _, output) = infer_src("let f = fn p => p.x");
     assert_eq!(
         steps(&mint, &output, "f"),
         [
             "defer  ?0.x ~ ?1 => no change",
             "stuck  ?0.x ~ ?1 => cannot infer the type being projected from; annotate it",
+            "recover  ?0 ~ ? => ?0 := ?",
             "recover  ?1 ~ ? => ?1 := ?",
         ]
+    );
+}
+
+/// Two structs line up when they carry exactly the same field names, in
+/// whatever order — and it is one rule, applied by both passes. Generation
+/// decides it when it checks a literal against an annotation and the solver
+/// decides it again when it unifies two struct types, and the two had spelled
+/// it out separately: a pair of maps one arm would take apart field by field
+/// while the other refused to equate them at all was a difference nothing
+/// would have reported.
+///
+/// Exact field sets are the current choice rather than an oversight. The two
+/// halves below are what would change if the language ever adopted width
+/// subtyping, which is why they are pinned here as well as commented there.
+#[test]
+fn a_struct_matches_on_its_field_names_in_both_passes() {
+    // Order is not part of a record's identity. The annotated definition is
+    // decided by checking; the argument at the call site can only be equated,
+    // so it is decided by unification.
+    inferred("let p : { a: Nat, b: Nat } = { b: 2, a: 1 }");
+    inferred("let f : { a: Nat, b: Nat } -> Nat = fn r => r.a\nlet y = f { b: 2, a: 1 }");
+
+    // A field too many, and a field too few. Both are refused, by both passes,
+    // and refused as one mismatch of whole types rather than as a complaint
+    // per field.
+    for (src, expected, actual) in [
+        (
+            "let p : { a: Nat } = { a: 1, b: 2 }",
+            "{ a: Nat }",
+            "{ a: Nat, b: Nat }",
+        ),
+        (
+            "let f : { a: Nat } -> Nat = fn r => r.a\nlet y = f { a: 1, b: 2 }",
+            "{ a: Nat }",
+            "{ a: Nat, b: Nat }",
+        ),
+        (
+            "let p : { a: Nat, b: Nat } = { a: 1 }",
+            "{ a: Nat, b: Nat }",
+            "{ a: Nat }",
+        ),
+        (
+            "let f : { a: Nat, b: Nat } -> Nat = fn r => r.a\nlet y = f { a: 1 }",
+            "{ a: Nat, b: Nat }",
+            "{ a: Nat }",
+        ),
+    ] {
+        let (_, _, output) = infer_src(src);
+        let [error] = output.errors.as_slice() else {
+            panic!("expected exactly one error for {src}: {:#?}", output.errors);
+        };
+        assert_eq!(
+            error.kind.to_string(),
+            format!("type mismatch: expected `{expected}`, found `{actual}`"),
+            "{src}"
+        );
+    }
+}
+
+/// A projection whose base nothing has explained yet is set aside and retried,
+/// and what is set aside is the projection — its two spans, its name and its
+/// result — rather than a constraint every round has to re-establish is a field
+/// one. Here `q.b` is emitted before the projection that decides what `q` is,
+/// so the first round can only defer it and a later one is what reads it.
+#[test]
+fn a_projection_is_deferred_until_a_later_round_knows_its_base() {
+    let (_, _, output) = inferred("let f : { a: { b: Nat } } -> Nat = fn p => (fn q => q.b) p.a");
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    let deferred = rules
+        .iter()
+        .position(|rule| *rule == Rule::Defer)
+        .unwrap_or_else(|| panic!("nothing was deferred: {rules:?}"));
+    assert!(
+        rules[deferred..].contains(&Rule::Project),
+        "the deferred projection was never retried: {rules:?}"
     );
 }

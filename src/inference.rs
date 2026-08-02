@@ -31,11 +31,7 @@
 //! type still has a type, [`Ty::Undecided`], which unifies with everything so
 //! that one mistake is reported once rather than echoed by every consumer.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    rc::Rc,
-};
+use std::{collections::HashMap, fmt, rc::Rc};
 
 use indexmap::IndexMap;
 
@@ -43,7 +39,7 @@ use crate::{
     ir::{Program, Term, TermKind, Type, TypeKind},
     symbol::Symbol,
     tracking::Span,
-    types::{Binding, Scheme, Slot, Ty, TyVar},
+    types::{Scheme, Ty, TyVar},
 };
 
 #[derive(Debug, Clone)]
@@ -91,8 +87,10 @@ pub struct Step {
     pub effect: Effect,
 }
 
-/// The case of the solver that fired. One per arm of [`Solve::unify`], plus the
-/// three a deferred projection can take.
+/// The case of the solver that fired. One per arm of [`Solve::unify`] — with
+/// the occurs check counting as its own, since it is the arm *not* applying —
+/// plus the three a deferred projection can take and the recovery that follows
+/// every failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// One side is [`Ty::Undecided`], which unifies with anything.
@@ -101,6 +99,12 @@ pub enum Rule {
     Same,
     /// A variable against a type: the only rule that grows the solution.
     Bind,
+    /// A variable against a type that contains it. The occurs check fired, so
+    /// the binding [`Rule::Bind`] would have made was not made — a rule of its
+    /// own rather than a `Bind` that failed, because a reader shown "a variable
+    /// takes the type it is against" above an effect reading "recursive type"
+    /// is being told the opposite of what happened.
+    Occurs,
     /// Two identical primitives.
     Prim,
     /// Two arrows, taken apart into argument and result.
@@ -115,8 +119,8 @@ pub enum Rule {
     Defer,
     /// A projection put back one round too many: nothing left will explain it.
     Stuck,
-    /// Pointing an abandoned goal's result at [`Ty::Undecided`] so that one
-    /// failure is not echoed by everything downstream of it.
+    /// Pointing what an abandoned goal would have decided at [`Ty::Undecided`]
+    /// so that one failure is not echoed by everything downstream of it.
     Recover,
 }
 
@@ -146,8 +150,9 @@ pub struct Constraint {
 #[derive(Debug, Clone)]
 pub enum ConstraintKind {
     /// Two types the program requires to be the same. `expected` is the side
-    /// the context demanded — an annotation, or the shape an application needs
-    /// — and `actual` is what the term turned out to be, which is the order a
+    /// the context demanded — an annotation, a function's parameter, or the
+    /// arrow shape a call site needs of something that is not one — and
+    /// `actual` is what the term turned out to be, which is the order a
     /// mismatch is worded in.
     Equal { expected: Rc<Ty>, actual: Rc<Ty> },
     /// `base` must be a struct with a `name` field, whose type is `result`.
@@ -177,21 +182,47 @@ pub struct Error {
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
     /// Two types that had to be equal are not. `expected` is the side the
-    /// context demanded — an annotation, or the shape an application needs —
-    /// and `actual` is what the term turned out to be.
+    /// context demanded — an annotation, a function's parameter, or the arrow
+    /// shape a call site needs — and `actual` is what the term turned out to
+    /// be.
     Mismatch { expected: Rc<Ty>, actual: Rc<Ty> },
     /// The occurs check fired: a variable would have to contain itself, as in
     /// `fn x => x x`. The cycle is reported rather than constructed, so the
     /// type language stays finite trees.
     Recursive,
-    /// Projection out of a type that is not — or never became — a struct. A
-    /// base that is still a variable when the solver runs out of constraints
-    /// lands here too: nothing in the definition ever said what it was.
+    /// Projection out of a type that is not a struct: `1.x`, or a field read
+    /// off a function.
     NotAStruct { base: Rc<Ty> },
+    /// Projection out of a base nothing in the definition ever said the type
+    /// of, as in an unannotated `fn p => p.x`. The fix is an annotation rather
+    /// than a different base, so it is a complaint of its own rather than a
+    /// [`ErrorKind::NotAStruct`] whose payload happens to be a variable: which
+    /// of the two it is has to be decided where the solver gives up, because
+    /// giving up is itself what points that variable at [`Ty::Undecided`].
+    UnknownBase,
     /// Projection of a field the struct does not have. The name is carried
     /// rather than left to be read back out of the source, so the message can
     /// be written once here instead of once per reporter.
     MissingField { base: Rc<Ty>, field: String },
+}
+
+/// What one type variable is known to be. Private to inference, and rightly so:
+/// it is the solver's working state rather than part of the type language, and
+/// nothing downstream ever sees a [`Ty::Var`] to want a slot for — generalizing
+/// and zonking are what make sure of that.
+#[derive(Debug, Clone)]
+enum Slot {
+    Unbound { level: u32 },
+    Bound(Rc<Ty>),
+}
+
+/// What one name in scope means. Private for the same reason as [`Slot`]: a
+/// binding exists only while a definition is being walked, and what survives
+/// the walk is the [`Scheme`] in [`Output::schemes`].
+#[derive(Debug, Clone)]
+enum Binding {
+    Mono(Rc<Ty>),
+    Poly(Scheme),
 }
 
 /// Every type variable ever minted, and the level fresh ones are born at.
@@ -218,6 +249,28 @@ struct Constrain<'a> {
     /// lambda argument can never collide with a top-level definition.
     env: &'a mut HashMap<Symbol, Binding>,
     out: Vec<Constraint>,
+}
+
+/// A [`ConstraintKind::Field`] taken apart once, at the moment the solver sets
+/// it aside.
+///
+/// Projections are the constraints that cannot be answered in the order they
+/// arrived, so they are collected and retried until a round learns nothing.
+/// Collecting them as whole [`Constraint`]s meant every use re-destructured a
+/// kind whose shape had already been established, behind an `unreachable!` that
+/// could only ever be read as noise. Taking them apart where it is *known* they
+/// are field constraints leaves the retry loop with the four things it uses and
+/// no arm to explain.
+struct Projection {
+    /// Where the field name was written — the only part of a projection the
+    /// user can change when the struct does not have it.
+    span: Span,
+    base: Rc<Ty>,
+    /// Where the base was written. A base that is not a struct is a complaint
+    /// about the base, not about the field name.
+    base_span: Span,
+    name: String,
+    result: Rc<Ty>,
 }
 
 /// Pass two: the solver, which sees constraints and never terms.
@@ -279,6 +332,11 @@ pub fn infer(program: &mut Program) -> Output {
         };
         let generated = constrain.out;
 
+        // Where this definition's complaints begin. Each is resolved against
+        // the substitution its own definition ends with, so which ones are its
+        // own has to be marked before the next solve appends to the list.
+        let reported = errors.len();
+
         Solve {
             table: &mut table,
             errors: &mut errors,
@@ -289,11 +347,19 @@ pub fn infer(program: &mut Program) -> Output {
         .run(&generated);
 
         table.level = 0;
-        let (scheme, subst) = table.generalize(&ty);
+        let (scheme, mut subst) = table.generalize(&ty);
         // With the substitution in hand, resolve every type the walk wrote
         // into the body, so a term's type and its definition's scheme spell
         // the same variable the same way.
-        table.zonk_term(&mut decl.value, &subst);
+        table.zonk_term(&mut decl.value, &mut subst);
+        // And the same for what it complained about, which is why this waits
+        // until the definition is solved rather than running where the error
+        // was reported: a variable in a payload may have been solved after the
+        // fact, and the later knowledge reads better. Nothing past here can
+        // touch this definition's variables, so this is the last word on them.
+        for error in &mut errors[reported..] {
+            error.kind = table.zonk_error(&error.kind, &mut subst);
+        }
         env.insert(*symbol, Binding::Poly(scheme.clone()));
         schemes.insert(*symbol, scheme);
         constraints.insert(*symbol, generated);
@@ -304,30 +370,6 @@ pub fn infer(program: &mut Program) -> Output {
     // that back; the sort is stable, so two complaints about one span keep the
     // order the solver found them in.
     errors.sort_by_key(|error| error.span.start);
-
-    // Error payloads resolve last: a variable in one may have been solved
-    // after the error was recorded, and the later knowledge reads better.
-    let none = HashMap::new();
-    let errors = errors
-        .iter()
-        .map(|error| Error {
-            span: error.span,
-            kind: match &error.kind {
-                ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
-                    expected: table.zonk(expected, &none),
-                    actual: table.zonk(actual, &none),
-                },
-                ErrorKind::Recursive => ErrorKind::Recursive,
-                ErrorKind::NotAStruct { base } => ErrorKind::NotAStruct {
-                    base: table.zonk(base, &none),
-                },
-                ErrorKind::MissingField { base, field } => ErrorKind::MissingField {
-                    base: table.zonk(base, &none),
-                    field: field.clone(),
-                },
-            },
-        })
-        .collect();
 
     Output {
         aliases,
@@ -358,6 +400,7 @@ impl Rule {
             Rule::Absorb => "absorb",
             Rule::Same => "same",
             Rule::Bind => "bind",
+            Rule::Occurs => "occurs",
             Rule::Prim => "prim",
             Rule::Arrow => "arrow",
             Rule::Struct => "struct",
@@ -379,6 +422,7 @@ impl fmt::Display for Rule {
             Rule::Absorb => "one side is undecided, which unifies with anything",
             Rule::Same => "already the same variable",
             Rule::Bind => "a variable takes the type it is against",
+            Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
             Rule::Prim => "the same primitive on both sides",
             Rule::Arrow => "two arrows: argument against argument, result against result",
             Rule::Struct => "two structs: field against field, matched by name",
@@ -412,6 +456,7 @@ impl ErrorKind {
             ErrorKind::Mismatch { .. } => "type-mismatch",
             ErrorKind::Recursive => "recursive-type",
             ErrorKind::NotAStruct { .. } => "not-a-struct",
+            ErrorKind::UnknownBase => "unknown-base",
             ErrorKind::MissingField { .. } => "missing-field",
         }
     }
@@ -447,15 +492,12 @@ impl fmt::Display for ErrorKind {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }
             ErrorKind::Recursive => f.write_str("recursive type"),
-            // A base that is still a variable means inference never learned
-            // enough, which asks for an annotation rather than a different
-            // base — the message has to say which problem it is.
-            ErrorKind::NotAStruct { base } => match **base {
-                Ty::Var(_) => {
-                    f.write_str("cannot infer the type being projected from; annotate it")
-                }
-                _ => write!(f, "cannot project a field out of `{base}`"),
-            },
+            ErrorKind::NotAStruct { base } => {
+                write!(f, "cannot project a field out of `{base}`")
+            }
+            ErrorKind::UnknownBase => {
+                f.write_str("cannot infer the type being projected from; annotate it")
+            }
             ErrorKind::MissingField { base, field } => {
                 write!(f, "no field `{field}` on `{base}`")
             }
@@ -473,19 +515,29 @@ impl Table {
     /// Follow bound variables until reaching something that is not one. Only
     /// the head is resolved; a composite's children still need their own
     /// resolution, which is what [`zonk`](Self::zonk) does exhaustively.
+    ///
+    /// What guarantees this terminates is the occurs check, not anything here:
+    /// [`assign`](Solve::assign) refuses every binding that would put a
+    /// variable inside its own type, so a chain of bindings can never close a
+    /// cycle and following one strictly shrinks what is left to follow. This is
+    /// the solver's hottest path — every rule resolves both its sides — so it
+    /// pays for no bookkeeping of its own.
+    ///
+    /// The budget is not that guarantee restated; it is a bound on what a bug
+    /// in the occurs check would cost. A chain that follows more bindings than
+    /// there are variables has visited one of them twice, so an off counter is
+    /// a panic the debugger renders rather than a hang that says nothing.
     fn resolve(&self, ty: &Rc<Ty>) -> Rc<Ty> {
         let mut ty = ty.clone();
-        let mut visited = HashSet::new();
+        let mut budget = self.vars.len();
         while let Ty::Var(v) = &*ty {
-            match &self.vars[*v as usize] {
-                Slot::Bound(inner) => {
-                    if !visited.insert(inner.as_ref() as *const Ty) {
-                        panic!("Circular reference in a type");
-                    };
-                    ty = inner.clone()
-                }
-                Slot::Unbound { .. } => break,
-            }
+            let Slot::Bound(inner) = &self.vars[*v as usize] else {
+                break;
+            };
+            budget = budget
+                .checked_sub(1)
+                .expect("a chain of bound variables closed a cycle the occurs check should refuse");
+            ty = inner.clone();
         }
         ty
     }
@@ -523,7 +575,7 @@ impl Table {
     /// Quantify everything in `ty` still unsolved deeper than the current
     /// level. Returns the scheme and the substitution that built it, so the
     /// caller can spell the same variables the same way elsewhere.
-    fn generalize(&mut self, ty: &Rc<Ty>) -> (Scheme, HashMap<TyVar, u32>) {
+    fn generalize(&self, ty: &Rc<Ty>) -> (Scheme, HashMap<TyVar, u32>) {
         let mut subst = HashMap::new();
         self.quantify(ty, &mut subst);
         let body = self.zonk(ty, &subst);
@@ -579,8 +631,26 @@ impl Table {
 
     /// [`zonk`](Self::zonk) applied to every type the walk wrote into a
     /// definition's body, once the definition is solved.
-    fn zonk_term(&self, term: &mut Term, subst: &HashMap<TyVar, u32>) {
-        term.ty = self.zonk(&term.ty, subst);
+    ///
+    /// The substitution grows as the walk goes, because the body is a larger
+    /// domain than the definition's own type: in `let a = k 1 (fn z => z)` the
+    /// argument is typed `?5 -> ?5`, which `a : Nat` never mentions and
+    /// generalization therefore never numbered. A variable like that is
+    /// unconstrained rather than unknown, so it is quantified here and
+    /// numbered on from the scheme's — which leaves no [`Ty::Var`] anywhere in
+    /// the program for a consumer to have to resolve, and still spells a
+    /// variable the scheme does name the way the scheme names it.
+    /// Resolve `ty` and give a name to whatever is still unsolved in it,
+    /// numbering on from `subst` so that a variable the scheme already named
+    /// keeps that name. The one rule everything outliving the solver goes
+    /// through, so no two of them can spell one variable differently.
+    fn close(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>) -> Rc<Ty> {
+        self.quantify(ty, subst);
+        self.zonk(ty, subst)
+    }
+
+    fn zonk_term(&self, term: &mut Term, subst: &mut HashMap<TyVar, u32>) {
+        term.ty = self.close(&term.ty, subst);
         match &mut term.kind {
             TermKind::Apply { func, arg } => {
                 self.zonk_term(func, subst);
@@ -596,12 +666,51 @@ impl Table {
             TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
         }
     }
+
+    /// [`close`](Self::close) applied to the types one complaint carries.
+    ///
+    /// Only the types move: which complaint this *is* was settled where it was
+    /// reported, by the code that knew why, so nothing here can reword one by
+    /// re-reading a payload the solve went on to change.
+    ///
+    /// A payload can name a variable neither the scheme nor the body does —
+    /// the parameter of something that turned out not to be a function belongs
+    /// to no term — so this quantifies as it goes rather than reading a
+    /// finished substitution. Left alone, such a variable would reach the
+    /// reader as `?7`, which names the solver's bookkeeping rather than
+    /// anything they wrote, and would spell as `?7` a type the scheme beside
+    /// it spells `'a`.
+    fn zonk_error(&self, kind: &ErrorKind, subst: &mut HashMap<TyVar, u32>) -> ErrorKind {
+        match kind {
+            ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
+                expected: self.close(expected, subst),
+                actual: self.close(actual, subst),
+            },
+            ErrorKind::Recursive => ErrorKind::Recursive,
+            ErrorKind::NotAStruct { base } => ErrorKind::NotAStruct {
+                base: self.close(base, subst),
+            },
+            ErrorKind::UnknownBase => ErrorKind::UnknownBase,
+            ErrorKind::MissingField { base, field } => ErrorKind::MissingField {
+                base: self.close(base, subst),
+                field: field.clone(),
+            },
+        }
+    }
 }
 
 impl Constrain<'_> {
-    /// Record that two types have to be the same. The walk's only verb: it
-    /// says so and moves on, which is the whole of what generation does.
-    fn equal(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
+    /// Record that `actual` — the type a term turned out to have — has to be
+    /// the type the context demanded of it. The walk's only verb: it says so
+    /// and moves on, which is the whole of what generation does.
+    ///
+    /// The demand goes last, and the name says which way round that is,
+    /// because nothing downstream can put it back: [`Solve::unify`]
+    /// decomposes structurally and swaps nothing, so a mismatch is worded in
+    /// whatever order this was called in. An arm that had to remember an
+    /// `expected, actual` pair got applications backwards and told the reader
+    /// their annotation was the mistake.
+    fn checks(&mut self, span: Span, actual: &Rc<Ty>, expected: &Rc<Ty>) {
         self.out.push(Constraint {
             span,
             kind: ConstraintKind::Equal {
@@ -626,12 +735,50 @@ impl Constrain<'_> {
             TermKind::Apply { func, arg } => {
                 self.infer_term(func);
                 self.infer_term(arg);
-                let result = self.table.fresh();
-                let wanted = Rc::new(Ty::Arrow(arg.ty.clone(), result.clone()));
-                // The function side is the `actual`: applying a non-function
-                // should read as "expected an arrow, found what you applied".
-                self.equal(span, &wanted, &func.ty.clone());
-                result
+                let applied = func.ty.clone();
+                match &*applied {
+                    // The function already knows what it takes, so the demand
+                    // on the argument is the parameter type and the result is
+                    // the arrow's own. Written this way round, a mismatch
+                    // reads "expected <parameter>, found <argument>": the
+                    // parameter is what the context asked for, and the
+                    // argument is the term the reader can change.
+                    Ty::Arrow(from, to) => {
+                        let (from, to) = (from.clone(), to.clone());
+                        let actual = arg.ty.clone();
+                        self.checks(arg.span, &actual, &from);
+                        to
+                    }
+                    // Nothing is known about the function yet, so what the
+                    // call site demands is the arrow shape itself, and the
+                    // function is the term being checked against it: applying
+                    // a non-function reads as "expected an arrow, found what
+                    // you applied".
+                    //
+                    // The parameter is a variable of its own, and the argument
+                    // is checked against it in a second constraint, because
+                    // writing the argument into the demanded arrow asks two
+                    // questions at once and answers both wrong as soon as the
+                    // function turns out to be an arrow after all.
+                    // [`Solve::unify`] decomposes without swapping, so the
+                    // argument would come back out on the `expected` side and
+                    // a mismatch would name the parameter as what was found —
+                    // the very inversion [`Constrain::checks`] is ordered to
+                    // prevent — carrying the whole application's span instead
+                    // of the argument's. And a function that is not one would
+                    // abandon the argument's type along with the arrow it was
+                    // written into, since [`Solve::fail`] cannot tell which
+                    // half of a demand the failure was about.
+                    _ => {
+                        let param = self.table.fresh();
+                        let result = self.table.fresh();
+                        let wanted = Rc::new(Ty::Arrow(param.clone(), result.clone()));
+                        self.checks(span, &applied, &wanted);
+                        let actual = arg.ty.clone();
+                        self.checks(arg.span, &actual, &param);
+                        result
+                    }
+                }
             }
             TermKind::Fn { arg, body } => {
                 let param = self.table.fresh();
@@ -688,9 +835,7 @@ impl Constrain<'_> {
                 self.check_term(body, &to);
                 term.ty = expected.clone();
             }
-            (TermKind::Struct(fields), Ty::Struct(tys))
-                if fields.len() == tys.len() && fields.keys().all(|k| tys.contains_key(k)) =>
-            {
+            (TermKind::Struct(fields), Ty::Struct(tys)) if same_field_set(fields, tys) => {
                 for (name, field) in fields.iter_mut() {
                     let want = tys[name].clone();
                     self.check_term(&mut field.value, &want);
@@ -700,7 +845,7 @@ impl Constrain<'_> {
             _ => {
                 self.infer_term(term);
                 let actual = term.ty.clone();
-                self.equal(term.span, expected, &actual);
+                self.checks(term.span, &actual, expected);
             }
         }
     }
@@ -740,16 +885,27 @@ impl Solve<'_> {
                 ConstraintKind::Equal { expected, actual } => {
                     self.unify(constraint.span, expected, actual)
                 }
-                ConstraintKind::Field { .. } => projections.push(constraint),
+                ConstraintKind::Field {
+                    base,
+                    base_span,
+                    name,
+                    result,
+                } => projections.push(Projection {
+                    span: constraint.span,
+                    base: base.clone(),
+                    base_span: *base_span,
+                    name: name.clone(),
+                    result: result.clone(),
+                }),
             }
         }
 
         while !projections.is_empty() {
             let waiting = projections.len();
             let mut deferred = Vec::new();
-            for constraint in projections {
-                if !self.project(constraint) {
-                    deferred.push(constraint);
+            for projection in projections {
+                if !self.project(&projection) {
+                    deferred.push(projection);
                 }
             }
             projections = deferred;
@@ -760,22 +916,28 @@ impl Solve<'_> {
 
         // What is still waiting has nothing left to wait for: the definition
         // never said what the base was, which asks for an annotation.
-        for constraint in projections {
-            let ConstraintKind::Field {
-                base_span, result, ..
-            } = &constraint.kind
-            else {
-                unreachable!("only field constraints are deferred");
-            };
-            let (base_span, result) = (*base_span, result.clone());
-            let goal = self.goal_of(constraint);
-            let ConstraintKind::Field { base, .. } = &goal else {
-                unreachable!("a field constraint's goal is a field goal");
-            };
-            let kind = ErrorKind::NotAStruct { base: base.clone() };
-            self.error(base_span, kind.clone());
-            self.step(constraint.span, Rule::Stuck, goal, Effect::Failed(kind));
-            self.recover(constraint.span, &result);
+        for projection in &projections {
+            let (base, result, goal) = self.resolved(projection);
+            let span = projection.span;
+            // The same arm [`Solve::project`] has, and for the same reason:
+            // giving up on one link of `x.a.b.c` points the next link's base
+            // at `Undecided`, and complaining about that again would name a
+            // type `?` the user never wrote, once per link of the chain.
+            if matches!(*base, Ty::Undecided) {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &result);
+                continue;
+            }
+            self.fail(
+                span,
+                Rule::Stuck,
+                goal,
+                Error {
+                    span: projection.base_span,
+                    kind: ErrorKind::UnknownBase,
+                },
+                &[base, result],
+            );
         }
     }
 
@@ -783,23 +945,13 @@ impl Solve<'_> {
     /// a base that is still an unbound variable might yet be learned from
     /// another projection, so it is left for the next round rather than failed
     /// here.
-    fn project(&mut self, constraint: &Constraint) -> bool {
-        let ConstraintKind::Field {
-            base_span, name, ..
-        } = &constraint.kind
-        else {
-            unreachable!("only field constraints are deferred");
-        };
-        let (span, base_span, name) = (constraint.span, *base_span, name.clone());
-        let goal = self.goal_of(constraint);
-        let ConstraintKind::Field { base, result, .. } = &goal else {
-            unreachable!("a field constraint's goal is a field goal");
-        };
-        let (base, result) = (base.clone(), result.clone());
+    fn project(&mut self, projection: &Projection) -> bool {
+        let (base, result, goal) = self.resolved(projection);
+        let span = projection.span;
 
         match &*base {
             Ty::Struct(fields) => {
-                match fields.get(&name).cloned() {
+                match fields.get(&projection.name).cloned() {
                     Some(ty) => {
                         self.step(span, Rule::Project, goal, Effect::Decomposed);
                         // `result` is the side the context demanded — whatever
@@ -813,11 +965,9 @@ impl Solve<'_> {
                     None => {
                         let kind = ErrorKind::MissingField {
                             base: base.clone(),
-                            field: name,
+                            field: projection.name.clone(),
                         };
-                        self.error(span, kind.clone());
-                        self.step(span, Rule::Project, goal, Effect::Failed(kind));
-                        self.recover(span, &result);
+                        self.fail(span, Rule::Project, goal, Error { span, kind }, &[result]);
                     }
                 }
                 true
@@ -834,35 +984,34 @@ impl Solve<'_> {
             }
             _ => {
                 let kind = ErrorKind::NotAStruct { base: base.clone() };
-                self.error(base_span, kind.clone());
-                self.step(span, Rule::Project, goal, Effect::Failed(kind));
-                self.recover(span, &result);
+                let error = Error {
+                    span: projection.base_span,
+                    kind,
+                };
+                self.fail(span, Rule::Project, goal, error, &[result]);
                 true
             }
         }
     }
 
-    /// A constraint with both its types resolved as far as the solver has got:
-    /// what the rule about to fire is actually looking at, rather than what
-    /// generation wrote down.
-    fn goal_of(&self, constraint: &Constraint) -> ConstraintKind {
-        match &constraint.kind {
-            ConstraintKind::Equal { expected, actual } => ConstraintKind::Equal {
-                expected: self.table.resolve(expected),
-                actual: self.table.resolve(actual),
-            },
-            ConstraintKind::Field {
-                base,
-                base_span,
-                name,
-                result,
-            } => ConstraintKind::Field {
-                base: self.table.resolve(base),
-                base_span: *base_span,
-                name: name.clone(),
-                result: self.table.resolve(result),
-            },
-        }
+    /// A projection with its two types resolved as far as the solver has got:
+    /// the base and the result the rule about to fire is actually looking at,
+    /// rather than what generation wrote down.
+    ///
+    /// The third value is the same pair again in the shape a [`Step`] records,
+    /// since a step's goal is a constraint. Built here rather than by each arm
+    /// so that what the reader is shown and what the rule decided on cannot be
+    /// resolved to two different points in the solve.
+    fn resolved(&self, projection: &Projection) -> (Rc<Ty>, Rc<Ty>, ConstraintKind) {
+        let base = self.table.resolve(&projection.base);
+        let result = self.table.resolve(&projection.result);
+        let goal = ConstraintKind::Field {
+            base: base.clone(),
+            base_span: projection.base_span,
+            name: projection.name.clone(),
+            result: result.clone(),
+        };
+        (base, result, goal)
     }
 
     /// Make `expected` and `actual` the same type, or report where they
@@ -877,19 +1026,22 @@ impl Solve<'_> {
         };
         match (&*lhs, &*rhs) {
             // Undecided is the absorbing error type: whatever failed under it
-            // was reported where it failed.
-            (Ty::Undecided, _) | (_, Ty::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None)
+            // was reported where it failed. Absorbing is not the same as
+            // learning nothing, though — the other side is a type this goal
+            // was going to decide, and leaving its variables unbound would let
+            // generalization quantify a term that only reached the solver
+            // through a failure.
+            (Ty::Undecided, _) => {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &rhs);
+            }
+            (_, Ty::Undecided) => {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover(span, &lhs);
             }
             (Ty::Var(a), Ty::Var(b)) if a == b => self.step(span, Rule::Same, goal, Effect::None),
-            (Ty::Var(var), _) => {
-                let effect = self.bind(span, *var, &rhs);
-                self.step(span, Rule::Bind, goal, effect);
-            }
-            (_, Ty::Var(var)) => {
-                let effect = self.bind(span, *var, &lhs);
-                self.step(span, Rule::Bind, goal, effect);
-            }
+            (Ty::Var(var), _) => self.assign(span, goal, *var, &rhs),
+            (_, Ty::Var(var)) => self.assign(span, goal, *var, &lhs),
             (Ty::Nat, Ty::Nat) => self.step(span, Rule::Prim, goal, Effect::None),
             (Ty::Arrow(from1, to1), Ty::Arrow(from2, to2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
@@ -900,11 +1052,7 @@ impl Solve<'_> {
                 self.unify(span, &to1, &to2);
                 self.depth -= 1;
             }
-            // Fields match by name, not position: structs are records, and
-            // `{ x: Nat, y: Nat }` written in either order is the same type.
-            (Ty::Struct(want), Ty::Struct(have))
-                if want.len() == have.len() && want.keys().all(|k| have.contains_key(k)) =>
-            {
+            (Ty::Struct(want), Ty::Struct(have)) if same_field_set(want, have) => {
                 let pairs: Vec<_> = want
                     .iter()
                     .map(|(name, ty)| (ty.clone(), have[name].clone()))
@@ -921,60 +1069,117 @@ impl Solve<'_> {
                     expected: lhs.clone(),
                     actual: rhs.clone(),
                 };
-                self.error(span, kind.clone());
-                self.step(span, Rule::Mismatch, goal, Effect::Failed(kind));
+                self.fail(
+                    span,
+                    Rule::Mismatch,
+                    goal,
+                    Error { span, kind },
+                    &[lhs.clone(), rhs.clone()],
+                );
             }
         }
     }
 
     /// Point an unbound variable at a type, unless the type contains the
-    /// variable itself — the occurs check that keeps every type a finite
-    /// tree. On failure the variable stays unbound; the cycle is reported at
-    /// the constraint that would have closed it.
-    ///
-    /// Returns what it did, for the step that is about to record it. The error
-    /// is pushed here rather than by the caller, so that a reporter reading
-    /// [`Output::errors`] and a reader stepping through the solve are looking
-    /// at the same failure.
-    fn bind(&mut self, span: Span, var: TyVar, ty: &Rc<Ty>) -> Effect {
+    /// variable itself — the occurs check that keeps every type a finite tree.
+    /// Either way one step is recorded, and the rule it names is the one that
+    /// actually applied: a cycle is [`Rule::Occurs`], not a [`Rule::Bind`] that
+    /// happened to leave the variable where it was.
+    fn assign(&mut self, span: Span, goal: ConstraintKind, var: TyVar, ty: &Rc<Ty>) {
         let Slot::Unbound { level } = self.table.vars[var as usize] else {
             unreachable!("resolve only stops at unbound variables");
         };
         if self.table.occurs(var, level, ty) {
-            self.error(span, ErrorKind::Recursive);
-            return Effect::Failed(ErrorKind::Recursive);
+            let error = Error {
+                span,
+                kind: ErrorKind::Recursive,
+            };
+            self.fail(
+                span,
+                Rule::Occurs,
+                goal,
+                error,
+                &[Rc::new(Ty::Var(var)), ty.clone()],
+            );
+            return;
         }
         self.table.vars[var as usize] = Slot::Bound(ty.clone());
-        Effect::Bound {
+        let effect = Effect::Bound {
             var,
             ty: ty.clone(),
+        };
+        self.step(span, Rule::Bind, goal, effect);
+    }
+
+    /// Report a failure and abandon what it was about, in one act: the
+    /// complaint, the step that ends the goal, and then every type in
+    /// `abandoned` pointed at [`Ty::Undecided`].
+    ///
+    /// The one way the solver has of failing, and deliberately so. Reporting
+    /// and recovering used to be two calls an arm had to remember to make in
+    /// order, and the arms disagreed: a mismatch reported without recovering,
+    /// so the variable it had abandoned stayed unbound, and generalization
+    /// quantified it — which made a term that failed to type polymorphic, and
+    /// therefore silently acceptable to every later use of it.
+    ///
+    /// The error carries its own span rather than taking `span`, because the
+    /// two are not always the same: a projection is stepped where it was
+    /// written and complained about at its base.
+    fn fail(
+        &mut self,
+        span: Span,
+        rule: Rule,
+        goal: ConstraintKind,
+        error: Error,
+        abandoned: &[Rc<Ty>],
+    ) {
+        let kind = error.kind.clone();
+        self.errors.push(error);
+        self.step(span, rule, goal, Effect::Failed(kind));
+        for ty in abandoned {
+            self.recover(span, ty);
         }
     }
 
-    /// Abandon a goal that was just reported: its result becomes
-    /// [`Ty::Undecided`], which unifies with everything, so the one complaint
-    /// is not echoed by every term downstream of it. No occurs check —
-    /// `Undecided` mentions no variables to close a cycle with.
+    /// Abandon a type a failed goal would have decided: every variable still
+    /// unsolved in it becomes [`Ty::Undecided`], which unifies with
+    /// everything, so the one complaint is not echoed by every term downstream
+    /// of it. No occurs check — `Undecided` mentions no variables to close a
+    /// cycle with.
     ///
-    /// A step of its own, because it changes the solution: a reader following
-    /// the state would otherwise see a variable acquire a value that no rule
-    /// they were shown gave it.
-    fn recover(&mut self, span: Span, result: &Rc<Ty>) {
-        let Ty::Var(var) = &*self.table.resolve(result) else {
-            return;
-        };
-        let (var, undecided) = (*var, Rc::new(Ty::Undecided));
-        self.table.vars[var as usize] = Slot::Bound(undecided.clone());
-        let goal = ConstraintKind::Equal {
-            expected: Rc::new(Ty::Var(var)),
-            actual: undecided.clone(),
-        };
-        self.step(
-            span,
-            Rule::Recover,
-            goal,
-            Effect::Bound { var, ty: undecided },
-        );
+    /// A step per variable, because each one changes the solution: a reader
+    /// following the state would otherwise see a variable acquire a value that
+    /// no rule they were shown gave it.
+    fn recover(&mut self, span: Span, ty: &Rc<Ty>) {
+        match &*self.table.resolve(ty) {
+            Ty::Var(var) => {
+                let (var, undecided) = (*var, Rc::new(Ty::Undecided));
+                self.table.vars[var as usize] = Slot::Bound(undecided.clone());
+                let goal = ConstraintKind::Equal {
+                    expected: Rc::new(Ty::Var(var)),
+                    actual: undecided.clone(),
+                };
+                self.step(
+                    span,
+                    Rule::Recover,
+                    goal,
+                    Effect::Bound { var, ty: undecided },
+                );
+            }
+            // A composite is abandoned by abandoning what it is made of: the
+            // goal that would have decided `?1 -> ?2` decided neither half.
+            Ty::Arrow(from, to) => {
+                let (from, to) = (from.clone(), to.clone());
+                self.recover(span, &from);
+                self.recover(span, &to);
+            }
+            Ty::Struct(fields) => {
+                for ty in fields.values().cloned().collect::<Vec<_>>() {
+                    self.recover(span, &ty);
+                }
+            }
+            Ty::Nat | Ty::Bound(_) | Ty::Undecided => {}
+        }
     }
 
     fn step(&mut self, span: Span, rule: Rule, goal: ConstraintKind, effect: Effect) {
@@ -986,10 +1191,6 @@ impl Solve<'_> {
             goal,
             effect,
         });
-    }
-
-    fn error(&mut self, span: Span, kind: ErrorKind) {
-        self.errors.push(Error { span, kind });
     }
 }
 
@@ -1019,6 +1220,27 @@ fn lower_type(aliases: &IndexMap<Symbol, Rc<Ty>>, ty: &Type) -> Rc<Ty> {
         )),
         TypeKind::Error => Rc::new(Ty::Undecided),
     }
+}
+
+/// Whether two field maps carry exactly the same names, in whatever order.
+///
+/// Structs are records: `{ x: Nat, y: Nat }` written either way round is one
+/// type, so what decides whether two of them line up is the set of names and
+/// nothing else. Generic over what the names map to because the two callers
+/// have different things there — a struct literal's fields against a written
+/// type's, and one semantic type against another — while the rule is the same
+/// rule, and was worth writing once.
+///
+/// Exact equality is deliberate, and this is the one place to change it. A
+/// wider struct does not satisfy a narrower demand: `{ x: Nat, y: Nat }` will
+/// not pass where `{ x: Nat }` is expected, and a struct literal missing a
+/// field is not checked against the annotation field by field. That follows
+/// from types here being equated and never ordered — see this module's own
+/// header — so admitting width subtyping would be a change to the language
+/// rather than to a predicate. If the spec ever adopts it, it is this function
+/// that grows a direction, and both call sites inherit it.
+fn same_field_set<A, B>(want: &IndexMap<String, A>, have: &IndexMap<String, B>) -> bool {
+    want.len() == have.len() && want.keys().all(|name| have.contains_key(name))
 }
 
 /// Replace each [`Ty::Bound`] with its instantiation. A free function rather

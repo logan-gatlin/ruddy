@@ -27,7 +27,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         });
 
     Stage {
-        micros: cx.micros.parse,
+        micros: Some(cx.micros.parse),
         nodes,
         debug: format!("{stmts:#?}"),
         ..spec.stage(cx.status(), format!("{types} type · {lets} let"))

@@ -9,7 +9,7 @@
 //! *that* stage's node ids rather than ids of their own.
 
 use crate::{
-    stage::{Cx, Ids, Spec, Trace},
+    stage::{Cx, Ids, Spec, Trace, plural},
     wire::{Node, Stage},
 };
 
@@ -22,44 +22,64 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     };
 
     let mut ids = Ids::default();
-    let mut nodes = Vec::new();
 
-    // Aliases first, then schemes — the order the program prints in, and the
+    // A row is a keyword, the name it declares, and what that declaration
+    // turned out to mean. Aliases and schemes differ in the keyword, in which
+    // map the meaning comes out of, and in which map the name's span comes out
+    // of — and in nothing else, so they are one row-builder over two sources
+    // rather than the same eighteen lines twice.
+    //
+    // Aliases first, then schemes: the order the program prints in, and the
     // order inference solved them in.
-    for (symbol, ty) in &output.aliases {
-        let mut node = Node::new(
-            ids.next(),
-            format!("type {}", mint.name(*symbol)),
+    let aliases = output.aliases.iter().map(|(symbol, ty)| {
+        (
+            "type",
+            *symbol,
             ty.to_string(),
-        );
-        if let Some(decl) = program.types.get(symbol) {
-            node = node.at(decl.name_span);
-        }
-        if let Some(index) = cx.symbols.get(symbol) {
-            node = node.symbol(*index);
-        }
-        nodes.push(node);
-    }
-    for (symbol, scheme) in &output.schemes {
-        let mut node = Node::new(
-            ids.next(),
-            format!("let {}", mint.name(*symbol)),
+            program.types.get(symbol).map(|decl| decl.name_span),
+        )
+    });
+    let schemes = output.schemes.iter().map(|(symbol, scheme)| {
+        (
+            "let",
+            *symbol,
             scheme.to_string(),
-        );
-        if let Some(decl) = program.terms.get(symbol) {
-            node = node.at(decl.name_span);
-        }
-        if let Some(index) = cx.symbols.get(symbol) {
-            node = node.symbol(*index);
-        }
-        nodes.push(node);
-    }
+            program.terms.get(symbol).map(|decl| decl.name_span),
+        )
+    });
+
+    let nodes: Vec<Node> = aliases
+        .chain(schemes)
+        .map(|(keyword, symbol, meaning, name_span)| {
+            let mut node = Node::new(
+                ids.next(),
+                format!("{keyword} {}", mint.name(symbol)),
+                meaning,
+            );
+            if let Some(span) = name_span {
+                node = node.at(span);
+            }
+            if let Some(index) = cx.symbols.get(&symbol) {
+                node = node.symbol(*index);
+            }
+            node
+        })
+        .collect();
 
     Stage {
-        micros: cx.micros.infer,
+        micros: Some(cx.micros.infer),
         nodes,
-        debug: format!("{output:#?}"),
-        ..spec.stage(cx.status(), format!("{} schemes", output.schemes.len()))
+        // Only what this tab owns. `Output` also carries the constraint list
+        // and every solver step, which the `Constraints` and `Solve` tabs dump
+        // in full already — dumping the whole of it here sent both across the
+        // wire a second time on every keystroke, for a raw view nobody would
+        // read them in. What is left out and not shown anywhere raw is
+        // `errors`, which reaches the page as diagnostics instead.
+        debug: format!(
+            "aliases: {:#?}\n\nschemes: {:#?}",
+            output.aliases, output.schemes
+        ),
+        ..spec.stage(cx.status(), plural(output.schemes.len(), "scheme"))
     }
 }
 

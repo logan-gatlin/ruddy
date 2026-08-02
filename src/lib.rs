@@ -1,3 +1,4 @@
+pub mod grammar;
 pub mod inference;
 pub mod ir;
 pub mod parse;

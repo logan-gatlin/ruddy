@@ -11,7 +11,7 @@
 //! pass that produced it, and the answer is one tab away.
 
 use crate::{
-    stage::{Cx, Ids, Spec},
+    stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -35,10 +35,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         let mut node = Node::new(
             ids.next(),
             format!("let {}", mint.name(*symbol)),
-            match constraints.len() {
-                1 => "1 constraint".to_string(),
-                count => format!("{count} constraints"),
-            },
+            plural(constraints.len(), "constraint"),
         );
         if let Some(decl) = program.terms.get(symbol) {
             node = node.at(decl.name_span);
@@ -61,6 +58,6 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     Stage {
         nodes,
         debug: format!("{:#?}", output.constraints),
-        ..spec.stage(cx.status(), format!("{total} constraints"))
+        ..spec.stage(cx.status(), plural(total, "constraint"))
     }
 }

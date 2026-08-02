@@ -39,21 +39,16 @@ fn main() -> ExitCode {
     let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
-
-    // The lowered program is not printed here. Rendering the IR as surface
-    // syntax lives in the debugger, which this crate cannot depend on without a
-    // cycle — run `ruddy-debug` and open the IR tab to read it.
-
     let inferred = inference::infer(&mut built.program);
 
     let errors =
         lexed.errors.len() + parsed.errors.len() + built.errors.len() + inferred.errors.len();
     if errors == 0 {
-        println!("\nbuilt successfully with no errors");
+        println!("built successfully with no errors");
         return ExitCode::SUCCESS;
     }
 
-    eprintln!("\n{errors} error(s):");
+    eprintln!("{errors} error(s):");
     for err in &lexed.errors {
         report(
             &source,

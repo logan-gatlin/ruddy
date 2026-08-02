@@ -287,6 +287,9 @@ impl Builder<'_> {
     fn term(&mut self, expr: Expr) -> Term {
         let span = expr.span;
         match expr.tracked {
+            // `()` is the empty struct rather than a form of its own, so it is
+            // erased here instead of surviving into the IR. See [`Ty::Struct`]
+            // for why, and for what it costs when the compiler answers.
             ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
             ExprKind::Ident { name } => match self.terms.get(&name.tracked) {
                 Some(symbol) => TermKind::Ident(symbol).with_span(span),
@@ -351,6 +354,8 @@ impl Builder<'_> {
     fn ty(&mut self, ty: parse::Type) -> Type {
         let span = ty.span;
         match ty.tracked {
+            // As in [`term`](Self::term): the two surface spellings of the
+            // empty struct, `()` and `{}`, meet here. See [`Ty::Struct`].
             parse::TypeKind::Unit => span.track(TypeKind::Struct(Default::default())),
             // A declaration is looked for before a primitive, so a `type Nat`
             // of one's own shadows the built-in rather than colliding with a

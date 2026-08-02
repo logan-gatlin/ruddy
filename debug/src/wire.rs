@@ -52,10 +52,27 @@ pub struct Stage {
     /// the stage's: the page matches what it is given without knowing what a
     /// match means. `None` for a stage whose text names nothing twice.
     pub highlight: Option<&'static str>,
+    /// Whether a match of `highlight` names the same thing only within the row
+    /// it appears in. Also the stage's to say: a `?4` is one variable of one
+    /// program-wide table, but a scheme's `'a` is numbered from scratch per
+    /// scheme, so two rows spelling `'a` are two unrelated variables.
+    pub scoped: bool,
     pub status: Status,
     /// Shown next to the tab title, e.g. `3 types · 5 terms`.
     pub summary: String,
-    pub micros: u64,
+    /// How long the compiler phase this stage owns took, in microseconds, or
+    /// `None` for a stage that owns none.
+    ///
+    /// The distinction is carried rather than left to be read off the number.
+    /// Most stages own a phase; an annotator, or a second view of a phase's
+    /// output — `Constraints` and `Solve` both read the one `infer` call — owns
+    /// nothing, and a chip for it would be the same microseconds counted twice.
+    /// That used to be inferred from `micros > 0`, which is a measurement
+    /// standing in for a fact about the registry: the figure is truncated to
+    /// whole microseconds, so a phase that genuinely ran in under one reported
+    /// zero and lost its chip. `Option` says which it is and cannot disagree
+    /// with itself.
+    pub micros: Option<u64>,
     pub nodes: Vec<Node>,
     /// Populated for [`View::Text`] stages only.
     pub text: Option<String>,
@@ -103,8 +120,18 @@ pub struct Node {
     pub span: Option<Range>,
     /// The node came from a generated span rather than from written source.
     pub generated: bool,
-    /// Index into the `symbols` stage, when this node names a symbol.
+    /// Index into the `symbols` stage, when this node's span is an occurrence
+    /// of that symbol's name. The page paints every carrier's span in the
+    /// editor as a use of the symbol, so a node whose span is somewhere else
+    /// belongs in `owner` instead.
     pub symbol: Option<u32>,
+    /// Index into the `symbols` stage, when this node is *about* a symbol
+    /// without being an occurrence of its name — a solve step, say, which is
+    /// part of one definition's solve but is spanned by whatever
+    /// sub-expression the constraint came from. The panel groups these with
+    /// the symbol's other rows; the editor does not paint them, because there
+    /// is nothing at that span the user wrote the name at.
+    pub owner: Option<u32>,
     /// Rendered red: an error node, or a check this stage runs that failed.
     pub error: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -223,6 +250,11 @@ impl Node {
 
     pub fn symbol(mut self, index: u32) -> Self {
         self.symbol = Some(index);
+        self
+    }
+
+    pub fn owner(mut self, index: u32) -> Self {
+        self.owner = Some(index);
         self
     }
 

@@ -54,6 +54,9 @@ fn every_stage_reports_on_the_demo() {
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
         assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
+        // The pane bar prints this beside the tab strip, so a stage that
+        // counted nothing leaves a blank there rather than a count.
+        assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
     }
 
     // The tab strip is the stages that annotate nothing, so the annotator at
@@ -110,6 +113,69 @@ fn every_span_lies_inside_the_source() {
             assert!(DEMO.get(start..end).is_some(), "{}", diagnostic.code);
         }
     }
+}
+
+/// `Node::symbol` is what the page paints occurrences from: it walks every
+/// stage, collects the span of every node carrying the symbol, and highlights
+/// all of them in the editor as uses of that name. So a node may only claim it
+/// when its span really is somewhere the name was written — which is a
+/// property of the whole snapshot, checkable here, and not one any single
+/// stage can be trusted to have remembered. A stage that wants the association
+/// without the span has `Node::owner` for it.
+#[test]
+fn a_node_naming_a_symbol_is_spanned_at_the_name() {
+    let snapshot = snapshot(DEMO);
+    let symbols = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "symbols")
+        .expect("the symbols stage is registered");
+    // The symbols stage is the index every `symbol` points into, and its own
+    // rows are labelled with the names.
+    let names: HashMap<u32, &str> = symbols
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.label.as_str()))
+        .collect();
+
+    let mut checked = 0;
+    for stage in &snapshot.stages {
+        for node in nodes(stage) {
+            let (Some(index), Some([start, end])) = (node.symbol, node.span) else {
+                continue;
+            };
+            let name = names
+                .get(&index)
+                .unwrap_or_else(|| panic!("{}: {} points at no symbol row", stage.id, node.label));
+            assert_eq!(
+                &DEMO[start..end],
+                *name,
+                "{}: {} claims to name {name} at {start}..{end}",
+                stage.id,
+                node.label
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no stage claimed a symbol at all");
+
+    // And the association a solve step does want is the one that costs it no
+    // occurrence: its span is whatever sub-expression the constraint came
+    // from, which is nowhere the definition's name appears.
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve stage is registered");
+    assert!(!solve.nodes.is_empty());
+    assert!(
+        solve.nodes.iter().all(|node| node.symbol.is_none()),
+        "a solve step claimed its span as an occurrence"
+    );
+    assert!(
+        solve.nodes.iter().any(|node| node.owner.is_some()),
+        "no solve step says which definition it belongs to"
+    );
 }
 
 #[test]
@@ -495,6 +561,28 @@ fn a_snapshot_survives_the_wire() {
     // Underscored fields are the page's, and have to survive too: the
     // editor's colouring is built from them.
     assert!(json.contains("_class"));
+
+    // Everything the pane bar and the highlighter read off a stage. A field
+    // the page branches on is no use to it left behind on this side.
+    let types = back["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .find(|stage| stage["id"] == "types")
+        .expect("the types stage is registered");
+    assert_eq!(types["scoped"], true);
+    // A stage owning no phase says so on the wire rather than reporting a zero
+    // the page has to guess the meaning of.
+    let solve = back["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .find(|stage| stage["id"] == "solve")
+        .expect("the solve stage is registered");
+    assert!(solve["micros"].is_null());
+    assert!(types["micros"].as_u64().is_some());
+    assert!(types["summary"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(json.contains("\"owner\""));
 }
 
 #[test]
@@ -575,6 +663,11 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
             if node.error { "carries no" } else { "carries" },
         );
         if let Some(bind) = field(node, "_bind") {
+            // The solution panel is the `_effect` column's bindings collected,
+            // so a step's `_bind` is its `_effect` and not a second wording of
+            // it. The two had been written out separately, identically, which
+            // is two places for one notation to drift from.
+            assert_eq!(field(node, "_effect"), Some(bind.clone()), "{}", node.label);
             bound.push(bind);
         }
         if let Some(error) = field(node, "_error") {
@@ -597,4 +690,83 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
         .map(|diagnostic| diagnostic.message.as_str())
         .collect();
     assert_eq!(failed, reported);
+}
+
+/// The pane bar prints one timing chip per compiler phase, and which stages own
+/// a phase is a fact about the registry rather than something to be read off a
+/// number. `Constraints` and `Solve` are two views of the one `infer` call and
+/// the annotator does no phase at all, so all three report nothing; everyone
+/// else reports what their phase took. The page filtered on `micros > 0`
+/// instead, which is a measurement standing in for that fact — and the
+/// measurement truncates to whole microseconds, so a phase quick enough to
+/// round to zero silently lost its chip.
+#[test]
+fn only_the_stages_that_own_a_phase_report_a_time() {
+    let snapshot = snapshot(DEMO);
+    let ids = |timed: bool| -> Vec<&str> {
+        snapshot
+            .stages
+            .iter()
+            .filter(|stage| stage.micros.is_some() == timed)
+            .map(|stage| stage.id)
+            .collect()
+    };
+    assert_eq!(ids(true), ["tokens", "ast", "ir", "types", "symbols"]);
+    assert_eq!(ids(false), ["constraints", "solve", "types-ir"]);
+}
+
+/// A tab's raw view dumps what that tab owns, and no more.
+/// `inference::Output` is one struct carrying three tabs' worth of material,
+/// and `Types` had been dumping the whole of it — so the constraint list and
+/// every solver step crossed the wire twice, on every keystroke, since each one
+/// posts a fresh snapshot.
+#[test]
+fn a_raw_dump_carries_only_its_own_tab() {
+    let snapshot = snapshot("let fst : { x: Nat } -> Nat = fn p => p.x\n");
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+
+    // Each of the three payloads, dumped by the one tab that shows it.
+    let types = stage("types");
+    assert!(types.debug.contains("schemes"), "{}", types.debug);
+    assert!(stage("constraints").debug.contains("Constraint"));
+    assert!(stage("solve").debug.contains("Step"));
+
+    // And not by the other two.
+    assert!(
+        !types.debug.contains("Step"),
+        "the Types dump repeats the solve"
+    );
+    assert!(
+        !types.debug.contains("Constraint"),
+        "the Types dump repeats the constraints"
+    );
+}
+
+/// Summaries sit in the pane bar as a phrase somebody reads, so the count and
+/// its noun agree. Three stages had spelled that out for themselves and the
+/// rest had not, which is how `1 schemes` reached the bar of a tool whose whole
+/// subject is getting the details right.
+#[test]
+fn a_count_of_one_is_said_in_the_singular() {
+    let snapshot = snapshot("let a : Nat = 1\n");
+    let summary = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+            .summary
+            .as_str()
+    };
+    assert_eq!(summary("constraints"), "1 constraint");
+    assert_eq!(summary("solve"), "1 step");
+    assert_eq!(summary("types"), "1 scheme");
+    assert_eq!(summary("symbols"), "1 symbol");
+    assert_eq!(summary("ir"), "0 types · 1 term");
 }

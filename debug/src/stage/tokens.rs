@@ -6,7 +6,7 @@
 use ruddy::token::Kind;
 
 use crate::{
-    stage::{Cx, Ids, Spec},
+    stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -31,12 +31,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         })
         .collect();
 
-    let summary = match nodes.len() {
-        1 => "1 token".to_string(),
-        n => format!("{n} tokens"),
-    };
+    let summary = plural(nodes.len(), "token");
     Stage {
-        micros: cx.micros.lex,
+        micros: Some(cx.micros.lex),
         nodes,
         debug: format!("{tokens:#?}"),
         ..spec.stage(cx.status(), summary)

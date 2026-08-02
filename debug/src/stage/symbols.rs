@@ -10,7 +10,7 @@ use std::{collections::HashMap, time::Instant};
 use ruddy::symbol::{Mint, Symbol, demangle};
 
 use crate::{
-    stage::{Cx, Spec},
+    stage::{Cx, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -55,9 +55,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         nodes.push(node);
     }
 
+    let counted = plural(nodes.len(), "symbol");
     let summary = match broken {
-        0 => format!("{} symbols", nodes.len()),
-        n => format!("{} symbols · {n} demangle mismatch", nodes.len()),
+        0 => counted,
+        n => format!("{counted} · {n} demangle mismatch"),
     };
 
     let status = match broken {
@@ -65,7 +66,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         _ => crate::wire::Status::Partial,
     };
     Stage {
-        micros: started.elapsed().as_micros() as u64,
+        micros: Some(started.elapsed().as_micros() as u64),
         nodes,
         debug: format!("{mint:#?}"),
         ..spec.stage(status, summary)
