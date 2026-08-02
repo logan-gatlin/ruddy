@@ -17,9 +17,10 @@ use std::{
 
 use ruddy::{
     inference, ir, parse,
-    symbol::{Bundle, Mint, Namespace, Version},
+    symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
+    ui,
 };
 
 use crate::{
@@ -99,26 +100,33 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     let inferred = built.as_mut().and_then(|built| {
         let started = Instant::now();
         let out = guard("types", &mut panicked, || {
-            inference::infer(&mut built.program)
+            inference::infer(&mint, &mut built.program)
         });
         micros.infer = started.elapsed().as_micros() as u64;
         out
     });
 
+    // Every phase words and codes its own errors in `ruddy::ui`, so the strip
+    // and the CLI driver cannot describe the same program differently, and a
+    // new error kind reaches both the moment it exists. What is added here is
+    // what only the strip has: the quoted snippet, and the second span a
+    // duplicate points back at.
     if let Some(lexed) = &lexed {
-        diagnostics.extend(
-            lexed
-                .errors
-                .iter()
-                .map(|error| lex_diagnostic(source, error)),
-        );
+        diagnostics.extend(lexed.errors.iter().map(|error| {
+            raw(
+                "lex",
+                error.kind.code(),
+                format!("{} {}", error.kind, quote(source, error.span)),
+                Some(error.span),
+            )
+        }));
     }
     if let Some(parsed) = &parsed {
         diagnostics.extend(parsed.errors.iter().map(|error| {
             raw(
                 "parse",
-                "unexpected-token",
-                format!("unexpected token {}", quote(source, error.span)),
+                error.code(),
+                format!("{error} {}", quote(source, error.span)),
                 Some(error.span),
             )
         }));
@@ -132,7 +140,14 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(inferred.errors.iter().map(types_diagnostic));
+        diagnostics.extend(inferred.errors.iter().map(|error| {
+            raw(
+                "types",
+                error.kind.code(),
+                error.kind.to_string(),
+                Some(error.span),
+            )
+        }));
     }
 
     // Sorted by where the reader would look for them, then numbered, so a
@@ -256,75 +271,23 @@ pub fn install_hook() {
     });
 }
 
-fn lex_diagnostic(source: &str, error: &token::Error) -> Diagnostic {
-    let (code, what) = match error.kind {
-        token::ErrorKind::Unrecognized => ("unrecognized-character", "unrecognized character"),
-        token::ErrorKind::MalformedNatural => ("malformed-natural", "malformed natural number"),
-        token::ErrorKind::NaturalTooLarge => (
-            "natural-too-large",
-            "natural number too large to fit in 128 bits",
-        ),
-    };
-    raw(
-        "lex",
-        code,
-        format!("{what} {}", quote(source, error.span)),
-        Some(error.span),
-    )
-}
-
+/// Lowering's errors, which are the only ones with a second place to point at.
 fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
-    match &error.kind {
-        ir::ErrorKind::Undefined { namespace } => raw(
-            "ir",
-            match namespace {
-                Namespace::Types => "undefined-type",
-                _ => "undefined-term",
-            },
-            format!("undefined {namespace} {}", quote(source, error.span)),
-            Some(error.span),
-        ),
-        ir::ErrorKind::Duplicate {
-            namespace,
-            previous,
-        } => {
-            let mut diagnostic = raw(
-                "ir",
-                match namespace {
-                    Namespace::Types => "duplicate-type",
-                    _ => "duplicate-term",
-                },
-                format!("duplicate {namespace} {}", quote(source, error.span)),
-                Some(error.span),
-            );
-            // One diagnostic with two highlights, rather than the two loose
-            // lines the CLI prints: the repeat is only legible next to what it
-            // repeats.
-            diagnostic.related.push(Related {
-                span: range(*previous),
-                message: "first defined here".to_string(),
-            });
-            diagnostic
-        }
-        ir::ErrorKind::DuplicateField => raw(
-            "ir",
-            "duplicate-field",
-            format!("duplicate field {}", quote(source, error.span)),
-            Some(error.span),
-        ),
-    }
-}
-
-/// Inference words and codes its own errors, so the strip and the CLI driver
-/// cannot describe the same program differently, and a new [`inference::
-/// ErrorKind`] reaches both the moment it exists.
-fn types_diagnostic(error: &inference::Error) -> Diagnostic {
-    raw(
-        "types",
+    let mut diagnostic = raw(
+        "ir",
         error.kind.code(),
-        error.kind.to_string(),
+        format!("{} {}", error.kind, quote(source, error.span)),
         Some(error.span),
-    )
+    );
+    // One diagnostic with two highlights, rather than the two loose lines the
+    // CLI prints: the repeat is only legible next to what it repeats.
+    if let ir::ErrorKind::Duplicate { previous, .. } = &error.kind {
+        diagnostic.related.push(Related {
+            span: range(*previous),
+            message: ui::FIRST_DEFINITION.to_string(),
+        });
+    }
+    diagnostic
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Span>) -> Diagnostic {

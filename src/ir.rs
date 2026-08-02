@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
-    tracking::{Span, Tracked},
+    tracking::{Span, Tracked, TrackedString},
     types::{Prim, Ty},
 };
 
@@ -54,7 +54,7 @@ pub enum TermKind {
     /// is no symbol to resolve it to and nothing here can fail to resolve.
     Project {
         base: Box<Term>,
-        field: Tracked<String>,
+        field: TrackedString,
     },
     Ident(Symbol),
     /// A natural number literal. It carries no symbol: a literal names nothing,
@@ -106,6 +106,15 @@ pub enum ErrorKind {
         previous: Span,
     },
     DuplicateField,
+    /// A type declared as a name that leads back to itself with nothing in
+    /// between: `type t = t`, or a pair each declared as the other.
+    ///
+    /// This is not the same complaint as a type that contains itself. A type
+    /// may name itself as much as it likes through a struct or an arrow —
+    /// that is what makes recursive types writable — because unfolding such a
+    /// type reaches a shape one step in. A chain of bare names never reaches
+    /// one, so there is nothing for the declaration to mean.
+    Circular,
 }
 
 #[derive(Debug, Clone)]
@@ -169,10 +178,9 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     };
     // Split before lowering rather than lowering in the order written: every
     // type is declared before any term is looked at, so a term can name a type
-    // written anywhere in the program. Each group keeps the order it was
-    // written in, so a type can still only name a type declared above it and a
-    // term only a term above it — the hoist is between the groups, not inside
-    // them.
+    // written anywhere in the program. Terms keep the order they were written
+    // in, so a term can still only name a term above it — the hoist is over
+    // the type group, not over the terms.
     let mut types = Vec::new();
     let mut terms = Vec::new();
     for stmt in stmts {
@@ -181,9 +189,19 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             StmtKind::Let { name, ty, body } => terms.push((name, ty, body)),
         }
     }
-    for (name, body) in types {
+    // Every type's name is bound before any type's body is read, so a type can
+    // name itself and two types can name each other. That is the whole of what
+    // makes a recursive type writable: nothing downstream ties the knot, and
+    // nothing downstream can, so a type is recursive exactly when a
+    // declaration says it is. Names are bound in the order they were written,
+    // so a repeated one is still reported against the first.
+    let declared: Vec<_> = types
+        .iter()
+        .map(|(name, _)| b.declare(Namespace::Types, name))
+        .collect();
+    for (symbol, (name, body)) in declared.into_iter().zip(types) {
         let value = b.ty(body);
-        if let Some(symbol) = b.declare(Namespace::Types, &name) {
+        if let Some(symbol) = symbol {
             program.types.insert(
                 symbol,
                 Decl {
@@ -193,6 +211,22 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
                 },
             );
         }
+    }
+    // A loop of bare names is the one recursion that cannot be allowed, and it
+    // is what mutual visibility just made writable. See [`ErrorKind::Circular`]
+    // for why it means nothing, and [`Solve::unify`](crate::inference) for what
+    // it would cost the solver to be handed one.
+    let circular: Vec<_> = program
+        .types
+        .keys()
+        .copied()
+        .filter(|symbol| returns_to_itself(&program.types, *symbol))
+        .collect();
+    for symbol in circular {
+        let decl = &mut program.types[&symbol];
+        let span = decl.value.span;
+        decl.value = span.track(TypeKind::Error);
+        b.error(span, ErrorKind::Circular);
     }
     for (name, ty, body) in terms {
         // Annotation and body are lowered in the order they were written, and
@@ -215,6 +249,32 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         program,
         errors: b.errors,
     }
+}
+
+/// Whether following what `start` is declared as, through nothing but names,
+/// arrives back at `start`.
+///
+/// Only a body that is a name outright is followed. A type with any structure
+/// to it — `type t = { next: t }`, `type t = t -> Nat` — says what it is one
+/// step in, and the loop through it is the recursion this language is for; it
+/// is only a name standing for a name standing for the first that never says
+/// anything. The walk is bounded by the number of declarations there are,
+/// since a longer chain has already passed through one of them twice.
+fn returns_to_itself(types: &IndexMap<Symbol, Decl<Type>>, start: Symbol) -> bool {
+    let mut at = start;
+    for _ in 0..types.len() {
+        let Some(decl) = types.get(&at) else {
+            return false;
+        };
+        let TypeKind::Ident(next) = decl.value.tracked else {
+            return false;
+        };
+        if next == start {
+            return true;
+        }
+        at = next;
+    }
+    false
 }
 
 impl Names {
@@ -260,7 +320,7 @@ impl Builder<'_> {
     /// Bind a top-level name to a fresh symbol. `None` when the name is already
     /// defined: the first definition is the one that stands, and the repeat is
     /// reported against it.
-    fn declare(&mut self, namespace: Namespace, name: &Tracked<String>) -> Option<Symbol> {
+    fn declare(&mut self, namespace: Namespace, name: &TrackedString) -> Option<Symbol> {
         if let Some(previous) = self.names(namespace).find(&name.tracked).map(|b| b.span) {
             self.error(
                 name.span,
@@ -397,7 +457,7 @@ impl Builder<'_> {
     /// the one that survives.
     fn fields<S, T>(
         &mut self,
-        fields: IndexMap<Tracked<String>, S>,
+        fields: IndexMap<TrackedString, S>,
         lower: impl Fn(&mut Self, S) -> T,
     ) -> IndexMap<String, Field<T>> {
         let mut lowered = IndexMap::new();

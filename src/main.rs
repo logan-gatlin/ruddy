@@ -5,6 +5,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
+    ui,
 };
 
 const DEMO_PATH: &str = "demo.hc";
@@ -39,7 +40,7 @@ fn main() -> ExitCode {
     let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program);
 
     let errors =
         lexed.errors.len() + parsed.errors.len() + built.errors.len() + inferred.errors.len();
@@ -48,38 +49,25 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Every phase's errors are worded by `ruddy::ui` and printed here, so that
+    // this driver and the debugger's diagnostic strip cannot describe the same
+    // program differently. What is left to a reporter is layout: the order, the
+    // indentation, and how a span is quoted.
     eprintln!("{errors} error(s):");
     for err in &lexed.errors {
-        report(
-            &source,
-            err.span,
-            match err.kind {
-                token::ErrorKind::Unrecognized => "unrecognized character",
-                token::ErrorKind::MalformedNatural => "malformed natural number",
-                token::ErrorKind::NaturalTooLarge => "natural number is too large",
-            },
-        );
+        report(&source, err.span, &err.kind.to_string());
     }
     for err in &parsed.errors {
-        report(&source, err.span, "unexpected token");
+        report(&source, err.span, &err.to_string());
     }
     for err in &built.errors {
-        match &err.kind {
-            ir::ErrorKind::Undefined { namespace } => {
-                report(&source, err.span, &format!("undefined {namespace}"));
-            }
-            ir::ErrorKind::Duplicate {
-                namespace,
-                previous,
-            } => {
-                report(&source, err.span, &format!("duplicate {namespace}"));
-                report(&source, *previous, "  first defined here");
-            }
-            ir::ErrorKind::DuplicateField => report(&source, err.span, "duplicate field"),
+        report(&source, err.span, &err.kind.to_string());
+        // A repeat is only legible next to what it repeats, so the definition
+        // that stands gets a line of its own, indented under the error.
+        if let ir::ErrorKind::Duplicate { previous, .. } = &err.kind {
+            report(&source, *previous, &format!("  {}", ui::FIRST_DEFINITION));
         }
     }
-    // Inference words its own errors, so that this driver and the debugger's
-    // diagnostic strip cannot describe the same program differently.
     for err in &inferred.errors {
         report(&source, err.span, &err.kind.to_string());
     }

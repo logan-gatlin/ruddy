@@ -16,6 +16,8 @@ pub struct Tracked<T> {
     pub span: Span,
 }
 
+pub type TrackedString = Tracked<String>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredFile {
     pub path: String,

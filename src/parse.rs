@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 
 use crate::{
     token::{Kind, Token},
-    tracking::{Span, Tracked},
+    tracking::{Span, Tracked, TrackedString},
 };
 
 pub type Stmt = Tracked<StmtKind>;
@@ -10,13 +10,13 @@ pub type Stmt = Tracked<StmtKind>;
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let {
-        name: Tracked<String>,
+        name: TrackedString,
         /// The written type, when the definition was ascribed one.
         ty: Option<Type>,
         body: Tracked<Expr>,
     },
     Type {
-        name: Tracked<String>,
+        name: TrackedString,
         body: Type,
     },
 }
@@ -30,16 +30,16 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
     Function {
-        args: Vec<Tracked<String>>,
+        args: Vec<TrackedString>,
         body: Box<Expr>,
     },
-    Struct(IndexMap<Tracked<String>, Expr>),
+    Struct(IndexMap<TrackedString, Expr>),
     Project {
         base: Box<Expr>,
-        field: Tracked<String>,
+        field: TrackedString,
     },
     Ident {
-        name: Tracked<String>,
+        name: TrackedString,
     },
     Natural(u128),
     Unit,
@@ -49,9 +49,9 @@ pub type Type = Tracked<TypeKind>;
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    Struct(IndexMap<Tracked<String>, Type>),
+    Struct(IndexMap<TrackedString, Type>),
     Arrow { from: Box<Type>, to: Box<Type> },
-    Ident { name: Tracked<String> },
+    Ident { name: TrackedString },
     Unit,
 }
 
@@ -153,7 +153,7 @@ impl Parser {
         }
     }
 
-    fn ident(&mut self) -> Option<Tracked<String>> {
+    fn ident(&mut self) -> Option<TrackedString> {
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
                 Kind::Identifier(name) => Some(tok.span.track(name.clone())),
@@ -330,7 +330,7 @@ impl Parser {
     /// The `<arg>+ =>` header of a function: gather the argument identifiers,
     /// then consume the `=>` arrow. A function must bind at least one argument,
     /// so an empty list is a parse error.
-    fn function_args(&mut self) -> Option<Vec<Tracked<String>>> {
+    fn function_args(&mut self) -> Option<Vec<TrackedString>> {
         let mut args = Vec::new();
         while matches!(self.peek().map(|t| &t.tracked), Some(Kind::Identifier(_))) {
             args.push(self.ident()?);

@@ -7,7 +7,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use ruddy::symbol::{Mint, Symbol, demangle};
+use ruddy::symbol::{LOCAL_SEGMENT, Mint, Symbol, demangle};
 
 use crate::{
     stage::{Cx, Spec, plural},
@@ -79,6 +79,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 /// does expose: the bundle, the path of names, and the namespace of the symbol
 /// itself. That is enough to catch a mangling or demangling that loses, adds,
 /// or reorders a component.
+///
+/// The rebuilt path puts a component carrying a disambiguator under
+/// [`LOCAL_SEGMENT`], the way [`Mint::path`] does — which makes this check the
+/// stricter one of the two: the mint only reports local-ness for the symbol
+/// itself, while a rebuilt path disagrees if the mangling dropped or invented a
+/// disambiguator anywhere along the chain.
 fn round_trip(mint: &Mint, symbol: Symbol, mangled: &str, path: &str) -> Result<(), String> {
     let Some(demangled) = demangle(mangled) else {
         return Err("did not demangle".to_string());
@@ -95,13 +101,15 @@ fn round_trip(mint: &Mint, symbol: Symbol, mangled: &str, path: &str) -> Result<
     if last.disambiguator.is_some() != mint.is_local(symbol) {
         return Err("scope changed".to_string());
     }
-    let names = demangled
-        .path
-        .iter()
-        .map(|component| component.name.as_str())
-        .collect::<Vec<_>>()
-        .join("::");
-    let rebuilt = format!("{}::{names}", mint.bundle().name());
+    let mut rebuilt = mint.bundle().name().to_string();
+    for component in &demangled.path {
+        if component.disambiguator.is_some() {
+            rebuilt.push_str("::");
+            rebuilt.push_str(LOCAL_SEGMENT);
+        }
+        rebuilt.push_str("::");
+        rebuilt.push_str(&component.name);
+    }
     match rebuilt == path {
         true => Ok(()),
         false => Err(format!("path became {rebuilt}")),

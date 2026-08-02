@@ -28,7 +28,7 @@ fn infer_src(src: &str) -> (Mint, ir::Output, inference::Output) {
     );
     let mut mint = dummy_mint();
     let mut out = ir::build(&mut mint, parsed.stmts);
-    let inferred = inference::infer(&mut out.program);
+    let inferred = inference::infer(&mint, &mut out.program);
     (mint, out, inferred)
 }
 
@@ -130,7 +130,10 @@ fn mentions_a_variable(ty: &Ty) -> bool {
         Ty::Var(_) => true,
         Ty::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
         Ty::Struct(fields) => fields.values().any(|ty| mentions_a_variable(ty)),
-        Ty::Nat | Ty::Bound(_) | Ty::Undecided => false,
+        // A declared type is not looked inside, for the reason the compiler's
+        // own walks do not: what one stands for was lowered from what the user
+        // wrote, and no solver variable can reach it.
+        Ty::Nat | Ty::Named { .. } | Ty::Bound(_) | Ty::Undecided => false,
     }
 }
 
@@ -381,7 +384,7 @@ fn a_failed_definition_is_undecided_rather_than_polymorphic() {
 }
 
 /// The occurs check failing is not a variable taking a type. A step naming
-/// `Rule::Bind` above an effect reading "recursive type" tells whoever is
+/// `Rule::Bind` above an effect reading "this type would have to contain itself" tells whoever is
 /// stepping through the solve the opposite of what happened.
 #[test]
 fn a_failed_occurs_check_is_a_rule_of_its_own() {
@@ -392,7 +395,7 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
             // Being applied makes `f` a function, which is true and is bound.
             "bind  ?1 -> ?2 ~ ?0 => ?0 := ?1 -> ?2",
             // Only the argument asks `f` to be its own parameter.
-            "occurs  ?1 ~ ?1 -> ?2 => recursive type",
+            "occurs  ?1 ~ ?1 -> ?2 => this type would have to contain itself",
             "recover  ?1 ~ ? => ?1 := ?",
             "recover  ?2 ~ ? => ?2 := ?",
         ]
@@ -448,7 +451,7 @@ fn an_unannotated_projection_asks_for_an_annotation() {
     );
     assert_eq!(
         error.kind.to_string(),
-        "cannot infer the type being projected from; annotate it"
+        "cannot tell what this is, so its fields are unknown; write out its type"
     );
 }
 
@@ -481,7 +484,9 @@ fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
 
     // The counter runs over the whole program, so a definition solved after
     // others is where an index shows through as something unplaceable.
-    let (_, _, output) = infer_src(&format!("let f = fn a b c => {{ p: a, q: b, r: c }}\n{src}"));
+    let (_, _, output) = infer_src(&format!(
+        "let f = fn a b c => {{ p: a, q: b, r: c }}\n{src}"
+    ));
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
@@ -527,11 +532,11 @@ fn a_projection_complaint_keeps_the_wording_it_was_reported_with() {
         wordings,
         [
             format!(
-                "{}: cannot infer the type being projected from; annotate it",
+                "{}: cannot tell what this is, so its fields are unknown; write out its type",
                 src.find("y.q").expect("the inner base")
             ),
             format!(
-                "{}: cannot infer the type being projected from; annotate it",
+                "{}: cannot tell what this is, so its fields are unknown; write out its type",
                 src.find("x.a").expect("the outer base")
             ),
         ]
@@ -545,7 +550,7 @@ fn a_projection_complaint_keeps_the_wording_it_was_reported_with() {
     };
     assert_eq!(
         error.kind.to_string(),
-        "cannot project a field out of `Nat`"
+        "`Nat` is not a struct, so it has no fields to read"
     );
 }
 
@@ -563,7 +568,7 @@ fn a_projection_chain_complains_once() {
         .collect();
     assert_eq!(
         messages,
-        ["cannot infer the type being projected from; annotate it"]
+        ["cannot tell what this is, so its fields are unknown; write out its type"]
     );
 }
 
@@ -606,6 +611,10 @@ fn a_projection_waits_for_a_base_another_projection_supplies() {
     assert_eq!(scheme(&mint, &output, "deep"), "Nat");
 }
 
+/// The line recursive types are not allowed to move. A declaration may name
+/// itself, because a person wrote down what it is; a term may not ask the
+/// solver to invent a type that contains itself, because nothing they could
+/// write is what it would be.
 #[test]
 fn self_application_is_recursive_not_divergent() {
     let (_, _, output) = infer_src("let w = fn x => x x");
@@ -617,16 +626,207 @@ fn self_application_is_recursive_not_divergent() {
         "expected a recursive-type error: {:#?}",
         output.errors
     );
+
+    // And it stays that way in a program that also declares a recursive type,
+    // so the two are decided separately rather than by one switch.
+    let (_, _, output) = infer_src("type list = { val: Nat, next: list }\nlet w = fn x => x x");
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Recursive)),
+        "expected a recursive-type error: {:#?}",
+        output.errors
+    );
 }
 
+/// A type may name itself, and reading a field off one gives the type back.
 #[test]
-fn aliases_unfold_to_their_meaning() {
+fn a_type_may_name_itself() {
+    let (mint, _, output) = inferred(
+        "type list = { val: Nat, next: list }\n\
+         let head : list -> Nat = fn l => l.val\n\
+         let rest : list -> list = fn l => l.next\n\
+         let third : list -> Nat = fn l => l.next.next.val\n\
+         let second = fn l => head (rest l)",
+    );
+    // The annotation is answered in the words it was written in.
+    assert_eq!(scheme(&mint, &output, "head"), "list -> Nat");
+    assert_eq!(scheme(&mint, &output, "rest"), "list -> list");
+    // A chain of projections walks the type as far as it is asked to, each
+    // link reading a field off a name the link before it produced.
+    assert_eq!(scheme(&mint, &output, "third"), "list -> Nat");
+    // And an unannotated definition works the name back out of the two it
+    // called, having never been told it.
+    assert_eq!(scheme(&mint, &output, "second"), "list -> Nat");
+
+    // What the declaration means is one step deep: the name inside it is still
+    // a name, which is why this is a finite value at all.
+    let list = symbol_named(&mint, output.aliases.keys().copied(), "list");
+    assert_eq!(
+        output.aliases[&list].to_string(),
+        "{ val: Nat, next: list }"
+    );
+}
+
+/// Equality is structural through a name, so two declarations of the same
+/// shape are one type however differently they are spelled — and neither is
+/// equal to a shape that differs.
+#[test]
+fn two_recursive_types_of_the_same_shape_are_one_type() {
+    let (mint, _, output) = inferred(
+        "type a = { n: a }\n\
+         type b = { n: b }\n\
+         let f : a -> b = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "a -> b");
+
+    let (_, _, output) = infer_src(
+        "type a = { n: a }\n\
+         type c = { n: Nat }\n\
+         let f : a -> c = fn x => x",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::Mismatch { .. }));
+}
+
+/// How far a type happens to be unrolled is not part of what it is. Deciding
+/// this is what the solver's assumption stack is for: without it the two sides
+/// unfold against each other forever, because neither ever runs out.
+#[test]
+fn equality_looks_past_how_far_a_type_is_unrolled() {
+    let (mint, _, output) = inferred(
+        "type a = { n: a }\n\
+         type b = { n: { n: b } }\n\
+         let f : a -> b = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "a -> b");
+
+    // Every other way two of them can be out of step: through arrows, through
+    // a third declaration, and against a shape written out by hand. Each of
+    // these is a solve that only ends because a pair it has already taken on
+    // is a pair it refuses to take on again — reaching the assertion at all is
+    // most of what is being checked.
+    let (mint, _, output) = inferred(
+        "type f1 = Nat -> f1\n\
+         type f2 = Nat -> Nat -> f2\n\
+         let f : f1 -> f2 = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "f1 -> f2");
+
+    let (mint, _, output) = inferred(
+        "type a = { n: b }\n\
+         type b = { n: a }\n\
+         type c = { n: c }\n\
+         let f : a -> c = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "a -> c");
+
+    let (mint, _, output) = inferred(
+        "type c = { n: c }\n\
+         let f : { n: c } -> c = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ n: c } -> c");
+}
+
+/// Two declarations may name each other, since every type's name is bound
+/// before any type's body is read.
+#[test]
+fn recursive_types_may_be_written_in_terms_of_each_other() {
+    let (mint, _, output) = inferred(
+        "type forest = { head: tree, tail: forest }\n\
+         type tree = { val: Nat, kids: forest }\n\
+         let first : forest -> Nat = fn f => f.head.val",
+    );
+    assert_eq!(scheme(&mint, &output, "first"), "forest -> Nat");
+
+    // Written below it, and reached anyway.
+    let tree = symbol_named(&mint, output.aliases.keys().copied(), "tree");
+    assert_eq!(
+        output.aliases[&tree].to_string(),
+        "{ val: Nat, kids: forest }"
+    );
+}
+
+/// The one loop that is not a recursive type: a name standing for a name
+/// standing for the first says nothing, so it is refused where it is written
+/// rather than unfolded forever — or, worse, taken as equal to everything by
+/// the assumption that makes the real ones work.
+#[test]
+fn a_type_declared_as_only_a_name_is_rejected() {
+    for src in [
+        "type t = t\nlet n : t = 1",
+        "type a = b\ntype b = a\nlet n : a = 1",
+    ] {
+        let (_, out, output) = infer_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ir::ErrorKind::Circular)),
+            "{src}: expected a circular-type error: {:#?}",
+            out.errors
+        );
+        // The declaration is undecided from there on, which absorbs: the one
+        // complaint is not echoed by everything that named it.
+        assert!(
+            output.errors.is_empty(),
+            "{src}: inference errors: {:#?}",
+            output.errors
+        );
+    }
+
+    // A loop with any shape in it is a type, not a mistake.
+    inferred("type t = { next: t }\nlet f : t -> t = fn x => x.next");
+    inferred("type t = t -> Nat\nlet f : t -> t = fn x => x");
+}
+
+/// Unfolding is a rule of the solve like any other, so a reader stepping
+/// through it is shown where a name was replaced and where a pair came back
+/// round.
+#[test]
+fn unfolding_a_declared_type_is_a_rule_of_its_own() {
+    let (mint, _, output) = inferred(
+        "type a = { n: a }\n\
+         type b = { n: b }\n\
+         let f : a -> b = fn x => x",
+    );
+    assert_eq!(
+        steps(&mint, &output, "f"),
+        [
+            // The body is an `a` where the annotation wants a `b`. Neither is
+            // a variable, so nothing binds: the whole question is whether two
+            // declarations mean the same thing.
+            "unfold  b ~ a => replaced by the goals below",
+            "  struct  { n: b } ~ { n: a } => replaced by the goals below",
+            // Which is the first question again, one field in. Three steps,
+            // not five: the pair is remembered by which declarations it names,
+            // so the second `b` and `a` are recognized as the first ones and
+            // not as two more copies to unfold.
+            "    assume  b ~ a => no change",
+        ]
+    );
+}
+
+/// A declared type keeps its name everywhere it is used, and the alias table
+/// is what says what a name means — one step, not all the way down. Unfolding
+/// used to happen at lowering, which spelled `Endo` back at the user as
+/// `Nat -> Nat` and made a type that names itself impossible to lower at all.
+#[test]
+fn a_declared_type_stays_the_name_it_was_written_as() {
     let (mint, _, output) =
         inferred("type Endo = Nat -> Nat\ntype Pair = { f: Endo }\nlet id : Endo = fn x => x");
-    assert_eq!(scheme(&mint, &output, "id"), "Nat -> Nat");
+    assert_eq!(scheme(&mint, &output, "id"), "Endo");
 
     let pair = symbol_named(&mint, output.aliases.keys().copied(), "Pair");
-    assert_eq!(output.aliases[&pair].to_string(), "{ f: Nat -> Nat }");
+    assert_eq!(output.aliases[&pair].to_string(), "{ f: Endo }");
+
+    // And the name is a barrier to unfolding only: `id` is still the function
+    // the alias stands for, so it takes a `Nat` and gives one back.
+    let (mint, _, output) =
+        inferred("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\nlet n = id 1");
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
 }
 
 #[test]
@@ -653,7 +853,7 @@ fn the_solve_is_recorded_rule_by_rule() {
         steps(&mint, &output, "fst"),
         [
             "bind  Nat ~ ?0 => ?0 := Nat",
-            "project  { x: Nat }.x ~ Nat => broken into smaller goals",
+            "project  { x: Nat }.x ~ Nat => replaced by the goals below",
             "  prim  Nat ~ Nat => no change",
         ]
     );
@@ -732,7 +932,7 @@ fn giving_up_on_a_goal_is_a_step_of_its_own() {
         steps(&mint, &output, "f"),
         [
             "defer  ?0.x ~ ?1 => no change",
-            "stuck  ?0.x ~ ?1 => cannot infer the type being projected from; annotate it",
+            "stuck  ?0.x ~ ?1 => cannot tell what this is, so its fields are unknown; write out its type",
             "recover  ?0 ~ ? => ?0 := ?",
             "recover  ?1 ~ ? => ?1 := ?",
         ]

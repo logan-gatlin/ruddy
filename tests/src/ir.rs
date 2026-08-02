@@ -338,19 +338,19 @@ fn primitives_are_resolved_from_their_spelling() {
     ));
 }
 
-/// Types are hoisted above terms, so a term names a declaration written below
-/// it — but the hoist is only between the groups. Within the types, resolution
-/// is source-ordered as ever, so one written above a declaration still reaches
-/// the built-in rather than forward-referencing it.
+/// Types are hoisted above terms and above each other: every type's name is
+/// bound before any type's body is read, so a declaration can name one written
+/// below it, and — the point of the ordering — can name itself.
 #[test]
-fn types_are_hoisted_above_terms_but_not_above_each_other() {
-    // A type above the declaration does not see it.
+fn types_are_hoisted_above_terms_and_above_each_other() {
+    // A type above the declaration sees it, and a declaration of `Nat` beats
+    // the built-in wherever it is written.
     let (mint, out) = built("type T = Nat  type Nat = ()");
     assert!(matches!(
         out.program.types[&type_symbol(&mint, &out, "T")]
             .value
             .tracked,
-        TypeKind::Prim(Prim::Nat)
+        TypeKind::Ident(_)
     ));
 
     // A term above it does, because every type is lowered first.

@@ -79,7 +79,7 @@ fn types_of(source: &str) -> (String, String) {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mut built.program);
+    let inferred = inference::infer(&mint, &mut built.program);
     assert!(
         inferred.errors.is_empty(),
         "{source}: {:#?}",
@@ -101,7 +101,7 @@ fn types_of(source: &str) -> (String, String) {
 /// A type reaches a reader two ways — off the debugger's tabs, and out of a
 /// diagnostic the compiler wrote — and both are the surface type grammar, so
 /// both have to spell it the same. They are the same rule now, in
-/// `ruddy::grammar`, which the debugger's printers and `Display for Ty` both
+/// `ruddy::ui`, which the debugger's printers and `Display for Ty` both
 /// go through; it used to be a copy each, with the compiler's own comment
 /// conceding it was "the same rule the debugger's printers apply".
 ///
@@ -127,6 +127,13 @@ fn a_type_reads_the_same_whichever_printer_reached_it() {
         (
             "let g : { p: { q: Nat } } -> Nat = fn r => r.p.q",
             "{ p: { q: Nat } } -> Nat",
+        ),
+        // A declared type is spelled as its name by both printers, and is an
+        // atom to both: the arrow it stands for never leaks parentheses out
+        // through the name.
+        (
+            "type Endo = Nat -> Nat\nlet h : Endo -> Endo = fn f => f",
+            "Endo -> Endo",
         ),
     ] {
         let (written, inferred) = types_of(source);

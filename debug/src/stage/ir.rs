@@ -5,6 +5,7 @@
 //! symbol across all panels.
 
 use ruddy::{
+    inference,
     ir::{Decl, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     types::Ty,
@@ -136,8 +137,13 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 arg.tracked,
             );
             // The bound name has no term of its own to carry a type, but the
-            // lambda's arrow knows it.
-            if let Ty::Arrow(from, _) = &*term.ty {
+            // lambda's arrow knows it — through a declared type if that is
+            // what the annotation was, since a lambda checked against `Endo`
+            // has an argument as surely as one checked against `Nat -> Nat`.
+            let shape = cx
+                .inference
+                .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
+            if let Some(Ty::Arrow(from, _)) = shape.as_deref() {
                 trace.terms.push((bound.id, from.clone()));
             }
             Node {

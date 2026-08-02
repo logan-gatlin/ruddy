@@ -31,21 +31,24 @@
 //! type still has a type, [`Ty::Undecided`], which unifies with everything so
 //! that one mistake is reported once rather than echoed by every consumer.
 
-use std::{collections::HashMap, fmt, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
 use indexmap::IndexMap;
 
 use crate::{
     ir::{Program, Term, TermKind, Type, TypeKind},
-    symbol::Symbol,
+    symbol::{Mint, Symbol},
     tracking::Span,
     types::{Scheme, Ty, TyVar},
 };
 
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// What each `type` declaration means, with every alias unfolded — the
-    /// semantic type behind the written one.
+    /// What each `type` declaration stands for: the semantic type its body
+    /// denotes, one step deep. A name inside a body stays a [`Ty::Named`] and
+    /// is looked up here again, which is how a declaration that names itself
+    /// stays a finite value — and why this map, not the type, is what a
+    /// recursive type is made of. See [`unfold`].
     pub aliases: IndexMap<Symbol, Rc<Ty>>,
     /// The scheme each top-level term was inferred, or checked, to have.
     pub schemes: IndexMap<Symbol, Scheme>,
@@ -88,22 +91,23 @@ pub struct Step {
 }
 
 /// The case of the solver that fired. One per arm of [`Solve::unify`] — with
-/// the occurs check counting as its own, since it is the arm *not* applying —
-/// plus the three a deferred projection can take and the recovery that follows
-/// every failure.
+/// the occurs check counting as its own, since it is the arm *not* applying,
+/// and the assumption that ends an unfolding likewise — plus the three a
+/// deferred projection can take and the recovery that follows every failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// One side is [`Ty::Undecided`], which unifies with anything.
     Absorb,
-    /// Both sides are already the same variable.
+    /// Both sides are already the same thing: the same variable, or the same
+    /// declared type. Either way there is nothing to take apart.
     Same,
     /// A variable against a type: the only rule that grows the solution.
     Bind,
     /// A variable against a type that contains it. The occurs check fired, so
     /// the binding [`Rule::Bind`] would have made was not made — a rule of its
     /// own rather than a `Bind` that failed, because a reader shown "a variable
-    /// takes the type it is against" above an effect reading "recursive type"
-    /// is being told the opposite of what happened.
+    /// takes the type it is against" above an effect reading "this type would have
+    /// to contain itself" is being told the opposite of what happened.
     Occurs,
     /// Two identical primitives.
     Prim,
@@ -111,6 +115,15 @@ pub enum Rule {
     Arrow,
     /// Two structs with the same field names, taken apart field by field.
     Struct,
+    /// A declared type replaced by what it stands for, so that a goal about a
+    /// name becomes a goal about a shape. What names are for: a type is equal
+    /// to another by how it unfolds, never by what it is called.
+    Unfold,
+    /// The same two types are already being compared further out, so unfolding
+    /// them again would ask a question that is already open. A recursive type
+    /// equals another when assuming they are equal never leads to a
+    /// contradiction, and this is that assumption being used.
+    Assume,
     /// Nothing above applied, and the two types cannot be made equal.
     Mismatch,
     /// A projection whose base turned out to be a struct.
@@ -133,7 +146,9 @@ pub enum Effect {
     None,
     /// A variable now points at a type.
     Bound { var: TyVar, ty: Rc<Ty> },
-    /// The goal became smaller goals, which follow it one level deeper.
+    /// The goal was replaced by the goals that follow it one level deeper —
+    /// the halves of an arrow, the fields of a struct, or the same goal asked
+    /// again about what a name stands for.
     Decomposed,
     /// Reported, and the goal abandoned.
     Failed(ErrorKind),
@@ -239,15 +254,20 @@ struct Table {
 }
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
-///
-/// It holds no aliases: every written type reaches it already lowered, so
-/// there is nothing left for it to unfold.
 struct Constrain<'a> {
     table: &'a mut Table,
     /// What each symbol in scope means. Symbols are globally unique, so one
     /// flat map serves every scope at once and nothing is ever popped: a
     /// lambda argument can never collide with a top-level definition.
     env: &'a mut HashMap<Symbol, Binding>,
+    /// What the declared types stand for, for the two arms that have to see a
+    /// shape rather than a name: applying something annotated `Endo`, and
+    /// checking a term against an annotation of `list`.
+    ///
+    /// Reading this is not reading the variable table. It is fixed before the
+    /// first definition is walked and mentions no variable, so an arm that
+    /// consults it still cannot depend on how much an earlier arm had solved.
+    aliases: &'a IndexMap<Symbol, Rc<Ty>>,
     out: Vec<Constraint>,
 }
 
@@ -278,25 +298,41 @@ struct Solve<'a> {
     table: &'a mut Table,
     errors: &'a mut Vec<Error>,
     steps: &'a mut Vec<Step>,
+    /// What the declared types stand for, so a goal about a name can become a
+    /// goal about a shape. See [`unfold`].
+    aliases: &'a IndexMap<Symbol, Rc<Ty>>,
     /// Stamped onto every step this solve records.
     definition: Symbol,
     /// How deep inside a decomposition the solver currently is.
     depth: u32,
+    /// The pairs of declarations the goals currently open were reached by
+    /// unfolding, innermost last.
+    ///
+    /// Two recursive types are equal when assuming they are equal never leads
+    /// to a contradiction, so meeting a pair already on this stack ends the
+    /// goal rather than starting it again. Kept as a stack rather than a set
+    /// because the assumption holds for the goals the unfolding broke into and
+    /// no further, which is the same scope [`Solve::depth`] tracks.
+    ///
+    /// Two declarations, rather than two types, because a pair of declarations
+    /// is the only pair that can come back round — see [`Solve::unfold`].
+    assumed: Vec<(Symbol, Symbol)>,
 }
 
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
-pub fn infer(program: &mut Program) -> Output {
+pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut table = Table::default();
     let mut env = HashMap::new();
     let mut aliases = IndexMap::new();
     let mut errors = Vec::new();
 
-    // Aliases first: annotations refer to them. Lowering only lets a type name
-    // a type declared above it, so one in-order pass unfolds every alias.
+    // Aliases first: annotations refer to them. A name inside a body stays a
+    // name, so this pass reads no alias it is still building and the order it
+    // runs in decides nothing — which is what lets two declarations refer to
+    // each other.
     for (symbol, decl) in &program.types {
-        let ty = lower_type(&aliases, &decl.value);
-        aliases.insert(*symbol, ty);
+        aliases.insert(*symbol, lower_type(mint, &decl.value));
     }
 
     let mut schemes = IndexMap::new();
@@ -313,11 +349,12 @@ pub fn infer(program: &mut Program) -> Output {
         let annotated = decl
             .annotation
             .as_ref()
-            .map(|annotation| lower_type(&aliases, annotation));
+            .map(|annotation| lower_type(mint, annotation));
 
         let mut constrain = Constrain {
             table: &mut table,
             env: &mut env,
+            aliases: &aliases,
             out: Vec::new(),
         };
         let ty = match &annotated {
@@ -341,8 +378,10 @@ pub fn infer(program: &mut Program) -> Output {
             table: &mut table,
             errors: &mut errors,
             steps: &mut steps,
+            aliases: &aliases,
             definition: *symbol,
             depth: 0,
+            assumed: Vec::new(),
         }
         .run(&generated);
 
@@ -377,131 +416,6 @@ pub fn infer(program: &mut Program) -> Output {
         constraints,
         steps,
         errors,
-    }
-}
-
-impl ConstraintKind {
-    /// A stable, greppable name for this kind of constraint, the way
-    /// [`ErrorKind::code`] names a kind of error. The debugger labels its rows
-    /// with it rather than with prose that may be reworded.
-    pub fn code(&self) -> &'static str {
-        match self {
-            ConstraintKind::Equal { .. } => "equal",
-            ConstraintKind::Field { .. } => "field",
-        }
-    }
-}
-
-impl Rule {
-    /// A stable, greppable name for this rule, the way [`ErrorKind::code`]
-    /// names a kind of error.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Rule::Absorb => "absorb",
-            Rule::Same => "same",
-            Rule::Bind => "bind",
-            Rule::Occurs => "occurs",
-            Rule::Prim => "prim",
-            Rule::Arrow => "arrow",
-            Rule::Struct => "struct",
-            Rule::Mismatch => "mismatch",
-            Rule::Project => "project",
-            Rule::Defer => "defer",
-            Rule::Stuck => "stuck",
-            Rule::Recover => "recover",
-        }
-    }
-}
-
-/// What a rule does, in a phrase. Said here rather than by whoever is showing
-/// the solve, so a reader stepping through it and a reader reading the code are
-/// told the same thing.
-impl fmt::Display for Rule {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Rule::Absorb => "one side is undecided, which unifies with anything",
-            Rule::Same => "already the same variable",
-            Rule::Bind => "a variable takes the type it is against",
-            Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
-            Rule::Prim => "the same primitive on both sides",
-            Rule::Arrow => "two arrows: argument against argument, result against result",
-            Rule::Struct => "two structs: field against field, matched by name",
-            Rule::Mismatch => "no rule applies, so the two types cannot be made equal",
-            Rule::Project => "the base is a struct, so the field can be read off it",
-            Rule::Defer => "the base is still unknown; wait for another round",
-            Rule::Stuck => "no round will explain the base now",
-            Rule::Recover => "the abandoned result becomes undecided, so nothing echoes it",
-        })
-    }
-}
-
-/// What a step changed, as one line: nothing, a new binding, the goals it broke
-/// into, or the complaint it ended in.
-impl fmt::Display for Effect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Effect::None => f.write_str("no change"),
-            Effect::Bound { var, ty } => write!(f, "?{var} := {ty}"),
-            Effect::Decomposed => f.write_str("broken into smaller goals"),
-            Effect::Failed(kind) => kind.fmt(f),
-        }
-    }
-}
-
-impl ErrorKind {
-    /// A stable, greppable name for this kind of error. Reporters key on it
-    /// rather than on the message, which is prose and may be reworded.
-    pub fn code(&self) -> &'static str {
-        match self {
-            ErrorKind::Mismatch { .. } => "type-mismatch",
-            ErrorKind::Recursive => "recursive-type",
-            ErrorKind::NotAStruct { .. } => "not-a-struct",
-            ErrorKind::UnknownBase => "unknown-base",
-            ErrorKind::MissingField { .. } => "missing-field",
-        }
-    }
-}
-
-/// A constraint prints as what it demands, with `~` for "must unify with" —
-/// the notation the literature uses, and short enough to sit in a debugger row.
-impl fmt::Display for Constraint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.kind.fmt(f)
-    }
-}
-
-impl fmt::Display for ConstraintKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
-            ConstraintKind::Field {
-                base, name, result, ..
-            } => write!(f, "{base}.{name} ~ {result}"),
-        }
-    }
-}
-
-/// What went wrong, in one sentence. Every reporter — the CLI driver, the
-/// debugger's diagnostic strip, whatever comes next — prints this rather than
-/// matching on the variants itself, so a new one cannot reach a reader phrased
-/// two different ways or not at all.
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ErrorKind::Mismatch { expected, actual } => {
-                write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
-            }
-            ErrorKind::Recursive => f.write_str("recursive type"),
-            ErrorKind::NotAStruct { base } => {
-                write!(f, "cannot project a field out of `{base}`")
-            }
-            ErrorKind::UnknownBase => {
-                f.write_str("cannot infer the type being projected from; annotate it")
-            }
-            ErrorKind::MissingField { base, field } => {
-                write!(f, "no field `{field}` on `{base}`")
-            }
-        }
     }
 }
 
@@ -568,7 +482,13 @@ impl Table {
                 }
                 false
             }
-            Ty::Nat | Ty::Bound(_) | Ty::Undecided => false,
+            // A declared type is not descended into, here or in any of the
+            // walks below. What one stands for was lowered from what the user
+            // wrote and mentions no variable at all, so there is nothing
+            // inside it to find, no level to pull up, and nothing to rebuild —
+            // and stopping is what keeps a walk over a type that names itself
+            // finite.
+            Ty::Nat | Ty::Named { .. } | Ty::Bound(_) | Ty::Undecided => false,
         }
     }
 
@@ -604,7 +524,7 @@ impl Table {
                     self.quantify(ty, subst);
                 }
             }
-            Ty::Nat | Ty::Bound(_) | Ty::Undecided => {}
+            Ty::Nat | Ty::Named { .. } | Ty::Bound(_) | Ty::Undecided => {}
         }
     }
 
@@ -625,7 +545,7 @@ impl Table {
                     .map(|(name, ty)| (name.clone(), self.zonk(ty, subst)))
                     .collect(),
             )),
-            Ty::Nat | Ty::Bound(_) | Ty::Undecided => ty,
+            Ty::Nat | Ty::Named { .. } | Ty::Bound(_) | Ty::Undecided => ty,
         }
     }
 
@@ -736,7 +656,11 @@ impl Constrain<'_> {
                 self.infer_term(func);
                 self.infer_term(arg);
                 let applied = func.ty.clone();
-                match &*applied {
+                // Through a name, so that something annotated `Endo` is
+                // applied as the arrow it stands for. The arrow the arm then
+                // works with is the unfolded one, which is the only shape a
+                // call site can take apart.
+                match &*unfold(self.aliases, &applied) {
                     // The function already knows what it takes, so the demand
                     // on the argument is the parameter type and the result is
                     // the arrow's own. Written this way round, a mismatch
@@ -828,7 +752,12 @@ impl Constrain<'_> {
     /// mention no solver variables, so checking, like the rest of generation,
     /// never has to ask the table anything.
     fn check_term(&mut self, term: &mut Term, expected: &Rc<Ty>) {
-        match (&mut term.kind, &**expected) {
+        // Checking looks through a name — an annotation of `list` still pushes
+        // into a struct literal — but `term.ty` is set from `expected` rather
+        // than from this, so the term keeps the name the user wrote and prints
+        // as it.
+        let shape = unfold(self.aliases, expected);
+        match (&mut term.kind, &*shape) {
             (TermKind::Fn { arg, body }, Ty::Arrow(from, to)) => {
                 let (from, to) = (from.clone(), to.clone());
                 self.env.insert(arg.tracked, Binding::Mono(from));
@@ -982,6 +911,23 @@ impl Solve<'_> {
                 self.step(span, Rule::Defer, goal, Effect::None);
                 false
             }
+            // A field is read off a shape, and a name is not one yet. No
+            // assumption is needed the way [`Solve::unfold`] needs one: a
+            // projection asks about one type rather than a pair, and unfolding
+            // one type reaches a shape or runs out of names.
+            Ty::Named { .. } => {
+                self.step(span, Rule::Unfold, goal, Effect::Decomposed);
+                self.depth += 1;
+                let unfolded = self.project(&Projection {
+                    base: unfold(self.aliases, &base),
+                    span: projection.span,
+                    base_span: projection.base_span,
+                    name: projection.name.clone(),
+                    result: projection.result.clone(),
+                });
+                self.depth -= 1;
+                unfolded
+            }
             _ => {
                 let kind = ErrorKind::NotAStruct { base: base.clone() };
                 let error = Error {
@@ -1040,8 +986,21 @@ impl Solve<'_> {
                 self.recover(span, &lhs);
             }
             (Ty::Var(a), Ty::Var(b)) if a == b => self.step(span, Rule::Same, goal, Effect::None),
+            // Before unfolding, so that a variable against a declared type
+            // takes the type by the name it was written as. What a definition
+            // is inferred to be then reads as what its annotations said, and
+            // the solver has one less thing to unfold later.
             (Ty::Var(var), _) => self.assign(span, goal, *var, &rhs),
             (_, Ty::Var(var)) => self.assign(span, goal, *var, &lhs),
+            // One declaration is only ever equal to itself, so this saves an
+            // unfolding rather than deciding anything. Two *different*
+            // declarations fall through to unfolding and are equal whenever
+            // what they stand for is: names are a barrier to unfolding, never
+            // to equality.
+            (Ty::Named { symbol: a, .. }, Ty::Named { symbol: b, .. }) if a == b => {
+                self.step(span, Rule::Same, goal, Effect::None)
+            }
+            (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => self.unfold(span, goal, &lhs, &rhs),
             (Ty::Nat, Ty::Nat) => self.step(span, Rule::Prim, goal, Effect::None),
             (Ty::Arrow(from1, to1), Ty::Arrow(from2, to2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
@@ -1080,11 +1039,63 @@ impl Solve<'_> {
         }
     }
 
+    /// Replace whichever sides are declared types with what they stand for,
+    /// and ask the goal again.
+    ///
+    /// This is where recursive types are decided, and it is the only rule that
+    /// can be asked the same question twice: `list` against a second
+    /// declaration of the same shape unfolds to two structs whose `next`
+    /// fields are the two declarations again. So a pair of declarations is
+    /// remembered while the goals it broke into are open, and meeting it again
+    /// is [`Rule::Assume`] — the two are equal exactly when assuming so leads
+    /// to no contradiction, and every contradiction there could be is one of
+    /// the goals in between.
+    ///
+    /// A pair of *declarations* is the only pair worth remembering, because it
+    /// is the only pair that can come back round. Every [`Ty`] is a finite
+    /// tree — a name is a leaf, not an edge — so a name against a shape
+    /// descends into a strictly smaller shape each time and runs out, and only
+    /// a name reached from a name can be where it started. That also makes
+    /// this terminate: there are finitely many pairs of declarations, and the
+    /// stack refuses to take one twice.
+    ///
+    /// Equality stays structural throughout. A name is a barrier to unfolding
+    /// and nothing else: two declarations that unfold the same way are one
+    /// type however differently they were written, and the same declaration on
+    /// both sides is decided by [`Rule::Same`] as a shortcut, never as a rule
+    /// that names carry meaning.
+    fn unfold(&mut self, span: Span, goal: ConstraintKind, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
+        let pair = match (&**lhs, &**rhs) {
+            (Ty::Named { symbol: a, .. }, Ty::Named { symbol: b, .. }) => Some((*a, *b)),
+            _ => None,
+        };
+        if pair.is_some_and(|pair| self.assumed.contains(&pair)) {
+            self.step(span, Rule::Assume, goal, Effect::None);
+            return;
+        }
+        let lhs = unfold(self.aliases, lhs);
+        let rhs = unfold(self.aliases, rhs);
+        self.step(span, Rule::Unfold, goal, Effect::Decomposed);
+        self.assumed.extend(pair);
+        self.depth += 1;
+        self.unify(span, &lhs, &rhs);
+        self.depth -= 1;
+        if pair.is_some() {
+            self.assumed.pop();
+        }
+    }
+
     /// Point an unbound variable at a type, unless the type contains the
     /// variable itself — the occurs check that keeps every type a finite tree.
     /// Either way one step is recorded, and the rule it names is the one that
     /// actually applied: a cycle is [`Rule::Occurs`], not a [`Rule::Bind`] that
     /// happened to leave the variable where it was.
+    ///
+    /// Recursive types do not soften this, and this is the line that says so.
+    /// A type may lead back to itself only through a declaration, where a
+    /// person wrote down what it is; `fn x => x x` asks the solver to invent
+    /// one, which is the difference between a type the language has and a type
+    /// nothing could have written.
     fn assign(&mut self, span: Span, goal: ConstraintKind, var: TyVar, ty: &Rc<Ty>) {
         let Slot::Unbound { level } = self.table.vars[var as usize] else {
             unreachable!("resolve only stops at unbound variables");
@@ -1178,7 +1189,7 @@ impl Solve<'_> {
                     self.recover(span, &ty);
                 }
             }
-            Ty::Nat | Ty::Bound(_) | Ty::Undecided => {}
+            Ty::Nat | Ty::Named { .. } | Ty::Bound(_) | Ty::Undecided => {}
         }
     }
 
@@ -1194,32 +1205,64 @@ impl Solve<'_> {
     }
 }
 
-/// The semantic type a written type denotes. Aliases unfold — this is where
-/// `Endo` becomes `Nat -> Nat` — and a type that failed to lower becomes
+/// The semantic type a written type denotes. A declared type stays the name it
+/// was written as — `Endo` stays `Endo`, and what it stands for is looked up
+/// where a shape is actually needed — and a type that failed to lower becomes
 /// [`Ty::Undecided`], which absorbs rather than cascades.
 ///
+/// Keeping the name is what makes a recursive declaration lowerable at all: a
+/// body that named its own meaning would have to contain it, and nothing
+/// finite does. It is also what a reader gets told, since a type prints as
+/// itself; the mint is here only to spell it, never to decide anything.
+///
 /// A free function, and the reason generation never needs the variable table:
-/// what comes back is built out of primitives, arrows, structs and other
-/// aliases, and mentions no [`Ty::Var`] at all.
-fn lower_type(aliases: &IndexMap<Symbol, Rc<Ty>>, ty: &Type) -> Rc<Ty> {
+/// what comes back is built out of primitives, arrows, structs and names, and
+/// mentions no [`Ty::Var`] at all.
+fn lower_type(mint: &Mint, ty: &Type) -> Rc<Ty> {
     match &ty.tracked {
         TypeKind::Prim(prim) => Rc::new((*prim).into()),
-        TypeKind::Ident(symbol) => aliases
-            .get(symbol)
-            .cloned()
-            .unwrap_or_else(|| Rc::new(Ty::Undecided)),
-        TypeKind::Arrow { from, to } => Rc::new(Ty::Arrow(
-            lower_type(aliases, from),
-            lower_type(aliases, to),
-        )),
+        TypeKind::Ident(symbol) => Rc::new(Ty::Named {
+            symbol: *symbol,
+            name: mint.name(*symbol).into(),
+        }),
+        TypeKind::Arrow { from, to } => {
+            Rc::new(Ty::Arrow(lower_type(mint, from), lower_type(mint, to)))
+        }
         TypeKind::Struct(fields) => Rc::new(Ty::Struct(
             fields
                 .iter()
-                .map(|(name, field)| (name.clone(), lower_type(aliases, &field.value)))
+                .map(|(name, field)| (name.clone(), lower_type(mint, &field.value)))
                 .collect(),
         )),
         TypeKind::Error => Rc::new(Ty::Undecided),
     }
+}
+
+/// What a declared type stands for: [`Ty::Named`] replaced by the body it was
+/// declared with, and again for as long as that is another name.
+///
+/// The one place a name is looked through, and always by one caller that needs
+/// a shape rather than a name — never as a normalization pass. A type that
+/// names itself unfolds forever if asked to, so nothing here asks: what comes
+/// back is one shape deep, and the names inside it are still names.
+///
+/// What guarantees this terminates is the check in
+/// [`ir::build`](crate::ir::build), not anything here: a chain of names that
+/// closed a loop would be a type declared as itself, which lowering refuses,
+/// so following one strictly shrinks what is left to follow. The same bargain
+/// [`Table::resolve`] has with the occurs check.
+///
+/// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
+/// write one is to repeat a type's name, which was already reported.
+pub fn unfold(aliases: &IndexMap<Symbol, Rc<Ty>>, ty: &Rc<Ty>) -> Rc<Ty> {
+    let mut ty = ty.clone();
+    while let Ty::Named { symbol, .. } = &*ty {
+        let Some(body) = aliases.get(symbol) else {
+            return Rc::new(Ty::Undecided);
+        };
+        ty = body.clone();
+    }
+    ty
 }
 
 /// Whether two field maps carry exactly the same names, in whatever order.
@@ -1256,6 +1299,6 @@ fn open(ty: &Rc<Ty>, fresh: &[Rc<Ty>]) -> Rc<Ty> {
                 .map(|(name, ty)| (name.clone(), open(ty, fresh)))
                 .collect(),
         )),
-        Ty::Nat | Ty::Var(_) | Ty::Undecided => ty.clone(),
+        Ty::Nat | Ty::Named { .. } | Ty::Var(_) | Ty::Undecided => ty.clone(),
     }
 }

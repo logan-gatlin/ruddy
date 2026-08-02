@@ -479,6 +479,90 @@ fn every_term_row_in_the_ir_wears_its_type() {
     assert_eq!(badge("Natural", "1"), "Nat");
 }
 
+/// A declared type is shown as what it stands for, one step deep, and says
+/// under itself which declarations it leads back through. The row above can
+/// only show the name coming back; whether that name leads anywhere is what
+/// two types declared in terms of each other make impossible to read off.
+#[test]
+fn the_types_tab_says_which_declarations_are_recursive() {
+    let snapshot = snapshot(
+        "type list = { val: Nat, next: list }\n\
+         type forest = { head: tree }\n\
+         type tree = { val: Nat, kids: forest }\n\
+         type Endo = Nat -> Nat\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let types = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage is registered");
+    let row = |name: &str| {
+        types
+            .nodes
+            .iter()
+            .find(|node| node.label == format!("type {name}"))
+            .unwrap_or_else(|| panic!("no row for {name}"))
+    };
+
+    // One step deep: the name inside is still a name, which is the only way a
+    // type that names itself can be rendered at all.
+    assert_eq!(row("list").text, "{ val: Nat, next: list }");
+    assert_eq!(row("Endo").text, "Nat -> Nat");
+
+    let recursion = |name: &str| -> Option<&str> {
+        row(name)
+            .children
+            .iter()
+            .find(|child| child.label == "recursive")
+            .map(|child| child.text.as_str())
+    };
+    // A declaration that names itself is a loop of one.
+    assert_eq!(recursion("list"), Some("list"));
+    // And one that does not is the case the row cannot show on its own:
+    // neither of these mentions itself, and the loop runs through a
+    // declaration written below the first of them.
+    assert_eq!(recursion("forest"), Some("forest, tree"));
+    assert_eq!(recursion("tree"), Some("tree, forest"));
+    // And an alias that leads nowhere says nothing.
+    assert_eq!(recursion("Endo"), None);
+}
+
+/// A lambda's argument badge comes from the arrow the lambda has, which is an
+/// arrow just as much when the annotation was a name for one.
+#[test]
+fn an_argument_wears_its_type_through_a_declared_type() {
+    let snapshot = snapshot("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\n");
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+    let badges: HashMap<u32, &str> = stage("types-ir")
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.text.as_str()))
+        .collect();
+    let arg = nodes(stage("ir"))
+        .into_iter()
+        .find(|node| node.label == "Arg")
+        .expect("the IR renders the bound name");
+    assert_eq!(badges[&arg.id], "Nat");
+}
+
 /// The strip's messages are inference's own words. They were a copy of the
 /// CLI driver's, and the two had already drifted apart on this very sentence —
 /// `tests/src/inference.rs` pins the other end of it.
@@ -518,6 +602,20 @@ fn symbols_round_trip_through_the_mangler() {
         assert_eq!(demangle.value, "ok", "{} did not round-trip", node.label);
         assert!(!node.error);
     }
+
+    // Each row's text is the path, and the lambda's `x` is a local: it belongs
+    // to no module, so the panel shows it one segment in rather than beside
+    // the top-level `f` it is not addressable alongside.
+    let paths: Vec<(&str, &str)> = nodes(symbols)
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    // In mint order, which is the row order: types are lowered first, and a
+    // lambda's binder is minted before the definition it is bound inside.
+    assert_eq!(
+        paths,
+        [("T", "demo::T"), ("x", "demo::_::x"), ("f", "demo::f")]
+    );
 }
 
 /// The compiler will panic while it is being worked on. When it does, the

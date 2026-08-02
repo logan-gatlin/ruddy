@@ -1,8 +1,8 @@
-use std::{fmt, rc::Rc};
+use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use crate::grammar::{Grouped, Prec, write_arrow, write_struct};
+use crate::symbol::Symbol;
 
 /// A type built into the language rather than declared in it.
 ///
@@ -51,75 +51,32 @@ pub enum Ty {
     /// syntax that re-lowers to exactly the type it was printed from, so the
     /// output stays something the user could have written.
     Struct(IndexMap<String, Rc<Ty>>),
+    /// A declared type, held as the name it was written as rather than as what
+    /// it stands for.
+    ///
+    /// This is the only place a type can be recursive, and the only reason it
+    /// can be: `symbol` keys
+    /// [`inference::Output::aliases`](crate::inference::Output::aliases), so a
+    /// declaration whose body names itself is a lookup that comes back round
+    /// rather than a tree that never ends. Nothing here points at the body, so
+    /// a type is still a finite tree — which is what keeps `Clone`, `Debug` and
+    /// every walk in the compiler terminating.
+    ///
+    /// It is a barrier to unfolding, never to equality. Two types are the same
+    /// when they unfold the same way, whatever they are called, so `symbol` is
+    /// compared only to spot the pair that needs no unfolding at all; see
+    /// [`Solve::unify`](crate::inference). `name` is what the type prints as
+    /// and is never compared: [`Display`](std::fmt::Display) is handed a bare
+    /// type with no mint to ask, and a spelling is cheaper to carry than a
+    /// context to thread through every diagnostic in the compiler.
+    Named {
+        symbol: Symbol,
+        name: Rc<str>,
+    },
     Var(TyVar),
     Bound(u32),
     #[default]
     Undecided,
-}
-
-impl fmt::Display for Prim {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-/// How much of the surface grammar a semantic type can be. Only the arrow
-/// extends rightward; everything else — a primitive, a braced struct, a
-/// variable — is a form nothing can be appended to.
-///
-/// The type language has no lambda and no application, so two of [`Prec`]'s
-/// four levels never arise here. They are still the right scale to answer on:
-/// grouping is decided by comparing against the position a type is being
-/// written into, and that comparison is the surface grammar's whether or not
-/// this particular tree can reach every level of it.
-impl Grouped for Ty {
-    fn prec(&self) -> Prec {
-        match self {
-            Ty::Arrow(..) => Prec::Arrow,
-            Ty::Nat | Ty::Struct(_) | Ty::Var(_) | Ty::Bound(_) | Ty::Undecided => Prec::Atom,
-        }
-    }
-}
-
-/// Types print in the surface type grammar, so a printed type reads the same
-/// as one the user could have written. The two forms with no surface spelling
-/// print as what they mean: a quantified variable as `'a`, and an unsolved or
-/// undecided type as `?` — inference's way of saying it has nothing to report.
-///
-/// The grouping and the braces come from [`crate::grammar`], which is also what
-/// the debugger's two tree printers write through. A type in a diagnostic and
-/// the same type on the debugger's IR tab are then the same string by
-/// construction rather than by two copies of the rule agreeing.
-impl fmt::Display for Ty {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Ty::Nat => f.write_str(Prim::Nat.name()),
-            Ty::Arrow(from, to) => write_arrow(f, &**from, &**to),
-            // Unit falls out of this as `{}` rather than `()`, on purpose:
-            // there is one type here, and one spelling for it. See
-            // [`Ty::Struct`].
-            Ty::Struct(fields) => write_struct(f, fields),
-            // A solver variable has no name, only an index; it is numbered so
-            // that two different unknowns in one message stay distinguishable.
-            Ty::Var(var) => write!(f, "?{var}"),
-            Ty::Bound(index) => {
-                let letter = (b'a' + (index % 26) as u8) as char;
-                match index / 26 {
-                    0 => write!(f, "'{letter}"),
-                    round => write!(f, "'{letter}{round}"),
-                }
-            }
-            Ty::Undecided => f.write_str("?"),
-        }
-    }
-}
-
-/// A scheme prints as its body: the quantifier is implied by the `'a`s that
-/// appear, the way ML type printers have always done it.
-impl fmt::Display for Scheme {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.body.fmt(f)
-    }
 }
 
 impl From<Prim> for Ty {

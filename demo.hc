@@ -8,6 +8,10 @@ type Pair = { first: A, second: B }
 
 type Boxed = { value: Nat }
 
+type list = { val: Nat, next: list }
+
+let rest : list -> list = fn l => l.next
+
 type Pairs = Pair -> Pair
 
 let after = id point

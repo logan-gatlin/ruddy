@@ -9,9 +9,6 @@ pub enum Kind {
     Let,
     In,
     Type,
-    Trait,
-    For,
-    Impl,
     End,
     With,
     Fn,
@@ -55,34 +52,6 @@ pub enum ErrorKind {
 pub struct Output {
     pub tokens: Vec<Token>,
     pub errors: Vec<Error>,
-}
-
-impl std::fmt::Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Kind::Let => f.write_str("let"),
-            Kind::In => f.write_str("in"),
-            Kind::Type => f.write_str("type"),
-            Kind::Trait => f.write_str("trait"),
-            Kind::For => f.write_str("for"),
-            Kind::Impl => f.write_str("impl"),
-            Kind::End => f.write_str("end"),
-            Kind::With => f.write_str("with"),
-            Kind::Fn => f.write_str("fn"),
-            Kind::Equal => f.write_str("="),
-            Kind::FatArrow => f.write_str("=>"),
-            Kind::Arrow => f.write_str("->"),
-            Kind::Colon => f.write_str(":"),
-            Kind::Comma => f.write_str(","),
-            Kind::Dot => f.write_str("."),
-            Kind::LeftBrace => f.write_str("{"),
-            Kind::RightBrace => f.write_str("}"),
-            Kind::LeftParen => f.write_str("("),
-            Kind::RightParen => f.write_str(")"),
-            Kind::Identifier(name) => f.write_str(name),
-            Kind::Natural(value) => write!(f, "{value}"),
-        }
-    }
 }
 
 pub fn lex(input: &str, file_id: FileID) -> Output {
@@ -160,9 +129,6 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "let" => Kind::Let,
                     "in" => Kind::In,
                     "type" => Kind::Type,
-                    "trait" => Kind::Trait,
-                    "for" => Kind::For,
-                    "impl" => Kind::Impl,
                     "end" => Kind::End,
                     "with" => Kind::With,
                     "fn" => Kind::Fn,

@@ -1,12 +1,19 @@
 //! What inference concluded, twice over.
 //!
 //! [`build`] is the `Types` tab: one row per declaration with its scheme (or,
-//! for a `type` declaration, the semantic type its alias unfolds to). And
+//! for a `type` declaration, what its name stands for — one step deep, since a
+//! name inside it is still a name and a recursive one has no other depth to be
+//! shown at). And
 //! [`annotate`] is the same information where it is most useful — painted onto
 //! the IR tab's own rows as inline badges, so every subterm shows its inferred
 //! type in place. That is what [`Stage::annotates`](crate::wire::Stage) is
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
+
+use std::rc::Rc;
+
+use indexmap::IndexMap;
+use ruddy::{symbol::Symbol, types::Ty};
 
 use crate::{
     stage::{Cx, Ids, Spec, Trace, plural},
@@ -62,7 +69,23 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(index) = cx.symbols.get(&symbol) {
                 node = node.symbol(*index);
             }
-            node
+            // A recursive declaration says so under itself, naming the loop it
+            // closes. The row above already shows the name coming back — what
+            // it cannot show is whether the name it came back through leads
+            // anywhere, which for a pair declared in terms of each other is
+            // the whole question.
+            match loop_through(&output.aliases, symbol) {
+                Some(loop_names) => node.child(Node::new(
+                    ids.next(),
+                    "recursive",
+                    loop_names
+                        .iter()
+                        .map(|symbol| mint.name(*symbol))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )),
+                None => node,
+            }
         })
         .collect();
 
@@ -80,6 +103,62 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             output.aliases, output.schemes
         ),
         ..spec.stage(cx.status(), plural(output.schemes.len(), "scheme"))
+    }
+}
+
+/// The declarations one has to pass through to get from `start` back to
+/// `start`, itself first, or `None` when it never does.
+///
+/// A declaration mentioning itself is `[start]`; two declared in terms of each
+/// other are `[start, other]`. Depth-first, so what comes back is the first
+/// loop found rather than the shortest — with no type parameters there is
+/// rarely more than one, and either answers the question the row asks.
+fn loop_through(aliases: &IndexMap<Symbol, Rc<Ty>>, start: Symbol) -> Option<Vec<Symbol>> {
+    let mut path = Vec::new();
+    walk(aliases, start, start, &mut path).then_some(path)
+}
+
+/// Whether `at` leads back to `start`, pushing each declaration onto `path` as
+/// it is entered and popping it again when it leads nowhere. `path` doubles as
+/// the visited set, which is what keeps this finite: a declaration already on
+/// it is a loop that does not pass through `start` and is somebody else's row.
+fn walk(
+    aliases: &IndexMap<Symbol, Rc<Ty>>,
+    at: Symbol,
+    start: Symbol,
+    path: &mut Vec<Symbol>,
+) -> bool {
+    if path.contains(&at) {
+        return false;
+    }
+    path.push(at);
+    let mut named = Vec::new();
+    if let Some(body) = aliases.get(&at) {
+        names_in(body, &mut named);
+    }
+    if named.contains(&start) || named.iter().any(|next| walk(aliases, *next, start, path)) {
+        return true;
+    }
+    path.pop();
+    false
+}
+
+/// Every declaration a type mentions, in the order it mentions them. Stops at
+/// a name rather than looking up what it stands for — following one is the
+/// caller's business, and the reason this cannot run away.
+fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
+    match ty {
+        Ty::Named { symbol, .. } => out.push(*symbol),
+        Ty::Arrow(from, to) => {
+            names_in(from, out);
+            names_in(to, out);
+        }
+        Ty::Struct(fields) => {
+            for ty in fields.values() {
+                names_in(ty, out);
+            }
+        }
+        Ty::Nat | Ty::Var(_) | Ty::Bound(_) | Ty::Undecided => {}
     }
 }
 
