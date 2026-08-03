@@ -201,6 +201,37 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             cx,
             *symbol,
         ),
+        // A parameter is a local symbol like a lambda's argument, so it
+        // cross-highlights against the head of its own declaration.
+        TypeKind::Param { symbol, .. } => with_symbol(
+            Node {
+                label: "Param".into(),
+                ..node
+            },
+            cx,
+            *symbol,
+        ),
+        TypeKind::Apply {
+            head,
+            head_span,
+            args,
+        } => {
+            let head = with_symbol(
+                Node::new(ids.next(), "Head", mint.name(*head).to_string()).at(*head_span),
+                cx,
+                *head,
+            );
+            Node {
+                label: "Apply".into(),
+                ..node
+            }
+            .child(head)
+            .children(
+                args.iter()
+                    .map(|arg| type_node(ids, cx, mint, arg))
+                    .collect::<Vec<_>>(),
+            )
+        }
         // A primitive is resolved from its spelling rather than from the name
         // table, so there is no symbol to cross-highlight it by.
         TypeKind::Prim(_) => Node {

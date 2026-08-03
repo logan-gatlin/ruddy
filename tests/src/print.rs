@@ -174,3 +174,32 @@ fn a_row_reads_as_written_and_as_quantified() {
         assert_eq!(as_inferred, inferred, "{source}: as inferred");
     }
 }
+
+/// An application is one rendering rule too, and a parameter is the case that
+/// could most easily drift: the IR knows it as a local symbol while the AST
+/// knows it as the string it was written as, and the two have to spell it the
+/// same. The declaration head has to print its parameters in both, or a
+/// re-lowered program would bind nothing.
+#[test]
+fn both_trees_render_an_application_the_same_way() {
+    for source in [
+        "type Pair A B = { first: A, second: B }",
+        "type Pair A B = { first: A, second: B }\ntype P = Pair Nat Nat",
+        // An argument that is itself an application, and one that is an arrow:
+        // the two positions that need parentheses to survive.
+        "type Box A = { it: A }\ntype N = Box (Box Nat)",
+        "type Box A = { it: A }\ntype F = Box (Nat -> Nat)",
+        // An application on the left of an arrow needs none, because it stops
+        // at the arrow of its own accord.
+        "type Box A = { it: A }\ntype G = Box Nat -> Nat",
+        // A parameter used bare, as the whole body.
+        "type Id A = A",
+        // Recursion through a parameterized declaration, handed its own
+        // parameter.
+        "type List a = { head: a, tail: List a }",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, ir, "{source}");
+        assert_eq!(ast, source, "{source}");
+    }
+}

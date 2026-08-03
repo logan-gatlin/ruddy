@@ -653,3 +653,204 @@ fn repeated_names_in_sibling_structs_are_fine() {
     let (_, out) = build_src("let p = fn a b => { x: a, inner: { x: b } }");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
+
+/// A declaration's parameters are bound for the length of its body and gone
+/// after it, the way a lambda's arguments are. Each one lowers to its position,
+/// which is what unfolding later hands an argument to.
+#[test]
+fn a_declaration_binds_its_parameters() {
+    let (_, out) = built("type Pair A B = { a: A, b: B }");
+    let decl = out.program.types.values().next().expect("one declaration");
+    assert_eq!(decl.params.len(), 2);
+
+    let TypeKind::Struct { fields, .. } = &decl.value.tracked else {
+        panic!("expected a struct: {:#?}", decl.value);
+    };
+    let indices: Vec<u32> = fields
+        .values()
+        .map(|field| match field.value.tracked {
+            TypeKind::Param { index, .. } => index,
+            ref other => panic!("expected a parameter: {other:#?}"),
+        })
+        .collect();
+    assert_eq!(indices, vec![0, 1]);
+}
+
+/// A parameter is scoped to the declaration that binds it, so the same name
+/// somewhere else is undefined rather than a reference to it.
+#[test]
+fn a_parameter_is_out_of_scope_outside_its_declaration() {
+    let (_, out) = build_src("type Pair A B = { a: A, b: B }  type Other = A");
+    assert_eq!(
+        out.errors
+            .iter()
+            .filter(|error| matches!(
+                error.kind,
+                ErrorKind::Undefined {
+                    namespace: Namespace::Types
+                }
+            ))
+            .count(),
+        1,
+        "errors: {:#?}",
+        out.errors
+    );
+}
+
+/// A parameter hides a declared type of the same name for the length of the
+/// body. That is what a scope is for, so it is not a repeat.
+#[test]
+fn a_parameter_shadows_a_declared_type() {
+    let (_, out) = built("type Nat = { n: Nat }  type Box Nat = { it: Nat }");
+    let boxed = out
+        .program
+        .types
+        .values()
+        .find(|decl| decl.params.len() == 1)
+        .expect("the parameterized declaration");
+    let TypeKind::Struct { fields, .. } = &boxed.value.tracked else {
+        panic!("expected a struct: {:#?}", boxed.value);
+    };
+    assert!(matches!(
+        fields["it"].value.tracked,
+        TypeKind::Param { index: 0, .. }
+    ));
+}
+
+/// A declaration takes what it takes wherever it is written: too few is the
+/// same complaint as too many, and a name written bare that takes some is too
+/// few.
+#[test]
+fn a_type_takes_the_arguments_it_declares() {
+    for (src, expected, found) in [
+        ("type Pair A B = { a: A, b: B }  type M = Pair Nat", 2, 1),
+        (
+            "type Pair A B = { a: A, b: B }  type M = Pair Nat Nat Nat",
+            2,
+            3,
+        ),
+        ("type Pair A B = { a: A, b: B }  type M = Pair", 2, 0),
+        ("type T = Nat  type M = T Nat", 0, 1),
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors.iter().any(|error| matches!(
+                error.kind,
+                ErrorKind::Arity { expected: e, found: f } if e == expected && f == found
+            )),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// Only a declared type can be applied. A primitive is counted rather than
+/// refused outright — it is a type that exists and was given too much — while a
+/// struct or a parenthesized arrow is not the sort of thing that takes anything
+/// at all.
+#[test]
+fn only_a_declared_type_can_be_applied() {
+    let (_, out) = build_src("type M = Nat Nat");
+    assert!(
+        out.errors.iter().any(|error| matches!(
+            error.kind,
+            ErrorKind::Arity {
+                expected: 0,
+                found: 1
+            }
+        )),
+        "errors: {:#?}",
+        out.errors
+    );
+
+    for src in ["type M = { x: Nat } Nat", "type M = (Nat -> Nat) Nat"] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::NotAConstructor)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// A parameter stands for one type, never for something still waiting for types
+/// of its own. Refusing this is what keeps the language free of higher kinds.
+#[test]
+fn a_parameter_may_not_be_applied() {
+    let (_, out) = build_src("type Flip f a = f a");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::ParameterApplied)),
+        "errors: {:#?}",
+        out.errors
+    );
+}
+
+#[test]
+fn a_declaration_binds_each_parameter_once() {
+    let (_, out) = build_src("type Pair A A = { a: A }");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::DuplicateParameter { .. })),
+        "errors: {:#?}",
+        out.errors
+    );
+}
+
+/// Applying a name is still only a name, so a pair of declarations that hand
+/// each other their parameters says nothing, exactly as a pair of bare names
+/// does. A body that is a parameter is not the same thing: it says its argument.
+#[test]
+fn a_type_defined_only_as_another_name_is_still_circular() {
+    let (_, out) = build_src("type A a = B a  type B b = A b");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Circular)),
+        "errors: {:#?}",
+        out.errors
+    );
+
+    // The identity constructor: useless, but it says what its argument is.
+    let (_, out) = build_src("type Id a = a");
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+}
+
+/// A type that leads back to itself must hand itself its own parameters,
+/// unchanged. Unfolding one that grows its argument never comes back round, so
+/// there would be no finite answer to whether two of them are the same type.
+#[test]
+fn recursion_must_hand_a_type_its_own_parameters() {
+    for src in [
+        "type List a = { head: a, tail: List a }",
+        // Mutual recursion, each member handing on its own parameter.
+        "type Tree a = { node: a, kids: Forest a }  \
+         type Forest a = { head: Tree a, tail: Forest a }",
+        // A different group's argument is unrestricted: only the `Rose a`
+        // inside `List` has to be verbatim, and it is.
+        "type List a = { head: a, tail: List a }  \
+         type Rose a = { node: a, kids: List (Rose a) }",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+
+    for src in [
+        "type T a = { next: T { x: a } }",
+        "type T a = { next: T Nat }",
+        "type A a = { x: B { y: a } }  type B b = { x: A b }",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::NonUniformRecursion)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+}

@@ -70,6 +70,21 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(index) = cx.symbols.get(&symbol) {
                 node = node.symbol(*index);
             }
+            // A declaration's parameters print as `'a`, `'b` in the meaning
+            // above, because that is what they are once the body is lowered.
+            // Which is unreadable on its own: these rows are what map each
+            // letter back to the name it was written as.
+            if let Some(decl) = program.types.get(&symbol) {
+                for (index, param) in decl.params.iter().enumerate() {
+                    let letter = Ty::Bound(index as u32).to_string();
+                    let mut row =
+                        Node::new(ids.next(), letter, mint.name(param.symbol)).at(param.span);
+                    if let Some(index) = cx.symbols.get(&param.symbol) {
+                        row = row.symbol(*index);
+                    }
+                    node = node.child(row);
+                }
+            }
             // A recursive declaration says so under itself, naming the loop it
             // closes. The row above already shows the name coming back — what
             // it cannot show is whether the name it came back through leads

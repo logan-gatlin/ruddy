@@ -1574,3 +1574,139 @@ fn a_projection_solves_wherever_it_falls_in_the_list() {
         inferred("let f : { a: { b: Nat } } -> Nat = fn p => (fn q => q.b) p.a");
     assert_eq!(scheme(&mint, &output, "f"), "{ a: { b: Nat } } -> Nat");
 }
+
+/// A declaration stands for its body with its arguments put in, so a term
+/// checked against one is checked against the shape that substitution reaches.
+#[test]
+fn a_constructor_stands_for_its_body_with_its_arguments_put_in() {
+    let (mint, _, output) = inferred(
+        "type Pair A B = { first: A, second: B }\n\
+         let p : Pair Nat Nat = { first: 1, second: 2 }",
+    );
+    assert_eq!(scheme(&mint, &output, "p"), "Pair Nat Nat");
+
+    // The argument reaches the field it was substituted into.
+    let (_, _, output) = infer_src(
+        "type Pair A B = { first: A, second: B }\n\
+         let p : Pair Nat Nat = { first: 1, second: {} }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// Two applications of one declaration are equal when their arguments are, and
+/// that is decided without unfolding either. Deciding it here is what keeps a
+/// declaration that leads back to itself from unfolding forever.
+#[test]
+fn applications_of_one_declaration_are_equal_by_their_arguments() {
+    let (_, _, output) = inferred(
+        "type Pair A B = { first: A, second: B }\n\
+         let same : Pair Nat Nat -> Pair Nat Nat = fn p => p",
+    );
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(rules.contains(&Rule::Congruent), "rules: {rules:?}");
+    assert!(!rules.contains(&Rule::Unfold), "rules: {rules:?}");
+
+    // A mismatched argument is reported as that argument rather than as
+    // something inside a body neither side wrote.
+    let (_, _, output) = infer_src(
+        "type Pair A B = { first: A, second: B }\n\
+         let f : Pair Nat Nat -> Nat = fn p => p.first\n\
+         let g : Pair Nat {} -> Nat = fn p => f p",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+}
+
+/// Two *different* declarations are still equal by what they unfold to, which
+/// is what keeps a name a barrier to unfolding rather than to equality.
+#[test]
+fn applications_of_different_declarations_unfold() {
+    let (_, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         type Crate A = { it: A }\n\
+         let f : Box Nat -> Crate Nat = fn b => b",
+    );
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(rules.contains(&Rule::Unfold), "rules: {rules:?}");
+}
+
+/// Congruence is what makes equality decidable, and this is what it costs: a
+/// declaration that ignores a parameter is no longer transparent, so `Ptr A`
+/// and `Ptr B` are different types though both stand for `Nat`. That is what a
+/// phantom type is, and it is a decision rather than an oversight.
+#[test]
+fn a_constructor_that_ignores_a_parameter_is_not_transparent() {
+    let (mint, _, output) = inferred(
+        "type Ptr A = Nat\n\
+         type Endo = Nat -> Nat\n\
+         let p : Ptr Nat = 1",
+    );
+    assert_eq!(scheme(&mint, &output, "p"), "Ptr Nat");
+
+    let (_, _, output) = infer_src(
+        "type Ptr A = Nat\n\
+         type Endo = Nat -> Nat\n\
+         let p : Ptr Nat = 1\n\
+         let q : Ptr Endo = p",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// A recursive constructor unfolds against another of the same shape and comes
+/// back round rather than running away. The point of the test is that it
+/// returns at all.
+#[test]
+fn a_recursive_constructor_does_not_unfold_forever() {
+    let (mint, _, output) = inferred(
+        "type List a = { head: a, tail: List a }\n\
+         type Seq a = { head: a, tail: Seq a }\n\
+         let f : List Nat -> Seq Nat = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "List Nat -> Seq Nat");
+}
+
+/// A row written inside an argument still says what its tail may not stand for.
+/// The condition lives beside the variables rather than inside the type, so it
+/// is only recorded by a walk that reaches in — and if this one stops at the
+/// name, the tail is quietly bound to a row repeating `x` and the definition
+/// comes out with a type it was never shown to have.
+#[test]
+fn a_row_inside_an_argument_still_lacks_what_it_names() {
+    let (_, _, output) = infer_src(
+        "type Box A = { it: A }\n\
+         let f : Box { x: Nat, ..r } -> { ..r } = fn b => { x: 1 }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+}
+
+/// A quantified argument is the definition's to generalize, the same as one
+/// written anywhere else. This is what fails if `quantify` or `zonk` stops at a
+/// name instead of descending into what it was applied to.
+#[test]
+fn an_open_argument_is_generalized_with_its_definition() {
+    let (mint, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "wrap"),
+        "Box { x: Nat, ..'a } -> Nat"
+    );
+}
+
+/// Nothing downstream of inference resolves a solver variable, so none may
+/// survive inside an argument either.
+#[test]
+fn no_solver_variable_survives_inside_an_argument() {
+    let (_, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
+    );
+    for scheme in output.schemes.values() {
+        assert!(
+            !mentions_a_variable(scheme.body()),
+            "a variable survived: {scheme}"
+        );
+    }
+}

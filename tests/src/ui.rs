@@ -56,6 +56,14 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateField,
         IrError::Circular,
         IrError::OpenDeclaredType,
+        IrError::Arity {
+            expected: 2,
+            found: 1,
+        },
+        IrError::NotAConstructor,
+        IrError::ParameterApplied,
+        IrError::DuplicateParameter { previous: span },
+        IrError::NonUniformRecursion,
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -89,6 +97,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 const RULES: &[Rule] = &[
     Rule::Absorb,
     Rule::Same,
+    Rule::Congruent,
     Rule::Bind,
     Rule::Occurs,
     Rule::Overlap,

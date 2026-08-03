@@ -15,7 +15,7 @@ use ruddy::{
 };
 
 use crate::print::{
-    Grouped, Prec, write_apply, write_arrow, write_project, write_row, write_struct,
+    Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -99,12 +99,11 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
-            write!(
-                f,
-                "type {} = {}",
-                self.mint.name(*symbol),
-                self.show(&decl.value)
-            )?;
+            write!(f, "type {}", self.mint.name(*symbol))?;
+            for param in &decl.params {
+                write!(f, " {}", self.mint.name(param.symbol))?;
+            }
+            write!(f, " = {}", self.show(&decl.value))?;
         }
         for (symbol, decl) in &self.node.terms {
             if !first {
@@ -141,9 +140,12 @@ impl Grouped for Show<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.node {
             TypeKind::Arrow { .. } => Prec::Arrow,
-            TypeKind::Struct { .. } | TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {
-                Prec::Atom
-            }
+            TypeKind::Apply { .. } => Prec::Apply,
+            TypeKind::Struct { .. }
+            | TypeKind::Ident(_)
+            | TypeKind::Param { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Error => Prec::Atom,
         }
     }
 }
@@ -178,6 +180,14 @@ impl fmt::Display for Show<'_, TypeKind> {
         match self.node {
             TypeKind::Error => f.write_str("<error>"),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
+            // A parameter prints as the name it was declared with, which is
+            // what makes this printer's output match the parse tree's.
+            TypeKind::Param { symbol, .. } => f.write_str(self.mint.name(*symbol)),
+            TypeKind::Apply { head, args, .. } => write_applied(
+                f,
+                &self.mint.name(*head),
+                args.iter().map(|arg| self.show(arg)),
+            ),
             TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
             TypeKind::Struct { fields, tail } => {

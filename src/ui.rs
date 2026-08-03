@@ -64,6 +64,14 @@ pub trait Grouped: fmt::Display {
     fn prec(&self) -> Prec;
 }
 
+/// A reference groups as what it points at, so a printer can hand out borrowed
+/// nodes without every caller wrapping them first.
+impl<T: Grouped + ?Sized> Grouped for &T {
+    fn prec(&self) -> Prec {
+        (**self).prec()
+    }
+}
+
 /// How tightly a printed node binds. Grouping is dropped rather than recorded,
 /// so the printers reconstruct it from this alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,6 +189,11 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateField => "duplicate-field",
             ir::ErrorKind::Circular => "circular-type",
             ir::ErrorKind::OpenDeclaredType => "open-declared-type",
+            ir::ErrorKind::Arity { .. } => "wrong-argument-count",
+            ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
+            ir::ErrorKind::ParameterApplied => "applied-parameter",
+            ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
+            ir::ErrorKind::NonUniformRecursion => "non-uniform-recursion",
         }
     }
 }
@@ -202,9 +215,62 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::OpenDeclaredType => f.write_str(
                 "a declared type must list its fields exactly; `..` and `?` belong in annotations",
             ),
+            // Counted in words, and said as what the type takes rather than as
+            // what the reader failed to supply — the count is the fact, and
+            // which side is short of it follows from the two numbers.
+            ir::ErrorKind::Arity { expected, found } => write!(
+                f,
+                "this type takes {}, and {} written",
+                arguments(*expected),
+                supplied(*found),
+            ),
+            ir::ErrorKind::NotAConstructor => {
+                f.write_str("only a declared type can be given arguments")
+            }
+            ir::ErrorKind::ParameterApplied => {
+                f.write_str("this stands for one type, so there is nothing to give arguments to")
+            }
+            ir::ErrorKind::DuplicateParameter { .. } => {
+                f.write_str("this type already takes something of this name")
+            }
+            // Said as the rule rather than as the loop: what the reader can
+            // change is the arguments at this one mention, and naming the whole
+            // cycle would point at declarations they got right.
+            ir::ErrorKind::NonUniformRecursion => f.write_str(
+                "a type that leads back to itself has to be given the same things it takes",
+            ),
         }
     }
 }
+
+/// `no arguments`, `one argument`, `two arguments` — small counts in words,
+/// because a message is a sentence and a sentence does not open with a numeral.
+///
+/// Beyond what is worth spelling out, the numeral: a type taking thirteen
+/// arguments has a problem this message is not going to help with.
+fn arguments(count: usize) -> String {
+    match count {
+        0 => "no arguments".to_string(),
+        1 => "one argument".to_string(),
+        2..=9 => format!("{} arguments", WORDS[count]),
+        _ => format!("{count} arguments"),
+    }
+}
+
+/// The same counting for the side that was written, which needs a verb that
+/// agrees with it.
+fn supplied(count: usize) -> String {
+    match count {
+        0 => "none was".to_string(),
+        1 => "one was".to_string(),
+        2..=9 => format!("{} were", WORDS[count]),
+        _ => format!("{count} were"),
+    }
+}
+
+const WORDS: [&str; 10] = [
+    "no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
 
 /// The canonical spelling of a bundle's identity. Bundle names cannot contain
 /// `@`, so this is one string per bundle and one bundle per string — which is
@@ -346,9 +412,7 @@ impl fmt::Display for Ty {
             // shorter, it is what they wrote, and it is the only way a type
             // that names itself can be printed at all.
             Ty::Named { name, args, .. } if args.is_empty() => f.write_str(name),
-            Ty::Named { name, args, .. } => {
-                write_applied(f, name, args.iter().map(|arg| &**arg as &dyn Grouped))
-            }
+            Ty::Named { name, args, .. } => write_applied(f, name, args.iter().map(|arg| &**arg)),
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
             Ty::Var(var) => write!(f, "?{var}"),
@@ -388,6 +452,7 @@ impl Rule {
         match self {
             Rule::Absorb => "absorb",
             Rule::Same => "same",
+            Rule::Congruent => "congruent",
             Rule::Bind => "bind",
             Rule::Occurs => "occurs",
             Rule::Overlap => "overlap",
@@ -411,6 +476,7 @@ impl fmt::Display for Rule {
         f.write_str(match self {
             Rule::Absorb => "one side is undecided, which unifies with anything",
             Rule::Same => "already the same thing on both sides",
+            Rule::Congruent => "the same declared type on both sides: argument against argument",
             Rule::Bind => "a variable takes the type it is against",
             Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
             Rule::Overlap => {
@@ -549,15 +615,15 @@ pub fn write_apply(
 /// intermediate node to stand for, so there is none to hand to
 /// [`write_apply`]. The head is written rather than grouped, since only a
 /// declared name can be one and a name is never a form that needs parentheses.
-pub fn write_applied<'a>(
+pub fn write_applied<A: Grouped>(
     f: &mut fmt::Formatter<'_>,
     head: &dyn fmt::Display,
-    args: impl IntoIterator<Item = &'a dyn Grouped>,
+    args: impl IntoIterator<Item = A>,
 ) -> fmt::Result {
     write!(f, "{head}")?;
     for arg in args {
         f.write_str(" ")?;
-        write_grouped(f, arg.prec() < Prec::Atom, arg)?;
+        write_grouped(f, arg.prec() < Prec::Atom, &arg)?;
     }
     Ok(())
 }
@@ -565,12 +631,17 @@ pub fn write_applied<'a>(
 /// Render `from -> to`. The arrow is right-associative, so only the left side
 /// can ever need grouping — an arrow there would otherwise re-parse as the outer
 /// arrow's right half.
+///
+/// Grouped against the arrow rather than against an atom, so only what could
+/// swallow the arrow is bracketed: an arrow, and a lambda. An application is
+/// left alone, because it stops at the arrow of its own accord and
+/// `Pair A B -> Nat` is how a person would write it.
 pub fn write_arrow(
     f: &mut fmt::Formatter<'_>,
     from: &impl Grouped,
     to: &impl Grouped,
 ) -> fmt::Result {
-    write_grouped(f, from.prec() < Prec::Atom, from)?;
+    write_grouped(f, from.prec() < Prec::Apply, from)?;
     write!(f, " -> {to}")
 }
 

@@ -992,3 +992,64 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("symbols"), "1 symbol");
     assert_eq!(summary("ir"), "0 types · 1 term");
 }
+
+/// A parameterized declaration's meaning prints its parameters as `'a`, `'b` —
+/// which says nothing on its own about which is which. The Types tab carries a
+/// row per parameter mapping each letter back to the name it was written as,
+/// and without them the tab is unreadable for exactly the declarations that
+/// most need reading.
+#[test]
+fn the_types_tab_maps_each_letter_back_to_its_parameter() {
+    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+
+    let rows = nodes(stage);
+    let pair = rows
+        .iter()
+        .find(|node| node.label == "type Pair")
+        .expect("a row for the declaration");
+    assert_eq!(pair.text, "{ first: 'a, second: 'b }");
+
+    let letters: Vec<(&str, &str)> = pair
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
+}
+
+/// The IR tab shows an application as its head and its arguments, and the head
+/// carries the declaration's symbol so it cross-highlights with the row that
+/// declares it.
+#[test]
+fn the_ir_tab_takes_an_application_apart() {
+    let snap = snapshot("type Box A = { it: A }\ntype N = Box Nat");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "ir")
+        .expect("the ir stage");
+
+    let rows = nodes(stage);
+    let apply = rows
+        .iter()
+        .find(|node| node.label == "Apply")
+        .expect("a row for the application");
+    assert_eq!(apply.text, "Box Nat");
+
+    let kids: Vec<&str> = apply
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(kids, vec!["Head", "Prim"]);
+    assert!(
+        apply.children[0].symbol.is_some(),
+        "the head should cross-highlight: {:#?}",
+        apply.children[0]
+    );
+}

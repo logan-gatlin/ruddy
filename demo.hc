@@ -4,7 +4,7 @@ let compose = fn f g x => f (g x)
 
 let point = { x: origin, y: shift base }
 
-type Pair = { first: A, second: B }
+type Pair A B = { first: A, second: B }
 
 type Boxed = { value: Nat }
 
@@ -12,7 +12,13 @@ type list = { val: Nat, next: list }
 
 let rest : list -> list = fn l => l.next
 
-type Pairs = Pair -> Pair
+type Pairs = Pair Nat Nat -> Pair Nat Nat
+
+let swap : Pair Nat Boxed -> Pair Boxed Nat = fn p => { first: p.second, second: p.first }
+
+type Stack a = { top: a, rest: Stack a }
+
+let peek : Stack Nat -> Nat = fn s => s.top
 
 let after = id point
 

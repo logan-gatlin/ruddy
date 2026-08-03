@@ -105,8 +105,16 @@ pub enum Rule {
     /// One side is [`Ty::Undecided`], which unifies with anything.
     Absorb,
     /// Both sides are already the same thing: the same variable, or the same
-    /// declared type. Either way there is nothing to take apart.
+    /// declared type applied to nothing. Either way there is nothing to take
+    /// apart.
     Same,
+    /// The same declared type on both sides, applied to arguments: taken apart
+    /// into one goal per argument rather than unfolded.
+    ///
+    /// What [`Rule::Same`] becomes when there is something to compare. It is
+    /// also the rule that keeps a recursive declaration from unfolding forever,
+    /// which is why it comes before [`Rule::Unfold`] rather than after it.
+    Congruent,
     /// A variable against a type: the only rule that grows the solution.
     Bind,
     /// A variable against a type that contains it. The occurs check fired, so
@@ -376,9 +384,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // runs in decides nothing — which is what lets two declarations refer to
     // each other.
     for (symbol, decl) in &program.types {
-        // Binding nothing, until declarations have parameters to bind.
+        // The parameters are already `Ty::Bound`s by their position, so the
+        // scheme is closed by counting them rather than by walking anything.
         let body = lower_type(mint, &mut table, &decl.value);
-        aliases.insert(*symbol, Scheme::new(0, body));
+        aliases.insert(*symbol, Scheme::new(decl.params.len() as u32, body));
     }
 
     let mut schemes = IndexMap::new();
@@ -1189,13 +1198,6 @@ impl Solve<'_> {
             // *different* declarations fall through to unfolding and are equal
             // whenever what they stand for is.
             //
-            // Matched on the arguments rather than through a `..`, so that the
-            // arm which will have to compare them cannot be reached before it
-            // exists. Two applications of one declaration are equal when their
-            // arguments are — decided without unfolding either, which is what
-            // will keep a declaration that leads back to itself from unfolding
-            // forever — and until declarations take arguments there is no such
-            // pair to meet. See [`Ty::Named`].
             (
                 Ty::Named {
                     symbol: a,
@@ -1209,6 +1211,39 @@ impl Solve<'_> {
                 },
             ) if a == b && xs.is_empty() && ys.is_empty() => {
                 self.step(span, Rule::Same, goal, Effect::None)
+            }
+            // Two applications of one declaration are equal when their
+            // arguments are, decided without unfolding either.
+            //
+            // Not an optimization. Unfolding both would ask the same question
+            // of a bigger type every time a declaration leads back to itself,
+            // and the assumption stack cannot save it: keyed on the pair of
+            // names it would answer a question it was never asked, and keyed on
+            // the whole goal it would never repeat. So this arm is what makes
+            // equality decidable at all, and the price is that a declaration
+            // ignoring a parameter stops being transparent. See [`Ty::Named`].
+            //
+            // Arity belongs to the declaration, so one symbol means one count
+            // and the zip drops nothing.
+            (
+                Ty::Named {
+                    symbol: a,
+                    args: xs,
+                    ..
+                },
+                Ty::Named {
+                    symbol: b,
+                    args: ys,
+                    ..
+                },
+            ) if a == b => {
+                let pairs: Vec<_> = xs.iter().cloned().zip(ys.iter().cloned()).collect();
+                self.step(span, Rule::Congruent, goal, Effect::Decomposed);
+                self.depth += 1;
+                for (x, y) in pairs {
+                    self.unify(span, &x, &y);
+                }
+                self.depth -= 1;
             }
             (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => self.unfold(span, goal, &lhs, &rhs),
             (Ty::Nat, Ty::Nat) => self.step(span, Rule::Prim, goal, Effect::None),
@@ -1917,10 +1952,21 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
         TypeKind::Ident(symbol) => Rc::new(Ty::Named {
             symbol: *symbol,
             name: mint.name(*symbol).into(),
-            // A name written bare is applied to nothing, which is every
-            // declaration until the type language grows a binder.
+            // Lowering counted the arguments, so a name that reaches here bare
+            // is one that takes none.
             args: Rc::from([]),
         }),
+        TypeKind::Apply { head, args, .. } => Rc::new(Ty::Named {
+            symbol: *head,
+            name: mint.name(*head).into(),
+            args: args
+                .iter()
+                .map(|arg| lower(mint, table, rows, arg))
+                .collect(),
+        }),
+        // A parameter is the position it was declared at, which is what
+        // unfolding hands an argument to. See [`Ty::Bound`].
+        TypeKind::Param { index, .. } => Rc::new(Ty::Bound(*index)),
         TypeKind::Arrow { from, to } => Rc::new(Ty::Arrow(
             lower(mint, table, rows, from),
             lower(mint, table, rows, to),
