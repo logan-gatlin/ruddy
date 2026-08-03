@@ -87,9 +87,9 @@ pub type Type = Tracked<TypeKind>;
 pub enum TypeKind {
     Struct {
         fields: IndexMap<String, TypeField>,
-        /// The `..` tail, when the struct type was written open. Never
-        /// `Some` inside a `type` declaration — see
-        /// [`ErrorKind::OpenDeclaredType`].
+        /// The `..` tail, when the struct type was written open. Inside a
+        /// `type` declaration this is `Some` only for a tail naming a row
+        /// parameter — see [`ErrorKind::OpenDeclaredType`].
         tail: Option<Tail>,
     },
     Arrow {
@@ -200,14 +200,21 @@ pub enum ErrorKind {
     /// type reaches a shape one step in. A chain of bare names never reaches
     /// one, so there is nothing for the declaration to mean.
     Circular,
-    /// A `..` tail or a `?` field inside a `type` declaration, as in
+    /// A `?` field inside a `type` declaration, or a `..` tail there that does
+    /// not name one of the declaration's own parameters — as in
     /// `type t = { x: Nat, .. }`.
     ///
     /// What a declaration stands for is lowered once, before any definition,
-    /// and holds for all of them; a tail or an optional field stands for
-    /// something a definition gets to decide, so there is nothing for one to
-    /// mean here. Inference leans on the difference: an alias body mentions
-    /// no solver variable, which is what lets every walk stop at a name.
+    /// and holds for all of them; a `?` or a bare `..` stands for something a
+    /// definition gets to decide, so there is nothing for one to mean here.
+    ///
+    /// A tail naming a row parameter is the exception, and the reason the rule
+    /// is worth stating this precisely rather than as "a declaration is
+    /// closed". What such a tail stands for is not decided here either — it is
+    /// supplied at every use — so it lowers to a [`Ty::Bound`], not to a
+    /// variable, and the property inference leans on survives untouched: a
+    /// declaration's body mentions no solver variable, which is what lets every
+    /// walk stop at a name instead of descending into what it stands for.
     OpenDeclaredType,
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
@@ -1121,11 +1128,19 @@ impl Builder<'_> {
     }
 
     /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
-    /// The type language has no binder, so unlike [`term`](Self::term) this
-    /// never pushes a scope: every name it resolves is a top-level declaration
-    /// or a primitive. A tail's name is not a binder either — it is scoped to
-    /// its annotation and resolved there by inference, so it passes through
-    /// here as the string it was written as.
+    ///
+    /// The scope this resolves against is pushed by the caller rather than
+    /// here, because a declaration's parameters are bound for the whole of its
+    /// body and this is called once per node in it. So every name reaching
+    /// here is a parameter of the declaration being lowered, a top-level
+    /// declaration, or a primitive — looked for in that order, since a
+    /// parameter is meant to hide a declaration of the same name.
+    ///
+    /// A tail's name may or may not be a binder, and which it is decides what
+    /// the tail means: naming a row parameter it is that parameter, and
+    /// anything else is scoped to its annotation and resolved by inference, so
+    /// it passes through here as the string it was written as. See
+    /// [`row`](Self::row).
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         match ty.tracked {

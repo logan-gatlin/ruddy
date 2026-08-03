@@ -1077,3 +1077,24 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .collect();
     assert_eq!(letters, vec![("'a", "A"), ("'b", "..r")]);
 }
+
+/// A type parameter is a symbol like any other — minted as a local, the way a
+/// lambda's argument is — so it reaches the Symbols tab with no special case,
+/// and the path it is listed under is one `demangle` can read back.
+#[test]
+fn a_type_parameter_is_a_symbol_like_any_other() {
+    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "symbols")
+        .expect("the symbols stage");
+
+    let listed: Vec<&str> = nodes(stage)
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    for name in ["Pair", "A", "B"] {
+        assert!(listed.contains(&name), "{name} is missing from {listed:?}");
+    }
+}

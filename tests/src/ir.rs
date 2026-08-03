@@ -993,3 +993,42 @@ fn a_declaration_is_open_only_through_a_parameter() {
         );
     }
 }
+
+/// A parameter hides a primitive for the length of the body, the way a
+/// declaration of the same name already did. Outside the body the primitive is
+/// back, so `type Box Nat = { it: Nat }` takes one type and `Box Nat` hands it
+/// the built-in — confusing to write, but the resolution order is the one the
+/// rest of the language already uses, and it should not quietly be a third.
+#[test]
+fn a_parameter_shadows_a_primitive() {
+    let (_, out) = built("type Box Nat = { it: Nat }  let b : Box Nat -> Nat = fn p => p.it");
+
+    let boxed = out.program.types.values().next().expect("the declaration");
+    let TypeKind::Struct { fields, .. } = &boxed.value.tracked else {
+        panic!("expected a struct: {:#?}", boxed.value);
+    };
+    assert!(
+        matches!(fields["it"].value.tracked, TypeKind::Param { index: 0, .. }),
+        "inside the body the parameter wins: {:#?}",
+        fields["it"].value
+    );
+
+    let annotation = out
+        .program
+        .terms
+        .values()
+        .next()
+        .and_then(|decl| decl.annotation.as_ref())
+        .expect("the annotation");
+    let TypeKind::Arrow { from, .. } = &annotation.tracked else {
+        panic!("expected an arrow: {annotation:#?}");
+    };
+    let TypeKind::Apply { args, .. } = &from.tracked else {
+        panic!("expected an application: {from:#?}");
+    };
+    assert!(
+        matches!(args[0].tracked, TypeKind::Prim(Prim::Nat)),
+        "outside it the primitive is back: {:#?}",
+        args[0]
+    );
+}

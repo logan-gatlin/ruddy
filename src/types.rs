@@ -78,10 +78,15 @@ pub enum Ty {
     /// `rest` is one of the row-shaped types: [`Ty::Empty`] for a struct whose
     /// fields are all listed, a [`Ty::Var`] for one that may have more,
     /// [`Ty::Undecided`] where a failure abandoned the question, another
-    /// [`Ty::Struct`] while a tail the solve bound to a row is waiting to be
-    /// spliced in, or a [`Ty::Bound`] once a scheme has quantified it. Never
-    /// anything else, for the same unenforced reason as
-    /// [`RowField::presence`].
+    /// [`Ty::Struct`] while a tail bound to a row — or handed one as an
+    /// argument — is waiting to be spliced in, or a [`Ty::Bound`] for a tail a
+    /// scheme quantified or a declaration takes as a row parameter.
+    ///
+    /// Never anything else, and unlike [`RowField::presence`] that is now
+    /// checked rather than merely true: a row parameter can be handed anything
+    /// a use site cares to write, so `WithX Nat` would put a number here.
+    /// [`ir::build`](crate::ir::build) refuses one, which is the only thing
+    /// standing between this sentence and a row holding a number.
     Struct {
         fields: IndexMap<String, RowField>,
         rest: Rc<Ty>,
@@ -185,8 +190,14 @@ impl RowField {
 }
 
 impl Scheme {
-    /// Close `body` over its quantified variables. Every [`Ty::Bound`] in
-    /// `body` must be an index below `count`; instantiation trusts that.
+    /// Close `body` over the variables it binds. Every [`Ty::Bound`] in `body`
+    /// must be an index below `count`; opening one trusts that.
+    ///
+    /// Two things are closed this way and the difference is only in who
+    /// supplies the values: a definition's scheme binds what generalization
+    /// quantified, and instantiation hands each one a fresh variable; a
+    /// declaration's binds its parameters, and unfolding hands each one the
+    /// argument written at the use site. See [`Ty::Bound`].
     pub fn new(count: u32, body: Rc<Ty>) -> Self {
         Self { count, body }
     }

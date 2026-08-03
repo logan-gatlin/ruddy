@@ -356,8 +356,10 @@ struct Solve<'a> {
     /// because the assumption holds for the goals the unfolding broke into and
     /// no further, which is the same scope [`Solve::depth`] tracks.
     ///
-    /// Two declarations, rather than two types, because a pair of declarations
-    /// is the only pair that can come back round — see [`Solve::unfold`].
+    /// Two symbols rather than two types, which is sound only because two
+    /// applications of one declaration never unfold and a recursion may not
+    /// change its arguments. Both are rules kept elsewhere; [`Solve::unfold`]
+    /// says which, and what breaks if either goes.
     assumed: Vec<(Symbol, Symbol)>,
     /// [`Constraint::base_span`] of the goal as it arrived, and only of that
     /// goal: [`Solve::unify`] takes it on the way in, so what a goal decomposes
@@ -1782,19 +1784,41 @@ impl Solve<'_> {
     /// to no contradiction, and every contradiction there could be is one of
     /// the goals in between.
     ///
-    /// A pair of *declarations* is the only pair worth remembering, because it
-    /// is the only pair that can come back round. Every [`Ty`] is a finite
-    /// tree — a name is a leaf, not an edge — so a name against a shape
-    /// descends into a strictly smaller shape each time and runs out, and only
-    /// a name reached from a name can be where it started. That also makes
-    /// this terminate: there are finitely many pairs of declarations, and the
-    /// stack refuses to take one twice.
+    /// Why remembering a pair of *symbols* is enough, now that a name carries
+    /// arguments and is no longer a leaf. Three things, and every one of them
+    /// is a rule enforced somewhere else — so this comment is the map of what
+    /// this rule rests on, and none of it may be relaxed without coming back
+    /// here first.
     ///
-    /// Equality stays structural throughout. A name is a barrier to unfolding
-    /// and nothing else: two declarations that unfold the same way are one
-    /// type however differently they were written, and the same declaration on
-    /// both sides is decided by [`Rule::Same`] as a shortcut, never as a rule
-    /// that names carry meaning.
+    /// 1. A name against a shape descends into a strictly smaller shape each
+    ///    time, so it runs out. Unchanged: a name is still the only way a type
+    ///    leads back to itself.
+    /// 2. Two applications of the *same* declaration never reach here at all —
+    ///    [`Rule::Congruent`] took them, comparing arguments instead of
+    ///    unfolding. So the pairs on this stack name two different
+    ///    declarations.
+    /// 3. Two different names unfold to two shapes, and any name inside them
+    ///    from the same group of mutually recursive declarations carries that
+    ///    declaration's own parameters unchanged — which is what
+    ///    [`ir::build`](crate::ir::build) refuses a recursion for not doing.
+    ///    So meeting the pair again is meeting the same goal again, and
+    ///    assuming it is sound. A name from a *different* group belongs to a
+    ///    strictly lower group in the dependency order, from which nothing in
+    ///    the enclosing group is reachable, so descending through groups is
+    ///    descent through a finite acyclic order.
+    ///
+    /// Without (3) the key would have to be the whole goal, and then it would
+    /// never repeat: `type T a = { next: T { x: a } }` grows its argument every
+    /// time round, and nothing finite comes back. Without (2) the key would be
+    /// unsound rather than merely coarse — two declarations of one shape but
+    /// different arguments would be assumed equal on the strength of their
+    /// names.
+    ///
+    /// Equality is structural *between* declarations and nominal *within* one:
+    /// two declarations that unfold the same way are one type however
+    /// differently they were written, while two applications of one
+    /// declaration are compared argument by argument. See [`Ty::Named`], which
+    /// states the rule and what it costs.
     fn unfold(&mut self, span: Span, goal: ConstraintKind, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
         let pair = match (&**lhs, &**rhs) {
             (Ty::Named { symbol: a, .. }, Ty::Named { symbol: b, .. }) => Some((*a, *b)),
@@ -1995,9 +2019,15 @@ impl Solve<'_> {
 /// lowered at so that what stays unconstrained is quantified with the
 /// definition. One call is one annotation, which is the whole scope of a
 /// tail's name: every `..r` in it shares one variable, and no other
-/// annotation's `r` can reach it. A `type` declaration's body mentions none
-/// of these — lowering refused them — so an alias never lowers to anything
-/// with a variable in it, which several walks here rely on.
+/// annotation's `r` can reach it.
+///
+/// A `type` declaration's body reaches none of that. A `?` and a bare `..` are
+/// refused there outright, and the one tail it may have names a row parameter,
+/// which lowers to a [`Ty::Bound`] — a leaf whose value comes from the use
+/// site, not a variable this table has to solve. So a declaration still lowers
+/// to something with no [`Ty::Var`] anywhere in it, which several walks here
+/// rely on: it is why they may stop at a name rather than descend into what it
+/// stands for.
 fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
     let mut rows = HashMap::new();
     let lowered = lower(mint, table, &mut rows, ty);
