@@ -64,6 +64,8 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::ParameterApplied,
         IrError::DuplicateParameter { previous: span },
         IrError::NonUniformRecursion,
+        IrError::MixedParameter,
+        IrError::NotARow,
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }

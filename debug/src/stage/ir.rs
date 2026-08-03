@@ -6,7 +6,7 @@
 
 use ruddy::{
     inference,
-    ir::{Decl, Term, TermKind, Type, TypeKind},
+    ir::{Decl, Row, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     types::Ty,
 };
@@ -261,7 +261,11 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             // The tail is a row of its own: it stands for the fields not
             // named, so it is shown beside them rather than folded into one.
             if let Some(tail) = tail {
-                let name = tail.name.as_deref().unwrap_or("");
+                let name = match &tail.of {
+                    Row::Anything => String::new(),
+                    Row::Named(name) => name.clone(),
+                    Row::Param { symbol, .. } => mint.name(*symbol).to_string(),
+                };
                 kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
             }
             Node {

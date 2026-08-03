@@ -20,6 +20,12 @@ type Stack a = { top: a, rest: Stack a }
 
 let peek : Stack Nat -> Nat = fn s => s.top
 
+type Tagged r = { tag: Nat, ..r }
+
+let tag : Tagged { note: Nat } -> Nat = fn t => t.tag
+
+let tagged = tag { tag: 7, note: 8 }
+
 let after = id point
 
 let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x

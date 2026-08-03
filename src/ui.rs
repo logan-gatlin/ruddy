@@ -194,6 +194,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::ParameterApplied => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
             ir::ErrorKind::NonUniformRecursion => "non-uniform-recursion",
+            ir::ErrorKind::MixedParameter => "mixed-parameter",
+            ir::ErrorKind::NotARow => "not-a-row",
         }
     }
 }
@@ -238,6 +240,15 @@ impl fmt::Display for ir::ErrorKind {
             // cycle would point at declarations they got right.
             ir::ErrorKind::NonUniformRecursion => f.write_str(
                 "a type that leads back to itself has to be given the same things it takes",
+            ),
+            // Said as the two readings rather than as "kind", which names a
+            // thing this language does not otherwise have and the reader has
+            // never been shown.
+            ir::ErrorKind::MixedParameter => f.write_str(
+                "this stands for the rest of a struct's fields in one place and for a whole type in another",
+            ),
+            ir::ErrorKind::NotARow => f.write_str(
+                "the rest of a struct's fields goes here, and this is not that",
             ),
         }
     }

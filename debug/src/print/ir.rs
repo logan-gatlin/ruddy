@@ -9,7 +9,7 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{Field, Program, Term, TermKind, TypeKind},
+    ir::{Field, Program, Row, Term, TermKind, TypeKind},
     symbol::Mint,
     tracking::Tracked,
 };
@@ -196,7 +196,13 @@ impl fmt::Display for Show<'_, TypeKind> {
                     .map(|(name, field)| (name, field.optional, self.show(&field.value)));
                 // The tail renders as what follows the `..`: a name, or
                 // nothing for the anonymous one. `write_row` writes the dots.
-                let tail = tail.as_ref().map(|tail| tail.name.as_deref().unwrap_or(""));
+                let tail = tail.as_ref().map(|tail| match &tail.of {
+                    Row::Anything => String::new(),
+                    Row::Named(name) => name.clone(),
+                    // A row parameter prints as the name it was declared with,
+                    // for the reason a type parameter does.
+                    Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+                });
                 write_row(
                     f,
                     fields,

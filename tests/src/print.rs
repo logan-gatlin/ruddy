@@ -197,6 +197,11 @@ fn both_trees_render_an_application_the_same_way() {
         // Recursion through a parameterized declaration, handed its own
         // parameter.
         "type List a = { head: a, tail: List a }",
+        // A row parameter: the `..` is written in the body, not at the head,
+        // so both printers have to reach the parameter through the tail.
+        "type WithX r = { x: Nat, ..r }",
+        "type Both A r = { it: A, ..r }",
+        "type WithX r = { x: Nat, ..r }\ntype P = WithX { y: Nat }",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");

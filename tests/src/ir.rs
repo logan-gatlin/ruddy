@@ -7,7 +7,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::Prim,
+    types::{ParamKind, Prim},
 };
 use ruddy_debug::print;
 
@@ -849,6 +849,145 @@ fn recursion_must_hand_a_type_its_own_parameters() {
             out.errors
                 .iter()
                 .any(|error| matches!(error.kind, ErrorKind::NonUniformRecursion)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// A parameter's kind is read off the body: a name in a `..` tail stands for a
+/// row, a name anywhere else stands for a type, and one nothing says anything
+/// about is a type because that is what a reader will expect.
+#[test]
+fn a_parameter_stands_for_what_the_body_uses_it_as() {
+    for (src, expected) in [
+        ("type WithX r = { x: Nat, ..r }", vec![ParamKind::Row]),
+        ("type Box A = { it: A }", vec![ParamKind::Type]),
+        ("type Ghost a = Nat", vec![ParamKind::Type]),
+        (
+            "type Both A r = { it: A, ..r }",
+            vec![ParamKind::Type, ParamKind::Row],
+        ),
+        (
+            "type Fn A B = A -> B",
+            vec![ParamKind::Type, ParamKind::Type],
+        ),
+    ] {
+        let (_, out) = built(src);
+        let decl = out.program.types.values().next().expect("one declaration");
+        let kinds: Vec<ParamKind> = decl.params.iter().map(|param| param.kind).collect();
+        assert_eq!(kinds, expected, "{src}");
+    }
+}
+
+/// A parameter handed straight to another declaration stands for whatever that
+/// declaration's parameter in that position stands for. Declarations are
+/// hoisted and may name each other, so this has to hold around a circle too —
+/// which is why the kinds are joined rather than assigned in some order.
+#[test]
+fn a_kind_travels_through_an_argument() {
+    // Along a chain, against the order the declarations are written in.
+    let (_, out) = built("type Outer s = Inner s  type Inner r = { x: Nat, ..r }");
+    for decl in out.program.types.values() {
+        assert_eq!(decl.params[0].kind, ParamKind::Row);
+    }
+
+    // And around a circle, where no declaration decides its own.
+    let (_, out) = built(
+        "type A x = { hop: B x, ..x }\n\
+         type B y = { hop: A y }",
+    );
+    for decl in out.program.types.values() {
+        assert_eq!(decl.params[0].kind, ParamKind::Row);
+    }
+}
+
+/// A parameter used both ways leaves nothing to read off, and neither use is
+/// the wrong one — so the declaration is what gets told.
+#[test]
+fn a_parameter_may_not_stand_for_both() {
+    for src in [
+        "type Bad r = { it: r, ..r }",
+        // Through an argument: `Inner` makes `r` a row, the field makes it a
+        // type.
+        "type Inner r = { x: Nat, ..r }  type Bad a = { it: a, more: Inner a }",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::MixedParameter)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// Only something that could stand for a set of fields may be written where a
+/// row parameter goes. Anything else would leave a row holding what no row can
+/// hold — which nothing downstream checks, so it is refused here.
+///
+/// This once passed for an annotation while catching the same mistake in a
+/// declaration, because the check ran before annotations were lowered. What
+/// reached the reader then was `expected `Nat`, found `∅`` — a complaint about
+/// the empty row, naming a symbol nobody had written.
+#[test]
+fn only_a_row_may_be_written_where_a_row_goes() {
+    for src in [
+        "type WithX r = { x: Nat, ..r }  let f : WithX Nat -> Nat = fn p => p.x",
+        "type WithX r = { x: Nat, ..r }  let f : WithX (Nat -> Nat) -> Nat = fn p => p.x",
+        "type WithX r = { x: Nat, ..r }  type Bad = WithX Nat",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::NotARow)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+
+    // A struct is one, and so is another row parameter handed straight on.
+    for src in [
+        "type WithX r = { x: Nat, ..r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
+        "type WithX r = { x: Nat, ..r }  let f : WithX {} -> Nat = fn p => p.x",
+        "type WithX r = { x: Nat, ..r }  type Pass s = WithX s",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+}
+
+/// A `..` naming a parameter is the one way a declared type may be left open,
+/// because what it stands for is supplied at every use rather than decided
+/// here. A bare `..` and a `?` are still refused, and so is a name that binds
+/// nothing.
+#[test]
+fn a_declaration_is_open_only_through_a_parameter() {
+    let (_, out) = built("type WithX r = { x: Nat, ..r }");
+    assert!(matches!(
+        out.program
+            .types
+            .values()
+            .next()
+            .expect("one declaration")
+            .value
+            .tracked,
+        TypeKind::Struct { tail: Some(_), .. }
+    ));
+
+    for src in [
+        "type T = { x: Nat, .. }",
+        "type T = { x: Nat, ..r }",
+        "type T A = { x: Nat, ..r }",
+        "type T r = { x?: Nat, ..r }",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
             "{src}: {:#?}",
             out.errors
         );

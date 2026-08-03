@@ -36,7 +36,7 @@ use std::{collections::HashMap, rc::Rc, slice};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
-    ir::{Program, Tail, Term, TermKind, Type, TypeKind},
+    ir::{Program, Row, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{RowField, Scheme, Ty, TyVar},
@@ -644,6 +644,21 @@ impl Table {
         }
     }
 
+    /// [`unfold`] with the row conditions its result implies recorded against
+    /// this table's variables.
+    ///
+    /// A declaration's body says which of its rows a `..` parameter is the tail
+    /// of, but the condition that follows — `type WithX r = { x: Nat, ..r }`
+    /// says `r` has no `x` — is not part of the body. It lived beside variables
+    /// the declaration never had, and this use site's are new, so it has to be
+    /// said again of them. Exactly what [`Constrain::instantiate`] does for a
+    /// scheme, for exactly the same reason.
+    fn unfolded(&mut self, aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+        let ty = unfold(aliases, ty);
+        self.note_lacks(&ty);
+        ty
+    }
+
     /// Whether a variable an annotation left open came back decided.
     ///
     /// Bound is decided, with one exception: a variable that resolves to
@@ -972,7 +987,7 @@ impl Constrain<'_> {
                 // applied as the arrow it stands for. The arrow the arm then
                 // works with is the unfolded one, which is the only shape a
                 // call site can take apart.
-                match &*unfold(self.aliases, &applied) {
+                match &*self.table.unfolded(self.aliases, &applied) {
                     // The function already knows what it takes, so the demand
                     // on the argument is the parameter type and the result is
                     // the arrow's own. Written this way round, a mismatch
@@ -1082,7 +1097,7 @@ impl Constrain<'_> {
         // into a struct literal — but `term.ty` is set from `expected` rather
         // than from this, so the term keeps the name the user wrote and prints
         // as it.
-        let shape = unfold(self.aliases, expected);
+        let shape = self.table.unfolded(self.aliases, expected);
         match (&mut term.kind, &*shape) {
             (TermKind::Fn { arg, body }, Ty::Arrow(from, to)) => {
                 let (from, to) = (from.clone(), to.clone());
@@ -1359,14 +1374,27 @@ impl Solve<'_> {
         self.step(span, Rule::Struct, goal.clone(), Effect::Decomposed);
         self.depth += 1;
 
-        // What flattening found twice, decided now that there is a rule to
-        // decide it under. Unreachable — see [`Solve::canon`] — and kept for
-        // the reason the arm there is kept.
+        // What flattening found twice, refused now that there is a rule to
+        // refuse it under.
+        //
+        // A row naming a field its own tail also names is not a type, and this
+        // is one of the two ways to write one: handing a declaration's `..`
+        // parameter a row that repeats a field the declaration already names,
+        // as `WithX { x: Nat }` does against
+        // `type WithX r = { x: Nat, ..r }`. The other way goes through a
+        // variable, and [`Solve::assign`]'s lacks check catches it before it is
+        // ever bound; this one has no variable to catch, because substitution
+        // put a written row straight into the tail.
+        //
+        // Refused rather than unified. Deciding the two copies against each
+        // other would accept `WithX { x: Nat }` — both copies are `Nat` — and
+        // then [`Table::zonk`] would keep one of them silently, which is
+        // exactly the failure the lacks check was added to end.
         for (name, first, second) in want_repeats {
-            self.field(span, &name, &expected, &expected, &first, &second);
+            self.repeat(span, goal.clone(), &name, &first, &second);
         }
         for (name, first, second) in have_repeats {
-            self.field(span, &name, &actual, &actual, &first, &second);
+            self.repeat(span, goal.clone(), &name, &first, &second);
         }
 
         let only_want: IndexMap<String, RowField> = want
@@ -1454,6 +1482,37 @@ impl Solve<'_> {
         self.depth -= 1;
     }
 
+    /// One field a row and its own tail both name: refused, and both copies
+    /// abandoned so the contradiction is reported once rather than echoed by
+    /// whatever was waiting on either.
+    ///
+    /// Worded as [`ErrorKind::RepeatedField`], the same complaint
+    /// [`Solve::assign`] makes when a tail would be *bound* to a row that
+    /// repeats a field. One contradiction, one sentence, whichever way it was
+    /// reached.
+    fn repeat(
+        &mut self,
+        span: Span,
+        goal: ConstraintKind,
+        name: &str,
+        first: &RowField,
+        second: &RowField,
+    ) {
+        let error = Error {
+            span,
+            kind: ErrorKind::RepeatedField {
+                field: name.to_string(),
+            },
+        };
+        let abandoned = [
+            first.ty.clone(),
+            second.ty.clone(),
+            first.presence.clone(),
+            second.presence.clone(),
+        ];
+        self.fail(span, Rule::Overlap, goal, error, &abandoned);
+    }
+
     /// A struct flattened: its own fields joined with every field its tail
     /// has already accumulated, and what remains of the tail — an unbound
     /// variable, [`Ty::Empty`], or [`Ty::Undecided`] — resolved as far as the
@@ -1465,13 +1524,18 @@ impl Solve<'_> {
     /// go into `repeats` instead, for [`Solve::rows`] to decide under its own
     /// step.
     ///
-    /// Nothing ever goes into `repeats`. A tail can only carry a field its own
-    /// row already names if something bound it to a row that names one, and
-    /// that is exactly what the lacks check in [`Solve::assign`] refuses — so
-    /// no chain of rows repeats a label. The pair is collected rather than
-    /// dropped because an [`IndexMap`] holds one entry per key: without
-    /// somewhere for a second copy to go, flattening would silently keep one
-    /// of two field types, which is the failure the lacks check exists to end.
+    /// What goes into `repeats` is a row naming a field its own tail also
+    /// names, which is not a type. There is one way to write one: handing a
+    /// declaration's `..` parameter a row that repeats a field the declaration
+    /// already names. Every other route runs through a variable, and the lacks
+    /// check in [`Solve::assign`] refuses those before anything is bound —
+    /// substitution is the one that has no variable to refuse, because it puts
+    /// a written row straight into the tail.
+    ///
+    /// The pair is collected rather than dropped because an [`IndexMap`] holds
+    /// one entry per key: without somewhere for a second copy to go, flattening
+    /// would silently keep one of two field types, which is the failure the
+    /// lacks check exists to end. [`Solve::rows`] refuses what lands here.
     fn canon(
         &self,
         ty: &Rc<Ty>,
@@ -1740,8 +1804,8 @@ impl Solve<'_> {
             self.step(span, Rule::Assume, goal, Effect::None);
             return;
         }
-        let lhs = unfold(self.aliases, lhs);
-        let rhs = unfold(self.aliases, rhs);
+        let lhs = self.table.unfolded(self.aliases, lhs);
+        let rhs = self.table.unfolded(self.aliases, rhs);
         self.step(span, Rule::Unfold, goal, Effect::Decomposed);
         self.assumed.extend(pair);
         self.depth += 1;
@@ -1986,15 +2050,18 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
                     (name.clone(), lowered)
                 })
                 .collect(),
-            rest: match tail {
+            rest: match tail.as_ref().map(|tail| &tail.of) {
                 None => Rc::new(Ty::Empty),
-                Some(Tail { name: None, .. }) => table.fresh(),
-                Some(Tail {
-                    name: Some(name), ..
-                }) => rows
+                Some(Row::Anything) => table.fresh(),
+                Some(Row::Named(name)) => rows
                     .entry(name.clone())
                     .or_insert_with(|| table.fresh())
                     .clone(),
+                // A row parameter is its position, the same as a type one: what
+                // it stands for is spliced in where this sits, by the flattening
+                // [`Table::zonk`] and [`Solve::canon`] already do for a tail
+                // bound to a row.
+                Some(Row::Param { index, .. }) => Rc::new(Ty::Bound(*index)),
             },
         }),
         TypeKind::Error => Rc::new(Ty::Undecided),

@@ -1710,3 +1710,97 @@ fn no_solver_variable_survives_inside_an_argument() {
         );
     }
 }
+
+/// A row argument's fields are spliced in where the parameter's tail sat. None
+/// of that is new machinery: substitution puts the row into the tail, and the
+/// flattening that already existed for a tail bound to a row does the rest.
+#[test]
+fn a_row_argument_is_spliced_into_the_tail() {
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
+         let n = f { x: 1, y: 2 }",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+
+    // Given nothing, the declaration is just its own fields.
+    let (_, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let g : WithX {} -> Nat = fn p => p.x\n\
+         let m = g { x: 1 }",
+    );
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+
+    // And the spliced field really is required: the row said `y` is there.
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
+         let n = f { x: 1 }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// A declaration's body says `r` has no `x`, and that condition has to be said
+/// again of every use — it lives beside the variables a use site mints, not
+/// inside the type. Handing the row a field the declaration already names is
+/// refused, and refused the same way whichever route it arrives by.
+#[test]
+fn a_row_argument_may_not_repeat_a_field_the_type_names() {
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { x: Nat } -> Nat = fn p => p.x",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+
+    // The same complaint reached the other way: not a written row spliced over
+    // a field, but a tail variable the definition later tries to bind to one.
+    // The condition is only on the variable once something has asked for the
+    // declaration's shape, which the projection here is what does.
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let g : WithX { ..s } -> { ..s } = fn p => { x: p.x }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+
+    // Naming the field rather than covering it is not the same thing, and is
+    // fine: the row still stands for what the declaration does not name.
+    let (_, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let ok : WithX { ..s } -> { x: Nat, ..s } = fn p => p",
+    );
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+}
+
+/// The condition is re-imposed per use rather than recorded once, so one use
+/// being wrong says nothing about another. Two annotations of the same
+/// declaration, one legal and one not, is what tells the two apart.
+#[test]
+fn the_lacks_condition_is_said_again_at_each_use() {
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let fine : WithX { y: Nat } -> Nat = fn p => p.x\n\
+         let bad : WithX { x: Nat } -> Nat = fn p => p.x\n\
+         let also : WithX { z: Nat } -> Nat = fn p => p.x",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+}
+
+/// A declaration left open through a parameter is still a declaration: its body
+/// mentions no solver variable, so it generalizes and prints as itself.
+#[test]
+fn a_row_parameter_leaves_the_declaration_closed_to_the_solver() {
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "WithX { y: Nat } -> Nat");
+    for scheme in output.schemes.values() {
+        assert!(
+            !mentions_a_variable(scheme.body()),
+            "a variable survived: {scheme}"
+        );
+    }
+}

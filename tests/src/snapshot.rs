@@ -1053,3 +1053,27 @@ fn the_ir_tab_takes_an_application_apart() {
         apply.children[0]
     );
 }
+
+/// The Types tab says which parameters stand for a set of fields, because
+/// nothing else on the row does: a row is the only reason a declared type can
+/// be open, and the meaning column spells every parameter `'a` alike.
+#[test]
+fn the_types_tab_says_which_parameters_are_rows() {
+    let snap = snapshot("type Both A r = { it: A, ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+
+    let both = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Both")
+        .expect("a row for the declaration");
+    let letters: Vec<(&str, &str)> = both
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "..r")]);
+}

@@ -13,7 +13,7 @@
 use indexmap::IndexMap;
 use ruddy::{
     symbol::Symbol,
-    types::{Scheme, Ty},
+    types::{ParamKind, Scheme, Ty},
 };
 
 use crate::{
@@ -77,8 +77,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
                     let letter = Ty::Bound(index as u32).to_string();
-                    let mut row =
-                        Node::new(ids.next(), letter, mint.name(param.symbol)).at(param.span);
+                    // What it stands for, beside what it is called: a row is
+                    // the reason a declaration can be open at all, and nothing
+                    // else on the row says which parameters are ones.
+                    let stands_for = match param.kind {
+                        ParamKind::Type => mint.name(param.symbol).to_string(),
+                        ParamKind::Row => format!("..{}", mint.name(param.symbol)),
+                    };
+                    let mut row = Node::new(ids.next(), letter, stands_for).at(param.span);
                     if let Some(index) = cx.symbols.get(&param.symbol) {
                         row = row.symbol(*index);
                     }

@@ -24,6 +24,25 @@ pub enum Prim {
 
 pub type TyVar = u32;
 
+/// What one parameter of a `type` declaration stands for.
+///
+/// Written nowhere: a parameter is a bare name, and which of these it is
+/// follows from where the body uses it — `..r` makes a row, anything else makes
+/// a type. Worked out in [`ir::build`](crate::ir::build), and carried here so
+/// that the two readers who need it, lowering and the debugger, agree.
+///
+/// Two of them, and no way to write a third. That is what keeps this a check
+/// rather than a language: every parameter is one of these, every declaration
+/// takes a fixed list of them, and nothing takes a declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParamKind {
+    /// Stands for a type. `A` in `type Pair A B`.
+    Type,
+    /// Stands for the fields a row does not name. `r` in
+    /// `type WithX r = { x: Nat, ..r }`.
+    Row,
+}
+
 #[derive(Debug, Clone)]
 pub struct Scheme {
     count: u32,
