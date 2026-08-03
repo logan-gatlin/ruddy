@@ -255,22 +255,27 @@ impl fmt::Display for Prim {
     }
 }
 
-/// How much of the surface grammar a semantic type can be. Only the arrow
-/// extends rightward; everything else — a primitive, a braced struct, a
-/// variable — is a form nothing can be appended to.
+/// How much of the surface grammar a semantic type can be. The arrow extends
+/// rightward and an application extends rightward by argument; everything else
+/// — a primitive, a braced struct, a variable — is a form nothing can be
+/// appended to.
 ///
-/// The type language has no lambda and no application, so two of [`Prec`]'s
-/// four levels never arise here. They are still the right scale to answer on:
-/// grouping is decided by comparing against the position a type is being
-/// written into, and that comparison is the surface grammar's whether or not
-/// this particular tree can reach every level of it.
+/// The type language has no lambda, so one of [`Prec`]'s four levels never
+/// arises here. It is still the right scale to answer on: grouping is decided
+/// by comparing against the position a type is being written into, and that
+/// comparison is the surface grammar's whether or not this particular tree can
+/// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match self {
             Ty::Arrow(..) => Prec::Arrow,
-            // A declared type is an atom whatever it stands for: it prints as
-            // its name, and a name is one word however many arrows are behind
-            // it.
+            // Applied to something, a declared type groups as the application
+            // it is: `Pair Nat Nat` needs parentheses wherever an argument
+            // could follow it.
+            Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
+            // Applied to nothing it is an atom whatever it stands for: it
+            // prints as its name, and a name is one word however many arrows
+            // are behind it.
             Ty::Nat
             | Ty::Struct { .. }
             | Ty::Named { .. }
@@ -337,9 +342,13 @@ impl fmt::Display for Ty {
                 write_row(f, entries, tail)
             }
             // A declared type prints as what the user called it rather than as
-            // what it stands for. It is shorter, it is what they wrote, and it
-            // is the only way a type that names itself can be printed at all.
-            Ty::Named { name, .. } => f.write_str(name),
+            // what it stands for, applied to whatever it was given. It is
+            // shorter, it is what they wrote, and it is the only way a type
+            // that names itself can be printed at all.
+            Ty::Named { name, args, .. } if args.is_empty() => f.write_str(name),
+            Ty::Named { name, args, .. } => {
+                write_applied(f, name, args.iter().map(|arg| &**arg as &dyn Grouped))
+            }
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
             Ty::Var(var) => write!(f, "?{var}"),
@@ -530,6 +539,27 @@ pub fn write_apply(
     write_grouped(f, func.prec() < Prec::Apply, func)?;
     f.write_str(" ")?;
     write_grouped(f, arg.prec() < Prec::Atom, arg)
+}
+
+/// Render `head arg arg ...` — the flat form of [`write_apply`], for the type
+/// language.
+///
+/// Flat rather than folded pairwise because a type constructor is applied to
+/// everything it takes at once: there is no half-applied thing for an
+/// intermediate node to stand for, so there is none to hand to
+/// [`write_apply`]. The head is written rather than grouped, since only a
+/// declared name can be one and a name is never a form that needs parentheses.
+pub fn write_applied<'a>(
+    f: &mut fmt::Formatter<'_>,
+    head: &dyn fmt::Display,
+    args: impl IntoIterator<Item = &'a dyn Grouped>,
+) -> fmt::Result {
+    write!(f, "{head}")?;
+    for arg in args {
+        f.write_str(" ")?;
+        write_grouped(f, arg.prec() < Prec::Atom, arg)?;
+    }
+    Ok(())
 }
 
 /// Render `from -> to`. The arrow is right-associative, so only the left side

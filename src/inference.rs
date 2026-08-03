@@ -49,7 +49,13 @@ pub struct Output {
     /// is looked up here again, which is how a declaration that names itself
     /// stays a finite value — and why this map, not the type, is what a
     /// recursive type is made of. See [`unfold`].
-    pub aliases: IndexMap<Symbol, Rc<Ty>>,
+    ///
+    /// A [`Scheme`] rather than a bare type, because handing a declaration its
+    /// arguments is substituting for the [`Ty::Bound`]s standing in for its
+    /// parameters — which is what instantiating a scheme already is, down to
+    /// the same `open`. A declaration taking no parameters is a scheme binding
+    /// nothing, and opening one returns its body unchanged.
+    pub aliases: IndexMap<Symbol, Scheme>,
     /// The scheme each top-level term was inferred, or checked, to have.
     pub schemes: IndexMap<Symbol, Scheme>,
     /// What generation asked of each definition, in the order it asked, and
@@ -317,7 +323,7 @@ struct Constrain<'a> {
     /// Reading this is not reading the variable table. It is fixed before the
     /// first definition is walked and mentions no variable, so an arm that
     /// consults it still cannot depend on how much an earlier arm had solved.
-    aliases: &'a IndexMap<Symbol, Rc<Ty>>,
+    aliases: &'a IndexMap<Symbol, Scheme>,
     out: Vec<Constraint>,
 }
 
@@ -328,7 +334,7 @@ struct Solve<'a> {
     steps: &'a mut Vec<Step>,
     /// What the declared types stand for, so a goal about a name can become a
     /// goal about a shape. See [`unfold`].
-    aliases: &'a IndexMap<Symbol, Rc<Ty>>,
+    aliases: &'a IndexMap<Symbol, Scheme>,
     /// Stamped onto every step this solve records.
     definition: Symbol,
     /// How deep inside a decomposition the solver currently is.
@@ -370,7 +376,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // runs in decides nothing — which is what lets two declarations refer to
     // each other.
     for (symbol, decl) in &program.types {
-        aliases.insert(*symbol, lower_type(mint, &mut table, &decl.value));
+        // Binding nothing, until declarations have parameters to bind.
+        let body = lower_type(mint, &mut table, &decl.value);
+        aliases.insert(*symbol, Scheme::new(0, body));
     }
 
     let mut schemes = IndexMap::new();
@@ -556,20 +564,19 @@ impl Table {
                 }
                 self.occurs(var, level, rest)
             }
-            // A declared type is not descended into, here or in any of the
-            // walks below. What one stands for was lowered from what the user
-            // wrote and mentions no variable at all — lowering refuses a `..`
-            // or a `?` in a declaration for exactly this reason — so there is
-            // nothing inside it to find, no level to pull up, and nothing to
-            // rebuild; and stopping is what keeps a walk over a type that
-            // names itself finite.
-            Ty::Nat
-            | Ty::Named { .. }
-            | Ty::Bound(_)
-            | Ty::Undecided
-            | Ty::Present
-            | Ty::Absent
-            | Ty::Empty => false,
+            // A declared type is descended into as far as its arguments and no
+            // further, here and in every walk below. What one stands for was
+            // lowered from what the user wrote and mentions no variable at all
+            // — lowering refuses a `..` or a `?` in a declaration for exactly
+            // this reason — so there is nothing in the body to find, no level
+            // to pull up, and nothing to rebuild; and stopping there is what
+            // keeps a walk over a type that names itself finite. The arguments
+            // are the other half: they were written at the use site and hold
+            // whatever it held, so skipping them would miss a cycle and leave a
+            // level unraised, and generalization would quantify a variable that
+            // escapes.
+            Ty::Named { args, .. } => args.iter().any(|arg| self.occurs(var, level, arg)),
+            Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => false,
         }
     }
 
@@ -610,8 +617,15 @@ impl Table {
                     self.lacks.entry(*var).or_default().extend(labels);
                 }
             }
+            // The body holds no row of its own to speak of, but an argument is
+            // whatever the use site wrote — including an open row whose tail
+            // must acquire the labels around it.
+            Ty::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.note_lacks(arg);
+                }
+            }
             Ty::Nat
-            | Ty::Named { .. }
             | Ty::Var(_)
             | Ty::Bound(_)
             | Ty::Undecided
@@ -726,13 +740,15 @@ impl Table {
                 }
                 self.quantify_walk(rest, subst, presences);
             }
-            Ty::Nat
-            | Ty::Named { .. }
-            | Ty::Bound(_)
-            | Ty::Undecided
-            | Ty::Present
-            | Ty::Absent
-            | Ty::Empty => {}
+            // An argument left open is the definition's to quantify, the same
+            // as one written anywhere else: `WithX ..'a -> Nat` names its tail
+            // because this descends.
+            Ty::Named { args, .. } => {
+                for arg in args.iter() {
+                    self.quantify_walk(arg, subst, presences);
+                }
+            }
+            Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => {}
         }
     }
 
@@ -795,6 +811,15 @@ impl Table {
                 }
                 Rc::new(Ty::Struct { fields, rest })
             }
+            // Rebuilt rather than handed back, because an argument may hold a
+            // variable and what leaves here may not. Nothing downstream
+            // resolves one, so a `Ty::Var` that survived this would reach a
+            // reader as an unanswerable `?3`.
+            Ty::Named { symbol, name, args } if !args.is_empty() => Rc::new(Ty::Named {
+                symbol: *symbol,
+                name: name.clone(),
+                args: args.iter().map(|arg| self.zonk(arg, subst)).collect(),
+            }),
             Ty::Nat
             | Ty::Named { .. }
             | Ty::Bound(_)
@@ -1159,12 +1184,30 @@ impl Solve<'_> {
             // the solver has one less thing to unfold later.
             (Ty::Var(var), _) => self.assign(span, goal, *var, &rhs),
             (_, Ty::Var(var)) => self.assign(span, goal, *var, &lhs),
-            // One declaration is only ever equal to itself, so this saves an
-            // unfolding rather than deciding anything. Two *different*
-            // declarations fall through to unfolding and are equal whenever
-            // what they stand for is: names are a barrier to unfolding, never
-            // to equality.
-            (Ty::Named { symbol: a, .. }, Ty::Named { symbol: b, .. }) if a == b => {
+            // One declaration applied to nothing is only ever equal to itself,
+            // so this saves an unfolding rather than deciding anything. Two
+            // *different* declarations fall through to unfolding and are equal
+            // whenever what they stand for is.
+            //
+            // Matched on the arguments rather than through a `..`, so that the
+            // arm which will have to compare them cannot be reached before it
+            // exists. Two applications of one declaration are equal when their
+            // arguments are — decided without unfolding either, which is what
+            // will keep a declaration that leads back to itself from unfolding
+            // forever — and until declarations take arguments there is no such
+            // pair to meet. See [`Ty::Named`].
+            (
+                Ty::Named {
+                    symbol: a,
+                    args: xs,
+                    ..
+                },
+                Ty::Named {
+                    symbol: b,
+                    args: ys,
+                    ..
+                },
+            ) if a == b && xs.is_empty() && ys.is_empty() => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
             (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => self.unfold(span, goal, &lhs, &rhs),
@@ -1814,13 +1857,14 @@ impl Solve<'_> {
                     self.recover(span, &ty);
                 }
             }
-            Ty::Nat
-            | Ty::Named { .. }
-            | Ty::Bound(_)
-            | Ty::Undecided
-            | Ty::Present
-            | Ty::Absent
-            | Ty::Empty => {}
+            // For the reason a field is: an argument the abandoned goal would
+            // have decided is left for generalization to quantify otherwise.
+            Ty::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.recover(span, arg);
+                }
+            }
+            Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => {}
         }
     }
 
@@ -1873,6 +1917,9 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
         TypeKind::Ident(symbol) => Rc::new(Ty::Named {
             symbol: *symbol,
             name: mint.name(*symbol).into(),
+            // A name written bare is applied to nothing, which is every
+            // declaration until the type language grows a binder.
+            args: Rc::from([]),
         }),
         TypeKind::Arrow { from, to } => Rc::new(Ty::Arrow(
             lower(mint, table, rows, from),
@@ -1909,7 +1956,14 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
 }
 
 /// What a declared type stands for: [`Ty::Named`] replaced by the body it was
-/// declared with, and again for as long as that is another name.
+/// declared with, holding the arguments it was applied to, and again for as
+/// long as that is another name.
+///
+/// Substituting the arguments is opening the declaration's [`Scheme`], which is
+/// the same `open` that instantiates a definition's — a declaration's
+/// parameters and a scheme's quantified variables are both [`Ty::Bound`], and
+/// both are handed their values from outside. One taking no arguments opens to
+/// its body unchanged, which is what this did before there were any.
 ///
 /// The one place a name is looked through, and always by one caller that needs
 /// a shape rather than a name — never as a normalization pass. A type that
@@ -1924,13 +1978,21 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
-pub fn unfold(aliases: &IndexMap<Symbol, Rc<Ty>>, ty: &Rc<Ty>) -> Rc<Ty> {
+pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     let mut ty = ty.clone();
-    while let Ty::Named { symbol, .. } = &*ty {
-        let Some(body) = aliases.get(symbol) else {
+    // The budget is the one [`Table::resolve`] keeps, for the reason it keeps
+    // it: a chain of declarations cannot close a loop, because
+    // [`ir::build`](crate::ir::build) refuses one. This bounds what a bug in
+    // that check would cost rather than restating the guarantee.
+    let mut budget = aliases.len();
+    while let Ty::Named { symbol, args, .. } = &*ty.clone() {
+        let Some(scheme) = aliases.get(symbol) else {
             return Rc::new(Ty::Undecided);
         };
-        ty = body.clone();
+        budget = budget
+            .checked_sub(1)
+            .expect("a chain of declarations closed a loop that lowering should refuse");
+        ty = open(scheme.body(), args);
     }
     ty
 }
@@ -1982,6 +2044,13 @@ fn open(ty: &Rc<Ty>, fresh: &[Rc<Ty>]) -> Rc<Ty> {
                 })
                 .collect(),
             rest: open(rest, fresh),
+        }),
+        // A declaration's own body reaches here holding its parameters, so
+        // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.
+        Ty::Named { symbol, name, args } if !args.is_empty() => Rc::new(Ty::Named {
+            symbol: *symbol,
+            name: name.clone(),
+            args: args.iter().map(|arg| open(arg, fresh)).collect(),
         }),
         Ty::Nat
         | Ty::Named { .. }

@@ -135,16 +135,14 @@ fn mentions_a_variable(ty: &Ty) -> bool {
                 .any(|field| mentions_a_variable(&field.presence) || mentions_a_variable(&field.ty))
                 || mentions_a_variable(rest)
         }
-        // A declared type is not looked inside, for the reason the compiler's
-        // own walks do not: what one stands for was lowered from what the user
-        // wrote, and no solver variable can reach it.
-        Ty::Nat
-        | Ty::Named { .. }
-        | Ty::Bound(_)
-        | Ty::Undecided
-        | Ty::Present
-        | Ty::Absent
-        | Ty::Empty => false,
+        // A declared type's body is not looked inside, for the reason the
+        // compiler's own walks do not: what one stands for was lowered from
+        // what the user wrote, and no solver variable can reach it. Its
+        // arguments are another matter — they were written at the use site and
+        // hold whatever it held, so this has to descend or it would pass while
+        // the leak it exists to catch is right there.
+        Ty::Named { args, .. } => args.iter().any(|arg| mentions_a_variable(arg)),
+        Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => false,
     }
 }
 

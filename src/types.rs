@@ -80,7 +80,7 @@ pub enum Ty {
     /// [`Ty::Struct::rest`].
     Empty,
     /// A declared type, held as the name it was written as rather than as what
-    /// it stands for.
+    /// it stands for, applied to whatever it was given.
     ///
     /// This is the only place a type can be recursive, and the only reason it
     /// can be: `symbol` keys
@@ -90,18 +90,57 @@ pub enum Ty {
     /// a type is still a finite tree — which is what keeps `Clone`, `Debug` and
     /// every walk in the compiler terminating.
     ///
-    /// It is a barrier to unfolding, never to equality. Two types are the same
-    /// when they unfold the same way, whatever they are called, so `symbol` is
-    /// compared only to spot the pair that needs no unfolding at all; see
-    /// [`Solve::unify`](crate::inference). `name` is what the type prints as
-    /// and is never compared: [`Display`](std::fmt::Display) is handed a bare
-    /// type with no mint to ask, and a spelling is cheaper to carry than a
-    /// context to thread through every diagnostic in the compiler.
+    /// The arguments are the exception to that, and the one thing about this
+    /// variant a walk may not skip. A body holds no solver variable — lowering
+    /// refuses a `..` or a `?` in a declaration for exactly that reason — but
+    /// `args` is written at the use site and holds whatever that site had. So
+    /// every walk stops at the body and descends into the arguments: see
+    /// [`Table::occurs`](crate::inference), which does both in one pass.
+    ///
+    /// Two of these are the same type when:
+    ///
+    /// - they are applications of the **same** declaration whose arguments are
+    ///   the same — decided without unfolding either, which is what keeps a
+    ///   declaration that leads back to itself from unfolding forever;
+    /// - or they are applications of **different** declarations that unfold the
+    ///   same way, whatever they are called.
+    ///
+    /// A declaration taking no arguments is the second case with an empty
+    /// argument list, which is what it has always been. The first case is why a
+    /// declaration that ignores a parameter is not transparent: `type Ptr a =
+    /// Nat` makes `Ptr A` and `Ptr B` different types though both stand for
+    /// `Nat`, which is what a phantom type is. See
+    /// [`Solve::unify`](crate::inference).
+    ///
+    /// `name` is what the type prints as and is never compared:
+    /// [`Display`](std::fmt::Display) is handed a bare type with no mint to
+    /// ask, and a spelling is cheaper to carry than a context to thread through
+    /// every diagnostic in the compiler.
     Named {
         symbol: Symbol,
         name: Rc<str>,
+        /// What the declaration was applied to, in order. Empty for one that
+        /// takes nothing, which is every declaration the language had before
+        /// type constructors.
+        ///
+        /// `Rc<[_]>` rather than `Vec`: a type is cloned on nearly every step
+        /// the solver takes, and the arguments should not be copied with it.
+        args: Rc<[Rc<Ty>]>,
     },
     Var(TyVar),
+    /// A variable some [`Scheme`] binds, by its position in that scheme.
+    ///
+    /// Which scheme depends on where the type came from, and the two never
+    /// meet. In a definition's scheme it is a variable generalization
+    /// quantified, and instantiation hands it a fresh [`Ty::Var`]. In a
+    /// declaration's scheme it is one of the declaration's parameters, and
+    /// unfolding hands it the argument written at the use site. Both are the
+    /// same substitution — see `open` in [`inference`](crate::inference) — which
+    /// is why one representation serves both and there is no second way to get
+    /// it wrong.
+    ///
+    /// A leaf either way: whatever it stands for is supplied from outside, so
+    /// there is nothing inside it for a walk to find.
     Bound(u32),
     #[default]
     Undecided,

@@ -273,6 +273,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let named = Rc::new(Ty::Named {
         symbol,
         name: "Endo".into(),
+        args: Rc::from([]),
     });
 
     for (prelude, ty, printed) in [
