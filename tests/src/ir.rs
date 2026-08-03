@@ -801,6 +801,22 @@ fn a_declaration_binds_each_parameter_once() {
     );
 }
 
+/// A repeated parameter binds once, so the declaration takes one thing. The
+/// count the arity check uses is the list the scheme binds; counting the list
+/// that was written asked for an argument no body could name.
+#[test]
+fn a_repeated_parameter_is_not_counted_twice() {
+    let (mint, out) = build_src("type P A A = { x: A }  let v : P Nat = { x: 1 }");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::DuplicateParameter { .. }
+    ));
+
+    let decl = &out.program.types[&type_symbol(&mint, &out, "P")];
+    assert_eq!(decl.params.len(), 1);
+}
+
 /// Applying a name is still only a name, so a pair of declarations that hand
 /// each other their parameters says nothing, exactly as a pair of bare names
 /// does. A body that is a parameter is not the same thing: it says its argument.
@@ -820,6 +836,49 @@ fn a_type_defined_only_as_another_name_is_still_circular() {
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
+/// A loop can close through a declaration that hands back what it is given:
+/// `A` stands for its argument, so `B` is declared as itself with `A` in
+/// between and says exactly as much as `type B = B` does.
+#[test]
+fn a_loop_can_close_through_a_parameter() {
+    for src in [
+        "type A a = a  type B = A B",
+        "type A a = a  type B = A C  type C = A B",
+        // The loop that goes out through an argument and comes back in.
+        "type S a = U (S a)  type U b = b",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::Circular)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+
+    // And what must not be caught with it. Following a pass-through twice is
+    // not following it round: each step hands back a smaller piece of what was
+    // written.
+    for src in [
+        "type Id a = a  type Y = Id (Id Nat)",
+        // The case a per-slot approximation reports wrongly: `Id` is handed an
+        // `X` somewhere else, which says nothing about `X`.
+        "type Id a = a  type X = Id Nat  type Y = { f: Id X }",
+        "type G g = g  type F a = G (G a)  type H = F Nat",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+
+    // Only the declarations on the loop are told; one that merely names one
+    // has nothing to fix.
+    let (mint, out) = build_src("type A a = a  type B = A B  type P = B");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let b = out.program.types[&type_symbol(&mint, &out, "B")].name_span;
+    assert!(out.errors[0].span.start >= b.start);
+}
+
 /// A type that leads back to itself must hand itself its own parameters,
 /// unchanged. Unfolding one that grows its argument never comes back round, so
 /// there would be no finite answer to whether two of them are the same type.
@@ -834,6 +893,9 @@ fn recursion_must_hand_a_type_its_own_parameters() {
         // inside `List` has to be verbatim, and it is.
         "type List a = { head: a, tail: List a }  \
          type Rose a = { node: a, kids: List (Rose a) }",
+        // A longer circle: every member is in one group, and every mention in
+        // it is verbatim.
+        "type A a = { x: B a }  type B b = { x: C b }  type C c = { x: A c }",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -843,6 +905,13 @@ fn recursion_must_hand_a_type_its_own_parameters() {
         "type T a = { next: T { x: a } }",
         "type T a = { next: T Nat }",
         "type A a = { x: B { y: a } }  type B b = { x: A b }",
+        // A monomorphic argument inside the group is refused too, and not
+        // because it grows: the solver's assumption that two names already
+        // being compared are equal is keyed on the names, so one declaration
+        // may not appear inside its own group with two different arguments.
+        // See `Solve::unfold`.
+        "type Tree a = { value: a, kids: Forest }  \
+         type Forest = { head: Tree Nat, tail: Forest }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -920,6 +989,55 @@ fn a_parameter_may_not_stand_for_both() {
             "{src}: {:#?}",
             out.errors
         );
+    }
+}
+
+/// What a parameter stands for is read off the declaration that binds it, in
+/// whichever order the declarations were written. A use site handing it the
+/// wrong thing is the use site's mistake, not evidence about the declaration.
+#[test]
+fn a_parameter_kind_does_not_depend_on_declaration_order() {
+    for src in [
+        "type WithX r = { x: Nat, ..r }  type Bad = WithX Nat",
+        "type Bad = WithX Nat  type WithX r = { x: Nat, ..r }",
+    ] {
+        let (mint, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        assert!(matches!(out.errors[0].kind, ErrorKind::NotARow), "{src}");
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find("WithX Nat").expect("the use") + "WithX ".len(),
+            "{src}: reported at the argument"
+        );
+        let with_x = &out.program.types[&type_symbol(&mint, &out, "WithX")];
+        assert_eq!(with_x.params[0].kind, ParamKind::Row, "{src}");
+    }
+}
+
+/// A parameter used two ways is reported against the parameter that was used
+/// two ways. The other declaration is right and is left alone — which the
+/// order the two were written in must not decide.
+#[test]
+fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
+    for src in [
+        "type V a = { f: a, g: W a }  type W r = { x: Nat, ..r }",
+        "type W r = { x: Nat, ..r }  type V a = { f: a, g: W a }",
+    ] {
+        let (mint, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::MixedParameter),
+            "{src}"
+        );
+
+        let v = &out.program.types[&type_symbol(&mint, &out, "V")];
+        assert_eq!(out.errors[0].span, v.params[0].span, "{src}: at `a` in `V`");
+        // A mixed parameter is taken as a row: what a row may hold is the one
+        // thing nothing downstream can recover from.
+        assert_eq!(v.params[0].kind, ParamKind::Row, "{src}");
+
+        let w = &out.program.types[&type_symbol(&mint, &out, "W")];
+        assert_eq!(w.params[0].kind, ParamKind::Row, "{src}: `W` is right");
     }
 }
 

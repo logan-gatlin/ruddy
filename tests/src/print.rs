@@ -69,6 +69,47 @@ fn the_empty_struct_carries_no_padding() {
     assert_eq!(ir, "let u : {} = {}");
 }
 
+/// One source as the parse tree's printer renders it, without lowering it.
+/// [`printed`] requires a clean lowering; this does not, because the debugger
+/// shows the parse tree of every program a reader can type.
+fn ast_of(source: &str) -> String {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let lexed = token::lex(source, file);
+    assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+
+    parsed
+        .stmts
+        .iter()
+        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The AST printer renders whatever was parsed, including programs lowering
+/// refuses. So its grouping has to hold for heads the IR can never carry: only
+/// a declared name can be applied, but anything at all can be *written*
+/// applied, and the head of a flat application has to read back as one atom.
+#[test]
+fn an_applied_head_is_grouped_like_any_other_position() {
+    for source in [
+        "type X = (Nat -> Nat) Nat",
+        "type Y = (Box Nat) Nat",
+        // A struct is an atom, so this one must not acquire parentheses.
+        "type Z = { x: Nat } Nat",
+    ] {
+        let printed = ast_of(source);
+        assert_eq!(printed, source, "{source}");
+        assert_eq!(
+            ast_of(&printed),
+            printed,
+            "{source}: printing is a fixed point"
+        );
+    }
+}
+
 /// The written type as the debugger renders it, and the type inference decided
 /// the definition has as the compiler renders it.
 fn types_of(source: &str) -> (String, String) {

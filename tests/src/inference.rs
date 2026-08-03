@@ -777,6 +777,22 @@ fn a_tail_may_not_take_a_field_its_own_row_names() {
     );
 }
 
+/// One contradiction, one sentence: a row handed to a `..` parameter that
+/// repeats two of the fields the declaration already names is one mistake with
+/// one thing to change, and `Solve::assign` already reports it that way.
+#[test]
+fn a_row_repeating_two_fields_is_one_complaint() {
+    let (_, _, output) = infer_src(
+        "type W r = { x: Nat, y: Nat, ..r }\n\
+         let p : W { x: Nat, y: Nat } = { x: 1, y: 2 }",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(
+        &output.errors[0].kind,
+        ErrorKind::RepeatedField { field } if field == "x"
+    ));
+}
+
 /// The condition survives every binding it passes through. A tail that
 /// absorbs a field continues as a fresh tail, and that fresh tail is where the
 /// next conflicting field would arrive — so what the first one could not be,
@@ -1257,6 +1273,25 @@ fn lowering_errors_are_absorbed_not_echoed() {
     assert_eq!(scheme(&mint, &output, "point"), "{ x: ? }");
 }
 
+/// An argument that cannot stand for a set of fields is refused and absorbed.
+/// Lowering said it once; inference must not say it again in words about the
+/// empty row, which is the failure `lowering_errors_are_absorbed_not_echoed`
+/// was written to prevent.
+#[test]
+fn a_bad_row_argument_is_absorbed_not_echoed() {
+    let (_, out, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX Nat -> Nat = fn p => p.x",
+    );
+    assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "not-a-row");
+    assert!(
+        output.errors.is_empty(),
+        "inference echoed it: {:#?}",
+        output.errors
+    );
+}
+
 #[test]
 fn the_solve_is_recorded_rule_by_rule() {
     let (mint, _, output) = inferred("let fst : { x: Nat } -> Nat = fn p => p.x");
@@ -1663,6 +1698,33 @@ fn a_recursive_constructor_does_not_unfold_forever() {
          let f : List Nat -> Seq Nat = fn x => x",
     );
     assert_eq!(scheme(&mint, &output, "f"), "List Nat -> Seq Nat");
+}
+
+/// The declaration binds one parameter, so the annotation hands it one, and
+/// opening the scheme reaches every `A` in the body.
+#[test]
+fn a_repeated_parameter_leaves_one_argument_to_supply() {
+    let (mint, _, output) = infer_src("type P A A = { x: A }\nlet v : P Nat = { x: 1 }");
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(scheme(&mint, &output, "v"), "P Nat");
+}
+
+/// A declaration standing for its own argument may be nested as deep as the
+/// writer likes: unfolding follows one declaration once per level, which is
+/// not following it round.
+#[test]
+fn a_pass_through_declaration_may_be_nested() {
+    let (mint, _, output) = inferred("type Id a = a\nlet x : Id (Id Nat) = 1");
+    assert_eq!(scheme(&mint, &output, "x"), "Id (Id Nat)");
+
+    // Deeper than there are declarations, which is what the old bound could
+    // not survive.
+    inferred("type Id a = a\nlet z : Id (Id (Id (Id Nat))) = 1");
+
+    // And it still unfolds to something: the literal is checked against `Nat`.
+    let (_, _, output) = infer_src("type Id a = a\nlet y : Id (Id Nat) = {}");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
 }
 
 /// A row written inside an argument still says what its tail may not stand for.

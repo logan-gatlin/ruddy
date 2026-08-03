@@ -185,7 +185,7 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Param { symbol, .. } => f.write_str(self.mint.name(*symbol)),
             TypeKind::Apply { head, args, .. } => write_applied(
                 f,
-                &self.mint.name(*head),
+                self.mint.name(*head),
                 args.iter().map(|arg| self.show(arg)),
             ),
             TypeKind::Prim(prim) => f.write_str(prim.name()),

@@ -1377,27 +1377,10 @@ impl Solve<'_> {
         self.depth += 1;
 
         // What flattening found twice, refused now that there is a rule to
-        // refuse it under.
-        //
-        // A row naming a field its own tail also names is not a type, and this
-        // is one of the two ways to write one: handing a declaration's `..`
-        // parameter a row that repeats a field the declaration already names,
-        // as `WithX { x: Nat }` does against
-        // `type WithX r = { x: Nat, ..r }`. The other way goes through a
-        // variable, and [`Solve::assign`]'s lacks check catches it before it is
-        // ever bound; this one has no variable to catch, because substitution
-        // put a written row straight into the tail.
-        //
-        // Refused rather than unified. Deciding the two copies against each
-        // other would accept `WithX { x: Nat }` — both copies are `Nat` — and
-        // then [`Table::zonk`] would keep one of them silently, which is
-        // exactly the failure the lacks check was added to end.
-        for (name, first, second) in want_repeats {
-            self.repeat(span, goal.clone(), &name, &first, &second);
-        }
-        for (name, first, second) in have_repeats {
-            self.repeat(span, goal.clone(), &name, &first, &second);
-        }
+        // refuse it under. Both sides together, because it is one row that went
+        // wrong however many labels it went wrong at; see [`Solve::repeat`].
+        let repeats: Vec<_> = want_repeats.into_iter().chain(have_repeats).collect();
+        self.repeat(span, goal.clone(), &repeats);
 
         let only_want: IndexMap<String, RowField> = want
             .iter()
@@ -1484,34 +1467,59 @@ impl Solve<'_> {
         self.depth -= 1;
     }
 
-    /// One field a row and its own tail both name: refused, and both copies
+    /// Every field a row and its own tail both name: refused, and every copy
     /// abandoned so the contradiction is reported once rather than echoed by
-    /// whatever was waiting on either.
+    /// whatever was waiting on any of them.
+    ///
+    /// A row naming a field its own tail also names is not a type, and this is
+    /// one of the two ways to write one: handing a declaration's `..` parameter
+    /// a row that repeats a field the declaration already names, as
+    /// `WithX { x: Nat }` does against `type WithX r = { x: Nat, ..r }`. The
+    /// other way goes through a variable, and [`Solve::assign`]'s lacks check
+    /// catches it before it is ever bound; this one has no variable to catch,
+    /// because substitution put a written row straight into the tail.
+    ///
+    /// Refused rather than unified. Deciding the two copies against each other
+    /// would accept `WithX { x: Nat }` — both copies are `Nat` — and then
+    /// [`Table::zonk`] would keep one of them silently, which is exactly the
+    /// failure the lacks check was added to end.
     ///
     /// Worded as [`ErrorKind::RepeatedField`], the same complaint
     /// [`Solve::assign`] makes when a tail would be *bound* to a row that
     /// repeats a field. One contradiction, one sentence, whichever way it was
-    /// reached.
+    /// reached — so the whole list arrives at once, the first label is the one
+    /// named, and the rest are abandoned rather than reported. Naming the first
+    /// is the rule [`Table::repeated`] states: the field a reader would reach
+    /// first reading the type left to right, expected side before actual.
+    /// Abandoning all of them is [`Solve::fail`]'s rule: reporting and
+    /// recovering are one act, and a copy left unrecovered is a variable
+    /// generalization would go on to quantify.
     fn repeat(
         &mut self,
         span: Span,
         goal: ConstraintKind,
-        name: &str,
-        first: &RowField,
-        second: &RowField,
+        repeats: &[(String, RowField, RowField)],
     ) {
+        let Some((name, ..)) = repeats.first() else {
+            return;
+        };
         let error = Error {
             span,
             kind: ErrorKind::RepeatedField {
-                field: name.to_string(),
+                field: name.clone(),
             },
         };
-        let abandoned = [
-            first.ty.clone(),
-            second.ty.clone(),
-            first.presence.clone(),
-            second.presence.clone(),
-        ];
+        let abandoned: Vec<Rc<Ty>> = repeats
+            .iter()
+            .flat_map(|(_, first, second)| {
+                [
+                    first.ty.clone(),
+                    second.ty.clone(),
+                    first.presence.clone(),
+                    second.presence.clone(),
+                ]
+            })
+            .collect();
         self.fail(span, Rule::Overlap, goal, error, &abandoned);
     }
 
@@ -2114,9 +2122,11 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
 /// back is one shape deep, and the names inside it are still names.
 ///
 /// What guarantees this terminates is the check in
-/// [`ir::build`](crate::ir::build), not anything here: a chain of names that
-/// closed a loop would be a type declared as itself, which lowering refuses,
-/// so following one strictly shrinks what is left to follow. The same bargain
+/// [`ir::build`](crate::ir::build), not anything here. Each round is one of
+/// two things and both run out: following a name to the name at the head of
+/// its body walks a chain of declarations that lowering refuses to let close a
+/// loop, and following one that stands for its own argument hands back a
+/// strictly smaller piece of the type that came in. The same bargain
 /// [`Table::resolve`] has with the occurs check.
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
@@ -2124,17 +2134,32 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
 pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     let mut ty = ty.clone();
     // The budget is the one [`Table::resolve`] keeps, for the reason it keeps
-    // it: a chain of declarations cannot close a loop, because
-    // [`ir::build`](crate::ir::build) refuses one. This bounds what a bug in
-    // that check would cost rather than restating the guarantee.
+    // it: it bounds what a bug in that check would cost rather than restating
+    // the guarantee.
+    //
+    // What it bounds is a chain of *name bodies*. A step whose body is another
+    // name applied to something follows one declaration to the one declaration
+    // written at the head of its body, and a body has one head that `open`
+    // never renames — so the successor is a function of the declaration alone,
+    // and more than one such step per declaration means a declaration was
+    // visited twice, which is the loop lowering refuses.
+    //
+    // A step whose body is a parameter hands back an argument instead. What is
+    // left to unfold is then a piece of the type that came in rather than
+    // anything this chain reached, so it starts a new chain and the budget
+    // resets. Counting those against one bound would panic on
+    // `type Id a = a` written `Id (Id Nat)`, which is a correct program.
     let mut budget = aliases.len();
     while let Ty::Named { symbol, args, .. } = &*ty.clone() {
         let Some(scheme) = aliases.get(symbol) else {
             return Rc::new(Ty::Undecided);
         };
-        budget = budget
-            .checked_sub(1)
-            .expect("a chain of declarations closed a loop that lowering should refuse");
+        budget = match &**scheme.body() {
+            Ty::Bound(_) => aliases.len(),
+            _ => budget
+                .checked_sub(1)
+                .expect("a chain of declarations closed a loop that lowering should refuse"),
+        };
         ty = open(scheme.body(), args);
     }
     ty

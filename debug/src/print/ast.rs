@@ -111,7 +111,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
             }
             TypeKind::Apply { head, args } => write_applied(
                 f,
-                &Ast(&head.tracked),
+                Ast(&head.tracked),
                 args.iter().map(|arg| Ast(&arg.tracked)),
             ),
             TypeKind::Ident { name } => f.write_str(&name.tracked),

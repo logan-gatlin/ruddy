@@ -72,6 +72,15 @@ impl<T: Grouped + ?Sized> Grouped for &T {
     }
 }
 
+/// A name is an atom: one word, however many arrows are behind it. Written
+/// here so that the head of an application can be a name in one printer and a
+/// whole written type in another, and both go through the same rule.
+impl Grouped for str {
+    fn prec(&self) -> Prec {
+        Prec::Atom
+    }
+}
+
 /// How tightly a printed node binds. Grouping is dropped rather than recorded,
 /// so the printers reconstruct it from this alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -239,7 +248,7 @@ impl fmt::Display for ir::ErrorKind {
             // change is the arguments at this one mention, and naming the whole
             // cycle would point at declarations they got right.
             ir::ErrorKind::NonUniformRecursion => f.write_str(
-                "a type that leads back to itself has to be given the same things it takes",
+                "types that lead back to each other have to hand each other the names they take, unchanged, so that two of them can be compared",
             ),
             // Said as the two readings rather than as "kind", which names a
             // thing this language does not otherwise have and the reader has
@@ -423,7 +432,9 @@ impl fmt::Display for Ty {
             // shorter, it is what they wrote, and it is the only way a type
             // that names itself can be printed at all.
             Ty::Named { name, args, .. } if args.is_empty() => f.write_str(name),
-            Ty::Named { name, args, .. } => write_applied(f, name, args.iter().map(|arg| &**arg)),
+            Ty::Named { name, args, .. } => {
+                write_applied(f, &**name, args.iter().map(|arg| &**arg))
+            }
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
             Ty::Var(var) => write!(f, "?{var}"),
@@ -624,14 +635,21 @@ pub fn write_apply(
 /// Flat rather than folded pairwise because a type constructor is applied to
 /// everything it takes at once: there is no half-applied thing for an
 /// intermediate node to stand for, so there is none to hand to
-/// [`write_apply`]. The head is written rather than grouped, since only a
-/// declared name can be one and a name is never a form that needs parentheses.
-pub fn write_applied<A: Grouped>(
+/// [`write_apply`].
+///
+/// The head is grouped against an atom rather than against an application, as
+/// [`write_apply`] groups its function: the form is flat, so `head arg arg`
+/// says the head is one atom, and an application there would swallow the
+/// arguments that follow it. The compiler's own printers never see a
+/// parenthesis here — a name is an atom, and only a declared name reaches this
+/// far in the IR — but the parse tree's printer renders what was written, and
+/// anything at all can be *written* applied.
+pub fn write_applied<H: Grouped, A: Grouped>(
     f: &mut fmt::Formatter<'_>,
-    head: &dyn fmt::Display,
+    head: H,
     args: impl IntoIterator<Item = A>,
 ) -> fmt::Result {
-    write!(f, "{head}")?;
+    write_grouped(f, head.prec() < Prec::Atom, &head)?;
     for arg in args {
         f.write_str(" ")?;
         write_grouped(f, arg.prec() < Prec::Atom, &arg)?;
