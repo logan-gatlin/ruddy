@@ -111,9 +111,11 @@ pub enum Rule {
     /// The same declared type on both sides, applied to arguments: taken apart
     /// into one goal per argument rather than unfolded.
     ///
-    /// What [`Rule::Same`] becomes when there is something to compare. It is
-    /// also the rule that keeps a recursive declaration from unfolding forever,
-    /// which is why it comes before [`Rule::Unfold`] rather than after it.
+    /// What [`Rule::Same`] becomes when there is something to compare, and
+    /// where a declaration is nominal within itself: two applications of one
+    /// declaration are equal by their arguments and never by what they unfold
+    /// to, so a declaration that ignores a parameter keeps them apart. It comes
+    /// before [`Rule::Unfold`] so that the name decides rather than the shape.
     Congruent,
     /// A variable against a type: the only rule that grows the solution.
     Bind,
@@ -347,20 +349,21 @@ struct Solve<'a> {
     definition: Symbol,
     /// How deep inside a decomposition the solver currently is.
     depth: u32,
-    /// The pairs of declarations the goals currently open were reached by
-    /// unfolding, innermost last.
+    /// The goals about two declared types that the goals currently open were
+    /// reached by unfolding, innermost last.
     ///
     /// Two recursive types are equal when assuming they are equal never leads
-    /// to a contradiction, so meeting a pair already on this stack ends the
-    /// goal rather than starting it again. Kept as a stack rather than a set
-    /// because the assumption holds for the goals the unfolding broke into and
-    /// no further, which is the same scope [`Solve::depth`] tracks.
+    /// to a contradiction, so meeting a goal already on this stack ends it
+    /// rather than starting it again. Kept as a stack rather than a set because
+    /// the assumption holds for the goals the unfolding broke into and no
+    /// further, which is the same scope [`Solve::depth`] tracks.
     ///
-    /// Two symbols rather than two types, which is sound only because two
-    /// applications of one declaration never unfold and a recursion may not
-    /// change its arguments. Both are rules kept elsewhere; [`Solve::unfold`]
-    /// says which, and what breaks if either goes.
-    assumed: Vec<(Symbol, Symbol)>,
+    /// Each entry is the two [`Ty::Named`]s themselves — names *and* arguments
+    /// — because that is the goal, and an assumption keyed on less than the goal
+    /// answers questions it was never asked. Compared with [`Table::alike`]
+    /// rather than by identity, since unfolding rebuilds an argument each round
+    /// rather than passing the same allocation on. See [`Solve::unfold`].
+    assumed: Vec<(Rc<Ty>, Rc<Ty>)>,
     /// [`Constraint::base_span`] of the goal as it arrived, and only of that
     /// goal: [`Solve::unify`] takes it on the way in, so what a goal decomposes
     /// into never sees it. Nothing under a projection's demand is about the
@@ -545,6 +548,83 @@ impl Table {
             ty = inner.clone();
         }
         ty
+    }
+
+    /// Whether two types are the same type as far as anything already decided
+    /// can tell — every variable followed to what it stands for, and then term
+    /// against term.
+    ///
+    /// Not a rule of the solve and never a reason to accept a program: solving
+    /// is what decides whether two types *can be made* equal, and this only
+    /// answers whether they already are. Its one caller is [`Solve::unfold`],
+    /// which needs to recognize a goal it is already in the middle of.
+    ///
+    /// Read at the moment of the question rather than recorded when the types
+    /// were first seen, which is the whole reason it resolves: a variable bound
+    /// since then is part of what the older goal now says, and comparing what it
+    /// said before would be comparing something the solver has stopped
+    /// believing.
+    ///
+    /// Says no where it cannot tell — a row spliced into a tail is the same row
+    /// written out flat, and this calls them different. Answering no to a
+    /// question that is really yes costs a repeated goal; answering yes to one
+    /// that is really no would accept two types that differ, so the one-sided
+    /// error is the one to make.
+    fn alike(&self, a: &Rc<Ty>, b: &Rc<Ty>) -> bool {
+        let (a, b) = (self.resolve(a), self.resolve(b));
+        match (&*a, &*b) {
+            (Ty::Nat, Ty::Nat)
+            | (Ty::Present, Ty::Present)
+            | (Ty::Absent, Ty::Absent)
+            | (Ty::Empty, Ty::Empty)
+            | (Ty::Undecided, Ty::Undecided) => true,
+            (Ty::Var(x), Ty::Var(y)) => x == y,
+            (Ty::Bound(x), Ty::Bound(y)) => x == y,
+            (Ty::Arrow(from, to), Ty::Arrow(other_from, other_to)) => {
+                self.alike(from, other_from) && self.alike(to, other_to)
+            }
+            // A record, so the order the fields were written in decides
+            // nothing; the names and what they hold decide everything.
+            (
+                Ty::Struct { fields, rest },
+                Ty::Struct {
+                    fields: others,
+                    rest: other_rest,
+                },
+            ) => {
+                fields.len() == others.len()
+                    && fields.iter().all(|(name, field)| {
+                        others.get(name).is_some_and(|other| {
+                            self.alike(&field.presence, &other.presence)
+                                && self.alike(&field.ty, &other.ty)
+                        })
+                    })
+                    && self.alike(rest, other_rest)
+            }
+            // The name and the arguments, and nothing of the body: two
+            // applications of one declaration are the same type exactly when
+            // their arguments are, which is the rule [`Rule::Congruent`]
+            // decides by. Arity belongs to the declaration, so equal symbols
+            // mean equal lengths and the zip drops nothing.
+            (
+                Ty::Named { symbol, args, .. },
+                Ty::Named {
+                    symbol: other,
+                    args: other_args,
+                    ..
+                },
+            ) => {
+                symbol == other
+                    && args
+                        .iter()
+                        .zip(other_args.iter())
+                        .all(|(arg, other)| self.alike(arg, other))
+            }
+            // Two different shapes, and — since this is the one arm that is not
+            // written out — anything a later variant is put against. Both are
+            // the same answer, and it is the safe one.
+            _ => false,
+        }
     }
 
     /// Whether `var` occurs in `ty` — and, on the same walk, the level
@@ -1232,13 +1312,13 @@ impl Solve<'_> {
             // Two applications of one declaration are equal when their
             // arguments are, decided without unfolding either.
             //
-            // Not an optimization. Unfolding both would ask the same question
-            // of a bigger type every time a declaration leads back to itself,
-            // and the assumption stack cannot save it: keyed on the pair of
-            // names it would answer a question it was never asked, and keyed on
-            // the whole goal it would never repeat. So this arm is what makes
-            // equality decidable at all, and the price is that a declaration
-            // ignoring a parameter stops being transparent. See [`Ty::Named`].
+            // Not an optimization, and not termination either: the assumption
+            // stack would catch a declaration leading back to itself, since it
+            // is keyed on the goal and a recursion may not grow its arguments.
+            // What this arm decides is that a declaration is nominal within
+            // itself — `Ptr A` and `Ptr B` are two types though both stand for
+            // `Nat`. Unfolding both sides would make them one, and phantom
+            // types are wanted. See [`Ty::Named`].
             //
             // Arity belongs to the declaration, so one symbol means one count
             // and the zip drops nothing.
@@ -1786,41 +1866,61 @@ impl Solve<'_> {
     /// This is where recursive types are decided, and it is the only rule that
     /// can be asked the same question twice: `list` against a second
     /// declaration of the same shape unfolds to two structs whose `next`
-    /// fields are the two declarations again. So a pair of declarations is
-    /// remembered while the goals it broke into are open, and meeting it again
-    /// is [`Rule::Assume`] — the two are equal exactly when assuming so leads
-    /// to no contradiction, and every contradiction there could be is one of
-    /// the goals in between.
+    /// fields are the two declarations again. So the goal is remembered while
+    /// the goals it broke into are open, and meeting it again is
+    /// [`Rule::Assume`] — the two are equal exactly when assuming so leads to
+    /// no contradiction, and every contradiction there could be is one of the
+    /// goals in between.
     ///
-    /// Why remembering a pair of *symbols* is enough, now that a name carries
-    /// arguments and is no longer a leaf. Three things, and every one of them
-    /// is a rule enforced somewhere else — so this comment is the map of what
-    /// this rule rests on, and none of it may be relaxed without coming back
-    /// here first.
+    /// What is remembered is the goal itself: both names *and* both argument
+    /// lists. Why that is sound, and why it still repeats often enough to be
+    /// worth having. Four things, two of them rules enforced somewhere else — so
+    /// this comment is the map of what this rule rests on, and none of it may be
+    /// relaxed without coming back here first.
     ///
     /// 1. A name against a shape descends into a strictly smaller shape each
     ///    time, so it runs out. Unchanged: a name is still the only way a type
     ///    leads back to itself.
     /// 2. Two applications of the *same* declaration never reach here at all —
     ///    [`Rule::Congruent`] took them, comparing arguments instead of
-    ///    unfolding. So the pairs on this stack name two different
-    ///    declarations.
-    /// 3. Two different names unfold to two shapes, and any name inside them
-    ///    from the same group of mutually recursive declarations carries that
-    ///    declaration's own parameters unchanged — which is what
-    ///    [`ir::build`](crate::ir::build) refuses a recursion for not doing.
-    ///    So meeting the pair again is meeting the same goal again, and
-    ///    assuming it is sound. A name from a *different* group belongs to a
-    ///    strictly lower group in the dependency order, from which nothing in
-    ///    the enclosing group is reachable, so descending through groups is
-    ///    descent through a finite acyclic order.
+    ///    unfolding. That is a decision about the language rather than
+    ///    something this rule needs: a declaration is nominal within itself, so
+    ///    `Ptr A` and `Ptr B` stay different types. So the entries on this stack
+    ///    name two different declarations.
+    /// 3. An entry stands for the question it was pushed for and for no other,
+    ///    because it *is* that question. `Tree {}` against `Tree2 Nat` is not
+    ///    `Tree Nat` against `Tree2 Nat`, so it is asked rather than assumed —
+    ///    and it is a different question, since one unfolds to `{ v: {}, .. }`
+    ///    and the other to `{ v: Nat, .. }`.
+    /// 4. The key still repeats, which is what makes assuming ever fire. Inside
+    ///    one group of mutually recursive declarations every argument handed on
+    ///    is either one that came in or a type written out in the program with
+    ///    no parameter in it — [`ir::build`](crate::ir::build) refuses anything
+    ///    that would grow. So the arguments reachable within a group are drawn
+    ///    from a finite set, the argument lists built from them are finite too,
+    ///    and a goal that keeps coming back must come back at a list already
+    ///    seen. A name from a *different* group belongs to a strictly lower
+    ///    group in the dependency order, from which nothing in the enclosing
+    ///    group is reachable, so descending through groups is descent through a
+    ///    finite acyclic order.
     ///
-    /// Without (3) the key would have to be the whole goal, and then it would
-    /// never repeat: `type T a = { next: T { x: a } }` grows its argument every
-    /// time round, and nothing finite comes back. Without (2) the key would be
-    /// unsound rather than merely coarse — two declarations of one shape but
-    /// different arguments would be assumed equal on the strength of their
-    /// names.
+    /// Without (4) nothing finite would come back. A declaration written
+    /// `type T a = { next: T { x: a } }` grows its argument every round, so no
+    /// goal about it is ever asked twice, and the stack only gets longer.
+    /// Without (3) the key would be unsound rather than merely coarse —
+    /// keyed on the two names alone, a declaration reached inside its own group
+    /// at two different arguments has its second question answered by the first
+    /// question's assumption, and two types that differ are accepted as equal.
+    /// That is the whole reason the arguments are here.
+    ///
+    /// The arguments are compared as they stand *now*, which is why
+    /// [`Table::alike`] resolves instead of this stack storing them resolved on
+    /// the way in. A variable inside an argument may be bound while the goal is
+    /// open, and when it is, the goal on the stack is the goal it has become —
+    /// the same two types under a substitution that has since decided more of
+    /// them, which is what the solver is in the middle of proving. Freezing the
+    /// key when it was pushed would compare against something no longer
+    /// believed, and would miss the repeat.
     ///
     /// Equality is structural *between* declarations and nominal *within* one:
     /// two declarations that unfold the same way are one type however
@@ -1829,13 +1929,19 @@ impl Solve<'_> {
     /// states the rule and what it costs.
     fn unfold(&mut self, span: Span, goal: ConstraintKind, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
         let pair = match (&**lhs, &**rhs) {
-            (Ty::Named { symbol: a, .. }, Ty::Named { symbol: b, .. }) => Some((*a, *b)),
+            (Ty::Named { .. }, Ty::Named { .. }) => Some((lhs.clone(), rhs.clone())),
             _ => None,
         };
-        if pair.is_some_and(|pair| self.assumed.contains(&pair)) {
+        let already = pair.is_some()
+            && self
+                .assumed
+                .iter()
+                .any(|(a, b)| self.table.alike(a, lhs) && self.table.alike(b, rhs));
+        if already {
             self.step(span, Rule::Assume, goal, Effect::None);
             return;
         }
+        let remembered = pair.is_some();
         let lhs = self.table.unfolded(self.aliases, lhs);
         let rhs = self.table.unfolded(self.aliases, rhs);
         self.step(span, Rule::Unfold, goal, Effect::Decomposed);
@@ -1843,7 +1949,7 @@ impl Solve<'_> {
         self.depth += 1;
         self.unify(span, &lhs, &rhs);
         self.depth -= 1;
-        if pair.is_some() {
+        if remembered {
             self.assumed.pop();
         }
     }

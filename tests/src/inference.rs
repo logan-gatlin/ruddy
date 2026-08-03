@@ -1231,9 +1231,9 @@ fn unfolding_a_declared_type_is_a_rule_of_its_own() {
             "unfold  b ~ a => replaced by the goals below",
             "  struct  { n: b } ~ { n: a } => replaced by the goals below",
             // Which is the first question again, one field in. Three steps,
-            // not five: the pair is remembered by which declarations it names,
-            // so the second `b` and `a` are recognized as the first ones and
-            // not as two more copies to unfold.
+            // not five: the goal is remembered while what it broke into is
+            // open, so the second `b` and `a` are recognized as the first ones
+            // and not as two more copies to unfold.
             "    assume  b ~ a => no change",
         ]
     );
@@ -1687,6 +1687,112 @@ fn a_constructor_that_ignores_a_parameter_is_not_transparent() {
     assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
 }
 
+/// A group whose members mention each other at a fixed argument is an ordinary
+/// recursive type, and two such groups of the same shape are one type.
+///
+/// The goal comes back round at the same arguments it went in with, so the
+/// assumption fires and the solve ends — which is the half of the finer key
+/// that could have been lost: a key that never repeats answers nothing.
+#[test]
+fn a_recursion_at_a_fixed_argument_still_comes_back_round() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree Nat, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood Nat, tail: Grove }\n\
+         let f : Forest -> Grove = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "Forest -> Grove");
+
+    // And the step a reader is shown says which goal was assumed, arguments
+    // and all — which is the key itself, so the solve reads back as what the
+    // solver actually did.
+    assert_eq!(
+        steps(&mint, &output, "f"),
+        [
+            "unfold  Grove ~ Forest => replaced by the goals below",
+            "  struct  { head: Wood Nat, tail: Grove } ~ { head: Tree Nat, tail: Forest } \
+             => replaced by the goals below",
+            "    unfold  Wood Nat ~ Tree Nat => replaced by the goals below",
+            "      struct  { value: Nat, kids: Grove } ~ { value: Nat, kids: Forest } \
+             => replaced by the goals below",
+            "        prim  Nat ~ Nat => no change",
+            "        assume  Grove ~ Forest => no change",
+            "    assume  Grove ~ Forest => no change",
+        ]
+    );
+}
+
+/// An argument may hold a variable, and the variable may be bound while the
+/// goal that carries it is still open. The assumption is then read against what
+/// the solver has since decided rather than against what it believed when the
+/// goal was pushed.
+///
+/// `peek` is generalized over whether its argument has an `x`, so the use in `q`
+/// asks `Tree { x?: Nat }` against `Wood { x: Nat }` with that question still
+/// open. Comparing the two `value` fields settles it, and by the time the goal
+/// comes back round one field further in it is the same goal — which the step
+/// list below shows being assumed rather than unfolded a second time.
+#[test]
+fn an_assumption_is_read_against_what_has_since_been_decided() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree { x: Nat }, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood { x: Nat }, tail: Grove }\n\
+         let peek : Tree { x?: Nat } -> Forest = fn t => t.kids\n\
+         let q : Wood { x: Nat } -> Grove = fn w => peek w",
+    );
+    assert_eq!(scheme(&mint, &output, "peek"), "Tree { x?: Nat } -> Forest");
+    assert_eq!(
+        steps(&mint, &output, "q")[..9],
+        [
+            "unfold  Tree { x?: Nat } ~ Wood { x: Nat } => replaced by the goals below",
+            "  struct  { value: { x?: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } \
+         => replaced by the goals below",
+            "    struct  { x?: Nat } ~ { x: Nat } => replaced by the goals below",
+            // Here is where the argument stops being a question.
+            "      bind  ?3 ~ present => ?3 := present",
+            "      prim  Nat ~ Nat => no change",
+            "    unfold  Forest ~ Grove => replaced by the goals below",
+            "      struct  { head: Tree { x: Nat }, tail: Forest } ~ \
+         { head: Wood { x: Nat }, tail: Grove } => replaced by the goals below",
+            // And here is the goal on the stack, recognized through the binding
+            // that has happened since it was pushed.
+            "        assume  Tree { x: Nat } ~ Wood { x: Nat } => no change",
+            "        assume  Forest ~ Grove => no change",
+        ]
+    );
+}
+
+/// The assumption that two names already being compared are equal has to be
+/// keyed on the whole goal, arguments and all. This program is the reason.
+///
+/// `Forest` against `Forest2` unfolds to `Tree Nat` against `Tree2 Nat`, whose
+/// unfolding asks `Bush` against `Bush2`, whose unfolding asks `Tree {}`
+/// against `Tree2 Nat`. Those are the same two *declarations* as the pair
+/// already open, and a different question: one stands for `{ v: {}, .. }` and
+/// the other for `{ v: Nat, .. }`. Keyed on the names alone the solver would
+/// take them as equal and accept `f`; keyed on the goal it asks the question
+/// and finds the contradiction.
+#[test]
+fn a_pair_of_declarations_is_not_assumed_equal_at_other_arguments() {
+    let (_, out, output) = infer_src(
+        "type Tree x = { v: x, k: Bush }\n\
+         type Bush = { t: Tree {}, f: Forest }\n\
+         type Forest = { t: Tree Nat }\n\
+         type Tree2 x = { v: x, k: Bush2 }\n\
+         type Bush2 = { t: Tree2 Nat, f: Forest2 }\n\
+         type Forest2 = { t: Tree2 Nat }\n\
+         let f : Forest -> Forest2 = fn x => x",
+    );
+    // Nothing here grows, so lowering has nothing to say: the whole question is
+    // the solver's.
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+}
+
 /// A recursive constructor unfolds against another of the same shape and comes
 /// back round rather than running away. The point of the test is that it
 /// returns at all.
@@ -1865,4 +1971,38 @@ fn a_row_parameter_leaves_the_declaration_closed_to_the_solver() {
             "a variable survived: {scheme}"
         );
     }
+}
+
+/// Every shape the growth rule allows comes back round. Each of these is a
+/// solve that only ends because a goal it has already taken on is one it
+/// recognizes, and reaching the assertion at all is most of what is checked.
+#[test]
+fn a_recursion_that_cannot_grow_always_comes_back_round() {
+    // A group member mentioned at a fixed argument that is itself a member of
+    // the group.
+    inferred(
+        "type A a = { x: A B, v: a }\n\
+         type B = { y: A Nat }\n\
+         type C a = { x: C D, v: a }\n\
+         type D = { y: C Nat }\n\
+         let f : A Nat -> C Nat = fn z => z",
+    );
+
+    // Asked at an argument the declarations never mention, so the goal has to
+    // travel one round before it repeats.
+    inferred(
+        "type T a = { next: T Nat }\n\
+         type U a = { next: U Nat }\n\
+         let f : T {} -> U {} = fn x => x",
+    );
+
+    // A permutation: the arguments only ever swap places, so the lists they
+    // make are finitely many.
+    inferred(
+        "type A a b = { x: B b a, v: a }\n\
+         type B c d = { x: A d c, v: c }\n\
+         type P a b = { x: Q b a, v: a }\n\
+         type Q c d = { x: P d c, v: c }\n\
+         let f : A Nat {} -> P Nat {} = fn x => x",
+    );
 }

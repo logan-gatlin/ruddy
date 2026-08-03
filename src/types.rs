@@ -124,8 +124,8 @@ pub enum Ty {
     /// Two of these are the same type when:
     ///
     /// - they are applications of the **same** declaration whose arguments are
-    ///   the same — decided without unfolding either, which is what keeps a
-    ///   declaration that leads back to itself from unfolding forever;
+    ///   the same — decided without unfolding either, so a declaration is
+    ///   nominal within itself;
     /// - or they are applications of **different** declarations that unfold the
     ///   same way, whatever they are called.
     ///
@@ -133,7 +133,11 @@ pub enum Ty {
     /// argument list, which is what it has always been. The first case is why a
     /// declaration that ignores a parameter is not transparent: `type Ptr a =
     /// Nat` makes `Ptr A` and `Ptr B` different types though both stand for
-    /// `Nat`, which is what a phantom type is. See
+    /// `Nat`, which is what a phantom type is. It is a decision about the
+    /// language and not what keeps unfolding finite — that is the assumption
+    /// [`Solve::unfold`](crate::inference) records, which is keyed on the whole
+    /// goal, arguments included, and comes back round because
+    /// [`ir::build`](crate::ir::build) refuses a recursion that grows one. See
     /// [`Solve::unify`](crate::inference).
     ///
     /// `name` is what the type prints as and is never compared:

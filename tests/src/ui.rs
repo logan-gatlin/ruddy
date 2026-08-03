@@ -63,7 +63,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::NotAConstructor,
         IrError::ParameterApplied,
         IrError::DuplicateParameter { previous: span },
-        IrError::NonUniformRecursion,
+        IrError::GrowingRecursion,
         IrError::MixedParameter,
         IrError::NotARow,
     ] {

@@ -10,6 +10,12 @@
 //! `_bind` and `_error` fields each step carries. That is the whole reason
 //! those are separate from the rendered effect: appending strings to a list is
 //! something the page can do without knowing what a binding *is*.
+//!
+//! The one piece of solver state with no field of its own is the stack of goals
+//! held open across an unfolding, and it needs none: an `assume` row's goal is
+//! that stack's key exactly — two declared types with their arguments — so the
+//! row already says which question was taken as answered, and a field for it
+//! would print the goal column twice.
 
 use ruddy::inference::Effect;
 

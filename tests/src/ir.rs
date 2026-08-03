@@ -879,23 +879,39 @@ fn a_loop_can_close_through_a_parameter() {
     assert!(out.errors[0].span.start >= b.start);
 }
 
-/// A type that leads back to itself must hand itself its own parameters,
-/// unchanged. Unfolding one that grows its argument never comes back round, so
-/// there would be no finite answer to whether two of them are the same type.
+/// A type that leads back to itself may not hand on an argument built out of
+/// what it takes. Unfolding one that grows its argument never comes back round,
+/// so there would be no finite answer to whether two of them are the same type.
+///
+/// Growth is the whole of the rule. It used to be stricter — a mention inside a
+/// group had to carry that member's own parameters verbatim — because the
+/// solver's assumption was keyed on a pair of names and so could not tell one
+/// declaration's two argument lists apart. The key now carries the arguments
+/// (see `Solve::unfold`), so a fixed argument, and a permuted one, are ordinary
+/// programs and are accepted here.
 #[test]
-fn recursion_must_hand_a_type_its_own_parameters() {
+fn recursion_may_not_make_its_argument_bigger() {
     for src in [
         "type List a = { head: a, tail: List a }",
         // Mutual recursion, each member handing on its own parameter.
         "type Tree a = { node: a, kids: Forest a }  \
          type Forest a = { head: Tree a, tail: Forest a }",
         // A different group's argument is unrestricted: only the `Rose a`
-        // inside `List` has to be verbatim, and it is.
+        // inside `List` is the group's business, and it hands on `a`.
         "type List a = { head: a, tail: List a }  \
          type Rose a = { node: a, kids: List (Rose a) }",
-        // A longer circle: every member is in one group, and every mention in
-        // it is verbatim.
+        // A longer circle, every member in one group.
         "type A a = { x: B a }  type B b = { x: C b }  type C c = { x: A c }",
+        // An argument that mentions no parameter is written out in the program
+        // and is the same type every round, so it cannot grow.
+        "type T a = { next: T Nat }",
+        "type Tree a = { value: a, kids: Forest }  \
+         type Forest = { head: Tree Nat, tail: Forest }",
+        // Both at once, in one group.
+        "type T a = { next: T a, other: T Nat }",
+        // Order and repetition are free: a permutation only ever shuffles what
+        // came in.
+        "type A a b = { x: B b a }  type B c d = { x: A d c }",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -903,21 +919,16 @@ fn recursion_must_hand_a_type_its_own_parameters() {
 
     for src in [
         "type T a = { next: T { x: a } }",
-        "type T a = { next: T Nat }",
         "type A a = { x: B { y: a } }  type B b = { x: A b }",
-        // A monomorphic argument inside the group is refused too, and not
-        // because it grows: the solver's assumption that two names already
-        // being compared are equal is keyed on the names, so one declaration
-        // may not appear inside its own group with two different arguments.
-        // See `Solve::unfold`.
-        "type Tree a = { value: a, kids: Forest }  \
-         type Forest = { head: Tree Nat, tail: Forest }",
+        // A parameter in a `..` tail is as much a way of growing as one in a
+        // field, and is the one place a parameter is not written as a name.
+        "type A r = { x: A { ..r } }",
     ] {
         let (_, out) = build_src(src);
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ErrorKind::NonUniformRecursion)),
+                .any(|error| matches!(error.kind, ErrorKind::GrowingRecursion)),
             "{src}: {:#?}",
             out.errors
         );

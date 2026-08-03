@@ -202,7 +202,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
-            ir::ErrorKind::NonUniformRecursion => "non-uniform-recursion",
+            ir::ErrorKind::GrowingRecursion => "growing-recursion",
             ir::ErrorKind::MixedParameter => "mixed-parameter",
             ir::ErrorKind::NotARow => "not-a-row",
         }
@@ -247,8 +247,8 @@ impl fmt::Display for ir::ErrorKind {
             // Said as the rule rather than as the loop: what the reader can
             // change is the arguments at this one mention, and naming the whole
             // cycle would point at declarations they got right.
-            ir::ErrorKind::NonUniformRecursion => f.write_str(
-                "types that lead back to each other have to hand each other the names they take, unchanged, so that two of them can be compared",
+            ir::ErrorKind::GrowingRecursion => f.write_str(
+                "types that lead back to each other may hand on the names they take, but not types built out of them, which get bigger every time round",
             ),
             // Said as the two readings rather than as "kind", which names a
             // thing this language does not otherwise have and the reader has

@@ -708,6 +708,47 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     );
 }
 
+/// The solver assumes a goal it is already in the middle of, and what it is
+/// keyed on is the whole goal — both declared types with their arguments. The
+/// Solve tab shows that key without being given anything of its own: a step's
+/// goal is the row's text, so the assumption stack has nothing left to say.
+/// A key a reader cannot see is one nobody can check the assumption against.
+#[test]
+fn an_assumed_step_shows_the_goal_it_was_keyed_on() {
+    let snapshot = snapshot(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree Nat, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood Nat, tail: Grove }\n\
+         let f : Forest -> Grove = fn x => x\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve stage is registered");
+    let texts: Vec<&str> = nodes(solve)
+        .iter()
+        .filter(|node| node.label == "assume")
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Grove ~ Forest", "Grove ~ Forest"]);
+
+    // And the row where the arguments are what is being decided reads as the
+    // types the reader wrote, applications and all.
+    let unfolded: Vec<&str> = nodes(solve)
+        .iter()
+        .filter(|node| node.label == "unfold")
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(unfolded, ["Grove ~ Forest", "Wood Nat ~ Tree Nat"]);
+}
+
 #[test]
 fn symbols_round_trip_through_the_mangler() {
     let snapshot = snapshot("let f = fn x => x\ntype T = ()\n");

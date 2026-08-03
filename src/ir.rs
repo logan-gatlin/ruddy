@@ -248,27 +248,22 @@ pub enum ErrorKind {
     DuplicateParameter {
         previous: Span,
     },
-    /// A type that leads back to itself having been given something other than
-    /// its own parameters, as in `type T a = { next: T { x: a } }`.
+    /// A type that leads back to itself having been given an argument built out
+    /// of what it takes, as in `type T a = { next: T { x: a } }`.
     ///
-    /// Two reasons, and the second is why the rule holds even where the first
-    /// does not.
-    ///
-    /// Unfolding `type T a = { next: T { x: a } }` builds a bigger argument
+    /// One reason, and it is growth. Unfolding that declaration hands on
+    /// `{ x: a }`, then `{ x: { x: a } }`, and so on: the argument is bigger
     /// every time and never comes back round, so there is no finite answer to
-    /// whether two of them are the same type. That much is about growth.
+    /// whether two of them are the same type.
     ///
-    /// An argument that mentions no parameter at all does not grow, and is
-    /// refused all the same: `type Forest = { head: Tree Nat }` inside `Tree`'s
-    /// own group. The solver's assumption that two names already being compared
-    /// are equal is keyed on the *names*, so one declaration appearing inside
-    /// its own group with two different arguments would let two goals that are
-    /// not the same goal be taken for one another, and two types that differ be
-    /// accepted as equal. Handing a type its own parameters unchanged is what
-    /// makes the key identify the goal, and it is what a recursive type is
-    /// normally for. See [`Solve::unfold`](crate::inference), point 3, which is
-    /// the map of what rests on this.
-    NonUniformRecursion,
+    /// What does come back round is allowed, and that is the whole of the rule.
+    /// A parameter handed straight on is whatever came in. An argument
+    /// mentioning no parameter is written out in the program and is the same
+    /// type every round, so `type Forest = { head: Tree Nat }` inside `Tree`'s
+    /// own group is an ordinary declaration and is accepted. See [`grows`] for
+    /// the condition and [`Solve::unfold`](crate::inference) for what rests on
+    /// it.
+    GrowingRecursion,
     /// A parameter used both as a type and as the fields a row does not name,
     /// as in `type Bad r = { x: r, ..r }`.
     ///
@@ -479,13 +474,13 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         decl.value = span.track(TypeKind::Error);
         b.error(span, ErrorKind::Circular);
     }
-    // The other recursion the solver cannot be handed: one that changes its
-    // arguments on the way round. See [`ErrorKind::NonUniformRecursion`].
-    for (symbol, at) in non_uniform(&program.types) {
+    // The other recursion the solver cannot be handed: one that builds a bigger
+    // argument on the way round. See [`ErrorKind::GrowingRecursion`].
+    for (symbol, at) in growing(&program.types) {
         let decl = &mut program.types[&symbol];
         let span = decl.value.span;
         decl.value = span.track(TypeKind::Error);
-        b.error(at, ErrorKind::NonUniformRecursion);
+        b.error(at, ErrorKind::GrowingRecursion);
     }
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
@@ -856,18 +851,18 @@ fn row_shaped(ty: &Type, rows: &HashMap<Symbol, ParamKind>) -> bool {
     }
 }
 
-/// Every place a declaration leads back to itself having changed its
-/// arguments, as the declaration it was found in and the span to report at.
+/// Every place a declaration leads back to itself with an argument that gets
+/// bigger, as the declaration it was found in and the span to report at.
 ///
 /// Two declarations are in one group when each leads to the other, and inside a
-/// group every mention of a member must hand it that member's own parameters,
-/// in order and unchanged. Across groups nothing is restricted:
+/// group every mention of a member must hand it arguments that cannot grow —
+/// see [`grows`] for what that allows. Across groups nothing is restricted:
 /// `type Rose a = { kids: List (Rose a) }` is fine because `List` is somebody
-/// else's group, and only the `Rose a` inside it has to be verbatim.
+/// else's group, and only the `Rose a` inside it is the group's business.
 ///
-/// See [`ErrorKind::NonUniformRecursion`] for why the restriction is here, and
+/// See [`ErrorKind::GrowingRecursion`] for why the restriction is here, and
 /// [`Solve::unfold`](crate::inference) for what rests on it.
-fn non_uniform(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Span)> {
+fn growing(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Span)> {
     // Who each declaration mentions, directly, and then everything each one
     // leads to. Closed once rather than walked per pair: the table is one file
     // long, and a pair being mutually reachable is the whole of what a group
@@ -892,10 +887,7 @@ fn non_uniform(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Span)> {
         if group.is_empty() {
             continue;
         }
-        let want: Vec<Symbol> = decl.params.iter().map(|param| param.symbol).collect();
-        verbatim(&decl.value, &group, &want, &mut |at| {
-            out.push((*symbol, at))
-        });
+        grows(&decl.value, &group, &mut |at| out.push((*symbol, at)));
     }
     out
 }
@@ -953,52 +945,88 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
     }
 }
 
-/// Report every mention of a `group` member in `ty` that is not that member
-/// applied to `want`, in order.
+/// Report every mention of a `group` member in `ty` that hands it an argument
+/// which could get bigger, in order.
 ///
-/// Every mention, including one whose arguments could never grow: `Tree Nat`
-/// written inside `Tree`'s own group is refused though nothing about it gets
-/// bigger. What the rule protects is not only termination but the solver's
-/// assumption key, which names two declarations and nothing else — so within
-/// one group a declaration must appear with one argument list, or the key
-/// stops identifying the goal. See [`ErrorKind::NonUniformRecursion`] and
-/// [`Solve::unfold`](crate::inference), point 3.
-fn verbatim(ty: &Type, group: &[Symbol], want: &[Symbol], report: &mut impl FnMut(Span)) {
+/// An argument is safe when it is one of two things:
+///
+/// - one of the mentioning declaration's own parameters, written bare — it is
+///   then whatever came in, passed straight through;
+/// - a type mentioning no parameter at all — it is then written out in full in
+///   the program and is the same type every time round, however many names or
+///   applications it is built from.
+///
+/// Anything else is a type built *out of* a parameter, and that is what grows:
+/// `type T a = { next: T { x: a } }` hands on `{ x: a }`, then `{ x: { x: a } }`,
+/// and never comes back round.
+///
+/// So the arguments a group can reach are drawn from the arguments it was given
+/// at the use site plus the finitely many param-free types written inside it —
+/// a finite set, and therefore finitely many argument lists, which is what makes
+/// the solver's assumption repeat. Order and repetition are free:
+/// `type A a b = { x: B b a }` only ever permutes what it was handed. See
+/// [`ErrorKind::GrowingRecursion`] and [`Solve::unfold`](crate::inference).
+fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
     match &ty.tracked {
-        // A group member written bare is uniform exactly when the group takes
-        // nothing — and if it takes something, the arity check has already
-        // spoken and this would be a second complaint about one mistake.
+        // A group member written bare hands on nothing — and if it takes
+        // something, the arity check has already spoken and this would be a
+        // second complaint about one mistake.
         TypeKind::Ident(_) => {}
         TypeKind::Apply {
             head,
             head_span,
             args,
         } => {
-            if group.contains(head) {
-                let same = args.len() == want.len()
-                    && args.iter().zip(want).all(|(arg, expected)| {
-                        matches!(&arg.tracked, TypeKind::Param { symbol, .. } if symbol == expected)
-                    });
-                if !same {
-                    report(*head_span);
-                }
+            let safe = |arg: &Type| {
+                matches!(arg.tracked, TypeKind::Param { .. }) || !mentions_a_parameter(arg)
+            };
+            if group.contains(head) && !args.iter().all(safe) {
+                report(*head_span);
             }
             // The arguments are still walked: a member hidden inside one is as
             // much a way round as a member at the top.
             for arg in args {
-                verbatim(arg, group, want, report);
+                grows(arg, group, report);
             }
         }
         TypeKind::Arrow { from, to } => {
-            verbatim(from, group, want, report);
-            verbatim(to, group, want, report);
+            grows(from, group, report);
+            grows(to, group, report);
         }
         TypeKind::Struct { fields, .. } => {
             for field in fields.values() {
-                verbatim(&field.value, group, want, report);
+                grows(&field.value, group, report);
             }
         }
         TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+    }
+}
+
+/// Whether a written type is built out of any of the parameters of the
+/// declaration whose body it is in. Every [`TypeKind::Param`] in a body is one
+/// of them, since a parameter is scoped to the declaration that binds it, so
+/// this asks about parameters at all rather than about a particular list.
+///
+/// The `..r` tail counts. It is the one place a parameter appears without being
+/// a [`TypeKind::Param`] node, and a type handed on with a parameter in its tail
+/// grows exactly as one with a parameter in a field does.
+fn mentions_a_parameter(ty: &Type) -> bool {
+    match &ty.tracked {
+        TypeKind::Param { .. } => true,
+        TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
+        TypeKind::Arrow { from, to } => mentions_a_parameter(from) || mentions_a_parameter(to),
+        TypeKind::Struct { fields, tail } => {
+            matches!(
+                tail,
+                Some(Tail {
+                    of: Row::Param { .. },
+                    ..
+                })
+            ) || fields
+                .values()
+                .any(|field| mentions_a_parameter(&field.value))
+        }
+        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => false,
     }
 }
 
