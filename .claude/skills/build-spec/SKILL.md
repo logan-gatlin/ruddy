@@ -75,6 +75,11 @@ cp -r "$DIR/." "$MAIN/.claude/specs/<slug>/"
 
 Do this even if a stage failed — a partial review is still evidence.
 
+Keep shell commands plain. A worktree-isolated session rejects git commands it cannot
+verify stay inside the worktree — no heredocs, no `cd` into the main checkout, no
+chained git invocations. Run git one plain command at a time, and if a `cp` is ever
+refused, split it into separate steps rather than working around the guard.
+
 Maintain `$DIR/run.md` as you go: slug, worktree path, branch, `$BASE`, start time from
 `date`, and a line per stage as it finishes. It is the audit trail if the loop is
 interrupted, and it syncs out with everything else.

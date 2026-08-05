@@ -47,6 +47,11 @@ deliberately: nothing under `.claude/` belongs in the commit — the spec and th
 artifacts live there and must stay out of the diff. Do not push, do not merge, do not
 touch any branch but the one you are on.
 
+A worktree-isolated session refuses shell commands it cannot verify stay inside the
+worktree, so heredocs and chained git commands will be rejected. Use plain, separate
+commands, and pass a multi-paragraph message as repeated `-m` flags rather than a
+heredoc.
+
 ## Return
 
 Your final message is data for an orchestrator, not prose for a human. Keep it under
