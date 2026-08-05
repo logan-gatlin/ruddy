@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(just check)",
+      "Bash(just test)",
+      "Bash(just build)",
+      "Bash(just clippy)",
+      "Bash(just fmt-check)",
+      "Bash(just demo)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git status:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git worktree list)"
+    ]
+  }
+}

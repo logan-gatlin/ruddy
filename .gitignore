@@ -1,3 +1,6 @@
 /target
 /debug/.dev
 /debug/scratch
+/.claude/specs
+/.claude/worktrees
+/.claude/settings.local.json
