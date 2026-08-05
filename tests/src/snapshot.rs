@@ -1063,6 +1063,67 @@ fn the_types_tab_maps_each_letter_back_to_its_parameter() {
     assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
 }
 
+/// The IR tab shows a `type` declaration's binders, as the AST tab and the
+/// Types tab both do. Without them the tab was the one panel where clicking a
+/// parameter lit nothing up — the body's uses of it carry the symbol, and the
+/// binder they point back at had no row to be pointed at.
+#[test]
+fn the_ir_tab_shows_a_declarations_parameters() {
+    let snap = snapshot("type Ghost a = Nat\ntype WithX r = { x: Nat, ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "ir")
+        .expect("the ir stage");
+
+    let params: Vec<(&str, Option<[usize; 2]>)> = nodes(stage)
+        .iter()
+        .filter(|node| node.label == "Param")
+        .map(|node| (node.text.as_str(), node.span))
+        .collect();
+    // What each stands for, beside the span it was written at — a row says so,
+    // and says what it may not stand for.
+    assert_eq!(
+        params,
+        [("a", Some([11, 12])), ("..r without x", Some([30, 31]))]
+    );
+
+    // And each cross-highlights, which is the whole reason the row is here.
+    for node in nodes(stage).iter().filter(|node| node.label == "Param") {
+        assert!(node.symbol.is_some(), "{node:#?}");
+    }
+
+    // A parameter that is never used still gets a row: the binder is what was
+    // written, whatever the body did with it.
+    let ghost = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Ghost")
+        .expect("a row for the declaration");
+    let kids: Vec<&str> = ghost
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(kids, ["Param", "Prim"]);
+}
+
+/// A repeated parameter is a repeat like any other, so it arrives as one
+/// diagnostic pointing at the name it repeats. The span was carried and no
+/// reporter rendered it, so the panel could not cross-highlight the two names
+/// the complaint is about.
+#[test]
+fn a_duplicate_parameter_carries_the_name_it_repeats() {
+    let snapshot = snapshot("type Pair A A = { first: A, second: A }\n");
+    let duplicate = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "duplicate-parameter")
+        .expect("the repeat is reported");
+    assert_eq!(duplicate.span, Some([12, 13]));
+    assert_eq!(duplicate.related.len(), 1);
+    assert_eq!(duplicate.related[0].span, Some([10, 11]));
+}
+
 /// The IR tab shows an application as its head and its arguments, and the head
 /// carries the declaration's symbol so it cross-highlights with the row that
 /// declares it.
@@ -1095,9 +1156,10 @@ fn the_ir_tab_takes_an_application_apart() {
     );
 }
 
-/// The Types tab says which parameters stand for a set of fields, because
-/// nothing else on the row does: a row is the only reason a declared type can
-/// be open, and the meaning column spells every parameter `'a` alike.
+/// The Types tab says which parameters stand for a set of fields, and which
+/// fields that set may not contain, because nothing else on the row does: a row
+/// is the only reason a declared type can be open, and the meaning column
+/// spells every parameter `'a` alike.
 #[test]
 fn the_types_tab_says_which_parameters_are_rows() {
     let snap = snapshot("type Both A r = { it: A, ..r }");
@@ -1116,7 +1178,21 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("'a", "A"), ("'b", "..r")]);
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "..r without it")]);
+
+    // A row beside no fields at all forbids nothing, and says so by saying
+    // nothing.
+    let snap = snapshot("type Bare r = { ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+    let bare = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Bare")
+        .expect("a row for the declaration");
+    assert_eq!(bare.children[0].text, "..r");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a

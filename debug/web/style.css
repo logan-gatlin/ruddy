@@ -852,13 +852,18 @@ pre.raw .hi {
   border-top: 1px solid var(--fg-faint);
 }
 
-/* The rule name is a column, not a word: there are eleven of them and they run
-   from `bind` to `mismatch`, so leaving each to its own width starts the goal
-   at a different place on every row and nothing lines up to be compared.
-   `min-width`, so a longer rule one day pushes the goal rather than losing its
-   own last letters. */
+/* The rule name is a column, not a word: there are fourteen of them, from the
+   four characters of `bind` and `same` to the nine of `congruent`, so leaving
+   each to its own width starts the goal at a different place on every row and
+   nothing lines up to be compared. Wide enough for the longest, and no wider:
+   a column short of one rule is one row per solve out of alignment, which is
+   the whole failure this exists to prevent, and every character past it is
+   taken off the goal on every other row. `min-width`, so a longer rule one day
+   pushes the goal rather than losing its own last letters — but the width is
+   meant to be brought back up to the longest code in `Rule::code` when one
+   is. */
 .step-row .label {
-  min-width: 8ch;
+  min-width: 9ch;
   padding-left: 8px;
 }
 /* What the step did, and which definition it was solving. Not the `.badge` an

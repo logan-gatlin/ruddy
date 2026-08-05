@@ -280,10 +280,18 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
         Some(error.span),
     );
     // One diagnostic with two highlights, rather than the two loose lines the
-    // CLI prints: the repeat is only legible next to what it repeats.
-    if let ir::ErrorKind::Duplicate { previous, .. } = &error.kind {
+    // CLI prints: the repeat is only legible next to what it repeats. Both of
+    // lowering's repeats carry the span, and a panel that cross-highlighted one
+    // pair of names and not the other would be showing the reader less than the
+    // compiler had already worked out.
+    let previous = match &error.kind {
+        ir::ErrorKind::Duplicate { previous, .. }
+        | ir::ErrorKind::DuplicateParameter { previous } => Some(*previous),
+        _ => None,
+    };
+    if let Some(previous) = previous {
         diagnostic.related.push(Related {
-            span: range(*previous),
+            span: range(previous),
             message: ui::FIRST_DEFINITION.to_string(),
         });
     }

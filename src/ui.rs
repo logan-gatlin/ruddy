@@ -205,6 +205,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::GrowingRecursion => "growing-recursion",
             ir::ErrorKind::MixedParameter => "mixed-parameter",
             ir::ErrorKind::NotARow => "not-a-row",
+            ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
         }
     }
 }
@@ -258,6 +259,14 @@ impl fmt::Display for ir::ErrorKind {
             ),
             ir::ErrorKind::NotARow => f.write_str(
                 "the rest of a struct's fields goes here, and this is not that",
+            ),
+            // Said as what the `..` covers, the way the solver's version of
+            // this complaint is: the reader can change the field they wrote,
+            // and the row the declaration would end up with is not a type
+            // anyone put on the page.
+            ir::ErrorKind::RepeatedRowField { field } => write!(
+                f,
+                "the rest of a struct's fields goes here, and this names `{field}`, which that struct already has",
             ),
         }
     }
@@ -498,7 +507,9 @@ impl fmt::Display for Rule {
         f.write_str(match self {
             Rule::Absorb => "one side is undecided, which unifies with anything",
             Rule::Same => "already the same thing on both sides",
-            Rule::Congruent => "the same declared type on both sides: argument against argument",
+            Rule::Congruent => {
+                "the same declared type on both sides, and it keeps what it takes: argument against argument"
+            }
             Rule::Bind => "a variable takes the type it is against",
             Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
             Rule::Overlap => {

@@ -13,7 +13,7 @@ use ruddy::{
 
 use crate::{
     print,
-    stage::{Cx, Ids, Spec, Trace, plural},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
     wire::{Node, Stage},
 };
 
@@ -89,6 +89,20 @@ fn decl_node<T>(
         let mut ascribed = type_node(ids, cx, mint, annotation);
         ascribed.label = format!("Ascribed {}", ascribed.label);
         node = node.child(ascribed);
+    }
+    // The binders, before the body that uses them, which is where they are
+    // written and how the AST panel already shows them. A parameter is a local
+    // symbol like a lambda's argument, so it cross-highlights with every
+    // `Param` row in the body and with the AST's own — and without a row here
+    // the IR tab was the one panel where clicking one lit nothing up. The text
+    // says what it stands for, since a `type` declaration's binder is the only
+    // binder in the language that stands for anything but a type.
+    for param in &decl.params {
+        node = node.child(with_symbol(
+            Node::new(ids.next(), "Param", stands_for(mint, param)).at(param.span),
+            cx,
+            param.symbol,
+        ));
     }
     node.child(value(ids, cx, mint, &decl.value))
 }

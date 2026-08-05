@@ -13,11 +13,11 @@
 use indexmap::IndexMap;
 use ruddy::{
     symbol::Symbol,
-    types::{ParamKind, Scheme, Ty},
+    types::{Scheme, Ty},
 };
 
 use crate::{
-    stage::{Cx, Ids, Spec, Trace, plural},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
     wire::{Node, Stage},
 };
 
@@ -73,18 +73,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // A declaration's parameters print as `'a`, `'b` in the meaning
             // above, because that is what they are once the body is lowered.
             // Which is unreadable on its own: these rows are what map each
-            // letter back to the name it was written as.
+            // letter back to the name it was written as, and to what it stands
+            // for — a row, and what the row may not name, being the two things
+            // the meaning column cannot say.
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
                     let letter = Ty::Bound(index as u32).to_string();
-                    // What it stands for, beside what it is called: a row is
-                    // the reason a declaration can be open at all, and nothing
-                    // else on the row says which parameters are ones.
-                    let stands_for = match param.kind {
-                        ParamKind::Type => mint.name(param.symbol).to_string(),
-                        ParamKind::Row => format!("..{}", mint.name(param.symbol)),
-                    };
-                    let mut row = Node::new(ids.next(), letter, stands_for).at(param.span);
+                    let mut row =
+                        Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
                     if let Some(index) = cx.symbols.get(&param.symbol) {
                         row = row.symbol(*index);
                     }

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::symbol::Symbol;
 
@@ -29,18 +29,32 @@ pub type TyVar = u32;
 /// Written nowhere: a parameter is a bare name, and which of these it is
 /// follows from where the body uses it — `..r` makes a row, anything else makes
 /// a type. Worked out in [`ir::build`](crate::ir::build), and carried here so
-/// that the two readers who need it, lowering and the debugger, agree.
+/// that the readers who need it — lowering, inference and the debugger — agree.
 ///
 /// Two of them, and no way to write a third. That is what keeps this a check
 /// rather than a language: every parameter is one of these, every declaration
 /// takes a fixed list of them, and nothing takes a declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
     /// Stands for a type. `A` in `type Pair A B`.
     Type,
-    /// Stands for the fields a row does not name. `r` in
-    /// `type WithX r = { x: Nat, ..r }`.
-    Row,
+    /// Stands for the fields a row does not name — and, with them, the labels
+    /// it may therefore not name itself.
+    ///
+    /// `r` in `type WithX r = { x: Nat, ..r }` is one, and the set is `{x}`:
+    /// the tail covers the fields the declaration does not write out, so a `r`
+    /// with an `x` of its own would give the type two fields of one name, and
+    /// the two copies could disagree. Carrying the set rather than a bare flag
+    /// is what lets the condition be said where the argument is written, at
+    /// the span the reader can act on, instead of being discovered later by
+    /// whatever happened to flatten the row — or never at all.
+    ///
+    /// A parameter handed straight on to another declaration collects that
+    /// declaration's labels too, which is why this is a fixpoint over the
+    /// whole table rather than a read of one body. Insertion-ordered, so a
+    /// complaint about a row breaking the rule twice always names the same
+    /// label first.
+    Row(IndexSet<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -121,20 +135,30 @@ pub enum Ty {
     /// every walk stops at the body and descends into the arguments: see
     /// [`Table::occurs`](crate::inference), which does both in one pass.
     ///
-    /// Two of these are the same type when:
+    /// Two of these are the same type exactly when what they stand for is the
+    /// same type. A name is a barrier to *unfolding*, never to equality: two
+    /// declarations written the same way are one type however differently they
+    /// were spelled, and a declaration is not a new type merely for having a
+    /// name of its own.
     ///
-    /// - they are applications of the **same** declaration whose arguments are
-    ///   the same — decided without unfolding either, so a declaration is
-    ///   nominal within itself;
-    /// - or they are applications of **different** declarations that unfold the
-    ///   same way, whatever they are called.
+    /// Which leaves the name one job, and it is a shortcut. Where every
+    /// parameter of a declaration survives unfolding — each one landing in a
+    /// structural position of the body, as `Pair`'s do — two applications of it
+    /// are equal if and only if their arguments are, so the arguments can be
+    /// compared directly and the bodies never built. That is
+    /// [`Rule::Congruent`](crate::inference::Rule), and it is sound *and*
+    /// complete there, which is the whole of what makes it safe to take: it can
+    /// only ever agree with unfolding.
     ///
-    /// A declaration taking no arguments is the second case with an empty
-    /// argument list, which is what it has always been. The first case is why a
-    /// declaration that ignores a parameter is not transparent: `type Ptr a =
-    /// Nat` makes `Ptr A` and `Ptr B` different types though both stand for
-    /// `Nat`, which is what a phantom type is. It is a decision about the
-    /// language and not what keeps unfolding finite — that is the assumption
+    /// A parameter the declaration discards buys no distinction. `type Ptr a =
+    /// Nat` stands for `Nat` whatever it is applied to, so `Ptr A` and `Ptr B`
+    /// are one type — the language has no phantom types, and a declaration is
+    /// nominal within itself only where being nominal agrees with what it
+    /// stands for. Congruence is refused for such a declaration precisely
+    /// because taking it would be a decision contradicting the rule above
+    /// rather than a shortcut to it.
+    ///
+    /// None of this is what keeps unfolding finite. That is the assumption
     /// [`Solve::unfold`](crate::inference) records, which is keyed on the whole
     /// goal, arguments included, and comes back round because
     /// [`ir::build`](crate::ir::build) refuses a recursion that grows one. See
@@ -172,6 +196,19 @@ pub enum Ty {
     Bound(u32),
     #[default]
     Undecided,
+}
+
+impl ParamKind {
+    /// The labels an argument written at this parameter may not name, or
+    /// `None` when the parameter does not stand for a row at all. The one
+    /// question every reader of a kind actually asks, so it is asked in one
+    /// place rather than matched out at each of them.
+    pub fn lacks(&self) -> Option<&IndexSet<String>> {
+        match self {
+            ParamKind::Type => None,
+            ParamKind::Row(labels) => Some(labels),
+        }
+    }
 }
 
 impl From<Prim> for Ty {
