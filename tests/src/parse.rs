@@ -377,17 +377,74 @@ fn only_a_let_may_be_ascribed() {
     assert!(!out.errors.is_empty(), "stmts: {:#?}", out.stmts);
 }
 
+/// Juxtaposition in a type is an application, the way it is in a term. It was
+/// once an error — there was no type-level binder for it to mean anything
+/// against — and the two cases below are the ones that used to be reported.
 #[test]
-fn types_do_not_apply() {
-    // With no type-level binder there is nothing a type could be applied to,
-    // so juxtaposition is not an application: `Map` is the whole type, and
-    // `K` is then a statement that cannot begin.
-    let out = parse(lex("type M = Map K", FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+fn types_apply_by_juxtaposition() {
+    assert_eq!(parse_one("type M = Map K"), "type M = Map K");
+    assert_eq!(
+        parse_one("type R = { items: List T }"),
+        "type R = { items: List T }"
+    );
+}
 
-    // Inside a struct the juxtaposition has nowhere to go at all: the field
-    // list wants a comma or a brace where `T` is written.
-    let out = parse(lex("type R = { items: List T }", FileID::GENERATED).tokens);
-    assert!(!out.errors.is_empty(), "stmts: {:#?}", out.stmts);
+/// Gathered flat and printed flat: `Pair A B` is one application of two
+/// arguments, so an argument that is itself an application needs parentheses to
+/// survive a round trip.
+#[test]
+fn type_application_is_flat() {
+    assert_eq!(parse_one("type P = Pair A B"), "type P = Pair A B");
+    assert_eq!(
+        parse_one("type P = Pair (Pair A B) C"),
+        "type P = Pair (Pair A B) C"
+    );
+    // An arrow is looser than an application, so an argument that is one keeps
+    // its parentheses and a result that is one does not need any.
+    assert_eq!(
+        parse_one("type F = Pair (A -> B) C"),
+        "type F = Pair (A -> B) C"
+    );
+}
+
+/// Application binds tighter than the arrow, so neither side of an arrow needs
+/// parentheses to hold an application.
+#[test]
+fn type_application_binds_tighter_than_the_arrow() {
+    assert_eq!(
+        parse_one("type F = Pair A B -> Nat"),
+        "type F = Pair A B -> Nat"
+    );
+    assert_eq!(
+        parse_one("type F = Nat -> Pair A B"),
+        "type F = Nat -> Pair A B"
+    );
+}
+
+/// A declaration binds its parameters at its head, and prints them back there.
+#[test]
+fn a_declaration_binds_parameters_at_its_head() {
+    assert_eq!(
+        parse_one("type Pair A B = { a: A, b: B }"),
+        "type Pair A B = { a: A, b: B }"
+    );
+    // Taking none is still the ordinary case, and prints with no room left for
+    // a list that is not there.
+    assert_eq!(parse_one("type T = Nat"), "type T = Nat");
+}
+
+/// The comma is what tells a field's type from the struct's tail. Without one,
+/// a `..` after a type would be an argument to it; with one, it ends the field
+/// list. Nothing today can write a `..` in argument position, but the grammar
+/// only stays unambiguous while that is true, so it is pinned here.
+#[test]
+fn a_comma_tells_a_field_from_a_tail() {
+    assert_eq!(
+        parse_one("let x : { f: List T, ..r } = y"),
+        "let x : { f: List T, ..r } = y"
+    );
+    assert_eq!(
+        parse_one("let x : { f: List, ..r } = y"),
+        "let x : { f: List, ..r } = y"
+    );
 }

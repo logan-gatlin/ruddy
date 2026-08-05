@@ -16,6 +16,7 @@ pub mod types;
 use std::{collections::HashMap, rc::Rc};
 
 use ruddy::{
+    ir::Param,
     parse::Stmt,
     symbol::{Mint, Symbol},
     token::Token,
@@ -252,6 +253,27 @@ pub fn plural(count: usize, noun: &str) -> String {
         1 => format!("1 {noun}"),
         _ => format!("{count} {noun}s"),
     }
+}
+
+/// What one parameter of a `type` declaration stands for, as a row of the IR
+/// and Types tabs reads it: the name it was written as, a `..` in front of it
+/// when it stands for the rest of a row, and — when there is one — the labels
+/// an argument written there may not name.
+///
+/// Both tabs show a parameter and neither can show one usefully without this:
+/// the meaning column spells every parameter `'a` alike, and which of them can
+/// be handed a row, and what that row may not contain, is nowhere else on the
+/// page. Written once so the two cannot spell it differently.
+pub fn stands_for(mint: &Mint, param: &Param) -> String {
+    let name = mint.name(param.symbol);
+    let Some(lacks) = param.kind.lacks() else {
+        return name.to_string();
+    };
+    if lacks.is_empty() {
+        return format!("..{name}");
+    }
+    let labels: Vec<&str> = lacks.iter().map(String::as_str).collect();
+    format!("..{name} without {}", labels.join(", "))
 }
 
 /// A stage whose input never arrived.

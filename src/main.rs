@@ -63,15 +63,29 @@ fn main() -> ExitCode {
     for err in &built.errors {
         report(&source, err.span, &err.kind.to_string());
         // A repeat is only legible next to what it repeats, so the definition
-        // that stands gets a line of its own, indented under the error.
-        if let ir::ErrorKind::Duplicate { previous, .. } = &err.kind {
-            report(&source, *previous, &format!("  {}", ui::FIRST_DEFINITION));
+        // that stands gets a line of its own, indented under the error. A
+        // repeated parameter is the same thing said about a smaller scope, and
+        // carries the same second span for the same reason.
+        if let Some(previous) = first_definition(&err.kind) {
+            report(&source, previous, &format!("  {}", ui::FIRST_DEFINITION));
         }
     }
     for err in &inferred.errors {
         report(&source, err.span, &err.kind.to_string());
     }
     ExitCode::FAILURE
+}
+
+/// Where the name a complaint repeats was first written, for the complaints
+/// that repeat one. Both of lowering's carry the span for it, and a reporter
+/// that renders one and not the other tells the reader half of what the
+/// compiler knows — see [`ui::FIRST_DEFINITION`].
+fn first_definition(kind: &ir::ErrorKind) -> Option<Span> {
+    match kind {
+        ir::ErrorKind::Duplicate { previous, .. }
+        | ir::ErrorKind::DuplicateParameter { previous } => Some(*previous),
+        _ => None,
+    }
 }
 
 /// Print a single diagnostic as `path:line:col: message: "snippet"`, resolving

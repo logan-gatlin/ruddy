@@ -56,6 +56,19 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateField,
         IrError::Circular,
         IrError::OpenDeclaredType,
+        IrError::Arity {
+            expected: 2,
+            found: 1,
+        },
+        IrError::NotAConstructor,
+        IrError::ParameterApplied,
+        IrError::DuplicateParameter { previous: span },
+        IrError::GrowingRecursion,
+        IrError::MixedParameter,
+        IrError::NotARow,
+        IrError::RepeatedRowField {
+            field: "x".to_string(),
+        },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -89,6 +102,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 const RULES: &[Rule] = &[
     Rule::Absorb,
     Rule::Same,
+    Rule::Congruent,
     Rule::Bind,
     Rule::Occurs,
     Rule::Overlap,
@@ -157,6 +171,39 @@ fn every_rule_is_named_and_explained_distinctly() {
     for rule in RULES {
         assert!(!rule.to_string().is_empty(), "{rule:?}");
     }
+}
+
+/// The Solve tab lays the rule out as a column, so that the goal beside it
+/// starts at the same place on every row and two rows can be compared by eye.
+/// The column's width is a number in the stylesheet and the codes are strings
+/// in `ruddy::ui`, and nothing but this connects them: a rule spelled longer
+/// than the column pushes the goal on its own rows and nothing lines up, which
+/// is the whole failure the fixed width exists to prevent.
+#[test]
+fn the_solve_tab_is_wide_enough_for_every_rule() {
+    let css = include_str!("../../debug/web/style.css");
+    let rule = css
+        .split(".step-row .label {")
+        .nth(1)
+        .expect("the rule column is styled");
+    let width: usize = rule
+        .split("min-width:")
+        .nth(1)
+        .and_then(|rest| rest.split("ch").next())
+        .expect("the column has a min-width in characters")
+        .trim()
+        .parse()
+        .expect("the min-width is a whole number of characters");
+
+    let longest = RULES
+        .iter()
+        .map(|rule| rule.code().chars().count())
+        .max()
+        .expect("there are rules");
+    assert_eq!(
+        width, longest,
+        "the column is {width}ch and the longest rule code is {longest} characters"
+    );
 }
 
 /// The namespaces appear in a message as the noun the complaint is about —
@@ -273,6 +320,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let named = Rc::new(Ty::Named {
         symbol,
         name: "Endo".into(),
+        args: Rc::from([]),
     });
 
     for (prelude, ty, printed) in [

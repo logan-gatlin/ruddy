@@ -17,6 +17,15 @@ pub enum StmtKind {
     },
     Type {
         name: TrackedString,
+        /// The parameters the declaration binds, in the order written. Empty
+        /// for the plain `type T = ...`, which is every declaration the
+        /// language had before it could take any.
+        ///
+        /// What each one stands for — a type, or the fields a row does not
+        /// name — is not written here and is not the parser's to know: it
+        /// follows from where the body uses it, which is a question for
+        /// lowering.
+        params: Vec<TrackedString>,
         body: Type,
     },
 }
@@ -58,6 +67,21 @@ pub enum TypeKind {
     Arrow {
         from: Box<Type>,
         to: Box<Type>,
+    },
+    /// `<head> <arg>...` — a type applied to arguments.
+    ///
+    /// Flat rather than nested one argument at a time, unlike
+    /// [`ExprKind::Apply`]: a declaration takes a fixed number of arguments and
+    /// is applied to all of them at once, so there is no half-applied type for
+    /// an intermediate node to stand for.
+    ///
+    /// `head` is a whole [`Type`] rather than a name because the parser judges
+    /// nothing: `{ x: Nat } Nat` parses here and is refused where the rest of
+    /// the rules about what may be applied live. The same division
+    /// [`projection`](Parser::projection) keeps.
+    Apply {
+        head: Box<Type>,
+        args: Vec<Type>,
     },
     Ident {
         name: TrackedString,
@@ -221,13 +245,24 @@ impl Parser {
         Some(span.track(StmtKind::Let { name, ty, body }))
     }
 
+    /// `type <name> <param>* = <type>`. The parameters are plain names, and the
+    /// list ends at the `=` — so an empty one is not the error an empty
+    /// [`function_expr`](Self::function_expr) argument list is: a type taking
+    /// no parameters is the ordinary case.
     fn type_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance()?; // `type`
         let name = self.ident()?;
+        let mut params = Vec::new();
+        while matches!(
+            self.peek().map(|tok| &tok.tracked),
+            Some(Kind::Identifier(_))
+        ) {
+            params.push(self.ident()?);
+        }
         self.eat(&Kind::Equal)?;
         let body = self.type_expr()?;
         let span = kw.span.merge(body.span);
-        Some(span.track(StmtKind::Type { name, body }))
+        Some(span.track(StmtKind::Type { name, params, body }))
     }
 
     /// Whether the next token can begin an atomic expression — used to decide
@@ -384,10 +419,11 @@ impl Parser {
         Some(args)
     }
 
-    /// `<atom> [-> <type>]` — the arrow is the only type operator, and it is
-    /// right-associative, so `A -> B -> C` is `A -> (B -> C)`.
+    /// `<apply> [-> <type>]` — the arrow is right-associative, so
+    /// `A -> B -> C` is `A -> (B -> C)`, and application binds tighter, so
+    /// `Pair Nat Nat -> Nat` is `(Pair Nat Nat) -> Nat`.
     fn type_expr(&mut self) -> Option<Type> {
-        let from = self.type_atom()?;
+        let from = self.type_apply()?;
         if self.eat_if(&Kind::Arrow).is_none() {
             return Some(from);
         }
@@ -399,9 +435,49 @@ impl Parser {
         }))
     }
 
-    /// A name, a struct, a parenthesized type, or `()`. The type language has
-    /// no binder and no application: every name written here denotes a type
-    /// outright, never a function from types to types.
+    /// `<atom> <atom>*` — a type applied to arguments, gathered flat.
+    ///
+    /// Flat rather than folded pairwise the way [`expr`](Self::expr) folds an
+    /// application: `Pair Nat Nat` is one node, and there is no `Pair Nat` in
+    /// between for anything to mean. The recursion goes through
+    /// [`type_atom`](Self::type_atom) rather than back through here, so
+    /// `Pair Pair Nat` is `Pair` applied to two arguments rather than a nested
+    /// application — which is what keeps a type from being applied to a type
+    /// that is itself waiting for arguments.
+    fn type_apply(&mut self) -> Option<Type> {
+        let head = self.type_atom()?;
+        if !self.at_type_atom() {
+            return Some(head);
+        }
+        let mut args = Vec::new();
+        let mut span = head.span;
+        while self.at_type_atom() {
+            let arg = self.type_atom()?;
+            span = span.merge(arg.span);
+            args.push(arg);
+        }
+        Some(span.track(TypeKind::Apply {
+            head: Box::new(head),
+            args,
+        }))
+    }
+
+    /// Whether the next token can begin an atomic type — the type-level
+    /// counterpart of [`at_expr_atom`](Self::at_expr_atom), and what decides
+    /// where an application stops.
+    fn at_type_atom(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(tok) if matches!(
+                tok.tracked,
+                Kind::Identifier(_) | Kind::LeftBrace | Kind::LeftParen
+            )
+        )
+    }
+
+    /// A name, a struct, a parenthesized type, or `()`. Application is
+    /// [`type_apply`](Self::type_apply)'s; what is here is what can be an
+    /// argument without parentheses.
     fn type_atom(&mut self) -> Option<Type> {
         let Some(tok) = self.peek() else {
             return self.unexpected();

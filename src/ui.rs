@@ -64,6 +64,23 @@ pub trait Grouped: fmt::Display {
     fn prec(&self) -> Prec;
 }
 
+/// A reference groups as what it points at, so a printer can hand out borrowed
+/// nodes without every caller wrapping them first.
+impl<T: Grouped + ?Sized> Grouped for &T {
+    fn prec(&self) -> Prec {
+        (**self).prec()
+    }
+}
+
+/// A name is an atom: one word, however many arrows are behind it. Written
+/// here so that the head of an application can be a name in one printer and a
+/// whole written type in another, and both go through the same rule.
+impl Grouped for str {
+    fn prec(&self) -> Prec {
+        Prec::Atom
+    }
+}
+
 /// How tightly a printed node binds. Grouping is dropped rather than recorded,
 /// so the printers reconstruct it from this alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,6 +198,14 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateField => "duplicate-field",
             ir::ErrorKind::Circular => "circular-type",
             ir::ErrorKind::OpenDeclaredType => "open-declared-type",
+            ir::ErrorKind::Arity { .. } => "wrong-argument-count",
+            ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
+            ir::ErrorKind::ParameterApplied => "applied-parameter",
+            ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
+            ir::ErrorKind::GrowingRecursion => "growing-recursion",
+            ir::ErrorKind::MixedParameter => "mixed-parameter",
+            ir::ErrorKind::NotARow => "not-a-row",
+            ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
         }
     }
 }
@@ -202,9 +227,79 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::OpenDeclaredType => f.write_str(
                 "a declared type must list its fields exactly; `..` and `?` belong in annotations",
             ),
+            // Counted in words, and said as what the type takes rather than as
+            // what the reader failed to supply — the count is the fact, and
+            // which side is short of it follows from the two numbers.
+            ir::ErrorKind::Arity { expected, found } => write!(
+                f,
+                "this type takes {}, and {} written",
+                arguments(*expected),
+                supplied(*found),
+            ),
+            ir::ErrorKind::NotAConstructor => {
+                f.write_str("only a declared type can be given arguments")
+            }
+            ir::ErrorKind::ParameterApplied => {
+                f.write_str("this stands for one type, so there is nothing to give arguments to")
+            }
+            ir::ErrorKind::DuplicateParameter { .. } => {
+                f.write_str("this type already takes something of this name")
+            }
+            // Said as the rule rather than as the loop: what the reader can
+            // change is the arguments at this one mention, and naming the whole
+            // cycle would point at declarations they got right.
+            ir::ErrorKind::GrowingRecursion => f.write_str(
+                "types that lead back to each other may hand on the names they take, but not types built out of them, which get bigger every time round",
+            ),
+            // Said as the two readings rather than as "kind", which names a
+            // thing this language does not otherwise have and the reader has
+            // never been shown.
+            ir::ErrorKind::MixedParameter => f.write_str(
+                "this stands for the rest of a struct's fields in one place and for a whole type in another",
+            ),
+            ir::ErrorKind::NotARow => f.write_str(
+                "the rest of a struct's fields goes here, and this is not that",
+            ),
+            // Said as what the `..` covers, the way the solver's version of
+            // this complaint is: the reader can change the field they wrote,
+            // and the row the declaration would end up with is not a type
+            // anyone put on the page.
+            ir::ErrorKind::RepeatedRowField { field } => write!(
+                f,
+                "the rest of a struct's fields goes here, and this names `{field}`, which that struct already has",
+            ),
         }
     }
 }
+
+/// `no arguments`, `one argument`, `two arguments` — small counts in words,
+/// because a message is a sentence and a sentence does not open with a numeral.
+///
+/// Beyond what is worth spelling out, the numeral: a type taking thirteen
+/// arguments has a problem this message is not going to help with.
+fn arguments(count: usize) -> String {
+    match count {
+        0 => "no arguments".to_string(),
+        1 => "one argument".to_string(),
+        2..=9 => format!("{} arguments", WORDS[count]),
+        _ => format!("{count} arguments"),
+    }
+}
+
+/// The same counting for the side that was written, which needs a verb that
+/// agrees with it.
+fn supplied(count: usize) -> String {
+    match count {
+        0 => "none was".to_string(),
+        1 => "one was".to_string(),
+        2..=9 => format!("{} were", WORDS[count]),
+        _ => format!("{count} were"),
+    }
+}
+
+const WORDS: [&str; 10] = [
+    "no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
 
 /// The canonical spelling of a bundle's identity. Bundle names cannot contain
 /// `@`, so this is one string per bundle and one bundle per string — which is
@@ -255,22 +350,27 @@ impl fmt::Display for Prim {
     }
 }
 
-/// How much of the surface grammar a semantic type can be. Only the arrow
-/// extends rightward; everything else — a primitive, a braced struct, a
-/// variable — is a form nothing can be appended to.
+/// How much of the surface grammar a semantic type can be. The arrow extends
+/// rightward and an application extends rightward by argument; everything else
+/// — a primitive, a braced struct, a variable — is a form nothing can be
+/// appended to.
 ///
-/// The type language has no lambda and no application, so two of [`Prec`]'s
-/// four levels never arise here. They are still the right scale to answer on:
-/// grouping is decided by comparing against the position a type is being
-/// written into, and that comparison is the surface grammar's whether or not
-/// this particular tree can reach every level of it.
+/// The type language has no lambda, so one of [`Prec`]'s four levels never
+/// arises here. It is still the right scale to answer on: grouping is decided
+/// by comparing against the position a type is being written into, and that
+/// comparison is the surface grammar's whether or not this particular tree can
+/// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match self {
             Ty::Arrow(..) => Prec::Arrow,
-            // A declared type is an atom whatever it stands for: it prints as
-            // its name, and a name is one word however many arrows are behind
-            // it.
+            // Applied to something, a declared type groups as the application
+            // it is: `Pair Nat Nat` needs parentheses wherever an argument
+            // could follow it.
+            Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
+            // Applied to nothing it is an atom whatever it stands for: it
+            // prints as its name, and a name is one word however many arrows
+            // are behind it.
             Ty::Nat
             | Ty::Struct { .. }
             | Ty::Named { .. }
@@ -337,9 +437,13 @@ impl fmt::Display for Ty {
                 write_row(f, entries, tail)
             }
             // A declared type prints as what the user called it rather than as
-            // what it stands for. It is shorter, it is what they wrote, and it
-            // is the only way a type that names itself can be printed at all.
-            Ty::Named { name, .. } => f.write_str(name),
+            // what it stands for, applied to whatever it was given. It is
+            // shorter, it is what they wrote, and it is the only way a type
+            // that names itself can be printed at all.
+            Ty::Named { name, args, .. } if args.is_empty() => f.write_str(name),
+            Ty::Named { name, args, .. } => {
+                write_applied(f, &**name, args.iter().map(|arg| &**arg))
+            }
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
             Ty::Var(var) => write!(f, "?{var}"),
@@ -379,6 +483,7 @@ impl Rule {
         match self {
             Rule::Absorb => "absorb",
             Rule::Same => "same",
+            Rule::Congruent => "congruent",
             Rule::Bind => "bind",
             Rule::Occurs => "occurs",
             Rule::Overlap => "overlap",
@@ -402,6 +507,9 @@ impl fmt::Display for Rule {
         f.write_str(match self {
             Rule::Absorb => "one side is undecided, which unifies with anything",
             Rule::Same => "already the same thing on both sides",
+            Rule::Congruent => {
+                "the same declared type on both sides, and it keeps what it takes: argument against argument"
+            }
             Rule::Bind => "a variable takes the type it is against",
             Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
             Rule::Overlap => {
@@ -532,15 +640,48 @@ pub fn write_apply(
     write_grouped(f, arg.prec() < Prec::Atom, arg)
 }
 
+/// Render `head arg arg ...` — the flat form of [`write_apply`], for the type
+/// language.
+///
+/// Flat rather than folded pairwise because a type constructor is applied to
+/// everything it takes at once: there is no half-applied thing for an
+/// intermediate node to stand for, so there is none to hand to
+/// [`write_apply`].
+///
+/// The head is grouped against an atom rather than against an application, as
+/// [`write_apply`] groups its function: the form is flat, so `head arg arg`
+/// says the head is one atom, and an application there would swallow the
+/// arguments that follow it. The compiler's own printers never see a
+/// parenthesis here — a name is an atom, and only a declared name reaches this
+/// far in the IR — but the parse tree's printer renders what was written, and
+/// anything at all can be *written* applied.
+pub fn write_applied<H: Grouped, A: Grouped>(
+    f: &mut fmt::Formatter<'_>,
+    head: H,
+    args: impl IntoIterator<Item = A>,
+) -> fmt::Result {
+    write_grouped(f, head.prec() < Prec::Atom, &head)?;
+    for arg in args {
+        f.write_str(" ")?;
+        write_grouped(f, arg.prec() < Prec::Atom, &arg)?;
+    }
+    Ok(())
+}
+
 /// Render `from -> to`. The arrow is right-associative, so only the left side
 /// can ever need grouping — an arrow there would otherwise re-parse as the outer
 /// arrow's right half.
+///
+/// Grouped against the arrow rather than against an atom, so only what could
+/// swallow the arrow is bracketed: an arrow, and a lambda. An application is
+/// left alone, because it stops at the arrow of its own accord and
+/// `Pair A B -> Nat` is how a person would write it.
 pub fn write_arrow(
     f: &mut fmt::Formatter<'_>,
     from: &impl Grouped,
     to: &impl Grouped,
 ) -> fmt::Result {
-    write_grouped(f, from.prec() < Prec::Atom, from)?;
+    write_grouped(f, from.prec() < Prec::Apply, from)?;
     write!(f, " -> {to}")
 }
 

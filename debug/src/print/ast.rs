@@ -14,7 +14,7 @@ use ruddy::{
 };
 
 use crate::print::{
-    Grouped, Prec, write_apply, write_arrow, write_project, write_row, write_struct,
+    Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -25,6 +25,7 @@ impl Grouped for Ast<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             TypeKind::Arrow { .. } => Prec::Arrow,
+            TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
         }
     }
@@ -60,8 +61,12 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 }
                 write!(f, " = {}", Ast(&body.tracked.tracked))
             }
-            StmtKind::Type { name, body } => {
-                write!(f, "type {} = {}", name.tracked, Ast(&body.tracked))
+            StmtKind::Type { name, params, body } => {
+                write!(f, "type {}", name.tracked)?;
+                for param in params {
+                    write!(f, " {}", param.tracked)?;
+                }
+                write!(f, " = {}", Ast(&body.tracked))
             }
         }
     }
@@ -104,6 +109,11 @@ impl fmt::Display for Ast<'_, TypeKind> {
                     tail.as_ref().map(|tail| tail as &dyn fmt::Display),
                 )
             }
+            TypeKind::Apply { head, args } => write_applied(
+                f,
+                Ast(&head.tracked),
+                args.iter().map(|arg| Ast(&arg.tracked)),
+            ),
             TypeKind::Ident { name } => f.write_str(&name.tracked),
             TypeKind::Unit => f.write_str("()"),
         }

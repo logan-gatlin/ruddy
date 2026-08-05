@@ -708,6 +708,47 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     );
 }
 
+/// The solver assumes a goal it is already in the middle of, and what it is
+/// keyed on is the whole goal — both declared types with their arguments. The
+/// Solve tab shows that key without being given anything of its own: a step's
+/// goal is the row's text, so the assumption stack has nothing left to say.
+/// A key a reader cannot see is one nobody can check the assumption against.
+#[test]
+fn an_assumed_step_shows_the_goal_it_was_keyed_on() {
+    let snapshot = snapshot(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree Nat, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood Nat, tail: Grove }\n\
+         let f : Forest -> Grove = fn x => x\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve stage is registered");
+    let texts: Vec<&str> = nodes(solve)
+        .iter()
+        .filter(|node| node.label == "assume")
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Grove ~ Forest", "Grove ~ Forest"]);
+
+    // And the row where the arguments are what is being decided reads as the
+    // types the reader wrote, applications and all.
+    let unfolded: Vec<&str> = nodes(solve)
+        .iter()
+        .filter(|node| node.label == "unfold")
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(unfolded, ["Grove ~ Forest", "Wood Nat ~ Tree Nat"]);
+}
+
 #[test]
 fn symbols_round_trip_through_the_mangler() {
     let snapshot = snapshot("let f = fn x => x\ntype T = ()\n");
@@ -991,4 +1032,186 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("types"), "1 scheme");
     assert_eq!(summary("symbols"), "1 symbol");
     assert_eq!(summary("ir"), "0 types · 1 term");
+}
+
+/// A parameterized declaration's meaning prints its parameters as `'a`, `'b` —
+/// which says nothing on its own about which is which. The Types tab carries a
+/// row per parameter mapping each letter back to the name it was written as,
+/// and without them the tab is unreadable for exactly the declarations that
+/// most need reading.
+#[test]
+fn the_types_tab_maps_each_letter_back_to_its_parameter() {
+    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+
+    let rows = nodes(stage);
+    let pair = rows
+        .iter()
+        .find(|node| node.label == "type Pair")
+        .expect("a row for the declaration");
+    assert_eq!(pair.text, "{ first: 'a, second: 'b }");
+
+    let letters: Vec<(&str, &str)> = pair
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
+}
+
+/// The IR tab shows a `type` declaration's binders, as the AST tab and the
+/// Types tab both do. Without them the tab was the one panel where clicking a
+/// parameter lit nothing up — the body's uses of it carry the symbol, and the
+/// binder they point back at had no row to be pointed at.
+#[test]
+fn the_ir_tab_shows_a_declarations_parameters() {
+    let snap = snapshot("type Ghost a = Nat\ntype WithX r = { x: Nat, ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "ir")
+        .expect("the ir stage");
+
+    let params: Vec<(&str, Option<[usize; 2]>)> = nodes(stage)
+        .iter()
+        .filter(|node| node.label == "Param")
+        .map(|node| (node.text.as_str(), node.span))
+        .collect();
+    // What each stands for, beside the span it was written at — a row says so,
+    // and says what it may not stand for.
+    assert_eq!(
+        params,
+        [("a", Some([11, 12])), ("..r without x", Some([30, 31]))]
+    );
+
+    // And each cross-highlights, which is the whole reason the row is here.
+    for node in nodes(stage).iter().filter(|node| node.label == "Param") {
+        assert!(node.symbol.is_some(), "{node:#?}");
+    }
+
+    // A parameter that is never used still gets a row: the binder is what was
+    // written, whatever the body did with it.
+    let ghost = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Ghost")
+        .expect("a row for the declaration");
+    let kids: Vec<&str> = ghost
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(kids, ["Param", "Prim"]);
+}
+
+/// A repeated parameter is a repeat like any other, so it arrives as one
+/// diagnostic pointing at the name it repeats. The span was carried and no
+/// reporter rendered it, so the panel could not cross-highlight the two names
+/// the complaint is about.
+#[test]
+fn a_duplicate_parameter_carries_the_name_it_repeats() {
+    let snapshot = snapshot("type Pair A A = { first: A, second: A }\n");
+    let duplicate = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "duplicate-parameter")
+        .expect("the repeat is reported");
+    assert_eq!(duplicate.span, Some([12, 13]));
+    assert_eq!(duplicate.related.len(), 1);
+    assert_eq!(duplicate.related[0].span, Some([10, 11]));
+}
+
+/// The IR tab shows an application as its head and its arguments, and the head
+/// carries the declaration's symbol so it cross-highlights with the row that
+/// declares it.
+#[test]
+fn the_ir_tab_takes_an_application_apart() {
+    let snap = snapshot("type Box A = { it: A }\ntype N = Box Nat");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "ir")
+        .expect("the ir stage");
+
+    let rows = nodes(stage);
+    let apply = rows
+        .iter()
+        .find(|node| node.label == "Apply")
+        .expect("a row for the application");
+    assert_eq!(apply.text, "Box Nat");
+
+    let kids: Vec<&str> = apply
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(kids, vec!["Head", "Prim"]);
+    assert!(
+        apply.children[0].symbol.is_some(),
+        "the head should cross-highlight: {:#?}",
+        apply.children[0]
+    );
+}
+
+/// The Types tab says which parameters stand for a set of fields, and which
+/// fields that set may not contain, because nothing else on the row does: a row
+/// is the only reason a declared type can be open, and the meaning column
+/// spells every parameter `'a` alike.
+#[test]
+fn the_types_tab_says_which_parameters_are_rows() {
+    let snap = snapshot("type Both A r = { it: A, ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+
+    let both = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Both")
+        .expect("a row for the declaration");
+    let letters: Vec<(&str, &str)> = both
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "..r without it")]);
+
+    // A row beside no fields at all forbids nothing, and says so by saying
+    // nothing.
+    let snap = snapshot("type Bare r = { ..r }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage");
+    let bare = nodes(stage)
+        .into_iter()
+        .find(|node| node.label == "type Bare")
+        .expect("a row for the declaration");
+    assert_eq!(bare.children[0].text, "..r");
+}
+
+/// A type parameter is a symbol like any other — minted as a local, the way a
+/// lambda's argument is — so it reaches the Symbols tab with no special case,
+/// and the path it is listed under is one `demangle` can read back.
+#[test]
+fn a_type_parameter_is_a_symbol_like_any_other() {
+    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let stage = snap
+        .stages
+        .iter()
+        .find(|stage| stage.id == "symbols")
+        .expect("the symbols stage");
+
+    let listed: Vec<&str> = nodes(stage)
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    for name in ["Pair", "A", "B"] {
+        assert!(listed.contains(&name), "{name} is missing from {listed:?}");
+    }
 }

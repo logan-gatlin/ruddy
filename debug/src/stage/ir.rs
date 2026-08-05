@@ -6,14 +6,14 @@
 
 use ruddy::{
     inference,
-    ir::{Decl, Term, TermKind, Type, TypeKind},
+    ir::{Decl, Row, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     types::Ty,
 };
 
 use crate::{
     print,
-    stage::{Cx, Ids, Spec, Trace, plural},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
     wire::{Node, Stage},
 };
 
@@ -89,6 +89,20 @@ fn decl_node<T>(
         let mut ascribed = type_node(ids, cx, mint, annotation);
         ascribed.label = format!("Ascribed {}", ascribed.label);
         node = node.child(ascribed);
+    }
+    // The binders, before the body that uses them, which is where they are
+    // written and how the AST panel already shows them. A parameter is a local
+    // symbol like a lambda's argument, so it cross-highlights with every
+    // `Param` row in the body and with the AST's own — and without a row here
+    // the IR tab was the one panel where clicking one lit nothing up. The text
+    // says what it stands for, since a `type` declaration's binder is the only
+    // binder in the language that stands for anything but a type.
+    for param in &decl.params {
+        node = node.child(with_symbol(
+            Node::new(ids.next(), "Param", stands_for(mint, param)).at(param.span),
+            cx,
+            param.symbol,
+        ));
     }
     node.child(value(ids, cx, mint, &decl.value))
 }
@@ -201,6 +215,37 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             cx,
             *symbol,
         ),
+        // A parameter is a local symbol like a lambda's argument, so it
+        // cross-highlights against the head of its own declaration.
+        TypeKind::Param { symbol, .. } => with_symbol(
+            Node {
+                label: "Param".into(),
+                ..node
+            },
+            cx,
+            *symbol,
+        ),
+        TypeKind::Apply {
+            head,
+            head_span,
+            args,
+        } => {
+            let head = with_symbol(
+                Node::new(ids.next(), "Head", mint.name(*head).to_string()).at(*head_span),
+                cx,
+                *head,
+            );
+            Node {
+                label: "Apply".into(),
+                ..node
+            }
+            .child(head)
+            .children(
+                args.iter()
+                    .map(|arg| type_node(ids, cx, mint, arg))
+                    .collect::<Vec<_>>(),
+            )
+        }
         // A primitive is resolved from its spelling rather than from the name
         // table, so there is no symbol to cross-highlight it by.
         TypeKind::Prim(_) => Node {
@@ -230,7 +275,11 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             // The tail is a row of its own: it stands for the fields not
             // named, so it is shown beside them rather than folded into one.
             if let Some(tail) = tail {
-                let name = tail.name.as_deref().unwrap_or("");
+                let name = match &tail.of {
+                    Row::Anything => String::new(),
+                    Row::Named(name) => name.clone(),
+                    Row::Param { symbol, .. } => mint.name(*symbol).to_string(),
+                };
                 kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
             }
             Node {

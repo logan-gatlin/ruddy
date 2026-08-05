@@ -135,16 +135,14 @@ fn mentions_a_variable(ty: &Ty) -> bool {
                 .any(|field| mentions_a_variable(&field.presence) || mentions_a_variable(&field.ty))
                 || mentions_a_variable(rest)
         }
-        // A declared type is not looked inside, for the reason the compiler's
-        // own walks do not: what one stands for was lowered from what the user
-        // wrote, and no solver variable can reach it.
-        Ty::Nat
-        | Ty::Named { .. }
-        | Ty::Bound(_)
-        | Ty::Undecided
-        | Ty::Present
-        | Ty::Absent
-        | Ty::Empty => false,
+        // A declared type's body is not looked inside, for the reason the
+        // compiler's own walks do not: what one stands for was lowered from
+        // what the user wrote, and no solver variable can reach it. Its
+        // arguments are another matter — they were written at the use site and
+        // hold whatever it held, so this has to descend or it would pass while
+        // the leak it exists to catch is right there.
+        Ty::Named { args, .. } => args.iter().any(|arg| mentions_a_variable(arg)),
+        Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => false,
     }
 }
 
@@ -779,6 +777,41 @@ fn a_tail_may_not_take_a_field_its_own_row_names() {
     );
 }
 
+/// One contradiction, one sentence: a row handed to a `..` parameter that
+/// repeats two of the fields the declaration already names is one mistake with
+/// one thing to change, and `Solve::assign` already reports it that way.
+#[test]
+fn a_row_repeating_two_fields_is_one_complaint() {
+    // A row written out where a row parameter goes is refused where it is
+    // written: what the declaration already names is part of what its parameter
+    // stands for, so lowering knows it without anything having to unfold. The
+    // first label is the one named, and the argument absorbs, so the second is
+    // not a second complaint.
+    let (_, out, _) = infer_src(
+        "type W r = { x: Nat, y: Nat, ..r }\n\
+         let p : W { x: Nat, y: Nat } = { x: 1, y: 2 }",
+    );
+    assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ir::ErrorKind::RepeatedRowField { field } if field == "x"
+    ));
+
+    // The same thing reached through a variable, where only the solve can know
+    // it: the tail `r` stands for the rest of a row that already names `x` and
+    // `y`, and the second argument is what says what that rest is.
+    let (_, out, output) = infer_src(
+        "let h : { x: Nat, y: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1\n\
+         let k = fn p q => h p { x: 1, y: 2 }",
+    );
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(
+        &output.errors[0].kind,
+        ErrorKind::RepeatedField { field } if field == "x"
+    ));
+}
+
 /// The condition survives every binding it passes through. A tail that
 /// absorbs a field continues as a fresh tail, and that fresh tail is where the
 /// next conflicting field would arrive — so what the first one could not be,
@@ -1217,9 +1250,9 @@ fn unfolding_a_declared_type_is_a_rule_of_its_own() {
             "unfold  b ~ a => replaced by the goals below",
             "  struct  { n: b } ~ { n: a } => replaced by the goals below",
             // Which is the first question again, one field in. Three steps,
-            // not five: the pair is remembered by which declarations it names,
-            // so the second `b` and `a` are recognized as the first ones and
-            // not as two more copies to unfold.
+            // not five: the goal is remembered while what it broke into is
+            // open, so the second `b` and `a` are recognized as the first ones
+            // and not as two more copies to unfold.
             "    assume  b ~ a => no change",
         ]
     );
@@ -1257,6 +1290,25 @@ fn lowering_errors_are_absorbed_not_echoed() {
         output.errors
     );
     assert_eq!(scheme(&mint, &output, "point"), "{ x: ? }");
+}
+
+/// An argument that cannot stand for a set of fields is refused and absorbed.
+/// Lowering said it once; inference must not say it again in words about the
+/// empty row, which is the failure `lowering_errors_are_absorbed_not_echoed`
+/// was written to prevent.
+#[test]
+fn a_bad_row_argument_is_absorbed_not_echoed() {
+    let (_, out, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX Nat -> Nat = fn p => p.x",
+    );
+    assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "not-a-row");
+    assert!(
+        output.errors.is_empty(),
+        "inference echoed it: {:#?}",
+        output.errors
+    );
 }
 
 #[test]
@@ -1575,4 +1627,515 @@ fn a_projection_solves_wherever_it_falls_in_the_list() {
     let (mint, _, output) =
         inferred("let f : { a: { b: Nat } } -> Nat = fn p => (fn q => q.b) p.a");
     assert_eq!(scheme(&mint, &output, "f"), "{ a: { b: Nat } } -> Nat");
+}
+
+/// A declaration stands for its body with its arguments put in, so a term
+/// checked against one is checked against the shape that substitution reaches.
+#[test]
+fn a_constructor_stands_for_its_body_with_its_arguments_put_in() {
+    let (mint, _, output) = inferred(
+        "type Pair A B = { first: A, second: B }\n\
+         let p : Pair Nat Nat = { first: 1, second: 2 }",
+    );
+    assert_eq!(scheme(&mint, &output, "p"), "Pair Nat Nat");
+
+    // The argument reaches the field it was substituted into.
+    let (_, _, output) = infer_src(
+        "type Pair A B = { first: A, second: B }\n\
+         let p : Pair Nat Nat = { first: 1, second: {} }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// Two applications of one declaration are equal when their arguments are, and
+/// that is decided without unfolding either. Deciding it here is what keeps a
+/// declaration that leads back to itself from unfolding forever.
+#[test]
+fn applications_of_one_declaration_are_equal_by_their_arguments() {
+    let (_, _, output) = inferred(
+        "type Pair A B = { first: A, second: B }\n\
+         let same : Pair Nat Nat -> Pair Nat Nat = fn p => p",
+    );
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(rules.contains(&Rule::Congruent), "rules: {rules:?}");
+    assert!(!rules.contains(&Rule::Unfold), "rules: {rules:?}");
+
+    // A congruence that fails is a failure of the two applications, so that is
+    // what the reader is shown: the types they wrote, not a field of a body
+    // neither of them put on the page.
+    let (_, _, output) = infer_src(
+        "type Pair A B = { first: A, second: B }\n\
+         let f : Pair Nat Nat -> Nat = fn p => p.first\n\
+         let g : Pair Nat {} -> Nat = fn p => f p",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Pair Nat Nat`, found `Pair Nat {}`"
+    );
+
+    // And the attempt leaves nothing behind: the steps a reader is shown are
+    // the ones that decided the answer, and the state they build is the state
+    // the solve ended in.
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(!rules.contains(&Rule::Congruent), "rules: {rules:?}");
+    assert!(rules.contains(&Rule::Mismatch), "rules: {rules:?}");
+}
+
+/// Two *different* declarations are still equal by what they unfold to, which
+/// is what keeps a name a barrier to unfolding rather than to equality.
+#[test]
+fn applications_of_different_declarations_unfold() {
+    let (_, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         type Crate A = { it: A }\n\
+         let f : Box Nat -> Crate Nat = fn b => b",
+    );
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(rules.contains(&Rule::Unfold), "rules: {rules:?}");
+}
+
+/// A parameter a declaration discards buys no distinction. `type Ptr a = Nat`
+/// stands for `Nat` whatever it is applied to, so `Ptr A` and `Ptr B` are one
+/// type — the language has no phantom types, and congruence is refused here
+/// precisely because taking it would say otherwise.
+///
+/// This is the transitivity the old rule broke: each of `Ptr A` and `Ptr B` was
+/// `Nat` by unfolding while the two were kept apart from each other by their
+/// name, so equality depended on which pair you asked about.
+#[test]
+fn a_constructor_that_ignores_a_parameter_is_transparent() {
+    let (mint, _, output) = inferred(
+        "type Ptr a = Nat\n\
+         type A = { a: Nat }\n\
+         type B = { b: Nat }\n\
+         let x : Ptr A = 1\n\
+         let y : Ptr B = x\n\
+         let z : Nat = x",
+    );
+    // It still prints as what the reader wrote: a name is a barrier to
+    // unfolding, not to equality.
+    assert_eq!(scheme(&mint, &output, "y"), "Ptr B");
+
+    // And it is decided by unfolding rather than by the name, so no congruence
+    // was taken.
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(!rules.contains(&Rule::Congruent), "rules: {rules:?}");
+
+    // A parameter reaching the body only through something that discards it is
+    // discarded too, however many hand-offs there are in between.
+    let (_, _, output) = inferred(
+        "type Ptr a = Nat\n\
+         type Alias b = Ptr b\n\
+         type A = { a: Nat }\n\
+         type B = { b: Nat }\n\
+         let x : Alias A = 1\n\
+         let y : Alias B = x",
+    );
+    let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
+    assert!(!rules.contains(&Rule::Congruent), "rules: {rules:?}");
+
+    // What is still refused is a difference the declaration keeps.
+    let (_, _, output) = infer_src(
+        "type Box a = { it: a }\n\
+         let x : Box Nat = { it: 1 }\n\
+         let y : Box {} = x",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// A group whose members mention each other at a fixed argument is an ordinary
+/// recursive type, and two such groups of the same shape are one type.
+///
+/// The goal comes back round at the same arguments it went in with, so the
+/// assumption fires and the solve ends — which is the half of the finer key
+/// that could have been lost: a key that never repeats answers nothing.
+#[test]
+fn a_recursion_at_a_fixed_argument_still_comes_back_round() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree Nat, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood Nat, tail: Grove }\n\
+         let f : Forest -> Grove = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "Forest -> Grove");
+
+    // And the step a reader is shown says which goal was assumed, arguments
+    // and all — which is the key itself, so the solve reads back as what the
+    // solver actually did.
+    assert_eq!(
+        steps(&mint, &output, "f"),
+        [
+            "unfold  Grove ~ Forest => replaced by the goals below",
+            "  struct  { head: Wood Nat, tail: Grove } ~ { head: Tree Nat, tail: Forest } \
+             => replaced by the goals below",
+            "    unfold  Wood Nat ~ Tree Nat => replaced by the goals below",
+            "      struct  { value: Nat, kids: Grove } ~ { value: Nat, kids: Forest } \
+             => replaced by the goals below",
+            "        prim  Nat ~ Nat => no change",
+            "        assume  Grove ~ Forest => no change",
+            "    assume  Grove ~ Forest => no change",
+        ]
+    );
+}
+
+/// An argument may hold a variable, and the variable may be bound while the
+/// goal that carries it is still open. The assumption is then read against what
+/// the solver has since decided rather than against what it believed when the
+/// goal was pushed.
+///
+/// `peek` is generalized over whether its argument has an `x`, so the use in `q`
+/// asks `Tree { x?: Nat }` against `Wood { x: Nat }` with that question still
+/// open. Comparing the two `value` fields settles it, and by the time the goal
+/// comes back round one field further in it is the same goal — which the step
+/// list below shows being assumed rather than unfolded a second time.
+#[test]
+fn an_assumption_is_read_against_what_has_since_been_decided() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Forest }\n\
+         type Forest = { head: Tree { x: Nat }, tail: Forest }\n\
+         type Wood a = { value: a, kids: Grove }\n\
+         type Grove = { head: Wood { x: Nat }, tail: Grove }\n\
+         let peek : Tree { x?: Nat } -> Forest = fn t => t.kids\n\
+         let q : Wood { x: Nat } -> Grove = fn w => peek w",
+    );
+    assert_eq!(scheme(&mint, &output, "peek"), "Tree { x?: Nat } -> Forest");
+    assert_eq!(
+        steps(&mint, &output, "q")[..9],
+        [
+            "unfold  Tree { x?: Nat } ~ Wood { x: Nat } => replaced by the goals below",
+            "  struct  { value: { x?: Nat }, kids: Forest } ~ { value: { x: Nat }, kids: Grove } \
+         => replaced by the goals below",
+            "    struct  { x?: Nat } ~ { x: Nat } => replaced by the goals below",
+            // Here is where the argument stops being a question.
+            "      bind  ?3 ~ present => ?3 := present",
+            "      prim  Nat ~ Nat => no change",
+            "    unfold  Forest ~ Grove => replaced by the goals below",
+            "      struct  { head: Tree { x: Nat }, tail: Forest } ~ \
+         { head: Wood { x: Nat }, tail: Grove } => replaced by the goals below",
+            // And here is the goal on the stack, recognized through the binding
+            // that has happened since it was pushed.
+            "        assume  Tree { x: Nat } ~ Wood { x: Nat } => no change",
+            "        assume  Forest ~ Grove => no change",
+        ]
+    );
+}
+
+/// The assumption that two names already being compared are equal has to be
+/// keyed on the whole goal, arguments and all. This program is the reason.
+///
+/// `Forest` against `Forest2` unfolds to `Tree Nat` against `Tree2 Nat`, whose
+/// unfolding asks `Bush` against `Bush2`, whose unfolding asks `Tree {}`
+/// against `Tree2 Nat`. Those are the same two *declarations* as the pair
+/// already open, and a different question: one stands for `{ v: {}, .. }` and
+/// the other for `{ v: Nat, .. }`. Keyed on the names alone the solver would
+/// take them as equal and accept `f`; keyed on the goal it asks the question
+/// and finds the contradiction.
+#[test]
+fn a_pair_of_declarations_is_not_assumed_equal_at_other_arguments() {
+    let (_, out, output) = infer_src(
+        "type Tree x = { v: x, k: Bush }\n\
+         type Bush = { t: Tree {}, f: Forest }\n\
+         type Forest = { t: Tree Nat }\n\
+         type Tree2 x = { v: x, k: Bush2 }\n\
+         type Bush2 = { t: Tree2 Nat, f: Forest2 }\n\
+         type Forest2 = { t: Tree2 Nat }\n\
+         let f : Forest -> Forest2 = fn x => x",
+    );
+    // Nothing here grows, so lowering has nothing to say: the whole question is
+    // the solver's.
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+}
+
+/// A recursive constructor unfolds against another of the same shape and comes
+/// back round rather than running away. The point of the test is that it
+/// returns at all.
+#[test]
+fn a_recursive_constructor_does_not_unfold_forever() {
+    let (mint, _, output) = inferred(
+        "type List a = { head: a, tail: List a }\n\
+         type Seq a = { head: a, tail: Seq a }\n\
+         let f : List Nat -> Seq Nat = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "List Nat -> Seq Nat");
+}
+
+/// The declaration binds one parameter, so the annotation hands it one, and
+/// opening the scheme reaches every `A` in the body.
+#[test]
+fn a_repeated_parameter_leaves_one_argument_to_supply() {
+    let (mint, _, output) = infer_src("type P A A = { x: A }\nlet v : P Nat = { x: 1 }");
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(scheme(&mint, &output, "v"), "P Nat");
+}
+
+/// A declaration standing for its own argument may be nested as deep as the
+/// writer likes: unfolding follows one declaration once per level, which is
+/// not following it round.
+#[test]
+fn a_pass_through_declaration_may_be_nested() {
+    let (mint, _, output) = inferred("type Id a = a\nlet x : Id (Id Nat) = 1");
+    assert_eq!(scheme(&mint, &output, "x"), "Id (Id Nat)");
+
+    // Deeper than there are declarations, which is what the old bound could
+    // not survive.
+    inferred("type Id a = a\nlet z : Id (Id (Id (Id Nat))) = 1");
+
+    // And it still unfolds to something: the literal is checked against `Nat`.
+    let (_, _, output) = infer_src("type Id a = a\nlet y : Id (Id Nat) = {}");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+}
+
+/// A row written inside an argument still says what its tail may not stand for.
+/// The condition lives beside the variables rather than inside the type, so it
+/// is only recorded by a walk that reaches in — and if this one stops at the
+/// name, the tail is quietly bound to a row repeating `x` and the definition
+/// comes out with a type it was never shown to have.
+#[test]
+fn a_row_inside_an_argument_still_lacks_what_it_names() {
+    let (_, _, output) = infer_src(
+        "type Box A = { it: A }\n\
+         let f : Box { x: Nat, ..r } -> { ..r } = fn b => { x: 1 }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+}
+
+/// A quantified argument is the definition's to generalize, the same as one
+/// written anywhere else. This is what fails if `quantify` or `zonk` stops at a
+/// name instead of descending into what it was applied to.
+#[test]
+fn an_open_argument_is_generalized_with_its_definition() {
+    let (mint, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "wrap"),
+        "Box { x: Nat, ..'a } -> Nat"
+    );
+}
+
+/// Nothing downstream of inference resolves a solver variable, so none may
+/// survive inside an argument either.
+#[test]
+fn no_solver_variable_survives_inside_an_argument() {
+    let (_, _, output) = inferred(
+        "type Box A = { it: A }\n\
+         let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
+    );
+    for scheme in output.schemes.values() {
+        assert!(
+            !mentions_a_variable(scheme.body()),
+            "a variable survived: {scheme}"
+        );
+    }
+}
+
+/// A row argument's fields are spliced in where the parameter's tail sat. None
+/// of that is new machinery: substitution puts the row into the tail, and the
+/// flattening that already existed for a tail bound to a row does the rest.
+#[test]
+fn a_row_argument_is_spliced_into_the_tail() {
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
+         let n = f { x: 1, y: 2 }",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+
+    // Given nothing, the declaration is just its own fields.
+    let (_, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let g : WithX {} -> Nat = fn p => p.x\n\
+         let m = g { x: 1 }",
+    );
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+
+    // And the spliced field really is required: the row said `y` is there.
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
+         let n = f { x: 1 }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+}
+
+/// A declaration's body says `r` has no `x`, and that condition has to be said
+/// again of every use — it lives beside the variables a use site mints, not
+/// inside the type. Handing the row a field the declaration already names is
+/// refused, and refused the same way whichever route it arrives by.
+///
+/// A row written out is refused where it is written, because what the
+/// declaration names is part of what its parameter stands for and lowering has
+/// both. A row that only turns out to name the field once the solve says what
+/// it is has nowhere earlier to be caught, and is caught at the binding.
+#[test]
+fn a_row_argument_may_not_repeat_a_field_the_type_names() {
+    let (_, out, _) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { x: Nat } -> Nat = fn p => p.x",
+    );
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
+
+    // The same complaint reached the other way: not a written row spliced over
+    // a field, but a tail variable the definition later tries to bind to one.
+    // The condition is only on the variable once something has asked for the
+    // declaration's shape, which the projection here is what does.
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let g : WithX { ..s } -> { ..s } = fn p => { x: p.x }",
+    );
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+
+    // Naming the field rather than covering it is not the same thing, and is
+    // fine: the row still stands for what the declaration does not name.
+    let (_, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let ok : WithX { ..s } -> { x: Nat, ..s } = fn p => p",
+    );
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+}
+
+/// The condition a declaration imposes on its row argument is recorded at the
+/// application, not on the way out of an unfolding — because there may not be
+/// one. Two applications of one declaration are compared argument against
+/// argument, so a goal about `WithX` can be decided from end to end without
+/// either side's body ever being built, and a condition only an unfolding
+/// recorded would simply be lost.
+///
+/// This program is what that cost. `f` says its argument is `WithX` of some
+/// rest, and `g` hands that rest a row naming `x` — which `WithX` names
+/// already. Nothing here unfolds `WithX`: the two `WithX`es meet each other and
+/// agree by their arguments. The definition used to come out typed
+/// `WithX { x: Nat } -> Nat`, a type naming one field twice, with nothing said.
+#[test]
+fn a_row_condition_survives_a_goal_that_never_unfolds() {
+    let (_, out, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { ..s } -> { ..s } -> Nat = fn a => fn b => 1\n\
+         let g : WithX { ..t } -> Nat = fn q => f q { x: 1 }",
+    );
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "repeated-field");
+
+    // A label `WithX` does not name is what the `..` was for, and travels the
+    // same route with nothing to say.
+    let (_, _, output) = infer_src(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { ..s } -> { ..s } -> Nat = fn a => fn b => 1\n\
+         let g : WithX { y: Nat } -> Nat = fn q => f q { y: 1 }",
+    );
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+}
+
+/// Refusing a row is a failure like any other, so the goal it was about is
+/// over: [`Solve::fail`] has already abandoned every copy of the repeated
+/// field, and lining the two rows up afterwards would compare whichever copy
+/// flattening happened to keep and complain a second time about a type nobody
+/// wrote.
+///
+/// The whole route is now caught a phase earlier — what a declaration names is
+/// part of what its row parameter stands for, so lowering refuses the argument
+/// where it is written — which is why this asserts the outcome rather than the
+/// rule: one complaint about the row, at the row, and nothing said twice.
+#[test]
+fn a_refused_row_is_not_compared_afterwards() {
+    let src = "type W r = { x: Nat, ..r }\nlet p : W { x: {} } = { x: {} }";
+    let (_, out, output) = infer_src(src);
+    assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("{ x: {} }").expect("the argument")
+    );
+
+    // Nothing says it again where it was said: what inference is left with is
+    // the definition's own body against the fields `W` declares, which is a
+    // complaint about somewhere else or none at all.
+    for error in &output.errors {
+        assert_ne!(error.span.start, out.errors[0].span.start, "{:#?}", error);
+        assert_ne!(error.kind.code(), "repeated-field", "{error:#?}");
+    }
+}
+
+/// The condition is re-imposed per use rather than recorded once, so one use
+/// being wrong says nothing about another. Two annotations of the same
+/// declaration, one legal and one not, is what tells the two apart.
+#[test]
+fn the_lacks_condition_is_said_again_at_each_use() {
+    let src = "type WithX r = { x: Nat, ..r }\n\
+               let fine : WithX { y: Nat } -> Nat = fn p => p.x\n\
+               let bad : WithX { x: Nat } -> Nat = fn p => p.x\n\
+               let also : WithX { z: Nat } -> Nat = fn p => p.x";
+    let (_, out, output) = infer_src(src);
+    assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
+    // At the one argument that names it, and not at either of the two beside it
+    // that do not.
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("{ x: Nat }").expect("the offending argument")
+    );
+    // And the argument absorbed, so nothing downstream says it again.
+    assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
+}
+
+/// A declaration left open through a parameter is still a declaration: its body
+/// mentions no solver variable, so it generalizes and prints as itself.
+#[test]
+fn a_row_parameter_leaves_the_declaration_closed_to_the_solver() {
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX { y: Nat } -> Nat = fn p => p.x",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "WithX { y: Nat } -> Nat");
+    for scheme in output.schemes.values() {
+        assert!(
+            !mentions_a_variable(scheme.body()),
+            "a variable survived: {scheme}"
+        );
+    }
+}
+
+/// Every shape the growth rule allows comes back round. Each of these is a
+/// solve that only ends because a goal it has already taken on is one it
+/// recognizes, and reaching the assertion at all is most of what is checked.
+#[test]
+fn a_recursion_that_cannot_grow_always_comes_back_round() {
+    // A group member mentioned at a fixed argument that is itself a member of
+    // the group.
+    inferred(
+        "type A a = { x: A B, v: a }\n\
+         type B = { y: A Nat }\n\
+         type C a = { x: C D, v: a }\n\
+         type D = { y: C Nat }\n\
+         let f : A Nat -> C Nat = fn z => z",
+    );
+
+    // Asked at an argument the declarations never mention, so the goal has to
+    // travel one round before it repeats.
+    inferred(
+        "type T a = { next: T Nat }\n\
+         type U a = { next: U Nat }\n\
+         let f : T {} -> U {} = fn x => x",
+    );
+
+    // A permutation: the arguments only ever swap places, so the lists they
+    // make are finitely many.
+    inferred(
+        "type A a b = { x: B b a, v: a }\n\
+         type B c d = { x: A d c, v: c }\n\
+         type P a b = { x: Q b a, v: a }\n\
+         type Q c d = { x: P d c, v: c }\n\
+         let f : A Nat {} -> P Nat {} = fn x => x",
+    );
 }

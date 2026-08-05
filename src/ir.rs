@@ -1,12 +1,16 @@
-use std::rc::Rc;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    rc::Rc,
+};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{Prim, Ty},
+    types::{ParamKind, Prim, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -25,7 +29,40 @@ pub struct Decl<T> {
     /// ascribed one. Always `None` for a `type` declaration: that *is* a type,
     /// so there is nothing to check it against.
     pub annotation: Option<Type>,
+    /// The parameters a `type` declaration binds, in order. Always empty for a
+    /// term, which binds none of its own — a lambda's argument is bound inside
+    /// its body rather than by the definition.
+    pub params: Vec<Param>,
     pub value: T,
+}
+
+/// One parameter of a `type` declaration.
+#[derive(Debug, Clone)]
+pub struct Param {
+    /// Where the name was written, so a repeat can point at what it repeats.
+    pub span: Span,
+    pub symbol: Symbol,
+    /// What it stands for. Not known while the body is being lowered — it
+    /// follows from how the body uses it — so it is [`ParamKind::Type`] until
+    /// the kinds are worked out, once every body is in.
+    pub kind: ParamKind,
+    /// Whether the argument written here survives unfolding: whether it reaches
+    /// a position of what the declaration stands for, rather than being handed
+    /// to something that throws it away.
+    ///
+    /// `a` in `type Box a = { it: a }` does, and `a` in `type Ptr a = Nat` does
+    /// not. The difference is the whole of what
+    /// [`Rule::Congruent`](crate::inference::Rule) may be taken on: comparing
+    /// two applications argument by argument agrees with comparing what they
+    /// stand for exactly when every argument reaches the body, so a
+    /// declaration with an argument that does not is compared by unfolding
+    /// like any other type. See [`relevance`] for how it is worked out and
+    /// [`Ty::Named`] for what rests on it.
+    ///
+    /// Not known while the body is being lowered either — it follows from what
+    /// every *other* declaration does with what it is handed — so it is `false`
+    /// until the fixpoint has run, which is the reading that decides nothing.
+    pub relevant: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,9 +108,9 @@ pub type Type = Tracked<TypeKind>;
 pub enum TypeKind {
     Struct {
         fields: IndexMap<String, TypeField>,
-        /// The `..` tail, when the struct type was written open. Never
-        /// `Some` inside a `type` declaration — see
-        /// [`ErrorKind::OpenDeclaredType`].
+        /// The `..` tail, when the struct type was written open. Inside a
+        /// `type` declaration this is `Some` only for a tail naming a row
+        /// parameter — see [`ErrorKind::OpenDeclaredType`].
         tail: Option<Tail>,
     },
     Arrow {
@@ -81,6 +118,37 @@ pub enum TypeKind {
         to: Box<Type>,
     },
     Ident(Symbol),
+    /// A declared type applied to arguments.
+    ///
+    /// The head is a symbol rather than a type: lowering is where "only a
+    /// declared type may be applied" is said, so by the time one of these
+    /// exists the head has already been one. The spine arrives flat from the
+    /// parser and stays flat, because a declaration is applied to everything it
+    /// takes at once.
+    Apply {
+        head: Symbol,
+        /// Where the head was written, for the complaints and the rows that are
+        /// about the name alone: the growth [`grows`] finds is a property of the
+        /// declaration being mentioned, and the debugger gives the head a row of
+        /// its own to cross-highlight against what it names.
+        ///
+        /// An arity complaint is deliberately *not* one of those. A wrong count
+        /// is about the whole application — counting the arguments is the thing
+        /// the reader has to do, and underlining four characters of a name says
+        /// nothing about how many follow it. See [`Builder::apply`].
+        head_span: Span,
+        args: Vec<Type>,
+    },
+    /// A parameter of the declaration this type is the body of.
+    ///
+    /// Both the symbol and the position, because the two readers want
+    /// different things: the debugger names it and cross-highlights it, and
+    /// inference substitutes for it by position — which is [`Ty::Bound`]
+    /// exactly, so lowering one is a rename rather than a translation.
+    Param {
+        symbol: Symbol,
+        index: u32,
+    },
     Prim(Prim),
     Error,
 }
@@ -94,14 +162,31 @@ pub struct TypeField {
     pub value: Type,
 }
 
-/// The `..` tail of a struct type. The name, when there is one, stays a
-/// string for the reason [`Field`]'s keys do: it is scoped to the one
-/// annotation it appears in, not a path anything can refer to, so there is no
-/// symbol to resolve it to and nothing here can fail to resolve.
+/// The `..` tail of a struct type: what is said about the fields not named.
 #[derive(Debug, Clone)]
 pub struct Tail {
     pub span: Span,
-    pub name: Option<String>,
+    pub of: Row,
+}
+
+/// What a `..` tail stands for.
+#[derive(Debug, Clone)]
+pub enum Row {
+    /// `..` — any fields at all. Only an annotation may say this; a
+    /// declaration holds for every definition and so cannot leave the question
+    /// open. See [`ErrorKind::OpenDeclaredType`].
+    Anything,
+    /// `..r` in an annotation, where `r` binds nothing: a name scoped to that
+    /// one annotation, staying a string for the reason [`Field`]'s keys do —
+    /// it is not a path anything can refer to, so there is no symbol to
+    /// resolve it to and nothing here can fail to resolve. Two `..r` in one
+    /// annotation stand for one rest; another annotation's `r` is unrelated.
+    Named(String),
+    /// `..r` naming a row parameter of the declaration being lowered. This is
+    /// the one tail a declaration may have, and the only way a declared type
+    /// can be left open: what it stands for is supplied at every use rather
+    /// than decided once here, so the body still mentions no solver variable.
+    Param { symbol: Symbol, index: u32 },
 }
 
 /// A struct field. The name is the map key rather than part of the value, so
@@ -142,16 +227,119 @@ pub enum ErrorKind {
     /// that is what makes recursive types writable — because unfolding such a
     /// type reaches a shape one step in. A chain of bare names never reaches
     /// one, so there is nothing for the declaration to mean.
+    ///
+    /// A declaration that stands for one of its own arguments is a link in
+    /// such a chain rather than an end to it: `type A a = a` hands back
+    /// whatever it was given, so `type B = A B` leads back to `B` with only a
+    /// hand-off in between and reaches no shape either. What closes the loop
+    /// is the whole chain, so the loop is looked for by following what each
+    /// declaration stands for rather than by reading any one body.
     Circular,
-    /// A `..` tail or a `?` field inside a `type` declaration, as in
+    /// A `?` field inside a `type` declaration, or a `..` tail there that does
+    /// not name one of the declaration's own parameters — as in
     /// `type t = { x: Nat, .. }`.
     ///
     /// What a declaration stands for is lowered once, before any definition,
-    /// and holds for all of them; a tail or an optional field stands for
-    /// something a definition gets to decide, so there is nothing for one to
-    /// mean here. Inference leans on the difference: an alias body mentions
-    /// no solver variable, which is what lets every walk stop at a name.
+    /// and holds for all of them; a `?` or a bare `..` stands for something a
+    /// definition gets to decide, so there is nothing for one to mean here.
+    ///
+    /// A tail naming a row parameter is the exception, and the reason the rule
+    /// is worth stating this precisely rather than as "a declaration is
+    /// closed". What such a tail stands for is not decided here either — it is
+    /// supplied at every use — so it lowers to a [`Ty::Bound`], not to a
+    /// variable, and the property inference leans on survives untouched: a
+    /// declaration's body mentions no solver variable, which is what lets every
+    /// walk stop at a name instead of descending into what it stands for.
     OpenDeclaredType,
+    /// A type given a different number of arguments than it takes, including a
+    /// name written bare that takes some.
+    ///
+    /// There is no partial application: a declaration takes what it takes
+    /// wherever it is written, so a name short of its arguments is the same
+    /// complaint as one given too many.
+    Arity {
+        expected: usize,
+        found: usize,
+    },
+    /// Something that is not a declared type, applied: a primitive, a struct,
+    /// a parenthesized arrow.
+    NotAConstructor,
+    /// A parameter used as the head of an application, as in
+    /// `type Flip f a = f a`.
+    ///
+    /// A parameter stands for one type, never for something still waiting for
+    /// types of its own. Refusing this is what keeps every declaration's
+    /// parameters plain — each one a type, and nothing higher — so that
+    /// checking an application is counting rather than a language of its own.
+    ParameterApplied,
+    /// One declaration binding a name twice: `type Pair A A = ...`.
+    DuplicateParameter {
+        previous: Span,
+    },
+    /// A type that leads back to itself having been given an argument built out
+    /// of what it takes, as in `type T a = { next: T { x: a } }`.
+    ///
+    /// One reason, and it is growth. Unfolding that declaration hands on
+    /// `{ x: a }`, then `{ x: { x: a } }`, and so on: the argument is bigger
+    /// every time and never comes back round, so there is no finite answer to
+    /// whether two of them are the same type.
+    ///
+    /// What does come back round is allowed, and that is the whole of the rule.
+    /// A parameter handed straight on is whatever came in. An argument
+    /// mentioning no parameter is written out in the program and is the same
+    /// type every round, so `type Forest = { head: Tree Nat }` inside `Tree`'s
+    /// own group is an ordinary declaration and is accepted. See [`grows`] for
+    /// the condition and [`Solve::unfold`](crate::inference) for what rests on
+    /// it.
+    GrowingRecursion,
+    /// A parameter used both as a type and as the fields a row does not name,
+    /// as in `type Bad r = { x: r, ..r }`.
+    ///
+    /// A parameter is written bare, so what it stands for is read off its
+    /// uses. Two uses that disagree leave nothing to read, and neither of them
+    /// is the wrong one — it is the declaration that has to say which it meant.
+    ///
+    /// The two readings can meet across declarations, when one hands its
+    /// parameter to another and uses it as a type as well. The declaration
+    /// told is the one that brought them together: one that merely hands the
+    /// parameter on to a declaration already broken says one thing about its
+    /// own and is right about it, however long the chain of them is.
+    ///
+    /// Every declaration the clash reaches is erased all the same, told or not.
+    /// What such a body would stand for is exactly what could not be worked
+    /// out, and leaving it standing would put whatever a use site handed it
+    /// into a row — so the declaration absorbs, and nothing is asked of the
+    /// arguments written at it either.
+    MixedParameter,
+    /// Something that cannot stand for a set of fields, written where a row
+    /// parameter goes: `WithX Nat` against `type WithX r = { x: Nat, ..r }`.
+    ///
+    /// A struct can stand for one, and so can another row parameter. A
+    /// declared name cannot, though it looks as though it should: a tail
+    /// holding a name would have to be unfolded by the walks that flatten
+    /// rows, and neither does.
+    ///
+    /// The argument absorbs, so this is said once. Left standing it would be
+    /// substituted into the tail all the same, and the reader would be told a
+    /// second time in words about a row they never wrote.
+    NotARow,
+    /// A row written where a row parameter goes, naming a field the
+    /// declaration it is handed to already names: `WithX { x: Nat }` against
+    /// `type WithX r = { x: Nat, ..r }`.
+    ///
+    /// A `..` covers the fields its row does not write out, so a row spliced
+    /// into one may not write out any of them: the type would name the field
+    /// twice, and the two copies could disagree. Which labels those are is
+    /// part of what the parameter stands for — see [`ParamKind::Row`] — so it
+    /// is known here, at the argument, rather than only wherever something
+    /// later happened to flatten the row.
+    ///
+    /// The argument absorbs, for the reason [`ErrorKind::NotARow`] does: left
+    /// standing it would be substituted into the tail all the same, and the
+    /// reader would be told a second time about a row nobody wrote.
+    RepeatedRowField {
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +357,18 @@ struct Builder<'a> {
     errors: Vec<Error>,
     terms: Names,
     types: Names,
+    /// How many arguments each declared type takes. Filled before any body is
+    /// lowered, so an application can be counted wherever it appears —
+    /// including above the declaration it names, which the hoist allows.
+    ///
+    /// The count is the parameters the declaration bound, not the names it
+    /// wrote: a repeated name binds nothing, so there is nothing in the body
+    /// that could name the argument it would ask for.
+    arities: HashMap<Symbol, usize>,
+    /// The parameters of the declaration being lowered, by symbol, and where
+    /// each sits in its list. Empty outside a `type` body, which is what makes
+    /// a parameter unwritable in an annotation.
+    params: HashMap<Symbol, u32>,
 }
 
 /// Which symbol a name means, for one namespace.
@@ -200,6 +400,87 @@ enum Place {
     Annotation,
 }
 
+/// Where one parameter sits: the declaration that binds it, and its position
+/// in that declaration's list. The unit everything in [`kinds`] and
+/// [`relevance`] is said about, since a parameter's own symbol says nothing
+/// about what is handed to it.
+type Slot = (Symbol, u32);
+
+/// One thing a declaration's body says about one of its own parameters. See
+/// [`constrain`], which reads them off a body, and [`kinds`], which resolves
+/// the three into a kind apiece.
+enum Fact {
+    /// The parameter is used as this kind here. A [`ParamKind::Row`] carries
+    /// the labels the row it tails writes out, which are what an argument
+    /// substituted for it may not name.
+    Says(u32, ParamKind),
+    /// The parameter is handed straight on to another declaration's slot, so
+    /// it stands for whatever that slot stands for — and may not name whatever
+    /// that slot may not name.
+    Hands(u32, Slot),
+    /// The parameter is the tail of a row written out as an argument, as `s` is
+    /// in `WithX { y: Nat, ..s }`. The row goes where the callee's own tail
+    /// sat, so this tail inherits the callee's obligation as well as its own
+    /// row's — but the *argument* is a row rather than the parameter, so this
+    /// says nothing about which of the two readings anything has.
+    Tails(u32, Slot),
+}
+
+/// Everything one body says about one of its own parameters, gathered before
+/// anything is resolved. [`Fact::Hands`] is what crosses declarations and lives
+/// in an edge map instead; these are what a slot says of itself.
+#[derive(Debug, Default)]
+struct Reading {
+    /// Read as a whole type somewhere.
+    as_type: bool,
+    /// Read as the fields a row does not name somewhere.
+    as_row: bool,
+    /// The labels those rows write out beside it.
+    lacks: IndexSet<String>,
+}
+
+/// What [`kinds`] worked out for the whole table.
+struct Kinds {
+    /// A kind per parameter, in the declaration's own order.
+    kinds: HashMap<Symbol, Vec<ParamKind>>,
+    /// Every declaration with a parameter read two ways. Its body is erased
+    /// and nothing is asked of the arguments written at it: what a mixed
+    /// parameter means is exactly what could not be worked out, and checking a
+    /// use site against a reading nobody could settle is the second complaint
+    /// about the first mistake.
+    mixed: IndexSet<Symbol>,
+    /// One complaint per declaration that has to say which reading it meant —
+    /// which is fewer than the declarations in `mixed`, since a declaration
+    /// that merely hands a broken parameter on has nothing to fix.
+    errors: Vec<Error>,
+}
+
+/// What a declaration's body turns out to be once every name in the way has
+/// been followed: a shape one step in, one of the declaration's own
+/// parameters, or a loop that reaches neither.
+#[derive(Debug, Clone, Copy)]
+enum Stands {
+    Shape,
+    Param(u32),
+    Loop,
+}
+
+/// Following what every declaration stands for, once, remembering the loops
+/// closed on the way. See [`ErrorKind::Circular`] for what a loop costs.
+struct Follow<'a> {
+    types: &'a IndexMap<Symbol, Decl<Type>>,
+    /// What each declaration was found to stand for. [`Stands::Loop`] is
+    /// absorbing — anything that reduces into a loop never reaches a shape
+    /// either — so a result reached under an open assumption is still the
+    /// right one to keep.
+    done: HashMap<Symbol, Stands>,
+    /// The declarations being followed, outermost first. Meeting one again is
+    /// the loop, and everything from it inwards is on that loop.
+    open: Vec<Symbol>,
+    /// Every declaration found to be on a loop, in the order they were found.
+    looping: IndexSet<Symbol>,
+}
+
 impl TermKind {
     fn with_span(self, span: Span) -> Term {
         Term {
@@ -217,6 +498,8 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         errors: Vec::new(),
         terms: Names::default(),
         types: Names::default(),
+        arities: HashMap::new(),
+        params: HashMap::new(),
     };
     let mut program = Program {
         terms: IndexMap::new(),
@@ -231,7 +514,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     let mut terms = Vec::new();
     for stmt in stmts {
         match stmt.tracked {
-            StmtKind::Type { name, body } => types.push((name, body)),
+            StmtKind::Type { name, params, body } => types.push((name, params, body)),
             StmtKind::Let { name, ty, body } => terms.push((name, ty, body)),
         }
     }
@@ -243,16 +526,37 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // so a repeated one is still reported against the first.
     let declared: Vec<_> = types
         .iter()
-        .map(|(name, _)| b.declare(Namespace::Types, name))
+        .map(|(name, _, _)| b.declare(Namespace::Types, name))
         .collect();
-    for (symbol, (name, body)) in declared.into_iter().zip(types) {
+    // Every declaration's parameters, minted before any body is read, and how
+    // many arguments each declaration therefore takes. Knowing the count above
+    // the declaration itself is what makes a forward reference applicable:
+    // `type A = B Nat` above `type B x = ...` has to be counted, and counting
+    // it cannot wait for `B` to be lowered.
+    let bound: Vec<Vec<Param>> = types
+        .iter()
+        .map(|(_, params, _)| b.declare_params(params))
+        .collect();
+    b.arities = declared
+        .iter()
+        .zip(&bound)
+        .filter_map(|(symbol, params)| Some(((*symbol)?, params.len())))
+        .collect();
+    for ((symbol, (name, _, body)), params) in declared.into_iter().zip(types).zip(bound) {
+        // The parameters are in scope for the length of the body and released
+        // after it, the way a lambda's argument is — this is the type
+        // language's only binder, and its only scope.
+        let mark = b.types.mark();
+        b.scope_params(&params);
         let value = b.ty(body, Place::Declaration);
+        b.types.release(mark);
         if let Some(symbol) = symbol {
             program.types.insert(
                 symbol,
                 Decl {
                     name_span: name.span,
                     annotation: None,
+                    params,
                     value,
                 },
             );
@@ -262,17 +566,55 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // is what mutual visibility just made writable. See [`ErrorKind::Circular`]
     // for why it means nothing, and [`Solve::unify`](crate::inference) for what
     // it would cost the solver to be handed one.
+    // Read back off the table in declaration order, so the reports come in the
+    // order the reader wrote them rather than the order the loops were found.
+    let on_a_loop = looping(&program.types);
     let circular: Vec<_> = program
         .types
         .keys()
         .copied()
-        .filter(|symbol| returns_to_itself(&program.types, *symbol))
+        .filter(|symbol| on_a_loop.contains(symbol))
         .collect();
     for symbol in circular {
         let decl = &mut program.types[&symbol];
         let span = decl.value.span;
         decl.value = span.track(TypeKind::Error);
         b.error(span, ErrorKind::Circular);
+    }
+    // The other recursion the solver cannot be handed: one that builds a bigger
+    // argument on the way round. See [`ErrorKind::GrowingRecursion`].
+    for (symbol, at) in growing(&program.types) {
+        let decl = &mut program.types[&symbol];
+        let span = decl.value.span;
+        decl.value = span.track(TypeKind::Error);
+        b.error(at, ErrorKind::GrowingRecursion);
+    }
+    // What each parameter stands for, which only the finished bodies can say: a
+    // parameter handed straight on to another declaration takes its kind from
+    // there, so no one body decides its own.
+    let Kinds {
+        mut kinds,
+        mixed,
+        errors: clashes,
+    } = kinds(&program.types);
+    b.errors.extend(clashes);
+    for (symbol, kinds) in &kinds {
+        for (param, kind) in program.types[symbol].params.iter_mut().zip(kinds) {
+            param.kind = kind.clone();
+        }
+    }
+    // A declaration whose parameter could not be read one way is erased, the
+    // way a circular one is, and dropped from the table the use sites are
+    // checked against. Both halves are the absorbing: a body left standing
+    // would put whatever a use site handed it into a tail, which is the one
+    // thing nothing downstream can recover from, and a slot left in the table
+    // would complain at every ordinary type written at it — three complaints
+    // about code the reader got right, for one mistake somewhere else.
+    for symbol in &mixed {
+        let decl = &mut program.types[symbol];
+        let span = decl.value.span;
+        decl.value = span.track(TypeKind::Error);
+        kinds.remove(symbol);
     }
     for (name, ty, body) in terms {
         // Annotation and body are lowered in the order they were written, and
@@ -286,41 +628,789 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
                 Decl {
                     name_span: name.span,
                     annotation,
+                    // A term binds no parameters of its own: a lambda's
+                    // argument is bound inside its body, not by the definition.
+                    params: Vec::new(),
                     value,
                 },
             );
         }
     }
+    // What the arguments handed to a row parameter are allowed to be. Last of
+    // all, because an annotation is as much a place to write one as a
+    // declaration's body is, and annotations are only just lowered.
+    b.errors.extend(row_arguments(&mut program, &kinds));
+    // Which parameters survive unfolding, read off the bodies as they finally
+    // stand: every erasure above is a position a parameter no longer reaches,
+    // and calling one relevant that nothing keeps would let the solver decide
+    // by a name what unfolding decides otherwise.
+    let relevant = relevance(&program.types);
+    for (symbol, decl) in program.types.iter_mut() {
+        for (index, param) in decl.params.iter_mut().enumerate() {
+            param.relevant = relevant.contains(&(*symbol, index as u32));
+        }
+    }
+    // Every complaint in the order the reader would meet it. The passes above
+    // do not run in source order and cannot — what a parameter stands for is
+    // not known until every body is in, and what a row argument may be is not
+    // known until every annotation is — so the whole list is put back in the
+    // one place that has all of it. The sort is stable, so two complaints about
+    // one span keep the order the passes found them in.
+    //
+    // Said here rather than left to each reporter: the debugger sorts its
+    // diagnostics for its own reasons, and a driver that prints them in the
+    // order they arrive should not be the only one telling the reader about
+    // line 3 before line 2.
+    b.errors.sort_by_key(|error| error.span.start);
     Output {
         program,
         errors: b.errors,
     }
 }
 
-/// Whether following what `start` is declared as, through nothing but names,
-/// arrives back at `start`.
+/// Every declaration that leads back to itself through nothing but names, in
+/// the order the loops were found.
 ///
-/// Only a body that is a name outright is followed. A type with any structure
+/// Only what a declaration stands for is followed. A type with any structure
 /// to it — `type t = { next: t }`, `type t = t -> Nat` — says what it is one
 /// step in, and the loop through it is the recursion this language is for; it
-/// is only a name standing for a name standing for the first that never says
-/// anything. The walk is bounded by the number of declarations there are,
-/// since a longer chain has already passed through one of them twice.
-fn returns_to_itself(types: &IndexMap<Symbol, Decl<Type>>, start: Symbol) -> bool {
-    let mut at = start;
-    for _ in 0..types.len() {
-        let Some(decl) = types.get(&at) else {
-            return false;
-        };
-        let TypeKind::Ident(next) = decl.value.tracked else {
-            return false;
-        };
-        if next == start {
-            return true;
-        }
-        at = next;
+/// is a name standing for a name standing for the first that never says
+/// anything. A name, or a parameter, which is the argument written for it:
+/// `type A a = a` says no more about `type B = A B` than a bare name would,
+/// because what `A` stands for is whatever it was handed.
+///
+/// Each declaration is followed once and remembered, which is what keeps a
+/// legal nesting from looking like a loop as much as it is what makes this
+/// terminate: `Id (Id Nat)` never finds `Id` still open, because the first was
+/// finished before the second was reached. Only the declarations *on* a loop
+/// are named — one that merely leads into one has nothing to fix.
+fn looping(types: &IndexMap<Symbol, Decl<Type>>) -> IndexSet<Symbol> {
+    let mut follow = Follow {
+        types,
+        done: HashMap::new(),
+        open: Vec::new(),
+        looping: IndexSet::new(),
+    };
+    for symbol in types.keys() {
+        follow.decl(*symbol);
     }
-    false
+    follow.looping
+}
+
+impl Follow<'_> {
+    /// What one declaration stands for, followed once and remembered.
+    fn decl(&mut self, symbol: Symbol) -> Stands {
+        if let Some(stands) = self.done.get(&symbol) {
+            return *stands;
+        }
+        // Meeting a declaration that is still being followed is the loop, and
+        // everything pushed since is on it with them.
+        if let Some(at) = self.open.iter().position(|open| *open == symbol) {
+            self.looping.extend(self.open[at..].iter().copied());
+            return Stands::Loop;
+        }
+        // A symbol with no declaration behind it is one whose declaration was
+        // refused as a repeat; counting it against this would be a second
+        // complaint about the first thing that went wrong, as in
+        // [`Builder::arity`].
+        let types = self.types;
+        let Some(decl) = types.get(&symbol) else {
+            return Stands::Shape;
+        };
+        self.open.push(symbol);
+        let stands = self.ty(&decl.value);
+        self.open.pop();
+        self.done.insert(symbol, stands);
+        stands
+    }
+
+    /// What one written type stands for, in the scope of the declaration being
+    /// followed.
+    fn ty(&mut self, ty: &Type) -> Stands {
+        match &ty.tracked {
+            // A shape one step in, which is all a declaration has to reach.
+            // `Error` absorbs, as everywhere else.
+            TypeKind::Struct { .. }
+            | TypeKind::Arrow { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Error => Stands::Shape,
+            TypeKind::Param { index, .. } => Stands::Param(*index),
+            TypeKind::Ident(symbol) => self.decl(*symbol),
+            TypeKind::Apply { head, args, .. } => match self.decl(*head) {
+                Stands::Shape => Stands::Shape,
+                Stands::Loop => Stands::Loop,
+                // The head hands back one of the arguments written here, so
+                // following it lands on a type still in the current scope and
+                // needs no substitution to do it — which is why a parameter of
+                // the head is not a parameter of anything this walk is in the
+                // middle of.
+                Stands::Param(index) => match args.get(index as usize) {
+                    Some(arg) => self.ty(arg),
+                    None => Stands::Shape,
+                },
+            },
+        }
+    }
+}
+
+/// What each parameter of each declaration stands for, worked out from how the
+/// bodies use them, and every parameter used both ways.
+///
+/// A parameter is written bare, so its kind is read off its uses: a name in a
+/// `..` tail stands for a row, a name anywhere else stands for a type, and a
+/// name handed straight on to another declaration stands for whatever that
+/// declaration's parameter in that position stands for. The third is what makes
+/// this an inference rather than a scan — declarations are hoisted and may name
+/// each other, so `type A x = B x` and `type B y = A y` constrain each other in
+/// a circle.
+///
+/// Which is why the answer is a reachability question and not an assignment: a
+/// slot stands for whatever it says of itself together with whatever every slot
+/// it hands itself on to says. Reachability needs no order, so no declaration
+/// can win a race by being written first, and it has a direction, so a
+/// disagreement is reported against the parameter that reached both readings
+/// rather than against whichever of the two a symmetric answer would have had
+/// to guess between.
+///
+/// Handing a parameter on is a demand on the *argument*, never on the callee. A
+/// use site writing `WithX Nat` says nothing about what `WithX` takes; it is
+/// checked against what `WithX` takes, by [`row_arguments`]. A declaration says
+/// what it takes, and a use site is not the declaration.
+///
+/// A slot nothing said anything about stands for a type: `type Ghost a = Nat`
+/// takes a type, because that is what a reader writing `Ghost Nat` will expect
+/// and there is nothing to contradict it.
+///
+/// A row parameter carries one thing more than the reading: the labels an
+/// argument written at it may not name. Those join the same way — a slot may
+/// not name what it writes out beside itself, nor what any slot it hands itself
+/// on to may not name — so the set falls out of the same closure with union in
+/// place of a boolean or. It is finite because the labels in a program are, so
+/// no amount of handing on can make it grow forever.
+fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
+    // What each body says of its own parameters, which slots each one hands
+    // itself on to, and which ones sit in the tail of a row handed on. All
+    // gathered over the whole table before anything is resolved, so the walk
+    // needs nothing from the answer and the answer needs nothing from the
+    // order.
+    let mut said: HashMap<Slot, Reading> = HashMap::new();
+    let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
+    let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
+    for (symbol, decl) in types {
+        constrain(&decl.value, &mut |fact| match fact {
+            Fact::Says(index, ParamKind::Type) => {
+                said.entry((*symbol, index)).or_default().as_type = true
+            }
+            Fact::Says(index, ParamKind::Row(labels)) => {
+                let entry = said.entry((*symbol, index)).or_default();
+                entry.as_row = true;
+                entry.lacks.extend(labels);
+            }
+            Fact::Hands(index, to) => handed.entry((*symbol, index)).or_default().push(to),
+            Fact::Tails(index, to) => tails.entry((*symbol, index)).or_default().push(to),
+        });
+    }
+    // Two closures over two edge sets, because the two questions travel
+    // differently. Which reading a slot has travels only along a parameter
+    // handed straight on: a row written out as an argument is a row whatever
+    // the callee is, so letting that edge carry the reading would call every
+    // tail inside an ordinary argument a mixed parameter. What a slot may not
+    // name travels along both, since either way the argument lands where the
+    // callee's tail sat.
+    let reads = closure(&handed);
+    let mut edges = handed.clone();
+    for (slot, to) in tails {
+        edges.entry(slot).or_default().extend(to);
+    }
+    let carries = closure(&edges);
+
+    let mut out = HashMap::new();
+    let mut mixed = IndexSet::new();
+    let mut told = Vec::new();
+    for (symbol, decl) in types {
+        let mut kinds = Vec::with_capacity(decl.params.len());
+        for (index, param) in decl.params.iter().enumerate() {
+            let slot = (*symbol, index as u32);
+            let (mut as_type, mut as_row) = (false, false);
+            for demand in reached(&reads, slot) {
+                let Some(reading) = said.get(&demand) else {
+                    continue;
+                };
+                as_type |= reading.as_type;
+                as_row |= reading.as_row;
+            }
+            let mut lacks = IndexSet::new();
+            for demand in reached(&carries, slot) {
+                if let Some(reading) = said.get(&demand) {
+                    lacks.extend(reading.lacks.iter().cloned());
+                }
+            }
+            // A parameter used both ways is reported against the parameter
+            // rather than against either use: neither use is wrong on its own,
+            // and it is the declaration that has to say which it meant. The
+            // declaration told is the one that brought the two readings
+            // together — a declaration that merely hands the parameter on to
+            // one already broken is right about its own and has nothing to
+            // change, which is what the second condition says. A slot leading
+            // back to itself is not below itself, so a pair that disagree
+            // around a circle are each told rather than neither.
+            if as_type && as_row {
+                mixed.insert(*symbol);
+                let below = handed.get(&slot).into_iter().flatten().any(|to| {
+                    both_ways(&reads, &said, *to) && !reached(&carries, *to).any(|at| at == slot)
+                });
+                if !below {
+                    told.push(Error {
+                        span: param.span,
+                        kind: ErrorKind::MixedParameter,
+                    });
+                }
+            }
+            // A parameter read two ways is still taken as a row, so that the
+            // debugger and the Types tab show what the body actually said of
+            // it. Nothing is enforced against it — the declaration is a
+            // write-off and `mixed` says so — but calling it a type would be
+            // this pass reporting one thing and displaying another.
+            kinds.push(match as_row {
+                true => ParamKind::Row(lacks),
+                false => ParamKind::Type,
+            });
+        }
+        out.insert(*symbol, kinds);
+    }
+    Kinds {
+        kinds: out,
+        mixed,
+        errors: told,
+    }
+}
+
+/// A slot together with everything it leads to, which is the set every question
+/// in [`kinds`] is answered over: a slot stands for whatever it says of itself
+/// joined with whatever every slot it hands itself on to says.
+fn reached(closed: &IndexMap<Slot, IndexSet<Slot>>, slot: Slot) -> impl Iterator<Item = Slot> + '_ {
+    std::iter::once(slot).chain(closed.get(&slot).into_iter().flatten().copied())
+}
+
+/// Whether one slot reaches both readings — the question [`kinds`] asks of a
+/// slot's successors to decide whether the clash it found is already somebody
+/// else's to fix.
+fn both_ways(
+    reads: &IndexMap<Slot, IndexSet<Slot>>,
+    said: &HashMap<Slot, Reading>,
+    slot: Slot,
+) -> bool {
+    let (mut as_type, mut as_row) = (false, false);
+    for demand in reached(reads, slot) {
+        if let Some(reading) = said.get(&demand) {
+            as_type |= reading.as_type;
+            as_row |= reading.as_row;
+        }
+    }
+    as_type && as_row
+}
+
+/// Everything one declaration's body says about its own parameters. See
+/// [`Fact`] for the three, and [`kinds`], which resolves them into a kind
+/// apiece.
+fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
+    match &ty.tracked {
+        // A name reached as a type is one: this walk only descends through
+        // positions a type goes in, so arriving here at all is the statement.
+        TypeKind::Param { index, .. } => out(Fact::Says(*index, ParamKind::Type)),
+        TypeKind::Struct { fields, tail } => {
+            for field in fields.values() {
+                constrain(&field.value, out);
+            }
+            if let Some(Tail {
+                of: Row::Param { index, .. },
+                ..
+            }) = tail
+            {
+                // The fields written beside the tail are exactly what it may
+                // not stand for: they are already named here, and a `..`
+                // covers what is not.
+                let labels = fields.keys().cloned().collect();
+                out(Fact::Says(*index, ParamKind::Row(labels)));
+            }
+        }
+        TypeKind::Arrow { from, to } => {
+            constrain(from, out);
+            constrain(to, out);
+        }
+        TypeKind::Apply { head, args, .. } => {
+            for (at, arg) in args.iter().enumerate() {
+                let slot = (*head, at as u32);
+                match &arg.tracked {
+                    // A parameter handed straight on stands for whatever it is
+                    // handed to. This is the statement that crosses
+                    // declarations, and the only one that needs resolving
+                    // rather than reading.
+                    //
+                    // Recorded here and *not* descended into: argument position
+                    // is not type position, and walking in would say the
+                    // parameter stands for a type — which is how a row handed
+                    // straight on came to look like a parameter used both ways.
+                    TypeKind::Param { index, .. } => out(Fact::Hands(*index, slot)),
+                    // Anything else says nothing about what the head takes.
+                    // Writing `WithX Nat` is a claim about `Nat`, not about
+                    // `WithX` — the argument is checked against the kind the
+                    // declaration was read to have, by [`row_arguments`], and
+                    // letting a use site vote here is what made that kind
+                    // depend on which declaration was written first. What is
+                    // inside the argument still speaks for itself, so this
+                    // descends.
+                    //
+                    // A row written out here is the one thing that carries
+                    // something back across the same edge: its own tail ends up
+                    // where the callee's tail sat, so it inherits what the
+                    // callee may not name. That is an obligation and not a
+                    // reading, which is why it is a [`Fact::Tails`] rather than
+                    // a second [`Fact::Hands`].
+                    _ => {
+                        if let TypeKind::Struct {
+                            tail:
+                                Some(Tail {
+                                    of: Row::Param { index, .. },
+                                    ..
+                                }),
+                            ..
+                        } = &arg.tracked
+                        {
+                            out(Fact::Tails(*index, slot));
+                        }
+                        constrain(arg, out);
+                    }
+                }
+            }
+        }
+        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {}
+    }
+}
+
+/// Every argument written where a row parameter goes that could not be one,
+/// erased where it stood.
+///
+/// Two ways to fail, and they are the two halves of what [`ParamKind::Row`]
+/// says. An argument has to be something that *can* stand for a set of fields
+/// — [`row_shaped`] — and it has to be a set of fields the declaration does not
+/// already name, since a `..` covers only what its row leaves out.
+///
+/// The kinds themselves are a well-formedness check and nothing more — a
+/// struct handed to a row parameter lowers to exactly the type it would
+/// anywhere else, and substitution puts it wherever the parameter sat. What
+/// this refuses is the argument that would leave a row holding something no row
+/// can hold, which is the invariant [`Ty::Struct`] documents and nothing else
+/// enforces, and the argument that would leave one naming a field twice, which
+/// nothing downstream can recover from either.
+///
+/// Refusing it is not enough on its own: an argument left standing is
+/// substituted into the tail anyway, and the reader is told a second time in
+/// words about a row nobody wrote. So the argument absorbs, the way
+/// [`ErrorKind::Circular`] and [`ErrorKind::OpenDeclaredType`] do — the
+/// argument and not the whole application, because the mistake is the argument
+/// and `WithX Nat -> Nat` is half correct. [`row_shaped`] already reads
+/// [`TypeKind::Error`] as row-shaped, so nothing complains about the erasure,
+/// and it lowers to [`Ty::Undecided`], which a tail is already allowed to be.
+fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
+    fn walk(
+        ty: &mut Type,
+        kinds: &HashMap<Symbol, Vec<ParamKind>>,
+        rows: &HashSet<Symbol>,
+        out: &mut Vec<Error>,
+    ) {
+        match &mut ty.tracked {
+            TypeKind::Apply { head, args, .. } => {
+                let head = *head;
+                for (at, arg) in args.iter_mut().enumerate() {
+                    let lacks = kinds
+                        .get(&head)
+                        .and_then(|kinds| kinds.get(at))
+                        .and_then(ParamKind::lacks);
+                    if let Some(lacks) = lacks {
+                        let refused = match row_shaped(arg, rows) {
+                            false => Some(ErrorKind::NotARow),
+                            true => repeats(arg, lacks).map(|field| ErrorKind::RepeatedRowField {
+                                field: field.clone(),
+                            }),
+                        };
+                        if let Some(kind) = refused {
+                            let span = arg.span;
+                            out.push(Error { span, kind });
+                            // Nothing left inside to walk: what it was made of
+                            // is no longer part of the program.
+                            *arg = span.track(TypeKind::Error);
+                            continue;
+                        }
+                    }
+                    walk(arg, kinds, rows, out);
+                }
+            }
+            TypeKind::Arrow { from, to } => {
+                walk(from, kinds, rows, out);
+                walk(to, kinds, rows, out);
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields.values_mut() {
+                    walk(&mut field.value, kinds, rows, out);
+                }
+            }
+            TypeKind::Ident(_) | TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for decl in program.types.values_mut() {
+        // Which of this declaration's own parameters are rows, so one handed
+        // straight on is recognised as one. Read out first, so that walking the
+        // body borrows nothing the kinds are still held in.
+        //
+        // Nothing more than the set is wanted: a parameter handed straight on
+        // has already collected everything the slot it goes to may not name —
+        // that is what [`kinds`] closed the sets over — so there is no second
+        // condition here for it to fail.
+        let rows: HashSet<Symbol> = decl
+            .params
+            .iter()
+            .filter(|param| param.kind.lacks().is_some())
+            .map(|param| param.symbol)
+            .collect();
+        walk(&mut decl.value, kinds, &rows, &mut out);
+    }
+    // An annotation binds no parameters, so nothing in one can be a row by
+    // being a parameter — but it is every bit as much a place to apply a
+    // declaration, and was the way this check was first written round.
+    for decl in program.terms.values_mut() {
+        if let Some(annotation) = decl.annotation.as_mut() {
+            walk(annotation, kinds, &HashSet::new(), &mut out);
+        }
+    }
+    out
+}
+
+/// Whether a written type could stand for the fields a row does not name.
+///
+/// A struct can: its fields are spliced in where the tail was. A row parameter
+/// can, by being one already. A declared name cannot, though it looks as though
+/// it should — a tail holding a name would have to be unfolded by the two walks
+/// that flatten rows, which neither does, so it is refused rather than silently
+/// mishandled.
+fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
+    match &ty.tracked {
+        TypeKind::Struct { .. } | TypeKind::Error => true,
+        TypeKind::Param { symbol, .. } => rows.contains(symbol),
+        _ => false,
+    }
+}
+
+/// The first label a row written where a row parameter goes names that the
+/// declaration already names, if any.
+///
+/// First in the row's own order rather than in the order the declaration wrote
+/// them, so the complaint names the field a reader would reach first reading
+/// the argument left to right — the rule [`Table::repeated`](crate::inference)
+/// states for the same complaint reached through a variable.
+///
+/// Only a struct can name anything. A parameter handed straight on names
+/// nothing here — what it stands for is supplied at every use of *its*
+/// declaration, and already carries this condition — and an erased argument
+/// absorbed a complaint already made.
+fn repeats<'a>(ty: &'a Type, lacks: &IndexSet<String>) -> Option<&'a String> {
+    let TypeKind::Struct { fields, .. } = &ty.tracked else {
+        return None;
+    };
+    fields.keys().find(|name| lacks.contains(*name))
+}
+
+/// Every place a declaration leads back to itself with an argument that gets
+/// bigger, as the declaration it was found in and the span to report at.
+///
+/// Two declarations are in one group when each leads to the other, and inside a
+/// group every mention of a member must hand it arguments that cannot grow —
+/// see [`grows`] for what that allows. Across groups nothing is restricted:
+/// `type Rose a = { kids: List (Rose a) }` is fine because `List` is somebody
+/// else's group, and only the `Rose a` inside it is the group's business.
+///
+/// See [`ErrorKind::GrowingRecursion`] for why the restriction is here, and
+/// [`Solve::unfold`](crate::inference) for what rests on it.
+fn growing(types: &IndexMap<Symbol, Decl<Type>>) -> Vec<(Symbol, Span)> {
+    // Who each declaration mentions, directly, and then everything each one
+    // leads to. Closed once rather than walked per pair: the table is one file
+    // long, and a pair being mutually reachable is the whole of what a group
+    // is.
+    let mentions: IndexMap<Symbol, Vec<Symbol>> = types
+        .iter()
+        .map(|(symbol, decl)| {
+            let mut out = Vec::new();
+            mentioned(&decl.value, &mut out);
+            (*symbol, out)
+        })
+        .collect();
+    let reachable = closure(&mentions);
+
+    // Which group each declaration is in, worked out once for the group rather
+    // than once per member. A declaration reaching itself is what puts it in
+    // one at all; everything mutually reachable with it is in the same one, and
+    // shares the answer — so the members are collected from the first of them
+    // reached and handed to the rest, and a declaration on no loop has no entry.
+    let mut groups: HashMap<Symbol, Rc<[Symbol]>> = HashMap::new();
+    for (symbol, reaches) in &reachable {
+        if groups.contains_key(symbol) || !reaches.contains(symbol) {
+            continue;
+        }
+        let group: Rc<[Symbol]> = reaches
+            .iter()
+            .copied()
+            .filter(|other| {
+                reachable
+                    .get(other)
+                    .is_some_and(|back| back.contains(symbol))
+            })
+            .collect();
+        for member in group.iter() {
+            groups.insert(*member, group.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    for (symbol, decl) in types {
+        let Some(group) = groups.get(symbol) else {
+            continue;
+        };
+        grows(&decl.value, group, &mut |at| out.push((*symbol, at)));
+    }
+    out
+}
+
+/// Everything each node leads to through one edge or more. A node leads to
+/// itself exactly when it is on a loop, which is why the set holds no node for
+/// free: two nodes each leading to the other is the whole of what a group of
+/// mutually recursive declarations is, and one node leading to itself is what
+/// makes a lone declaration one.
+///
+/// One walk per node, with a set that answers in one look — the pairwise
+/// question is asked about every ordered pair, and asking it that way walked
+/// the table twice per pair. Generic over the node because the same closure
+/// answers "which parameter slots does this one hand itself on to", in
+/// [`kinds`]; insertion-ordered so that nothing downstream depends on a hash.
+fn closure<T: Copy + Eq + Hash>(edges: &IndexMap<T, Vec<T>>) -> IndexMap<T, IndexSet<T>> {
+    edges
+        .keys()
+        .map(|from| {
+            let mut seen = IndexSet::new();
+            let mut stack = vec![*from];
+            while let Some(at) = stack.pop() {
+                for next in edges.get(&at).into_iter().flatten() {
+                    if seen.insert(*next) {
+                        stack.push(*next);
+                    }
+                }
+            }
+            (*from, seen)
+        })
+        .collect()
+}
+
+/// Which parameters survive unfolding: which slots the argument written at them
+/// reaches a position of what the declaration stands for.
+///
+/// A parameter written anywhere in the body reaches one, except inside an
+/// argument to another declaration — there it reaches one only if *that* slot
+/// does, because unfolding the head is what decides whether the argument is
+/// kept or thrown away. `a` in `type Box a = { it: a }` reaches one; `a` in
+/// `type Ptr a = Nat` never appears and so reaches none; `a` in
+/// `type Alias a = Ptr a` appears only where `Ptr` discards it, so it reaches
+/// none either.
+///
+/// Which makes this a fixpoint over the declaration graph for the same reason
+/// [`kinds`] is one: declarations are hoisted and may name each other, so no
+/// one body decides its own answer. Each occurrence contributes the slots it
+/// sits inside, all of which must survive for the occurrence to; a slot
+/// survives if any one of its occurrences does. Both are monotone in a set that
+/// only grows and is bounded by the parameters in the program, so the loop
+/// stops. Starting from nothing is the safe start: a slot wrongly called
+/// irrelevant costs an unfolding, and a slot wrongly called relevant would let
+/// [`Rule::Congruent`](crate::inference::Rule) decide something unfolding
+/// disagrees with.
+///
+/// A `..r` tail counts as an occurrence, being the one place a parameter is not
+/// written as a [`TypeKind::Param`]: what is spliced in there is as much part
+/// of what the declaration stands for as a field is.
+fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
+    /// Every occurrence of a parameter in one body, as the slots it is nested
+    /// inside — innermost order does not matter, since all of them have to
+    /// survive.
+    fn occurrences(ty: &Type, under: &mut Vec<Slot>, out: &mut impl FnMut(u32, &[Slot])) {
+        match &ty.tracked {
+            TypeKind::Param { index, .. } => out(*index, under),
+            TypeKind::Struct { fields, tail } => {
+                for field in fields.values() {
+                    occurrences(&field.value, under, out);
+                }
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = tail
+                {
+                    out(*index, under);
+                }
+            }
+            TypeKind::Arrow { from, to } => {
+                occurrences(from, under, out);
+                occurrences(to, under, out);
+            }
+            TypeKind::Apply { head, args, .. } => {
+                for (at, arg) in args.iter().enumerate() {
+                    under.push((*head, at as u32));
+                    occurrences(arg, under, out);
+                    under.pop();
+                }
+            }
+            TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {}
+        }
+    }
+
+    let mut demands: IndexMap<Slot, Vec<Vec<Slot>>> = IndexMap::new();
+    for (symbol, decl) in types {
+        let mut under = Vec::new();
+        occurrences(&decl.value, &mut under, &mut |index, guards| {
+            demands
+                .entry((*symbol, index))
+                .or_default()
+                .push(guards.to_vec());
+        });
+    }
+
+    let mut relevant: HashSet<Slot> = HashSet::new();
+    loop {
+        let mut grew = false;
+        for (slot, occurrences) in &demands {
+            if relevant.contains(slot) {
+                continue;
+            }
+            // An occurrence nested inside nothing is a position of the body
+            // outright, which is the base case the empty `all` gives for free.
+            if occurrences
+                .iter()
+                .any(|guards| guards.iter().all(|slot| relevant.contains(slot)))
+            {
+                relevant.insert(*slot);
+                grew = true;
+            }
+        }
+        if !grew {
+            return relevant;
+        }
+    }
+}
+
+/// Every declaration a type mentions, at any depth. A parameter is not one: it
+/// is a local, and no declaration answers to it.
+fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
+    match &ty.tracked {
+        TypeKind::Ident(symbol) => out.push(*symbol),
+        TypeKind::Apply { head, args, .. } => {
+            out.push(*head);
+            for arg in args {
+                mentioned(arg, out);
+            }
+        }
+        TypeKind::Arrow { from, to } => {
+            mentioned(from, out);
+            mentioned(to, out);
+        }
+        TypeKind::Struct { fields, .. } => {
+            for field in fields.values() {
+                mentioned(&field.value, out);
+            }
+        }
+        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+    }
+}
+
+/// Report every mention of a `group` member in `ty` that hands it an argument
+/// which could get bigger, in order.
+///
+/// An argument is safe when it is one of two things:
+///
+/// - one of the mentioning declaration's own parameters, written bare — it is
+///   then whatever came in, passed straight through;
+/// - a type mentioning no parameter at all — it is then written out in full in
+///   the program and is the same type every time round, however many names or
+///   applications it is built from.
+///
+/// Anything else is a type built *out of* a parameter, and that is what grows:
+/// `type T a = { next: T { x: a } }` hands on `{ x: a }`, then `{ x: { x: a } }`,
+/// and never comes back round.
+///
+/// So the arguments a group can reach are drawn from the arguments it was given
+/// at the use site plus the finitely many param-free types written inside it —
+/// a finite set, and therefore finitely many argument lists, which is what makes
+/// the solver's assumption repeat. Order and repetition are free:
+/// `type A a b = { x: B b a }` only ever permutes what it was handed. See
+/// [`ErrorKind::GrowingRecursion`] and [`Solve::unfold`](crate::inference).
+fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
+    match &ty.tracked {
+        // A group member written bare hands on nothing — and if it takes
+        // something, the arity check has already spoken and this would be a
+        // second complaint about one mistake.
+        TypeKind::Ident(_) => {}
+        TypeKind::Apply {
+            head,
+            head_span,
+            args,
+        } => {
+            let safe = |arg: &Type| {
+                matches!(arg.tracked, TypeKind::Param { .. }) || !mentions_a_parameter(arg)
+            };
+            if group.contains(head) && !args.iter().all(safe) {
+                report(*head_span);
+            }
+            // The arguments are still walked: a member hidden inside one is as
+            // much a way round as a member at the top.
+            for arg in args {
+                grows(arg, group, report);
+            }
+        }
+        TypeKind::Arrow { from, to } => {
+            grows(from, group, report);
+            grows(to, group, report);
+        }
+        TypeKind::Struct { fields, .. } => {
+            for field in fields.values() {
+                grows(&field.value, group, report);
+            }
+        }
+        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+    }
+}
+
+/// Whether a written type is built out of any of the parameters of the
+/// declaration whose body it is in. Every [`TypeKind::Param`] in a body is one
+/// of them, since a parameter is scoped to the declaration that binds it, so
+/// this asks about parameters at all rather than about a particular list.
+///
+/// The `..r` tail counts. It is the one place a parameter appears without being
+/// a [`TypeKind::Param`] node, and a type handed on with a parameter in its tail
+/// grows exactly as one with a parameter in a field does.
+fn mentions_a_parameter(ty: &Type) -> bool {
+    match &ty.tracked {
+        TypeKind::Param { .. } => true,
+        TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
+        TypeKind::Arrow { from, to } => mentions_a_parameter(from) || mentions_a_parameter(to),
+        TypeKind::Struct { fields, tail } => {
+            matches!(
+                tail,
+                Some(Tail {
+                    of: Row::Param { .. },
+                    ..
+                })
+            ) || fields
+                .values()
+                .any(|field| mentions_a_parameter(&field.value))
+        }
+        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => false,
+    }
 }
 
 impl Names {
@@ -384,6 +1474,158 @@ impl Builder<'_> {
         self.names(namespace)
             .bind(name.tracked.clone(), symbol, name.span);
         Some(symbol)
+    }
+
+    /// Mint one declaration's parameters, in the order they were written.
+    ///
+    /// Minted as locals, the way a lambda's arguments are, so a parameter is a
+    /// symbol like any other and the debugger lists and cross-highlights it
+    /// with no special case. Nothing is put in scope here: the parameters of
+    /// every declaration are minted before any body is read, and only the one
+    /// declaration's own are in scope while its body is.
+    ///
+    /// A repeat is reported against the earlier name in this same list, and
+    /// binds nothing — which is what makes the list this returns the number of
+    /// arguments the declaration takes. Only against this declaration's own
+    /// parameters: a parameter shadowing a declared type is what a scope is
+    /// for, not a repeat.
+    fn declare_params(&mut self, params: &[TrackedString]) -> Vec<Param> {
+        let mut bound = Vec::new();
+        let mut seen: Vec<(&str, Span)> = Vec::new();
+        for name in params {
+            if let Some(&(_, previous)) = seen.iter().find(|(seen, _)| *seen == name.tracked) {
+                self.error(name.span, ErrorKind::DuplicateParameter { previous });
+                continue;
+            }
+            seen.push((&name.tracked, name.span));
+            let symbol = self
+                .mint
+                .local(self.module, Namespace::Types, &name.tracked);
+            bound.push(Param {
+                span: name.span,
+                symbol,
+                // Both read off the bodies once every body is in; see [`kinds`]
+                // and [`relevance`].
+                kind: ParamKind::Type,
+                relevant: false,
+            });
+        }
+        bound
+    }
+
+    /// Put one declaration's parameters in scope for the length of its body,
+    /// as the parameter scope [`ty`](Self::ty) resolves against. The caller
+    /// releases them; see [`build`].
+    fn scope_params(&mut self, params: &[Param]) {
+        self.params.clear();
+        for (index, param) in params.iter().enumerate() {
+            let name = self.mint.name(param.symbol).to_string();
+            self.params.insert(param.symbol, index as u32);
+            self.types.bind(name, param.symbol, param.span);
+        }
+    }
+
+    /// What a `..` tail stands for, and the one place a declaration is allowed
+    /// to be open.
+    ///
+    /// A name is looked for among the parameters first, because that is the
+    /// only reading under which a declaration's tail means anything: what it
+    /// stands for is supplied at every use rather than decided here, so the
+    /// body still mentions no solver variable and every walk can still stop at
+    /// a name. Anything else in a declaration — a bare `..`, or a name that
+    /// binds nothing — is a question a declaration cannot leave open, and is
+    /// reported here rather than by the caller, since only here is it known
+    /// which of the three a tail turned out to be.
+    fn row(&mut self, span: Span, name: Option<TrackedString>, place: Place) -> Row {
+        let Some(name) = name else {
+            if place == Place::Declaration {
+                self.error(span, ErrorKind::OpenDeclaredType);
+            }
+            return Row::Anything;
+        };
+        if let Some(symbol) = self.types.get(&name.tracked)
+            && let Some(&index) = self.params.get(&symbol)
+        {
+            return Row::Param { symbol, index };
+        }
+        if place == Place::Declaration {
+            self.error(span, ErrorKind::OpenDeclaredType);
+        }
+        Row::Named(name.tracked)
+    }
+
+    /// How many arguments a declared type takes. A symbol with no entry is one
+    /// whose declaration was refused, and counting against it would be a second
+    /// complaint about the first thing that went wrong.
+    fn arity(&self, symbol: Symbol) -> usize {
+        self.arities.get(&symbol).copied().unwrap_or(0)
+    }
+
+    /// Lower `<head> <arg>...`.
+    ///
+    /// The arguments are lowered before the head is judged, so a bad name
+    /// inside an application nobody could have applied is still reported — the
+    /// precedent [`ty`](Self::ty) already sets for an open declared type. The
+    /// head goes the same way: something that is not a name cannot be applied,
+    /// but it is still a written type, and `{ x: Bogus } Nat` should tell the
+    /// reader about `Bogus` rather than make fixing the application the price
+    /// of hearing about it. So it is lowered for its complaints and the result
+    /// dropped, since there is nothing here for a head to be part of.
+    fn apply(
+        &mut self,
+        span: Span,
+        head: parse::Type,
+        args: Vec<parse::Type>,
+        place: Place,
+    ) -> Type {
+        let found = args.len();
+        let args: Vec<Type> = args.into_iter().map(|arg| self.ty(arg, place)).collect();
+        let head_span = head.span;
+        if !matches!(head.tracked, parse::TypeKind::Ident { .. }) {
+            self.ty(head, place);
+            self.error(head_span, ErrorKind::NotAConstructor);
+            return span.track(TypeKind::Error);
+        }
+        let parse::TypeKind::Ident { name } = head.tracked else {
+            unreachable!("the head was just found to be a name");
+        };
+        let Some(symbol) = self.types.get(&name.tracked) else {
+            // A primitive takes nothing, so applying one is an arity complaint
+            // rather than a "not a constructor": the reader wrote a type that
+            // exists and gave it too much.
+            if Prim::from_name(&name.tracked).is_some() {
+                self.error(span, ErrorKind::Arity { expected: 0, found });
+            } else {
+                self.error(
+                    name.span,
+                    ErrorKind::Undefined {
+                        namespace: Namespace::Types,
+                    },
+                );
+            }
+            return span.track(TypeKind::Error);
+        };
+        if self.params.contains_key(&symbol) {
+            self.error(head_span, ErrorKind::ParameterApplied);
+            return span.track(TypeKind::Error);
+        }
+        let expected = self.arity(symbol);
+        if expected != found {
+            // Once, at the application — the whole of it, head and arguments
+            // together, because counting them is what the reader has to do and
+            // a span around the name alone shows none of what was counted. Then
+            // the whole thing absorbs: a wrong count makes every position after
+            // the first guesswork, and pairing them up to say more would be
+            // inventing what was meant. See [`TypeKind::Apply::head_span`],
+            // which exists for the complaints that *are* about the name.
+            self.error(span, ErrorKind::Arity { expected, found });
+            return span.track(TypeKind::Error);
+        }
+        span.track(TypeKind::Apply {
+            head: symbol,
+            head_span,
+            args,
+        })
     }
 
     /// Lower a surface expression into an IR term. Multi-argument functions are
@@ -454,11 +1696,19 @@ impl Builder<'_> {
     }
 
     /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
-    /// The type language has no binder, so unlike [`term`](Self::term) this
-    /// never pushes a scope: every name it resolves is a top-level declaration
-    /// or a primitive. A tail's name is not a binder either — it is scoped to
-    /// its annotation and resolved there by inference, so it passes through
-    /// here as the string it was written as.
+    ///
+    /// The scope this resolves against is pushed by the caller rather than
+    /// here, because a declaration's parameters are bound for the whole of its
+    /// body and this is called once per node in it. So every name reaching
+    /// here is a parameter of the declaration being lowered, a top-level
+    /// declaration, or a primitive — looked for in that order, since a
+    /// parameter is meant to hide a declaration of the same name.
+    ///
+    /// A tail's name may or may not be a binder, and which it is decides what
+    /// the tail means: naming a row parameter it is that parameter, and
+    /// anything else is scoped to its annotation and resolved by inference, so
+    /// it passes through here as the string it was written as. See
+    /// [`row`](Self::row).
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         match ty.tracked {
@@ -474,7 +1724,22 @@ impl Builder<'_> {
             // such a declaration wherever it was written; a type sees only the
             // ones above it, and reaches the built-in otherwise.
             parse::TypeKind::Ident { name } => match self.types.get(&name.tracked) {
-                Some(symbol) => span.track(TypeKind::Ident(symbol)),
+                Some(symbol) => match self.params.get(&symbol) {
+                    // A parameter stands for one type outright, so a bare name
+                    // is the only way to write one and there is nothing to
+                    // count.
+                    Some(&index) => span.track(TypeKind::Param { symbol, index }),
+                    // A declaration written bare is applied to nothing, which
+                    // is only enough if it takes nothing. See
+                    // [`ErrorKind::Arity`].
+                    None => match self.arity(symbol) {
+                        0 => span.track(TypeKind::Ident(symbol)),
+                        expected => {
+                            self.error(name.span, ErrorKind::Arity { expected, found: 0 });
+                            span.track(TypeKind::Error)
+                        }
+                    },
+                },
                 None => match Prim::from_name(&name.tracked) {
                     Some(prim) => span.track(TypeKind::Prim(prim)),
                     None => {
@@ -488,6 +1753,7 @@ impl Builder<'_> {
                     }
                 },
             },
+            parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
             parse::TypeKind::Struct { fields, tail } => {
                 // The values are lowered before openness is judged, so a bad
                 // name inside an open declared type is still reported: the
@@ -515,18 +1781,33 @@ impl Builder<'_> {
                         )
                     })
                     .collect();
-                // A declaration must be closed; see
-                // [`ErrorKind::OpenDeclaredType`]. Each `?` and the `..` is
-                // its own report, and the struct lowers to the error type,
-                // which absorbs — the `Circular` precedent.
+                let tail = tail.map(|tail| {
+                    let span = tail.span;
+                    Tail {
+                        span,
+                        of: self.row(span, tail.name, place),
+                    }
+                });
+                // A declaration must be closed, except through a parameter;
+                // see [`ErrorKind::OpenDeclaredType`]. Each `?` is its own
+                // report, and the struct lowers to the error type, which
+                // absorbs — the `Circular` precedent. A tail has already
+                // reported for itself in [`row`](Self::row), because only
+                // there is it known which of the three it is.
                 if place == Place::Declaration {
                     let offending: Vec<Span> = lowered
                         .values()
                         .filter(|field| field.optional)
                         .map(|field| field.name_span)
-                        .chain(tail.as_ref().map(|tail| tail.span))
                         .collect();
-                    if !offending.is_empty() {
+                    let open_tail = matches!(
+                        &tail,
+                        Some(Tail {
+                            of: Row::Anything | Row::Named(_),
+                            ..
+                        })
+                    );
+                    if !offending.is_empty() || open_tail {
                         for span in offending {
                             self.error(span, ErrorKind::OpenDeclaredType);
                         }
@@ -535,10 +1816,7 @@ impl Builder<'_> {
                 }
                 span.track(TypeKind::Struct {
                     fields: lowered,
-                    tail: tail.map(|tail| Tail {
-                        span: tail.span,
-                        name: tail.name.map(|name| name.tracked),
-                    }),
+                    tail,
                 })
             }
             parse::TypeKind::Arrow { from, to } => {

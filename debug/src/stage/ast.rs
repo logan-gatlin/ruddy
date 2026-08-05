@@ -56,12 +56,18 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             // itself `Tracked`, hence the doubled hop to reach the node.
             let_node.child(expr_node(ids, &body.tracked))
         }
-        StmtKind::Type { name, body } => Node {
-            label: "Type".into(),
-            ..node
+        StmtKind::Type { name, params, body } => {
+            let mut type_node_ = Node {
+                label: "Type".into(),
+                ..node
+            }
+            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            for param in params {
+                type_node_ = type_node_
+                    .child(Node::new(ids.next(), "Param", param.tracked.clone()).at(param.span));
+            }
+            type_node_.child(type_node(ids, body))
         }
-        .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span))
-        .child(type_node(ids, body)),
     }
 }
 
@@ -155,6 +161,16 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         }
         .child(type_node(ids, from))
         .child(type_node(ids, to)),
+        TypeKind::Apply { head, args } => Node {
+            label: "Apply".into(),
+            ..node
+        }
+        .child(type_node(ids, head))
+        .children(
+            args.iter()
+                .map(|arg| type_node(ids, arg))
+                .collect::<Vec<_>>(),
+        ),
         TypeKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node

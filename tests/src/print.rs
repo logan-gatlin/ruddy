@@ -69,6 +69,47 @@ fn the_empty_struct_carries_no_padding() {
     assert_eq!(ir, "let u : {} = {}");
 }
 
+/// One source as the parse tree's printer renders it, without lowering it.
+/// [`printed`] requires a clean lowering; this does not, because the debugger
+/// shows the parse tree of every program a reader can type.
+fn ast_of(source: &str) -> String {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let lexed = token::lex(source, file);
+    assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+
+    parsed
+        .stmts
+        .iter()
+        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The AST printer renders whatever was parsed, including programs lowering
+/// refuses. So its grouping has to hold for heads the IR can never carry: only
+/// a declared name can be applied, but anything at all can be *written*
+/// applied, and the head of a flat application has to read back as one atom.
+#[test]
+fn an_applied_head_is_grouped_like_any_other_position() {
+    for source in [
+        "type X = (Nat -> Nat) Nat",
+        "type Y = (Box Nat) Nat",
+        // A struct is an atom, so this one must not acquire parentheses.
+        "type Z = { x: Nat } Nat",
+    ] {
+        let printed = ast_of(source);
+        assert_eq!(printed, source, "{source}");
+        assert_eq!(
+            ast_of(&printed),
+            printed,
+            "{source}: printing is a fixed point"
+        );
+    }
+}
+
 /// The written type as the debugger renders it, and the type inference decided
 /// the definition has as the compiler renders it.
 fn types_of(source: &str) -> (String, String) {
@@ -172,5 +213,39 @@ fn a_row_reads_as_written_and_as_quantified() {
         let (as_written, as_inferred) = types_of(source);
         assert_eq!(as_written, written, "{source}: as written");
         assert_eq!(as_inferred, inferred, "{source}: as inferred");
+    }
+}
+
+/// An application is one rendering rule too, and a parameter is the case that
+/// could most easily drift: the IR knows it as a local symbol while the AST
+/// knows it as the string it was written as, and the two have to spell it the
+/// same. The declaration head has to print its parameters in both, or a
+/// re-lowered program would bind nothing.
+#[test]
+fn both_trees_render_an_application_the_same_way() {
+    for source in [
+        "type Pair A B = { first: A, second: B }",
+        "type Pair A B = { first: A, second: B }\ntype P = Pair Nat Nat",
+        // An argument that is itself an application, and one that is an arrow:
+        // the two positions that need parentheses to survive.
+        "type Box A = { it: A }\ntype N = Box (Box Nat)",
+        "type Box A = { it: A }\ntype F = Box (Nat -> Nat)",
+        // An application on the left of an arrow needs none, because it stops
+        // at the arrow of its own accord.
+        "type Box A = { it: A }\ntype G = Box Nat -> Nat",
+        // A parameter used bare, as the whole body.
+        "type Id A = A",
+        // Recursion through a parameterized declaration, handed its own
+        // parameter.
+        "type List a = { head: a, tail: List a }",
+        // A row parameter: the `..` is written in the body, not at the head,
+        // so both printers have to reach the parameter through the tail.
+        "type WithX r = { x: Nat, ..r }",
+        "type Both A r = { it: A, ..r }",
+        "type WithX r = { x: Nat, ..r }\ntype P = WithX { y: Nat }",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, ir, "{source}");
+        assert_eq!(ast, source, "{source}");
     }
 }

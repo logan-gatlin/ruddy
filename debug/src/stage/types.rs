@@ -10,13 +10,14 @@
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
 
-use std::rc::Rc;
-
 use indexmap::IndexMap;
-use ruddy::{symbol::Symbol, types::Ty};
+use ruddy::{
+    symbol::Symbol,
+    types::{Scheme, Ty},
+};
 
 use crate::{
-    stage::{Cx, Ids, Spec, Trace, plural},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
     wire::{Node, Stage},
 };
 
@@ -69,6 +70,23 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(index) = cx.symbols.get(&symbol) {
                 node = node.symbol(*index);
             }
+            // A declaration's parameters print as `'a`, `'b` in the meaning
+            // above, because that is what they are once the body is lowered.
+            // Which is unreadable on its own: these rows are what map each
+            // letter back to the name it was written as, and to what it stands
+            // for — a row, and what the row may not name, being the two things
+            // the meaning column cannot say.
+            if let Some(decl) = program.types.get(&symbol) {
+                for (index, param) in decl.params.iter().enumerate() {
+                    let letter = Ty::Bound(index as u32).to_string();
+                    let mut row =
+                        Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
+                    if let Some(index) = cx.symbols.get(&param.symbol) {
+                        row = row.symbol(*index);
+                    }
+                    node = node.child(row);
+                }
+            }
             // A recursive declaration says so under itself, naming the loop it
             // closes. The row above already shows the name coming back — what
             // it cannot show is whether the name it came back through leads
@@ -111,9 +129,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 ///
 /// A declaration mentioning itself is `[start]`; two declared in terms of each
 /// other are `[start, other]`. Depth-first, so what comes back is the first
-/// loop found rather than the shortest — with no type parameters there is
-/// rarely more than one, and either answers the question the row asks.
-fn loop_through(aliases: &IndexMap<Symbol, Rc<Ty>>, start: Symbol) -> Option<Vec<Symbol>> {
+/// loop found rather than the shortest — either answers the question the row
+/// asks, and showing every loop a declaration is part of is not what the row is
+/// for.
+fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec<Symbol>> {
     let mut path = Vec::new();
     walk(aliases, start, start, &mut path).then_some(path)
 }
@@ -123,7 +142,7 @@ fn loop_through(aliases: &IndexMap<Symbol, Rc<Ty>>, start: Symbol) -> Option<Vec
 /// the visited set, which is what keeps this finite: a declaration already on
 /// it is a loop that does not pass through `start` and is somebody else's row.
 fn walk(
-    aliases: &IndexMap<Symbol, Rc<Ty>>,
+    aliases: &IndexMap<Symbol, Scheme>,
     at: Symbol,
     start: Symbol,
     path: &mut Vec<Symbol>,
@@ -133,8 +152,8 @@ fn walk(
     }
     path.push(at);
     let mut named = Vec::new();
-    if let Some(body) = aliases.get(&at) {
-        names_in(body, &mut named);
+    if let Some(scheme) = aliases.get(&at) {
+        names_in(scheme.body(), &mut named);
     }
     if named.contains(&start) || named.iter().any(|next| walk(aliases, *next, start, path)) {
         return true;
@@ -148,7 +167,16 @@ fn walk(
 /// caller's business, and the reason this cannot run away.
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
     match ty {
-        Ty::Named { symbol, .. } => out.push(*symbol),
+        // The arguments are walked though the body is not: a declaration
+        // reached only through one — `type Rose a = { kids: List (Rose a) }` —
+        // is mentioned just as much as one written bare, and a row that missed
+        // it would not show as recursive.
+        Ty::Named { symbol, args, .. } => {
+            out.push(*symbol);
+            for arg in args.iter() {
+                names_in(arg, out);
+            }
+        }
         Ty::Arrow(from, to) => {
             names_in(from, out);
             names_in(to, out);
