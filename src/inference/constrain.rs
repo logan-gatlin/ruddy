@@ -172,15 +172,15 @@ impl Constrain<'_> {
             }
             // The walk cannot name the type it produced — which type `.field`
             // has depends on a base the walk is in no position to know — but
-            // it can say everything a projection demands of the base: a
-            // struct that has the field, whatever else it may also have. The
-            // field's type and the tail are variables, so `fn p => p.x` is
-            // not a base waiting to be explained; it is a definition
+            // it can say everything a projection demands of the base: a type
+            // that has the field, whatever else it may also have. The core,
+            // the field's type and the tail are all variables, so `fn p => p.x`
+            // is not a base waiting to be explained; it is a definition
             // polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
                 let result = self.table.fresh_type();
-                let core = Core::Var(self.table.mint());
+                let core = Core::Var(self.table.fresh_core());
                 let rest = self.table.fresh_row();
                 let want = Rc::new(Ty {
                     core,

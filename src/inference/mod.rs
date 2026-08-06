@@ -714,7 +714,7 @@ impl Table {
     }
 
     /// One more variable, of no sort yet. A variable's sort is fixed by the
-    /// position it was minted for, and the three functions below are those
+    /// position it was minted for, and the four functions below are those
     /// positions; nothing else may call this.
     fn mint(&mut self) -> TyVar {
         let var = self.vars.len() as TyVar;
@@ -727,6 +727,21 @@ impl Table {
     fn fresh_type(&mut self) -> Rc<Ty> {
         let var = self.mint();
         Rc::new(Ty::plain(Core::Var(var)))
+    }
+
+    /// A variable standing for the core of a type whose fields are written
+    /// beside it — the projection's demand, and nothing else so far.
+    ///
+    /// The same sort as [`fresh_type`](Self::fresh_type) and a different
+    /// position, which is why it is its own function. A fresh *type* is bare, so
+    /// binding it takes whatever it meets entire, fields and all; a fresh
+    /// *core* has labels standing next to it, so binding it takes only what the
+    /// other side is under those labels — and the labels beside it are a
+    /// condition on it, which is what [`Table::note_lacks`] then records. It
+    /// hands back the variable rather than a type because its caller has a row
+    /// to build around it.
+    fn fresh_core(&mut self) -> TyVar {
+        self.mint()
     }
 
     /// A variable standing for the rest of a row.
@@ -928,6 +943,15 @@ impl Table {
     /// Whether `var` occurs in what it is about to be bound to, whichever sort
     /// that is. One variable space, so a core variable hiding inside a row is
     /// as much a cycle as one hiding inside a type.
+    ///
+    /// Asked of every sort, and answered yes so far only about a type. The
+    /// other two are written because the rule is about all three and a rule
+    /// with a hole in it is a rule nobody can rely on; they say no today
+    /// because something earlier already turned the cycle away. A presence
+    /// against itself is [`Rule::Same`] in [`Solve::presences`] before a
+    /// binding is proposed, and two rows sharing a tail and differing in
+    /// labels are refused in [`Solve::rows`], where the complaint can name
+    /// both rows instead of one variable.
     fn occurs(&self, var: TyVar, value: &Assigned) -> bool {
         match value {
             Assigned::Ty(ty) => self.occurs_ty(var, ty),
@@ -1132,18 +1156,24 @@ impl Table {
     /// about the wrong line. Bound to another variable still counts, unbound
     /// or not: the annotation said this part of the type was its own, and a
     /// definition that tied it to anything else has not kept that.
+    ///
+    /// Asked only of the variables an annotation left open, and a written type
+    /// can leave open only `..`, `..r` and `?` — so every variable that arrives
+    /// here is row-sorted or presence-sorted, and none is a whole type. The row
+    /// arm is written to serve the type sort too rather than to assume that,
+    /// reading a value for the row it carries the way every other lacks-shaped
+    /// reader does.
     fn narrowed(&self, var: TyVar) -> bool {
         let Slot::Bound(value) = &self.vars[var as usize] else {
             return false;
         };
         match value {
-            Assigned::Ty(ty) => !matches!(self.resolve(ty).core, Core::Undecided),
-            Assigned::Row(row) => {
-                let flat = self.canon(row);
-                !(flat.labels.is_empty() && matches!(flat.rest, Rest::Undecided))
-            }
             Assigned::Presence(presence) => {
                 !matches!(self.presence_of(presence), Presence::Undecided)
+            }
+            value => {
+                let flat = self.canon(&value.as_row(Shape::Struct));
+                !(flat.labels.is_empty() && matches!(flat.rest, Rest::Undecided))
             }
         }
     }
@@ -1245,12 +1275,12 @@ impl Table {
         self.quantify_walk(ty, subst, true);
     }
 
-    /// One numbering pass: over everything but the presence slots, or — when
-    /// `presences` — over only them. A variable can only be one or the other,
-    /// so the two passes cannot number one twice.
-    /// One numbering pass over one type: the core first and then the fields it
-    /// carries, which is what makes `'c with { x: 'r }` number its core `'a`.
-    /// No special case for a core — it is descended into exactly where it sits.
+    /// One numbering pass over one type: over everything but the presence
+    /// slots, or — when `presences` — over only them. A variable can only be one
+    /// or the other, so the two passes cannot number one twice. Either way the
+    /// descent is the same: the core first and then the fields it carries, which
+    /// is what makes `'c with { x: 'r }` number its core `'a`. No special case
+    /// for a core — it is descended into exactly where it sits.
     fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>, presences: bool) {
         let ty = self.resolve(ty);
         match &ty.core {
@@ -1644,28 +1674,24 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 }
 
 /// A type whose head has been replaced by what it stands for: the inner type's
-/// core, carrying the labels written outside it with the inner type's own
-/// joined underneath.
+/// core, carrying the row written outside it.
 ///
-/// The outer labels win, the way [`Table::canon`] settles a tail's. What the
-/// outer row leaves open is what the whole leaves open, and nothing is lost by
-/// keeping it: a core only ever stands for a whole type where the type
-/// mentioning it names no fields of its own — which is the line above — and for
-/// a bare core otherwise.
+/// The inner type's own fields contribute nothing, and there is no merge here
+/// because there is never anything to merge. A core stands for a whole type in
+/// exactly two places, and both of them leave one of the two rows trivial. A
+/// bare core takes what it meets entire — the line above, and
+/// [`Solve::unify`]'s bare-variable rule — so the type mentioning it names no
+/// fields of its own and the outer row is trivial. Everywhere else a core is
+/// bound to a [`Ty::plain`] built from the other side's core, which names no
+/// fields either. So the outer row is what the whole ends up with, labels and
+/// tail alike: what it leaves open is what the whole leaves open.
 fn splice(outer: &Row, inner: &Rc<Ty>) -> Rc<Ty> {
     if outer.is_trivial() {
         return inner.clone();
     }
-    let mut labels = outer.labels.clone();
-    for (name, field) in &inner.fields.labels {
-        labels.entry(name.clone()).or_insert_with(|| field.clone());
-    }
     Rc::new(Ty {
         core: inner.core.clone(),
-        fields: Row {
-            labels,
-            rest: outer.rest.clone(),
-        },
+        fields: outer.clone(),
     })
 }
 

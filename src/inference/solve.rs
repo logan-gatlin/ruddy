@@ -695,11 +695,11 @@ impl Solve<'_> {
         match (lhs, rhs) {
             (Presence::Undecided, _) => {
                 self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_presence(span, rhs);
+                self.recover(span, &Assigned::Presence(rhs.clone()));
             }
             (_, Presence::Undecided) => {
                 self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_presence(span, lhs);
+                self.recover(span, &Assigned::Presence(lhs.clone()));
             }
             (Presence::Var(a), Presence::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
@@ -754,7 +754,7 @@ impl Solve<'_> {
                 Rest::Var(var) => self.assign(span, goal, *var, Assigned::Row(row)),
                 _ => {
                     self.step(span, Rule::Absorb, goal, Effect::None);
-                    self.recover_row(span, &row);
+                    self.recover(span, &Assigned::Row(row));
                 }
             }
             return;
@@ -978,10 +978,16 @@ impl Solve<'_> {
         }
     }
 
-    /// Abandon a value a failed goal would have decided: every variable still
-    /// unsolved in it becomes undecided, which unifies with everything, so the
-    /// one complaint is not echoed by every term downstream of it. No occurs
-    /// check — an undecided value mentions no variables to close a cycle with.
+    /// Abandon a value nothing will decide: every variable still unsolved in it
+    /// becomes undecided, which unifies with everything, so the one complaint is
+    /// not echoed by every term downstream of it. No occurs check — an undecided
+    /// value mentions no variables to close a cycle with.
+    ///
+    /// The one way in, whichever sort the value is. Two kinds of caller reach
+    /// it: [`fail`](Self::fail), abandoning what a complaint was about, and the
+    /// arms that meet something already undecided — an undecided presence or an
+    /// undecided tail absorbs whatever it was put against, and everything that
+    /// would have decided it is abandoned with it.
     fn recover(&mut self, span: Span, value: &Assigned) {
         match value {
             Assigned::Ty(ty) => self.recover_ty(span, ty),

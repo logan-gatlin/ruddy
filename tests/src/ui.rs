@@ -951,6 +951,20 @@ fn a_printer_reports_a_writer_that_refuses_it() {
                 rest: Rest::Bound(0),
             }))),
         ),
+        // The `with` form, whose core and whose braces are two writes with a
+        // word between them: a refusal on any of the three has to come back.
+        (
+            "a type carrying fields",
+            Rc::new(Ty {
+                core: Core::Nat,
+                fields: Row {
+                    labels: [("x".to_string(), RowField::present(nat.clone()))]
+                        .into_iter()
+                        .collect(),
+                    rest: Rest::Closed,
+                },
+            }),
+        ),
         (
             "a case carrying unit",
             Rc::new(Ty::plain(Core::Sum(Row {
