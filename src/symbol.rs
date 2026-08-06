@@ -419,13 +419,28 @@ impl Mint {
     }
 }
 
+impl Clash {
+    /// What it means that `arriving` fingerprints the same as the `registered`
+    /// bundle: either it is that bundle, or two identities have collided.
+    ///
+    /// A named rule rather than an arm inside [`Bundles::register`], because a
+    /// collision is a thing no program can be made to produce — the fingerprint
+    /// is sixty-four bits of the identity — and a check nothing can reach is a
+    /// check nobody can confirm still says what it means to.
+    pub fn between(registered: &Bundle, arriving: &Bundle) -> Self {
+        match registered == arriving {
+            true => Clash::Duplicate,
+            false => Clash::Fingerprint(registered.clone()),
+        }
+    }
+}
+
 impl Bundles {
     /// Registering is where bundle identities are checked against each other,
     /// which is the one thing no single mint can do for itself.
     pub fn register(&mut self, bundle: Bundle) -> Result<(), Clash> {
         match self.entries.get(&bundle.hash) {
-            Some(entry) if entry.bundle == bundle => Err(Clash::Duplicate),
-            Some(entry) => Err(Clash::Fingerprint(entry.bundle.clone())),
+            Some(entry) => Err(Clash::between(&entry.bundle, &bundle)),
             None => {
                 self.entries.insert(
                     bundle.hash,
@@ -522,7 +537,7 @@ pub fn demangle(mangled: &str) -> Option<Demangled> {
 
     let mut path = Vec::new();
     while !parser.rest.is_empty() {
-        let namespace = Namespace::from_tag(parser.tag()?)?;
+        let namespace = Namespace::from_tag(parser.tag())?;
         let name = parser.body()?;
         let disambiguator = if parser.eat('s') {
             Some(parser.number()?)
@@ -557,11 +572,14 @@ impl Parser<'_> {
         }
     }
 
-    fn tag(&mut self) -> Option<char> {
+    /// The next character, which the caller has already found to be there.
+    fn tag(&mut self) -> char {
         let mut chars = self.rest.chars();
-        let tag = chars.next()?;
+        let tag = chars
+            .next()
+            .expect("the caller checked there is more to read");
         self.rest = chars.as_str();
-        Some(tag)
+        tag
     }
 
     /// A decimal number with no padding, so that each number has one spelling.

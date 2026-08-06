@@ -66,9 +66,10 @@ test:
 build:
     cargo build --workspace
 
-# Line coverage for the compiler library: runs every test, skips the CLI.
+# Line and branch coverage for the compiler library: runs every test, skips the
+# CLI. Branch coverage is a nightly-only rustc feature, hence `+nightly`.
 cov *args:
-    cargo llvm-cov --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/|/src/main\.rs' {{args}}
+    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/|/src/main\.rs' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

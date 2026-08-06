@@ -433,6 +433,25 @@ pub struct Output {
     pub errors: Vec<Error>,
 }
 
+/// The namespaces the surface grammar writes into. [`Namespace`] has a third —
+/// modules — and this language has no syntax that reaches it, so a builder
+/// holding two name tables is told which of the two rather than asked to rule
+/// out a value it can never be handed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Terms,
+    Types,
+}
+
+impl From<Scope> for Namespace {
+    fn from(scope: Scope) -> Self {
+        match scope {
+            Scope::Terms => Namespace::Terms,
+            Scope::Types => Namespace::Types,
+        }
+    }
+}
+
 struct Builder<'a> {
     mint: &'a mut Mint,
     /// The module being lowered into. The surface syntax has no modules yet, so
@@ -624,7 +643,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // so a repeated one is still reported against the first.
     let declared: Vec<_> = types
         .iter()
-        .map(|(name, _, _)| b.declare(Namespace::Types, name))
+        .map(|(name, _, _)| b.declare(Scope::Types, name))
         .collect();
     // Every declaration's parameters, minted before any body is read, and how
     // many arguments each declaration therefore takes. Knowing the count above
@@ -720,7 +739,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // and there is no recursion to resolve.
         let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
         let value = b.term(body.tracked);
-        if let Some(symbol) = b.declare(Namespace::Terms, &name) {
+        if let Some(symbol) = b.declare(Scope::Terms, &name) {
             program.terms.insert(
                 symbol,
                 Decl {
@@ -807,14 +826,10 @@ impl Follow<'_> {
             self.looping.extend(self.open[at..].iter().copied());
             return Stands::Loop;
         }
-        // A symbol with no declaration behind it is one whose declaration was
-        // refused as a repeat; counting it against this would be a second
-        // complaint about the first thing that went wrong, as in
-        // [`Builder::arity`].
-        let types = self.types;
-        let Some(decl) = types.get(&symbol) else {
-            return Stands::Shape;
-        };
+        // Every symbol a body can name was declared, and every declaration that
+        // was made is in this table: a name that repeats one binds nothing and
+        // so is never written into a type at all.
+        let decl = &self.types[&symbol];
         self.open.push(symbol);
         let stands = self.ty(&decl.value);
         self.open.pop();
@@ -843,10 +858,10 @@ impl Follow<'_> {
                 // needs no substitution to do it — which is why a parameter of
                 // the head is not a parameter of anything this walk is in the
                 // middle of.
-                Stands::Param(index) => match args.get(index as usize) {
-                    Some(arg) => self.ty(arg),
-                    None => Stands::Shape,
-                },
+                // Indexed rather than looked up: the arity check ran where the
+                // application was written, so a head standing for its own
+                // parameter has an argument in that position.
+                Stands::Param(index) => self.ty(&args[index as usize]),
             },
         }
     }
@@ -1632,19 +1647,19 @@ impl Builder<'_> {
         self.errors.push(Error { span, kind });
     }
 
-    fn names(&mut self, namespace: Namespace) -> &mut Names {
-        match namespace {
-            Namespace::Terms => &mut self.terms,
-            Namespace::Types => &mut self.types,
-            Namespace::Modules => unreachable!("the surface syntax has no modules"),
+    fn names(&mut self, scope: Scope) -> &mut Names {
+        match scope {
+            Scope::Terms => &mut self.terms,
+            Scope::Types => &mut self.types,
         }
     }
 
     /// Bind a top-level name to a fresh symbol. `None` when the name is already
     /// defined: the first definition is the one that stands, and the repeat is
     /// reported against it.
-    fn declare(&mut self, namespace: Namespace, name: &TrackedString) -> Option<Symbol> {
-        if let Some(previous) = self.names(namespace).find(&name.tracked).map(|b| b.span) {
+    fn declare(&mut self, scope: Scope, name: &TrackedString) -> Option<Symbol> {
+        let namespace = Namespace::from(scope);
+        if let Some(previous) = self.names(scope).find(&name.tracked).map(|b| b.span) {
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
@@ -1658,7 +1673,7 @@ impl Builder<'_> {
             .mint
             .global(self.module, namespace, &name.tracked)
             .expect("the name table already ruled out a repeat");
-        self.names(namespace)
+        self.names(scope)
             .bind(name.tracked.clone(), symbol, name.span);
         Some(symbol)
     }
@@ -1867,13 +1882,16 @@ impl Builder<'_> {
         let found = args.len();
         let args: Vec<Type> = args.into_iter().map(|arg| self.ty(arg, place)).collect();
         let head_span = head.span;
-        if !matches!(head.tracked, parse::TypeKind::Ident { .. }) {
-            self.ty(head, place);
-            self.error(head_span, ErrorKind::NotAConstructor);
-            return span.track(TypeKind::Error);
-        }
-        let parse::TypeKind::Ident { name } = head.tracked else {
-            unreachable!("the head was just found to be a name");
+        let name = match head.tracked {
+            parse::TypeKind::Ident { name } => name,
+            // Something that is not a name cannot be applied, but it is still a
+            // written type: it is lowered for its own complaints and the result
+            // dropped, since there is nothing here for a head to be part of.
+            written => {
+                self.ty(head_span.track(written), place);
+                self.error(head_span, ErrorKind::NotAConstructor);
+                return span.track(TypeKind::Error);
+            }
         };
         let Some(symbol) = self.types.get(&name.tracked) else {
             // A primitive takes nothing, so applying one is an arity complaint

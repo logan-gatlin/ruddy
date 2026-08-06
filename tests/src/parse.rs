@@ -602,3 +602,54 @@ fn a_sum_and_a_struct_nest_without_help() {
         "let x : { f: `A, g: Nat } = y"
     );
 }
+
+/// Every production that can give up, made to. A production that returned
+/// `None` quietly would drop the statement it was parsing and leave the run
+/// looking successful, so what this pins is that each one reports before it
+/// does: one complaint per source, and the statement gone.
+///
+/// The list is by position rather than by kind — a name, a separator, a
+/// delimiter, or the thing after it — because that is what the parser is made
+/// of, and a position with no case here is one whose failure nothing watches.
+#[test]
+fn every_position_that_can_fail_reports_before_it_does() {
+    for src in [
+        // A definition's own name, and the two halves of an ascription.
+        "let = 1",
+        "let x : = 1",
+        "let x : Nat",
+        // An application's argument: the token begins an atom, and the atom
+        // still does not parse.
+        "let v = f {",
+        // Inside a struct term: the label, the colon, the value, the brace.
+        "let v = { 1: 2 }",
+        "let v = { x 2 }",
+        "let v = { x: }",
+        "let v = { x: 1",
+        // A case's payload, which is an atom taken greedily.
+        "let v = `A {",
+        // Parentheses, around an expression that is not one and around one
+        // that is never closed.
+        "let v = (let)",
+        "let v = (1",
+        // A function's arrow and its body.
+        "let f = fn x y",
+        "let f = fn x =>",
+        // The type language keeps the same positions: a case's payload, an
+        // argument, a field's label, a field's type, and the parentheses.
+        "type X = `A {",
+        "type X = Box {",
+        "type X = { 1: Nat }",
+        "type X = { a: }",
+        "type X = (let)",
+        "type X = (Nat",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(
+            out.stmts.is_empty(),
+            "{src:?} kept a statement: {:#?}",
+            out.stmts
+        );
+    }
+}

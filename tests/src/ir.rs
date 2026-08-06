@@ -1035,6 +1035,15 @@ fn recursion_may_not_make_its_argument_bigger() {
         // A parameter in a `..` tail is as much a way of growing as one in a
         // field, and is the one place a parameter is not written as a name.
         "type A r = { x: A { ..r } }",
+        // Every other way a type can be built out of a parameter: handed to
+        // another declaration, put on either side of an arrow, or made a
+        // case's payload. Each of them is a type that gets bigger every round,
+        // and the walk that looks for a parameter has to reach all of them.
+        "type Box b = { it: b }  type T a = { next: T (Box a) }",
+        "type T a = { next: T (a -> Nat) }",
+        "type T a = { next: T (Nat -> a) }",
+        "type T a = { next: T (`A a) }",
+        "type T r = { next: T (`A Nat | ..r) }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1642,6 +1651,24 @@ fn one_tail_name_is_one_shape_of_rest() {
     };
     assert_eq!(previous.start, src.find("..r").expect("the first tail"));
 
+    // Either order: the row that absorbs is the second one written, whichever
+    // shape that is.
+    let (_, out) =
+        build_src("let f : (`A Nat | ..r) -> { x: Nat, ..r } -> Nat = fn a => fn b => 1");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::MixedTail {
+                first: Shape::Sum,
+                second: Shape::Struct,
+                ..
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+
     // Two tails of one shape are what naming one is *for*, and stay one rest.
     let (_, out) = build_src("let f : { x: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -1655,4 +1682,112 @@ fn one_tail_name_is_one_shape_of_rest() {
          let g : (`A Nat | ..r) -> Nat = fn b => 2",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+/// A type declared twice keeps the first, exactly as a term does: the repeat is
+/// reported against it and lowers to nothing, so the name still stands for one
+/// declaration and everything that mentions it means that one.
+#[test]
+fn duplicate_type_declarations_keep_the_first() {
+    let (mint, out) = build_src("type T = Nat  type T = { x: Nat }  let v : T = 1");
+
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Duplicate {
+                namespace: Namespace::Types,
+                previous,
+            } if previous.start == 5
+        ),
+        "{:#?}",
+        out.errors
+    );
+
+    // One declaration, and it is the first one's body.
+    assert_eq!(out.program.types.len(), 1);
+    let symbol = type_symbol(&mint, &out, "T");
+    assert!(matches!(
+        out.program.types[&symbol].value.tracked,
+        TypeKind::Prim(Prim::Nat)
+    ));
+}
+
+/// Applying a name nothing declares is an undefined type, reported at the name
+/// rather than at the application: the arguments are not what went wrong, and
+/// the reader has a name to fix. A primitive is the other way round — it exists
+/// and takes nothing — which is why the two are told apart here at all.
+#[test]
+fn applying_an_undeclared_name_is_an_undefined_type() {
+    let src = "type P = Missing Nat";
+    let (_, out) = build_src(src);
+
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Undefined {
+                namespace: Namespace::Types
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+    assert_eq!(out.errors[0].span.start, src.find("Missing").expect("head"));
+
+    // The primitive beside it says how many it takes, at the whole application.
+    let (_, out) = build_src("type P = Nat Nat");
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Arity {
+                expected: 0,
+                found: 1
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// A `..` naming a declared type is not a rest — a rest is a parameter or
+/// nothing — so in an annotation it is read as a name of its own, the way any
+/// other unbound tail name is. The declaration it happens to share a spelling
+/// with has nothing to do with it.
+#[test]
+fn a_tail_naming_a_declared_type_is_still_just_a_name() {
+    let (_, out) = build_src("type T = Nat  let f : { x: Nat, ..T } -> Nat = fn r => r.x");
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+
+    // And it is one rest like any other, so giving it two shapes still clashes.
+    let (_, out) = build_src(
+        "type T = Nat  let f : { x: Nat, ..T } -> (`A Nat | ..T) -> Nat = fn a => fn b => 1",
+    );
+    assert!(
+        matches!(out.errors[0].kind, ErrorKind::MixedTail { .. }),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// An argument written where a row parameter goes has to be a row of that
+/// shape. A type that already went wrong is not held to it: it absorbed a
+/// complaint, and a second one about the same words would tell the reader
+/// nothing they can act on.
+#[test]
+fn an_erroneous_row_argument_absorbs() {
+    let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type P = WithX Missing");
+
+    // The undefined name, and nothing about the shape it failed to have.
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Undefined {
+                namespace: Namespace::Types
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
 }

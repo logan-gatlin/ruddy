@@ -201,9 +201,10 @@ impl Parser {
 
     fn advance(&mut self) -> Option<Token> {
         let tok = self.toks.get(self.pos).cloned();
-        if tok.is_some() {
-            self.pos += 1;
-        }
+        // Clamped rather than guarded: past the end there is nothing to step
+        // over, and a cursor that ran on would only have to be checked again by
+        // everything that reads it.
+        self.pos = (self.pos + 1).min(self.toks.len());
         tok
     }
 
@@ -214,10 +215,9 @@ impl Parser {
     /// The zero-width position just past the last token, so that running out of
     /// input has somewhere to point.
     fn eof_span(&self) -> Span {
-        match self.toks.last() {
-            Some(tok) => tok.span.file_id.span(tok.span.end(), 0),
-            None => Span::default(),
-        }
+        self.toks.last().map_or_else(Span::default, |tok| {
+            tok.span.file_id.span(tok.span.end(), 0)
+        })
     }
 
     /// Report the next token — or the end of input — as one that cannot be used
@@ -289,7 +289,7 @@ impl Parser {
     /// `let <name> [: <type>] = <expr>`. The ascription is optional: without it
     /// the definition's type is whatever is inferred for its body.
     fn let_stmt(&mut self) -> Option<Stmt> {
-        let kw = self.advance()?; // `let`
+        let kw = self.advance().expect("the caller peeked `let`");
         let name = self.ident()?;
         let ty = match self.eat_if(&Kind::Colon) {
             Some(_) => Some(self.type_expr()?),
@@ -307,14 +307,14 @@ impl Parser {
     /// [`function_expr`](Self::function_expr) argument list is: a type taking
     /// no parameters is the ordinary case.
     fn type_stmt(&mut self) -> Option<Stmt> {
-        let kw = self.advance()?; // `type`
+        let kw = self.advance().expect("the caller peeked `type`");
         let name = self.ident()?;
         let mut params = Vec::new();
         while matches!(
             self.peek().map(|tok| &tok.tracked),
             Some(Kind::Identifier(_))
         ) {
-            params.push(self.ident()?);
+            params.push(self.ident().expect("the loop peeked a name"));
         }
         self.eat(&Kind::Equal)?;
         let body = self.type_expr()?;
@@ -410,7 +410,7 @@ impl Parser {
     /// `{ <field>: <expr>, <field>: <expr>, ... }` with an optional trailing
     /// comma — the same shape as a struct type, but with expression values.
     fn struct_expr(&mut self) -> Option<Expr> {
-        let open = self.eat(&Kind::LeftBrace)?;
+        let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
 
         while !matches!(
@@ -469,7 +469,7 @@ impl Parser {
     /// is returned as-is, widened to cover the delimiters, so no grouping node
     /// exists to reach the IR. An empty pair is the unit expression.
     fn paren_expr(&mut self) -> Option<Expr> {
-        let open = self.eat(&Kind::LeftParen)?;
+        let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(ExprKind::Unit));
         }
@@ -482,7 +482,7 @@ impl Parser {
     /// arguments. The body is a full expression and extends as far right as it
     /// can, ML-style.
     fn function_expr(&mut self) -> Option<Expr> {
-        let kw = self.advance()?; // `fn`
+        let kw = self.advance().expect("the caller peeked `fn`");
         let args = self.function_args()?;
         let body = self.expr()?;
         let span = kw.span.merge(body.span);
@@ -498,7 +498,7 @@ impl Parser {
     fn function_args(&mut self) -> Option<Vec<TrackedString>> {
         let mut args = Vec::new();
         while matches!(self.peek().map(|t| &t.tracked), Some(Kind::Identifier(_))) {
-            args.push(self.ident()?);
+            args.push(self.ident().expect("the loop peeked a name"));
         }
         let arrow = self.eat(&Kind::FatArrow)?;
         if args.is_empty() {
@@ -560,7 +560,7 @@ impl Parser {
         loop {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
                 let name = match self.peek().map(|t| &t.tracked) {
-                    Some(Kind::Identifier(_)) => Some(self.ident()?),
+                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
                     _ => None,
                 };
                 let at = name
@@ -680,7 +680,7 @@ impl Parser {
     /// for have no order among the named ones to claim — and takes no comma
     /// after it.
     fn struct_type(&mut self) -> Option<Type> {
-        let open = self.eat(&Kind::LeftBrace)?;
+        let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
         let mut tail = None;
 
@@ -690,7 +690,7 @@ impl Parser {
         ) {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
                 let name = match self.peek().map(|t| &t.tracked) {
-                    Some(Kind::Identifier(_)) => Some(self.ident()?),
+                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
                     _ => None,
                 };
                 let span = name
@@ -719,7 +719,7 @@ impl Parser {
     /// `( <type> )` — the type-level counterpart of
     /// [`paren_expr`](Self::paren_expr), discarded just the same.
     fn paren_type(&mut self) -> Option<Type> {
-        let open = self.eat(&Kind::LeftParen)?;
+        let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
         if let Some(close) = self.eat_if(&Kind::RightParen) {
             return Some(open.span.merge(close.span).track(TypeKind::Unit));
         }

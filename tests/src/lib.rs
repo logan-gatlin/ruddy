@@ -18,5 +18,6 @@ mod snapshot;
 mod stage;
 mod symbol;
 mod token;
+mod tracking;
 mod types;
 mod ui;

@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use ruddy::symbol::{
-    Bundle, Bundles, Clash, Component, LOCAL_SEGMENT, Mint, Namespace, PREFIX, Version, demangle,
+    Bundle, Bundles, Clash, Component, LOCAL_SEGMENT, Mint, Namespace, PREFIX, Symbol, Version,
+    demangle,
 };
 
 /// Every mangling in these tests starts with this, for `app@1.0.0`.
@@ -334,6 +335,11 @@ fn demangle_rejects_malformed_and_non_canonical_names() {
         "_RM3appv1m0p0V1x",               // no bundle tag
         "_RB3appV1x",                     // no version
         "_RB3appv1m0V1x",                 // version cut short
+        "_RB3appv1p0V1x",                 // a version with no minor
+        "_RB99appv1m0p0V1x",              // a bundle name shorter than its length
+        "_RB3appv1mp0V1x",                // a minor that is not a number
+        "_RB3appv1m0pV1x",                // a patch that is not a number
+        "_RB3appv1m0p0r9abV1x",           // a prerelease shorter than its length
         "_RB3appv01m0p0V1x",              // padded major
         "_RB3appv1m0p0",                  // a bundle alone names no symbol
         "_RB7_30_appv1m0p0V1x",           // a name the identity rules forbid
@@ -341,17 +347,21 @@ fn demangle_rejects_malformed_and_non_canonical_names() {
         "_RB3appv1m0p0r0V1x",             // an empty prerelease
     ];
     let components = [
-        "X1x",     // unknown namespace tag
-        "V2x",     // length runs past the end
-        "V1x!",    // trailing garbage
-        "V1xs",    // disambiguator with no number
-        "V01x",    // padded length
-        "V1xs00",  // padded disambiguator
-        "V4_41_",  // escape for a character that needs none
-        "V5_05F_", // padded hex
-        "V2__",    // empty escape
-        "V3_5F",   // unterminated escape
-        "V4_5f_",  // lowercase hex
+        "X1x",            // unknown namespace tag
+        "V2x",            // length runs past the end
+        "V1x!",           // trailing garbage
+        "V1xs",           // disambiguator with no number
+        "V01x",           // padded length
+        "V1xs00",         // padded disambiguator
+        "V4_41_",         // escape for a character that needs none
+        "V5_05F_",        // padded hex
+        "V2__",           // empty escape
+        "V3_5F",          // unterminated escape
+        "V4_5f_",         // lowercase hex
+        "V6_D800_",       // an escape for a number that is no character
+        "V11_FFFFFFFFF_", // an escape for a number too big to be one
+        "V3a-b",          // a character that should have been escaped, written raw
+        "V2_x",           // a body opening an escape it never fills
     ];
 
     for case in whole {
@@ -414,4 +424,71 @@ fn symbols_do_not_cross_bundles() {
     let symbol = app.global(None, Namespace::Terms, "x").unwrap();
 
     let _ = other.name(symbol);
+}
+
+/// A symbol names the bundle it was minted in, and a module is a symbol with a
+/// namespace already decided — so the two agree about which bundle they belong
+/// to, and a module can be handed anywhere a symbol goes.
+#[test]
+fn a_symbol_carries_the_bundle_it_was_minted_in() {
+    let mut m = mint();
+    let util = m.module(None, "util").unwrap();
+    let symbol = m.global(Some(util), Namespace::Terms, "map").unwrap();
+
+    assert_eq!(symbol.bundle(), m.bundle().hash());
+    assert_eq!(Symbol::from(util), util.symbol());
+    assert_eq!(Symbol::from(util).bundle(), symbol.bundle());
+    assert_eq!(m.namespace(util.symbol()), Namespace::Modules);
+}
+
+/// A module is a global like any other, so a second one of the same name in
+/// the same scope is the first one handed back rather than a new module the
+/// two halves of the program would disagree about.
+#[test]
+fn a_repeated_module_is_the_one_already_there() {
+    let mut m = mint();
+    let first = m.module(None, "util").unwrap();
+
+    assert_eq!(m.module(None, "util"), Err(first));
+    // Nested, and against a module of the same name in another scope, which is
+    // a different path and so a different module.
+    let inner = m.module(Some(first), "util").unwrap();
+    assert_ne!(inner, first);
+    assert_eq!(m.module(Some(first), "util"), Err(inner));
+}
+
+/// The escape is the codepoint in hex with no padding, so a character below
+/// `0x10` escapes to a single digit. Nothing in a source name reaches that far
+/// down, but the mangling is the language's own format and both directions of
+/// it have to agree about the short form or a name would fail to come back.
+#[test]
+fn a_short_escape_is_one_hex_digit() {
+    let mut m = mint();
+    let symbol = m.global(None, Namespace::Terms, "\n").unwrap();
+
+    assert_eq!(m.mangle(symbol), format!("{APP_PREFIX}V3_A_"));
+    assert_eq!(demangle(&m.mangle(symbol)).unwrap().path[0].name, "\n");
+}
+
+/// Two bundles that fingerprinted the same would be a correctness bug, and the
+/// registry is the only place that could notice. Sixty-four bits of the
+/// identity go into the fingerprint, so no program can be made to produce a
+/// collision — the rule that decides what one means is named and checked here
+/// instead.
+#[test]
+fn a_fingerprint_collision_is_told_apart_from_a_repeat() {
+    let app = bundle("app");
+    let again = bundle("app");
+    let other = bundle("std");
+
+    assert_eq!(Clash::between(&app, &again), Clash::Duplicate);
+    assert_eq!(
+        Clash::between(&app, &other),
+        Clash::Fingerprint(app.clone()),
+        "the bundle already registered is the one the reader has to be shown"
+    );
+    // Which is what the registry answers with when a hash is already taken.
+    let mut bundles = Bundles::default();
+    bundles.register(app.clone()).unwrap();
+    assert_eq!(bundles.register(again), Err(Clash::Duplicate));
 }

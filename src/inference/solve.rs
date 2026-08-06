@@ -12,6 +12,24 @@ use crate::{
 
 use super::{Constraint, ConstraintKind, Effect, Error, ErrorKind, Rule, Side, Slot, Step, Table};
 
+/// A row a goal is about, and the shape it was matched on.
+///
+/// The two travel together everywhere below [`Solve::rows`]: a complaint names
+/// the row, and is worded in the nouns of the shape. Paired rather than read
+/// back off the row where it is needed, so there is one reading of the shape —
+/// the goal's — and nothing further in that could come to disagree with it.
+#[derive(Clone, Copy)]
+struct Rowed<'a> {
+    shape: Shape,
+    ty: &'a Rc<Ty>,
+}
+
+impl<'a> Rowed<'a> {
+    const fn new(shape: Shape, ty: &'a Rc<Ty>) -> Self {
+        Self { shape, ty }
+    }
+}
+
 /// Pass two: the solver, which sees constraints and never terms.
 pub struct Solve<'a> {
     pub table: &'a mut Table,
@@ -128,9 +146,9 @@ impl Solve<'_> {
                     args: ys,
                     ..
                 },
-            ) if a == b && xs.is_empty() && ys.is_empty() => {
-                self.step(span, Rule::Same, goal, Effect::None)
-            }
+                // Arity belongs to the declaration, so one empty argument list
+                // means the other is empty too.
+            ) if a == b && xs.is_empty() => self.step(span, Rule::Same, goal, Effect::None),
             // Two applications of one declaration are equal when their
             // arguments are — and this is a shortcut to unfolding rather than a
             // rule that could contradict it, which is the whole of what
@@ -259,11 +277,11 @@ impl Solve<'_> {
             // is still about the name that was read.
             _ => {
                 let error = match (&*lhs, &*rhs) {
-                    _ if self.demanded(&lhs) && rhs.is_fieldless() => Error {
+                    _ if self.demanded(&lhs) => Error {
                         span: base_span.unwrap_or(span),
                         kind: ErrorKind::NotAStruct { base: rhs.clone() },
                     },
-                    _ if self.demanded(&rhs) && lhs.is_fieldless() => Error {
+                    _ if self.demanded(&rhs) => Error {
                         span: base_span.unwrap_or(span),
                         kind: ErrorKind::NotAStruct { base: lhs.clone() },
                     },
@@ -311,10 +329,8 @@ impl Solve<'_> {
     /// account for its own children — the fields under it come from a row the
     /// line above does not show.
     fn rows(&mut self, span: Span, shape: Shape, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
-        let mut want_repeats = Vec::new();
-        let (want, want_rest) = self.canon(lhs, &mut want_repeats);
-        let mut have_repeats = Vec::new();
-        let (have, have_rest) = self.canon(rhs, &mut have_repeats);
+        let (want, want_rest) = self.canon(lhs);
+        let (have, have_rest) = self.canon(rhs);
         let expected = Rc::new(Ty::Row {
             shape,
             fields: want.clone(),
@@ -336,23 +352,6 @@ impl Solve<'_> {
         };
         self.step(span, rule, goal.clone(), Effect::Decomposed);
         self.depth += 1;
-
-        // What flattening found twice, refused now that there is a rule to
-        // refuse it under. Both sides together, because it is one row that went
-        // wrong however many labels it went wrong at; see [`Solve::repeat`].
-        //
-        // And then this goal is over. Refusing is a failure like any other, so
-        // it has already abandoned every copy of every repeated field —
-        // [`Solve::fail`]'s rule that reporting and recovering are one act —
-        // and going on to line the two rows up would compare whichever copy
-        // flattening happened to keep against a field the reader can no longer
-        // see, and report a second time about a type nobody wrote.
-        let repeats: Vec<_> = want_repeats.into_iter().chain(have_repeats).collect();
-        if !repeats.is_empty() {
-            self.repeat(span, shape, goal, &repeats);
-            self.depth -= 1;
-            return;
-        }
 
         let only_want: IndexMap<String, RowField> = want
             .iter()
@@ -399,7 +398,7 @@ impl Solve<'_> {
                 &want_rest,
                 only_have,
                 &have_rest,
-                &expected,
+                Rowed::new(shape, &expected),
             ),
             (false, true) => self.absorb(
                 span,
@@ -407,7 +406,7 @@ impl Solve<'_> {
                 &have_rest,
                 only_want,
                 &want_rest,
-                &actual,
+                Rowed::new(shape, &actual),
             ),
             // Extras both ways continue as one fresh tail, which is what
             // makes the two rows end as the same row rather than merely
@@ -420,9 +419,16 @@ impl Solve<'_> {
                     &want_rest,
                     only_have,
                     &rest,
-                    &expected,
+                    Rowed::new(shape, &expected),
                 );
-                self.absorb(span, Side::Actual, &have_rest, only_want, &rest, &actual);
+                self.absorb(
+                    span,
+                    Side::Actual,
+                    &have_rest,
+                    only_want,
+                    &rest,
+                    Rowed::new(shape, &actual),
+                );
             }
         }
 
@@ -434,67 +440,16 @@ impl Solve<'_> {
             })
             .collect();
         for (name, want, have) in shared {
-            self.field(span, &name, &expected, &actual, &want, &have);
+            self.field(
+                span,
+                &name,
+                Rowed::new(shape, &expected),
+                Rowed::new(shape, &actual),
+                &want,
+                &have,
+            );
         }
         self.depth -= 1;
-    }
-
-    /// Every field a row and its own tail both name: refused, and every copy
-    /// abandoned so the contradiction is reported once rather than echoed by
-    /// whatever was waiting on any of them.
-    ///
-    /// A row naming a field its own tail also names is not a type, and this is
-    /// one of the two ways to write one: handing a declaration's `..` parameter
-    /// a row that repeats a field the declaration already names, as
-    /// `WithX { x: Nat }` does against `type WithX r = { x: Nat, ..r }`. The
-    /// other way goes through a variable, and [`Solve::assign`]'s lacks check
-    /// catches it before it is ever bound; this one has no variable to catch,
-    /// because substitution put a written row straight into the tail.
-    ///
-    /// Refused rather than unified. Deciding the two copies against each other
-    /// would accept `WithX { x: Nat }` — both copies are `Nat` — and then
-    /// [`Table::zonk`] would keep one of them silently, which is exactly the
-    /// failure the lacks check was added to end.
-    ///
-    /// Worded as [`ErrorKind::RepeatedField`], the same complaint
-    /// [`Solve::assign`] makes when a tail would be *bound* to a row that
-    /// repeats a field. One contradiction, one sentence, whichever way it was
-    /// reached — so the whole list arrives at once, the first label is the one
-    /// named, and the rest are abandoned rather than reported. Naming the first
-    /// is the rule [`Table::repeated`] states: the field a reader would reach
-    /// first reading the type left to right, expected side before actual.
-    /// Abandoning all of them is [`Solve::fail`]'s rule: reporting and
-    /// recovering are one act, and a copy left unrecovered is a variable
-    /// generalization would go on to quantify.
-    fn repeat(
-        &mut self,
-        span: Span,
-        shape: Shape,
-        goal: ConstraintKind,
-        repeats: &[(String, RowField, RowField)],
-    ) {
-        let Some((name, ..)) = repeats.first() else {
-            return;
-        };
-        let error = Error {
-            span,
-            kind: ErrorKind::RepeatedField {
-                shape,
-                field: name.clone(),
-            },
-        };
-        let abandoned: Vec<Rc<Ty>> = repeats
-            .iter()
-            .flat_map(|(_, first, second)| {
-                [
-                    first.ty.clone(),
-                    second.ty.clone(),
-                    first.presence.clone(),
-                    second.presence.clone(),
-                ]
-            })
-            .collect();
-        self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
     }
 
     /// A row flattened: its own labels joined with every label its tail
@@ -507,34 +462,16 @@ impl Solve<'_> {
     /// where an argument is written and unification enforces everywhere else.
     /// The caller knew it before this was called and still knows it after.
     ///
-    /// A read and nothing else. It used to unify the labels it met twice on
-    /// the way down, which made the shape of a goal something the solver
-    /// settled before it had recorded the rule that was settling it; the pairs
-    /// go into `repeats` instead, for [`Solve::rows`] to decide under its own
-    /// step.
-    ///
-    /// What goes into `repeats` is a row naming a field its own tail also
-    /// names, which is not a type. There is one way to write one: handing a
-    /// declaration's `..` parameter a row that repeats a field the declaration
-    /// already names. Every other route runs through a variable, and the lacks
-    /// check in [`Solve::assign`] refuses those before anything is bound —
-    /// substitution is the one that has no variable to refuse, because it puts
-    /// a written row straight into the tail.
-    ///
-    /// The pair is collected rather than dropped because an [`IndexMap`] holds
-    /// one entry per key: without somewhere for a second copy to go, flattening
-    /// would silently keep one of two field types, which is the failure the
-    /// lacks check exists to end. [`Solve::rows`] refuses what lands here.
-    fn canon(
-        &self,
-        ty: &Rc<Ty>,
-        repeats: &mut Vec<(String, RowField, RowField)>,
-    ) -> (IndexMap<String, RowField>, Rc<Ty>) {
-        let Ty::Row { fields, rest, .. } = &**ty else {
-            unreachable!("canon is only called on rows");
-        };
-        let mut fields = fields.clone();
-        let mut rest = self.table.resolve(rest);
+    /// A read and nothing else, and one an [`IndexMap`] settles: the outer
+    /// row's own labels are inserted first, so a label its tail also names is
+    /// the label the row wrote out. A row that names one of its tail's labels
+    /// is not a type, and there is no way left to write one — lowering refuses
+    /// a declaration handed a row that repeats a label it already names, and
+    /// [`Solve::assign`]'s lacks check refuses every route that goes through a
+    /// variable — so what arrives here is a row and its tail agreeing.
+    fn canon(&self, ty: &Rc<Ty>) -> (IndexMap<String, RowField>, Rc<Ty>) {
+        let mut fields: IndexMap<String, RowField> = IndexMap::new();
+        let mut rest = ty.clone();
         while let Ty::Row {
             fields: inner,
             rest: deeper,
@@ -542,12 +479,7 @@ impl Solve<'_> {
         } = &*rest.clone()
         {
             for (name, field) in inner {
-                match fields.get(name) {
-                    Some(existing) => repeats.push((name.clone(), existing.clone(), field.clone())),
-                    None => {
-                        fields.insert(name.clone(), field.clone());
-                    }
-                }
+                fields.entry(name.clone()).or_insert_with(|| field.clone());
             }
             rest = self.table.resolve(deeper);
         }
@@ -599,14 +531,10 @@ impl Solve<'_> {
     /// Field types and whatever is left of the tail stay live: those are not
     /// decided by the failing goal's siblings, and later knowledge about them
     /// is knowledge the reader wants.
-    fn frozen(&self, ty: &Rc<Ty>) -> Rc<Ty> {
-        let resolved = self.table.resolve(ty);
-        let Ty::Row { shape, .. } = &*resolved else {
-            return resolved;
-        };
-        let shape = *shape;
+    fn frozen(&self, row: Rowed<'_>) -> Rc<Ty> {
+        let shape = row.shape;
         let mut fields: IndexMap<String, RowField> = IndexMap::new();
-        let mut row = resolved;
+        let mut row = self.table.resolve(row.ty);
         while let Ty::Row {
             fields: named,
             rest,
@@ -639,23 +567,20 @@ impl Solve<'_> {
     /// has, never as `present` against `absent` — the field's name is known
     /// here, and the complaint should name it.
     ///
-    /// Which noun the rule is read in comes off the rows themselves, the way
-    /// [`Solve::absorb`] reads the shape it continues extras as: the two are
-    /// the rows this is deciding a label of, so nothing can arrive disagreeing
-    /// with them.
+    /// Which noun the rule is read in is handed down from [`Solve::rows`], the
+    /// way [`Solve::absorb`]'s is: the shape is what the two rows were matched
+    /// on, so passing it costs nothing and leaves no second reading of it here
+    /// to drift.
     fn field(
         &mut self,
         span: Span,
         name: &str,
-        expected_base: &Rc<Ty>,
-        actual_base: &Rc<Ty>,
+        expected: Rowed<'_>,
+        actual: Rowed<'_>,
         want: &RowField,
         have: &RowField,
     ) {
-        let Ty::Row { shape, .. } = &**expected_base else {
-            unreachable!("field is only called with the rows the label belongs to");
-        };
-        let shape = *shape;
+        let shape = expected.shape;
         let p1 = self.table.resolve(&want.presence);
         let p2 = self.table.resolve(&have.presence);
         let goal = ConstraintKind::Equal {
@@ -668,7 +593,7 @@ impl Solve<'_> {
             (Ty::Present, Ty::Present) => self.unify(span, &want.ty, &have.ty),
             (Ty::Present, Ty::Absent) => {
                 let kind = ErrorKind::MissingField {
-                    base: self.frozen(actual_base),
+                    base: self.frozen(actual),
                     field: name.to_string(),
                 };
                 let abandoned = [want.ty.clone(), have.ty.clone()];
@@ -682,7 +607,7 @@ impl Solve<'_> {
             }
             (Ty::Absent, Ty::Present) => {
                 let kind = ErrorKind::ExtraField {
-                    base: self.frozen(expected_base),
+                    base: self.frozen(expected),
                     field: name.to_string(),
                 };
                 let abandoned = [want.ty.clone(), have.ty.clone()];
@@ -711,9 +636,10 @@ impl Solve<'_> {
     /// Push the labels only one row names into the other row's tail, to
     /// continue as `rest`. `side` says which side of the goal the tail sits
     /// on, so that every act performed on its behalf keeps the direction the
-    /// constraint was worded in; `base` is the row the tail belongs to,
-    /// which is the type a complaint names, and `shape` is what the row the
-    /// extras continue as has to be.
+    /// constraint was worded in; `shape` is what the row the extras continue as
+    /// has to be, handed down from the goal that matched the two rows on it;
+    /// and `base` is the row the tail belongs to, which is the type a complaint
+    /// names.
     ///
     /// An open tail takes the row whole — one binding, occurs-checked like
     /// any other. A closed tail takes nothing: each label must turn out
@@ -726,16 +652,9 @@ impl Solve<'_> {
         tail: &Rc<Ty>,
         extras: IndexMap<String, RowField>,
         rest: &Rc<Ty>,
-        base: &Rc<Ty>,
+        base: Rowed<'_>,
     ) {
-        // What the extras continue as is a row of the shape they came out of,
-        // and `base` is that row — so it is read off rather than passed
-        // alongside, which is one less thing that could arrive disagreeing
-        // with it.
-        let Ty::Row { shape, .. } = &**base else {
-            unreachable!("absorb is only called with the row the tail belongs to");
-        };
-        let shape = *shape;
+        let shape = base.shape;
         if !matches!(&**tail, Ty::Empty) {
             let row = Rc::new(Ty::Row {
                 shape,
@@ -927,10 +846,7 @@ impl Solve<'_> {
     /// the contradiction reached the reader as a silently narrowed type or as
     /// a mismatch somewhere else entirely.
     fn assign(&mut self, span: Span, goal: ConstraintKind, var: TyVar, ty: &Rc<Ty>) {
-        let Slot::Unbound { level } = self.table.vars[var as usize] else {
-            unreachable!("resolve only stops at unbound variables");
-        };
-        if self.table.occurs(var, level, ty) {
+        if self.table.occurs(var, ty) {
             let error = Error {
                 span,
                 kind: ErrorKind::Recursive,

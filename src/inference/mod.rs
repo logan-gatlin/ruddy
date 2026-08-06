@@ -1,8 +1,7 @@
 //! Assigning a type to every term.
 //!
-//! Hindley–Milner: unification, `let`-generalization, and Rémy-style levels
-//! to decide what a definition may quantify over. Types are equated, never
-//! ordered — two types either unify or they are an error — so a term's type
+//! Hindley–Milner: unification and `let`-generalization. Types are equated,
+//! never ordered — two types either unify or they are an error — so a term's type
 //! is the one type it has rather than a bound on it.
 //!
 //! Each definition is typed in two passes, and the [`Constraint`] list is all
@@ -302,7 +301,7 @@ pub enum ErrorKind {
 /// and zonking are what make sure of that.
 #[derive(Debug, Clone)]
 enum Slot {
-    Unbound { level: u32 },
+    Unbound,
     Bound(Rc<Ty>),
 }
 
@@ -332,17 +331,21 @@ enum Side {
     Actual,
 }
 
-/// Every type variable ever minted, and the level fresh ones are born at.
+/// Every type variable ever minted.
 ///
 /// Both passes hold this: generation mints into it, solving binds in it, and
 /// generalization reads it. It is the only state that outlives a pass.
 #[derive(Default)]
 struct Table {
     /// One slot per variable; [`Ty::Var`] indexes into it.
+    ///
+    /// There is no generalization level beside it. A definition is the only
+    /// thing this language generalizes at and there is no `let` inside one, so
+    /// every variable still unsolved when a definition ends was minted by that
+    /// definition and is its to quantify. Rémy-style levels are what decides
+    /// this where a definition can nest, and are what a nested `let` would have
+    /// to bring back with it.
     vars: Vec<Slot>,
-    /// The current generalization level. Fresh variables are born at it, and
-    /// generalization quantifies exactly the variables born deeper than it.
-    level: u32,
     /// What each row variable may not stand for: the field names the rows it
     /// is the tail of already write out.
     ///
@@ -414,10 +417,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut constraints = IndexMap::new();
     let mut steps = Vec::new();
     for (symbol, decl) in program.terms.iter_mut() {
-        // Each definition is solved one level in, so that everything still
-        // unsolved when it ends is provably local to it and can be quantified.
-        table.level = 1;
-
         // The annotation is the contract: the body is checked against it, and
         // it — not whatever the body's constraints worked out along the way —
         // is what the definition means to everyone downstream.
@@ -494,7 +493,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             });
         }
 
-        table.level = 0;
         let (scheme, mut subst) = table.generalize(&ty);
         // With the substitution in hand, resolve every type the walk wrote
         // into the body, so a term's type and its definition's scheme spell
@@ -553,7 +551,7 @@ impl Table {
 
     fn fresh(&mut self) -> Rc<Ty> {
         let var = self.vars.len() as TyVar;
-        self.vars.push(Slot::Unbound { level: self.level });
+        self.vars.push(Slot::Unbound);
         Rc::new(Ty::Var(var))
     }
 
@@ -616,7 +614,11 @@ impl Table {
             | (Ty::Empty, Ty::Empty)
             | (Ty::Undecided, Ty::Undecided) => true,
             (Ty::Var(x), Ty::Var(y)) => x == y,
-            (Ty::Bound(x), Ty::Bound(y)) => x == y,
+            // A quantified variable is not written out, on purpose: nothing
+            // reaches here holding one — an argument was lowered from what
+            // somebody wrote at a use site, and a scheme is opened before it is
+            // ever compared — and a variant this cannot tell about belongs in
+            // the arm below, whose answer is the safe one.
             (Ty::Arrow(from, to), Ty::Arrow(other_from, other_to)) => {
                 self.alike(from, other_from) && self.alike(to, other_to)
             }
@@ -672,46 +674,30 @@ impl Table {
         }
     }
 
-    /// Whether `var` occurs in `ty` — and, on the same walk, the level
-    /// adjustment: every unbound variable in `ty` is pulled up to `level` if
-    /// it was deeper, because it is about to be reachable from something at
-    /// `level` and must not be generalized past it.
-    fn occurs(&mut self, var: TyVar, level: u32, ty: &Rc<Ty>) -> bool {
+    /// Whether `var` occurs in `ty`.
+    fn occurs(&self, var: TyVar, ty: &Rc<Ty>) -> bool {
         let ty = self.resolve(ty);
         match &*ty {
-            Ty::Var(other) => {
-                if *other == var {
-                    return true;
-                }
-                let Slot::Unbound { level: at } = &mut self.vars[*other as usize] else {
-                    unreachable!("resolve only stops at unbound variables");
-                };
-                *at = (*at).min(level);
-                false
-            }
-            Ty::Arrow(from, to) => self.occurs(var, level, from) || self.occurs(var, level, to),
-            Ty::Row { fields, rest, .. } => {
-                for field in fields.values() {
-                    if self.occurs(var, level, &field.presence)
-                        || self.occurs(var, level, &field.ty)
-                    {
-                        return true;
-                    }
-                }
-                self.occurs(var, level, rest)
-            }
+            Ty::Var(other) => *other == var,
+            Ty::Arrow(from, to) => self.occurs(var, from) || self.occurs(var, to),
+            // Every slot a row has, in one sequence: a field's presence is as
+            // much a place a variable can hide as its type is, and the tail is
+            // another, and none of the three is a different question.
+            Ty::Row { fields, rest, .. } => fields
+                .values()
+                .flat_map(|field| [&field.presence, &field.ty])
+                .chain([rest])
+                .any(|inner| self.occurs(var, inner)),
             // A declared type is descended into as far as its arguments and no
             // further, here and in every walk below. What one stands for was
             // lowered from what the user wrote and mentions no variable at all
             // — lowering refuses a `..` or a `?` in a declaration for exactly
-            // this reason — so there is nothing in the body to find, no level
-            // to pull up, and nothing to rebuild; and stopping there is what
-            // keeps a walk over a type that names itself finite. The arguments
-            // are the other half: they were written at the use site and hold
-            // whatever it held, so skipping them would miss a cycle and leave a
-            // level unraised, and generalization would quantify a variable that
-            // escapes.
-            Ty::Named { args, .. } => args.iter().any(|arg| self.occurs(var, level, arg)),
+            // this reason — so there is nothing in the body to find and nothing
+            // to rebuild; and stopping there is what keeps a walk over a type
+            // that names itself finite. The arguments are the other half: they
+            // were written at the use site and hold whatever it held, so
+            // skipping them would miss a cycle.
+            Ty::Named { args, .. } => args.iter().any(|arg| self.occurs(var, arg)),
             Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => false,
         }
     }
@@ -929,7 +915,7 @@ impl Table {
         match &*ty {
             Ty::Var(var) => {
                 if !presences {
-                    self.quantify_var(*var, subst);
+                    Self::quantify_var(*var, subst);
                 }
             }
             Ty::Arrow(from, to) => {
@@ -939,7 +925,7 @@ impl Table {
             Ty::Row { fields, rest, .. } => {
                 for field in fields.values() {
                     if presences && let Ty::Var(var) = &*self.resolve(&field.presence) {
-                        self.quantify_var(*var, subst);
+                        Self::quantify_var(*var, subst);
                     }
                     self.quantify_walk(&field.ty, subst, presences);
                 }
@@ -957,13 +943,11 @@ impl Table {
         }
     }
 
-    fn quantify_var(&self, var: TyVar, subst: &mut HashMap<TyVar, u32>) {
-        let Slot::Unbound { level } = self.vars[var as usize] else {
-            unreachable!("resolve only stops at unbound variables");
-        };
-        if level > self.level && !subst.contains_key(&var) {
-            subst.insert(var, subst.len() as u32);
-        }
+    /// Number one variable, unless it already has a number. Every variable
+    /// this reaches is one the definition may quantify; see [`Table::vars`].
+    fn quantify_var(var: TyVar, subst: &mut HashMap<TyVar, u32>) {
+        let next = subst.len() as u32;
+        subst.entry(var).or_insert(next);
     }
 
     /// Resolve a type all the way down, replacing each variable in `subst`
@@ -972,10 +956,10 @@ impl Table {
     fn zonk(&self, ty: &Rc<Ty>, subst: &HashMap<TyVar, u32>) -> Rc<Ty> {
         let ty = self.resolve(ty);
         match &*ty {
-            Ty::Var(var) => match subst.get(var) {
-                Some(&index) => Rc::new(Ty::Bound(index)),
-                None => ty,
-            },
+            // Indexed rather than looked up: everything that zonks quantifies
+            // first — see [`Table::close`] and [`Table::generalize`] — so a
+            // variable this walk can reach has a number by the time it does.
+            Ty::Var(var) => Rc::new(Ty::Bound(subst[var])),
             Ty::Arrow(from, to) => Rc::new(Ty::Arrow(self.zonk(from, subst), self.zonk(to, subst))),
             Ty::Row {
                 shape,
@@ -1313,9 +1297,10 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     // `type Id a = a` written `Id (Id Nat)`, which is a correct program.
     let mut budget = aliases.len();
     while let Ty::Named { symbol, args, .. } = &*ty.clone() {
-        let Some(scheme) = aliases.get(symbol) else {
-            return Rc::new(Ty::Undecided);
-        };
+        // Indexed rather than looked up: a name that repeats a declaration
+        // binds nothing, so a name lowering wrote into a type is one this table
+        // has.
+        let scheme = &aliases[symbol];
         budget = match &**scheme.body() {
             Ty::Bound(_) => aliases.len(),
             _ => budget
@@ -1328,27 +1313,6 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 }
 
 impl Ty {
-    /// Whether this type is one a field could not be read off whatever else is
-    /// true of it. The three the language has: a number, a function, and a sum,
-    /// whose cases are not fields and cannot be read as any.
-    ///
-    /// Listed rather than written as "not a struct", so that a type added later
-    /// has to be considered instead of quietly inheriting a message about fields.
-    /// The presence and row constants are excluded on the same principle — one of
-    /// those meeting a struct is a bug in the solver, and "`absent` is not a
-    /// struct" is not the diagnostic that should carry it to anyone.
-    fn is_fieldless(&self) -> bool {
-        matches!(
-            self,
-            Ty::Nat
-                | Ty::Arrow(..)
-                | Ty::Row {
-                    shape: Shape::Sum,
-                    ..
-                }
-        )
-    }
-
     /// Replace each [`Ty::Bound`] with its instantiation. A free function rather
     /// than a method: a scheme's body mentions no solver variables, so opening it
     /// needs nothing from the solver's state.

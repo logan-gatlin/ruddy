@@ -6,18 +6,23 @@
 //! two of them are coded the same, and that the wording is shaped so a reporter
 //! can drop it into a line of its own choosing.
 
-use std::{collections::HashSet, rc::Rc};
+use std::{
+    collections::HashSet,
+    fmt::{self, Write as _},
+    rc::Rc,
+};
 
 use ruddy::{
     inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Rule},
     ir::{self, ErrorKind as IrError},
     parse,
     symbol::{Bundle, Mint, Namespace, Version},
-    token::{self, ErrorKind as LexError},
+    token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
-    types::{RowField, Sense, Shape, Ty},
+    types::{Prim, RowField, Sense, Shape, Ty},
     ui,
 };
+use ruddy_debug::print;
 
 /// Every error kind in the compiler, with the phase that raises it. Listed by
 /// hand because nothing can force it: a new variant added without a line here
@@ -628,5 +633,318 @@ fn a_mixed_parameter_names_both_readings() {
         mixed.to_string(),
         "this stands for the rest of a struct's fields in one place \
          and for the rest of a sum's cases in another"
+    );
+}
+
+/// Every token with a fixed spelling, printed and lexed again. `Display for
+/// Kind` is what the debugger's Tokens tab and the parse-tree printers write
+/// with, so a kind that printed as something else — or as what another kind
+/// prints as — would show a reader a stream that is not the one the compiler
+/// holds. The keywords the parser has no use for yet are here for that reason:
+/// they lex, so they print, and nothing else would notice if they printed
+/// wrong.
+#[test]
+fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
+    let fixed = [
+        TokenKind::Let,
+        TokenKind::In,
+        TokenKind::Type,
+        TokenKind::End,
+        TokenKind::With,
+        TokenKind::Fn,
+        TokenKind::Equal,
+        TokenKind::FatArrow,
+        TokenKind::Arrow,
+        TokenKind::Colon,
+        TokenKind::Comma,
+        TokenKind::Dot,
+        TokenKind::DotDot,
+        TokenKind::Question,
+        TokenKind::Pipe,
+        TokenKind::LeftBrace,
+        TokenKind::RightBrace,
+        TokenKind::LeftParen,
+        TokenKind::RightParen,
+    ];
+
+    let spellings: HashSet<_> = fixed.iter().map(|kind| kind.to_string()).collect();
+    assert_eq!(spellings.len(), fixed.len(), "{spellings:?}");
+
+    for kind in fixed {
+        let printed = kind.to_string();
+        let out = token::lex(&printed, FileID::GENERATED);
+        assert!(out.errors.is_empty(), "{printed}: {:#?}", out.errors);
+        assert_eq!(out.tokens.len(), 1, "{printed}");
+        assert_eq!(out.tokens[0].tracked.to_string(), printed);
+    }
+
+    // The three that carry something print it, and re-lex to themselves as
+    // well: the backtick stays on, and a number keeps its value.
+    for kind in [
+        TokenKind::Tag("Some".to_string()),
+        TokenKind::Identifier("x".to_string()),
+        TokenKind::Natural(4096),
+    ] {
+        let printed = kind.to_string();
+        let out = token::lex(&printed, FileID::GENERATED);
+        assert!(out.errors.is_empty(), "{printed}: {:#?}", out.errors);
+        assert_eq!(out.tokens.len(), 1, "{printed}");
+        assert_eq!(out.tokens[0].tracked.to_string(), printed);
+    }
+}
+
+/// An arity complaint counts in words, and both halves of it — what the type
+/// takes and what was written — count the same way. Nine is the last word;
+/// past that it is a numeral, because a type taking ten arguments has a
+/// problem the sentence is not going to help with.
+#[test]
+fn an_arity_complaint_counts_in_words_as_far_as_words_go() {
+    let said = |expected, found| IrError::Arity { expected, found }.to_string();
+
+    assert_eq!(
+        said(0, 1),
+        "this type takes no arguments, and one was written"
+    );
+    assert_eq!(
+        said(1, 0),
+        "this type takes one argument, and none was written"
+    );
+    assert_eq!(
+        said(2, 9),
+        "this type takes two arguments, and nine were written"
+    );
+    // Beyond the words, the numeral — on both sides.
+    assert_eq!(
+        said(10, 13),
+        "this type takes 10 arguments, and 13 were written"
+    );
+}
+
+/// A primitive prints as the one name it is written with, so a message quoting
+/// a type and the parser reading one back agree about the word.
+#[test]
+fn a_primitive_prints_as_the_name_it_is_written_with() {
+    assert_eq!(Prim::Nat.to_string(), Prim::Nat.name());
+    assert_eq!(Prim::Nat.to_string(), "Nat");
+}
+
+/// A case the solver settled absent is not part of what the sum says, so it is
+/// not printed — the same rule a struct's absent field keeps. Without it a
+/// complaint would quote a type carrying a case the reader was just told it
+/// does not have.
+#[test]
+fn a_case_settled_absent_is_not_part_of_the_sum() {
+    let sum = Rc::new(Ty::Row {
+        shape: Shape::Sum,
+        fields: [
+            ("A".to_string(), RowField::present(Rc::new(Ty::Nat))),
+            (
+                "B".to_string(),
+                RowField {
+                    presence: Rc::new(Ty::Absent),
+                    ty: Rc::new(Ty::Nat),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rc::new(Ty::Empty),
+    });
+    assert_eq!(sum.to_string(), "`A Nat");
+
+    // A case carrying a row that is not unit keeps its payload, open tail and
+    // all: only the empty closed struct is written as no payload at all.
+    let open = Rc::new(Ty::Row {
+        shape: Shape::Sum,
+        fields: [(
+            "A".to_string(),
+            RowField::present(Rc::new(Ty::Row {
+                shape: Shape::Struct,
+                fields: Default::default(),
+                rest: Rc::new(Ty::Bound(0)),
+            })),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rc::new(Ty::Empty),
+    });
+    assert_eq!(open.to_string(), "`A { ..\'a }");
+
+    // The two forms that write no case at all keep the leading bar, which is
+    // the only thing that makes either read back as a sum.
+    let empty = Rc::new(Ty::Row {
+        shape: Shape::Sum,
+        fields: Default::default(),
+        rest: Rc::new(Ty::Empty),
+    });
+    assert_eq!(empty.to_string(), "|");
+    let only_tail = Rc::new(Ty::Row {
+        shape: Shape::Sum,
+        fields: Default::default(),
+        rest: Rc::new(Ty::Bound(0)),
+    });
+    assert_eq!(only_tail.to_string(), "| ..\'a");
+}
+
+/// A sink that accepts `left` writes and then fails, so a printer can be run
+/// against a failure at every point it has one.
+struct Failing {
+    left: usize,
+}
+
+impl fmt::Write for Failing {
+    fn write_str(&mut self, _: &str) -> fmt::Result {
+        match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(fmt::Error),
+        }
+    }
+}
+
+/// How many writes rendering `shown` takes.
+fn write_count(shown: &dyn fmt::Display) -> usize {
+    struct Counting {
+        writes: usize,
+    }
+    impl fmt::Write for Counting {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            self.writes += 1;
+            Ok(())
+        }
+    }
+
+    let mut counting = Counting { writes: 0 };
+    write!(counting, "{shown}").expect("counting cannot fail");
+    counting.writes
+}
+
+/// Fail the sink at each write in turn and check the printer says so. A `?`
+/// dropped anywhere in a printer would show up here as a render that claimed to
+/// succeed after the sink had refused it — and, for the printers that write in
+/// pieces, as a half-written type reaching whoever asked for it.
+fn every_failure_is_reported(what: &str, shown: &dyn fmt::Display) {
+    let total = write_count(shown);
+    assert!(total > 0, "{what} wrote nothing");
+    for left in 0..total {
+        let mut failing = Failing { left };
+        assert!(
+            write!(failing, "{shown}").is_err(),
+            "{what}: the failure at write {left} of {total} was swallowed"
+        );
+    }
+    // And the same render against a sink that never refuses.
+    let mut enough = Failing { left: total };
+    assert!(write!(enough, "{shown}").is_ok(), "{what}");
+}
+
+/// Everything the compiler prints goes to a `fmt::Write` it does not own, and
+/// one that fails is a real thing — a socket, a full disk, the debugger's own
+/// buffers. A printer that swallowed the failure would hand back a type or a
+/// program that was never written, which is worse than the error it hid.
+#[test]
+fn a_printer_reports_a_writer_that_refuses_it() {
+    let nat = Rc::new(Ty::Nat);
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
+    let module = mint.module(None, "util").expect("a fresh name");
+    let local = mint.local(Some(module), Namespace::Terms, "x");
+    let named = Rc::new(Ty::Named {
+        symbol: mint
+            .global(None, Namespace::Types, "Pair")
+            .expect("a fresh name"),
+        name: "Pair".into(),
+        args: Rc::from([nat.clone(), nat.clone()]),
+    });
+
+    // A path, which writes the bundle, a module, and the anonymous segment a
+    // local is shown under.
+    every_failure_is_reported("a path", &mint.path(local));
+
+    let optional = RowField {
+        presence: Rc::new(Ty::Undecided),
+        ty: nat.clone(),
+    };
+    for (what, ty) in [
+        ("an arrow", Rc::new(Ty::Arrow(nat.clone(), nat.clone()))),
+        ("an application", named.clone()),
+        (
+            "an open struct",
+            Rc::new(Ty::Row {
+                shape: Shape::Struct,
+                fields: [
+                    ("x".to_string(), RowField::present(nat.clone())),
+                    ("y".to_string(), optional.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                rest: Rc::new(Ty::Bound(0)),
+            }),
+        ),
+        (
+            "an open sum",
+            Rc::new(Ty::Row {
+                shape: Shape::Sum,
+                fields: [
+                    ("A".to_string(), RowField::present(nat.clone())),
+                    ("B".to_string(), optional.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                rest: Rc::new(Ty::Bound(0)),
+            }),
+        ),
+        (
+            "the empty sum",
+            Rc::new(Ty::Row {
+                shape: Shape::Sum,
+                fields: Default::default(),
+                rest: Rc::new(Ty::Empty),
+            }),
+        ),
+        (
+            "the sum that is only its tail",
+            Rc::new(Ty::Row {
+                shape: Shape::Sum,
+                fields: Default::default(),
+                rest: Rc::new(Ty::Bound(0)),
+            }),
+        ),
+        (
+            "a case carrying unit",
+            Rc::new(Ty::Row {
+                shape: Shape::Sum,
+                fields: [(
+                    "None".to_string(),
+                    RowField::present(Rc::new(Ty::Row {
+                        shape: Shape::Struct,
+                        fields: Default::default(),
+                        rest: Rc::new(Ty::Empty),
+                    })),
+                )]
+                .into_iter()
+                .collect(),
+                rest: Rc::new(Ty::Empty),
+            }),
+        ),
+    ] {
+        every_failure_is_reported(what, &ty);
+    }
+
+    // And the term printers, which have forms of their own: an application and
+    // a projection, neither of which a type can be.
+    let source = "type Pair a b = { first: a, second: b }\n\
+                  let f = fn g => fn p => g p.first\n\
+                  let v : { first: Nat, second: Nat } = { first: 1, second: 2 }";
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut program_mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid"));
+    let built = ruddy::ir::build(&mut program_mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "{:#?}", built.errors);
+
+    every_failure_is_reported(
+        "a lowered program",
+        &print::ir::program(&built.program, &program_mint),
     );
 }

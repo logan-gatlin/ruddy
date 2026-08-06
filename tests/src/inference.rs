@@ -2364,3 +2364,239 @@ fn a_sum_tail_may_not_come_back_naming_its_own_case() {
          and here it would have to cover ``A`"
     );
 }
+
+/// A label both rows name and disagree about is reported as the label, never
+/// as `present` against `absent`: the name is known here, and "no field `x`"
+/// is what a reader can act on where "expected present, found absent" is a
+/// sentence about the solver.
+///
+/// Getting a row to hold a settled `absent` takes three uses of one parameter:
+/// one to give it the optional field, one to close it — which settles the
+/// field away — and one that then asks for the field back. A `?` field is the
+/// only thing that can be settled either way, so it is the only thing that can
+/// disagree with a constant on the other side.
+#[test]
+fn a_settled_presence_is_reported_as_the_field_it_is_about() {
+    // The annotation demands the field; the row it is given no longer has it.
+    let (_, _, output) = infer_src(
+        "let optional : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let demands : { x: Nat } -> Nat = fn p => p.x\n\
+         let f = fn r => { a: optional r, b: closed r, c: demands r }",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(
+        error.kind.to_string(),
+        "no field `x` on `{}`",
+        "the row is quoted as it stands, and a field settled away is not part of it"
+    );
+
+    // And the other way round: the parameter settled the field away, so a
+    // caller writing it is writing one the function does not take.
+    let (_, _, output) = infer_src(
+        "let optional : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let f = fn r => { a: optional r, b: closed r }\n\
+         let v = f { x: 1 }",
+    );
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "extra-field");
+    assert!(
+        error.kind.to_string().contains("extra field `x`"),
+        "{}",
+        error.kind
+    );
+}
+
+/// A field already known to be absent is nothing for a closed row to refuse:
+/// it is not part of what the type says, so closing a row that has settled it
+/// away is closing a row that does not name it.
+#[test]
+fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
+    inferred(
+        "let optional : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let f = fn r => { a: optional r, b: closed r, c: closed r }",
+    );
+
+    // And an open row asking for it back settles its own `?` the same way,
+    // without going near the field's type: an absent field's type slot means
+    // nothing, and constraining it would refuse rows that agree.
+    inferred(
+        "let optional : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let f = fn r => { a: optional r, b: closed r, c: optional r }",
+    );
+}
+
+/// A declaration whose parameter is its whole rest names nothing beside it, so
+/// there is no label an argument could repeat and nothing to forbid. The
+/// condition is recorded only where there is one.
+#[test]
+fn a_rest_that_stands_for_everything_forbids_nothing() {
+    let (mint, _, output) = inferred("type Only r = { ..r }\nlet v : Only { x: Nat } = { x: 1 }");
+    assert_eq!(scheme(&mint, &output, "v"), "Only { x: Nat }");
+}
+
+/// Two applications of one recursive declaration are compared argument by
+/// argument when the goal comes back round, and an argument is any type at
+/// all: an arrow is compared as an arrow, side by side, rather than by whether
+/// the two were written the same way.
+#[test]
+fn a_recursive_constructor_carrying_an_arrow_comes_back_round() {
+    let (mint, _, output) = inferred(
+        "type List a = { head: a, tail: List a }\n\
+         type Seq a = { head: a, tail: Seq a }\n\
+         let f : List (Nat -> Nat) -> Seq (Nat -> Nat) = fn x => x",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "List (Nat -> Nat) -> Seq (Nat -> Nat)"
+    );
+}
+
+/// The demand a projection makes can land on either side of a goal, because
+/// which side it lands on is decided by whoever emitted the constraint rather
+/// than by the projection. Reading a field off a definition the annotation
+/// says is a `Nat` puts the demand on the `actual` half — and it is still the
+/// `Nat` that has no fields, worded exactly as it is the other way round.
+#[test]
+fn a_demand_on_the_actual_side_still_names_the_type_with_no_fields() {
+    let (_, _, output) = infer_src("let g = fn p => p.x\nlet v : Nat -> Nat = g");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "not-a-struct");
+    assert_eq!(
+        error.kind.to_string(),
+        "`Nat` is not a struct, so it has no fields to read"
+    );
+}
+
+/// An assumption is compared to the goal in front of it argument by argument,
+/// and an argument still holding a variable is compared as that variable: two
+/// `?` fields unified with each other are one question, so the goal that comes
+/// back round is the goal already on the stack.
+#[test]
+fn an_assumption_matches_through_a_variable_the_two_sides_share() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Nest a }\n\
+         type Nest a = { head: Tree a, tail: Nest a }\n\
+         type Wood a = { value: a, kids: Grove a }\n\
+         type Grove a = { head: Wood a, tail: Grove a }\n\
+         let peek : Tree { x?: Nat } -> Nat = fn t => 1\n\
+         let take : Wood { x?: Nat } -> Nat = fn w => 2\n\
+         let q = fn w => { a: peek w, b: take w }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "q"),
+        "Tree { x?: Nat } -> { a: Nat, b: Nat }"
+    );
+}
+
+/// One declaration against itself is the same declaration however it was
+/// applied, and the shortcut that says so has to stop short of applications
+/// that were given something: `List Nat` against `List Nat` is decided by
+/// comparing the arguments, not by the names agreeing.
+#[test]
+fn one_declaration_applied_to_something_is_not_settled_by_its_name() {
+    let (mint, _, output) = inferred(
+        "type List a = { head: a, tail: List a }\n\
+         let f : List Nat -> Nat = fn x => 1\n\
+         let g : List Nat -> Nat = fn x => f x",
+    );
+    assert_eq!(scheme(&mint, &output, "g"), "List Nat -> Nat");
+}
+
+/// Two rows sharing one tail cannot differ in fields — but two that share a
+/// tail and name the same fields are simply the same row, and refusing that
+/// pair would refuse a function applied twice to one argument.
+#[test]
+fn two_rows_sharing_a_tail_and_naming_the_same_fields_agree() {
+    let (mint, _, output) = inferred(
+        "let f : { x: Nat, ..r } -> { x: Nat, ..r } -> Nat = fn a => fn b => 1\n\
+         let g = fn p => f p p",
+    );
+    assert_eq!(scheme(&mint, &output, "g"), "{ x: Nat, ..\'a } -> Nat");
+
+    // One more field on one side and the pair is the cycle again: whatever the
+    // shared tail absorbed from one row it would grow on the other.
+    for src in [
+        "let f : { x: Nat, ..r } -> { x: Nat, y: Nat, ..r } -> Nat = fn a => fn b => 1\n\
+         let g = fn p => f p p",
+        // Whichever side is the longer one: the extras are the same cycle from
+        // either end.
+        "let f : { x: Nat, y: Nat, ..r } -> { x: Nat, ..r } -> Nat = fn a => fn b => 1\n\
+         let g = fn p => f p p",
+    ] {
+        let (_, _, output) = infer_src(src);
+        let [error] = output.errors.as_slice() else {
+            panic!("expected exactly one error for {src}: {:#?}", output.errors);
+        };
+        assert_eq!(error.kind.code(), "recursive-type", "{src}");
+    }
+}
+
+/// An assumption is only about the goal it was pushed for. Reaching the same
+/// two declarations at a different argument is a different question, and the
+/// comparison that decides so has to look at whatever an argument can be: a
+/// row with other labels, a row with more of them, a row of the other shape, an
+/// arrow whose halves differ, and a `?` nothing has decided yet.
+///
+/// Each of these programs reaches `Tree ? ~ Tree2 ?` twice with the two
+/// arguments apart, so the second question is asked rather than answered by
+/// the first — and every one of them is true, so the answer is the same either
+/// way. What differs is only how much work it took, which is exactly what an
+/// assumption is for.
+#[test]
+fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
+    for src in [
+        // Other labels, and more of them.
+        "type Bush = { t: Tree { b: Nat } }\n\
+         type Bush2 = { t: Tree2 { b: Nat } }\n\
+         let f : Tree { a: Nat } -> Tree2 { a: Nat } = fn x => x",
+        "type Bush = { t: Tree { a: Nat, b: Nat } }\n\
+         type Bush2 = { t: Tree2 { a: Nat, b: Nat } }\n\
+         let f : Tree { a: Nat } -> Tree2 { a: Nat } = fn x => x",
+        // The other shape: a sum and a struct are two types however much their
+        // insides look alike.
+        "type Bush = { t: Tree { b: Nat } }\n\
+         type Bush2 = { t: Tree2 { b: Nat } }\n\
+         let f : Tree (`a Nat) -> Tree2 (`a Nat) = fn x => x",
+        // An arrow, compared side by side rather than whole.
+        "type Bush = { t: Tree (Nat -> Nat) }\n\
+         type Bush2 = { t: Tree2 (Nat -> Nat) }\n\
+         let f : Tree ({} -> Nat) -> Tree2 ({} -> Nat) = fn x => x",
+    ] {
+        let src = format!(
+            "type Tree x = {{ v: x, k: Bush }}\n\
+             type Tree2 x = {{ v: x, k: Bush2 }}\n{src}"
+        );
+        let (_, out, output) = infer_src(&src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(output.errors.is_empty(), "{src}: {:#?}", output.errors);
+    }
+
+    // And a presence still open, which is the one part of an argument that can
+    // be a variable while the goal is being asked. The definition is left
+    // unannotated so that unifying the two `?`s is not the annotation being
+    // narrowed.
+    let (mint, _, output) = inferred(
+        "type Tree x = { v: x, k: Bush }\n\
+         type Bush = { t: Tree { a: Nat } }\n\
+         type Tree2 x = { v: x, k: Bush2 }\n\
+         type Bush2 = { t: Tree2 { a: Nat } }\n\
+         let g : Tree { a?: Nat } -> Nat = fn x => 1\n\
+         let h : Tree2 { a?: Nat } -> Nat = fn x => 2\n\
+         let f = fn y => { p: g y, q: h y }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "Tree { a?: Nat } -> { p: Nat, q: Nat }"
+    );
+}
