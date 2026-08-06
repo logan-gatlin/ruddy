@@ -66,6 +66,10 @@ test:
 build:
     cargo build --workspace
 
+# Line coverage for the compiler: runs every test, reports only `src/`.
+coverage *args:
+    cargo llvm-cov --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/' {{args}}
+
 clippy:
     cargo clippy --workspace --all-targets
 
