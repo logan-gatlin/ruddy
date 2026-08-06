@@ -1,6 +1,6 @@
 //! Tests for [`ruddy_debug::stage`].
 
-use ruddy::types::Ty;
+use ruddy::types::Core;
 use ruddy_debug::{
     stage::{Build, REGISTRY, Spec, panicked, skipped},
     wire::Stage,
@@ -37,7 +37,7 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     assert_eq!(pattern, r"\?\d*|'[a-z]\d*");
 
     // `\?\d*`: a `?`, then digits — of which a bare `?` is the empty case.
-    for (ty, tail) in [(Ty::Var(4), "4"), (Ty::Undecided, "")] {
+    for (ty, tail) in [(Core::Var(4), "4"), (Core::Undecided, "")] {
         let printed = ty.to_string();
         assert_eq!(printed, format!("?{tail}"));
         assert!(tail.chars().all(|c| c.is_ascii_digit()), "{printed}");
@@ -46,7 +46,7 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     // `'[a-z]\d*`: a quote, a letter, then the digits that appear once the
     // alphabet runs out.
     for index in [0, 25, 26] {
-        let printed = Ty::Bound(index).to_string();
+        let printed = Core::Bound(index).to_string();
         let mut chars = printed.chars();
         assert_eq!(chars.next(), Some('\''), "{printed}");
         assert!(

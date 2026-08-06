@@ -84,7 +84,7 @@ pub struct Param {
     /// stand for exactly when every argument reaches the body, so a
     /// declaration with an argument that does not is compared by unfolding
     /// like any other type. See [`relevance`] for how it is worked out and
-    /// [`Ty::Named`] for what rests on it.
+    /// [`Core::Named`] for what rests on it.
     ///
     /// Not known while the body is being lowered either — it follows from what
     /// every *other* declaration does with what it is handed — so it is `false`
@@ -95,7 +95,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Term {
     /// What the term was inferred to be. Lowering runs before inference, so
-    /// until then this is [`Ty::Undecided`] — see [`TermKind::with_span`].
+    /// until then this is [`Ty::default`], the undecided type — see
+    /// [`TermKind::with_span`].
     pub ty: Rc<Ty>,
     pub span: Span,
     pub kind: TermKind,
@@ -196,7 +197,7 @@ pub enum TypeKind {
     ///
     /// Both the symbol and the position, because the two readers want
     /// different things: the debugger names it and cross-highlights it, and
-    /// inference substitutes for it by position — which is [`Ty::Bound`]
+    /// inference substitutes for it by position — which is [`Core::Bound`]
     /// exactly, so lowering one is a rename rather than a translation.
     Param {
         symbol: Symbol,
@@ -323,7 +324,7 @@ pub enum ErrorKind {
     /// A tail naming a row parameter is the exception, and the reason the rule
     /// is worth stating this precisely rather than as "a declaration is
     /// closed". What such a tail stands for is not decided here either — it is
-    /// supplied at every use — so it lowers to a [`Ty::Bound`], not to a
+    /// supplied at every use — so it lowers to a [`Core::Bound`], not to a
     /// variable, and the property inference leans on survives untouched: a
     /// declaration's body mentions no solver variable, which is what lets every
     /// walk stop at a name instead of descending into what it stands for.
@@ -1449,8 +1450,8 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
 /// struct handed to a row parameter lowers to exactly the type it would
 /// anywhere else, and substitution puts it wherever the parameter sat. What
 /// this refuses is the argument that would leave a row holding something no row
-/// can hold, which is the invariant [`Ty::Row`] documents and nothing else
-/// enforces, and the argument that would leave one naming a field twice, which
+/// can hold, which is the invariant [`Rest`](crate::types::Rest) documents and
+/// nothing else enforces, and the argument that would leave one naming a field twice, which
 /// nothing downstream can recover from either.
 ///
 /// Refusing it is not enough on its own: an argument left standing is
@@ -1460,7 +1461,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
 /// argument and not the whole application, because the mistake is the argument
 /// and `WithX Nat -> Nat` is half correct. [`row_shaped`] already reads
 /// [`TypeKind::Error`] as row-shaped, so nothing complains about the erasure,
-/// and it lowers to [`Ty::Undecided`], which a tail is already allowed to be.
+/// and it lowers to the undecided type, which a tail is already allowed to be.
 fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
     fn walk(
         ty: &mut Type,
@@ -2230,8 +2231,9 @@ impl Builder<'_> {
         let span = expr.span;
         match expr.tracked {
             // `()` is the empty struct rather than a form of its own, so it is
-            // erased here instead of surviving into the IR. See [`Ty::Row`]
-            // for why, and for what it costs when the compiler answers.
+            // erased here instead of surviving into the IR. See
+            // [`Core::Unit`](crate::types::Core::Unit) for why, and for what it
+            // costs when the compiler answers.
             ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
             ExprKind::Ident { name } => match self.terms.get(&name.tracked) {
                 Some(symbol) => TermKind::Ident(symbol).with_span(span),
@@ -2311,7 +2313,8 @@ impl Builder<'_> {
         let span = ty.span;
         match ty.tracked {
             // As in [`term`](Self::term): the two surface spellings of the
-            // empty struct, `()` and `{}`, meet here. See [`Ty::Row`].
+            // empty struct, `()` and `{}`, meet here. See
+            // [`Core::Unit`](crate::types::Core::Unit).
             parse::TypeKind::Unit => span.track(TypeKind::Struct {
                 fields: Default::default(),
                 tail: None,

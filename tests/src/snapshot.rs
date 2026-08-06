@@ -768,11 +768,8 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     let [diagnostic] = flat.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", flat.diagnostics);
     };
-    assert_eq!(diagnostic.code, "not-a-struct");
-    assert_eq!(
-        diagnostic.message,
-        "`Nat` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(diagnostic.code, "missing-field");
+    assert_eq!(diagnostic.message, "no field `x` on `Nat`");
 }
 
 /// The solver assumes a goal it is already in the middle of, and what it is
@@ -1365,4 +1362,59 @@ fn sums_reach_every_stage() {
         .map(|node| node.text.as_str())
         .collect();
     assert!(types.contains(&"Fallible (`Ok Nat)"), "{types:?}");
+}
+
+/// A type carrying fields its core is not unit for reaches every tab that
+/// shows a type, because they all print through the compiler's own printer.
+/// `fn p => p.x` is the whole program that produces one: the base is
+/// polymorphic in its core, so the scheme wears a `with` and the badge on the
+/// lambda's argument does too.
+#[test]
+fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
+    let snapshot = snapshot("let getx = fn p => p.x\n");
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let types = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types tab");
+    let scheme = nodes(types)
+        .iter()
+        .map(|node| node.text.clone())
+        .find(|text| text.contains("with"))
+        .expect("the scheme prints with a `with`");
+    assert_eq!(scheme, "'a with { x: 'b, ..'c } -> 'b");
+
+    // And the IR tab's inline badges, which the types stage paints on: the
+    // binder `p` wears the base's own type.
+    let badges = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.annotates == Some("ir"))
+        .expect("the ir annotator");
+    assert!(
+        nodes(badges)
+            .iter()
+            .any(|node| node.text == "'a with { x: 'b, ..'c }"),
+        "{:#?}",
+        nodes(badges)
+    );
+
+    // The Solve tab shows the same form in its goals, so a reader stepping
+    // through the solve sees the type the scheme reports.
+    let solve = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve tab");
+    assert!(
+        nodes(solve).iter().any(|node| node.text.contains("with")),
+        "{:#?}",
+        nodes(solve)
+    );
 }
