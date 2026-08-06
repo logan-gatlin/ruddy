@@ -114,6 +114,11 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
             }
         }
         TermKind::Project { base, .. } => out.extend(body_tys(base)),
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                out.extend(body_tys(payload));
+            }
+        }
         TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
     }
     out
@@ -129,7 +134,7 @@ fn mentions_a_variable(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) => true,
         Ty::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
-        Ty::Struct { fields, rest } => {
+        Ty::Row { fields, rest, .. } => {
             fields
                 .values()
                 .any(|field| mentions_a_variable(&field.presence) || mentions_a_variable(&field.ty))
@@ -794,7 +799,7 @@ fn a_row_repeating_two_fields_is_one_complaint() {
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
     assert!(matches!(
         &out.errors[0].kind,
-        ir::ErrorKind::RepeatedRowField { field } if field == "x"
+        ir::ErrorKind::RepeatedRowField { field, .. } if field == "x"
     ));
 
     // The same thing reached through a variable, where only the solve can know
@@ -808,7 +813,7 @@ fn a_row_repeating_two_fields_is_one_complaint() {
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(
         &output.errors[0].kind,
-        ErrorKind::RepeatedField { field } if field == "x"
+        ErrorKind::RepeatedField { field, .. } if field == "x"
     ));
 }
 
@@ -2137,5 +2142,225 @@ fn a_recursion_that_cannot_grow_always_comes_back_round() {
          type P a b = { x: Q b a, v: a }\n\
          type Q c d = { x: P d c, v: c }\n\
          let f : A Nat {} -> P Nat {} = fn x => x",
+    );
+}
+
+/// A tag literal is one case of however many the context allows, so its type
+/// names that case and leaves the tail open. That is the exact opposite of a
+/// struct literal, which has every field it will ever have — and it is the
+/// whole of what makes a sum row-polymorphic.
+#[test]
+fn a_tag_is_open_where_a_struct_literal_is_closed() {
+    let (mint, _, out) = inferred("let v = `Some 1");
+    assert_eq!(scheme(&mint, &out, "v"), "`Some Nat | ..'a");
+
+    // A case written bare carries unit, which is the same type `()` has.
+    let (mint, _, out) = inferred("let n = `None");
+    assert_eq!(scheme(&mint, &out, "n"), "`None | ..'a");
+
+    // The payload is inferred like anything else, so a function over one is
+    // polymorphic in what it wraps as well as in the cases it allows.
+    let (mint, _, out) = inferred("let wrap = fn x => `Some x");
+    assert_eq!(scheme(&mint, &out, "wrap"), "'a -> `Some 'a | ..'b");
+}
+
+/// A declared sum lists every case there is, so a literal naming one of them
+/// fits: the literal's own tail absorbs the cases it did not name.
+#[test]
+fn a_tag_fits_a_declaration_that_allows_its_case() {
+    let (mint, _, out) = inferred(
+        "type Option T = `Some T | `None\n\
+         let some : Option Nat = `Some 1\n\
+         let none : Option Nat = `None",
+    );
+    assert_eq!(scheme(&mint, &out, "some"), "Option Nat");
+    assert_eq!(scheme(&mint, &out, "none"), "Option Nat");
+
+    // And the annotation is what the definition means downstream, so a second
+    // definition can take it as the declared type.
+    let (mint, _, out) = inferred(
+        "type Option T = `Some T | `None\n\
+         let some : Option Nat = `Some 1\n\
+         let again : Option Nat = some",
+    );
+    assert_eq!(scheme(&mint, &out, "again"), "Option Nat");
+}
+
+/// A case the type does not allow is the sum's version of an extra field, and
+/// a case it requires that the value cannot be is a missing one. Both are
+/// worded as cases, because the type they are about says so.
+#[test]
+fn a_case_a_sum_does_not_allow_is_reported_as_a_case() {
+    let (_, _, out) = infer_src(
+        "type Flag = `On | `Off\n\
+         let bad : Flag = `Maybe",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "extra-field");
+    assert_eq!(
+        out.errors[0].kind.to_string(),
+        "extra case ``Maybe`: the type ``On | `Off` lists every case it allows"
+    );
+
+    // The other direction: a closed sum on the value's side, against a type
+    // that requires a case it has not got.
+    let (_, _, out) = infer_src(
+        "let f : (`A Nat | `B) -> Nat = fn x => 1\n\
+         let g : (`A Nat) -> Nat = fn y => f y",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "missing-field");
+    assert_eq!(out.errors[0].kind.to_string(), "no case ``B` on ``A Nat`");
+}
+
+/// A struct and a sum are two types, however much their rows look alike. The
+/// solver refuses the pair rather than lining their labels up, and says so as
+/// the ordinary mismatch it is.
+#[test]
+fn a_struct_and_a_sum_are_never_the_same_type() {
+    let (_, _, out) = infer_src("let bad : { a: Nat } = `a 1");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "type-mismatch");
+
+    // And a sum is not something a field can be read off, so a projection
+    // against one says what it has rather than quoting the shape the solver
+    // asked for.
+    let (_, _, out) = infer_src("let f : (`A Nat) -> Nat = fn s => s.a");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "not-a-struct");
+    assert_eq!(
+        out.errors[0].kind.to_string(),
+        "``A Nat` is not a struct, so it has no fields to read"
+    );
+}
+
+/// The row machinery is one machinery, so a declaration takes the rest of a
+/// sum's cases exactly as it takes the rest of a struct's fields.
+#[test]
+fn a_declaration_may_take_the_rest_of_a_sum() {
+    let (mint, _, out) = inferred(
+        "type Fallible r = `Err Nat | ..r\n\
+         let ok : Fallible (`Ok Nat) = `Ok 1",
+    );
+    assert_eq!(scheme(&mint, &out, "ok"), "Fallible (`Ok Nat)");
+
+    // What the tail may not name is a fact about the declaration, so a use
+    // site repeating one of its cases is refused where the argument is
+    // written — before anything unfolds.
+    let (_, out, _) = infer_src(
+        "type Fallible r = `Err Nat | ..r\n\
+         let bad : Fallible (`Err Nat) = `Err 1",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ir::ErrorKind::RepeatedRowField { field, .. } if field == "Err"
+    ));
+}
+
+/// The solve reads as what it is about: a goal between two sums fires the sum
+/// rule where one between two structs fires the struct rule, so a reader
+/// stepping through it is never told about a struct they did not write.
+#[test]
+fn the_solve_names_the_shape_it_took_apart() {
+    let (mint, _, out) = inferred(
+        "type Flag = `On Nat | `Off Nat\n\
+         let v = `On 1\n\
+         let f : Flag = v",
+    );
+    let taken = steps(&mint, &out, "f");
+    assert!(taken.iter().any(|step| step.contains("sum")), "{taken:#?}");
+    assert!(
+        !taken.iter().any(|step| step.contains("struct")),
+        "{taken:#?}"
+    );
+
+    // A case carrying nothing carries unit, which is a struct — so the struct
+    // rule does appear under the sum's, and about a type the reader did write,
+    // just not in the syntax they wrote it in.
+    let (mint, _, out) = inferred(
+        "type Flag = `On | `Off\n\
+         let v = `On\n\
+         let g : Flag = v",
+    );
+    let carrying_unit = steps(&mint, &out, "g");
+    assert!(
+        carrying_unit.iter().any(|step| step.contains("struct")),
+        "{carrying_unit:#?}"
+    );
+}
+
+/// Checking pushes an expected sum into a tag, so a literal named by the type
+/// it is being checked against asks nothing of the row at all: what is left is
+/// the payload against what the case carries.
+#[test]
+fn checking_pushes_a_sum_into_a_tag() {
+    let (mint, _, out) = inferred(
+        "type Flag = `On Nat | `Off Nat\n\
+         let f : Flag = `On 1",
+    );
+    assert_eq!(
+        steps(&mint, &out, "f"),
+        vec!["prim  Nat ~ Nat => no change"]
+    );
+    // And the term keeps the name the annotation gave it rather than the row
+    // the literal would have been inferred.
+    assert_eq!(scheme(&mint, &out, "f"), "Flag");
+}
+
+/// A case that may or may not be allowed is the dual of a field that may or
+/// may not be there, and it is not something a tail can say: a tail allows
+/// every other case, and a `?` allows exactly one more.
+#[test]
+fn a_case_may_be_marked_optional() {
+    let (mint, _, out) = inferred("let m : `A? Nat | `B = `B");
+    assert_eq!(scheme(&mint, &out, "m"), "`A? Nat | `B");
+
+    // Written open, the definition would have to decide it, and an annotation
+    // the definition narrows is one the reader was promised more by than the
+    // definition keeps.
+    let (_, _, out) = infer_src("let m : `A? Nat | `B = `A 1");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "annotation-too-open");
+}
+
+/// A sum leads back to itself the way a struct does, and unfolding it stops at
+/// the name — so a recursive sum is a finite type with a finite scheme.
+#[test]
+fn a_sum_may_name_itself() {
+    let (mint, _, out) = inferred(
+        "type List a = `Nil | `Cons { head: a, tail: List a }\n\
+         let empty : List Nat = `Nil\n\
+         let one : List Nat = `Cons { head: 1, tail: empty }",
+    );
+    assert_eq!(scheme(&mint, &out, "empty"), "List Nat");
+    assert_eq!(scheme(&mint, &out, "one"), "List Nat");
+    let symbol = symbol_named(&mint, out.aliases.keys().copied(), "List");
+    assert_eq!(
+        out.aliases[&symbol].to_string(),
+        "`Nil | `Cons { head: 'a, tail: List 'a }"
+    );
+}
+
+/// The lacks condition is one condition, so it reaches a sum's tail through a
+/// variable exactly as it reaches a struct's — and the complaint that comes
+/// back is worded as the cases it is about.
+#[test]
+fn a_sum_tail_may_not_come_back_naming_its_own_case() {
+    let (_, out, output) = infer_src(
+        "let h : (`A Nat | ..r) -> (| ..r) -> Nat = fn a => fn b => 1\n\
+         let k = fn p => h p (`A 1)",
+    );
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(
+        matches!(&output.errors[0].kind, ErrorKind::RepeatedField { field, .. } if field == "A"),
+        "{:#?}",
+        output.errors
+    );
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "`..` covers only the cases a type does not already name, \
+         and here it would have to cover ``A`"
     );
 }

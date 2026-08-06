@@ -48,6 +48,22 @@ let open : { small: Nat, ..extra } -> Nat = fn s => s.small
 
 let opt : { label?: Nat, value: Nat, .. } -> Nat = fn r => r.value
 
+type Option T = `Some T | `None
+
+let some = `Some 1
+
+let nothing : Option Nat = `None
+
+let wrap = fn x => `Some x
+
+type Tree a = `Leaf | `Branch { value: a, kids: Tree a }
+
+let leaf : Tree Nat = `Leaf
+
+type Fallible r = `Err Nat | ..r
+
+let handled : Fallible (`Ok Nat) -> Nat = fn t => 0
+
 let bad = @
 
 let malformed = 12abc

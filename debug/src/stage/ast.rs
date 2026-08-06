@@ -102,6 +102,20 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             .at(name.span)
             .child(expr_node(ids, value))
         })),
+        // The case is a label rather than a name, so the node carries the span
+        // it was written at and no symbol — the same as a field, and for the
+        // same reason. A tag carrying nothing is a leaf.
+        ExprKind::Tag { name, payload } => {
+            let node = Node {
+                label: "Tag".into(),
+                ..node
+            }
+            .at(name.span);
+            match payload {
+                Some(payload) => node.child(expr_node(ids, payload)),
+                None => node,
+            }
+        }
         // The field is a label rather than a name, so its node carries the span
         // it was written at and no symbol.
         ExprKind::Project { base, field } => Node {
@@ -151,6 +165,35 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             }
             Node {
                 label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
+        }
+        // The struct's row shown again about cases: one child per case, the
+        // payload under it, and the tail beside them.
+        TypeKind::Sum { cases, tail } => {
+            let mut kids: Vec<Node> = cases
+                .iter()
+                .map(|(name, case)| {
+                    let mark = if case.optional { "?" } else { "" };
+                    let text = case
+                        .payload
+                        .as_ref()
+                        .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());
+                    let node = Node::new(ids.next(), format!("`{}{mark}", name.tracked), text)
+                        .at(name.span);
+                    match &case.payload {
+                        Some(payload) => node.child(type_node(ids, payload)),
+                        None => node,
+                    }
+                })
+                .collect();
+            if let Some(tail) = tail {
+                let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
+                kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+            }
+            Node {
+                label: "Sum".into(),
                 ..node
             }
             .children(kids)

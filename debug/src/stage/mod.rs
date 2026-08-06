@@ -21,6 +21,7 @@ use ruddy::{
     symbol::{Mint, Symbol},
     token::Token,
     types::Ty,
+    ui,
 };
 
 use crate::wire::{Stage, Status, View};
@@ -257,23 +258,27 @@ pub fn plural(count: usize, noun: &str) -> String {
 
 /// What one parameter of a `type` declaration stands for, as a row of the IR
 /// and Types tabs reads it: the name it was written as, a `..` in front of it
-/// when it stands for the rest of a row, and — when there is one — the labels
-/// an argument written there may not name.
+/// when it stands for the rest of a row, which kind of row that is, and — when
+/// there is one — the labels an argument written there may not name.
 ///
 /// Both tabs show a parameter and neither can show one usefully without this:
 /// the meaning column spells every parameter `'a` alike, and which of them can
-/// be handed a row, and what that row may not contain, is nowhere else on the
-/// page. Written once so the two cannot spell it differently.
+/// be handed a row, what kind, and what that row may not contain, is nowhere
+/// else on the page. Written once so the two cannot spell it differently.
+///
+/// The labels are spelled the way their own shape spells them — a field bare, a
+/// case with its backtick — through [`ui::label`], so this row and the
+/// compiler's own complaint about the same parameter name it the same way.
 pub fn stands_for(mint: &Mint, param: &Param) -> String {
     let name = mint.name(param.symbol);
-    let Some(lacks) = param.kind.lacks() else {
+    let Some((shape, lacks)) = param.kind.row() else {
         return name.to_string();
     };
     if lacks.is_empty() {
-        return format!("..{name}");
+        return format!("..{name} ({shape})");
     }
-    let labels: Vec<&str> = lacks.iter().map(String::as_str).collect();
-    format!("..{name} without {}", labels.join(", "))
+    let labels: Vec<String> = lacks.iter().map(|label| ui::label(shape, label)).collect();
+    format!("..{name} ({shape}) without {}", labels.join(", "))
 }
 
 /// A stage whose input never arrived.

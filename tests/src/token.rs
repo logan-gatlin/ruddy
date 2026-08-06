@@ -135,3 +135,55 @@ fn an_unrecognized_character_is_still_its_own_error() {
     assert_eq!(out.len(), 1, "errors: {out:#?}");
     assert_eq!(out[0].kind, ErrorKind::Unrecognized);
 }
+
+#[test]
+fn lexes_a_tag_as_one_token() {
+    assert!(matches!(&kinds("`Some")[..], [Kind::Tag(name)] if name == "Some"));
+    // The backtick is not part of the name, so a tag and an identifier of the
+    // same spelling carry the same string.
+    assert!(matches!(&kinds("`x1")[..], [Kind::Tag(name)] if name == "x1"));
+    assert!(matches!(&kinds("`_a")[..], [Kind::Tag(name)] if name == "_a"));
+}
+
+#[test]
+fn a_tag_is_spanned_and_printed_as_written() {
+    let out = lex("let v = `Some 1", FileID::GENERATED);
+    let tag = &out.tokens[3];
+    // The span covers the backtick as well as the name: it is one lexeme, and
+    // a reader selecting the case should get all of it.
+    assert_eq!(tag.span.start, 8);
+    assert_eq!(tag.span.width, 5);
+    // And printing writes the backtick back on, so the stream re-lexes to
+    // itself rather than to an identifier.
+    assert_eq!(tag.tracked.to_string(), "`Some");
+}
+
+#[test]
+fn a_backtick_that_begins_no_name_is_unrecognized() {
+    // The `-` precedent: a character that begins nothing on its own is
+    // reported where it was written rather than swallowing what follows.
+    //
+    // What it did swallow, it underlines. The name runs over the characters an
+    // identifier continues with, so `` `1abc `` is one bad tag rather than a
+    // backtick beside something else, and the span is the whole of it — the
+    // rule the malformed natural below already keeps. A span narrower than the
+    // lexeme points at a character the reader cannot act on and leaves the rest
+    // of the mistake unmarked.
+    for (src, width) in [("`", 1), ("` ", 1), ("`?", 1), ("`1", 2), ("`1abc", 5)] {
+        let out = errors(src);
+        assert_eq!(out.len(), 1, "{src}: {out:#?}");
+        assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");
+        assert_eq!(out[0].span.start, 0, "{src}");
+        assert_eq!(out[0].span.width, width, "{src}");
+    }
+}
+
+#[test]
+fn lexes_the_case_separator() {
+    assert!(matches!(
+        &kinds("`A | `B")[..],
+        [Kind::Tag(_), Kind::Pipe, Kind::Tag(_)]
+    ));
+    // The empty sum is one token and no name at all.
+    assert!(matches!(kinds("|")[..], [Kind::Pipe]));
+}

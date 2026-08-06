@@ -14,7 +14,7 @@ use crate::symbol::Symbol;
 ///
 /// Unit is deliberately not one of them. `()` is a spelling of the empty
 /// struct, not a type of its own, so there is nothing here for it to name; see
-/// [`Ty::Struct`] for why it stays that way even though it means the compiler
+/// [`Ty::Row`] for why it stays that way even though it means the compiler
 /// answers in `{}` where the user wrote `()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
@@ -24,6 +24,39 @@ pub enum Prim {
 
 pub type TyVar = u32;
 
+/// Which of the two things a row of labels is.
+///
+/// A row is a set of named things, each either there or not, plus a tail
+/// saying what is known about the names it does not list. Both composites in
+/// the language are one: a struct is a row of fields, all of which a value
+/// has, and a sum is a row of cases, one of which a value is. The two are
+/// unified, flattened, generalized and printed by the same code, and this is
+/// the only thing that tells them apart.
+///
+/// Never inferred and never defaulted: which one a row is, is decided by the
+/// syntax that wrote it — braces or backticks — and travels with the type from
+/// there. Two rows of different shapes are two types, and the solver refuses
+/// them the way it refuses a `Nat` against an arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Shape {
+    /// `{ x: Nat, ..r }` — a value has every field the row says is there.
+    Struct,
+    /// `` `A Nat | ..r `` — a value is one of the cases the row says is there.
+    Sum,
+}
+
+/// What one parameter of a `type` declaration stands for, without the labels a
+/// row carries.
+///
+/// The question by itself, so that a complaint about a parameter read two ways
+/// can name the two readings without quoting a set of labels nobody asked
+/// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sense {
+    Type,
+    Row(Shape),
+}
+
 /// What one parameter of a `type` declaration stands for.
 ///
 /// Written nowhere: a parameter is a bare name, and which of these it is
@@ -31,14 +64,15 @@ pub type TyVar = u32;
 /// a type. Worked out in [`ir::build`](crate::ir::build), and carried here so
 /// that the readers who need it — lowering, inference and the debugger — agree.
 ///
-/// Two of them, and no way to write a third. That is what keeps this a check
-/// rather than a language: every parameter is one of these, every declaration
-/// takes a fixed list of them, and nothing takes a declaration.
+/// Three of them, and no way to write a fourth: a type, the rest of a struct,
+/// or the rest of a sum. That is what keeps this a check rather than a
+/// language: every parameter is one of these, every declaration takes a fixed
+/// list of them, and nothing takes a declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
     /// Stands for a type. `A` in `type Pair A B`.
     Type,
-    /// Stands for the fields a row does not name — and, with them, the labels
+    /// Stands for the labels a row does not name — and, with them, the labels
     /// it may therefore not name itself.
     ///
     /// `r` in `type WithX r = { x: Nat, ..r }` is one, and the set is `{x}`:
@@ -49,12 +83,21 @@ pub enum ParamKind {
     /// the span the reader can act on, instead of being discovered later by
     /// whatever happened to flatten the row — or never at all.
     ///
+    /// The shape is carried for the same reason and enforced in the same
+    /// place: a struct's tail stands for fields and a sum's for cases, so
+    /// `WithX` applied to a sum would splice cases into a struct, and nothing
+    /// downstream could make sense of the result. See
+    /// [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
+    ///
     /// A parameter handed straight on to another declaration collects that
     /// declaration's labels too, which is why this is a fixpoint over the
     /// whole table rather than a read of one body. Insertion-ordered, so a
     /// complaint about a row breaking the rule twice always names the same
     /// label first.
-    Row(IndexSet<String>),
+    Row {
+        shape: Shape,
+        lacks: IndexSet<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +106,13 @@ pub struct Scheme {
     body: Rc<Ty>,
 }
 
-/// One field of a [`Ty::Struct`]: whether it is there, and what it is when it
+/// One label of a [`Ty::Row`]: whether it is there, and what it holds when it
 /// is.
+///
+/// One type for both shapes, because the question is the same one twice. In a
+/// struct it is a field: whether a value has it, and what it holds. In a sum it
+/// is a case: whether a value may be it, and what it carries. Every rule the
+/// solver has about presence is written once and reaches both.
 ///
 /// `presence` is one of the presence-shaped types: [`Ty::Present`],
 /// [`Ty::Absent`], a [`Ty::Var`] while the solver is still deciding,
@@ -74,7 +122,8 @@ pub struct Scheme {
 /// because nothing ever writes anything else into it.
 ///
 /// When it resolves to [`Ty::Absent`], `ty` is meaningless and deliberately
-/// left unconstrained: a field that is not there has nothing to have a type.
+/// left unconstrained: a field that is not there has nothing to have a type,
+/// and neither has a case a value can never be.
 #[derive(Debug, Clone)]
 pub struct RowField {
     pub presence: Rc<Ty>,
@@ -85,37 +134,48 @@ pub struct RowField {
 pub enum Ty {
     Nat,
     Arrow(Rc<Ty>, Rc<Ty>),
-    /// A record of named fields — each with a presence — a tail saying what is
-    /// known about the fields not named, and, with no fields and a closed
-    /// tail, unit.
+    /// A row of named labels — each with a presence — a tail saying what is
+    /// known about the labels not named, and a shape saying what the whole
+    /// stands for.
     ///
-    /// `rest` is one of the row-shaped types: [`Ty::Empty`] for a struct whose
-    /// fields are all listed, a [`Ty::Var`] for one that may have more,
+    /// Two composites over one representation. A [`Shape::Struct`] row is a
+    /// record: a value has every label the row says is there, and a row with
+    /// no fields and a closed tail is unit. A [`Shape::Sum`] row is a sum: a
+    /// value is one of the labels the row says is there, and a row with no
+    /// cases and a closed tail is the type nothing inhabits. Everything
+    /// between those two sentences — unification, flattening, the lacks
+    /// condition, generalization — is written once and reaches both.
+    ///
+    /// `rest` is one of the row-shaped types: [`Ty::Empty`] for a row whose
+    /// labels are all listed, a [`Ty::Var`] for one that may have more,
     /// [`Ty::Undecided`] where a failure abandoned the question, another
-    /// [`Ty::Struct`] while a tail bound to a row — or handed one as an
-    /// argument — is waiting to be spliced in, or a [`Ty::Bound`] for a tail a
-    /// scheme quantified or a declaration takes as a row parameter.
+    /// [`Ty::Row`] *of the same shape* while a tail bound to a row — or handed
+    /// one as an argument — is waiting to be spliced in, or a [`Ty::Bound`]
+    /// for a tail a scheme quantified or a declaration takes as a row
+    /// parameter.
     ///
     /// Never anything else, and unlike [`RowField::presence`] that is now
     /// checked rather than merely true: a row parameter can be handed anything
-    /// a use site cares to write, so `WithX Nat` would put a number here.
-    /// [`ir::build`](crate::ir::build) refuses one, which is the only thing
-    /// standing between this sentence and a row holding a number.
-    Struct {
+    /// a use site cares to write, so `WithX Nat` would put a number here and
+    /// `WithX (`A Nat)` would put a set of cases into a record.
+    /// [`ir::build`](crate::ir::build) refuses both, which is the only thing
+    /// standing between this sentence and a row holding what no row can hold.
+    Row {
+        shape: Shape,
         fields: IndexMap<String, RowField>,
         rest: Rc<Ty>,
     },
-    /// The presence of a field that is there. Not a type a term can have: it
+    /// The presence of a label that is there. Not a type a term can have: it
     /// lives only inside [`RowField::presence`], where a variable standing for
     /// a presence resolves to it.
     Present,
-    /// The presence of a field that is not there. Arises only from solving —
-    /// no literal and no written type puts one in a field map — when an open
-    /// row meets a closed one that lacks the field.
+    /// The presence of a label that is not there. Arises only from solving —
+    /// no literal and no written type puts one in a label map — when an open
+    /// row meets a closed one that lacks the label.
     Absent,
-    /// The closed row tail: every field the struct does not name is absent.
+    /// The closed row tail: every label the row does not name is absent.
     /// Like [`Ty::Present`], not a type a term can have; it lives only in
-    /// [`Ty::Struct::rest`].
+    /// [`Ty::Row::rest`].
     Empty,
     /// A declared type, held as the name it was written as rather than as what
     /// it stands for, applied to whatever it was given.
@@ -199,14 +259,40 @@ pub enum Ty {
 }
 
 impl ParamKind {
-    /// The labels an argument written at this parameter may not name, or
-    /// `None` when the parameter does not stand for a row at all. The one
-    /// question every reader of a kind actually asks, so it is asked in one
-    /// place rather than matched out at each of them.
-    pub fn lacks(&self) -> Option<&IndexSet<String>> {
+    /// What an argument written at this parameter has to be — the shape it has
+    /// to have, and the labels it may not name — or `None` when the parameter
+    /// does not stand for a row at all. The one question every reader of a kind
+    /// actually asks, so it is asked in one place rather than matched out at
+    /// each of them.
+    pub fn row(&self) -> Option<(Shape, &IndexSet<String>)> {
         match self {
             ParamKind::Type => None,
-            ParamKind::Row(labels) => Some(labels),
+            ParamKind::Row { shape, lacks } => Some((*shape, lacks)),
+        }
+    }
+
+    /// What this parameter stands for, with the labels dropped. See [`Sense`].
+    pub fn sense(&self) -> Sense {
+        match self {
+            ParamKind::Type => Sense::Type,
+            ParamKind::Row { shape, .. } => Sense::Row(*shape),
+        }
+    }
+}
+
+impl Shape {
+    /// A row of this shape with nothing in it and nothing more to come: unit
+    /// for a struct, and the type nothing inhabits for a sum.
+    ///
+    /// Written here because both are reached by more than one caller —
+    /// lowering a `()`, lowering a tag with no payload, closing a tail — and a
+    /// second spelling of either would be a second empty row for the solver to
+    /// find not quite equal to the first.
+    pub fn empty(self) -> Ty {
+        Ty::Row {
+            shape: self,
+            fields: IndexMap::new(),
+            rest: Rc::new(Ty::Empty),
         }
     }
 }
@@ -220,8 +306,9 @@ impl From<Prim> for Ty {
 }
 
 impl RowField {
-    /// A field that is definitely there: what a struct literal's fields are,
-    /// and what a written `name: Ty` field lowers to.
+    /// A label that is definitely there: what a struct literal's fields are,
+    /// what a written `name: Ty` field lowers to, and what the one case a tag
+    /// literal names is.
     pub fn present(ty: Rc<Ty>) -> Self {
         Self {
             presence: Rc::new(Ty::Present),

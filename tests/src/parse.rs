@@ -448,3 +448,157 @@ fn a_comma_tells_a_field_from_a_tail() {
         "let x : { f: List, ..r } = y"
     );
 }
+
+/// A sum type is its cases, separated by `|`, and the leading one is optional.
+/// Both spellings are one tree, and it prints back without the leading bar —
+/// so the round-trip through `parse_one` is what pins that the printer's
+/// choice is one the parser reads back.
+#[test]
+fn sum_types() {
+    assert_eq!(
+        parse_one("type Option T = `Some T | `None"),
+        "type Option T = `Some T | `None"
+    );
+    // The leading `|` is accepted and dropped.
+    assert_eq!(
+        parse_one("type Option T = | `Some T | `None"),
+        "type Option T = `Some T | `None"
+    );
+    // One case is a sum like any other.
+    assert_eq!(parse_one("type Just = `It Nat"), "type Just = `It Nat");
+    // And a case may be marked `?`, which no tail can say for it.
+    assert_eq!(
+        parse_one("let x : `A? Nat | `B = y"),
+        "let x : `A? Nat | `B = y"
+    );
+}
+
+/// The two forms that write no case at all. Neither would be read back as a
+/// sum without the leading `|`, which is why the printer writes one there and
+/// nowhere else.
+#[test]
+fn a_sum_with_no_cases_is_a_bare_bar() {
+    assert_eq!(parse_one("type Void = |"), "type Void = |");
+    assert_eq!(parse_one("type Only r = | ..r"), "type Only r = | ..r");
+}
+
+/// A `|` between two cases promises a second one, so one with nothing after it
+/// is reported. Left silent, the annotation in `` let x : `A Nat | = 1 `` read
+/// as `` `A Nat `` and the bar the writer meant something by vanished without a
+/// word.
+///
+/// The leading bar is the exception, and the only one: `|` alone is the sum
+/// with no cases, so there is nothing it promised. The cases already read
+/// stand either way — the reader has one thing to delete, and the sum they
+/// wrote is still there to be checked.
+#[test]
+fn a_bar_promising_a_case_that_never_comes_is_reported() {
+    for (src, at) in [
+        ("let x : `A Nat | = 1", 15),
+        ("let x : `A Nat | | `B = 1", 15),
+        ("type T = `A | ", 12),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let first = out.errors.first().unwrap_or_else(|| panic!("{src}"));
+        assert_eq!(first.span.start, at, "{src}: {:#?}", out.errors);
+        assert_eq!(first.span.width, 1, "{src}: {:#?}", out.errors);
+    }
+
+    // The leading bar promises nothing, and neither does a case with no bar
+    // after it.
+    for src in ["type Void = |", "type Only r = | ..r", "type T = `A | `B"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+}
+
+/// A sum's tail is the struct's `..`, standing for the cases not written out.
+#[test]
+fn a_sum_may_be_left_open() {
+    assert_eq!(
+        parse_one("let x : `A Nat | .. = y"),
+        "let x : `A Nat | .. = y"
+    );
+    assert_eq!(
+        parse_one("type Tagged r = `Err Nat | ..r"),
+        "type Tagged r = `Err Nat | ..r"
+    );
+}
+
+/// A case carries one atom, the same as a tag in a term does, so anything with
+/// a space in it takes parentheses — and an arrow is looser than a sum, so
+/// `` `A Nat -> Nat `` is a function *from* the sum rather than a case carrying
+/// an arrow. The printer puts the parentheses back where the grammar needs
+/// them.
+#[test]
+fn a_case_carries_one_atom() {
+    assert_eq!(
+        parse_one("type F = `Some (Pair A B)"),
+        "type F = `Some (Pair A B)"
+    );
+    assert_eq!(
+        parse_one("type F = `A Nat -> Nat"),
+        "type F = `A Nat -> Nat"
+    );
+    assert_eq!(
+        parse_one("type F = `A (Nat -> Nat)"),
+        "type F = `A (Nat -> Nat)"
+    );
+    // A sum in a position an argument could follow needs parentheses of its
+    // own, which is the whole of why it sits above the arrow.
+    assert_eq!(
+        parse_one("type F = Pair (`A Nat | `B) Nat"),
+        "type F = Pair (`A Nat | `B) Nat"
+    );
+    // To the right of an arrow nothing can follow it, so none are written.
+    assert_eq!(
+        parse_one("type F = Nat -> `A Nat | `B"),
+        "type F = Nat -> `A Nat | `B"
+    );
+}
+
+/// A tag takes one operand, and takes it greedily: `` f `A 1 `` is `f` applied
+/// to the case rather than the case applied to `1`. A tag carries one thing, so
+/// there is nothing the other reading could mean.
+#[test]
+fn a_tag_binds_tighter_than_application() {
+    assert_eq!(parse_one("let v = `Some 1"), "let v = `Some 1");
+    assert_eq!(parse_one("let v = `None"), "let v = `None");
+    assert_eq!(parse_one("let v = f `A 1"), "let v = f (`A 1)");
+    // Which is why a bare tag written as an argument comes back in
+    // parentheses: nothing follows it here, but the printer decides one node
+    // at a time, and a second argument after it would be read as the payload
+    // it has not got.
+    assert_eq!(parse_one("let v = f `A"), "let v = f (`A)");
+    // The same rule at the head of an application, where leaving them off
+    // would turn the argument into a payload and print the tree above.
+    assert_eq!(parse_one("let v = f (`A) 1"), "let v = f (`A) 1");
+    assert_eq!(parse_one("let v = (`A) 1"), "let v = (`A) 1");
+    // The payload is a projection, so the field is carried rather than the
+    // record it was read off.
+    assert_eq!(parse_one("let v = `Some p.x"), "let v = `Some p.x");
+    // And an application as a payload takes parentheses, which the printer
+    // supplies because the tag groups as an application itself.
+    assert_eq!(parse_one("let v = `Some (f x)"), "let v = `Some (f x)");
+}
+
+/// The two shapes nest inside each other, and each closes itself: a struct's
+/// braces end a sum written in a field, and a case's payload is one atom, so a
+/// struct written as one needs no parentheses either.
+#[test]
+fn a_sum_and_a_struct_nest_without_help() {
+    assert_eq!(
+        parse_one("let x : { f: `A Nat | `B, g: Nat } = y"),
+        "let x : { f: `A Nat | `B, g: Nat } = y"
+    );
+    assert_eq!(
+        parse_one("type List a = `Nil | `Cons { head: a, tail: List a }"),
+        "type List a = `Nil | `Cons { head: a, tail: List a }"
+    );
+    // A case with no payload followed by another field ends where the comma
+    // does, since a comma begins no atom.
+    assert_eq!(
+        parse_one("let x : { f: `A, g: Nat } = y"),
+        "let x : { f: `A, g: Nat } = y"
+    );
+}
