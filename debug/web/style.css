@@ -24,6 +24,9 @@
   --punct: #7f8896;
   --ident: #d7dae0;
   --number: #f78c6c;
+  /* A sum's cases. Kin to a literal rather than to a name, because that is
+     what a tag is: nothing resolves it, and it stands for itself. */
+  --tag: #f7c76c;
   --unlexed: #ff6b6b;
 
   --row: 20px;
@@ -53,6 +56,7 @@
     --punct: #6b7280;
     --ident: #1f2430;
     --number: #b4531a;
+    --tag: #8a6216;
     --unlexed: #c92a2a;
   }
 }
@@ -312,6 +316,9 @@ input {
 }
 .hl .number {
   color: var(--number);
+}
+.hl .tag {
+  color: var(--tag);
 }
 .hl .unlexed {
   color: var(--unlexed);

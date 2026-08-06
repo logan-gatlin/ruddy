@@ -58,6 +58,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Dot => "Dot",
         Kind::DotDot => "DotDot",
         Kind::Question => "Question",
+        Kind::Pipe => "Pipe",
+        Kind::Tag(_) => "Tag",
         Kind::LeftBrace => "LeftBrace",
         Kind::RightBrace => "RightBrace",
         Kind::LeftParen => "LeftParen",
@@ -68,12 +70,17 @@ pub fn label(kind: &Kind) -> &'static str {
 }
 
 /// The CSS class the editor paints this token with. Keywords, punctuation,
-/// identifiers and literals are the only distinctions the surface syntax
+/// identifiers, literals and tags are the only distinctions the surface syntax
 /// supports so far.
+///
+/// A tag has a class of its own rather than sharing the identifier's: it names
+/// a case rather than a definition, nothing ever resolves it, and a reader
+/// scanning a sum wants to see where the cases are.
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
         Kind::Natural(_) => "number",
+        Kind::Tag(_) => "tag",
         Kind::Equal
         | Kind::FatArrow
         | Kind::Arrow
@@ -82,6 +89,7 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::Dot
         | Kind::DotDot
         | Kind::Question
+        | Kind::Pipe
         | Kind::LeftBrace
         | Kind::RightBrace
         | Kind::LeftParen

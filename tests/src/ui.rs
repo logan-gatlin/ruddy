@@ -15,7 +15,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError},
     tracking::{FileID, Span},
-    types::{RowField, Ty},
+    types::{RowField, Sense, Shape, Ty},
     ui,
 };
 
@@ -55,7 +55,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     for kind in [
         IrError::DuplicateField,
         IrError::Circular,
-        IrError::OpenDeclaredType,
+        IrError::OpenDeclaredType {
+            shape: Shape::Struct,
+        },
         IrError::Arity {
             expected: 2,
             found: 1,
@@ -64,9 +66,21 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::ParameterApplied,
         IrError::DuplicateParameter { previous: span },
         IrError::GrowingRecursion,
-        IrError::MixedParameter,
-        IrError::NotARow,
+        IrError::DuplicateCase,
+        IrError::MixedTail {
+            first: Shape::Struct,
+            second: Shape::Sum,
+            previous: span,
+        },
+        IrError::MixedParameter {
+            first: Sense::Type,
+            second: Sense::Row(Shape::Struct),
+        },
+        IrError::NotARow {
+            shape: Shape::Struct,
+        },
         IrError::RepeatedRowField {
+            shape: Shape::Struct,
             field: "x".to_string(),
         },
     ] {
@@ -90,6 +104,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         TypeError::NotAStruct { base: nat.clone() },
         TypeError::AnnotationTooOpen,
         TypeError::RepeatedField {
+            shape: Shape::Struct,
             field: "x".to_string(),
         },
     ] {
@@ -99,17 +114,28 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
 }
 
 /// Every rule the solver can apply. Same reasoning as [`diagnostics`].
+///
+/// One shape apiece for the two rules that carry one: what they say about the
+/// other is the same sentence in the other noun, which
+/// [`a_shaped_rule_is_read_in_the_nouns_of_its_shape`] pins on its own. Listed
+/// twice here, they would read as two rules sharing a code, which is exactly
+/// what [`every_rule_is_named_and_explained_distinctly`] exists to refuse.
 const RULES: &[Rule] = &[
     Rule::Absorb,
     Rule::Same,
     Rule::Congruent,
     Rule::Bind,
     Rule::Occurs,
-    Rule::Overlap,
+    Rule::Overlap {
+        shape: Shape::Struct,
+    },
     Rule::Prim,
     Rule::Arrow,
     Rule::Struct,
-    Rule::Presence,
+    Rule::Sum,
+    Rule::Presence {
+        shape: Shape::Struct,
+    },
     Rule::Unfold,
     Rule::Assume,
     Rule::Mismatch,
@@ -170,6 +196,53 @@ fn every_rule_is_named_and_explained_distinctly() {
     assert_eq!(messages.len(), RULES.len());
     for rule in RULES {
         assert!(!rule.to_string().is_empty(), "{rule:?}");
+    }
+}
+
+/// The two rules that decide one label at a time say which kind of label it
+/// was, because a reader stepping through a solve is reading about their own
+/// program: "whether the field is there" over a goal about `` `Some `` and
+/// `` `None `` describes something they never wrote. The same reason
+/// `Rule::Struct` and `Rule::Sum` are two rules rather than one worded about
+/// rows — and the reason neither says "label", a word the language does not
+/// have anywhere a reader can see it.
+///
+/// The code is shared by the two shapes on purpose: it names which act of the
+/// solver ran, and the goal beside it already shows which shape it ran on.
+#[test]
+fn a_shaped_rule_is_read_in_the_nouns_of_its_shape() {
+    for shape in [Shape::Struct, Shape::Sum] {
+        let (theirs, others) = match shape {
+            Shape::Struct => ("field", "case"),
+            Shape::Sum => ("case", "field"),
+        };
+        for rule in [Rule::Presence { shape }, Rule::Overlap { shape }] {
+            let message = rule.to_string();
+            assert!(message.contains(theirs), "{rule:?}: {message}");
+            assert!(!message.contains(others), "{rule:?}: {message}");
+            // The two words that name the representation the shapes share
+            // rather than anything a reader wrote.
+            assert!(!message.contains("label"), "{rule:?}: {message}");
+            assert!(!message.contains("row"), "{rule:?}: {message}");
+        }
+    }
+
+    for (struct_shaped, sum_shaped) in [
+        (
+            Rule::Presence {
+                shape: Shape::Struct,
+            },
+            Rule::Presence { shape: Shape::Sum },
+        ),
+        (
+            Rule::Overlap {
+                shape: Shape::Struct,
+            },
+            Rule::Overlap { shape: Shape::Sum },
+        ),
+    ] {
+        assert_eq!(struct_shaped.code(), sum_shaped.code());
+        assert_ne!(struct_shaped.to_string(), sum_shaped.to_string());
     }
 }
 
@@ -333,11 +406,12 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
             "(Nat -> Nat) -> Nat -> Nat",
         ),
         // The empty struct is unit, and prints as the one spelling this
-        // language has for it. See `Ty::Struct` for why it is `{}` and not
+        // language has for it. See `Ty::Row` for why it is `{}` and not
         // `()`.
         (
             "",
-            Rc::new(Ty::Struct {
+            Rc::new(Ty::Row {
+                shape: Shape::Struct,
                 fields: Default::default(),
                 rest: Rc::new(Ty::Empty),
             }),
@@ -345,7 +419,8 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         ),
         (
             "",
-            Rc::new(Ty::Struct {
+            Rc::new(Ty::Row {
+                shape: Shape::Struct,
                 fields: [("x".to_string(), RowField::present(endo.clone()))]
                     .into_iter()
                     .collect(),
@@ -387,7 +462,8 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
     // quantified tail wears its letter and an undecided one has nothing to
     // report. An open row with no fields still shows it is open.
     assert_eq!(
-        Ty::Struct {
+        Ty::Row {
+            shape: Shape::Struct,
             fields: [("x".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
@@ -397,7 +473,8 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
         "{ x: Nat, ..'a }"
     );
     assert_eq!(
-        Ty::Struct {
+        Ty::Row {
+            shape: Shape::Struct,
             fields: [("x".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
@@ -407,7 +484,8 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
         "{ x: Nat, .. }"
     );
     assert_eq!(
-        Ty::Struct {
+        Ty::Row {
+            shape: Shape::Struct,
             fields: Default::default(),
             rest: Rc::new(Ty::Bound(0)),
         }
@@ -419,7 +497,8 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
     // is unmarked, undecided either way is `?`, and certainly absent is not
     // part of what the type says at all.
     assert_eq!(
-        Ty::Struct {
+        Ty::Row {
+            shape: Shape::Struct,
             fields: [
                 (
                     "x".to_string(),
@@ -450,11 +529,104 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
     assert_eq!(round_trip("", "{ x: Nat, .. }"), "{ x: Nat, ..'a }");
 }
 
-/// The note is held in [`ui`] rather than in either reporter, because both
-/// print it: the CLI as a second indented line, the strip as a second highlight
-/// on the same diagnostic.
+/// The notes are held in [`ui`] rather than in either reporter, because both
+/// print them: the CLI as a second indented line, the strip as a second
+/// highlight on the same diagnostic. One for the complaints about a name
+/// defined twice and one for the name used two ways, since the second place is
+/// a definition in the first and a use in the other.
 #[test]
-fn the_duplicate_note_is_worded_once() {
-    assert!(!ui::FIRST_DEFINITION.is_empty());
-    assert!(!ui::FIRST_DEFINITION.ends_with('.'));
+fn the_notes_pointing_elsewhere_are_worded_once() {
+    for note in [ui::FIRST_DEFINITION, ui::FIRST_USE] {
+        assert!(!note.is_empty());
+        assert!(!note.ends_with('.'));
+        assert!(
+            !note.starts_with(|c: char| c.is_ascii_uppercase()),
+            "{note}"
+        );
+    }
+    assert_ne!(ui::FIRST_DEFINITION, ui::FIRST_USE);
+}
+
+/// Which kind of row a complaint is about decides the noun and the spelling,
+/// and nothing else: the shape is not part of the code, because a missing case
+/// and a missing field are one thing gone wrong and a reporter that wants to
+/// tell them apart is reading the type rather than the complaint.
+///
+/// The two that carry a base read the shape off it. That is the one way the
+/// word and the type printed beside it cannot come out disagreeing, and it is
+/// what this pins.
+#[test]
+fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
+    let sum = Rc::new(Ty::Row {
+        shape: Shape::Sum,
+        fields: [(
+            "A".to_string(),
+            RowField {
+                presence: Rc::new(Ty::Present),
+                ty: Rc::new(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rc::new(Ty::Empty),
+    });
+    let nat = Rc::new(Ty::Nat);
+
+    let missing = TypeError::MissingField {
+        base: sum.clone(),
+        field: "B".to_string(),
+    };
+    assert_eq!(missing.to_string(), "no case ``B` on ``A Nat`");
+    let extra = TypeError::ExtraField {
+        base: sum.clone(),
+        field: "B".to_string(),
+    };
+    assert!(extra.to_string().contains("extra case ``B`"), "{extra}");
+    // The same two about a struct keep the wording they always had.
+    let field = TypeError::MissingField {
+        base: nat.clone(),
+        field: "x".to_string(),
+    };
+    assert_eq!(field.to_string(), "no field `x` on `Nat`");
+
+    // And the codes do not split, because the complaints do not.
+    assert_eq!(missing.code(), field.code());
+
+    // The ones handed a shape rather than a type say the same thing.
+    let repeated = TypeError::RepeatedField {
+        shape: Shape::Sum,
+        field: "A".to_string(),
+    };
+    assert!(repeated.to_string().contains("cases"), "{repeated}");
+    assert!(repeated.to_string().contains("``A`"), "{repeated}");
+    let not_a_row = IrError::NotARow { shape: Shape::Sum };
+    assert!(not_a_row.to_string().contains("sum's cases"), "{not_a_row}");
+
+    // Including the one a declaration raises about being left open: a `?` on a
+    // case and a `?` on a field are the same mistake, and lowering reaches them
+    // through the same check, so the shape is the only thing telling the reader
+    // which of the two they made.
+    let open = IrError::OpenDeclaredType { shape: Shape::Sum };
+    assert!(open.to_string().contains("its cases"), "{open}");
+    let fields = IrError::OpenDeclaredType {
+        shape: Shape::Struct,
+    };
+    assert!(fields.to_string().contains("its fields"), "{fields}");
+    assert_eq!(open.code(), fields.code());
+}
+
+/// A parameter read more than one way names the two readings it was found to
+/// have, so the reader is told what to choose between rather than that there
+/// was a choice.
+#[test]
+fn a_mixed_parameter_names_both_readings() {
+    let mixed = IrError::MixedParameter {
+        first: Sense::Row(Shape::Struct),
+        second: Sense::Row(Shape::Sum),
+    };
+    assert_eq!(
+        mixed.to_string(),
+        "this stands for the rest of a struct's fields in one place \
+         and for the rest of a sum's cases in another"
+    );
 }

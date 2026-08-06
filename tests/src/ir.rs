@@ -7,14 +7,22 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{ParamKind, Prim},
+    types::{ParamKind, Prim, Shape},
 };
 use ruddy_debug::print;
 
-/// A row parameter that may not stand for any of `labels` — the shape
+/// A struct's row parameter that may not stand for any of `labels` — the shape
 /// [`ParamKind::Row`] carries, written the way a test wants to read it.
 fn row(labels: &[&str]) -> ParamKind {
-    ParamKind::Row(labels.iter().map(|label| label.to_string()).collect())
+    cases(Shape::Struct, labels)
+}
+
+/// The same for either shape, for the tests that care which.
+fn cases(shape: Shape, labels: &[&str]) -> ParamKind {
+    ParamKind::Row {
+        shape,
+        lacks: labels.iter().map(|label| label.to_string()).collect(),
+    }
 }
 
 /// A mint for the builder to mint into. Fresh per build, so one test's
@@ -618,9 +626,12 @@ fn a_declared_type_must_be_closed() {
     ] {
         let (_, out) = build_src(src);
         assert!(
-            out.errors
-                .iter()
-                .any(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
+            out.errors.iter().any(|error| matches!(
+                error.kind,
+                ErrorKind::OpenDeclaredType {
+                    shape: Shape::Struct
+                }
+            )),
             "{src}: {:#?}",
             out.errors
         );
@@ -630,9 +641,12 @@ fn a_declared_type_must_be_closed() {
     let (_, out) = build_src("type T = { x?: Nat, y?: Nat, .. }");
     assert_eq!(out.errors.len(), 3, "errors: {:#?}", out.errors);
     assert!(
-        out.errors
-            .iter()
-            .all(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
+        out.errors.iter().all(|error| matches!(
+            error.kind,
+            ErrorKind::OpenDeclaredType {
+                shape: Shape::Struct
+            }
+        )),
         "errors: {:#?}",
         out.errors
     );
@@ -1118,7 +1132,7 @@ fn a_parameter_may_not_stand_for_both() {
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ErrorKind::MixedParameter)),
+                .any(|error| matches!(error.kind, ErrorKind::MixedParameter { .. })),
             "{src}: {:#?}",
             out.errors
         );
@@ -1136,7 +1150,10 @@ fn a_parameter_kind_does_not_depend_on_declaration_order() {
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
-        assert!(matches!(out.errors[0].kind, ErrorKind::NotARow), "{src}");
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::NotARow { .. }),
+            "{src}"
+        );
         assert_eq!(
             out.errors[0].span.start,
             src.find("WithX Nat").expect("the use") + "WithX ".len(),
@@ -1159,7 +1176,7 @@ fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
         assert!(
-            matches!(out.errors[0].kind, ErrorKind::MixedParameter),
+            matches!(out.errors[0].kind, ErrorKind::MixedParameter { .. }),
             "{src}"
         );
 
@@ -1197,7 +1214,10 @@ fn a_mixed_parameter_absorbs_its_own_use_sites() {
                let h: Bad Nat -> Nat = fn v => 1";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::MixedParameter));
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::MixedParameter { .. }
+    ));
 
     let bad = &out.program.types[&type_symbol(&mint, &out, "Bad")];
     assert!(
@@ -1219,7 +1239,10 @@ fn a_mixed_parameter_is_reported_once_along_a_chain() {
                type Q q = V q";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::MixedParameter));
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::MixedParameter { .. }
+    ));
 
     // At `t` in `U`, which is where the field and the hand-off meet.
     let u = &out.program.types[&type_symbol(&mint, &out, "U")];
@@ -1256,7 +1279,7 @@ fn only_a_row_may_be_written_where_a_row_goes() {
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ErrorKind::NotARow)),
+                .any(|error| matches!(error.kind, ErrorKind::NotARow { .. })),
             "{src}: {:#?}",
             out.errors
         );
@@ -1284,7 +1307,7 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
-        matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field } if field == "x"),
+        matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, .. } if field == "x"),
         "{:#?}",
         out.errors
     );
@@ -1343,9 +1366,12 @@ fn a_declaration_is_open_only_through_a_parameter() {
     ] {
         let (_, out) = build_src(src);
         assert!(
-            out.errors
-                .iter()
-                .any(|error| matches!(error.kind, ErrorKind::OpenDeclaredType)),
+            out.errors.iter().any(|error| matches!(
+                error.kind,
+                ErrorKind::OpenDeclaredType {
+                    shape: Shape::Struct
+                }
+            )),
             "{src}: {:#?}",
             out.errors
         );
@@ -1389,4 +1415,244 @@ fn a_parameter_shadows_a_primitive() {
         "outside it the primitive is back: {:#?}",
         args[0]
     );
+}
+
+/// A sum lowers to the cases it names, keyed by name and carrying what each
+/// one was written with. The `payload` stays `None` where nothing was written:
+/// it means unit, but the unit is inference's to supply, not the tree's.
+#[test]
+fn lowers_a_sum_type() {
+    let (mint, out) = built("type Option T = `Some T | `None");
+    let decl = &out.program.types[&type_symbol(&mint, &out, "Option")];
+    let TypeKind::Sum { cases, tail } = &decl.value.tracked else {
+        panic!("expected a sum, got {:#?}", decl.value.tracked);
+    };
+    assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Some", "None"]);
+    assert!(matches!(
+        cases["Some"].payload.as_ref().map(|ty| &ty.tracked),
+        Some(TypeKind::Param { index: 0, .. })
+    ));
+    assert!(cases["None"].payload.is_none());
+    assert!(!cases["Some"].optional);
+    // A declaration lists every case there is, so there is no tail.
+    assert!(tail.is_none());
+}
+
+/// A tag lowers to the case it names and what it carries — and, like a field
+/// name, the case is a label rather than a symbol, so nothing resolves it and
+/// nothing about it can fail to resolve.
+#[test]
+fn lowers_a_tag() {
+    let (mint, out) = built("let v = `Some 1  let n = `None");
+    let TermKind::Tag { name, payload } = term_value(&mint, &out, "v") else {
+        panic!("expected a tag");
+    };
+    assert_eq!(name.tracked, "Some");
+    assert!(matches!(
+        payload.as_ref().map(|term| &term.kind),
+        Some(TermKind::Natural(1))
+    ));
+
+    let TermKind::Tag { name, payload } = term_value(&mint, &out, "n") else {
+        panic!("expected a tag");
+    };
+    assert_eq!(name.tracked, "None");
+    assert!(payload.is_none());
+}
+
+/// A name written twice in one sum is one case, reported at the repeat — the
+/// same rule a struct's fields keep, worded as the case it is about.
+#[test]
+fn a_repeated_case_is_reported_once() {
+    let (mint, out) = build_src("type T = `A Nat | `A Nat");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    // The first occurrence is the one that stands.
+    let decl = &out.program.types[&type_symbol(&mint, &out, "T")];
+    let TypeKind::Sum { cases, .. } = &decl.value.tracked else {
+        panic!("expected a sum");
+    };
+    assert_eq!(cases.len(), 1);
+}
+
+/// A declaration holds for every definition, so it cannot leave a question a
+/// definition would answer — which is as true of a case that may or may not be
+/// allowed as it is of a field that may or may not be there.
+///
+/// The complaint carries the shape it was raised about, because that is the
+/// only way the sentence it becomes can be about cases: a sum told to list its
+/// fields describes a type its writer never wrote.
+#[test]
+fn a_declared_sum_must_list_its_cases() {
+    for src in [
+        "type T = `A Nat | ..",
+        "type T = `A Nat | ..r",
+        "type T = `A? Nat | `B",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors.iter().any(|error| matches!(
+                error.kind,
+                ErrorKind::OpenDeclaredType { shape: Shape::Sum }
+            )),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+    // A tail naming one of the declaration's own parameters is the exception,
+    // for the reason it is the exception for a struct: what it stands for is
+    // supplied at every use rather than decided here.
+    let (mint, out) = built("type Tagged r = `Err Nat | ..r");
+    let decl = &out.program.types[&type_symbol(&mint, &out, "Tagged")];
+    assert_eq!(decl.params[0].kind, cases(Shape::Sum, &["Err"]));
+}
+
+/// A struct's tail stands for fields and a sum's for cases, so what may be
+/// written at one is not what may be written at the other. A parameter read
+/// both ways is the same clash as one read as a type and as a row.
+#[test]
+fn a_row_parameter_knows_which_shape_it_is() {
+    // A sum where a struct's tail goes, and a struct where a sum's does.
+    for src in [
+        "type WithX r = { x: Nat, ..r }  type Bad = WithX (`A Nat)",
+        "type Cases r = `A Nat | ..r  type Bad = Cases { y: Nat }",
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::NotARow { .. }),
+            "{src}"
+        );
+    }
+
+    // And a parameter handed to both is a parameter that has to say which it
+    // meant.
+    let (_, out) = build_src(
+        "type WithX r = { x: Nat, ..r }  type Cases s = `A Nat | ..s  \
+         type Bad t = { it: WithX t, also: Cases t }",
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::MixedParameter { .. })),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// A row handed to a sum's tail may not name a case the declaration already
+/// names, for the reason it may not name such a field: the type would allow
+/// the case twice, and the two copies could carry different things.
+#[test]
+fn a_sum_argument_may_not_repeat_a_case() {
+    let (_, out) = build_src("type Cases r = `A Nat | ..r  type Bad = Cases (`A Nat)");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, shape }
+            if field == "A" && *shape == Shape::Sum),
+        "{:#?}",
+        out.errors
+    );
+
+    // And the cases travel back through a sum written out as an argument, the
+    // way they do through a struct: `OuterC`'s own tail ends up where `Cases`'s
+    // sat, so it may not stand for `` `A `` either. Written out and not just
+    // handed on — that is the edge a sum used to be left off, and the argument
+    // it let through was accepted with the case carrying the wrong type.
+    let src = "type Cases q = `A Nat | ..q  type OuterC p = Cases (`B Nat | ..p)  \
+               type Bad = OuterC (`A Nat)";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, shape }
+            if field == "A" && *shape == Shape::Sum),
+        "{:#?}",
+        out.errors
+    );
+    // At the argument, parentheses and all: they are what the reader wrote
+    // around it, and the span is the text they can change.
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("(`A Nat)").expect("the argument")
+    );
+
+    // A case neither of them names is what the `..` is for.
+    let (_, out) = build_src(
+        "type Cases q = `A Nat | ..q  type OuterC p = Cases (`B Nat | ..p)  \
+         type Fine = OuterC (`C Nat)",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+/// A type may lead back to itself through a sum as much as through a struct: a
+/// case is a shape one step in, which is all a declaration has to reach.
+#[test]
+fn a_sum_makes_a_type_recursive_rather_than_circular() {
+    let (mint, out) = built("type List a = `Nil | `Cons { head: a, tail: List a }");
+    let decl = &out.program.types[&type_symbol(&mint, &out, "List")];
+    assert!(matches!(decl.value.tracked, TypeKind::Sum { .. }));
+    // And the parameter reaches a position of what the declaration stands
+    // for, through the case's payload, so congruence may be taken on it.
+    assert!(decl.params[0].relevant);
+
+    // The recursion that still cannot be allowed is the one that grows.
+    let (_, out) = build_src("type T a = `Next (T { x: a })");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::GrowingRecursion)),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// Naming a tail is for saying that two `..`s stand for one rest, and one rest
+/// is one shape. A name given both is refused at the second use — the one that
+/// brought the two together — and the row it was written in absorbs.
+///
+/// Left standing, the two tails really would share a variable, and a field
+/// pushed into one would come back out of the other as a case, with nothing
+/// anywhere telling the reader why.
+#[test]
+fn one_tail_name_is_one_shape_of_rest() {
+    let src = "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat = fn a => fn b => 1";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::MixedTail {
+                first: Shape::Struct,
+                second: Shape::Sum,
+                ..
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+    // At the second `..r`, which is the one the writer has to choose about —
+    // and pointing back at the first, which is the other half of what went
+    // wrong and is somewhere else on the page.
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind("..r").expect("the tail")
+    );
+    let ErrorKind::MixedTail { previous, .. } = out.errors[0].kind else {
+        panic!("the clash was just matched");
+    };
+    assert_eq!(previous.start, src.find("..r").expect("the first tail"));
+
+    // Two tails of one shape are what naming one is *for*, and stay one rest.
+    let (_, out) = build_src("let f : { x: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1");
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let (_, out) = build_src("let f : (`A Nat | ..r) -> (| ..r) -> Nat = fn a => fn b => 1");
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    // And the scope is one written type, so two annotations may each use `r`
+    // for a rest of their own.
+    let (_, out) = build_src(
+        "let f : { x: Nat, ..r } -> Nat = fn a => 1\n\
+         let g : (`A Nat | ..r) -> Nat = fn b => 2",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }

@@ -8,10 +8,10 @@ use crate::{
     ir::{Term, TermKind},
     symbol::Symbol,
     tracking::Span,
-    types::{RowField, Scheme, Ty},
+    types::{RowField, Scheme, Shape, Ty},
 };
 
-use super::{same_field_set, Binding, Constraint, ConstraintKind, Table};
+use super::{Binding, Constraint, ConstraintKind, Table, same_field_set};
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
 pub struct Constrain<'a> {
@@ -145,10 +145,42 @@ impl Constrain<'_> {
                 }
                 // A literal's fields are all there, and are all it has: the
                 // tail is closed. Openness belongs to demands, not to values.
-                Rc::new(Ty::Struct {
+                Rc::new(Ty::Row {
+                    shape: Shape::Struct,
                     fields: tys,
                     rest: Rc::new(Ty::Empty),
                 })
+            }
+            // A tag is one case of a sum, and which sum is not for the literal
+            // to say — so the type it gets names that case and leaves the tail
+            // open. That is the whole of what makes a sum row-polymorphic, and
+            // it is the exact opposite of the struct above: a literal record
+            // has every field it will ever have, and a literal tag is one case
+            // of however many the context turns out to allow.
+            //
+            // A case written with no payload carries unit, which is the same
+            // type `()` is. Said here rather than in the tree; see
+            // [`ir::TermKind::Tag`](crate::ir::TermKind::Tag).
+            TermKind::Tag { name, payload } => {
+                let carried = match payload {
+                    Some(payload) => {
+                        self.infer_term(payload);
+                        payload.ty.clone()
+                    }
+                    None => Rc::new(Shape::Struct.empty()),
+                };
+                let rest = self.table.fresh();
+                let ty = Rc::new(Ty::Row {
+                    shape: Shape::Sum,
+                    fields: [(name.tracked.clone(), RowField::present(carried))]
+                        .into_iter()
+                        .collect(),
+                    rest,
+                });
+                // "However many the context allows" is every case but this
+                // one, so the tail minted for it lacks this name.
+                self.table.note_lacks(&ty);
+                ty
             }
             // The walk cannot name the type it produced — which type `.field`
             // has depends on a base the walk is in no position to know — but
@@ -161,7 +193,8 @@ impl Constrain<'_> {
                 self.infer_term(base);
                 let result = self.table.fresh();
                 let rest = self.table.fresh();
-                let want = Rc::new(Ty::Struct {
+                let want = Rc::new(Ty::Row {
+                    shape: Shape::Struct,
                     fields: [(field.tracked.clone(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
@@ -213,16 +246,58 @@ impl Constrain<'_> {
             // same things, just without the better spans pushing gives. The
             // gate reads the written type's own syntax, never the table, so
             // generation stays a description of the term.
-            (TermKind::Struct(fields), Ty::Struct { fields: tys, rest })
-                if matches!(&**rest, Ty::Empty)
-                    && tys
-                        .values()
-                        .all(|field| matches!(&*field.presence, Ty::Present))
-                    && same_field_set(fields, tys) =>
+            (
+                TermKind::Struct(fields),
+                Ty::Row {
+                    shape: Shape::Struct,
+                    fields: tys,
+                    rest,
+                },
+            ) if matches!(&**rest, Ty::Empty)
+                && tys
+                    .values()
+                    .all(|field| matches!(&*field.presence, Ty::Present))
+                && same_field_set(fields, tys) =>
             {
                 for (name, field) in fields.iter_mut() {
                     let want = tys[name].ty.clone();
                     self.check_term(&mut field.value, &want);
+                }
+                term.ty = expected.clone();
+            }
+            // A tag is pushed into whenever the expected sum names its case as
+            // one it certainly allows: what the case carries is what the
+            // payload is checked against, and the cases the literal does not
+            // name are exactly what its own open tail would have absorbed.
+            //
+            // Which is a weaker gate than the struct's above, and rightly so.
+            // Pushing a closed struct into a literal is only safe when the two
+            // name the same fields, because a literal has every field it will
+            // ever have; a tag has one case out of however many, so a sum with
+            // more cases than the literal names is the ordinary case rather
+            // than the one to fall back on.
+            (
+                TermKind::Tag { name, payload },
+                Ty::Row {
+                    shape: Shape::Sum,
+                    fields: cases,
+                    ..
+                },
+            ) if cases
+                .get(&name.tracked)
+                .is_some_and(|case| matches!(&*case.presence, Ty::Present)) =>
+            {
+                let want = cases[&name.tracked].ty.clone();
+                match payload {
+                    Some(payload) => self.check_term(payload, &want),
+                    // Nothing written is unit, and the case has to carry one.
+                    // Said as a constraint rather than pushed, since there is
+                    // no term here to push into — and worded with the tag's own
+                    // span, which is the whole of what the reader wrote.
+                    None => {
+                        let carried = Rc::new(Shape::Struct.empty());
+                        self.checks(name.span, &carried, &want);
+                    }
                 }
                 term.ty = expected.clone();
             }

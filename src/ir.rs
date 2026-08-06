@@ -10,7 +10,7 @@ use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{ParamKind, Prim, Ty},
+    types::{ParamKind, Prim, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -85,6 +85,23 @@ pub enum TermKind {
         body: Box<Term>,
     },
     Struct(IndexMap<String, Field<Term>>),
+    /// `` `Some 1 `` — one case of a sum, with what it carries.
+    ///
+    /// The name stays a string for the reason [`Field`]'s keys do: it is a
+    /// label scoped to whichever sum turns out to be on the other side, not a
+    /// path anything can refer to, so there is no symbol to resolve it to and
+    /// nothing here can fail to resolve.
+    ///
+    /// A case carrying nothing keeps its `None` rather than being handed a
+    /// `{}` here. `()` and `{}` are two spellings of one *written* type and so
+    /// meet in this pass; `` `None `` writes no type at all, and inventing one
+    /// would put a node on the page the reader never wrote. What it means is
+    /// unit all the same, which [`inference`](crate::inference) says where it
+    /// builds the type rather than the tree.
+    Tag {
+        name: TrackedString,
+        payload: Option<Box<Term>>,
+    },
     /// Reading one field out of a struct. The name stays a string for the
     /// reason [`Field`]'s keys do: it is a label scoped to whichever struct
     /// turns out to be on the left, not a path anything can refer to, so there
@@ -111,6 +128,15 @@ pub enum TypeKind {
         /// The `..` tail, when the struct type was written open. Inside a
         /// `type` declaration this is `Some` only for a tail naming a row
         /// parameter — see [`ErrorKind::OpenDeclaredType`].
+        tail: Option<Tail>,
+    },
+    /// `` `Some T | `None `` — a sum type, as the cases it allows.
+    ///
+    /// The struct's twin down to the [`Tail`]: what a `..` stands for, and
+    /// what it may be inside a declaration, is the same question about cases
+    /// that it is about fields.
+    Sum {
+        cases: IndexMap<String, SumCase>,
         tail: Option<Tail>,
     },
     Arrow {
@@ -160,6 +186,20 @@ pub struct TypeField {
     pub name_span: Span,
     pub optional: bool,
     pub value: Type,
+}
+
+/// One case of a sum type: the [`Field`] split of spans, whether the case was
+/// marked `?` — a case a value may or may not be — and what it carries.
+///
+/// `payload` keeps the `None` the parser gave it, for the reason
+/// [`TermKind::Tag`] does: a case written bare means unit, and saying so here
+/// would be this pass writing a type nobody wrote into the tree the debugger
+/// shows.
+#[derive(Debug, Clone)]
+pub struct SumCase {
+    pub name_span: Span,
+    pub optional: bool,
+    pub payload: Option<Type>,
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -219,6 +259,8 @@ pub enum ErrorKind {
         previous: Span,
     },
     DuplicateField,
+    /// A second case of a name in one sum.
+    DuplicateCase,
     /// A type declared as a name that leads back to itself with nothing in
     /// between: `type t = t`, or a pair each declared as the other.
     ///
@@ -250,7 +292,13 @@ pub enum ErrorKind {
     /// variable, and the property inference leans on survives untouched: a
     /// declaration's body mentions no solver variable, which is what lets every
     /// walk stop at a name instead of descending into what it stands for.
-    OpenDeclaredType,
+    ///
+    /// The shape is carried for the wording alone: `` type X = `A? Nat `` is the
+    /// same mistake made about cases, and a complaint that said "fields" to
+    /// someone who wrote backticks would be describing a type they never wrote.
+    OpenDeclaredType {
+        shape: Shape,
+    },
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
     ///
@@ -292,8 +340,32 @@ pub enum ErrorKind {
     /// the condition and [`Solve::unfold`](crate::inference) for what rests on
     /// it.
     GrowingRecursion,
-    /// A parameter used both as a type and as the fields a row does not name,
-    /// as in `type Bad r = { x: r, ..r }`.
+    /// One name given to two rests of different shapes in one written type, as
+    /// in `{ x: Nat, ..r } -> (`A Nat | ..r)`.
+    ///
+    /// Naming a tail is for saying that two `..`s stand for the same rest, and
+    /// a rest is a set of labels of one kind: the fields a struct does not
+    /// write out, or the cases a sum does not. One name cannot be both, and
+    /// which of the two was meant is the writer's to say — so this is reported
+    /// at the second use, the one that brought the two together, the way a
+    /// mixed parameter is reported at the parameter.
+    ///
+    /// The row absorbs, for the reason every other row mistake does: left
+    /// standing, the tail would be shared anyway, and a field would come back
+    /// out of the solve as a case with the reader never told why.
+    ///
+    /// Where the name was first used is carried the way a repeat carries the
+    /// definition it repeats — see [`ErrorKind::Duplicate`] — because half of
+    /// what went wrong is somewhere else on the page, and a reader shown only
+    /// the second `..` has to hunt for the first one themselves.
+    MixedTail {
+        first: Shape,
+        second: Shape,
+        previous: Span,
+    },
+    /// A parameter used as more than one of the things a parameter can be —
+    /// a whole type, the rest of a struct, the rest of a sum — as in
+    /// `type Bad r = { x: r, ..r }`.
     ///
     /// A parameter is written bare, so what it stands for is read off its
     /// uses. Two uses that disagree leave nothing to read, and neither of them
@@ -310,19 +382,31 @@ pub enum ErrorKind {
     /// out, and leaving it standing would put whatever a use site handed it
     /// into a row — so the declaration absorbs, and nothing is asked of the
     /// arguments written at it either.
-    MixedParameter,
-    /// Something that cannot stand for a set of fields, written where a row
-    /// parameter goes: `WithX Nat` against `type WithX r = { x: Nat, ..r }`.
     ///
-    /// A struct can stand for one, and so can another row parameter. A
-    /// declared name cannot, though it looks as though it should: a tail
-    /// holding a name would have to be unfolded by the walks that flatten
-    /// rows, and neither does.
+    /// The two readings are carried so the complaint can name them. A
+    /// parameter read all three ways still names two: there is one thing to
+    /// fix, and a sentence listing every way the declaration is wrong is not a
+    /// better instruction for fixing it.
+    MixedParameter {
+        first: Sense,
+        second: Sense,
+    },
+    /// Something that cannot stand for the rest of a row of this shape, written
+    /// where a row parameter goes: `WithX Nat` against
+    /// `type WithX r = { x: Nat, ..r }`.
+    ///
+    /// A row of the same shape can stand for one, and so can another row
+    /// parameter of that shape. A struct written where a sum's tail goes
+    /// cannot, and neither can a declared name, though the latter looks as
+    /// though it should: a tail holding a name would have to be unfolded by the
+    /// walks that flatten rows, and neither does.
     ///
     /// The argument absorbs, so this is said once. Left standing it would be
     /// substituted into the tail all the same, and the reader would be told a
     /// second time in words about a row they never wrote.
-    NotARow,
+    NotARow {
+        shape: Shape,
+    },
     /// A row written where a row parameter goes, naming a field the
     /// declaration it is handed to already names: `WithX { x: Nat }` against
     /// `type WithX r = { x: Nat, ..r }`.
@@ -338,6 +422,7 @@ pub enum ErrorKind {
     /// standing it would be substituted into the tail all the same, and the
     /// reader would be told a second time about a row nobody wrote.
     RepeatedRowField {
+        shape: Shape,
         field: String,
     },
 }
@@ -369,6 +454,14 @@ struct Builder<'a> {
     /// each sits in its list. Empty outside a `type` body, which is what makes
     /// a parameter unwritable in an annotation.
     params: HashMap<Symbol, u32>,
+    /// Which shape each named tail in the written type being lowered was first
+    /// used at, and where. Cleared for every written type, which is the whole
+    /// scope of a tail's name: `..r` twice in one annotation stands for one
+    /// rest, and another annotation's `r` is unrelated.
+    ///
+    /// One rest is one shape, and this is what says so. See
+    /// [`ErrorKind::MixedTail`].
+    tails: HashMap<String, (Shape, Span)>,
 }
 
 /// Which symbol a name means, for one namespace.
@@ -411,8 +504,8 @@ type Slot = (Symbol, u32);
 /// the three into a kind apiece.
 enum Fact {
     /// The parameter is used as this kind here. A [`ParamKind::Row`] carries
-    /// the labels the row it tails writes out, which are what an argument
-    /// substituted for it may not name.
+    /// the shape of the row it tails and the labels that row writes out, which
+    /// are what an argument substituted for it has to be and may not name.
     Says(u32, ParamKind),
     /// The parameter is handed straight on to another declaration's slot, so
     /// it stands for whatever that slot stands for — and may not name whatever
@@ -431,11 +524,15 @@ enum Fact {
 /// in an edge map instead; these are what a slot says of itself.
 #[derive(Debug, Default)]
 struct Reading {
-    /// Read as a whole type somewhere.
-    as_type: bool,
-    /// Read as the fields a row does not name somewhere.
-    as_row: bool,
-    /// The labels those rows write out beside it.
+    /// Every way the parameter was read: as a whole type, as the rest of a
+    /// struct, as the rest of a sum. One of them is a parameter that means
+    /// something; two or three is the clash [`ErrorKind::MixedParameter`]
+    /// reports, and the set is what lets the complaint name which two.
+    ///
+    /// Insertion-ordered, so the reading a body states first is the one a
+    /// mixed parameter is displayed as and the one a complaint names first.
+    senses: IndexSet<Sense>,
+    /// The labels the rows it tails write out beside it.
     lacks: IndexSet<String>,
 }
 
@@ -500,6 +597,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         types: Names::default(),
         arities: HashMap::new(),
         params: HashMap::new(),
+        tails: HashMap::new(),
     };
     let mut program = Program {
         terms: IndexMap::new(),
@@ -548,7 +646,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // language's only binder, and its only scope.
         let mark = b.types.mark();
         b.scope_params(&params);
-        let value = b.ty(body, Place::Declaration);
+        let value = b.written(body, Place::Declaration);
         b.types.release(mark);
         if let Some(symbol) = symbol {
             program.types.insert(
@@ -620,7 +718,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // Annotation and body are lowered in the order they were written, and
         // the body before the name is bound, so a definition cannot see itself
         // and there is no recursion to resolve.
-        let annotation = ty.map(|ty| b.ty(ty, Place::Annotation));
+        let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
         let value = b.term(body.tracked);
         if let Some(symbol) = b.declare(Namespace::Terms, &name) {
             program.terms.insert(
@@ -731,6 +829,7 @@ impl Follow<'_> {
             // A shape one step in, which is all a declaration has to reach.
             // `Error` absorbs, as everywhere else.
             TypeKind::Struct { .. }
+            | TypeKind::Sum { .. }
             | TypeKind::Arrow { .. }
             | TypeKind::Prim(_)
             | TypeKind::Error => Stands::Shape,
@@ -798,13 +897,12 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     for (symbol, decl) in types {
         constrain(&decl.value, &mut |fact| match fact {
-            Fact::Says(index, ParamKind::Type) => {
-                said.entry((*symbol, index)).or_default().as_type = true
-            }
-            Fact::Says(index, ParamKind::Row(labels)) => {
+            Fact::Says(index, kind) => {
                 let entry = said.entry((*symbol, index)).or_default();
-                entry.as_row = true;
-                entry.lacks.extend(labels);
+                entry.senses.insert(kind.sense());
+                if let Some((_, labels)) = kind.row() {
+                    entry.lacks.extend(labels.iter().cloned());
+                }
             }
             Fact::Hands(index, to) => handed.entry((*symbol, index)).or_default().push(to),
             Fact::Tails(index, to) => tails.entry((*symbol, index)).or_default().push(to),
@@ -831,49 +929,55 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
         let mut kinds = Vec::with_capacity(decl.params.len());
         for (index, param) in decl.params.iter().enumerate() {
             let slot = (*symbol, index as u32);
-            let (mut as_type, mut as_row) = (false, false);
-            for demand in reached(&reads, slot) {
-                let Some(reading) = said.get(&demand) else {
-                    continue;
-                };
-                as_type |= reading.as_type;
-                as_row |= reading.as_row;
-            }
+            let read_as = senses(&reads, &said, slot);
             let mut lacks = IndexSet::new();
             for demand in reached(&carries, slot) {
                 if let Some(reading) = said.get(&demand) {
                     lacks.extend(reading.lacks.iter().cloned());
                 }
             }
-            // A parameter used both ways is reported against the parameter
-            // rather than against either use: neither use is wrong on its own,
-            // and it is the declaration that has to say which it meant. The
-            // declaration told is the one that brought the two readings
+            // A parameter used more than one way is reported against the
+            // parameter rather than against any one use: no use is wrong on its
+            // own, and it is the declaration that has to say which it meant. The
+            // declaration told is the one that brought the readings
             // together — a declaration that merely hands the parameter on to
             // one already broken is right about its own and has nothing to
             // change, which is what the second condition says. A slot leading
             // back to itself is not below itself, so a pair that disagree
             // around a circle are each told rather than neither.
-            if as_type && as_row {
+            //
+            // The first two readings are the ones named. A parameter read all
+            // three ways has one mistake to point at like any other, and the
+            // sentence that names two of them says enough to find it.
+            if read_as.len() > 1 {
                 mixed.insert(*symbol);
                 let below = handed.get(&slot).into_iter().flatten().any(|to| {
-                    both_ways(&reads, &said, *to) && !reached(&carries, *to).any(|at| at == slot)
+                    senses(&reads, &said, *to).len() > 1
+                        && !reached(&carries, *to).any(|at| at == slot)
                 });
                 if !below {
                     told.push(Error {
                         span: param.span,
-                        kind: ErrorKind::MixedParameter,
+                        kind: ErrorKind::MixedParameter {
+                            first: read_as[0],
+                            second: read_as[1],
+                        },
                     });
                 }
             }
-            // A parameter read two ways is still taken as a row, so that the
-            // debugger and the Types tab show what the body actually said of
-            // it. Nothing is enforced against it — the declaration is a
-            // write-off and `mixed` says so — but calling it a type would be
-            // this pass reporting one thing and displaying another.
-            kinds.push(match as_row {
-                true => ParamKind::Row(lacks),
-                false => ParamKind::Type,
+            // A parameter read more than one way is still taken as the first
+            // row among them, so that the debugger and the Types tab show what
+            // the body actually said of it. Nothing is enforced against it —
+            // the declaration is a write-off and `mixed` says so — but calling
+            // it a type would be this pass reporting one thing and displaying
+            // another.
+            let row = read_as.iter().find_map(|sense| match sense {
+                Sense::Row(shape) => Some(*shape),
+                Sense::Type => None,
+            });
+            kinds.push(match row {
+                Some(shape) => ParamKind::Row { shape, lacks },
+                None => ParamKind::Type,
             });
         }
         out.insert(*symbol, kinds);
@@ -892,22 +996,26 @@ fn reached(closed: &IndexMap<Slot, IndexSet<Slot>>, slot: Slot) -> impl Iterator
     std::iter::once(slot).chain(closed.get(&slot).into_iter().flatten().copied())
 }
 
-/// Whether one slot reaches both readings — the question [`kinds`] asks of a
-/// slot's successors to decide whether the clash it found is already somebody
-/// else's to fix.
-fn both_ways(
+/// Every way one slot is read: what it says of itself joined with what every
+/// slot it hands itself on to says. More than one is the clash, so this is both
+/// what [`kinds`] decides a parameter's kind from and what it asks of a slot's
+/// successors to decide whether the clash it found is already somebody else's
+/// to fix.
+///
+/// Insertion-ordered, and the order is the order the bodies were read in, so a
+/// complaint naming two readings names the same two every run.
+fn senses(
     reads: &IndexMap<Slot, IndexSet<Slot>>,
     said: &HashMap<Slot, Reading>,
     slot: Slot,
-) -> bool {
-    let (mut as_type, mut as_row) = (false, false);
+) -> IndexSet<Sense> {
+    let mut senses = IndexSet::new();
     for demand in reached(reads, slot) {
         if let Some(reading) = said.get(&demand) {
-            as_type |= reading.as_type;
-            as_row |= reading.as_row;
+            senses.extend(reading.senses.iter().copied());
         }
     }
-    as_type && as_row
+    senses
 }
 
 /// Everything one declaration's body says about its own parameters. See
@@ -930,8 +1038,37 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                 // The fields written beside the tail are exactly what it may
                 // not stand for: they are already named here, and a `..`
                 // covers what is not.
-                let labels = fields.keys().cloned().collect();
-                out(Fact::Says(*index, ParamKind::Row(labels)));
+                let lacks = fields.keys().cloned().collect();
+                out(Fact::Says(
+                    *index,
+                    ParamKind::Row {
+                        shape: Shape::Struct,
+                        lacks,
+                    },
+                ));
+            }
+        }
+        // The struct arm again, about cases: a payload is a type position, and
+        // the cases written beside a tail are what it may not name.
+        TypeKind::Sum { cases, tail } => {
+            for case in cases.values() {
+                if let Some(payload) = &case.payload {
+                    constrain(payload, out);
+                }
+            }
+            if let Some(Tail {
+                of: Row::Param { index, .. },
+                ..
+            }) = tail
+            {
+                let lacks = cases.keys().cloned().collect();
+                out(Fact::Says(
+                    *index,
+                    ParamKind::Row {
+                        shape: Shape::Sum,
+                        lacks,
+                    },
+                ));
             }
         }
         TypeKind::Arrow { from, to } => {
@@ -968,14 +1105,21 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                     // reading, which is why it is a [`Fact::Tails`] rather than
                     // a second [`Fact::Hands`].
                     _ => {
-                        if let TypeKind::Struct {
-                            tail:
-                                Some(Tail {
-                                    of: Row::Param { index, .. },
-                                    ..
-                                }),
+                        // Either shape of row: a sum written out as an argument
+                        // ends up where the callee's tail sat exactly as a
+                        // struct does, and skipping one of the two left a sum's
+                        // row parameter never told what the declaration it is
+                        // handed to already names.
+                        let tail = match &arg.tracked {
+                            TypeKind::Struct { tail, .. } | TypeKind::Sum { tail, .. } => {
+                                tail.as_ref()
+                            }
+                            _ => None,
+                        };
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
                             ..
-                        } = &arg.tracked
+                        }) = tail
                         {
                             out(Fact::Tails(*index, slot));
                         }
@@ -1000,7 +1144,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
 /// struct handed to a row parameter lowers to exactly the type it would
 /// anywhere else, and substitution puts it wherever the parameter sat. What
 /// this refuses is the argument that would leave a row holding something no row
-/// can hold, which is the invariant [`Ty::Struct`] documents and nothing else
+/// can hold, which is the invariant [`Ty::Row`] documents and nothing else
 /// enforces, and the argument that would leave one naming a field twice, which
 /// nothing downstream can recover from either.
 ///
@@ -1016,21 +1160,22 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     fn walk(
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
-        rows: &HashSet<Symbol>,
+        rows: &HashMap<Symbol, Shape>,
         out: &mut Vec<Error>,
     ) {
         match &mut ty.tracked {
             TypeKind::Apply { head, args, .. } => {
                 let head = *head;
                 for (at, arg) in args.iter_mut().enumerate() {
-                    let lacks = kinds
+                    let row = kinds
                         .get(&head)
                         .and_then(|kinds| kinds.get(at))
-                        .and_then(ParamKind::lacks);
-                    if let Some(lacks) = lacks {
-                        let refused = match row_shaped(arg, rows) {
-                            false => Some(ErrorKind::NotARow),
+                        .and_then(ParamKind::row);
+                    if let Some((shape, lacks)) = row {
+                        let refused = match row_shaped(arg, shape, rows) {
+                            false => Some(ErrorKind::NotARow { shape }),
                             true => repeats(arg, lacks).map(|field| ErrorKind::RepeatedRowField {
+                                shape,
                                 field: field.clone(),
                             }),
                         };
@@ -1055,6 +1200,13 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     walk(&mut field.value, kinds, rows, out);
                 }
             }
+            TypeKind::Sum { cases, .. } => {
+                for case in cases.values_mut() {
+                    if let Some(payload) = case.payload.as_mut() {
+                        walk(payload, kinds, rows, out);
+                    }
+                }
+            }
             TypeKind::Ident(_) | TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
         }
     }
@@ -1069,11 +1221,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         // has already collected everything the slot it goes to may not name —
         // that is what [`kinds`] closed the sets over — so there is no second
         // condition here for it to fail.
-        let rows: HashSet<Symbol> = decl
+        let rows: HashMap<Symbol, Shape> = decl
             .params
             .iter()
-            .filter(|param| param.kind.lacks().is_some())
-            .map(|param| param.symbol)
+            .filter_map(|param| Some((param.symbol, param.kind.row()?.0)))
             .collect();
         walk(&mut decl.value, kinds, &rows, &mut out);
     }
@@ -1082,23 +1233,28 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // declaration, and was the way this check was first written round.
     for decl in program.terms.values_mut() {
         if let Some(annotation) = decl.annotation.as_mut() {
-            walk(annotation, kinds, &HashSet::new(), &mut out);
+            walk(annotation, kinds, &HashMap::new(), &mut out);
         }
     }
     out
 }
 
-/// Whether a written type could stand for the fields a row does not name.
+/// Whether a written type could stand for the labels a row of `shape` does not
+/// name.
 ///
-/// A struct can: its fields are spliced in where the tail was. A row parameter
-/// can, by being one already. A declared name cannot, though it looks as though
-/// it should — a tail holding a name would have to be unfolded by the two walks
-/// that flatten rows, which neither does, so it is refused rather than silently
-/// mishandled.
-fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
+/// A row of the same shape can: its labels are spliced in where the tail was. A
+/// row parameter can, by being one already — of that shape, since a struct's
+/// tail stands for fields and a sum's for cases, and splicing one into the
+/// other would leave a type nothing downstream could read. A declared name
+/// cannot either, though it looks as though it should: a tail holding a name
+/// would have to be unfolded by the two walks that flatten rows, which neither
+/// does, so it is refused rather than silently mishandled.
+fn row_shaped(ty: &Type, shape: Shape, rows: &HashMap<Symbol, Shape>) -> bool {
     match &ty.tracked {
-        TypeKind::Struct { .. } | TypeKind::Error => true,
-        TypeKind::Param { symbol, .. } => rows.contains(symbol),
+        TypeKind::Error => true,
+        TypeKind::Struct { .. } => shape == Shape::Struct,
+        TypeKind::Sum { .. } => shape == Shape::Sum,
+        TypeKind::Param { symbol, .. } => rows.get(symbol) == Some(&shape),
         _ => false,
     }
 }
@@ -1116,10 +1272,12 @@ fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
 /// declaration, and already carries this condition — and an erased argument
 /// absorbed a complaint already made.
 fn repeats<'a>(ty: &'a Type, lacks: &IndexSet<String>) -> Option<&'a String> {
-    let TypeKind::Struct { fields, .. } = &ty.tracked else {
-        return None;
+    let labels: Box<dyn Iterator<Item = &String>> = match &ty.tracked {
+        TypeKind::Struct { fields, .. } => Box::new(fields.keys()),
+        TypeKind::Sum { cases, .. } => Box::new(cases.keys()),
+        _ => return None,
     };
-    fields.keys().find(|name| lacks.contains(*name))
+    labels.into_iter().find(|name| lacks.contains(*name))
 }
 
 /// Every place a declaration leads back to itself with an argument that gets
@@ -1255,6 +1413,20 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                     out(*index, under);
                 }
             }
+            TypeKind::Sum { cases, tail } => {
+                for case in cases.values() {
+                    if let Some(payload) = &case.payload {
+                        occurrences(payload, under, out);
+                    }
+                }
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = tail
+                {
+                    out(*index, under);
+                }
+            }
             TypeKind::Arrow { from, to } => {
                 occurrences(from, under, out);
                 occurrences(to, under, out);
@@ -1324,6 +1496,13 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
                 mentioned(&field.value, out);
             }
         }
+        TypeKind::Sum { cases, .. } => {
+            for case in cases.values() {
+                if let Some(payload) = &case.payload {
+                    mentioned(payload, out);
+                }
+            }
+        }
         TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
     }
 }
@@ -1381,6 +1560,13 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
                 grows(&field.value, group, report);
             }
         }
+        TypeKind::Sum { cases, .. } => {
+            for case in cases.values() {
+                if let Some(payload) = &case.payload {
+                    grows(payload, group, report);
+                }
+            }
+        }
         TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
     }
 }
@@ -1399,15 +1585,16 @@ fn mentions_a_parameter(ty: &Type) -> bool {
         TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
         TypeKind::Arrow { from, to } => mentions_a_parameter(from) || mentions_a_parameter(to),
         TypeKind::Struct { fields, tail } => {
-            matches!(
-                tail,
-                Some(Tail {
-                    of: Row::Param { .. },
-                    ..
-                })
-            ) || fields
-                .values()
-                .any(|field| mentions_a_parameter(&field.value))
+            tails_a_parameter(tail)
+                || fields
+                    .values()
+                    .any(|field| mentions_a_parameter(&field.value))
+        }
+        TypeKind::Sum { cases, tail } => {
+            tails_a_parameter(tail)
+                || cases
+                    .values()
+                    .any(|case| case.payload.as_ref().is_some_and(mentions_a_parameter))
         }
         TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => false,
     }
@@ -1536,22 +1723,121 @@ impl Builder<'_> {
     /// binds nothing — is a question a declaration cannot leave open, and is
     /// reported here rather than by the caller, since only here is it known
     /// which of the three a tail turned out to be.
-    fn row(&mut self, span: Span, name: Option<TrackedString>, place: Place) -> Row {
+    fn row(
+        &mut self,
+        span: Span,
+        name: Option<TrackedString>,
+        place: Place,
+        shape: Shape,
+    ) -> Option<Row> {
         let Some(name) = name else {
             if place == Place::Declaration {
-                self.error(span, ErrorKind::OpenDeclaredType);
+                self.error(span, ErrorKind::OpenDeclaredType { shape });
             }
-            return Row::Anything;
+            return Some(Row::Anything);
         };
         if let Some(symbol) = self.types.get(&name.tracked)
             && let Some(&index) = self.params.get(&symbol)
         {
-            return Row::Param { symbol, index };
+            return Some(Row::Param { symbol, index });
         }
         if place == Place::Declaration {
-            self.error(span, ErrorKind::OpenDeclaredType);
+            self.error(span, ErrorKind::OpenDeclaredType { shape });
         }
-        Row::Named(name.tracked)
+        // A name is one rest, and one rest is one shape. Recorded at the first
+        // use and checked at every one after, so the complaint lands on the
+        // tail that brought the two together rather than on whichever the
+        // writer happened to put first. `None` says the row absorbs; see
+        // [`ErrorKind::MixedTail`].
+        match self.tails.get(&name.tracked) {
+            Some(&(first, previous)) if first != shape => {
+                self.error(
+                    span,
+                    ErrorKind::MixedTail {
+                        first,
+                        second: shape,
+                        previous,
+                    },
+                );
+                return None;
+            }
+            Some(_) => {}
+            None => {
+                self.tails.insert(name.tracked.clone(), (shape, span));
+            }
+        }
+        Some(Row::Named(name.tracked))
+    }
+
+    /// Lower one whole written type — a declaration's body, or a definition's
+    /// annotation — which is the scope a tail's name lives in and so the scope
+    /// this clears. Every other caller of [`ty`](Self::ty) is inside one of
+    /// these and shares its scope, which is exactly what makes two `..r` in one
+    /// annotation stand for one rest.
+    fn written(&mut self, ty: parse::Type, place: Place) -> Type {
+        self.tails.clear();
+        self.ty(ty, place)
+    }
+
+    /// The `..` a row was written with, lowered, or `Err` when it named a rest
+    /// the written type already gave another shape to — which is the row
+    /// absorbing, the way [`ErrorKind::OpenDeclaredType`] makes one absorb.
+    fn tail(
+        &mut self,
+        tail: Option<parse::Tail>,
+        place: Place,
+        shape: Shape,
+    ) -> Result<Option<Tail>, ()> {
+        let Some(tail) = tail else {
+            return Ok(None);
+        };
+        let span = tail.span;
+        match self.row(span, tail.name, place, shape) {
+            Some(of) => Ok(Some(Tail { span, of })),
+            None => Err(()),
+        }
+    }
+
+    /// Whether a row written here may stand as it is: a declaration must be
+    /// closed, except through a parameter, and everything else may be as open
+    /// as it likes. See [`ErrorKind::OpenDeclaredType`].
+    ///
+    /// `marks` is where each `?` was written — every one is its own report,
+    /// since every one is a label the reader can close — and `tail` is the `..`
+    /// the row ended with, which has already reported for itself in
+    /// [`row`](Self::row), because only there is it known which of the three a
+    /// tail turned out to be. A row refused here lowers to the error type,
+    /// which absorbs: the `Circular` precedent.
+    ///
+    /// One rule for both shapes, because it is one rule. The two arms of
+    /// [`ty`](Self::ty) that call it differ in the nouns they are written about
+    /// and in nothing else, and a rule about openness kept in two places is one
+    /// a sum can quietly stop obeying.
+    fn closed(
+        &mut self,
+        place: Place,
+        shape: Shape,
+        marks: impl IntoIterator<Item = Span>,
+        tail: &Option<Tail>,
+    ) -> bool {
+        if place != Place::Declaration {
+            return true;
+        }
+        let marks: Vec<Span> = marks.into_iter().collect();
+        let open_tail = matches!(
+            tail,
+            Some(Tail {
+                of: Row::Anything | Row::Named(_),
+                ..
+            })
+        );
+        if marks.is_empty() && !open_tail {
+            return true;
+        }
+        for span in marks {
+            self.error(span, ErrorKind::OpenDeclaredType { shape });
+        }
+        false
     }
 
     /// How many arguments a declared type takes. A symbol with no entry is one
@@ -1636,7 +1922,7 @@ impl Builder<'_> {
         let span = expr.span;
         match expr.tracked {
             // `()` is the empty struct rather than a form of its own, so it is
-            // erased here instead of surviving into the IR. See [`Ty::Struct`]
+            // erased here instead of surviving into the IR. See [`Ty::Row`]
             // for why, and for what it costs when the compiler answers.
             ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
             ExprKind::Ident { name } => match self.terms.get(&name.tracked) {
@@ -1684,6 +1970,10 @@ impl Builder<'_> {
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
             }
+            ExprKind::Tag { name, payload } => {
+                let payload = payload.map(|payload| Box::new(self.term(*payload)));
+                TermKind::Tag { name, payload }.with_span(span)
+            }
             ExprKind::Project { base, field } => {
                 let base = self.term(*base);
                 TermKind::Project {
@@ -1713,7 +2003,7 @@ impl Builder<'_> {
         let span = ty.span;
         match ty.tracked {
             // As in [`term`](Self::term): the two surface spellings of the
-            // empty struct, `()` and `{}`, meet here. See [`Ty::Struct`].
+            // empty struct, `()` and `{}`, meet here. See [`Ty::Row`].
             parse::TypeKind::Unit => span.track(TypeKind::Struct {
                 fields: Default::default(),
                 tail: None,
@@ -1781,41 +2071,62 @@ impl Builder<'_> {
                         )
                     })
                     .collect();
-                let tail = tail.map(|tail| {
-                    let span = tail.span;
-                    Tail {
-                        span,
-                        of: self.row(span, tail.name, place),
-                    }
-                });
-                // A declaration must be closed, except through a parameter;
-                // see [`ErrorKind::OpenDeclaredType`]. Each `?` is its own
-                // report, and the struct lowers to the error type, which
-                // absorbs — the `Circular` precedent. A tail has already
-                // reported for itself in [`row`](Self::row), because only
-                // there is it known which of the three it is.
-                if place == Place::Declaration {
-                    let offending: Vec<Span> = lowered
-                        .values()
-                        .filter(|field| field.optional)
-                        .map(|field| field.name_span)
-                        .collect();
-                    let open_tail = matches!(
-                        &tail,
-                        Some(Tail {
-                            of: Row::Anything | Row::Named(_),
-                            ..
-                        })
-                    );
-                    if !offending.is_empty() || open_tail {
-                        for span in offending {
-                            self.error(span, ErrorKind::OpenDeclaredType);
-                        }
-                        return span.track(TypeKind::Error);
-                    }
+                let tail = match self.tail(tail, place, Shape::Struct) {
+                    Ok(tail) => tail,
+                    Err(()) => return span.track(TypeKind::Error),
+                };
+                // Where a declaration is held to being closed; see
+                // [`closed`](Self::closed), which is the same check the sum
+                // arm below makes.
+                let marks = lowered
+                    .values()
+                    .filter(|field| field.optional)
+                    .map(|field| field.name_span);
+                if !self.closed(place, Shape::Struct, marks, &tail) {
+                    return span.track(TypeKind::Error);
                 }
                 span.track(TypeKind::Struct {
                     fields: lowered,
+                    tail,
+                })
+            }
+            // The struct arm again, about cases. Everything it says holds
+            // here — the payloads are lowered before openness is judged,
+            // re-keying is the same question, and openness is literally the
+            // same check — so what differs is the two nouns and the payload a
+            // case may not have.
+            parse::TypeKind::Sum { cases, tail } => {
+                let lowered: IndexMap<String, SumCase> = self
+                    .labels(cases, ErrorKind::DuplicateCase, |b, case| {
+                        let payload = case.payload.map(|payload| b.ty(payload, place));
+                        (case.optional, payload)
+                    })
+                    .into_iter()
+                    .map(|(name, case)| {
+                        let (optional, payload) = case.value;
+                        (
+                            name,
+                            SumCase {
+                                name_span: case.name_span,
+                                optional,
+                                payload,
+                            },
+                        )
+                    })
+                    .collect();
+                let tail = match self.tail(tail, place, Shape::Sum) {
+                    Ok(tail) => tail,
+                    Err(()) => return span.track(TypeKind::Error),
+                };
+                let marks = lowered
+                    .values()
+                    .filter(|case| case.optional)
+                    .map(|case| case.name_span);
+                if !self.closed(place, Shape::Sum, marks, &tail) {
+                    return span.track(TypeKind::Error);
+                }
+                span.track(TypeKind::Sum {
+                    cases: lowered,
                     tail,
                 })
             }
@@ -1830,25 +2141,51 @@ impl Builder<'_> {
         }
     }
 
-    /// Re-key surface struct fields by name, lowering each value with `lower`.
-    /// The surface syntax tolerates a name appearing twice; the IR does not, so
-    /// a repeat is reported at the offending name and the first occurrence is
-    /// the one that survives.
+    /// [`labels`](Self::labels) for a struct's fields, which is every caller
+    /// but one.
     fn fields<S, T>(
         &mut self,
         fields: IndexMap<TrackedString, S>,
         lower: impl Fn(&mut Self, S) -> T,
     ) -> IndexMap<String, Field<T>> {
+        self.labels(fields, ErrorKind::DuplicateField, lower)
+    }
+
+    /// Re-key surface labels by name, lowering each value with `lower`.
+    /// The surface syntax tolerates a name appearing twice; the IR does not, so
+    /// a repeat is reported at the offending name — as `repeat`, since a field
+    /// and a case are two complaints — and the first occurrence is the one that
+    /// survives.
+    fn labels<S, T>(
+        &mut self,
+        labels: IndexMap<TrackedString, S>,
+        repeat: ErrorKind,
+        lower: impl Fn(&mut Self, S) -> T,
+    ) -> IndexMap<String, Field<T>> {
         let mut lowered = IndexMap::new();
-        for (name, value) in fields {
+        for (name, value) in labels {
             let name_span = name.span;
             let value = lower(self, value);
             if lowered.contains_key(&name.tracked) {
-                self.error(name_span, ErrorKind::DuplicateField);
+                self.error(name_span, repeat.clone());
                 continue;
             }
             lowered.insert(name.tracked, Field { name_span, value });
         }
         lowered
     }
+}
+
+/// Whether a row's `..` names one of its declaration's parameters. The one
+/// place a parameter appears without being a [`TypeKind::Param`] node, so every
+/// walk that asks about parameters has to ask about this too — and both shapes
+/// of row have one.
+fn tails_a_parameter(tail: &Option<Tail>) -> bool {
+    matches!(
+        tail,
+        Some(Tail {
+            of: Row::Param { .. },
+            ..
+        })
+    )
 }

@@ -181,7 +181,7 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
             names_in(from, out);
             names_in(to, out);
         }
-        Ty::Struct { fields, rest } => {
+        Ty::Row { fields, rest, .. } => {
             for field in fields.values() {
                 names_in(&field.ty, out);
             }

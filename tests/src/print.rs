@@ -249,3 +249,72 @@ fn both_trees_render_an_application_the_same_way() {
         assert_eq!(ast, source, "{source}");
     }
 }
+
+/// A sum renders the same way in both trees, for the reason a struct does: the
+/// bars, the backticks and the `..` are one rule in `print`, and both printers
+/// read it.
+#[test]
+fn both_trees_render_a_sum_the_same_way() {
+    for source in [
+        "type Option T = `Some T | `None",
+        "let v = `Some 1",
+        "let n = `None",
+        "let f = fn x => `Wrap x",
+        "let p = fn f => `Some (f 1)",
+        // A case marked `?`, and a tail: the two ways a sum is left open, both
+        // of which only an annotation may write.
+        "let o : `A? Nat | `B = `B",
+        "let t : `A Nat | .. = `A 1",
+        "let r : `A Nat | ..s = `A 1",
+        // The two forms that write no case, and so print the leading bar the
+        // rest of them do not.
+        "type Void = |",
+        "type Only r = | ..r",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, ir, "{source}");
+        assert_eq!(ast, source, "{source}");
+    }
+}
+
+/// A tag with no payload is a word still waiting for one, so both printers put
+/// it in parentheses wherever an atom could follow it. Without them the printed
+/// source reads back as a different tree: `` f (`A) 1 `` is `f` applied to the
+/// case and then to `1`, while `` f `A 1 `` is `f` applied to a case carrying
+/// `1` — one printed program, two meanings, and the one it re-parses as is not
+/// the one it was printed from.
+#[test]
+fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
+    for source in [
+        "let f = fn a => a\nlet v = f (`A) 1",
+        "let f = fn a => a\nlet v = f (`A)",
+        "let f = fn a => a\nlet v = (`A) 1",
+        // As a payload, where the same argument applies: the inner tag would
+        // take the `1` the outer one is applied to.
+        "let f = fn a => a\nlet v = `Some (`A) 1",
+        // Carrying something it groups as the application it reads as, and
+        // takes no parentheses at the head of one.
+        "let v = `Some 1 2",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, ir, "{source}");
+        assert_eq!(ast, source, "{source}");
+    }
+}
+
+/// A case carrying unit is written with no payload, and prints with none — so
+/// `` `None `` survives lowering as itself rather than coming back as the
+/// `` `None {} `` it means. The struct's `()` is the other way round on
+/// purpose: there, two spellings of one written type collapse to one.
+#[test]
+fn a_case_carrying_nothing_keeps_its_missing_payload() {
+    let (ast, ir) = printed("type Flag = `On | `Off");
+    assert_eq!(ast, "type Flag = `On | `Off");
+    assert_eq!(ir, "type Flag = `On | `Off");
+
+    // Written out, the unit stays written out: it is a payload the reader
+    // put on the page, and `{}` is what `()` already prints as.
+    let (ast, ir) = printed("type Flag = `On () | `Off {}");
+    assert_eq!(ast, "type Flag = `On () | `Off {}");
+    assert_eq!(ir, "type Flag = `On {} | `Off {}");
+}

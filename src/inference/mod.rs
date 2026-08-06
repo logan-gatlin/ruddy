@@ -42,10 +42,10 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
-    ir::{Program, Row, Term, TermKind, Type, TypeKind},
+    ir::{Program, Row, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{ParamKind, RowField, Scheme, Ty, TyVar},
+    types::{ParamKind, RowField, Scheme, Shape, Ty, TyVar},
 };
 use constrain::Constrain;
 use solve::Solve;
@@ -138,7 +138,11 @@ pub enum Rule {
     /// the first row already names. The lacks check fired, so — for the same
     /// reason [`Rule::Occurs`] is not a [`Rule::Bind`] — the refusal is a rule
     /// of its own rather than a binding that did not happen.
-    Overlap,
+    ///
+    /// The shape rides along for the wording, as it does on [`Rule::Presence`]:
+    /// the rule is one rule, and a reader watching two sums be decided should
+    /// still be read to in cases.
+    Overlap { shape: Shape },
     /// Two identical primitives.
     Prim,
     /// Two arrows, taken apart into argument and result.
@@ -146,10 +150,24 @@ pub enum Rule {
     /// Two structs, taken apart: the fields both name against each other, and
     /// the fields only one names into what the other's tail allows.
     Struct,
+    /// [`Rule::Struct`] about the other shape: two sums, the cases both name
+    /// against each other and the cases only one names into what the other's
+    /// tail allows.
+    ///
+    /// One rule in the code and two here, because a reader stepping through a
+    /// solve is reading about their program: a line saying "two structs" over
+    /// a goal about `` `Some `` and `` `None `` describes something they never
+    /// wrote. See [`Solve::rows`], which is both.
+    Sum,
     /// Whether one field is there, decided: present agrees with present and
-    /// absent with absent, and a field one side must have while the other
-    /// side cannot is where a missing or extra field is discovered.
-    Presence,
+    /// absent with absent, and a field one side must have while the other side
+    /// cannot is where a missing or extra one is discovered.
+    ///
+    /// One rule in the code and two in the reading, the way [`Rule::Struct`]
+    /// and [`Rule::Sum`] are — except that the two differ in one noun rather
+    /// than in a sentence, so the shape is carried here and the wording reads
+    /// it. A reader watching a sum be decided is told about its cases.
+    Presence { shape: Shape },
     /// A declared type replaced by what it stands for, so that a goal about a
     /// name becomes a goal about a shape. What names are for: a type is equal
     /// to another by how it unfolds, never by what it is called.
@@ -230,14 +248,19 @@ pub enum ErrorKind {
     /// only way to make two structs equal would put their shared tail inside
     /// itself.
     Recursive,
-    /// A field demanded — by a projection, or by a struct type that requires
-    /// it — of a struct that does not have it. The name is carried rather
-    /// than left to be read back out of the source, so the message can be
-    /// written once here instead of once per reporter.
+    /// A label demanded of a row that does not have it: a field a projection
+    /// or a struct type requires, or a case a sum type requires. The name is
+    /// carried rather than left to be read back out of the source, so the
+    /// message can be written once here instead of once per reporter.
+    ///
+    /// Which of the two it is, is not carried: `base` *is* the row, so the
+    /// wording reads the shape off it and the noun and the type beside it
+    /// cannot disagree. One complaint, because it is one thing gone wrong —
+    /// a row was asked for a label it does not have.
     MissingField { base: Rc<Ty>, field: String },
-    /// A field the struct has but the type it is against does not allow: a
-    /// closed struct type lists every field there is, so one more is as wrong
-    /// as one missing. Worded from the type rather than the field's own span
+    /// A label the row has but the type it is against does not allow: a closed
+    /// type lists every field — or case — there is, so one more is as wrong as
+    /// one missing. Worded from the type rather than the label's own span
     /// because the type is the side that says what is allowed.
     ExtraField { base: Rc<Ty>, field: String },
     /// A struct shape was demanded of something that is not a struct at all.
@@ -263,14 +286,14 @@ pub enum ErrorKind {
     /// already points at, and the type it should have said instead is the
     /// scheme printed beside it.
     AnnotationTooOpen,
-    /// A `..` was decided to stand for a field the row it tails already names.
+    /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..r }` says "an `x`, plus whatever else `r` is", so `r`
     /// standing for anything with an `x` of its own would name the field
-    /// twice — and the two copies could disagree. Only the label is carried:
-    /// it is the one thing both halves of the contradiction have in common,
-    /// and the rows it was found between are each half a type the reader never
-    /// wrote down.
-    RepeatedField { field: String },
+    /// twice — and the two copies could disagree. Only the label and what kind
+    /// of row it was found in are carried: those are the two things both
+    /// halves of the contradiction have in common, and the rows themselves are
+    /// each half a type the reader never wrote down.
+    RepeatedField { shape: Shape, field: String },
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -597,16 +620,22 @@ impl Table {
             (Ty::Arrow(from, to), Ty::Arrow(other_from, other_to)) => {
                 self.alike(from, other_from) && self.alike(to, other_to)
             }
-            // A record, so the order the fields were written in decides
-            // nothing; the names and what they hold decide everything.
+            // A row, so the order the labels were written in decides nothing;
+            // the names, what they hold and what the row is decide everything.
             (
-                Ty::Struct { fields, rest },
-                Ty::Struct {
+                Ty::Row {
+                    shape,
+                    fields,
+                    rest,
+                },
+                Ty::Row {
+                    shape: other_shape,
                     fields: others,
                     rest: other_rest,
                 },
             ) => {
-                fields.len() == others.len()
+                shape == other_shape
+                    && fields.len() == others.len()
                     && fields.iter().all(|(name, field)| {
                         others.get(name).is_some_and(|other| {
                             self.alike(&field.presence, &other.presence)
@@ -661,7 +690,7 @@ impl Table {
                 false
             }
             Ty::Arrow(from, to) => self.occurs(var, level, from) || self.occurs(var, level, to),
-            Ty::Struct { fields, rest } => {
+            Ty::Row { fields, rest, .. } => {
                 for field in fields.values() {
                     if self.occurs(var, level, &field.presence)
                         || self.occurs(var, level, &field.ty)
@@ -710,10 +739,10 @@ impl Table {
                 self.note_lacks(&from);
                 self.note_lacks(&to);
             }
-            Ty::Struct { .. } => {
+            Ty::Row { .. } => {
                 let mut labels = IndexSet::new();
                 let mut row = ty.clone();
-                while let Ty::Struct { fields, rest } = &*row.clone() {
+                while let Ty::Row { fields, rest, .. } = &*row.clone() {
                     for (name, field) in fields {
                         labels.insert(name.clone());
                         self.note_lacks(&field.ty);
@@ -742,7 +771,9 @@ impl Table {
                     // when there is something to forbid, which a type parameter
                     // never has.
                     let labels = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
-                        Some(ParamKind::Row(labels)) if !labels.is_empty() => Some(labels.clone()),
+                        Some(ParamKind::Row { lacks, .. }) if !lacks.is_empty() => {
+                            Some(lacks.clone())
+                        }
                         _ => None,
                     };
                     if let Some(labels) = labels {
@@ -772,7 +803,7 @@ impl Table {
     /// variable for.
     fn forbid(&mut self, ty: &Rc<Ty>, labels: &IndexSet<String>) {
         let mut row = self.resolve(ty);
-        while let Ty::Struct { rest, .. } = &*row.clone() {
+        while let Ty::Row { rest, .. } = &*row.clone() {
             row = self.resolve(rest);
         }
         if let Ty::Var(var) = &*row {
@@ -825,22 +856,28 @@ impl Table {
         !matches!(&*self.resolve(ty), Ty::Undecided)
     }
 
-    /// The first field `var` may not stand for that `ty` names, if any: the
-    /// lacks check, which [`Solve::assign`] runs before every binding the way
-    /// it runs the occurs check.
+    /// The first label `var` may not stand for that `ty` names, if any, and
+    /// the kind of row it was found in: the lacks check, which
+    /// [`Solve::assign`] runs before every binding the way it runs the occurs
+    /// check.
     ///
     /// First in the row's own order rather than in the order the condition was
-    /// recorded, so that the complaint names the field a reader would reach
+    /// recorded, so that the complaint names the label a reader would reach
     /// first reading the type left to right.
-    fn repeated(&self, var: TyVar, ty: &Rc<Ty>) -> Option<String> {
+    fn repeated(&self, var: TyVar, ty: &Rc<Ty>) -> Option<(Shape, String)> {
         let lacks = self.lacks.get(&var)?;
         let mut row = self.resolve(ty);
         loop {
-            let Ty::Struct { fields, rest } = &*row.clone() else {
+            let Ty::Row {
+                shape,
+                fields,
+                rest,
+            } = &*row.clone()
+            else {
                 return None;
             };
             if let Some(name) = fields.keys().find(|name| lacks.contains(*name)) {
-                return Some(name.clone());
+                return Some((*shape, name.clone()));
             }
             row = self.resolve(rest);
         }
@@ -899,7 +936,7 @@ impl Table {
                 self.quantify_walk(from, subst, presences);
                 self.quantify_walk(to, subst, presences);
             }
-            Ty::Struct { fields, rest } => {
+            Ty::Row { fields, rest, .. } => {
                 for field in fields.values() {
                     if presences && let Ty::Var(var) = &*self.resolve(&field.presence) {
                         self.quantify_var(*var, subst);
@@ -940,7 +977,12 @@ impl Table {
                 None => ty,
             },
             Ty::Arrow(from, to) => Rc::new(Ty::Arrow(self.zonk(from, subst), self.zonk(to, subst))),
-            Ty::Struct { fields, rest } => {
+            Ty::Row {
+                shape,
+                fields,
+                rest,
+            } => {
+                let shape = *shape;
                 let mut fields: IndexMap<String, RowField> = fields
                     .iter()
                     .map(|(name, field)| {
@@ -952,13 +994,14 @@ impl Table {
                     })
                     .collect();
                 // A tail the solve bound to a row is spliced in, so that what
-                // outlives the solver is one flat struct rather than a chain
+                // outlives the solver is one flat row rather than a chain
                 // of them: `{ x: Nat, ..{ y: Nat } }` is not a type anyone
                 // wrote. The tail was zonked first, so it is flat already and
-                // one splice reaches its end.
+                // one splice reaches its end. Its shape is this row's, since a
+                // tail only ever holds a row of the shape it is the tail of.
                 //
                 // The two sides cannot share a label. A tail stands for the
-                // fields its row does not write out, and [`Solve::assign`]
+                // labels its row does not write out, and [`Solve::assign`]
                 // refuses to bind one to a row that writes out one of them, so
                 // by the time a solve is over no chain of rows repeats a name.
                 // `or_insert` is what says that here: it is a no-op, and the
@@ -967,9 +1010,10 @@ impl Table {
                 // quietly lost a copy, and a definition came out with a type
                 // it had never been shown to have.
                 let mut rest = self.zonk(rest, subst);
-                while let Ty::Struct {
+                while let Ty::Row {
                     fields: inner,
                     rest: deeper,
+                    ..
                 } = &*rest.clone()
                 {
                     for (name, field) in inner {
@@ -977,7 +1021,11 @@ impl Table {
                     }
                     rest = deeper.clone();
                 }
-                Rc::new(Ty::Struct { fields, rest })
+                Rc::new(Ty::Row {
+                    shape,
+                    fields,
+                    rest,
+                })
             }
             // Rebuilt rather than handed back, because an argument may hold a
             // variable and what leaves here may not. Nothing downstream
@@ -1032,6 +1080,11 @@ impl Table {
                 }
             }
             TermKind::Project { base, .. } => self.zonk_term(base, subst),
+            TermKind::Tag { payload, .. } => {
+                if let Some(payload) = payload {
+                    self.zonk_term(payload, subst);
+                }
+            }
             TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
         }
     }
@@ -1068,7 +1121,8 @@ impl Table {
                 base: self.close(base, subst),
             },
             ErrorKind::AnnotationTooOpen => ErrorKind::AnnotationTooOpen,
-            ErrorKind::RepeatedField { field } => ErrorKind::RepeatedField {
+            ErrorKind::RepeatedField { shape, field } => ErrorKind::RepeatedField {
+                shape: *shape,
                 field: field.clone(),
             },
         }
@@ -1137,37 +1191,81 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rc<Ty>>, ty:
             lower(mint, table, rows, from),
             lower(mint, table, rows, to),
         )),
-        TypeKind::Struct { fields, tail } => Rc::new(Ty::Struct {
-            fields: fields
-                .iter()
-                .map(|(name, field)| {
-                    let presence = match field.optional {
-                        true => table.fresh(),
-                        false => Rc::new(Ty::Present),
-                    };
-                    let lowered = RowField {
-                        presence,
-                        ty: lower(mint, table, rows, &field.value),
-                    };
-                    (name.clone(), lowered)
-                })
-                .collect(),
-            rest: match tail.as_ref().map(|tail| &tail.of) {
-                None => Rc::new(Ty::Empty),
-                Some(Row::Anything) => table.fresh(),
-                Some(Row::Named(name)) => rows
-                    .entry(name.clone())
-                    .or_insert_with(|| table.fresh())
-                    .clone(),
-                // A row parameter is its position, the same as a type one: what
-                // it stands for is spliced in where this sits, by the flattening
-                // [`Table::zonk`] and [`Solve::canon`] already do for a tail
-                // bound to a row.
-                Some(Row::Param { index, .. }) => Rc::new(Ty::Bound(*index)),
-            },
-        }),
+        TypeKind::Struct { fields, tail } => {
+            let mut labels = IndexMap::new();
+            for (name, field) in fields {
+                let lowered = RowField {
+                    presence: presence(table, field.optional),
+                    ty: lower(mint, table, rows, &field.value),
+                };
+                labels.insert(name.clone(), lowered);
+            }
+            row(table, rows, Shape::Struct, labels, tail)
+        }
+        // The struct arm again, about cases. The one difference is the payload
+        // a case may not have written, which is unit — the same type `()` is,
+        // built here rather than in the tree so that what the reader wrote and
+        // what the compiler means stay two separate things. See
+        // [`ir::TermKind::Tag`](crate::ir::TermKind::Tag).
+        TypeKind::Sum { cases, tail } => {
+            let mut labels = IndexMap::new();
+            for (name, case) in cases {
+                let carried = match &case.payload {
+                    Some(payload) => lower(mint, table, rows, payload),
+                    None => Rc::new(Shape::Struct.empty()),
+                };
+                let lowered = RowField {
+                    presence: presence(table, case.optional),
+                    ty: carried,
+                };
+                labels.insert(name.clone(), lowered);
+            }
+            row(table, rows, Shape::Sum, labels, tail)
+        }
         TypeKind::Error => Rc::new(Ty::Undecided),
     }
+}
+
+/// Whether one label is there, as the written `?` says it: a mark means the
+/// definition decides, so the presence is a fresh variable, and no mark means
+/// it is simply there.
+fn presence(table: &mut Table, optional: bool) -> Rc<Ty> {
+    match optional {
+        true => table.fresh(),
+        false => Rc::new(Ty::Present),
+    }
+}
+
+/// The labels of a written row and what its `..` stands for, assembled into the
+/// type. Shared by the two shapes, because the tail is the one part of a row
+/// that reads the same either way: `..` is a variable this definition may
+/// decide, `..r` is that variable shared across one annotation, and `..r`
+/// naming a parameter is a position an argument is handed to.
+fn row(
+    table: &mut Table,
+    rows: &mut HashMap<String, Rc<Ty>>,
+    shape: Shape,
+    fields: IndexMap<String, RowField>,
+    tail: &Option<Tail>,
+) -> Rc<Ty> {
+    let rest = match tail.as_ref().map(|tail| &tail.of) {
+        None => Rc::new(Ty::Empty),
+        Some(Row::Anything) => table.fresh(),
+        Some(Row::Named(name)) => rows
+            .entry(name.clone())
+            .or_insert_with(|| table.fresh())
+            .clone(),
+        // A row parameter is its position, the same as a type one: what it
+        // stands for is spliced in where this sits, by the flattening
+        // [`Table::zonk`] and [`Solve::canon`] already do for a tail bound to a
+        // row.
+        Some(Row::Param { index, .. }) => Rc::new(Ty::Bound(*index)),
+    };
+    Rc::new(Ty::Row {
+        shape,
+        fields,
+        rest,
+    })
 }
 
 /// What a declared type stands for: [`Ty::Named`] replaced by the body it was
@@ -1231,7 +1329,8 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 
 impl Ty {
     /// Whether this type is one a field could not be read off whatever else is
-    /// true of it. The two the language has: a number and a function.
+    /// true of it. The three the language has: a number, a function, and a sum,
+    /// whose cases are not fields and cannot be read as any.
     ///
     /// Listed rather than written as "not a struct", so that a type added later
     /// has to be considered instead of quietly inheriting a message about fields.
@@ -1239,7 +1338,15 @@ impl Ty {
     /// those meeting a struct is a bug in the solver, and "`absent` is not a
     /// struct" is not the diagnostic that should carry it to anyone.
     fn is_fieldless(&self) -> bool {
-        matches!(self, Ty::Nat | Ty::Arrow(..))
+        matches!(
+            self,
+            Ty::Nat
+                | Ty::Arrow(..)
+                | Ty::Row {
+                    shape: Shape::Sum,
+                    ..
+                }
+        )
     }
 
     /// Replace each [`Ty::Bound`] with its instantiation. A free function rather
@@ -1249,7 +1356,12 @@ impl Ty {
         match self {
             Ty::Bound(index) => fresh[*index as usize].clone(),
             Ty::Arrow(from, to) => Rc::new(Ty::Arrow(from.open(fresh), to.open(fresh))),
-            Ty::Struct { fields, rest } => Rc::new(Ty::Struct {
+            Ty::Row {
+                shape,
+                fields,
+                rest,
+            } => Rc::new(Ty::Row {
+                shape: *shape,
                 fields: fields
                     .iter()
                     .map(|(name, field)| {
