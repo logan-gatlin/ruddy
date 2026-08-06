@@ -66,6 +66,10 @@ test:
 build:
     cargo build --workspace
 
+# Line coverage for the compiler library: runs every test, skips the CLI.
+coverage *args:
+    cargo llvm-cov --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/|/src/main\.rs' {{args}}
+
 clippy:
     cargo clippy --workspace --all-targets
 
