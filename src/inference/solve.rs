@@ -7,11 +7,10 @@ use indexmap::IndexMap;
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{RowField, Scheme, Ty, TyVar},
+    types::{RowField, Scheme, Shape, Ty, TyVar},
 };
 
-use super::{
-    Constraint, ConstraintKind, Effect, Error, ErrorKind, Rule, Side, Slot, Step, Table,};
+use super::{Constraint, ConstraintKind, Effect, Error, ErrorKind, Rule, Side, Slot, Step, Table};
 
 /// Pass two: the solver, which sees constraints and never terms.
 pub struct Solve<'a> {
@@ -209,23 +208,27 @@ impl Solve<'_> {
             }
             (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => self.unfold(span, goal, &lhs, &rhs),
             (Ty::Nat, Ty::Nat) => self.step(span, Rule::Prim, goal, Effect::None),
-            // The presence constants meeting themselves. No path reaches this:
-            // every presence pair goes through [`Solve::field`], which decides
-            // all four combinations of the constants itself and only calls
-            // back here when at least one side is still a variable. Kept
+            // A constant meeting itself, which is [`Rule::Same`] like any other
+            // pair that is already the same thing. The presences reach it from
+            // no path: every presence pair goes through [`Solve::field`], which
+            // decides all four combinations of the constants itself and only
+            // calls back here when at least one side is still a variable. Kept
             // because being unreachable is a property of the callers rather
             // than of the type language — two presences *are* equal when they
             // are the same constant — and a fall-through to the mismatch arm
             // below would report that as a contradiction.
             //
+            // Said as `Same` rather than as [`Rule::Presence`] because that
+            // rule is worded about the field or case whose presence it is
+            // deciding, and here there is no row in sight to have one.
+            //
             // Their mismatches never reach the arm below either: a presence
             // clash is intercepted where the field's name is known, so the
             // complaint can name the field instead of saying `present` against
             // `absent`.
-            (Ty::Present, Ty::Present) | (Ty::Absent, Ty::Absent) => {
-                self.step(span, Rule::Presence, goal, Effect::None)
+            (Ty::Present, Ty::Present) | (Ty::Absent, Ty::Absent) | (Ty::Empty, Ty::Empty) => {
+                self.step(span, Rule::Same, goal, Effect::None)
             }
-            (Ty::Empty, Ty::Empty) => self.step(span, Rule::Same, goal, Effect::None),
             (Ty::Arrow(from1, to1), Ty::Arrow(from2, to2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
                 let (from2, to2) = (from2.clone(), to2.clone());
@@ -235,7 +238,13 @@ impl Solve<'_> {
                 self.unify(span, &to1, &to2);
                 self.depth -= 1;
             }
-            (Ty::Struct { .. }, Ty::Struct { .. }) => self.rows(span, &lhs, &rhs),
+            // Two rows of one shape. Two of different shapes fall through to
+            // the arm below and are an ordinary mismatch: a struct and a sum
+            // are two types however much their insides look alike, and lining
+            // their labels up would be answering a question nobody asked.
+            (Ty::Row { shape: a, .. }, Ty::Row { shape: b, .. }) if a == b => {
+                self.rows(span, *a, &lhs, &rhs)
+            }
             // Nothing applies. Which complaint that is depends on whether
             // either side is a demand rather than a written type: an open row
             // is one — no closed written type has a tail — so a projection
@@ -277,13 +286,14 @@ impl Solve<'_> {
         }
     }
 
-    /// Make two structs the same row. [`Rule::Struct`] replaces the pair with
-    /// everything that has to hold of it: fields only one side names flow
-    /// into the other side's tail, and the fields both name are decided one
-    /// by one.
+    /// Make two rows of one shape the same row. [`Rule::Struct`] — or
+    /// [`Rule::Sum`], which is the same rule about the other shape — replaces
+    /// the pair with everything that has to hold of it: labels only one side
+    /// names flow into the other side's tail, and the labels both name are
+    /// decided one by one.
     ///
-    /// The tails go first, the shared fields after. The other order would let
-    /// a shared field's own unification bind one of the tails behind the
+    /// The tails go first, the shared labels after. The other order would let
+    /// a shared label's own unification bind one of the tails behind the
     /// resolved copy this function is holding — a field's type can mention
     /// its own row's tail — and an act performed on a stale tail is an act
     /// performed on the wrong type.
@@ -300,16 +310,18 @@ impl Solve<'_> {
     /// differ, and it is exactly the case where the unflattened goal cannot
     /// account for its own children — the fields under it come from a row the
     /// line above does not show.
-    fn rows(&mut self, span: Span, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
+    fn rows(&mut self, span: Span, shape: Shape, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
         let mut want_repeats = Vec::new();
         let (want, want_rest) = self.canon(lhs, &mut want_repeats);
         let mut have_repeats = Vec::new();
         let (have, have_rest) = self.canon(rhs, &mut have_repeats);
-        let expected = Rc::new(Ty::Struct {
+        let expected = Rc::new(Ty::Row {
+            shape,
             fields: want.clone(),
             rest: want_rest.clone(),
         });
-        let actual = Rc::new(Ty::Struct {
+        let actual = Rc::new(Ty::Row {
+            shape,
             fields: have.clone(),
             rest: have_rest.clone(),
         });
@@ -318,7 +330,11 @@ impl Solve<'_> {
             actual: actual.clone(),
         };
 
-        self.step(span, Rule::Struct, goal.clone(), Effect::Decomposed);
+        let rule = match shape {
+            Shape::Struct => Rule::Struct,
+            Shape::Sum => Rule::Sum,
+        };
+        self.step(span, rule, goal.clone(), Effect::Decomposed);
         self.depth += 1;
 
         // What flattening found twice, refused now that there is a rule to
@@ -333,7 +349,7 @@ impl Solve<'_> {
         // see, and report a second time about a type nobody wrote.
         let repeats: Vec<_> = want_repeats.into_iter().chain(have_repeats).collect();
         if !repeats.is_empty() {
-            self.repeat(span, goal, &repeats);
+            self.repeat(span, shape, goal, &repeats);
             self.depth -= 1;
             return;
         }
@@ -453,6 +469,7 @@ impl Solve<'_> {
     fn repeat(
         &mut self,
         span: Span,
+        shape: Shape,
         goal: ConstraintKind,
         repeats: &[(String, RowField, RowField)],
     ) {
@@ -462,6 +479,7 @@ impl Solve<'_> {
         let error = Error {
             span,
             kind: ErrorKind::RepeatedField {
+                shape,
                 field: name.clone(),
             },
         };
@@ -476,13 +494,18 @@ impl Solve<'_> {
                 ]
             })
             .collect();
-        self.fail(span, Rule::Overlap, goal, error, &abandoned);
+        self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
     }
 
-    /// A struct flattened: its own fields joined with every field its tail
+    /// A row flattened: its own labels joined with every label its tail
     /// has already accumulated, and what remains of the tail — an unbound
     /// variable, [`Ty::Empty`], or [`Ty::Undecided`] — resolved as far as the
     /// solver has got.
+    ///
+    /// The shape is not returned because it never changes on the way down: a
+    /// tail holds a row of the shape it is the tail of, which lowering enforces
+    /// where an argument is written and unification enforces everywhere else.
+    /// The caller knew it before this was called and still knows it after.
     ///
     /// A read and nothing else. It used to unify the labels it met twice on
     /// the way down, which made the shape of a goal something the solver
@@ -507,14 +530,15 @@ impl Solve<'_> {
         ty: &Rc<Ty>,
         repeats: &mut Vec<(String, RowField, RowField)>,
     ) -> (IndexMap<String, RowField>, Rc<Ty>) {
-        let Ty::Struct { fields, rest } = &**ty else {
-            unreachable!("canon is only called on structs");
+        let Ty::Row { fields, rest, .. } = &**ty else {
+            unreachable!("canon is only called on rows");
         };
         let mut fields = fields.clone();
         let mut rest = self.table.resolve(rest);
-        while let Ty::Struct {
+        while let Ty::Row {
             fields: inner,
             rest: deeper,
+            ..
         } = &*rest.clone()
         {
             for (name, field) in inner {
@@ -540,8 +564,18 @@ impl Solve<'_> {
     /// it is open too — but the wording it picks is right for that case as
     /// well: whatever was asked of a `Nat`, the answer is that a `Nat` has no
     /// fields.
+    ///
+    /// Structs only, though an open sum is far commoner: a tag literal is open
+    /// by its nature — one case of however many — and is a type the reader
+    /// wrote rather than a question the solver made up, so quoting it back at
+    /// them is exactly right and this must not call it a demand.
     fn demanded(&self, ty: &Rc<Ty>) -> bool {
-        let Ty::Struct { rest, .. } = &**ty else {
+        let Ty::Row {
+            shape: Shape::Struct,
+            rest,
+            ..
+        } = &**ty
+        else {
             return false;
         };
         matches!(&*self.table.resolve(rest), Ty::Var(_) | Ty::Undecided)
@@ -567,14 +601,16 @@ impl Solve<'_> {
     /// is knowledge the reader wants.
     fn frozen(&self, ty: &Rc<Ty>) -> Rc<Ty> {
         let resolved = self.table.resolve(ty);
-        if !matches!(&*resolved, Ty::Struct { .. }) {
+        let Ty::Row { shape, .. } = &*resolved else {
             return resolved;
-        }
+        };
+        let shape = *shape;
         let mut fields: IndexMap<String, RowField> = IndexMap::new();
         let mut row = resolved;
-        while let Ty::Struct {
+        while let Ty::Row {
             fields: named,
             rest,
+            ..
         } = &*row.clone()
         {
             for (name, field) in named {
@@ -590,7 +626,11 @@ impl Solve<'_> {
             }
             row = self.table.resolve(rest);
         }
-        Rc::new(Ty::Struct { fields, rest: row })
+        Rc::new(Ty::Row {
+            shape,
+            fields,
+            rest: row,
+        })
     }
 
     /// Decide one field both rows name: whether it is there must agree, and
@@ -598,6 +638,11 @@ impl Solve<'_> {
     /// worded as the field the actual side is missing or the extra one it
     /// has, never as `present` against `absent` — the field's name is known
     /// here, and the complaint should name it.
+    ///
+    /// Which noun the rule is read in comes off the rows themselves, the way
+    /// [`Solve::absorb`] reads the shape it continues extras as: the two are
+    /// the rows this is deciding a label of, so nothing can arrive disagreeing
+    /// with them.
     fn field(
         &mut self,
         span: Span,
@@ -607,6 +652,10 @@ impl Solve<'_> {
         want: &RowField,
         have: &RowField,
     ) {
+        let Ty::Row { shape, .. } = &**expected_base else {
+            unreachable!("field is only called with the rows the label belongs to");
+        };
+        let shape = *shape;
         let p1 = self.table.resolve(&want.presence);
         let p2 = self.table.resolve(&have.presence);
         let goal = ConstraintKind::Equal {
@@ -623,7 +672,13 @@ impl Solve<'_> {
                     field: name.to_string(),
                 };
                 let abandoned = [want.ty.clone(), have.ty.clone()];
-                self.fail(span, Rule::Presence, goal, Error { span, kind }, &abandoned);
+                self.fail(
+                    span,
+                    Rule::Presence { shape },
+                    goal,
+                    Error { span, kind },
+                    &abandoned,
+                );
             }
             (Ty::Absent, Ty::Present) => {
                 let kind = ErrorKind::ExtraField {
@@ -631,7 +686,13 @@ impl Solve<'_> {
                     field: name.to_string(),
                 };
                 let abandoned = [want.ty.clone(), have.ty.clone()];
-                self.fail(span, Rule::Presence, goal, Error { span, kind }, &abandoned);
+                self.fail(
+                    span,
+                    Rule::Presence { shape },
+                    goal,
+                    Error { span, kind },
+                    &abandoned,
+                );
             }
             // At least one side is still a variable or undecided: the
             // presences unify as anything else does, and the types follow
@@ -647,15 +708,16 @@ impl Solve<'_> {
         }
     }
 
-    /// Push the fields only one row names into the other row's tail, to
+    /// Push the labels only one row names into the other row's tail, to
     /// continue as `rest`. `side` says which side of the goal the tail sits
     /// on, so that every act performed on its behalf keeps the direction the
-    /// constraint was worded in; `base` is the struct the tail belongs to,
-    /// which is the type a complaint names.
+    /// constraint was worded in; `base` is the row the tail belongs to,
+    /// which is the type a complaint names, and `shape` is what the row the
+    /// extras continue as has to be.
     ///
     /// An open tail takes the row whole — one binding, occurs-checked like
-    /// any other. A closed tail takes nothing: each field must turn out
-    /// absent, one that certainly is not is a missing or extra field by
+    /// any other. A closed tail takes nothing: each label must turn out
+    /// absent, one that certainly is not is a missing or extra label by
     /// `side`, and whatever would have continued as `rest` is closed too.
     fn absorb(
         &mut self,
@@ -666,8 +728,17 @@ impl Solve<'_> {
         rest: &Rc<Ty>,
         base: &Rc<Ty>,
     ) {
+        // What the extras continue as is a row of the shape they came out of,
+        // and `base` is that row — so it is read off rather than passed
+        // alongside, which is one less thing that could arrive disagreeing
+        // with it.
+        let Ty::Row { shape, .. } = &**base else {
+            unreachable!("absorb is only called with the row the tail belongs to");
+        };
+        let shape = *shape;
         if !matches!(&**tail, Ty::Empty) {
-            let row = Rc::new(Ty::Struct {
+            let row = Rc::new(Ty::Row {
+                shape,
                 fields: extras,
                 rest: rest.clone(),
             });
@@ -699,7 +770,7 @@ impl Solve<'_> {
                     let error = Error { span, kind };
                     self.fail(
                         span,
-                        Rule::Presence,
+                        Rule::Presence { shape },
                         goal,
                         error,
                         slice::from_ref(&field.ty),
@@ -717,7 +788,7 @@ impl Solve<'_> {
                     let error = Error { span, kind };
                     self.fail(
                         span,
-                        Rule::Presence,
+                        Rule::Presence { shape },
                         goal,
                         error,
                         slice::from_ref(&field.ty),
@@ -876,14 +947,14 @@ impl Solve<'_> {
         // One complaint per binding, not per label: a tail that would have to
         // repeat two fields is one thing gone wrong with one row, and naming
         // the first of them is what the reader has to look at either way.
-        if let Some(field) = self.table.repeated(var, ty) {
+        if let Some((shape, field)) = self.table.repeated(var, ty) {
             let error = Error {
                 span,
-                kind: ErrorKind::RepeatedField { field },
+                kind: ErrorKind::RepeatedField { shape, field },
             };
             self.fail(
                 span,
-                Rule::Overlap,
+                Rule::Overlap { shape },
                 goal,
                 error,
                 &[Rc::new(Ty::Var(var)), ty.clone()],
@@ -964,7 +1035,7 @@ impl Solve<'_> {
             // A field is abandoned whole: its presence, its type, and the tail
             // saying what else the struct might have had. Missing one would
             // leave a variable unbound for generalization to quantify.
-            Ty::Struct { fields, rest } => {
+            Ty::Row { fields, rest, .. } => {
                 let parts: Vec<_> = fields
                     .values()
                     .flat_map(|field| [field.presence.clone(), field.ty.clone()])

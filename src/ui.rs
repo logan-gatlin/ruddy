@@ -48,7 +48,7 @@ use crate::{
     ir, parse,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
-    types::{Prim, Scheme, Ty},
+    types::{Prim, Scheme, Sense, Shape, Ty},
 };
 
 /// The note a duplicate definition points back with, printed against the span
@@ -56,6 +56,12 @@ use crate::{
 /// wording because it is a second line about a second place, and only a
 /// reporter knows how to attach one.
 pub const FIRST_DEFINITION: &str = "first defined here";
+
+/// The note a clash of tails points back with, printed against the span of the
+/// `..` that decided what the name stands for. [`FIRST_DEFINITION`]'s
+/// counterpart for the complaints about a name that was used rather than
+/// defined twice — see [`ir::ErrorKind::MixedTail`].
+pub const FIRST_USE: &str = "first used here";
 
 /// A node a printer has to parenthesize by precedence. Implemented by every
 /// wrapper that prints as surface syntax, and by [`Ty`], which prints as one
@@ -90,6 +96,21 @@ pub enum Prec {
     Lambda,
     /// `from -> to`.
     Arrow,
+    /// `` `A Nat | `B `` — a sum extends rightward by case, so it needs
+    /// parentheses anywhere a case could follow it. Above the arrow, which is
+    /// what makes `` `A Nat | `B -> Nat `` a function *from* the sum rather
+    /// than a sum whose last case carries an arrow.
+    Sum,
+    /// `` `A `` with nothing after it — a tag takes the next atom as its
+    /// payload, so a bare one needs parentheses anywhere one could follow.
+    ///
+    /// Below [`Prec::Apply`] rather than at it, which is the whole difference
+    /// between the two: a tag that already carries something groups as the
+    /// application it reads as and may head one, `` `A 1 2 `` being `` `A 1 ``
+    /// applied to `2`, while a bare tag heading one would swallow the argument
+    /// it was applied to — `` f (`A) 1 `` printed without the parentheses reads
+    /// back as `` f (`A 1) ``.
+    Tag,
     /// `func arg`.
     Apply,
     /// A form nothing can be appended to: a name, a literal, `()`, a braced
@@ -155,6 +176,11 @@ impl fmt::Display for Kind {
             Kind::Dot => f.write_str("."),
             Kind::DotDot => f.write_str(".."),
             Kind::Question => f.write_str("?"),
+            Kind::Pipe => f.write_str("|"),
+            // The backtick is written back on: it is how the token was
+            // spelled, and a `Tag` printing as a bare name would re-lex as an
+            // identifier.
+            Kind::Tag(name) => write!(f, "`{name}"),
             Kind::LeftBrace => f.write_str("{"),
             Kind::RightBrace => f.write_str("}"),
             Kind::LeftParen => f.write_str("("),
@@ -197,35 +223,49 @@ impl ir::ErrorKind {
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
             ir::ErrorKind::Circular => "circular-type",
-            ir::ErrorKind::OpenDeclaredType => "open-declared-type",
+            ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
             ir::ErrorKind::DuplicateParameter { .. } => "duplicate-parameter",
             ir::ErrorKind::GrowingRecursion => "growing-recursion",
-            ir::ErrorKind::MixedParameter => "mixed-parameter",
-            ir::ErrorKind::NotARow => "not-a-row",
+            ir::ErrorKind::DuplicateCase => "duplicate-case",
+            // The shape is not part of these codes, only of their wording: a
+            // reporter that treats a struct's row differently from a sum's is
+            // reading the type, not the complaint. The namespace on
+            // [`ir::ErrorKind::Undefined`] is the other way round, and says so.
+            ir::ErrorKind::MixedTail { .. } => "mixed-tail",
+            ir::ErrorKind::MixedParameter { .. } => "mixed-parameter",
+            ir::ErrorKind::NotARow { .. } => "not-a-row",
             ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
         }
     }
 }
 
 /// What lowering could not resolve, in a phrase. [`ir::ErrorKind::Duplicate`]
-/// says nothing here about the definition it repeats: that is a second span in
-/// another place, and pointing at it is layout — see [`FIRST_DEFINITION`].
+/// says nothing here about the definition it repeats, and
+/// [`ir::ErrorKind::MixedTail`] nothing about the first `..` it clashes with:
+/// each is a second span in another place, and pointing at one is layout — see
+/// [`FIRST_DEFINITION`] and [`FIRST_USE`].
 impl fmt::Display for ir::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ir::ErrorKind::Undefined { namespace } => write!(f, "undefined {namespace}"),
             ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
             ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),
+            ir::ErrorKind::DuplicateCase => f.write_str("duplicate case"),
             // Not "recursive": a type is welcome to lead back to itself, and
             // what is wrong here is that there is nothing in the way when it
             // does. Said as what the reader can change — give the type a shape
             // — rather than as the loop the compiler noticed.
             ir::ErrorKind::Circular => f.write_str("type defined only as another name"),
-            ir::ErrorKind::OpenDeclaredType => f.write_str(
-                "a declared type must list its fields exactly; `..` and `?` belong in annotations",
+            // The noun follows the shape that was written: someone who wrote
+            // backticks is told about cases, and the `?` and the `..` are the
+            // same two marks either way.
+            ir::ErrorKind::OpenDeclaredType { shape } => write!(
+                f,
+                "a declared type must list its {}s exactly; `..` and `?` belong in annotations",
+                noun(Some(*shape)),
             ),
             // Counted in words, and said as what the type takes rather than as
             // what the reader failed to supply — the count is the fact, and
@@ -254,19 +294,32 @@ impl fmt::Display for ir::ErrorKind {
             // Said as the two readings rather than as "kind", which names a
             // thing this language does not otherwise have and the reader has
             // never been shown.
-            ir::ErrorKind::MixedParameter => f.write_str(
-                "this stands for the rest of a struct's fields in one place and for a whole type in another",
+            // One sentence for the two, because it is one thing gone wrong:
+            // a name that has to be one rest was given two. Which name it is,
+            // the span already says.
+            ir::ErrorKind::MixedTail { first, second, .. } => write!(
+                f,
+                "this stands for {} in one place and for {} in another",
+                Sense::Row(*first),
+                Sense::Row(*second),
             ),
-            ir::ErrorKind::NotARow => f.write_str(
-                "the rest of a struct's fields goes here, and this is not that",
+            ir::ErrorKind::MixedParameter { first, second } => write!(
+                f,
+                "this stands for {first} in one place and for {second} in another",
             ),
+            ir::ErrorKind::NotARow { shape } => {
+                write!(f, "{} goes here, and this is not that", Sense::Row(*shape))
+            }
             // Said as what the `..` covers, the way the solver's version of
             // this complaint is: the reader can change the field they wrote,
             // and the row the declaration would end up with is not a type
             // anyone put on the page.
-            ir::ErrorKind::RepeatedRowField { field } => write!(
+            ir::ErrorKind::RepeatedRowField { shape, field } => write!(
                 f,
-                "the rest of a struct's fields goes here, and this names `{field}`, which that struct already has",
+                "{} goes here, and this names `{}`, which that {} already has",
+                Sense::Row(*shape),
+                label(*shape, field),
+                shape,
             ),
         }
     }
@@ -315,6 +368,78 @@ impl fmt::Display for Bundle {
     }
 }
 
+/// What a row of this shape is called, in the one word a sentence about it
+/// needs. Never "row": the word names the representation the two share, which
+/// is the compiler's business, and a reader who wrote braces should be told
+/// about a struct.
+impl fmt::Display for Shape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Shape::Struct => "struct",
+            Shape::Sum => "sum",
+        })
+    }
+}
+
+/// What a parameter stands for, as the phrase a complaint drops into a
+/// sentence. Read as "this stands for …", which is what
+/// [`ir::ErrorKind::MixedParameter`] says twice and
+/// [`ir::ErrorKind::NotARow`] once.
+impl fmt::Display for Sense {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Sense::Type => "a whole type",
+            Sense::Row(Shape::Struct) => "the rest of a struct's fields",
+            Sense::Row(Shape::Sum) => "the rest of a sum's cases",
+        })
+    }
+}
+
+/// What one label of a row of this shape is called, for the complaints that
+/// read a shape off a type rather than being handed one. A type that is
+/// somehow not a row gets `field`, which is what every complaint of this kind
+/// said before there were sums.
+fn noun(shape: Option<Shape>) -> &'static str {
+    match shape {
+        Some(Shape::Sum) => "case",
+        Some(Shape::Struct) | None => "field",
+    }
+}
+
+/// What kind of row a type is, or `None` when it is not one.
+fn shape_of(ty: &Ty) -> Option<Shape> {
+    match ty {
+        Ty::Row { shape, .. } => Some(*shape),
+        _ => None,
+    }
+}
+
+/// The two words a complaint about one label of `base` needs: what to call it,
+/// and how it is written there.
+///
+/// Both come off the type rather than out of a second payload: `base` *is* the
+/// row that went wrong, so reading it here is the one way the word and the type
+/// beside it cannot disagree. A base that is somehow not a row is described the
+/// way a struct is, which is what every complaint of this kind said before
+/// there were sums.
+fn about(base: &Ty, name: &str) -> (&'static str, String) {
+    let shape = shape_of(base);
+    (noun(shape), label(shape.unwrap_or(Shape::Struct), name))
+}
+
+/// One label as it is written in a row of this shape: a field is its bare
+/// name, a case wears the backtick that makes it one.
+///
+/// Every complaint that quotes a label goes through here rather than
+/// interpolating the string it was given, so that a message about `` `Some ``
+/// never asks the reader to look for `Some`.
+pub fn label(shape: Shape, name: &str) -> String {
+    match shape {
+        Shape::Struct => name.to_string(),
+        Shape::Sum => format!("`{name}"),
+    }
+}
+
 impl fmt::Display for Namespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -351,28 +476,34 @@ impl fmt::Display for Prim {
 }
 
 /// How much of the surface grammar a semantic type can be. The arrow extends
-/// rightward and an application extends rightward by argument; everything else
-/// — a primitive, a braced struct, a variable — is a form nothing can be
-/// appended to.
+/// rightward, an application extends rightward by argument, and a sum extends
+/// rightward by case; everything else — a primitive, a braced struct, a
+/// variable — is a form nothing can be appended to.
 ///
-/// The type language has no lambda, so one of [`Prec`]'s four levels never
-/// arises here. It is still the right scale to answer on: grouping is decided
-/// by comparing against the position a type is being written into, and that
+/// The type language has no lambda, so one of [`Prec`]'s levels never arises
+/// here. It is still the right scale to answer on: grouping is decided by
+/// comparing against the position a type is being written into, and that
 /// comparison is the surface grammar's whether or not this particular tree can
 /// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match self {
             Ty::Arrow(..) => Prec::Arrow,
+            // A sum is written as its cases with nothing around them, so
+            // anything that could follow a case has to be kept off it — an
+            // argument, a payload, another case.
+            Ty::Row {
+                shape: Shape::Sum, ..
+            } => Prec::Sum,
             // Applied to something, a declared type groups as the application
             // it is: `Pair Nat Nat` needs parentheses wherever an argument
             // could follow it.
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
             // Applied to nothing it is an atom whatever it stands for: it
             // prints as its name, and a name is one word however many arrows
-            // are behind it.
+            // are behind it. A struct is one too: its braces close it.
             Ty::Nat
-            | Ty::Struct { .. }
+            | Ty::Row { .. }
             | Ty::Named { .. }
             | Ty::Var(_)
             | Ty::Bound(_)
@@ -408,7 +539,7 @@ impl fmt::Display for Ty {
             Ty::Arrow(from, to) => write_arrow(f, &**from, &**to),
             // Unit falls out of this as `{}` rather than `()`, on purpose:
             // there is one type here, and one spelling for it. See
-            // [`Ty::Struct`].
+            // [`Ty::Row`].
             //
             // A field prints by what its presence resolved to: there for
             // certain as `name: T`, absent not at all — a field that is not
@@ -420,7 +551,11 @@ impl fmt::Display for Ty {
             // there is nothing to report. A closed struct prints no tail,
             // which is what makes this collapse to the old notation whenever
             // nothing is open.
-            Ty::Struct { fields, rest } => {
+            Ty::Row {
+                shape: Shape::Struct,
+                fields,
+                rest,
+            } => {
                 let entries = fields
                     .iter()
                     .filter_map(|(name, field)| match &*field.presence {
@@ -428,13 +563,26 @@ impl fmt::Display for Ty {
                         Ty::Present => Some((name, false, &field.ty)),
                         _ => Some((name, true, &field.ty)),
                     });
-                let tail = match &**rest {
-                    Ty::Empty => None,
-                    Ty::Undecided => Some(String::new()),
-                    open => Some(open.to_string()),
-                };
-                let tail = tail.as_ref().map(|tail| tail as &dyn fmt::Display);
-                write_row(f, entries, tail)
+                write_row(f, entries, tail_of(rest).as_ref().map(shown))
+            }
+            // A sum reads the same way with cases in place of fields: absent
+            // not at all, undecided as `` `A? T ``, and the tail after them.
+            // The one thing it has that a struct has not is a case carrying
+            // unit, which prints as no payload at all — `` `None `` is how it
+            // was written, and `` `None {} `` is the same type spelled longer.
+            Ty::Row {
+                shape: Shape::Sum,
+                fields,
+                rest,
+            } => {
+                let cases = fields
+                    .iter()
+                    .filter_map(|(name, field)| match &*field.presence {
+                        Ty::Absent => None,
+                        Ty::Present => Some((name, false, payload(&field.ty))),
+                        _ => Some((name, true, payload(&field.ty))),
+                    });
+                write_sum(f, cases, tail_of(rest).as_ref().map(shown))
             }
             // A declared type prints as what the user called it rather than as
             // what it stands for, applied to whatever it was given. It is
@@ -467,6 +615,59 @@ impl fmt::Display for Ty {
     }
 }
 
+/// What follows a row's `..`, or `None` when the row is closed and no `..` is
+/// written at all: a quantified `'a`, a solver variable's `?3`, or the empty
+/// string where the rest is undecided and there is nothing to report.
+///
+/// Shared by the two shapes because the tail is the one part of a row that
+/// reads the same either way — it stands for the labels not named, and what it
+/// stands for is spelled by what it resolved to rather than by what kind of
+/// row it ends.
+fn tail_of(rest: &Ty) -> Option<String> {
+    match rest {
+        Ty::Empty => None,
+        Ty::Undecided => Some(String::new()),
+        open => Some(open.to_string()),
+    }
+}
+
+/// A borrowed tail as the trait object [`write_row`] and [`write_sum`] take.
+/// One line, but `map(shown)` reads where the turbofished cast it replaces did
+/// not.
+fn shown(tail: &String) -> &dyn fmt::Display {
+    tail
+}
+
+/// What a case carries, or `None` when it carries unit and so is written with
+/// no payload at all.
+///
+/// Unit is what a tag with no payload lowers to — `` `None `` is `` `None () ``
+/// — so this is the inverse of that lowering, and it is what makes a printed
+/// sum re-lower to the sum it was printed from. A payload that is unit however
+/// it was written goes the same way, `{}` and `()` alike: the two spell one
+/// type, and `` `None {} `` is that type written longer. Everything else
+/// prints.
+fn payload(ty: &Ty) -> Option<&Ty> {
+    let Ty::Row {
+        shape: Shape::Struct,
+        fields,
+        rest,
+    } = ty
+    else {
+        return Some(ty);
+    };
+    // A field settled absent is not part of what the type says, so a row that
+    // prints as `{}` is unit however many labels the solver left in the map.
+    let empty = matches!(&**rest, Ty::Empty)
+        && fields
+            .values()
+            .all(|field| matches!(&*field.presence, Ty::Absent));
+    match empty {
+        true => None,
+        false => Some(ty),
+    }
+}
+
 /// A scheme prints as its body: the quantifier is implied by the `'a`s that
 /// appear, the way ML type printers have always done it.
 impl fmt::Display for Scheme {
@@ -486,11 +687,18 @@ impl Rule {
             Rule::Congruent => "congruent",
             Rule::Bind => "bind",
             Rule::Occurs => "occurs",
-            Rule::Overlap => "overlap",
+            // The shape is not part of these two codes, only of their wording,
+            // for the reason a row error's is not part of its code: a reader
+            // filtering the Solve tab for a rule is asking which act of the
+            // solver ran, and the goal beside it already says which shape it
+            // ran on. [`Rule::Struct`] and [`Rule::Sum`] are the other way
+            // round because they are two sentences rather than one noun.
+            Rule::Overlap { .. } => "overlap",
             Rule::Prim => "prim",
             Rule::Arrow => "arrow",
             Rule::Struct => "struct",
-            Rule::Presence => "presence",
+            Rule::Sum => "sum",
+            Rule::Presence { .. } => "presence",
             Rule::Unfold => "unfold",
             Rule::Assume => "assume",
             Rule::Mismatch => "mismatch",
@@ -504,28 +712,50 @@ impl Rule {
 /// told the same thing.
 impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Rule::Absorb => "one side is undecided, which unifies with anything",
-            Rule::Same => "already the same thing on both sides",
-            Rule::Congruent => {
-                "the same declared type on both sides, and it keeps what it takes: argument against argument"
+        match self {
+            Rule::Absorb => f.write_str("one side is undecided, which unifies with anything"),
+            Rule::Same => f.write_str("already the same thing on both sides"),
+            Rule::Congruent => f.write_str(
+                "the same declared type on both sides, and it keeps what it takes: argument against argument",
+            ),
+            Rule::Bind => f.write_str("a variable takes the type it is against"),
+            Rule::Occurs => {
+                f.write_str("the variable is inside the type it is against, so no finite type fits")
             }
-            Rule::Bind => "a variable takes the type it is against",
-            Rule::Occurs => "the variable is inside the type it is against, so no finite type fits",
-            Rule::Overlap => {
-                "the rest of a row cannot be a row naming a field the row already names"
+            // In the reader's nouns, like everything else said about a row: the
+            // rest of a struct is a struct, and what it may not name is a
+            // field. Saying it about a "row" and a "label" would name the
+            // representation the two shapes share, which is the compiler's
+            // business and nothing the reader wrote.
+            Rule::Overlap { shape } => write!(
+                f,
+                "the rest of a {shape} cannot be a {shape} naming a {} the {shape} already names",
+                noun(Some(*shape)),
+            ),
+            Rule::Prim => f.write_str("the same primitive on both sides"),
+            Rule::Arrow => {
+                f.write_str("two arrows: argument against argument, result against result")
             }
-            Rule::Prim => "the same primitive on both sides",
-            Rule::Arrow => "two arrows: argument against argument, result against result",
-            Rule::Struct => {
-                "two structs: shared fields field against field, the rest into the other's tail"
+            Rule::Struct => f.write_str(
+                "two structs: shared fields field against field, the rest into the other's tail",
+            ),
+            Rule::Sum => f.write_str(
+                "two sums: shared cases case against case, the rest into the other's tail",
+            ),
+            Rule::Presence { shape } => write!(
+                f,
+                "whether the {} is there must agree on both sides",
+                noun(Some(*shape)),
+            ),
+            Rule::Unfold => f.write_str("a declared type stands for something; ask again about that"),
+            Rule::Assume => {
+                f.write_str("these two are already being compared, so take them as equal")
             }
-            Rule::Presence => "whether the field is there must agree on both sides",
-            Rule::Unfold => "a declared type stands for something; ask again about that",
-            Rule::Assume => "these two are already being compared, so take them as equal",
-            Rule::Mismatch => "no rule applies, so the two types cannot be made equal",
-            Rule::Recover => "the abandoned result becomes undecided, so nothing echoes it",
-        })
+            Rule::Mismatch => f.write_str("no rule applies, so the two types cannot be made equal"),
+            Rule::Recover => {
+                f.write_str("the abandoned result becomes undecided, so nothing echoes it")
+            }
+        }
     }
 }
 
@@ -579,6 +809,10 @@ impl inference::ErrorKind {
         match self {
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
+            // A missing case and a missing field are one complaint, so they
+            // are one code: what went wrong is that a row was asked for a
+            // label it has not got, and a reporter that wants to know which
+            // kind of row is reading the type rather than the complaint.
             inference::ErrorKind::MissingField { .. } => "missing-field",
             inference::ErrorKind::ExtraField { .. } => "extra-field",
             inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
@@ -599,10 +833,15 @@ impl fmt::Display for inference::ErrorKind {
                 f.write_str("this type would have to contain itself")
             }
             inference::ErrorKind::MissingField { base, field } => {
-                write!(f, "no field `{field}` on `{base}`")
+                let (noun, field) = about(base, field);
+                write!(f, "no {noun} `{field}` on `{base}`")
             }
             inference::ErrorKind::ExtraField { base, field } => {
-                write!(f, "extra field `{field}`: the type `{base}` lists every field it allows")
+                let (noun, field) = about(base, field);
+                write!(
+                    f,
+                    "extra {noun} `{field}`: the type `{base}` lists every {noun} it allows",
+                )
             }
             // Only the type that is not a struct: what was asked of it is a
             // shape the solver made up, and quoting that back would answer a
@@ -619,9 +858,11 @@ impl fmt::Display for inference::ErrorKind {
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the
             // field is the whole of what they can change.
-            inference::ErrorKind::RepeatedField { field } => write!(
+            inference::ErrorKind::RepeatedField { shape, field } => write!(
                 f,
-                "`..` covers only the fields a type does not already name, and here it would have to cover `{field}`"
+                "`..` covers only the {}s a type does not already name, and here it would have to cover `{}`",
+                noun(Some(*shape)),
+                label(*shape, field),
             ),
         }
     }
@@ -675,13 +916,14 @@ pub fn write_applied<H: Grouped, A: Grouped>(
 /// Grouped against the arrow rather than against an atom, so only what could
 /// swallow the arrow is bracketed: an arrow, and a lambda. An application is
 /// left alone, because it stops at the arrow of its own accord and
-/// `Pair A B -> Nat` is how a person would write it.
+/// `Pair A B -> Nat` is how a person would write it — and so is a sum, whose
+/// last case carries an atom and so cannot reach the arrow either.
 pub fn write_arrow(
     f: &mut fmt::Formatter<'_>,
     from: &impl Grouped,
     to: &impl Grouped,
 ) -> fmt::Result {
-    write_grouped(f, from.prec() < Prec::Apply, from)?;
+    write_grouped(f, from.prec() < Prec::Sum, from)?;
     write!(f, " -> {to}")
 }
 
@@ -736,6 +978,77 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
         write!(f, "..{tail}")?;
     }
     f.write_str(" }")
+}
+
+/// Render a `` `A Nat | `B? | ..tail `` sum: cases, each wearing a backtick and
+/// possibly a `?`, each with a payload or without one, and then whatever is
+/// known about the cases not named.
+///
+/// The counterpart of [`write_row`], and the same contract: `tail` is what
+/// follows the `..`, `None` means the sum names every case there is, and the
+/// `|`s are written here so the callers agree on them by construction.
+///
+/// The leading `|` the grammar allows is not written — `` `A | `B `` reads
+/// better inline, and inside the parentheses a nested sum needs it would be
+/// noise. It comes back for the one form that cannot do without it: a sum with
+/// no cases written out is `|`, and `| ..r` for one that is only a tail, since
+/// a bare `..r` begins no type the parser would read back.
+pub fn write_sum<K: fmt::Display, V: Grouped>(
+    f: &mut fmt::Formatter<'_>,
+    cases: impl IntoIterator<Item = (K, bool, Option<V>)>,
+    tail: Option<&dyn fmt::Display>,
+) -> fmt::Result {
+    let mut first = true;
+    for (name, optional, payload) in cases {
+        if !first {
+            f.write_str(" | ")?;
+        }
+        first = false;
+        write_tag(f, &name.to_string(), optional, payload)?;
+    }
+    // The empty sum, and the sum that is nothing but its tail: neither writes a
+    // case, so neither would be read back as a sum without this.
+    if first {
+        f.write_str("|")?;
+    }
+    match tail {
+        Some(tail) => {
+            if !first {
+                f.write_str(" |")?;
+            }
+            write!(f, " ..{tail}")
+        }
+        None => Ok(()),
+    }
+}
+
+/// Render one case of a sum — `` `Name ``, the `?` it may wear, and what it
+/// carries — grouped so that a payload nothing can be appended to is left
+/// bare and anything else is bracketed.
+///
+/// One case and one tag literal are the same thing written in two places, so
+/// they are written by one function: `` `Some 1 `` in a term and `` `Some Nat ``
+/// in a type differ in what follows the name and in nothing else.
+///
+/// A payload of `None` writes nothing at all, which is how a case that carries
+/// unit is spelled. Whether a given type *is* unit is the caller's to decide —
+/// the term printers know it because nothing was written, and the type printer
+/// works it out — so this is handed the answer rather than reaching for it.
+pub fn write_tag<V: Grouped>(
+    f: &mut fmt::Formatter<'_>,
+    name: &str,
+    optional: bool,
+    payload: Option<V>,
+) -> fmt::Result {
+    let mark = if optional { "?" } else { "" };
+    write!(f, "`{name}{mark}")?;
+    match payload {
+        Some(payload) => {
+            f.write_str(" ")?;
+            write_grouped(f, payload.prec() < Prec::Atom, &payload)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Render `base.field`. Projection binds tighter than everything that follows a

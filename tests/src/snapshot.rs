@@ -438,6 +438,26 @@ fn a_duplicate_carries_the_definition_it_repeats() {
     assert_eq!(duplicate.related[0].span, Some([4, 5]));
 }
 
+/// A name given two rests of different shapes is the same kind of complaint:
+/// half of what went wrong is the `..` somewhere else on the page, so the strip
+/// highlights that one too rather than leaving the reader to find it.
+#[test]
+fn a_mixed_tail_carries_the_use_it_clashes_with() {
+    let source = "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat = fn a => fn b => 1\n";
+    let snapshot = snapshot(source);
+    let mixed = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "mixed-tail")
+        .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
+    let first = source.find("..r").expect("the first tail");
+    assert_eq!(mixed.related.len(), 1);
+    assert_eq!(mixed.related[0].span, Some([first, first + 3]));
+    // Worded as a use rather than as a definition: nothing here was defined
+    // twice.
+    assert_eq!(mixed.related[0].message, "first used here");
+}
+
 /// The types stage reports what inference concluded, and the annotating
 /// stage carries the same conclusions keyed by the IR stage's own node ids.
 /// That keying is the whole contract behind `annotates`, and the page's badge
@@ -686,7 +706,10 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(field(overlap, "_error"), Some(diagnostic.message.clone()));
     assert_eq!(
         field(overlap, "_rule"),
-        Some("the rest of a row cannot be a row naming a field the row already names".to_string())
+        Some(
+            "the rest of a struct cannot be a struct naming a field the struct already names"
+                .to_string()
+        )
     );
 
     let narrowed = snapshot("let f : { x?: Nat, .. } -> Nat = fn p => p.x\n");
@@ -1085,7 +1108,10 @@ fn the_ir_tab_shows_a_declarations_parameters() {
     // and says what it may not stand for.
     assert_eq!(
         params,
-        [("a", Some([11, 12])), ("..r without x", Some([30, 31]))]
+        [
+            ("a", Some([11, 12])),
+            ("..r (struct) without x", Some([30, 31]))
+        ]
     );
 
     // And each cross-highlights, which is the whole reason the row is here.
@@ -1178,7 +1204,10 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("'a", "A"), ("'b", "..r without it")]);
+    assert_eq!(
+        letters,
+        vec![("'a", "A"), ("'b", "..r (struct) without it")]
+    );
 
     // A row beside no fields at all forbids nothing, and says so by saying
     // nothing.
@@ -1192,7 +1221,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "..r");
+    assert_eq!(bare.children[0].text, "..r (struct)");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -1214,4 +1243,81 @@ fn a_type_parameter_is_a_symbol_like_any_other() {
     for name in ["Pair", "A", "B"] {
         assert!(listed.contains(&name), "{name} is missing from {listed:?}");
     }
+}
+
+/// A sum through every panel that renders one: the tokens it lexes to, the
+/// case and tail rows of both trees, the badge the term wears, and the scheme
+/// the definition ends with.
+#[test]
+fn sums_reach_every_stage() {
+    let source = "type Fallible r = `Err Nat | ..r\nlet e : Fallible (`Ok Nat) = `Err 1\n";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .expect("the stage is registered")
+    };
+    let labelled = |id: &str, label: &str| -> Vec<String> {
+        nodes(stage(id))
+            .into_iter()
+            .filter(|node| node.label == label)
+            .map(|node| node.text.clone())
+            .collect()
+    };
+
+    // A tag is one token with a class of its own, so the editor paints a case
+    // differently from the names around it.
+    assert_eq!(
+        labelled("tokens", "Tag"),
+        ["`Err", "`Ok", "`Err"],
+        "{:#?}",
+        nodes(stage("tokens"))
+    );
+    assert_eq!(labelled("tokens", "Pipe"), ["|"]);
+    let tag = nodes(stage("tokens"))
+        .into_iter()
+        .find(|node| node.label == "Tag")
+        .expect("a tag row");
+    let class = tag
+        .fields
+        .iter()
+        .find(|field| field.name == "_class")
+        .map(|field| field.value.as_str());
+    assert_eq!(class, Some("tag"));
+
+    for id in ["ast", "ir"] {
+        // A case is a row of the sum's, wearing its backtick in the label, and
+        // the tail is a row of its own — the same two shapes a struct has.
+        assert_eq!(labelled(id, "`Err"), ["Nat"], "{id}");
+        assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
+        // And the tag in the term is a node that names no symbol, the way a
+        // field name is.
+        assert_eq!(labelled(id, "Tag"), ["`Err 1"], "{id}");
+    }
+
+    // The Types tab says which shape the parameter stands for, since the
+    // meaning column spells it `'a` like any other.
+    let fallible = nodes(stage("types"))
+        .into_iter()
+        .find(|node| node.label == "type Fallible")
+        .expect("a row for the declaration");
+    assert_eq!(fallible.text, "`Err Nat | ..'a");
+    assert_eq!(fallible.children[0].text, "..r (sum) without `Err");
+
+    // And the definition's scheme is the declared type, applied to the row the
+    // use site handed it.
+    let types: Vec<&str> = stage("types")
+        .nodes
+        .iter()
+        .map(|node| node.text.as_str())
+        .collect();
+    assert!(types.contains(&"Fallible (`Ok Nat)"), "{types:?}");
 }

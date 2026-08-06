@@ -66,8 +66,8 @@ fn main() -> ExitCode {
         // that stands gets a line of its own, indented under the error. A
         // repeated parameter is the same thing said about a smaller scope, and
         // carries the same second span for the same reason.
-        if let Some(previous) = first_definition(&err.kind) {
-            report(&source, previous, &format!("  {}", ui::FIRST_DEFINITION));
+        if let Some((previous, note)) = elsewhere(&err.kind) {
+            report(&source, previous, &format!("  {note}"));
         }
     }
     for err in &inferred.errors {
@@ -76,14 +76,16 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Where the name a complaint repeats was first written, for the complaints
-/// that repeat one. Both of lowering's carry the span for it, and a reporter
-/// that renders one and not the other tells the reader half of what the
-/// compiler knows — see [`ui::FIRST_DEFINITION`].
-fn first_definition(kind: &ir::ErrorKind) -> Option<Span> {
+/// The second place a complaint points at, and what to call it: where the name
+/// a repeat repeats was first written, or where the `..` a tail clashes with
+/// was first used. Every kind that carries such a span is listed, and a
+/// reporter that renders one and not the others tells the reader half of what
+/// the compiler knows — see [`ui::FIRST_DEFINITION`] and [`ui::FIRST_USE`].
+fn elsewhere(kind: &ir::ErrorKind) -> Option<(Span, &'static str)> {
     match kind {
         ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous } => Some(*previous),
+        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
+        ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,
     }
 }

@@ -24,13 +24,23 @@ pub enum Kind {
     /// struct is written closed. Distinct from two [`Dot`](Kind::Dot)s the way
     /// [`FatArrow`](Kind::FatArrow) is distinct from `=` then `>`.
     DotDot,
-    /// `?`, marking a struct type's field as one that may or may not be there.
+    /// `?`, marking a struct type's field — or a sum type's case — as one that
+    /// may or may not be there.
     Question,
+    /// `|`, separating the cases of a sum type. Also the whole of the empty
+    /// sum, which is the one type written with nothing but punctuation.
+    Pipe,
     LeftBrace,
     RightBrace,
     LeftParen,
     RightParen,
     Identifier(String),
+    /// `` `Some `` — one of a sum type's cases, named. One token rather than a
+    /// backtick beside a name, because that is what it is: a label with no
+    /// spaces allowed inside it, and a span a reader can select in one go. The
+    /// backtick is not part of the name it carries, the way a struct's braces
+    /// are not part of its field names.
+    Tag(String),
     /// A natural number literal. Bounded by `u128` rather than unbounded like
     /// the naturals themselves; a literal that does not fit is rejected by the
     /// lexer instead of silently wrapping.
@@ -117,6 +127,37 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             '?' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Question));
                 chars.next();
+            }
+            '|' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+                chars.next();
+            }
+            // A backtick begins nothing on its own, so — like `-` — the only
+            // thing it can be is the head of something longer, and a lone one
+            // is reported where it was written. The name runs over the
+            // characters an identifier does, so `` `1x `` is one bad tag here
+            // rather than a tag beside a number.
+            '`' => {
+                chars.next();
+                let name = word(&mut chars);
+                match name.chars().next() {
+                    Some(c) if c.is_alphabetic() || c == '_' => {
+                        // The backtick is one byte and `name` was built from
+                        // the source, so the span is exactly what was written.
+                        let span = file_id.span(start, name.len() + 1);
+                        tokens.push(span.track(Kind::Tag(name)));
+                    }
+                    // The whole of what was consumed, not just the backtick:
+                    // `` `1x `` was read as one lexeme, so it is underlined as
+                    // one. A span narrower than what the lexer ate points the
+                    // reader at a character that is not the mistake and leaves
+                    // the rest of it unmarked. The natural literal below spans
+                    // its own lexeme for the same reason.
+                    _ => errors.push(Error {
+                        span: file_id.span(start, name.len() + 1),
+                        kind: ErrorKind::Unrecognized,
+                    }),
+                }
             }
             '{' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftBrace));

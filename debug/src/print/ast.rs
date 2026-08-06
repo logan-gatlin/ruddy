@@ -15,6 +15,7 @@ use ruddy::{
 
 use crate::print::{
     Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
+    write_sum, write_tag,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -25,6 +26,7 @@ impl Grouped for Ast<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             TypeKind::Arrow { .. } => Prec::Arrow,
+            TypeKind::Sum { .. } => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
         }
@@ -37,6 +39,15 @@ impl Grouped for Ast<'_, ExprKind> {
             // The body runs as far right as it can, so anything appended after
             // a bare lambda would be read as part of it.
             ExprKind::Function { .. } => Prec::Lambda,
+            // A tag carrying something groups as the application it reads as:
+            // anything appended to `` `A x `` would be read as applying the
+            // case rather than as a second argument to it. Carrying nothing it
+            // is not a word but a word still waiting for one, so it groups
+            // below an application — see [`Prec::Tag`].
+            ExprKind::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            ExprKind::Tag { payload: None, .. } => Prec::Tag,
             ExprKind::Apply { .. } => Prec::Apply,
             // Self-delimiting: each ends at a token of its own, so nothing that
             // follows can be drawn into it.
@@ -83,6 +94,17 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Project { base, field } => {
                 write_project(f, &Ast(&base.tracked), &field.tracked)
             }
+            // A term's tag is written by the same rule a type's case is, so
+            // `` `Some 1 `` and `` `Some Nat `` cannot come out spelled
+            // differently. It never wears a `?`: that says a case may or may
+            // not be allowed, which is a claim about a type and not something
+            // a value can be.
+            ExprKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                false,
+                payload.as_ref().map(|payload| Ast(&payload.tracked)),
+            ),
             ExprKind::Ident { name } => f.write_str(&name.tracked),
             ExprKind::Natural(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
@@ -106,6 +128,22 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 write_row(
                     f,
                     fields,
+                    tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+                )
+            }
+            TypeKind::Sum { cases, tail } => {
+                let cases = cases.iter().map(|(name, case)| {
+                    let payload = case.payload.as_ref().map(|ty| Ast(&ty.tracked));
+                    (&name.tracked, case.optional, payload)
+                });
+                // The tail renders as it does for a struct: what follows the
+                // `..`, with `write_sum` writing the dots and the bars.
+                let tail = tail
+                    .as_ref()
+                    .map(|tail| tail.name.as_ref().map_or("", |name| name.tracked.as_str()));
+                write_sum(
+                    f,
+                    cases,
                     tail.as_ref().map(|tail| tail as &dyn fmt::Display),
                 )
             }

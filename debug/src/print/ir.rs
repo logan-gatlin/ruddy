@@ -16,6 +16,7 @@ use ruddy::{
 
 use crate::print::{
     Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
+    write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -126,6 +127,14 @@ impl Grouped for Show<'_, TermKind> {
     fn prec(&self) -> Prec {
         match self.node {
             TermKind::Fn { .. } => Prec::Lambda,
+            // A tag carrying something groups as the application it reads as;
+            // carrying nothing it groups below one, because the argument would
+            // be read as the payload it has not got. The parse tree's printer
+            // says the same, because it is the same syntax.
+            TermKind::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            TermKind::Tag { payload: None, .. } => Prec::Tag,
             TermKind::Apply { .. } => Prec::Apply,
             TermKind::Project { .. }
             | TermKind::Struct(_)
@@ -140,6 +149,7 @@ impl Grouped for Show<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.node {
             TypeKind::Arrow { .. } => Prec::Arrow,
+            TypeKind::Sum { .. } => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. }
             | TypeKind::Ident(_)
@@ -168,6 +178,15 @@ impl fmt::Display for Show<'_, TermKind> {
                 self.show(&**body)
             ),
             TermKind::Struct(fields) => write_struct(f, self.pairs(fields)),
+            // A case carrying nothing prints as nothing, which is what it was
+            // written as: lowering left the payload absent rather than filling
+            // in the unit it means. See [`TermKind::Tag`].
+            TermKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                false,
+                payload.as_ref().map(|payload| self.show(&**payload)),
+            ),
             TermKind::Project { base, field } => {
                 write_project(f, &self.show(&**base), &field.tracked)
             }
@@ -188,6 +207,24 @@ impl fmt::Display for Show<'_, TypeKind> {
                 self.mint.name(*head),
                 args.iter().map(|arg| self.show(arg)),
             ),
+            TypeKind::Sum { cases, tail } => {
+                let cases = cases.iter().map(|(name, case)| {
+                    let payload = case.payload.as_ref().map(|ty| self.show(ty));
+                    (name, case.optional, payload)
+                });
+                // The tail renders as it does for a struct, and a row
+                // parameter as the name it was declared with.
+                let tail = tail.as_ref().map(|tail| match &tail.of {
+                    Row::Anything => String::new(),
+                    Row::Named(name) => name.clone(),
+                    Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+                });
+                write_sum(
+                    f,
+                    cases,
+                    tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+                )
+            }
             TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
             TypeKind::Struct { fields, tail } => {
