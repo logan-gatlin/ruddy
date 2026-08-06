@@ -77,6 +77,40 @@ fn term_fields<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a IndexMap<Str
     }
 }
 
+/// The binding groups as the names a reader would see, in the order lowering
+/// published them.
+fn groups<'a>(mint: &'a Mint, out: &Output) -> Vec<Vec<&'a str>> {
+    out.program
+        .groups
+        .iter()
+        .map(|group| {
+            group
+                .members
+                .iter()
+                .map(|symbol| mint.name(*symbol))
+                .collect()
+        })
+        .collect()
+}
+
+/// The definitions reported circular, named, in the order they were reported.
+/// Each is found by the span it was reported at, which is its value's — so this
+/// pins where the complaint lands as much as which definitions get one.
+fn circular<'a>(mint: &'a Mint, out: &'a Output) -> Vec<&'a str> {
+    out.errors
+        .iter()
+        .filter(|error| matches!(error.kind, ErrorKind::Circular { .. }))
+        .map(|error| {
+            out.program
+                .terms
+                .iter()
+                .find(|(_, decl)| decl.value.span == error.span)
+                .map(|(symbol, _)| mint.name(*symbol))
+                .unwrap_or_else(|| panic!("no definition at {:?}", error.span))
+        })
+        .collect()
+}
+
 fn type_symbol(mint: &Mint, out: &Output, name: &str) -> Symbol {
     *out.program
         .types
@@ -437,9 +471,21 @@ fn displays_empty_program_as_nothing() {
     assert_eq!(print::ir::program(&out.program, &mint).to_string(), "");
 }
 
+/// Every top-level name is bound before any body is lowered, so where a
+/// definition sits on the page decides nothing about what can see it.
 #[test]
-fn names_are_not_visible_before_their_definition() {
-    let (_, out) = build_src("let a = b  let b = ()");
+fn a_definition_may_name_one_written_below_it() {
+    let (mint, out) = built("let a = b  let b = fn z => z");
+
+    let b = term_symbol(&mint, &out, "b");
+    assert!(matches!(term_value(&mint, &out, "a"), TermKind::Ident(s) if *s == b));
+}
+
+/// Which leaves `Undefined` meaning "defined nowhere in this file" rather than
+/// "defined below here".
+#[test]
+fn a_name_defined_nowhere_is_still_undefined() {
+    let (_, out) = build_src("let a = nope");
 
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, 8);
@@ -451,13 +497,41 @@ fn names_are_not_visible_before_their_definition() {
     ));
 }
 
+/// A definition can see itself, which is the whole point of the hoist: the name
+/// in the body is the definition's own symbol rather than a complaint.
 #[test]
-fn a_definition_cannot_see_itself() {
-    // No recursion: the body is lowered before the name is bound.
-    let (_, out) = build_src("let f = f");
+fn a_definition_can_see_itself() {
+    let (mint, out) = built("let f = fn n => f n");
 
-    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert_eq!(out.errors[0].span.start, 8);
+    let f = term_symbol(&mint, &out, "f");
+    let TermKind::Fn { body, .. } = term_value(&mint, &out, "f") else {
+        panic!("expected a function");
+    };
+    let TermKind::Apply { func, .. } = &body.kind else {
+        panic!("expected an application");
+    };
+    assert!(matches!(func.kind, TermKind::Ident(s) if s == f));
+}
+
+/// And two definitions can see each other, in both directions at once.
+#[test]
+fn two_definitions_can_name_each_other() {
+    let (mint, out) = built("let even = fn n => odd n  let odd = fn n => even n");
+
+    let named = |name| {
+        let TermKind::Fn { body, .. } = term_value(&mint, &out, name) else {
+            panic!("expected a function");
+        };
+        let TermKind::Apply { func, .. } = &body.kind else {
+            panic!("expected an application");
+        };
+        match func.kind {
+            TermKind::Ident(symbol) => symbol,
+            ref other => panic!("expected a name, got {other:?}"),
+        }
+    };
+    assert_eq!(named("even"), term_symbol(&mint, &out, "odd"));
+    assert_eq!(named("odd"), term_symbol(&mint, &out, "even"));
 }
 
 #[test]
@@ -480,6 +554,25 @@ fn duplicate_definitions_keep_the_first() {
     assert!(matches!(
         term_value(&mint, &out, "x"),
         TermKind::Struct(fields) if fields.is_empty()
+    ));
+
+    // The repeat's body is lowered all the same, though nothing keeps it: a
+    // bad name inside one is still the reader's to fix, and hearing about it
+    // should not be the price of fixing the name above.
+    let (_, out) = build_src("let x = ()  let x = nope");
+    assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Duplicate {
+            namespace: Namespace::Terms,
+            ..
+        }
+    ));
+    assert!(matches!(
+        out.errors[1].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
     ));
 }
 
@@ -938,7 +1031,7 @@ fn a_type_defined_only_as_another_name_is_still_circular() {
     assert!(
         out.errors
             .iter()
-            .any(|error| matches!(error.kind, ErrorKind::Circular)),
+            .any(|error| matches!(error.kind, ErrorKind::Circular { .. })),
         "errors: {:#?}",
         out.errors
     );
@@ -963,7 +1056,7 @@ fn a_loop_can_close_through_a_parameter() {
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ErrorKind::Circular)),
+                .any(|error| matches!(error.kind, ErrorKind::Circular { .. })),
             "{src}: {:#?}",
             out.errors
         );
@@ -1789,5 +1882,162 @@ fn an_erroneous_row_argument_absorbs() {
         ),
         "{:#?}",
         out.errors
+    );
+}
+
+/// A value given as a name that leads back to itself is never given one, which
+/// is the term half of the rule `type t = t` already breaks. The value is
+/// erased, so inference is never handed the loop.
+#[test]
+fn a_definition_given_only_as_a_name_is_circular() {
+    let (mint, out) = build_src("let x = x");
+
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, 8);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Circular {
+            namespace: Namespace::Terms
+        }
+    ));
+    assert!(matches!(term_value(&mint, &out, "x"), TermKind::Error));
+}
+
+/// Every definition on the loop is told, in the order they were written, and
+/// only the ones on it: a definition that merely leads into one has nothing to
+/// fix.
+#[test]
+fn every_definition_on_a_loop_is_told() {
+    let (mint, out) = build_src("let a = b  let b = a");
+    assert_eq!(circular(&mint, &out), ["a", "b"]);
+
+    let (mint, out) = build_src("let a = b  let b = c  let c = a");
+    assert_eq!(circular(&mint, &out), ["a", "b", "c"]);
+
+    // `d` leads into the loop and is not on it.
+    let (mint, out) = build_src("let d = a  let a = b  let b = a");
+    assert_eq!(circular(&mint, &out), ["a", "b"]);
+    assert!(matches!(term_value(&mint, &out, "d"), TermKind::Ident(_)));
+}
+
+/// A shape ends the chain, however the definition names itself. `fn` is a
+/// shape, so this is the recursion the language is for rather than a loop of
+/// bare names — and so is everything else a value can be.
+#[test]
+fn a_definition_reaching_a_shape_is_not_circular() {
+    for src in [
+        "let f = fn n => f n",
+        "let s = { a: s }",
+        "let t = `Some t",
+        "let p = q.field  let q = p",
+        "let u = u 1",
+        "let z = 1  let y = z",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+
+    // And nothing was erased on the way.
+    let (mint, out) = built("let f = fn n => f n");
+    assert!(matches!(term_value(&mint, &out, "f"), TermKind::Fn { .. }));
+}
+
+/// A file of definitions that name nobody is a group apiece, in source order.
+#[test]
+fn independent_definitions_are_a_group_each() {
+    let (mint, out) = built("let a = 1  let b = 2  let c = 3");
+
+    assert_eq!(groups(&mint, &out), [vec!["a"], vec!["b"], vec!["c"]]);
+    assert!(out.program.groups.iter().all(|group| !group.recursive));
+}
+
+/// A definition that names itself is a group of one that says so, which is the
+/// case the flag exists for: the members alone cannot tell it from the group
+/// above.
+#[test]
+fn a_self_naming_definition_is_a_recursive_group_of_one() {
+    let (mint, out) = built("let f = fn n => f n");
+
+    assert_eq!(groups(&mint, &out), [vec!["f"]]);
+    assert!(out.program.groups[0].recursive);
+}
+
+/// Two definitions that name each other are one group, members in source
+/// order.
+#[test]
+fn a_mutual_pair_is_one_group() {
+    let (mint, out) = built("let even = fn n => odd n  let odd = fn n => even n");
+
+    assert_eq!(groups(&mint, &out), [vec!["even", "odd"]]);
+    assert!(out.program.groups[0].recursive);
+}
+
+/// Groups come out in dependency order, so what a definition names is always
+/// solved first — including when it is written below.
+#[test]
+fn a_dependency_comes_before_what_names_it() {
+    let (mint, out) = built("let id = fn x => x  let a = id 1");
+    assert_eq!(groups(&mint, &out), [vec!["id"], vec!["a"]]);
+
+    let (mint, out) = built("let a = id 1  let id = fn x => x");
+    assert_eq!(groups(&mint, &out), [vec!["id"], vec!["a"]]);
+
+    // The exact vector, and not merely the pairwise order: a hash-ordered
+    // grouping passes every "this is before that" assertion and still hands
+    // inference a different order every run.
+    let (mint, out) =
+        built("let top = mid 1  let mid = fn n => bot n  let bot = fn n => n  let lone = 0");
+    // `lone` names nobody and nobody names it, so it sits after the three that
+    // have to come in that order — its own name being the last of the four
+    // written.
+    assert_eq!(
+        groups(&mint, &out),
+        [vec!["bot"], vec!["mid"], vec!["top"], vec!["lone"]]
+    );
+}
+
+/// A refused loop is erased, so what is left names nobody: the graph is read
+/// off the values as they finally stand rather than as they were written.
+#[test]
+fn a_refused_loop_is_a_group_of_one() {
+    let (mint, out) = build_src("let a = b  let b = a  let c = 1");
+
+    assert_eq!(groups(&mint, &out), [vec!["a"], vec!["b"], vec!["c"]]);
+    assert!(out.program.groups.iter().all(|group| !group.recursive));
+}
+
+/// Every definition is in exactly one group, and the groups hold nothing else
+/// — not a lambda binder, which is no definition at all, and not a name that
+/// failed to resolve.
+#[test]
+fn the_groups_hold_every_definition_once() {
+    let (mint, out) = build_src(
+        "let id = fn x => x  let even = fn n => odd n  let odd = fn n => even n  \
+         let used = id even  let broken = nope",
+    );
+
+    let held: Vec<Symbol> = out
+        .program
+        .groups
+        .iter()
+        .flat_map(|group| group.members.iter().copied())
+        .collect();
+    let defined: Vec<Symbol> = out.program.terms.keys().copied().collect();
+    let mut sorted = held.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), held.len(), "a definition is in two groups");
+    let mut expected = defined;
+    expected.sort();
+    assert_eq!(sorted, expected);
+
+    assert_eq!(
+        groups(&mint, &out),
+        [
+            vec!["id"],
+            vec!["even", "odd"],
+            vec!["used"],
+            vec!["broken"]
+        ]
     );
 }

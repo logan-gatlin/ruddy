@@ -49,10 +49,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
         nodes.push(node);
     }
 
+    // The groups are counted beside the two tables because they are the third
+    // thing lowering decided: how many separate schemes the terms will turn
+    // into, which is the whole difference between a file of definitions and one
+    // definition written many times.
     let summary = format!(
-        "{} · {}",
+        "{} · {} · {}",
         plural(program.types.len(), "type"),
-        plural(program.terms.len(), "term")
+        plural(program.terms.len(), "term"),
+        plural(program.groups.len(), "group")
     );
     let stage = Stage {
         micros: Some(cx.micros.build),

@@ -17,6 +17,33 @@ use crate::{
 pub struct Program {
     pub terms: IndexMap<Symbol, Decl<Term>>,
     pub types: IndexMap<Symbol, Decl<Type>>,
+    /// The definitions split into the smallest sets that have to be typed
+    /// together, earliest first. See [`Group`] and [`grouping`].
+    pub groups: Vec<Group>,
+}
+
+/// A set of definitions that all have to be typed at once, because each of them
+/// is reachable from every other through the names their values mention.
+///
+/// This is what buys recursion without costing let-polymorphism. Every
+/// definition in one group is monomorphic to every other while the group is
+/// being solved — that is what lets a definition name itself — and each is
+/// generalized once the group is done, so a definition that shares its group
+/// with nothing keeps exactly the scheme it would have had if nothing here
+/// existed. Treating the whole file as one group would type-check every
+/// recursion and destroy the polymorphism of everything else.
+#[derive(Debug, Clone)]
+pub struct Group {
+    /// The definitions in this group, in source order.
+    pub members: Vec<Symbol>,
+    /// Whether anything in the group refers back into it.
+    ///
+    /// Every group of two or more is one, since being a group at all is being
+    /// mutually reachable. A group of one is only recursive when the definition
+    /// names itself, and nothing about the members can say which — hence the
+    /// flag, rather than a reader of this working it out again from a graph
+    /// this is the published form of.
+    pub recursive: bool,
 }
 
 /// A top-level definition. The symbol is the map key rather than part of the
@@ -261,8 +288,8 @@ pub enum ErrorKind {
     DuplicateField,
     /// A second case of a name in one sum.
     DuplicateCase,
-    /// A type declared as a name that leads back to itself with nothing in
-    /// between: `type t = t`, or a pair each declared as the other.
+    /// A definition given as a name that leads back to itself with nothing in
+    /// between: `type t = t`, `let x = x`, or a pair each given as the other.
     ///
     /// This is not the same complaint as a type that contains itself. A type
     /// may name itself as much as it likes through a struct or an arrow —
@@ -276,7 +303,15 @@ pub enum ErrorKind {
     /// hand-off in between and reaches no shape either. What closes the loop
     /// is the whole chain, so the loop is looked for by following what each
     /// declaration stands for rather than by reading any one body.
-    Circular,
+    ///
+    /// One rule about both namespaces, worded twice. A term is the same
+    /// mistake made about values: `let f = fn n => f n` names itself through a
+    /// shape and is an ordinary recursive function, and `let x = x` reaches no
+    /// shape at all and so says nothing about what `x` is. The namespace is
+    /// carried for the wording, the way [`ErrorKind::Undefined`] carries one.
+    Circular {
+        namespace: Namespace,
+    },
     /// A `?` field inside a `type` declaration, or a `..` tail there that does
     /// not name one of the declaration's own parameters — as in
     /// `type t = { x: Nat, .. }`.
@@ -571,9 +606,12 @@ struct Kinds {
     errors: Vec<Error>,
 }
 
-/// What a declaration's body turns out to be once every name in the way has
-/// been followed: a shape one step in, one of the declaration's own
-/// parameters, or a loop that reaches neither.
+/// What a body turns out to be once every name in the way has been followed: a
+/// shape one step in, one of the declaration's own parameters, or a loop that
+/// reaches neither.
+///
+/// [`Stands::Param`] is a declaration's answer alone. A definition binds no
+/// parameters, so [`Chain`] only ever reaches the other two.
 #[derive(Debug, Clone, Copy)]
 enum Stands {
     Shape,
@@ -594,6 +632,24 @@ struct Follow<'a> {
     /// the loop, and everything from it inwards is on that loop.
     open: Vec<Symbol>,
     /// Every declaration found to be on a loop, in the order they were found.
+    looping: IndexSet<Symbol>,
+}
+
+/// [`Follow`] about definitions: following what each one's value stands for,
+/// once, remembering the loops closed on the way.
+///
+/// The twin rather than the same walk, because the two languages are different
+/// enough that one walk over both would be a match on which it was in every
+/// arm. What they share is the shape: a memo, a stack of what is still open,
+/// and the set of everything found on a loop.
+struct Chain<'a> {
+    terms: &'a IndexMap<Symbol, Decl<Term>>,
+    /// What each definition was found to stand for; [`Stands::Loop`] absorbs,
+    /// exactly as it does for [`Follow`].
+    done: HashMap<Symbol, Stands>,
+    /// The definitions being followed, outermost first.
+    open: Vec<Symbol>,
+    /// Every definition found to be on a loop, in the order they were found.
     looping: IndexSet<Symbol>,
 }
 
@@ -621,12 +677,13 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     let mut program = Program {
         terms: IndexMap::new(),
         types: IndexMap::new(),
+        groups: Vec::new(),
     };
     // Split before lowering rather than lowering in the order written: every
     // type is declared before any term is looked at, so a term can name a type
-    // written anywhere in the program. Terms keep the order they were written
-    // in, so a term can still only name a term above it — the hoist is over
-    // the type group, not over the terms.
+    // written anywhere in the program. Both halves keep the order they were
+    // written in, and both are hoisted over themselves, so where a name is
+    // written decides nothing about what can see it.
     let mut types = Vec::new();
     let mut terms = Vec::new();
     for stmt in stmts {
@@ -696,7 +753,12 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         let decl = &mut program.types[&symbol];
         let span = decl.value.span;
         decl.value = span.track(TypeKind::Error);
-        b.error(span, ErrorKind::Circular);
+        b.error(
+            span,
+            ErrorKind::Circular {
+                namespace: Namespace::Types,
+            },
+        );
     }
     // The other recursion the solver cannot be handed: one that builds a bigger
     // argument on the way round. See [`ErrorKind::GrowingRecursion`].
@@ -733,13 +795,24 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         decl.value = span.track(TypeKind::Error);
         kinds.remove(symbol);
     }
-    for (name, ty, body) in terms {
-        // Annotation and body are lowered in the order they were written, and
-        // the body before the name is bound, so a definition cannot see itself
-        // and there is no recursion to resolve.
+    // Every definition's name is bound before any definition's body is read —
+    // the hoist the `type` half above already gets, and for the same reason.
+    // That is the whole of what makes a definition able to name itself and two
+    // definitions able to name each other; nothing downstream ties the knot,
+    // so a definition is recursive exactly when its body says so. Names are
+    // bound in the order they were written, so a repeated one is still
+    // reported against the first, and the first is still the one that stands.
+    let defined: Vec<_> = terms
+        .iter()
+        .map(|(name, _, _)| b.declare(Scope::Terms, name))
+        .collect();
+    for (symbol, (name, ty, body)) in defined.into_iter().zip(terms) {
+        // Annotation and body are lowered in the order they were written. A
+        // repeat's body is lowered like any other, though nothing keeps it:
+        // a bad name inside one is still the reader's to fix.
         let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
         let value = b.term(body.tracked);
-        if let Some(symbol) = b.declare(Scope::Terms, &name) {
+        if let Some(symbol) = symbol {
             program.terms.insert(
                 symbol,
                 Decl {
@@ -753,6 +826,32 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             );
         }
     }
+    // The term half of the loop refused above, and refused for the same
+    // reason: a value given as a name that leads back to itself is never given
+    // one. Read back off the table in definition order, so the reports come in
+    // the order the reader wrote them.
+    let circling = circling(&program.terms);
+    let circular: Vec<_> = program
+        .terms
+        .keys()
+        .copied()
+        .filter(|symbol| circling.contains(symbol))
+        .collect();
+    for symbol in circular {
+        let decl = &mut program.terms[&symbol];
+        let span = decl.value.span;
+        decl.value = TermKind::Error.with_span(span);
+        b.error(
+            span,
+            ErrorKind::Circular {
+                namespace: Namespace::Terms,
+            },
+        );
+    }
+    // Which definitions have to be typed together, read off the values as they
+    // finally stand — so a refused loop is a group of one naming nobody rather
+    // than the group its erased value used to describe.
+    program.groups = grouping(&program.terms);
     // What the arguments handed to a row parameter are allowed to be. Last of
     // all, because an annotation is as much a place to write one as a
     // declaration's body is, and annotations are only just lowered.
@@ -864,6 +963,197 @@ impl Follow<'_> {
                 Stands::Param(index) => self.ty(&args[index as usize]),
             },
         }
+    }
+}
+
+/// Every definition whose value leads back to itself through nothing but names,
+/// in the order the loops were found. [`looping`] about terms.
+///
+/// Only what a definition's value stands for is followed, and a value with any
+/// structure to it stands for itself: `fn`, a struct, a tag, a call, a literal
+/// all say what the definition is one step in, and a name that leads to one of
+/// them has been given a value through it. `let f = fn n => f n` is the shape
+/// of recursion this language is for, and it ends the chain at the `fn`. What
+/// never says anything is a name standing for a name standing for the first.
+///
+/// A projection is a shape too, though it looks like a hand-off. `let a = b.x`
+/// reads a field out of whatever `b` is, so it is not `b`; a loop closing
+/// through one still describes a value, and whether it can be typed is
+/// [`inference`](crate::inference)'s occurs check to answer.
+fn circling(terms: &IndexMap<Symbol, Decl<Term>>) -> IndexSet<Symbol> {
+    let mut chain = Chain {
+        terms,
+        done: HashMap::new(),
+        open: Vec::new(),
+        looping: IndexSet::new(),
+    };
+    for symbol in terms.keys() {
+        chain.def(*symbol);
+    }
+    chain.looping
+}
+
+impl Chain<'_> {
+    /// What one definition stands for, followed once and remembered.
+    fn def(&mut self, symbol: Symbol) -> Stands {
+        if let Some(stands) = self.done.get(&symbol) {
+            return *stands;
+        }
+        // Meeting a definition that is still being followed is the loop, and
+        // everything pushed since is on it with them.
+        if let Some(at) = self.open.iter().position(|open| *open == symbol) {
+            self.looping.extend(self.open[at..].iter().copied());
+            return Stands::Loop;
+        }
+        // Every symbol a value can name bare was defined, and every definition
+        // that was made is in this table: a name that repeats one binds nothing
+        // and so is never written into a term at all, and a lambda's argument
+        // is only in scope under the `fn` that binds it, which this walk stops
+        // at.
+        let decl = &self.terms[&symbol];
+        self.open.push(symbol);
+        let stands = self.value(&decl.value);
+        self.open.pop();
+        self.done.insert(symbol, stands);
+        stands
+    }
+
+    /// What one value stands for. Every kind but a bare name is a shape, which
+    /// is the whole rule.
+    fn value(&mut self, term: &Term) -> Stands {
+        match &term.kind {
+            TermKind::Ident(symbol) => self.def(*symbol),
+            TermKind::Apply { .. }
+            | TermKind::Fn { .. }
+            | TermKind::Struct(_)
+            | TermKind::Tag { .. }
+            | TermKind::Project { .. }
+            | TermKind::Natural(_)
+            | TermKind::Error => Stands::Shape,
+        }
+    }
+}
+
+/// Which definitions have to be typed together, and in which order.
+///
+/// A group is a set of definitions each of which is reachable from every other
+/// through the names their values mention — the strongly connected components
+/// of the reference graph — and the groups come back in dependency order, so
+/// that a definition is always solved after everything it names outside its own
+/// group. That is what lets an earlier group's definition be instantiated at a
+/// use site rather than shared with it. See [`Group`].
+///
+/// Only the definitions in the table are nodes. A lambda's argument is not one,
+/// being no definition at all, and a name that failed to resolve became
+/// [`TermKind::Error`] and mentions nobody.
+///
+/// Deterministic throughout, and deliberately so: the groups decide the order
+/// inference runs in, so a hash anywhere in here would be a program that
+/// type-checks on one run and not the next.
+fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
+    // Who each definition names, and then everything each one leads to. The
+    // same closure the type half takes for the same question; a pair being
+    // mutually reachable is the whole of what a group is.
+    let mentions: IndexMap<Symbol, Vec<Symbol>> = terms
+        .iter()
+        .map(|(symbol, decl)| {
+            let mut out = Vec::new();
+            references(&decl.value, &mut out);
+            out.retain(|named| terms.contains_key(named));
+            (*symbol, out)
+        })
+        .collect();
+    let reachable = closure(&mentions);
+
+    // The groups, and which one each definition landed in. Walked in source
+    // order, so the first definition of a group reached is its earliest and the
+    // members it collects are in source order too. A definition leading back to
+    // itself is what makes its group recursive — including a group of one,
+    // which is the case the flag exists for, and including every group of two
+    // or more, where being a group at all makes it so.
+    let mut of: HashMap<Symbol, usize> = HashMap::new();
+    let mut groups: Vec<Group> = Vec::new();
+    for symbol in terms.keys() {
+        if of.contains_key(symbol) {
+            continue;
+        }
+        let reaches = &reachable[symbol];
+        let members: Vec<Symbol> = terms
+            .keys()
+            .copied()
+            .filter(|other| {
+                other == symbol || (reaches.contains(other) && reachable[other].contains(symbol))
+            })
+            .collect();
+        for member in &members {
+            of.insert(*member, groups.len());
+        }
+        groups.push(Group {
+            members,
+            recursive: reaches.contains(symbol),
+        });
+    }
+
+    // Which groups each group has to wait for: the ones its members name and
+    // are not in. A group never waits for itself, which is what makes this a
+    // graph with no loops in it — everything mutually reachable is already one
+    // node here.
+    let mut needs: Vec<IndexSet<usize>> = vec![IndexSet::new(); groups.len()];
+    for (at, group) in groups.iter().enumerate() {
+        for named in group.members.iter().flat_map(|member| &mentions[member]) {
+            let other = of[named];
+            if other != at {
+                needs[at].insert(other);
+            }
+        }
+    }
+
+    // Dependency order, taking the earliest group that is ready at every step.
+    // `groups` is already in order of earliest member, so the lowest index that
+    // is ready is the earliest one, and two groups with nothing between them
+    // come out in the order they were written.
+    //
+    // Every group is placed. Each round places one unless nothing is ready, and
+    // nothing being ready in a graph with no loops means nothing is left.
+    let mut placed = vec![false; groups.len()];
+    let mut order = Vec::with_capacity(groups.len());
+    while let Some(next) =
+        (0..groups.len()).find(|at| !placed[*at] && needs[*at].iter().all(|need| placed[*need]))
+    {
+        placed[next] = true;
+        order.push(next);
+    }
+    order.into_iter().map(|at| groups[at].clone()).collect()
+}
+
+/// Every definition a value names, at any depth, in the order it names them. A
+/// lambda's argument is not one: it is a local, and no definition answers to it.
+///
+/// [`mentioned`] about terms, down to what it is for — the edges of the graph
+/// [`grouping`] closes.
+fn references(term: &Term, out: &mut Vec<Symbol>) {
+    match &term.kind {
+        TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Apply { func, arg } => {
+            references(func, out);
+            references(arg, out);
+        }
+        // The binder names nothing here; only the body can name anything, and
+        // a use of the binder inside it is a symbol this walk pushes and
+        // [`grouping`] then drops, since it is in no definition table.
+        TermKind::Fn { body, .. } => references(body, out),
+        TermKind::Struct(fields) => {
+            for field in fields.values() {
+                references(&field.value, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                references(payload, out);
+            }
+        }
+        TermKind::Project { base, .. } => references(base, out),
+        TermKind::Natural(_) | TermKind::Error => {}
     }
 }
 

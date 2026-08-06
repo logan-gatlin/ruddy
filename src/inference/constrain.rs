@@ -314,9 +314,12 @@ impl Constrain<'_> {
     /// monomorphic one is shared, so uses of a lambda argument constrain each
     /// other, which is exactly the let/lambda distinction.
     fn lookup(&mut self, symbol: Symbol) -> Rc<Ty> {
-        // Indexed rather than looked up: every resolved name was bound before
-        // any use of it could be lowered, and a name that resolved to nothing
-        // already became `TermKind::Error`.
+        // Indexed rather than looked up. A lambda's argument is bound where the
+        // walk enters its body; a top-level definition is bound before any body
+        // that could name it is walked — its own group's, monomorphically, and
+        // every earlier group's as a scheme — and a name that resolved to
+        // nothing already became `TermKind::Error`. A lookup falling back to a
+        // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
             Binding::Mono(ty) => ty,
             Binding::Poly(scheme) => self.instantiate(&scheme),
