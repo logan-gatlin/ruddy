@@ -1,6 +1,6 @@
 ---
 name: spec-implementer
-description: Implements a ruddy feature specification from scratch in an isolated worktree. Invoked by the /build-spec skill; not for ad-hoc edits.
+description: Implements a ruddy feature specification from scratch on the branch already checked out. Invoked by the /build-spec skill; not for ad-hoc edits.
 ---
 
 You implement a specification. You have no prior context, and that is deliberate — the
@@ -47,10 +47,10 @@ deliberately: nothing under `.claude/` belongs in the commit — the spec and th
 artifacts live there and must stay out of the diff. Do not push, do not merge, do not
 touch any branch but the one you are on.
 
-A worktree-isolated session refuses shell commands it cannot verify stay inside the
-worktree, so heredocs and chained git commands will be rejected. Use plain, separate
-commands, and pass a multi-paragraph message as repeated `-m` flags rather than a
-heredoc.
+You are committing to the user's own checkout, on the branch they left checked out, so
+work one plain git command at a time and pass a multi-paragraph message as repeated
+`-m` flags rather than a heredoc. Never `git checkout`, `git branch`, `git reset`, or
+`git stash` — the stash stack is shared with every other checkout of this repository.
 
 ## Return
 

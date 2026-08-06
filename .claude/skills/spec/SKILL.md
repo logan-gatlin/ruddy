@@ -20,16 +20,11 @@ revise. If empty, ask what they want to build.
 ## 1. Set up
 
 ```bash
-MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+ROOT=$(git rev-parse --show-toplevel)
 ```
 
-`$MAIN` is the primary checkout even when this session sits in a worktree. Specs live
-at `$MAIN/.claude/specs/<slug>/spec.md` — gitignored, and deliberately outside any
-worktree so they survive one being deleted.
-
-If this session is itself inside `.claude/worktrees/`, the file-writing tools will
-refuse that path. Write the spec to the worktree's own `.claude/specs/<slug>/spec.md`
-and copy it out with `cp`, which is allowed to cross the boundary.
+Specs live at `$ROOT/.claude/specs/<slug>/spec.md`, gitignored, so a spec never reaches
+the diff of the feature it describes.
 
 Pick a short kebab-case `<slug>` from the feature name (`sum-types`, `let-polymorphism`,
 `span-tracking`). If that directory already exists, you are revising: read the existing
@@ -37,7 +32,7 @@ spec and treat this as an amendment pass.
 
 ## 2. Ground yourself before asking anything
 
-Read `$MAIN/CLAUDE.md`, then read enough of the codebase to know which phases the
+Read `CLAUDE.md`, then read enough of the codebase to know which phases the
 feature touches — `src/token.rs`, `src/parse.rs`, `src/ir.rs`, `src/inference/`,
 `src/types.rs`, `src/ui.rs`, and the matching `debug/src/stage/` and `debug/src/print/`
 modules. Look at `tests/src/` for how the existing tests are shaped.
@@ -76,7 +71,7 @@ Do not write code, and do not start implementing. This skill produces one file.
 
 ## 4. Write the spec
 
-Write `$MAIN/.claude/specs/<slug>/spec.md` with this structure. Requirements get stable
+Write `$ROOT/.claude/specs/<slug>/spec.md` with this structure. Requirements get stable
 IDs — `R1`, `R2`, … — because every downstream review finding must cite one.
 
 ```markdown
