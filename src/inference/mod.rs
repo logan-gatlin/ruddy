@@ -290,6 +290,15 @@ pub enum ErrorKind {
     /// one missing. Worded from the type rather than the label's own span
     /// because the type is the side that says what is allowed. The shape is
     /// carried for the reason [`ErrorKind::MissingField`]'s is.
+    ///
+    /// The base need not be a struct, now that every type carries a field row.
+    /// A type whose row is closed and empty allows no label at all, so a
+    /// projection's demand landing on the *actual* side of a goal against `Nat`
+    /// is refused here rather than as a missing field — `let b : Nat -> Nat =
+    /// fn p => p.x` reads ``extra field `x`: the type `Nat` lists every field
+    /// it allows``. Which of the two complaints a demand becomes is decided by
+    /// which side of the goal it sits on, which is decided by where the
+    /// annotation is; see [`Solve::absorb`].
     ExtraField {
         shape: Shape,
         base: Rc<Ty>,
@@ -944,31 +953,59 @@ impl Table {
     /// that is. One variable space, so a core variable hiding inside a row is
     /// as much a cycle as one hiding inside a type.
     ///
-    /// Asked of every sort, and answered yes so far only about a type. The
-    /// other two are written because the rule is about all three and a rule
-    /// with a hole in it is a rule nobody can rely on; they say no today
-    /// because something earlier already turned the cycle away. A presence
-    /// against itself is [`Rule::Same`] in [`Solve::presences`] before a
-    /// binding is proposed, and two rows sharing a tail and differing in
-    /// labels are refused in [`Solve::rows`], where the complaint can name
-    /// both rows instead of one variable.
+    /// Asked by listing every variable the value mentions and then looking for
+    /// this one, rather than by asking "is this it?" at each position in turn.
+    /// The question is one question, and asking it once is what keeps the walk
+    /// a walk: the positions differ in where they look, not in what they are
+    /// looking for.
+    ///
+    /// It is answered yes only about a core variable, and that is a fact about
+    /// the solver rather than a hole in the walk. Two reasons, and between them
+    /// they cover every route here:
+    ///
+    /// - A variable's sort is fixed where it was minted and never changes, so a
+    ///   presence variable is never the same variable as a row or core one. Most
+    ///   of what this walk turns up is therefore of the wrong sort to be the one
+    ///   being bound, and no comparison across two sorts can say yes.
+    /// - The same-sort cases are turned away before a binding is ever proposed.
+    ///   Two rows that share a tail variable and differ in labels either way
+    ///   round are refused in [`Solve::rows`], where the complaint can name both
+    ///   rows instead of one variable; two tails that flatten to the same
+    ///   variable are [`Rule::Same`] in [`Solve::rests`]; two presences that are
+    ///   the same variable are [`Rule::Same`] in [`Solve::presences`], and both
+    ///   of its callers — [`Solve::field`] and [`Solve::absorb`] — put each
+    ///   presence through [`Table::presence_of`] first, so no chain of aliases
+    ///   arrives back at the variable being bound.
+    ///
+    /// The walk stays whole regardless. Those interceptions are where they are
+    /// because they word a better complaint, not because this cannot answer;
+    /// a rule with a hole in it is a rule nobody can rely on, and the next
+    /// person to move one of them should find this check already correct.
     fn occurs(&self, var: TyVar, value: &Assigned) -> bool {
+        let mut mentioned = Vec::new();
+        self.mentions(value, &mut mentioned);
+        mentioned.contains(&var)
+    }
+
+    /// Collect every variable `value` mentions, whichever sort it is.
+    fn mentions(&self, value: &Assigned, found: &mut Vec<TyVar>) {
         match value {
-            Assigned::Ty(ty) => self.occurs_ty(var, ty),
-            Assigned::Row(row) => self.occurs_row(var, row),
-            Assigned::Presence(presence) => {
-                matches!(self.presence_of(presence), Presence::Var(other) if other == var)
-            }
+            Assigned::Ty(ty) => self.mentions_ty(ty, found),
+            Assigned::Row(row) => self.mentions_row(row, found),
+            Assigned::Presence(presence) => self.mentions_presence(presence, found),
         }
     }
 
-    /// Whether `var` occurs in `ty` — in its core, or in the fields it carries.
-    fn occurs_ty(&self, var: TyVar, ty: &Rc<Ty>) -> bool {
+    /// Every variable `ty` mentions — in its core, and in the fields it carries.
+    fn mentions_ty(&self, ty: &Rc<Ty>, found: &mut Vec<TyVar>) {
         let ty = self.resolve(ty);
-        let core = match &ty.core {
-            Core::Var(other) => *other == var,
-            Core::Arrow(from, to) => self.occurs_ty(var, from) || self.occurs_ty(var, to),
-            Core::Sum(cases) => self.occurs_row(var, cases),
+        match &ty.core {
+            Core::Var(var) => found.push(*var),
+            Core::Arrow(from, to) => {
+                self.mentions_ty(from, found);
+                self.mentions_ty(to, found);
+            }
+            Core::Sum(cases) => self.mentions_row(cases, found),
             // A declared type is descended into as far as its arguments and no
             // further, here and in every walk below. What one stands for was
             // lowered from what the user wrote and mentions no variable at all
@@ -978,22 +1015,35 @@ impl Table {
             // that names itself finite. The arguments are the other half: they
             // were written at the use site and hold whatever it held, so
             // skipping them would miss a cycle.
-            Core::Named { args, .. } => args.iter().any(|arg| self.occurs_ty(var, arg)),
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => false,
-        };
-        core || self.occurs_row(var, &ty.fields)
+            Core::Named { args, .. } => {
+                for arg in args.iter() {
+                    self.mentions_ty(arg, found);
+                }
+            }
+            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
+        }
+        self.mentions_row(&ty.fields, found);
     }
 
-    /// Whether `var` occurs in `row`. Every slot a row has, in one sequence: a
+    /// Every variable `row` mentions. Every slot a row has, in one sequence: a
     /// label's presence is as much a place a variable can hide as its type is,
     /// and the tail is another, and none of the three is a different question.
-    fn occurs_row(&self, var: TyVar, row: &Row) -> bool {
+    fn mentions_row(&self, row: &Row, found: &mut Vec<TyVar>) {
         let row = self.canon(row);
-        matches!(row.rest, Rest::Var(other) if other == var)
-            || row.labels.values().any(|field| {
-                matches!(self.presence_of(&field.presence), Presence::Var(other) if other == var)
-                    || self.occurs_ty(var, &field.ty)
-            })
+        if let Rest::Var(var) = row.rest {
+            found.push(var);
+        }
+        for field in row.labels.values() {
+            self.mentions_presence(&field.presence, found);
+            self.mentions_ty(&field.ty, found);
+        }
+    }
+
+    /// The variable a presence stands for, if it still stands for one.
+    fn mentions_presence(&self, presence: &Presence, found: &mut Vec<TyVar>) {
+        if let Presence::Var(var) = self.presence_of(presence) {
+            found.push(var);
+        }
     }
 
     /// Record what the row variables inside `ty` may not stand for: every row

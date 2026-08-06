@@ -726,6 +726,17 @@ impl Solve<'_> {
     /// any other. A closed tail takes nothing: each label must turn out
     /// absent, one that certainly is not is a missing or extra label by
     /// `side`, and whatever would have continued as `rest` is closed too.
+    ///
+    /// Both complaints are reachable from one projection, and `side` is the
+    /// whole of the difference. `1.x` and `let b : Nat -> Nat = fn p => p.x`
+    /// put the projection's demand on the expected side and read ``no field `x`
+    /// on `Nat` `` — [`ErrorKind::MissingField`], and the common case, because a
+    /// demand is usually what a type is being checked against. Naming the
+    /// definition instead, as `let g = fn p => p.x` then `let b : Nat -> Nat =
+    /// g` does, puts the demand on the actual side and the annotation on the
+    /// expected one, and the same refusal comes out as
+    /// [`ErrorKind::ExtraField`]. Nothing about the projection decides that;
+    /// where the annotation sits does.
     fn absorb(
         &mut self,
         span: Span,

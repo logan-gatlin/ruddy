@@ -993,6 +993,32 @@ fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
     }
 }
 
+/// The same projection, refused from the other side of the goal, is an extra
+/// field rather than a missing one. `g` demands a base carrying an `x`, and the
+/// annotation on `b` is what the demand is checked against — so the `x` is a
+/// label the checked-against type does not allow, and the closed empty field
+/// row of `Nat` pushes it out as an extra. This used to be `not-a-struct`, and
+/// which of the two complaints it becomes is decided by where the annotation
+/// sits, not by anything the projection did. Pinned so the direction stays
+/// deliberate.
+#[test]
+fn a_projection_checked_against_a_fieldless_annotation_is_an_extra_field() {
+    let src = "let g = fn p => p.x\nlet b : Nat -> Nat = g";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "extra-field");
+    assert_eq!(
+        error.kind.to_string(),
+        "extra field `x`: the type `Nat` lists every field it allows"
+    );
+
+    // Underlining the definition, which is the side the demand came from.
+    assert_eq!(error.span.start, 41);
+    assert_eq!(error.span.width, 1);
+}
+
 /// Every projection complaint underlines the field name, whatever the base is.
 /// There is one way for a projection to be wrong now — the base has not got the
 /// field — and one place to say it: the name that was read. A base that used to
