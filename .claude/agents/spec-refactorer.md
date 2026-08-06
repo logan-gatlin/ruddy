@@ -40,9 +40,10 @@ that breakage is part of the task, not a new one.
 Commit the source changes with `spec(<slug>): round <N> refactor`. Stage deliberately:
 nothing under `.claude/` belongs in the commit. Do not push, merge, or switch branches.
 
-A worktree-isolated session refuses shell commands it cannot verify stay inside the
-worktree, so heredocs and chained git commands will be rejected. Use plain, separate
-commands, and pass a multi-paragraph message as repeated `-m` flags.
+You are committing to the user's own checkout, on the branch they left checked out, so
+work one plain git command at a time and pass a multi-paragraph message as repeated
+`-m` flags. Never `git checkout`, `git branch`, `git reset`, or `git stash` — the stash
+stack is shared with every other checkout of this repository.
 
 ## Return
 

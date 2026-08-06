@@ -318,3 +318,26 @@ fn a_case_carrying_nothing_keeps_its_missing_payload() {
     assert_eq!(ast, "type Flag = `On () | `Off {}");
     assert_eq!(ir, "type Flag = `On {} | `Off {}");
 }
+
+/// A printed program re-lowers into the one it was printed from, definitions
+/// that name themselves and each other included. Terms print in the order they
+/// were written, which is now the only order there is: a definition can name
+/// one written below it, so no printing order could put every name after its
+/// definition and none has to.
+#[test]
+fn recursion_and_forward_references_round_trip() {
+    for source in [
+        "let f = fn n => f n",
+        "let even = fn n => odd n\nlet odd = fn n => even n",
+        "let a = id 1\nlet id = fn x => x",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+
+        // And again, off what was printed: the second rendering is the first
+        // one, or the printer said something the builder reads differently.
+        let (_, again) = printed(&ir);
+        assert_eq!(again, ir, "{source} did not round-trip");
+    }
+}

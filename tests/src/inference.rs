@@ -410,11 +410,16 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
         steps(&mint, &output, "t"),
         [
             // Being applied makes `f` a function, which is true and is bound.
-            "bind  ?1 -> ?2 ~ ?0 => ?0 := ?1 -> ?2",
+            // `?0` is the definition's own variable, minted before the body was
+            // walked so that the body could have named it; `?1` is `f`.
+            "bind  ?2 -> ?3 ~ ?1 => ?1 := ?2 -> ?3",
             // Only the argument asks `f` to be its own parameter.
-            "occurs  ?1 ~ ?1 -> ?2 => this type would have to contain itself",
-            "recover  ?1 ~ ? => ?1 := ?",
+            "occurs  ?2 ~ ?2 -> ?3 => this type would have to contain itself",
             "recover  ?2 ~ ? => ?2 := ?",
+            "recover  ?3 ~ ? => ?3 := ?",
+            // And the definition is what its body turned out to be, which is
+            // the last thing every unannotated definition says.
+            "bind  ?0 ~ ?1 -> ?3 => ?0 := ?1 -> ?3",
         ]
     );
     // No step claims to have bound anything by the rule that failed. The bind
@@ -1039,10 +1044,12 @@ fn generation_records_what_it_asked_for_without_solving_it() {
         ["equal: { x: ?0, ..?1 } ~ { x: Nat }", "equal: Nat ~ ?0"]
     );
 
-    // A definition can demand nothing at all, and still be one the pass ran
-    // over: the entry is there, empty, rather than missing.
+    // The one demand every unannotated definition makes, and in `let n = 1`
+    // the only one: that the definition is what its body turned out to be.
+    // `?0` is the variable the definition was put in scope as before its body
+    // was walked, which is what a body naming the definition would have found.
     let (mint, _, output) = inferred("let n = 1");
-    assert!(constraints(&mint, &output, "n").is_empty());
+    assert_eq!(constraints(&mint, &output, "n"), ["equal: ?0 ~ Nat"]);
 }
 
 #[test]
@@ -1218,7 +1225,7 @@ fn a_type_declared_as_only_a_name_is_rejected() {
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ir::ErrorKind::Circular)),
+                .any(|error| matches!(error.kind, ir::ErrorKind::Circular { .. })),
             "{src}: expected a circular-type error: {:#?}",
             out.errors
         );
@@ -1371,15 +1378,18 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
     assert_eq!(
         steps(&mint, &output, "f"),
         [
-            "bind  { x: ?1, ..?2 } ~ ?0 => ?0 := { x: ?1, ..?2 }",
-            "struct  { y: ?3, ..?4 } ~ { x: ?1, ..?2 } => replaced by the goals below",
-            "  bind  ?4 ~ { x: ?1, ..?7 } => ?4 := { x: ?1, ..?7 }",
-            "  bind  { y: ?3, ..?7 } ~ ?2 => ?2 := { y: ?3, ..?7 }",
-            // The base is `{ x: ?1, ..?2 }` and `?2` is `{ y: ?3, ..?7 }`; the
+            // `?0` is the definition itself, minted before its body was walked;
+            // `?1` is `p`.
+            "bind  { x: ?2, ..?3 } ~ ?1 => ?1 := { x: ?2, ..?3 }",
+            "struct  { y: ?4, ..?5 } ~ { x: ?2, ..?3 } => replaced by the goals below",
+            "  bind  ?5 ~ { x: ?2, ..?8 } => ?5 := { x: ?2, ..?8 }",
+            "  bind  { y: ?4, ..?8 } ~ ?3 => ?3 := { y: ?4, ..?8 }",
+            // The base is `{ x: ?2, ..?3 }` and `?3` is `{ y: ?4, ..?8 }`; the
             // goal says so rather than leaving the reader to remember it.
-            "struct  { z: ?5, ..?6 } ~ { x: ?1, y: ?3, ..?7 } => replaced by the goals below",
-            "  bind  ?6 ~ { x: ?1, y: ?3, ..?8 } => ?6 := { x: ?1, y: ?3, ..?8 }",
-            "  bind  { z: ?5, ..?8 } ~ ?7 => ?7 := { z: ?5, ..?8 }",
+            "struct  { z: ?6, ..?7 } ~ { x: ?2, y: ?4, ..?8 } => replaced by the goals below",
+            "  bind  ?7 ~ { x: ?2, y: ?4, ..?9 } => ?7 := { x: ?2, y: ?4, ..?9 }",
+            "  bind  { z: ?6, ..?9 } ~ ?8 => ?8 := { z: ?6, ..?9 }",
+            "bind  ?0 ~ ?1 -> { a: ?2, b: ?4, c: ?6 } => ?0 := ?1 -> { a: ?2, b: ?4, c: ?6 }",
         ]
     );
 
@@ -1392,10 +1402,11 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
     assert_eq!(
         steps(&mint, &output, "h"),
         [
-            "bind  { x: Nat, ..?2 } ~ ?1 => ?1 := { x: Nat, ..?2 }",
-            "struct  { y: Nat, ..?2 } ~ { x: Nat, ..?2 } => replaced by the goals below",
-            "  occurs  { y: Nat, ..?2 } ~ { x: Nat, ..?2 } => this type would have to contain itself",
-            "  recover  ?2 ~ ? => ?2 := ?",
+            "bind  { x: Nat, ..?3 } ~ ?2 => ?2 := { x: Nat, ..?3 }",
+            "struct  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => replaced by the goals below",
+            "  occurs  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => this type would have to contain itself",
+            "  recover  ?3 ~ ? => ?3 := ?",
+            "bind  ?1 ~ ?2 -> Nat => ?1 := ?2 -> Nat",
         ]
     );
 }
@@ -1503,8 +1514,13 @@ fn giving_up_on_a_goal_is_a_step_of_its_own() {
     assert_eq!(
         steps(&mint, &output, "bad"),
         [
-            "mismatch  { x: ?0, ..?1 } ~ Nat => `Nat` is not a struct, so it has no fields to read",
-            "recover  ?0 ~ ? => ?0 := ?",
+            "mismatch  { x: ?2, ..?3 } ~ Nat => `Nat` is not a struct, so it has no fields to read",
+            "recover  ?2 ~ ? => ?2 := ?",
+            "recover  ?3 ~ ? => ?3 := ?",
+            // And the definition is what its abandoned body is, which absorbs
+            // — and abandons `bad`'s own variable with it, so nothing later
+            // reads it as still open.
+            "absorb  ?1 ~ ? => no change",
             "recover  ?1 ~ ? => ?1 := ?",
         ]
     );
@@ -2599,4 +2615,177 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
         scheme(&mint, &output, "f"),
         "Tree { a?: Nat } -> { p: Nat, q: Nat }"
     );
+}
+
+/// A definition may name itself. Nothing constrains the recursive call here, so
+/// the argument and the result stay whatever the caller wants.
+#[test]
+fn a_definition_may_name_itself() {
+    let (mint, _, output) = inferred("let loop = fn x => loop x");
+    assert_eq!(scheme(&mint, &output, "loop"), "'a -> 'b");
+}
+
+/// And the use is monomorphic, which is what a recursive use inside its own
+/// group means: passing a literal there pins the parameter for the definition
+/// as a whole.
+#[test]
+fn a_recursive_use_is_monomorphic() {
+    let (mint, _, output) = inferred("let self = fn x => self 1");
+    assert_eq!(scheme(&mint, &output, "self"), "Nat -> 'a");
+}
+
+/// Two definitions can name each other, and both are typed at once.
+#[test]
+fn a_mutual_pair_is_typed_together() {
+    let (mint, _, output) = inferred("let even = fn n => odd n  let odd = fn n => even n");
+    assert_eq!(scheme(&mint, &output, "even"), "'a -> 'b");
+    assert_eq!(scheme(&mint, &output, "odd"), "'a -> 'b");
+}
+
+/// The regression test for the whole design. Grouping is what keeps a
+/// definition that is not recursive polymorphic: treating the file as one
+/// mutually recursive block would make `id` monomorphic and refuse the second
+/// use of it.
+#[test]
+fn a_definition_outside_a_group_stays_polymorphic() {
+    let (mint, _, output) = inferred("let id = fn x => x  let a = id 1  let b = id { x: 1 }");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
+    assert_eq!(scheme(&mint, &output, "a"), "Nat");
+    assert_eq!(scheme(&mint, &output, "b"), "{ x: Nat }");
+}
+
+/// And it is still polymorphic when it is written below the use, since the
+/// group it is in is solved first however the file is laid out.
+#[test]
+fn a_forward_reference_instantiates_a_scheme() {
+    let (mint, _, output) = inferred("let a = id 1  let b = id { x: 1 }  let id = fn x => x");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
+    assert_eq!(scheme(&mint, &output, "a"), "Nat");
+    assert_eq!(scheme(&mint, &output, "b"), "{ x: Nat }");
+}
+
+/// An annotated definition is checked against its annotation, and so are its
+/// recursive uses: the definition is put in scope as what it says it is, so a
+/// use inside it is checked against that rather than against nothing.
+#[test]
+fn a_recursive_use_is_checked_against_the_annotation() {
+    let (mint, _, output) = inferred("let count : Nat -> Nat = fn n => count n");
+    assert_eq!(scheme(&mint, &output, "count"), "Nat -> Nat");
+
+    let (_, _, output) = infer_src("let bad : Nat -> Nat = fn n => bad { x: n }");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    let ErrorKind::Mismatch { expected, actual } = &output.errors[0].kind else {
+        panic!("expected a mismatch, got {:#?}", output.errors[0].kind);
+    };
+    assert_eq!(expected.to_string(), "Nat");
+    assert_eq!(actual.to_string(), "{ x: Nat }");
+}
+
+/// A definition naming itself through a shape reaches inference, which is where
+/// a value that would have to contain itself is refused.
+#[test]
+fn a_definition_that_would_contain_itself_is_refused() {
+    for src in ["let s = { a: s }", "let f = fn x => f x x"] {
+        let (_, out, output) = infer_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::Recursive)),
+            "{src}: {:#?}",
+            output.errors
+        );
+    }
+}
+
+/// Two members of one group are solved together, and each still owns its own
+/// complaints: the span is the member's own, and the types in it are spelled
+/// the way that member's scheme spells them.
+#[test]
+fn a_complaint_belongs_to_the_member_that_made_it() {
+    let (mint, out, output) = infer_src(
+        "let one = fn x => two (fn p => ({ a: p }).missing)\n\
+         let two = fn y => one (fn q => ({ b: q }).missing)",
+    );
+    assert_eq!(output.errors.len(), 2, "{:#?}", output.errors);
+
+    // Each complaint lands inside the definition that made it.
+    let span_of = |name| term_decl(&mint, &out, name).value.span;
+    let (one, two) = (span_of("one"), span_of("two"));
+    assert!(output.errors[0].span.start >= one.start && output.errors[0].span.end() <= one.end());
+    assert!(output.errors[1].span.start >= two.start && output.errors[1].span.end() <= two.end());
+
+    // And each is spelled in its own definition's letters. The struct named
+    // holds a variable the solve never decided, so a complaint zonked against
+    // some other member's substitution would name it `?7` — the solver's
+    // bookkeeping, and a number the reader cannot count to.
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "no field `missing` on `{ a: 'c }`"
+    );
+    assert_eq!(
+        output.errors[1].kind.to_string(),
+        "no field `missing` on `{ b: 'c }`"
+    );
+    assert!(
+        output
+            .errors
+            .iter()
+            .all(|error| !names_a_solver_index(&error.kind.to_string())),
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// Both maps are keyed in source order however the groups were solved. The file
+/// below is written back to front, so a map keyed in solve order would come out
+/// reversed.
+#[test]
+fn the_schemes_are_keyed_in_source_order() {
+    let (mint, out, output) = inferred("let a = b 1  let b = fn n => c n  let c = fn n => n");
+
+    let source: Vec<&str> = out
+        .program
+        .terms
+        .keys()
+        .map(|symbol| mint.name(*symbol))
+        .collect();
+    assert_eq!(source, ["a", "b", "c"]);
+
+    let keys = |map: Vec<Symbol>| -> Vec<&str> {
+        map.into_iter().map(|symbol| mint.name(symbol)).collect()
+    };
+    assert_eq!(keys(output.schemes.keys().copied().collect()), source);
+    assert_eq!(keys(output.constraints.keys().copied().collect()), source);
+
+    // The solve ran the other way round, which is what makes the above a
+    // statement rather than a coincidence.
+    let mut solved: Vec<&str> = Vec::new();
+    for step in &output.steps {
+        let name = mint.name(step.definition);
+        if solved.last() != Some(&name) {
+            solved.push(name);
+        }
+    }
+    assert_eq!(solved, ["c", "b", "a"]);
+}
+
+/// An annotation that leaves something open and gets it decided is still the
+/// complaint it always was, recursive definition or not — and is still held
+/// back when that definition already said something else.
+#[test]
+fn a_recursive_definition_may_still_promise_too_much() {
+    let (_, _, output) = infer_src("let f : { x?: Nat } -> Nat = fn r => f { x: r.x }");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(
+        output.errors[0].kind,
+        ErrorKind::AnnotationTooOpen
+    ));
+
+    // And not at all when the definition already failed: the annotation is not
+    // the mistake to send the reader to.
+    let (_, _, output) = infer_src("let f : { x?: Nat } -> Nat = fn r => f { x: r.y }");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "missing-field");
 }

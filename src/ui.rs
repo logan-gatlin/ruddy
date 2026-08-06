@@ -222,7 +222,10 @@ impl ir::ErrorKind {
                 Namespace::Terms | Namespace::Modules => "duplicate-term",
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
-            ir::ErrorKind::Circular => "circular-type",
+            ir::ErrorKind::Circular { namespace } => match namespace {
+                Namespace::Types => "circular-type",
+                Namespace::Terms | Namespace::Modules => "circular-term",
+            },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
@@ -254,11 +257,18 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
             ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),
             ir::ErrorKind::DuplicateCase => f.write_str("duplicate case"),
-            // Not "recursive": a type is welcome to lead back to itself, and
-            // what is wrong here is that there is nothing in the way when it
-            // does. Said as what the reader can change — give the type a shape
-            // — rather than as the loop the compiler noticed.
-            ir::ErrorKind::Circular => f.write_str("type defined only as another name"),
+            // Not "recursive": a definition is welcome to lead back to itself,
+            // and what is wrong here is that there is nothing in the way when
+            // it does. Said as what the reader can change — give it a shape —
+            // rather than as the loop the compiler noticed. Two wordings for
+            // the one rule, because a reader who wrote `let` is being told
+            // about a value rather than about a type.
+            ir::ErrorKind::Circular { namespace } => match namespace {
+                Namespace::Types => f.write_str("type defined only as another name"),
+                Namespace::Terms | Namespace::Modules => {
+                    f.write_str("this definition is never given a value of its own")
+                }
+            },
             // The noun follows the shape that was written: someone who wrote
             // backticks is told about cases, and the `?` and the `..` are the
             // same two marks either way.

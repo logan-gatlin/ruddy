@@ -12,7 +12,8 @@
 
 use indexmap::IndexMap;
 use ruddy::{
-    symbol::Symbol,
+    ir::Program,
+    symbol::{Mint, Symbol},
     types::{Scheme, Ty},
 };
 
@@ -92,18 +93,17 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // it cannot show is whether the name it came back through leads
             // anywhere, which for a pair declared in terms of each other is
             // the whole question.
-            match loop_through(&output.aliases, symbol) {
-                Some(loop_names) => node.child(Node::new(
-                    ids.next(),
-                    "recursive",
-                    loop_names
-                        .iter()
-                        .map(|symbol| mint.name(*symbol))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )),
-                None => node,
+            if let Some(loop_names) = loop_through(&output.aliases, symbol) {
+                node = node.child(named_row(&mut ids, mint, loop_names));
             }
+            // And a recursive definition says the same thing, off the groups
+            // lowering published rather than off a walk of its own: a scheme
+            // shows none of this, since a definition solved with its group
+            // prints exactly like one solved alone.
+            if let Some(members) = grouped_with(program, symbol) {
+                node = node.child(named_row(&mut ids, mint, members));
+            }
+            node
         })
         .collect();
 
@@ -122,6 +122,45 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         ),
         ..spec.stage(cx.status(), plural(output.schemes.len(), "scheme"))
     }
+}
+
+/// The `recursive` child: the names something loops through, or is grouped
+/// with, itself first and the rest in the order they were found. One row
+/// builder for the two, because they are one row — a reader looking at it wants
+/// the same thing of a `type` and a `let`.
+fn named_row(ids: &mut Ids, mint: &Mint, names: Vec<Symbol>) -> Node {
+    Node::new(
+        ids.next(),
+        "recursive",
+        names
+            .iter()
+            .map(|symbol| mint.name(*symbol))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// The definitions `symbol` is typed together with, itself first and the rest
+/// in group order, or `None` when its group refers back into itself nowhere.
+///
+/// `None` for a `type` declaration too: groups are a term's business, and a
+/// declaration's own recursion is [`loop_through`]'s to find.
+fn grouped_with(program: &Program, symbol: Symbol) -> Option<Vec<Symbol>> {
+    let group = program
+        .groups
+        .iter()
+        .find(|group| group.members.contains(&symbol))?;
+    group.recursive.then(|| {
+        std::iter::once(symbol)
+            .chain(
+                group
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|member| *member != symbol),
+            )
+            .collect()
+    })
 }
 
 /// The declarations one has to pass through to get from `start` back to

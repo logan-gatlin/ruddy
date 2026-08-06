@@ -9,7 +9,7 @@ Run a spec to completion: implement it, then review and refactor in rounds until
 reviewer finds nothing above minor severity.
 
 **Argument:** `$ARGUMENTS` — the spec slug, optionally followed by `--rounds N`
-(default 4). If no slug is given, list `$MAIN/.claude/specs/*/` and ask which one.
+(default 4). If no slug is given, list `.claude/specs/*/` and ask which one.
 
 ## Your role: dispatcher, not participant
 
@@ -34,73 +34,58 @@ You may read the spec's title and requirement count for your own report. That is
 ## 1. Set up
 
 ```bash
-MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+ROOT=$(git rev-parse --show-toplevel)
+DIR="$ROOT/.claude/specs/<slug>"
 ```
 
-The spec of record is `$MAIN/.claude/specs/<slug>/spec.md`. Verify it exists; if not,
-say so and suggest `/spec`.
+The spec of record is `$DIR/spec.md`. Verify it exists; if not, say so and suggest
+`/spec`.
 
-## 2. Isolate
+Everything runs on the branch already checked out — no worktree, no isolation. Every
+agent inherits this working directory, so they share the one tree and the commits land
+where the user can see them.
 
-Unless the session is already inside `.claude/worktrees/`, call `EnterWorktree` with
-name `spec-<slug>`. Every agent inherits this working directory, so they all share one
-tree while the main checkout stays untouched.
+Two preconditions, both worth stopping for:
 
-If `EnterWorktree` fails, tell the user, and ask before running agents in their checkout.
+- **The working tree must be clean.** Every review diffs the whole branch against the
+  base commit, so uncommitted changes would be read as the implementation's work. Check
+  `git status --short`; if it is not empty, tell the user what is dirty and stop. Do not
+  stash — the stash stack is shared with every other checkout and is not yours to move.
+- **If HEAD is the repository's default branch**, say so and ask whether to branch first
+  before running anything. The loop commits several times; the user may not want that
+  history on `main`.
 
-### Artifact plumbing — follow this exactly
-
-A worktree-isolated session can *read* the main checkout but its file-writing tools
-refuse to write there; only `Bash` can cross the boundary. So agents work entirely
-inside the worktree, and you sync across the boundary on their behalf.
-
-After entering the worktree, seed it and record the branch point:
+Then record the branch point:
 
 ```bash
-WT=$(pwd)
-DIR="$WT/.claude/specs/<slug>"          # agents only ever touch paths under $WT
-mkdir -p "$DIR"
-cp "$MAIN/.claude/specs/<slug>/spec.md" "$DIR/spec.md"
 BASE=$(git rev-parse HEAD)
 ```
 
-`$DIR/spec.md` is the copy every agent reads. Never let an agent edit it.
+`$DIR/spec.md` is what every agent reads. Never let an agent edit it, and never edit it
+yourself mid-run — a spec that moves under the loop makes every round incomparable.
 
-**After each stage completes**, copy the artifacts back so they survive the worktree
-being deleted:
-
-```bash
-cp -r "$DIR/." "$MAIN/.claude/specs/<slug>/"
-```
-
-Do this even if a stage failed — a partial review is still evidence.
-
-Keep shell commands plain. A worktree-isolated session rejects git commands it cannot
-verify stay inside the worktree — no heredocs, no `cd` into the main checkout, no
-chained git invocations. Run git one plain command at a time, and if a `cp` is ever
-refused, split it into separate steps rather than working around the guard.
-
-Maintain `$DIR/run.md` as you go: slug, worktree path, branch, `$BASE`, start time from
-`date`, and a line per stage as it finishes. It is the audit trail if the loop is
-interrupted, and it syncs out with everything else.
+Maintain `$DIR/run.md` as you go: slug, branch, `$BASE`, start time from `date`, and a
+line per stage as it finishes. It is the audit trail if the loop is interrupted, so
+write each line as the stage returns rather than at the end.
 
 `.claude/specs/` is gitignored, so none of this reaches the diff. If an agent ever
 reports committing files under `.claude/`, stop the loop and tell the user.
 
-## 3. Implement
+## 2. Implement
 
 Spawn `spec-implementer` with `run_in_background: false` and wait. The prompt gives it:
 
 - the absolute path to `$DIR/spec.md` — "the specification is the authority; read it in
   full first, and never edit it"
-- the worktree path, and that all its work stays inside it
+- `$ROOT`, the repository it works in
 - `$BASE`
-- instruction to commit source changes only, once `just check` is green
+- instruction to commit source changes only, once `just check` is green, on the branch
+  already checked out — never branching, merging, or pushing
 
 It returns a short summary: files touched, requirements implemented, anything it could
 not do. Relay that to the user in your own words. Do not open the files it names.
 
-## 4. Review / refactor loop
+## 3. Review / refactor loop
 
 For round `N` from 1 to the round cap:
 
@@ -141,20 +126,19 @@ round's opinion.
 
 Run stages strictly one at a time. They mutate the same tree.
 
-## 5. Report
+## 4. Report
 
-Sync the artifacts out one last time, write the final state into `run.md`, sync again,
-then tell the user:
+Write the final state into `run.md`, then tell the user:
 
 - Which round it exited on and why — clean, capped, or stalled.
 - Findings per round, as counts, showing the trend.
 - Remaining minor issues, by title, from the last reviewer's return summary.
 - Anything the planner ruled out of scope, and the reason — these are the spots where
   the spec and the reviewer disagreed, and they are worth the user's attention.
-- The worktree path and branch, with the commits on it.
-- How to land it: review the branch, then merge or cherry-pick. Do not merge, push,
-  or delete the worktree yourself.
-- Where the artifacts are: `$MAIN/.claude/specs/<slug>/`.
+- The branch, and the commits the loop added to it.
+- How to land it: review the commits, then merge or push. Do not merge or push
+  yourself, and do not reset or rewrite the branch to tidy it.
+- Where the artifacts are: `$DIR`.
 
 If the loop exited capped or stalled, say plainly that the feature is not finished and
 what is left.

@@ -64,6 +64,16 @@ type Fallible r = `Err Nat | ..r
 
 let handled : Fallible (`Ok Nat) -> Nat = fn t => 0
 
+let repeat = fn x => repeat x
+
+let ping = fn n => pong n
+
+let pong = fn n => ping n
+
+let forwarded = identity 7
+
+let identity = fn x => x
+
 let bad = @
 
 let malformed = 12abc

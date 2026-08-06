@@ -616,6 +616,50 @@ fn the_types_tab_says_which_declarations_are_recursive() {
     assert_eq!(recursion("Endo"), None);
 }
 
+/// A definition says the same thing under itself, off the binding groups. A
+/// scheme shows none of it — a definition solved with its group prints exactly
+/// like one solved alone — so without the row the tab cannot say which
+/// definitions had to be typed at once.
+#[test]
+fn the_types_tab_says_which_definitions_are_recursive() {
+    let snapshot = snapshot(
+        "let loops = fn x => loops x\n\
+         let even = fn n => odd n\n\
+         let odd = fn n => even n\n\
+         let plain = fn x => x\n",
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let types = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types stage is registered");
+    let recursion = |name: &str| -> Option<&str> {
+        types
+            .nodes
+            .iter()
+            .find(|node| node.label == format!("let {name}"))
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .children
+            .iter()
+            .find(|child| child.label == "recursive")
+            .map(|child| child.text.as_str())
+    };
+    // A definition that names itself is a group of one, which the members
+    // alone could not tell from the group below.
+    assert_eq!(recursion("loops"), Some("loops"));
+    // A pair typed together names itself first and then the rest of its group.
+    assert_eq!(recursion("even"), Some("even, odd"));
+    assert_eq!(recursion("odd"), Some("odd, even"));
+    // And a definition that refers back into its group nowhere says nothing.
+    assert_eq!(recursion("plain"), None);
+}
+
 /// A lambda's argument badge comes from the arrow the lambda has, which is an
 /// arrow just as much when the annotation was a name for one.
 #[test]
@@ -798,11 +842,12 @@ fn symbols_round_trip_through_the_mangler() {
         .iter()
         .map(|node| (node.label.as_str(), node.text.as_str()))
         .collect();
-    // In mint order, which is the row order: types are lowered first, and a
-    // lambda's binder is minted before the definition it is bound inside.
+    // In mint order, which is the row order: types are lowered first, and every
+    // definition's name is minted before any body is lowered — so `f` comes
+    // before the `x` its own lambda binds.
     assert_eq!(
         paths,
-        [("T", "demo::T"), ("x", "demo::_::x"), ("f", "demo::f")]
+        [("T", "demo::T"), ("f", "demo::f"), ("x", "demo::_::x")]
     );
 }
 
@@ -1054,7 +1099,7 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("solve"), "1 step");
     assert_eq!(summary("types"), "1 scheme");
     assert_eq!(summary("symbols"), "1 symbol");
-    assert_eq!(summary("ir"), "0 types · 1 term");
+    assert_eq!(summary("ir"), "0 types · 1 term · 1 group");
 }
 
 /// A parameterized declaration's meaning prints its parameters as `'a`, `'b` —

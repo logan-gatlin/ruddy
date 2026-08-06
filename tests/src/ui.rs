@@ -44,8 +44,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     let unexpected = parse::Error { span };
     all.push(("parse", unexpected.code(), unexpected.to_string()));
 
-    // Both namespaces of both name errors: the namespace is part of the code,
-    // so an undefined type and an undefined term are two diagnostics here.
+    // Both namespaces of all three name errors: the namespace is part of the
+    // code, so an undefined type and an undefined term are two diagnostics
+    // here, and so are the two halves of a loop of bare names.
     for namespace in [Namespace::Terms, Namespace::Types] {
         for kind in [
             IrError::Undefined { namespace },
@@ -53,13 +54,13 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
                 namespace,
                 previous: span,
             },
+            IrError::Circular { namespace },
         ] {
             all.push(("ir", kind.code(), kind.to_string()));
         }
     }
     for kind in [
         IrError::DuplicateField,
-        IrError::Circular,
         IrError::OpenDeclaredType {
             shape: Shape::Struct,
         },
@@ -294,6 +295,28 @@ fn the_namespaces_are_spelled_apart() {
         .map(|namespace| namespace.to_string())
         .collect();
     assert_eq!(spellings.len(), 3, "{spellings:?}");
+}
+
+/// One rule about both namespaces, worded twice. A reader who wrote `let` is
+/// being told about a value they never gave, and one who wrote `type` about a
+/// type that stands for nothing; a single sentence covering both would describe
+/// neither.
+#[test]
+fn a_loop_of_bare_names_is_worded_for_its_namespace() {
+    let term = IrError::Circular {
+        namespace: Namespace::Terms,
+    };
+    assert_eq!(term.code(), "circular-term");
+    assert_eq!(
+        term.to_string(),
+        "this definition is never given a value of its own"
+    );
+
+    let ty = IrError::Circular {
+        namespace: Namespace::Types,
+    };
+    assert_eq!(ty.code(), "circular-type");
+    assert_eq!(ty.to_string(), "type defined only as another name");
 }
 
 /// A constraint prints as what it demands, in the notation the Constraints tab

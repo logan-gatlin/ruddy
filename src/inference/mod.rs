@@ -4,8 +4,8 @@
 //! never ordered — two types either unify or they are an error — so a term's type
 //! is the one type it has rather than a bound on it.
 //!
-//! Each definition is typed in two passes, and the [`Constraint`] list is all
-//! they share.
+//! Each binding group is typed in two passes, and the [`Constraint`] list is
+//! all they share.
 //!
 //! *Generation* ([`Constrain`]) walks the term, mints a variable wherever the
 //! type is not yet known, writes one into every [`Term`], and records what has
@@ -19,9 +19,12 @@
 //! performs is also recorded as a [`Step`], so the solve can be replayed one
 //! rule at a time rather than only read as its result.
 //!
-//! Generalization is why the two passes alternate per definition rather than
-//! running over the whole program: `let id = fn x => x` has to become a scheme
-//! before the next definition's `id 1` can instantiate it.
+//! Generalization is why the two passes alternate per binding group rather
+//! than running over the whole program: `let id = fn x => x` has to become a
+//! scheme before a later definition's `id 1` can instantiate it. A group is as
+//! small as that alternation can be made — the definitions that name each other
+//! have to be solved at once, and everything else gets a scheme of its own. See
+//! [`Group`](crate::ir::Group).
 //!
 //! Inference runs after lowering and mutates the [`Program`] it is handed:
 //! every [`Term`]'s `ty` goes from [`Ty::Undecided`] to what was inferred for
@@ -35,6 +38,7 @@ mod solve;
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     rc::Rc,
 };
 
@@ -331,6 +335,41 @@ enum Side {
     Actual,
 }
 
+/// One member of a binding group as it goes into scope, before anything in the
+/// group has been walked.
+///
+/// Which is the whole of what makes recursion typable here: what the rest of
+/// the group — and the definition itself — sees this name as has to exist
+/// before any body mentioning it is read. See [`Binding::Mono`].
+struct Scoped {
+    symbol: Symbol,
+    /// What the definition is bound to for the length of the group: its
+    /// lowered annotation, or a variable standing for whatever the body turns
+    /// out to be.
+    bound: Rc<Ty>,
+    /// The variables the annotation minted, which are the ones it left for the
+    /// definition to decide. Empty for a definition with no annotation. See
+    /// [`Table::narrowed`].
+    opened: Range<TyVar>,
+}
+
+/// One member of a binding group once it has been walked and solved, waiting
+/// for the group to end so that it can be generalized.
+struct Solved {
+    scoped: Scoped,
+    /// The type this definition publishes: its annotation, which is the
+    /// contract, or what its body turned out to be.
+    ty: Rc<Ty>,
+    /// What generation asked of it, kept exactly as it was asked. See
+    /// [`Output::constraints`].
+    generated: Vec<Constraint>,
+    /// Where this definition's own complaints begin in the shared list. Each is
+    /// resolved against the substitution its own definition ends with, so which
+    /// ones are whose has to be marked before the next member's solve appends
+    /// to the list.
+    reported: usize,
+}
+
 /// Every type variable ever minted.
 ///
 /// Both passes hold this: generation mints into it, solving binds in it, and
@@ -339,12 +378,18 @@ enum Side {
 struct Table {
     /// One slot per variable; [`Ty::Var`] indexes into it.
     ///
-    /// There is no generalization level beside it. A definition is the only
+    /// There is no generalization level beside it. A binding group is the only
     /// thing this language generalizes at and there is no `let` inside one, so
-    /// every variable still unsolved when a definition ends was minted by that
-    /// definition and is its to quantify. Rémy-style levels are what decides
-    /// this where a definition can nest, and are what a nested `let` would have
-    /// to bring back with it.
+    /// every variable still unsolved when a group ends was minted by that group
+    /// and is its members' to quantify. Rémy-style levels are what decides this
+    /// where a definition can nest, and are what a nested `let` would have to
+    /// bring back with it.
+    ///
+    /// A group rather than a definition, and the difference is only where the
+    /// line falls: two definitions that name each other are solved together, so
+    /// a variable one of them minted may still be open while the other is being
+    /// walked. It is still nobody's but the group's, because the group is
+    /// finished before anything outside it is looked at.
     vars: Vec<Slot>,
     /// What each row variable may not stand for: the field names the rows it
     /// is the tail of already write out.
@@ -416,100 +461,188 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut schemes = IndexMap::new();
     let mut constraints = IndexMap::new();
     let mut steps = Vec::new();
-    for (symbol, decl) in program.terms.iter_mut() {
-        // The annotation is the contract: the body is checked against it, and
-        // it — not whatever the body's constraints worked out along the way —
-        // is what the definition means to everyone downstream.
+    // The groups are read out before anything is solved: solving mutates the
+    // definitions they name, and which definitions have to be typed together is
+    // a fact about the lowered program that nothing here changes.
+    let groups: Vec<Vec<Symbol>> = program
+        .groups
+        .iter()
+        .map(|group| group.members.clone())
+        .collect();
+    for members in groups {
+        // Every member is in scope, monomorphically, before any of them is
+        // walked. That is the whole of what makes recursion typable: a use of a
+        // group member inside the group is the one type the group is deciding,
+        // rather than a copy of a scheme that does not exist yet. A use of a
+        // definition in an earlier group is a [`Binding::Poly`] and instantiates
+        // as it always has, which is what keeps let-polymorphism.
         //
-        // Which is only honest while the body cannot decide the parts of it
-        // the annotation left open. Nothing stops it: a `..`, a `..r` and a
-        // `?` each lower to an ordinary variable, and a variable is something
-        // the solve is free to bind. So the variables this lowering mints are
-        // counted off here and checked once the definition is solved — see
-        // [`Table::narrowed`]. The alternative is to make them unbindable, and
-        // that is a larger language than this one has: a variable that refuses
-        // to be bound needs a rule saying what happens when something tries,
-        // and the answer has to travel all the way back to the annotation
-        // anyway. Checking says the same thing, at the one place that knows
-        // which variables came from where.
-        let opened = table.vars.len() as TyVar;
-        let annotated = decl
-            .annotation
-            .as_ref()
-            .map(|annotation| lower_type(mint, &mut table, annotation));
-        let closed = table.vars.len() as TyVar;
+        // A member with an annotation is bound to *it* rather than to a fresh
+        // variable. A variable would never be tied to what was written, so the
+        // recursive uses the annotation exists for would be checked against
+        // nothing at all.
+        let scoped: Vec<Scoped> = members
+            .iter()
+            .map(|symbol| {
+                // The annotation is the contract: the body is checked against
+                // it, and it — not whatever the body's constraints worked out
+                // along the way — is what the definition means to everyone
+                // downstream.
+                //
+                // Which is only honest while the body cannot decide the parts
+                // of it the annotation left open. Nothing stops it: a `..`, a
+                // `..r` and a `?` each lower to an ordinary variable, and a
+                // variable is something the solve is free to bind. So the
+                // variables this lowering mints are counted off here and
+                // checked once the group is solved — see [`Table::narrowed`].
+                // The alternative is to make them unbindable, and that is a
+                // larger language than this one has: a variable that refuses to
+                // be bound needs a rule saying what happens when something
+                // tries, and the answer has to travel all the way back to the
+                // annotation anyway. Checking says the same thing, at the one
+                // place that knows which variables came from where.
+                let from = table.vars.len() as TyVar;
+                let annotated = program.terms[symbol]
+                    .annotation
+                    .as_ref()
+                    .map(|annotation| lower_type(mint, &mut table, annotation));
+                let opened = from..table.vars.len() as TyVar;
+                let bound = annotated.unwrap_or_else(|| table.fresh());
+                env.insert(*symbol, Binding::Mono(bound.clone()));
+                Scoped {
+                    symbol: *symbol,
+                    bound,
+                    opened,
+                }
+            })
+            .collect();
 
-        let mut constrain = Constrain {
-            table: &mut table,
-            env: &mut env,
-            aliases: &aliases,
-            out: Vec::new(),
-        };
-        let ty = match &annotated {
-            Some(expected) => {
-                constrain.check_term(&mut decl.value, expected);
-                expected.clone()
+        // One walk and one solve per member, in source order, over the shared
+        // table — which decides the same things solving the union would, since
+        // unification does not care what order it is asked in, and keeps a
+        // [`Step`] able to name the definition it came from.
+        let mut solved: Vec<Solved> = Vec::with_capacity(scoped.len());
+        for scoped in scoped {
+            let decl = &mut program.terms[&scoped.symbol];
+            let mut constrain = Constrain {
+                table: &mut table,
+                env: &mut env,
+                aliases: &aliases,
+                out: Vec::new(),
+            };
+            // Checked against exactly what the rest of the group sees this
+            // definition as. For an annotated one that is the annotation, as it
+            // has always been; for the rest it is the variable standing in for
+            // the definition, and checking against a bare variable is inferring
+            // and equating — see [`Constrain::check_term`]. The equation is what
+            // ties the name the body used to the type the body has.
+            constrain.check_term(&mut decl.value, &scoped.bound);
+            let generated = constrain.out;
+            let ty = match &decl.annotation {
+                Some(_) => scoped.bound.clone(),
+                None => decl.value.ty.clone(),
+            };
+            let reported = errors.len();
+
+            Solve {
+                table: &mut table,
+                errors: &mut errors,
+                steps: &mut steps,
+                aliases: &aliases,
+                nominal: &nominal,
+                definition: scoped.symbol,
+                depth: 0,
+                assumed: Vec::new(),
+                base_span: None,
             }
-            None => {
-                constrain.infer_term(&mut decl.value);
-                decl.value.ty.clone()
-            }
-        };
-        let generated = constrain.out;
+            .run(&generated);
 
-        // Where this definition's complaints begin. Each is resolved against
-        // the substitution its own definition ends with, so which ones are its
-        // own has to be marked before the next solve appends to the list.
-        let reported = errors.len();
-
-        Solve {
-            table: &mut table,
-            errors: &mut errors,
-            steps: &mut steps,
-            aliases: &aliases,
-            nominal: &nominal,
-            definition: *symbol,
-            depth: 0,
-            assumed: Vec::new(),
-            base_span: None,
-        }
-        .run(&generated);
-
-        // One complaint per definition, not per variable: an annotation that
-        // is too open is one thing to rewrite however many of its `..`s and
-        // `?`s the body pinned down, and the reader is being sent to the same
-        // line either way. Held back when the definition already said
-        // something, because everything a failure abandons it also decides —
-        // pointing it at `Ty::Undecided` is a binding like any other — and a
-        // second complaint about the fallout of the first is one mistake said
-        // twice.
-        if let Some(annotation) = &decl.annotation
-            && errors.len() == reported
-            && (opened..closed).any(|var| table.narrowed(var))
-        {
-            errors.push(Error {
-                span: annotation.span,
-                kind: ErrorKind::AnnotationTooOpen,
+            solved.push(Solved {
+                scoped,
+                ty,
+                generated,
+                reported,
             });
         }
 
-        let (scheme, mut subst) = table.generalize(&ty);
-        // With the substitution in hand, resolve every type the walk wrote
-        // into the body, so a term's type and its definition's scheme spell
-        // the same variable the same way.
-        table.zonk_term(&mut decl.value, &mut subst);
-        // And the same for what it complained about, which is why this waits
-        // until the definition is solved rather than running where the error
-        // was reported: a variable in a payload may have been solved after the
-        // fact, and the later knowledge reads better. Nothing past here can
-        // touch this definition's variables, so this is the last word on them.
-        for error in &mut errors[reported..] {
-            error.kind = table.zonk_error(&error.kind, &mut subst);
+        // Where each member's complaints end, which is where the next one's
+        // begin — and, for the last, where the group left the list.
+        let mut bounds: Vec<usize> = solved.iter().map(|member| member.reported).collect();
+        bounds.push(errors.len());
+
+        // Generalization, once the whole group is solved and not before: a
+        // member's type is not settled while another member of its own group
+        // can still constrain it. Each is then quantified into a scheme of its
+        // own. Two members can share a variable and each quantify it
+        // separately, which loses the sharing — and there is no scope outside
+        // for that to matter to, because this language has no `let` inside a
+        // definition.
+        for (at, member) in solved.into_iter().enumerate() {
+            let symbol = member.scoped.symbol;
+            let (from, to) = (bounds[at], bounds[at + 1]);
+            let decl = &mut program.terms[&symbol];
+
+            // One complaint per definition, not per variable: an annotation
+            // that is too open is one thing to rewrite however many of its
+            // `..`s and `?`s the body pinned down, and the reader is being sent
+            // to the same line either way. Held back when *this* definition
+            // already said something, because everything a failure abandons it
+            // also decides — pointing it at `Ty::Undecided` is a binding like
+            // any other — and a second complaint about the fallout of the first
+            // is one mistake said twice. Its own range and nobody else's: a
+            // definition that shares a group with a broken one is not the one
+            // with something to rewrite.
+            //
+            // Said here, past every member's solve, rather than beside the
+            // list it is about, so that it lands after all of them: a member's
+            // own range was fixed while the group was being solved, and a
+            // complaint written into the middle of it would move everybody
+            // else's.
+            let told = errors.len();
+            if let Some(annotation) = &decl.annotation
+                && from == to
+                && member.scoped.opened.clone().any(|var| table.narrowed(var))
+            {
+                errors.push(Error {
+                    span: annotation.span,
+                    kind: ErrorKind::AnnotationTooOpen,
+                });
+            }
+
+            let (scheme, mut subst) = table.generalize(&member.ty);
+            // With the substitution in hand, resolve every type the walk wrote
+            // into the body, so a term's type and its definition's scheme spell
+            // the same variable the same way.
+            table.zonk_term(&mut decl.value, &mut subst);
+            // And the same for what it complained about, which is why this
+            // waits until the group is solved rather than running where the
+            // error was reported: a variable in a payload may have been solved
+            // after the fact, and the later knowledge reads better. Nothing
+            // past here can touch this definition's variables, so this is the
+            // last word on them. Its own two stretches of the list: the range
+            // its solve wrote, and whatever was just added past the end.
+            for at in (from..to).chain(told..errors.len()) {
+                let zonked = table.zonk_error(&errors[at].kind, &mut subst);
+                errors[at].kind = zonked;
+            }
+            env.insert(symbol, Binding::Poly(scheme.clone()));
+            schemes.insert(symbol, scheme);
+            constraints.insert(symbol, member.generated);
         }
-        env.insert(*symbol, Binding::Poly(scheme.clone()));
-        schemes.insert(*symbol, scheme);
-        constraints.insert(*symbol, generated);
     }
+
+    // Both maps are keyed in source order, whatever order the groups were
+    // solved in: a reader of either is reading the file, and which definition
+    // had to be solved first is the solver's business rather than theirs.
+    // [`Output::steps`] is that business exactly, and stays in solve order.
+    let position: HashMap<Symbol, usize> = program
+        .terms
+        .keys()
+        .enumerate()
+        .map(|(at, symbol)| (*symbol, at))
+        .collect();
+    schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+    constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
