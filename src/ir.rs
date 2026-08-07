@@ -1566,30 +1566,36 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
     }
 }
 
-/// Every argument written where a row parameter goes that could not be one,
-/// erased where it stood.
+/// Every argument written where a parameter's conditions refuse it, erased where
+/// it stood.
 ///
-/// Two ways to fail, and they are the two halves of what [`ParamKind::Row`]
-/// says. An argument has to be something that *can* stand for a set of fields
-/// — [`row_shaped`] — and it has to be a set of fields the declaration does not
-/// already name, since a `..` covers only what its row leaves out.
+/// Two ways to fail, and which of them a parameter can be failed by is what
+/// [`ParamKind`] says. A [`ParamKind::Cases`] parameter has both: a sum's rest is
+/// spliced into a row, so the argument has to be something a row can hold —
+/// [`row_shaped`] — and it has to name none of the cases the declaration already
+/// names, since a `..` covers only what its row leaves out. A
+/// [`ParamKind::Type`] parameter has only the second. A struct's `..` is the
+/// type's core, and a core takes every type there is, so there is no shape left
+/// to refuse; what is left is the labels the argument would bring with it, which
+/// [`carried`] reads through a name as readily as off a struct written out.
 ///
-/// The kinds themselves are a well-formedness check and nothing more — a
-/// struct handed to a row parameter lowers to exactly the type it would
-/// anywhere else, and substitution puts it wherever the parameter sat. What
-/// this refuses is the argument that would leave a row holding something no row
-/// can hold, which is the invariant [`Rest`](crate::types::Rest) documents and
-/// nothing else enforces, and the argument that would leave one naming a field twice, which
-/// nothing downstream can recover from either.
+/// The kinds themselves are a well-formedness check and nothing more — an
+/// argument lowers to exactly the type it would anywhere else, and substitution
+/// puts it wherever the parameter sat. What this refuses is the argument that
+/// would leave a row holding something no row can hold, which is the invariant
+/// [`Rest`](crate::types::Rest) documents and nothing else enforces, and the
+/// argument that would leave a row or a type naming a label twice, which nothing
+/// downstream can recover from either.
 ///
 /// Refusing it is not enough on its own: an argument left standing is
-/// substituted into the tail anyway, and the reader is told a second time in
-/// words about a row nobody wrote. So the argument absorbs, the way
+/// substituted where the parameter sat anyway, and the reader is told a second
+/// time in words about a type nobody wrote. So the argument absorbs, the way
 /// [`ErrorKind::Circular`] and [`ErrorKind::OpenDeclaredType`] do — the
 /// argument and not the whole application, because the mistake is the argument
-/// and `WithX Nat -> Nat` is half correct. [`row_shaped`] already reads
-/// [`TypeKind::Error`] as row-shaped, so nothing complains about the erasure,
-/// and it lowers to the undecided type, which a tail is already allowed to be.
+/// and `WithX { x: Nat } -> Nat` is half correct. [`row_shaped`] already reads
+/// [`TypeKind::Error`] as row-shaped and [`carried`] reads it as carrying
+/// nothing, so nothing complains about the erasure, and it lowers to the
+/// undecided type, which a tail and a core are both already allowed to be.
 fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
     fn walk(
         ty: &mut Type,

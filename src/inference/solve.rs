@@ -235,7 +235,8 @@ impl Solve<'_> {
     ///    less thing to unfold later.
     /// 3. A name beside labels is unfolded and the goal asked again. See
     ///    [`Solve::unwrapped`].
-    /// 4. Everything else is [`Solve::fielded`]: the labels and the core.
+    /// 4. Everything else is [`Solve::fielded`]: the labels and the core, in the
+    ///    order it gives.
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);

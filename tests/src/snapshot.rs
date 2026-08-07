@@ -773,7 +773,7 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(
         field(overlap, "_rule"),
         Some(
-            "the rest of a struct cannot be a struct naming a field the struct already names"
+            "the rest of a struct cannot be a type naming a field the struct already names"
                 .to_string()
         )
     );

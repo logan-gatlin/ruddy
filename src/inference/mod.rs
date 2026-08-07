@@ -191,9 +191,9 @@ pub enum Rule {
     /// tail allows.
     ///
     /// One rule in the code and two here, because a reader stepping through a
-    /// solve is reading about their program: a line saying "two structs" over
-    /// a goal about `` `Some `` and `` `None `` describes something they never
-    /// wrote. See [`Solve::labels`], which is both.
+    /// solve is reading about their program: a line about fields over a goal
+    /// about `` `Some `` and `` `None `` describes something they never wrote.
+    /// See [`Solve::labels`], which is both.
     Sum,
     /// Whether one field is there, decided: present agrees with present and
     /// absent with absent, and a field one side must have while the other side

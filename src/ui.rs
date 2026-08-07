@@ -949,20 +949,27 @@ impl fmt::Display for Rule {
             // field, and someone who wrote backticks about a sum and a case.
             // Saying it about a "row" and a "label" would name the
             // representation the two shapes share, which is the compiler's
-            // business and nothing the reader wrote. What a struct's rest
-            // *is* — the type its fields sit on — is the compiler's business
-            // too, so the sentence keeps to what the reader can see.
-            Rule::Overlap { shape } => write!(
-                f,
-                "the rest of a {shape} cannot be a {shape} naming a {} the {shape} already names",
-                noun(*shape),
-            ),
+            // business and nothing the reader wrote.
+            //
+            // Two sentences rather than one formula, because the two rests are
+            // no longer the same kind of thing. A sum's rest is a set of cases,
+            // so only a sum can be one; a struct's rest is the type its fields
+            // sit on, so anything at all can be one — and what is refused is
+            // whichever of them names a field the struct already has.
+            Rule::Overlap { shape } => match shape {
+                Shape::Struct => f.write_str(
+                    "the rest of a struct cannot be a type naming a field the struct already names",
+                ),
+                Shape::Sum => f.write_str(
+                    "the rest of a sum cannot be a sum naming a case the sum already names",
+                ),
+            },
             Rule::Prim => f.write_str("the same primitive on both sides"),
             Rule::Arrow => {
                 f.write_str("two arrows: argument against argument, result against result")
             }
             Rule::Struct => f.write_str(
-                "two structs: shared fields field against field, the rest into the other's tail",
+                "two types and their fields: shared fields field against field, the rest into whatever the other leaves open",
             ),
             Rule::Sum => f.write_str(
                 "two sums: shared cases case against case, the rest into the other's tail",

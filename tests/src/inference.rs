@@ -3175,16 +3175,19 @@ fn two_projections_on_one_binder_share_a_core_variable() {
 }
 
 /// Generalization numbers variables in plain first-occurrence order, reading a
-/// type core-first and then the fields it carries. No special case for a core:
-/// the base of an accessor is `'a` because it is the first variable a reader
-/// meets, and the field's type is `'b` because it is the second.
+/// type's labels and then the core beneath them — which is the order they print
+/// in, since the core is what a `..` spells and a tail is written last. No
+/// special case for a core: the field's type of an accessor is `'a` because it
+/// is the first variable a reader meets, and the base's core is `'b` because it
+/// is the second.
 #[test]
 fn variables_are_numbered_in_the_order_they_are_read() {
     let (mint, _, output) = inferred("let getx = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
 
     // Presences keep their second pass, so a `?` never takes a letter another
-    // variable would have had: the core is still `'a` and the tail `'b`.
+    // variable would have had: `f`'s one letter is its core, and `g`'s are the
+    // field's type and then the core it sits on.
     let (mint, _, output) = inferred(
         "let f : { x?: Nat, .. } -> Nat = fn p => 1\nlet g = fn p => { got: p.y, more: p }",
     );
