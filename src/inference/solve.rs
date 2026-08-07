@@ -1173,16 +1173,25 @@ impl Solve<'_> {
     /// nothing could have written.
     ///
     /// The lacks check beside it is the row's version of the same idea: a tail
-    /// stands for the labels its row does not write out, so a row that writes
-    /// one of them out is not a value that tail can take — and a core variable
-    /// is under the same condition, since it stands for a type the labels
-    /// beside it are already on. Refused here rather than noticed later for a
-    /// reason the occurs check does not share — nothing later is guaranteed to
-    /// notice. Two rows sharing a tail are only compared again if the program
-    /// happens to bring them back together, and [`Table::zonk`] keeps one copy
-    /// of a repeated label without a word, so the contradiction reached the
-    /// reader as a silently narrowed type or as a mismatch somewhere else
-    /// entirely.
+    /// stands for the labels its row does not write out, so a row that
+    /// certainly has one of them is not a value that tail can take — and a
+    /// core variable is under the same condition, since it stands for a type
+    /// the labels beside it are already on. Refused here rather than noticed
+    /// later for a reason the occurs check does not share — nothing later is
+    /// guaranteed to notice. Two rows sharing a tail are only compared again
+    /// if the program happens to bring them back together, and [`Table::zonk`]
+    /// keeps one copy of a repeated label without a word, so the contradiction
+    /// reached the reader as a silently narrowed type or as a mismatch
+    /// somewhere else entirely.
+    ///
+    /// Certainly has, not names: presence is what the condition is really
+    /// about, because only a label that is there is a copy at all. A label the
+    /// row names settled absent is not part of what the type says — the label
+    /// rule already passes one over a closed row without a word, and a
+    /// complaint here would refuse a row the solver itself holds equal to one
+    /// it accepts. And a label still being decided has just met the thing that
+    /// decides it: absent is the one answer both sides allow, and it is the
+    /// answer [`Solve::absorb`] gives the same label against a closed row.
     fn assign(&mut self, span: Span, goal: Goal, var: TyVar, value: Assigned) {
         if self.table.occurs(var, &value) {
             let error = Error {
@@ -1193,17 +1202,39 @@ impl Solve<'_> {
             self.fail(span, Rule::Occurs, goal, error, &abandoned);
             return;
         }
-        // One complaint per binding, not per label: a tail that would have to
-        // repeat two fields is one thing gone wrong with one row, and naming
-        // the first of them is what the reader has to look at either way.
-        if let Some((shape, field)) = self.table.repeated(var, &value) {
-            let error = Error {
-                span,
-                kind: ErrorKind::RepeatedField { shape, field },
-            };
-            let abandoned = [value.variable(var), value];
-            self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
-            return;
+        if let Some((shape, named)) = self.table.lacked(var, &value) {
+            // One complaint per binding, not per label: a tail that would have
+            // to repeat two fields is one thing gone wrong with one row, and
+            // naming the first of them is what the reader has to look at
+            // either way. Ruled on before anything is settled, so a refusal
+            // leaves no binding behind that only this goal wanted.
+            if let Some((field, _)) = named
+                .iter()
+                .find(|(_, presence)| matches!(presence, Presence::Present))
+            {
+                let error = Error {
+                    span,
+                    kind: ErrorKind::RepeatedField {
+                        shape,
+                        field: field.clone(),
+                    },
+                };
+                let abandoned = [value.variable(var), value];
+                self.fail(span, Rule::Overlap { shape }, goal, error, &abandoned);
+                return;
+            }
+            // No label is certainly there, so the ones still being decided are
+            // decided: absent, the one answer the condition leaves open. Said
+            // through the presence rule so the act is a step like any other.
+            // The rest already answer the condition — settled absent, or
+            // abandoned by a failure that was reported where it happened —
+            // and two labels never share a presence variable, so no entry
+            // here is a stale reading of another.
+            for (_, presence) in &named {
+                if matches!(presence, Presence::Var(_)) {
+                    self.presences(span, &Presence::Absent, presence);
+                }
+            }
         }
         self.table.inherit_lacks(var, &value);
         // And the levels travel the same way the conditions do: what this
