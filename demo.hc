@@ -76,6 +76,26 @@ let forwarded = identity 7
 
 let identity = fn x => x
 
+let named =
+  let half = { v: 21 } in
+  { doubled: half.v, original: half }
+
+let twice =
+  let same = fn x => x in
+  { a: same 1, b: same {} }
+
+let selfnaming =
+  let step = fn n => step n in
+  step
+
+let ascribed =
+  let total : Nat = 4 in
+  total
+
+let shadowing =
+  let count = { v: 1 } in
+  count
+
 let bad = @
 
 let malformed = 12abc

@@ -1468,3 +1468,74 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
         nodes(solve)
     );
 }
+
+/// A nested `let` reaches all four tabs that had to keep up with it: the AST
+/// and IR trees show it as a node of its own, the Constraints tab shows the two
+/// lists it carries as rows beneath it, and the Types tab says what the name it
+/// binds was generalized to.
+#[test]
+fn a_nested_let_reaches_every_stage() {
+    let source = "let a = let id : Nat -> Nat = fn x => x in id 1\n";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+
+    // Both trees label the node with the name it binds, and both print it back
+    // as the source it stands for.
+    // The two trees name a lambda differently — one has the surface form and
+    // the other the curried one — and agree about everything else.
+    for (id, lambda) in [("ast", "Function"), ("ir", "Fn")] {
+        let node = nodes(stage(id))
+            .into_iter()
+            .find(|node| node.label == "Let id")
+            .unwrap_or_else(|| panic!("{id} renders no nested let"));
+        assert_eq!(node.text, "let id : Nat -> Nat = fn x => x in id 1", "{id}");
+        // The written type is a child, between the name and the value where it
+        // was written.
+        let labels: Vec<&str> = node
+            .children
+            .iter()
+            .map(|child| child.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Name", "Ascribed Arrow", lambda, "Apply"], "{id}");
+    }
+
+    // The Constraints tab is a tree: the `let` is a row, and what its value and
+    // its body require are rows beneath it, in the order the solver runs them.
+    let bound = nodes(stage("constraints"))
+        .into_iter()
+        .find(|node| node.label == "let")
+        .expect("the constraints tab renders the let");
+    assert!(!bound.children.is_empty(), "{bound:#?}");
+    let codes: Vec<&str> = bound
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert!(codes.contains(&"instance"), "{codes:?}");
+
+    // And the Types tab says what the local was generalized to, under the
+    // definition it was written in.
+    let definition = stage("types")
+        .nodes
+        .iter()
+        .find(|node| node.label == "let a")
+        .expect("the types tab renders the definition");
+    let local = definition
+        .children
+        .iter()
+        .find(|child| child.label == "local id")
+        .unwrap_or_else(|| panic!("no local row: {definition:#?}"));
+    assert_eq!(local.text, "Nat -> Nat");
+}

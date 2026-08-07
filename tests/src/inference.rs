@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use ruddy::{
-    inference::{self, Effect, ErrorKind, Rule},
+    inference::{self, ConstraintKind, Effect, ErrorKind, Rule},
     ir::{self, Decl, Term, TermKind},
     parse,
     symbol::{Bundle, Mint, Symbol, Version},
@@ -108,6 +108,10 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
             out.extend(body_tys(arg));
         }
         TermKind::Fn { body, .. } => out.extend(body_tys(body)),
+        TermKind::Let { value, body, .. } => {
+            out.extend(body_tys(value));
+            out.extend(body_tys(body));
+        }
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 out.extend(body_tys(&field.value));
@@ -3623,4 +3627,268 @@ fn an_assumption_compares_a_sum_argument_as_a_sum() {
         taken.iter().any(|step| step.contains("assume")),
         "{taken:#?}"
     );
+}
+
+/// A nested binding's value is generalized once it is solved, and each use of
+/// the name in the body instantiates a fresh copy — which is the whole point of
+/// keeping [`TermKind::Let`] a node of its own rather than desugaring it into a
+/// lambda applied to its value, where the two uses would have to agree.
+#[test]
+fn a_nested_let_is_generalized() {
+    let (mint, _, output) = inferred("let pair = let id = fn x => x in { a: id 1, b: id {} }");
+    assert_eq!(scheme(&mint, &output, "pair"), "{ a: Nat, b: {} }");
+}
+
+/// There is no value restriction: a binding whose value is not a function
+/// generalizes like any other. This language has nothing mutable for the
+/// restriction to protect.
+#[test]
+fn a_nested_let_generalizes_whatever_its_value_is() {
+    let (mint, _, output) =
+        inferred("let e = let box = { it: fn x => x } in { a: box.it 1, b: box.it {} }");
+    assert_eq!(scheme(&mint, &output, "e"), "{ a: Nat, b: {} }");
+}
+
+/// Generalization quantifies only what the value is entitled to. A variable an
+/// enclosing binder owns is not quantified even when it was first minted inside
+/// the let, which is what levels decide and what a range of minted variables
+/// could never have.
+#[test]
+fn a_nested_let_quantifies_only_what_it_owns() {
+    // The field's variable is minted inside the let, by the projection, and
+    // then dropped out of the let's range when `p`'s own variable is bound to a
+    // type carrying it. So the argument and the result are one type.
+    let (mint, _, output) = inferred("let projected = fn p => let q = p.x in q");
+    assert_eq!(scheme(&mint, &output, "projected"), "{ x: 'a, ..'b } -> 'a");
+
+    // The same, without the projection in the way.
+    let (mint, _, output) = inferred("let held = fn p => let q = p in q");
+    assert_eq!(scheme(&mint, &output, "held"), "'a -> 'a");
+
+    // And both halves at once: `dup` generalizes, so it is used at two types,
+    // while `p` — the lambda's — does not, so the two uses share it.
+    let (mint, _, output) =
+        inferred("let shared = fn p => let dup = fn x => x in { a: dup p, b: dup 1 }");
+    assert_eq!(scheme(&mint, &output, "shared"), "'a -> { a: 'a, b: Nat }");
+}
+
+/// Inside its own value the name is bound monomorphically, the same rule a
+/// binding group follows: a recursive use is the one type being decided rather
+/// than a copy of a scheme that does not exist yet. So the binding is not
+/// polymorphically recursive.
+#[test]
+fn a_nested_let_names_itself_monomorphically() {
+    let (mint, _, output) = inferred("let looping = let f = fn n => f n in f");
+    assert_eq!(scheme(&mint, &output, "looping"), "'a -> 'b");
+}
+
+/// Every shape of nesting and every position a `let` can be written in, by the
+/// type it comes out as.
+#[test]
+fn nested_lets_nest_and_sit_wherever_an_expression_does() {
+    for (src, name, printed) in [
+        (
+            "let chained = let one = 1 in let two = { v: one } in two",
+            "chained",
+            "{ v: Nat }",
+        ),
+        (
+            "let inside = fn p => let x = p.x in { first: x, second: x }",
+            "inside",
+            "{ x: 'a, ..'b } -> { first: 'a, second: 'a }",
+        ),
+        (
+            "let in_field = { v: let n = 1 in n }",
+            "in_field",
+            "{ v: Nat }",
+        ),
+        (
+            "let id = fn x => x\nlet applied = id (let n = 1 in n)",
+            "applied",
+            "Nat",
+        ),
+        (
+            "let n = 1\nlet shadowed = let n = { v: 2 } in n",
+            "shadowed",
+            "{ v: Nat }",
+        ),
+    ] {
+        let (mint, _, output) = inferred(src);
+        assert_eq!(scheme(&mint, &output, name), printed, "{src}");
+    }
+}
+
+/// An annotated nested binding is checked the way an annotated definition is:
+/// the annotation is the contract, the value is checked against it, and the
+/// scheme published is the annotation's.
+#[test]
+fn an_annotated_nested_let_is_checked_against_its_annotation() {
+    let (mint, _, output) = inferred("let annotated = let n : Nat = 1 in n");
+    assert_eq!(scheme(&mint, &output, "annotated"), "Nat");
+
+    // A value that does not match is refused at the value, which is the term
+    // the reader can change.
+    let src = "let e = let n : Nat = {} in n";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Nat`, found `{}`"
+    );
+    assert_eq!(output.errors[0].span.start, src.find("{}").expect("value"));
+
+    // And the annotation is what the name means inside its own value, so a
+    // recursive use is checked against it.
+    let (mint, _, output) = inferred("let e = let f : Nat -> Nat = fn n => f n in f 1");
+    assert_eq!(scheme(&mint, &output, "e"), "Nat");
+}
+
+/// A nested annotation is held to the same promise a definition's is: what it
+/// left open with a `..` or a `?` the value may not decide. Reported once, at
+/// the annotation, and held back when the binding already complained.
+#[test]
+fn a_nested_annotation_may_not_be_narrowed_by_its_value() {
+    let src = "let e = let n : { a?: Nat } = { a: 1 } in n";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(
+        output.errors[0].kind,
+        ErrorKind::AnnotationTooOpen
+    ));
+    assert_eq!(
+        output.errors[0].span.start,
+        src.find("{ a?: Nat }").expect("the annotation")
+    );
+
+    // An annotation the value keeps open is no complaint.
+    let (_, _, output) = infer_src("let e = let f : { x: Nat, .. } -> Nat = fn p => p.x in f");
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+
+    // And nothing is said when the definition already failed: a second
+    // complaint about the fallout of the first is one mistake said twice.
+    let (_, _, output) = infer_src("let e = let n : { a?: Nat } = { a: 1 } in n.b");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "missing-field");
+}
+
+/// One scheme per nested binding, in the order the lets were walked, beside the
+/// definitions rather than among them: `Output::schemes` keeps meaning the
+/// top-level definitions and nothing else.
+#[test]
+fn every_nested_let_publishes_a_scheme() {
+    let (mint, _, output) = inferred(
+        "let a = let id = fn x => x in { one: id 1, two: id {} }\n\
+         let b = fn p => let q = p.x in q\n",
+    );
+    let locals: Vec<(&str, String)> = output
+        .locals
+        .iter()
+        .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
+        .collect();
+    assert_eq!(
+        locals,
+        [("id", "'a -> 'a".to_string()), ("q", "'a".to_string())]
+    );
+
+    // The definitions' own map is untouched by any of it.
+    let named: Vec<&str> = output
+        .schemes
+        .keys()
+        .map(|symbol| mint.name(*symbol))
+        .collect();
+    assert_eq!(named, ["a", "b"]);
+}
+
+/// Every term inside a nested `let` carries its resolved type when inference is
+/// done, the way every other subterm does — and the `Let` node's own type is
+/// its body's, which is what the expression evaluates to.
+#[test]
+fn every_term_inside_a_nested_let_is_typed() {
+    let (mint, out, _) = inferred("let a = let n = 1 in { v: n }");
+    assert_eq!(
+        body_types(&term_decl(&mint, &out, "a").value),
+        [
+            // The `let` itself, which is its body's type.
+            "{ v: Nat }",
+            // Its value, then its body and the use inside it.
+            "Nat",
+            "{ v: Nat }",
+            "Nat",
+        ]
+    );
+
+    // And no solver variable survives anywhere in one, including the parts
+    // generalization never numbered.
+    let (_, out, _) = infer_src("let a = fn p => let q = fn z => z in { held: p, made: q }");
+    for decl in out.program.terms.values() {
+        for ty in body_tys(&decl.value) {
+            assert!(!mentions_a_variable(&ty), "{ty}");
+        }
+    }
+}
+
+/// The scoping a nested `let` needs lives in the constraint language, so the
+/// walk still reads nothing out of the variable table: what has to happen in
+/// what order is written down as a constraint that carries its two lists.
+#[test]
+fn a_nested_let_is_said_as_two_constraint_kinds() {
+    let (mint, _, output) = inferred("let a = let id = fn x => x in id 1");
+    // One `let` carrying everything the expression asked for, and then the
+    // definition's own equation tying it to what `a` is.
+    let generated = constraints(&mint, &output, "a");
+    assert_eq!(generated.len(), 2, "{generated:#?}");
+    assert!(generated[0].starts_with("let: "), "{generated:#?}");
+    assert!(generated[1].starts_with("equal: "), "{generated:#?}");
+
+    // The two lists are the `let`'s own, in the order the solver runs them.
+    let symbol = output
+        .constraints
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "a")
+        .expect("the definition");
+    let ConstraintKind::Let {
+        level, value, body, ..
+    } = &output.constraints[&symbol][0].kind
+    else {
+        panic!("expected a let constraint");
+    };
+    assert_eq!(*level, 1);
+    assert!(
+        value
+            .iter()
+            .all(|constraint| constraint.kind.code() == "equal"),
+        "{value:#?}"
+    );
+    let codes: Vec<&str> = body
+        .iter()
+        .map(|constraint| constraint.kind.code())
+        .collect();
+    assert!(codes.contains(&"instance"), "{codes:?}");
+}
+
+/// A local's scheme may leave more than a bare core free. A sum's tail and a
+/// field's presence are variables like any other, so one an enclosing binder
+/// owns stays where it stands rather than being quantified — and is numbered
+/// only when the scheme is published, past the quantifiers of its own.
+#[test]
+fn a_local_leaves_every_sort_of_outer_variable_alone() {
+    for (src, printed) in [
+        (
+            "let f : (`A | ..r) -> Nat = fn s => let q = s in 1",
+            "`A | ..'a",
+        ),
+        (
+            "let f : { a?: Nat } -> Nat = fn r => let q = r in 1",
+            "{ a?: Nat }",
+        ),
+    ] {
+        let (mint, _, output) = inferred(src);
+        let locals: Vec<(&str, String)> = output
+            .locals
+            .iter()
+            .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
+            .collect();
+        assert_eq!(locals, [("q", printed.to_string())], "{src}");
+    }
 }

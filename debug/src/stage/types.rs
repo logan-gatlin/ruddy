@@ -12,8 +12,9 @@
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::Program,
+    ir::{Program, Term, TermKind},
     symbol::{Mint, Symbol},
+    tracking::Tracked,
     types::{Core, Rest, Row, RowField, Scheme, Ty},
 };
 
@@ -103,6 +104,37 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(members) = grouped_with(program, symbol) {
                 node = node.child(named_row(&mut ids, mint, members));
             }
+            // And every name bound inside it, with the scheme it was given. A
+            // local binding is no definition, so it has no row of its own up
+            // here — but it is generalized exactly as a definition is, and the
+            // whole point of a nested `let` is that it can be used at two
+            // types, which is a thing only its scheme says.
+            //
+            // Found by walking the definition's value rather than by reading
+            // the symbol: a local is minted beside its module, not under the
+            // definition it was written in, so the tree is the only thing that
+            // knows whose it is.
+            if let Some(decl) = program.terms.get(&symbol) {
+                for local in locals(&decl.value) {
+                    let scheme = match output.locals.get(&local.tracked) {
+                        Some(scheme) => scheme.to_string(),
+                        // Nothing was published for it, which means inference
+                        // never reached it: the definition failed to lower, and
+                        // its value was erased.
+                        None => String::new(),
+                    };
+                    let mut row = Node::new(
+                        ids.next(),
+                        format!("local {}", mint.name(local.tracked)),
+                        scheme,
+                    )
+                    .at(local.span);
+                    if let Some(index) = cx.symbols.get(&local.tracked) {
+                        row = row.symbol(*index);
+                    }
+                    node = node.child(row);
+                }
+            }
             node
         })
         .collect();
@@ -121,6 +153,44 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             output.aliases, output.schemes
         ),
         ..spec.stage(cx.status(), plural(output.schemes.len(), "scheme"))
+    }
+}
+
+/// Every name a nested `let` binds inside one definition's value, in the order
+/// they were written — which is the order they were walked, and so the order
+/// their schemes were published in.
+fn locals(term: &Term) -> Vec<Tracked<Symbol>> {
+    let mut out = Vec::new();
+    walk_locals(term, &mut out);
+    out
+}
+
+fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
+    match &term.kind {
+        TermKind::Let {
+            name, value, body, ..
+        } => {
+            out.push(*name);
+            walk_locals(value, out);
+            walk_locals(body, out);
+        }
+        TermKind::Apply { func, arg } => {
+            walk_locals(func, out);
+            walk_locals(arg, out);
+        }
+        TermKind::Fn { body, .. } => walk_locals(body, out),
+        TermKind::Struct(fields) => {
+            for field in fields.values() {
+                walk_locals(&field.value, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                walk_locals(payload, out);
+            }
+        }
+        TermKind::Project { base, .. } => walk_locals(base, out),
+        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
     }
 }
 

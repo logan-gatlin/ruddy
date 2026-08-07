@@ -89,6 +89,29 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
                 .map(|arg| Node::new(ids.next(), "Arg", arg.tracked.clone()).at(arg.span)),
         )
         .child(expr_node(ids, body)),
+        // The statement's row again, about the expression: the name it binds,
+        // the type it was ascribed, the value and the body. Labelled with the
+        // name, since that is what a reader scanning the tree is looking for.
+        ExprKind::Let {
+            name,
+            ty,
+            value,
+            body,
+        } => {
+            let mut let_node = Node {
+                label: format!("Let {}", name.tracked),
+                ..node
+            }
+            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            if let Some(ty) = ty {
+                let mut ascribed = type_node(ids, ty);
+                ascribed.label = format!("Ascribed {}", ascribed.label);
+                let_node = let_node.child(ascribed);
+            }
+            let_node
+                .child(expr_node(ids, value))
+                .child(expr_node(ids, body))
+        }
         ExprKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node

@@ -2177,3 +2177,214 @@ fn an_erased_argument_is_let_through_a_sum_tail() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 }
+
+/// The name a nested `let` binds is in scope for both halves — its own value,
+/// so a binding may name itself, and the body written after the `in`.
+#[test]
+fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
+    let (mint, out) = built("let a = let f = fn n => f n in f");
+    let TermKind::Let {
+        name, value, body, ..
+    } = term_value(&mint, &out, "a")
+    else {
+        panic!("expected a let: {:#?}", term_value(&mint, &out, "a"));
+    };
+    // The body is the name, and the recursive use inside the value is the same
+    // symbol — one binding, seen from both sides.
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.tracked));
+    let TermKind::Fn { body: inner, .. } = &value.kind else {
+        panic!("expected a lambda: {:#?}", value.kind);
+    };
+    let TermKind::Apply { func, .. } = &inner.kind else {
+        panic!("expected an application: {:#?}", inner.kind);
+    };
+    assert!(matches!(func.kind, TermKind::Ident(symbol) if symbol == name.tracked));
+
+    // And the name is a local, minted beside the module the way a lambda's
+    // argument is rather than declared as a definition.
+    assert_eq!(mint.name(name.tracked), "f");
+    assert!(mint.is_local(name.tracked));
+    assert!(!out.program.terms.contains_key(&name.tracked));
+}
+
+/// And released at the end of the body: a name bound by a nested `let` is not
+/// visible after the expression it was written in.
+#[test]
+fn a_nested_let_releases_its_name_after_the_body() {
+    let src = "let leaked = let n = 1 in n\nlet after = n";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
+    ));
+    assert_eq!(out.errors[0].span.start, src.rfind('n').expect("the use"));
+    assert!(matches!(term_value(&mint, &out, "after"), TermKind::Error));
+}
+
+/// A nested binding shadows whatever the name meant outside it, silently — the
+/// way a lambda's argument already does. Two *definitions* of one name are a
+/// different thing and still complain: a scope inside a definition is not a
+/// second definition.
+#[test]
+fn a_nested_let_shadows_without_complaint() {
+    let (mint, out) = built("let n = 1\nlet a = let n = { v: 2 } in n");
+    let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
+        panic!("expected a let");
+    };
+    // The use in the body is the inner binding, not the definition above it.
+    assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.tracked));
+    assert_ne!(name.tracked, term_symbol(&mint, &out, "n"));
+
+    let (_, out) = build_src("let n = 1  let n = 2");
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::Duplicate { .. }));
+}
+
+/// Two nested lets cannot name each other. There is no block form to bind a
+/// group of them together, so `b` is simply not in scope where `a`'s value is
+/// written, and naming it is an unresolved name like any other.
+#[test]
+fn two_nested_lets_cannot_name_each_other() {
+    let src = "let e = let a = b in let b = 1 in a";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
+    ));
+    assert_eq!(out.errors[0].span.start, src.find("b in").expect("the use"));
+}
+
+/// A nested binding given as itself is the same complaint, in the same words,
+/// that `let x = x` gets at the top level: reported at the value's span, with
+/// the value erased so that inference is never handed the loop.
+#[test]
+fn a_nested_let_given_as_itself_is_circular() {
+    let src = "let e = let x = x in x";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-term");
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("x in").expect("the value")
+    );
+
+    let TermKind::Let { value, .. } = term_value(&mint, &out, "e") else {
+        panic!("expected a let");
+    };
+    assert!(matches!(value.kind, TermKind::Error));
+
+    // Including one written under a `fn`, which no definition's own chain
+    // reaches: the walk stops at a lambda, so every nested binding is followed
+    // from itself as well.
+    let src = "let g = fn p => let q = q in q";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-term");
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("q in").expect("the value")
+    );
+}
+
+/// A loop closed through two nested bindings tells both of them.
+///
+/// Two lets written side by side cannot reach each other — `b` is not in scope
+/// where `a`'s value is written — so the way two of them close a loop is by
+/// nesting: `x` is in scope inside its own value, so `y` written there can name
+/// it, and `x` is given as the `let` that stands for `y`.
+#[test]
+fn a_loop_through_two_nested_lets_reports_both() {
+    let src = "let e = let x = let y = x in y in x";
+    let (_, out) = build_src(src);
+    let spans: Vec<usize> = out
+        .errors
+        .iter()
+        .filter(|error| error.kind.code() == "circular-term")
+        .map(|error| error.span.start)
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            src.find("let y").expect("x's value"),
+            src.find("x in y").expect("y's value"),
+        ],
+        "errors: {:#?}",
+        out.errors
+    );
+}
+
+/// A shape ends a nested chain as surely as it ends a definition's, and the
+/// walk reads through a `let` to whatever its *body* stands for.
+#[test]
+fn a_nested_let_reaching_a_shape_is_not_circular() {
+    for src in [
+        "let e = let f = fn n => f n in f",
+        "let e = let x = 1 in let y = x in y",
+        "let e = fn p => let q = p in q",
+        "let a = let x = 1 in x  let b = a",
+    ] {
+        let (_, out) = build_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
+}
+
+/// A nested annotation is a written type like any other, so what a row
+/// argument may be is asked of one too. An annotation this walk never reached
+/// would be a `RepeatedRowField` never reported.
+#[test]
+fn a_nested_annotation_reaches_the_row_argument_check() {
+    let src = "type WithX r = { x: Nat, ..r }\nlet e = let n : WithX { x: Nat } = 1 in n";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::RepeatedRowField {
+            shape: Shape::Struct,
+            ..
+        }
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("{ x: Nat }").expect("the argument")
+    );
+}
+
+/// Grouping reads through a nested `let`: a top-level name mentioned only from
+/// inside one still puts the two definitions in one group, and the local the
+/// `let` binds is not a definition for a group to be about.
+#[test]
+fn grouping_sees_through_a_nested_let() {
+    let (mint, out) = built("let a = let x = b in { v: x }  let b = let y = a in { w: y }");
+    assert_eq!(groups(&mint, &out), [vec!["a", "b"]]);
+    assert!(out.program.groups[0].recursive);
+
+    // And a definition whose nested binding names nobody is a group of one.
+    let (mint, out) = built("let a = let x = 1 in x");
+    assert_eq!(groups(&mint, &out), [vec!["a"]]);
+    assert!(!out.program.groups[0].recursive);
+}
+
+/// The IR prints as surface syntax, and a nested `let` is no exception: it
+/// reads back as what was written, and re-lowers to the same program.
+#[test]
+fn displays_nested_lets() {
+    assert_eq!(
+        display_program("let a = let x = 1 in x"),
+        "let a = let x = 1 in x"
+    );
+    assert_eq!(
+        display_program("let a = let x : Nat = 1 in x"),
+        "let a = let x : Nat = 1 in x"
+    );
+    // A `let` in argument position wears the parentheses that make it one.
+    assert_eq!(
+        display_program("let f = fn x => x  let a = f (let x = 1 in x)"),
+        "let f = fn x => x\nlet a = f (let x = 1 in x)"
+    );
+}

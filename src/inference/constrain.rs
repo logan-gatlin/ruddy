@@ -6,16 +6,20 @@ use indexmap::IndexMap;
 
 use crate::{
     ir::{Term, TermKind},
-    symbol::Symbol,
+    symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Assigned, Core, Presence, Row, RowField, Scheme, Ty},
+    types::{Core, Presence, Row, RowField, Scheme, Ty, TyVar},
 };
 
-use super::{Binding, Constraint, ConstraintKind, Table, same_field_set};
+use super::{Annotated, Binding, Constraint, ConstraintKind, Table, lower_type, same_field_set};
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
 pub struct Constrain<'a> {
     pub table: &'a mut Table,
+    /// How to spell a declared type's name, for the one arm that lowers a
+    /// written type: a nested `let`'s annotation. Nothing is decided by it —
+    /// see [`lower_type`], where the mint is only ever a speller.
+    pub mint: &'a Mint,
     /// What each symbol in scope means. Symbols are globally unique, so one
     /// flat map serves every scope at once and nothing is ever popped: a
     /// lambda argument can never collide with a top-level definition.
@@ -29,6 +33,9 @@ pub struct Constrain<'a> {
     /// consults it still cannot depend on how much an earlier arm had solved.
     pub aliases: &'a IndexMap<Symbol, Scheme>,
     pub out: Vec<Constraint>,
+    /// Every annotation this walk lowered for a nested `let`, and the variables
+    /// each left open. See [`Annotated`].
+    pub annotated: Vec<Annotated>,
 }
 
 impl Constrain<'_> {
@@ -62,7 +69,80 @@ impl Constrain<'_> {
             TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
             TermKind::Ident(symbol) => {
                 let symbol = *symbol;
-                self.lookup(symbol)
+                self.lookup(span, symbol)
+            }
+            // A name bound for the length of a body, and everything about that
+            // said in the constraint language rather than done here: the walk
+            // still reads nothing out of the table, and what has to happen in
+            // what order is [`ConstraintKind::Let`]'s to say.
+            //
+            // The level is raised over the value and dropped again for the
+            // body, so a variable is minted at the level it was written at —
+            // which is the whole of what decides, later, whether the value is
+            // entitled to quantify it.
+            TermKind::Let {
+                name,
+                annotation,
+                value,
+                body,
+            } => {
+                self.table.level += 1;
+                let level = self.table.level;
+                // What the name is bound to inside its own value. An annotation
+                // is the contract, so the value is checked against it and the
+                // recursive uses the annotation exists for are checked against
+                // it too; without one it is a variable the value decides.
+                let bound = match annotation {
+                    Some(annotation) => {
+                        // The variables it minted are counted off, so that an
+                        // annotation the value went on to decide can be
+                        // refused. See [`Annotated`]. Counting is not
+                        // inspecting: how many variables exist says nothing
+                        // about what any of them has been solved to, which is
+                        // the invariant this pass keeps.
+                        let from = self.table.vars.len() as TyVar;
+                        let bound = lower_type(self.mint, self.table, annotation);
+                        self.annotated.push(Annotated {
+                            span: annotation.span,
+                            opened: from..self.table.vars.len() as TyVar,
+                        });
+                        bound
+                    }
+                    None => self.table.fresh_type(),
+                };
+                // Monomorphically, the same rule a binding group follows: a use
+                // of the name inside its own value is the one type being
+                // decided rather than a copy of a scheme that does not exist
+                // yet.
+                self.env.insert(name.tracked, Binding::Mono(bound.clone()));
+                let outer = std::mem::take(&mut self.out);
+                self.check_term(value, &bound);
+                let required = std::mem::replace(&mut self.out, outer);
+
+                self.table.level -= 1;
+                // And polymorphically in the body, where the scheme exists.
+                // Nothing is put back afterwards: a symbol is unique, so the
+                // name a nested `let` binds can never be one anything outside
+                // its body could have meant — the scope was decided by
+                // lowering, and this map only says what each symbol is.
+                self.env.insert(name.tracked, Binding::Local);
+                let outer = std::mem::take(&mut self.out);
+                self.infer_term(body);
+                let rest = std::mem::replace(&mut self.out, outer);
+
+                self.out.push(Constraint {
+                    span,
+                    kind: ConstraintKind::Let {
+                        symbol: name.tracked,
+                        bound,
+                        level,
+                        value: required,
+                        body: rest,
+                    },
+                });
+                // What the expression evaluates to is what its body evaluates
+                // to; the value is what the name is, not what the `let` is.
+                body.ty.clone()
             }
             TermKind::Apply { func, arg } => {
                 self.infer_term(func);
@@ -286,33 +366,36 @@ impl Constrain<'_> {
     /// The type of one name in scope. A polymorphic binding is instantiated —
     /// each use gets its own copy of the quantified variables — while a
     /// monomorphic one is shared, so uses of a lambda argument constrain each
-    /// other, which is exactly the let/lambda distinction.
-    fn lookup(&mut self, symbol: Symbol) -> Rc<Ty> {
+    /// other, which is exactly the let/lambda distinction. A name a nested
+    /// `let` bound is the polymorphic case with the scheme still to come, so
+    /// the copy is asked for rather than made.
+    fn lookup(&mut self, span: Span, symbol: Symbol) -> Rc<Ty> {
         // Indexed rather than looked up. A lambda's argument is bound where the
-        // walk enters its body; a top-level definition is bound before any body
+        // walk enters its body; a nested `let`'s name is bound before its own
+        // value is walked; a top-level definition is bound before any body
         // that could name it is walked — its own group's, monomorphically, and
         // every earlier group's as a scheme — and a name that resolved to
         // nothing already became `TermKind::Error`. A lookup falling back to a
         // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
             Binding::Mono(ty) => ty,
-            Binding::Poly(scheme) => self.instantiate(&scheme),
+            Binding::Poly(scheme) => self.table.instantiate(&scheme),
+            // The scheme is not written yet, so the walk says what this use is
+            // rather than what it has: a fresh copy of whatever the enclosing
+            // [`ConstraintKind::Let`] publishes. Which keeps the invariant this
+            // pass is built on — nothing here reads the table — over the one
+            // construct that would otherwise have to wait for a solve.
+            Binding::Local => {
+                let ty = self.table.fresh_type();
+                self.out.push(Constraint {
+                    span,
+                    kind: ConstraintKind::Instance {
+                        symbol,
+                        ty: ty.clone(),
+                    },
+                });
+                ty
+            }
         }
-    }
-
-    fn instantiate(&mut self, scheme: &Scheme) -> Rc<Ty> {
-        // One fresh variable per position the scheme bound, handed over as a
-        // bare type: which sort each one is, is decided where it lands, since
-        // that is what a scheme records. See [`Assigned::as_row`].
-        let fresh: Vec<Assigned> = (0..scheme.count())
-            .map(|_| Assigned::Ty(self.table.fresh_type()))
-            .collect();
-        let ty = scheme.body().open(&fresh);
-        // A scheme's body says which of its rows a quantified tail is the tail
-        // of, but the condition that follows from that is not part of the
-        // body: it lived beside the variables the scheme closed over, and this
-        // copy's variables are new. Said again, of them.
-        self.table.note_lacks(&ty);
-        ty
     }
 }

@@ -341,3 +341,32 @@ fn recursion_and_forward_references_round_trip() {
         assert_eq!(again, ir, "{source} did not round-trip");
     }
 }
+
+/// A nested `let` prints back as the surface syntax it was written as, in both
+/// trees, and the printed form re-parses and re-lowers to the same thing.
+///
+/// The `in` is what makes this need no parentheses anywhere: it begins no atom,
+/// so a value that would otherwise run rightward stops in front of it, and the
+/// body is the last thing on the line. A `let` written where something may
+/// follow it is a different question, and the two below are that question — an
+/// argument, and the head of an application.
+#[test]
+fn a_nested_let_round_trips() {
+    for source in [
+        "let a = let x = 1 in x",
+        "let a = let x : Nat = 1 in x",
+        "let a = let x = 1 in let y = { v: x } in y",
+        "let a = let x = let y = 1 in y in x",
+        "let a = fn p => let x = p.v in x",
+        "let a = { v: let n = 1 in n }",
+        "let f = fn x => x\nlet a = f (let n = 1 in n)",
+        "let a = (let f = fn x => x in f) 1",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+
+        let (_, again) = printed(&ir);
+        assert_eq!(again, ir, "{source} did not round-trip");
+    }
+}

@@ -653,3 +653,134 @@ fn every_position_that_can_fail_reports_before_it_does() {
         );
     }
 }
+
+/// `let <name> [: <type>] = <value> in <body>` is an expression, and it prints
+/// back as what it was written as. The ascription is the same grammar the
+/// statement has, so a definition and a binding inside one read alike.
+#[test]
+fn a_let_is_an_expression() {
+    assert_eq!(
+        parse_one("let a = let x = 1 in x"),
+        "let a = let x = 1 in x"
+    );
+    assert_eq!(
+        parse_one("let a = let x : Nat = 1 in x"),
+        "let a = let x : Nat = 1 in x"
+    );
+    assert_eq!(
+        parse_one("let a = let f : { x: Nat } -> Nat = fn p => p.x in f"),
+        "let a = let f : { x: Nat } -> Nat = fn p => p.x in f"
+    );
+}
+
+/// The body extends as far right as it can, ML-style, exactly as a `fn` body
+/// does — so the application is inside the `let` rather than the `let` inside
+/// the application.
+#[test]
+fn a_lets_body_runs_as_far_right_as_it_can() {
+    assert_eq!(
+        parse_one("let a = let f = g in f x y"),
+        "let a = let f = g in f x y"
+    );
+    // And the value stops at the `in`, which is what makes that unambiguous:
+    // `in` begins no atom, so the application gathering `g`'s arguments ends
+    // in front of it.
+    assert_eq!(
+        parse_one("let a = let f = g x in f"),
+        "let a = let f = g x in f"
+    );
+}
+
+/// A `let` may start an expression anywhere an atom may.
+#[test]
+fn a_let_starts_an_expression_wherever_an_atom_does() {
+    for (src, printed) in [
+        // A `fn` body.
+        (
+            "let a = fn p => let x = p in x",
+            "let a = fn p => let x = p in x",
+        ),
+        // A struct field's value.
+        (
+            "let a = { v: let n = 1 in n }",
+            "let a = { v: let n = 1 in n }",
+        ),
+        // A parenthesized expression.
+        ("let a = (let n = 1 in n)", "let a = let n = 1 in n"),
+        // Another let's value, and another let's body.
+        (
+            "let a = let x = let y = 1 in y in x",
+            "let a = let x = let y = 1 in y in x",
+        ),
+        (
+            "let a = let x = 1 in let y = x in y",
+            "let a = let x = 1 in let y = x in y",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src}");
+    }
+}
+
+/// A `let` is not an application argument: the loop that gathers arguments
+/// stops in front of one. Which is what keeps two definitions written one after
+/// the other from reading as an application, and what makes the parentheses in
+/// `f (let x = 1 in x)` the way to pass one.
+#[test]
+fn a_let_is_not_an_application_argument() {
+    let out = parse(lex("let a = 1 let b = 2", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+
+    assert_eq!(
+        parse_one("let a = f (let x = 1 in x)"),
+        "let a = f (let x = 1 in x)"
+    );
+
+    // Without them the application ends at `f`, the `let` is read as a new
+    // definition, and its `in` is the token nothing can use.
+    let src = "let a = f let x = 1 in x";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find(" in ").expect("the `in`") + 1
+    );
+}
+
+/// Every position a nested `let` can fail at, reported where it is — and the
+/// statement dropped, so recovery resumes at the next `let` or `type` the way
+/// it does for any other malformed statement.
+#[test]
+fn a_let_expression_reports_where_it_fails() {
+    // Each case is the source and the tail of it the complaint should land on,
+    // which is the token the position had no reading for.
+    for (src, from) in [
+        // The name, the ascribed type, and the `=`.
+        ("let a = let = 1 in x", "= 1 in x"),
+        ("let a = let x : = 1 in x", "= 1 in x"),
+        ("let a = let x 1 in x", "1 in x"),
+        // The value, the `in` the body follows, and the body itself.
+        ("let a = let x = in x", "in x"),
+        ("let a = let x = 1 } x", "} x"),
+        ("let a = let x = 1 in }", "}"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
+        let at = src.len() - from.len();
+        assert_eq!(out.errors[0].span.start, at, "{src:?}");
+    }
+
+    // A `let` with no `in` at all runs out of input, and is reported there.
+    let src = "let a = let x = 1";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, src.len());
+    assert_eq!(out.errors[0].span.width, 0);
+
+    // And recovery resumes at the next statement rather than swallowing it.
+    let out = parse(lex("let a = let x = 1  let b = 2", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+}

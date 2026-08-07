@@ -15,8 +15,8 @@ use ruddy::{
 };
 
 use crate::print::{
-    Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
-    write_sum, write_tag,
+    Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project, write_row,
+    write_struct, write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -126,7 +126,10 @@ impl fmt::Display for Show<'_, Program> {
 impl Grouped for Show<'_, TermKind> {
     fn prec(&self) -> Prec {
         match self.node {
-            TermKind::Fn { .. } => Prec::Lambda,
+            // A `let`'s body runs as far right as a lambda's does, so the two
+            // group alike. The parse tree's printer says the same, because it
+            // is the same syntax.
+            TermKind::Fn { .. } | TermKind::Let { .. } => Prec::Lambda,
             // A tag carrying something groups as the application it reads as;
             // carrying nothing it groups below one, because the argument would
             // be read as the payload it has not got. The parse tree's printer
@@ -176,6 +179,21 @@ impl fmt::Display for Show<'_, TermKind> {
                 "fn {} => {}",
                 self.mint.name(arg.tracked),
                 self.show(&**body)
+            ),
+            // The name comes off the mint, the way every other IR node's does,
+            // so what is printed is the name that was written even though the
+            // tree holds a symbol.
+            TermKind::Let {
+                name,
+                annotation,
+                value,
+                body,
+            } => write_let(
+                f,
+                self.mint.name(name.tracked),
+                annotation.as_ref().map(|ty| self.show(ty)),
+                &self.show(&**value),
+                &self.show(&**body),
             ),
             TermKind::Struct(fields) => write_struct(f, self.pairs(fields)),
             // A case carrying nothing prints as nothing, which is what it was
