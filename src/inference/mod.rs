@@ -294,11 +294,18 @@ pub enum ErrorKind {
     /// The base need not be a struct, now that every type carries a field row.
     /// A type whose row is closed and empty allows no label at all, so a
     /// projection's demand landing on the *actual* side of a goal against `Nat`
-    /// is refused here rather than as a missing field — `let b : Nat -> Nat =
-    /// fn p => p.x` reads ``extra field `x`: the type `Nat` lists every field
-    /// it allows``. Which of the two complaints a demand becomes is decided by
-    /// which side of the goal it sits on, which is decided by where the
-    /// annotation is; see [`Solve::absorb`].
+    /// is refused here rather than as a missing field: `let g = fn p => p.x` and
+    /// then `let b : Nat -> Nat = g` reads ``extra field `x`: the type `Nat`
+    /// lists every field it allows``, because the annotation is the expected side
+    /// and what is being checked against it — demand and all — is `g`.
+    ///
+    /// Which of the two complaints a demand becomes is decided by which side of
+    /// the goal it sits on, which is decided by where the annotation is and by
+    /// nothing about the projection. Writing the same thing as one definition,
+    /// `let b : Nat -> Nat = fn p => p.x`, puts the demand on the expected side —
+    /// a projection is a demand on its base — and the annotation's `Nat` on the
+    /// actual one, and the very same refusal comes out as ``no field `x` on
+    /// `Nat` ``. See [`Solve::absorb`], which says this from the other end.
     ExtraField {
         shape: Shape,
         base: Rc<Ty>,
@@ -958,6 +965,15 @@ impl Table {
     /// The question is one question, and asking it once is what keeps the walk
     /// a walk: the positions differ in where they look, not in what they are
     /// looking for.
+    ///
+    /// Which is also the only form of it this codebase can hold itself to. Asked
+    /// per position, the comparison at a row's tail and the one at a presence
+    /// could never answer yes — the paragraph below is why — so two of the
+    /// walk's own branches would be unreachable, and a rule with a branch nobody
+    /// can exercise is a rule nobody can rely on. One comparison, at the end, is
+    /// a comparison both answers of which a program can produce. Walking the
+    /// whole value to reach it is what that costs, and this is not the place the
+    /// solver's time goes.
     ///
     /// It is answered yes only about a core variable, and that is a fact about
     /// the solver rather than a hole in the walk. Two reasons, and between them

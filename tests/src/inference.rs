@@ -406,6 +406,46 @@ fn a_failed_definition_is_undecided_rather_than_polymorphic() {
     );
 }
 
+/// A definition whose fields could not be made to agree publishes a type
+/// something can satisfy, so the mistake is reported where it was made and not
+/// again at every use.
+///
+/// The core is why this needs saying. A projection demands a fresh core carrying
+/// the field, and asking the same base for something else — to be a function,
+/// say — binds that core to the something else. If the fields then turn out not
+/// to fit on it, the binding was part of the goal that failed: left standing it
+/// makes the parameter a function that also carries an `x`, which no term can
+/// be and no annotation can write, and every call is then refused for a mistake
+/// already reported one line up.
+#[test]
+fn a_definition_whose_fields_failed_is_not_refused_again_at_every_use() {
+    let src = "let f = fn p => { a: p.x, b: p 1 }\nlet g = f { x: 1 }\nlet h = f (fn n => n)";
+    let (mint, _, output) = infer_src(src);
+    let messages: Vec<String> = output
+        .errors
+        .iter()
+        .map(|error| error.kind.to_string())
+        .collect();
+    assert_eq!(
+        messages,
+        ["extra field `x`: the type `Nat -> 'a` lists every field it allows"],
+        "{:#?}",
+        output.errors
+    );
+    // What `f` takes is abandoned rather than published: the core is undecided,
+    // which unifies with anything, so both calls go through.
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "? with { x: ? } -> { a: ?, b: 'a }"
+    );
+
+    // The same shape one binder further out, where the two projections share a
+    // core and the failure is about the other binder's.
+    let src = "let z = fn a => fn b => { l: a.m, r: b.m, e: a b }\nlet w = z { m: 1 } { m: 2 }";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
 /// The occurs check failing is not a variable taking a type. A step naming
 /// `Rule::Bind` above an effect reading "this type would have to contain itself" tells whoever is
 /// stepping through the solve the opposite of what happened.
@@ -1017,6 +1057,17 @@ fn a_projection_checked_against_a_fieldless_annotation_is_an_extra_field() {
     // Underlining the definition, which is the side the demand came from.
     assert_eq!(error.span.start, 41);
     assert_eq!(error.span.width, 1);
+
+    // And the same thing written as one definition is the *other* complaint: the
+    // annotation pushes the `Nat` down onto `p`, so the demand is the expected
+    // side and the `Nat` the actual one. Two doc comments used to disagree about
+    // this program; the compiler never did.
+    let (_, _, output) = infer_src("let b : Nat -> Nat = fn p => p.x");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(error.kind.to_string(), "no field `x` on `Nat`");
 }
 
 /// Every projection complaint underlines the field name, whatever the base is.
@@ -1590,6 +1641,12 @@ fn giving_up_on_a_goal_is_a_step_of_its_own() {
             "    presence  present ~ absent => no field `x` on `Nat`",
             "    recover  ?2 ~ ? => ?2 := ?",
             "    bind  ?4 ~ ∅ => ?4 := ∅",
+            // And then the core, which the step above bound to the `Nat` and
+            // the failure took back: a type is its core and its fields, one
+            // goal decided both, and a core standing for a type that carries a
+            // field it cannot carry is a type nothing satisfies. Said as a step
+            // like every other change to the solution.
+            "recover  ?3 ~ ? => ?3 := ?",
             // And the definition is what its abandoned body is, which absorbs
             // — and abandons `bad`'s own variable with it, so nothing later
             // reads it as still open.

@@ -188,13 +188,22 @@ impl Solve<'_> {
             // with no fields is every type the language can write, so this
             // second step is invisible to every program that could be written
             // before fields were a property of all of them.
+            //
+            // And if those fields turn out not to agree, the cores go with
+            // them: the two halves were decided by one goal, so a failure in
+            // the second half is a failure of the whole of it. See
+            // [`Solve::abandon`].
             _ => {
                 let decided = self.cores(span, goal, &lhs, &rhs);
                 let carried = !(lhs.fields.is_trivial() && rhs.fields.is_trivial());
                 if decided && carried {
+                    let reported = self.errors.len();
                     self.depth += 1;
                     self.rows(span, Rowed::fields(&lhs), Rowed::fields(&rhs));
                     self.depth -= 1;
+                    if self.errors.len() > reported {
+                        self.abandon(span, &lhs, &rhs);
+                    }
                 }
             }
         }
@@ -292,21 +301,7 @@ impl Solve<'_> {
                 self.errors.truncate(reported);
                 self.steps.truncate(stepped);
                 self.table.restore(known);
-                let error = Error {
-                    span,
-                    kind: ErrorKind::Mismatch {
-                        expected: lhs.clone(),
-                        actual: rhs.clone(),
-                    },
-                };
-                self.fail(
-                    span,
-                    Rule::Mismatch,
-                    goal,
-                    error,
-                    &[Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())],
-                );
-                false
+                self.mismatch(span, goal, lhs, rhs)
             }
             (Core::Named { .. }, _) | (_, Core::Named { .. }) => {
                 self.unfold(span, goal, lhs, rhs);
@@ -352,28 +347,34 @@ impl Solve<'_> {
                 self.rows(span, Rowed::cases(lhs, cases), Rowed::cases(rhs, others));
                 true
             }
-            // Nothing applies, and the two types cannot be made equal. Named as
-            // the two whole types rather than as their cores: a `Nat` against
-            // `{ x: Nat }` is a mismatch of what the reader wrote, and the
-            // cores alone would quote them a unit they never mentioned.
-            _ => {
-                let error = Error {
-                    span,
-                    kind: ErrorKind::Mismatch {
-                        expected: lhs.clone(),
-                        actual: rhs.clone(),
-                    },
-                };
-                self.fail(
-                    span,
-                    Rule::Mismatch,
-                    goal,
-                    error,
-                    &[Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())],
-                );
-                false
-            }
+            // Nothing applies, and the two types cannot be made equal.
+            _ => self.mismatch(span, goal, lhs, rhs),
         }
+    }
+
+    /// The two types cannot be made equal: report it, abandon both of them, and
+    /// say the field rows are not worth deciding.
+    ///
+    /// Two arms above end here — no rule applying, and a congruence whose
+    /// arguments disagreed, which is the same answer reached after putting back
+    /// everything the attempt did. One function because it is one act, said the
+    /// same way both times: a reader who meets the two complaints should not have
+    /// to check whether they abandon the same things.
+    ///
+    /// Named as the two whole types rather than as their cores: a `Nat` against
+    /// `{ x: Nat }` is a mismatch of what the reader wrote, and the cores alone
+    /// would quote them a unit they never mentioned.
+    fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+        let error = Error {
+            span,
+            kind: ErrorKind::Mismatch {
+                expected: lhs.clone(),
+                actual: rhs.clone(),
+            },
+        };
+        let abandoned = [Assigned::Ty(lhs.clone()), Assigned::Ty(rhs.clone())];
+        self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+        false
     }
 
     /// Make two rows of one shape the same row. [`Rule::Struct`] — or
@@ -530,8 +531,8 @@ impl Solve<'_> {
     /// binding the flattened row rather than its bare end is what makes that a
     /// fact about the callers instead of something this has to be told.
     fn rests(&mut self, span: Span, lhs: &Rest, rhs: &Rest) {
-        let want = Rc::new(self.table.canon(&bare(lhs)));
-        let have = Rc::new(self.table.canon(&bare(rhs)));
+        let want = Rc::new(self.table.canon(&Row::of(lhs.clone())));
+        let have = Rc::new(self.table.canon(&Row::of(rhs.clone())));
         let goal = Goal::Row {
             expected: want.clone(),
             actual: have.clone(),
@@ -634,26 +635,25 @@ impl Solve<'_> {
             // The common case: certainly there on both sides, so presence
             // has nothing to say and the types carry the whole question.
             (Presence::Present, Presence::Present) => self.unify(span, &want.ty, &have.ty),
-            (Presence::Present, Presence::Absent) => {
-                let kind = ErrorKind::MissingField {
-                    shape,
-                    base: self.frozen(actual),
-                    field: name.to_string(),
-                };
-                let abandoned = [Assigned::Ty(want.ty.clone()), Assigned::Ty(have.ty.clone())];
-                self.fail(
-                    span,
-                    Rule::Presence { shape },
-                    goal,
-                    Error { span, kind },
-                    &abandoned,
-                );
-            }
-            (Presence::Absent, Presence::Present) => {
-                let kind = ErrorKind::ExtraField {
-                    shape,
-                    base: self.frozen(expected),
-                    field: name.to_string(),
+            // One side must have the label and the other cannot. Which of the two
+            // complaints that is, is which way round they are, and nothing else
+            // about the failure differs: the same rule, the same goal, and both
+            // label types abandoned either way. So it is one arm — the label is
+            // missing from the side that cannot have it, and the type named is
+            // the side that says what is allowed.
+            (Presence::Present, Presence::Absent) | (Presence::Absent, Presence::Present) => {
+                let field = name.to_string();
+                let kind = match p1 {
+                    Presence::Present => ErrorKind::MissingField {
+                        shape,
+                        base: self.frozen(actual),
+                        field,
+                    },
+                    _ => ErrorKind::ExtraField {
+                        shape,
+                        base: self.frozen(expected),
+                        field,
+                    },
                 };
                 let abandoned = [Assigned::Ty(want.ty.clone()), Assigned::Ty(have.ty.clone())];
                 self.fail(
@@ -753,8 +753,8 @@ impl Solve<'_> {
                 rest: rest.clone(),
             });
             let (expected, actual) = match side {
-                Side::Expected => (Rc::new(bare(tail)), row.clone()),
-                Side::Actual => (row.clone(), Rc::new(bare(tail))),
+                Side::Expected => (Rc::new(Row::of(tail.clone())), row.clone()),
+                Side::Actual => (row.clone(), Rc::new(Row::of(tail.clone()))),
             };
             let goal = Goal::Row { expected, actual };
             // Not a second row rule: what the extras are was decided above, and
@@ -989,6 +989,38 @@ impl Solve<'_> {
         }
     }
 
+    /// Abandon the cores of two types whose field rows could not be made to
+    /// agree.
+    ///
+    /// [`fail`](Self::fail) abandons what a failing rule was about, and a core
+    /// is the one thing it cannot reach. A type is its core and its fields, both
+    /// decided by one goal, so a failure over the fields is a failure of the
+    /// whole of it — and the core was bound in between, by the step before. Left
+    /// standing, a core variable bound to a fieldless type while labels sit
+    /// beside it is a type nothing can be: the definition publishes it, and
+    /// every use of the definition is refused again for the one mistake already
+    /// reported. `let f = fn p => { a: p.x, b: p 1 }` is the shape of it — `p`
+    /// would have to be a function carrying an `x` — and that is `f`'s mistake,
+    /// said once, wherever `f` is then used.
+    ///
+    /// Settled rather than recovered because there is no longer a variable to
+    /// recover: this goal bound it, so [`recover_ty`](Self::recover_ty) would
+    /// resolve straight through the binding and find nothing to abandon.
+    ///
+    /// The cores and nothing else. What the two types hold besides them — a
+    /// label's type, an arrow's halves — was not decided by the goal that
+    /// failed, and a complaint already made names one of these two types: a
+    /// reader is better served by ``no field `y` on `'a -> 'a` `` than by the
+    /// same sentence about `? -> ?`.
+    fn abandon(&mut self, span: Span, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
+        for core in [&lhs.core, &rhs.core] {
+            if let Core::Var(var) = core {
+                let var = *var;
+                self.settle(span, var, Assigned::Ty(Rc::new(Ty::default())));
+            }
+        }
+    }
+
     /// Abandon a value nothing will decide: every variable still unsolved in it
     /// becomes undecided, which unifies with everything, so the one complaint is
     /// not echoed by every term downstream of it. No occurs check — an undecided
@@ -1056,15 +1088,8 @@ impl Solve<'_> {
 
     /// [`recover`](Self::recover) over a tail.
     fn recover_rest(&mut self, span: Span, rest: &Rest) {
-        if let Rest::Var(var) = self.table.canon(&bare(rest)).rest {
-            self.settle(
-                span,
-                var,
-                Assigned::Row(Rc::new(Row {
-                    labels: IndexMap::new(),
-                    rest: Rest::Undecided,
-                })),
-            );
+        if let Rest::Var(var) = self.table.canon(&Row::of(rest.clone())).rest {
+            self.settle(span, var, Assigned::Row(Rc::new(Row::of(Rest::Undecided))));
         }
     }
 
@@ -1086,7 +1111,7 @@ impl Solve<'_> {
                 actual: ty.clone(),
             },
             Assigned::Row(row) => Goal::Row {
-                expected: Rc::new(bare(&Rest::Var(var))),
+                expected: Rc::new(Row::of(Rest::Var(var))),
                 actual: row.clone(),
             },
             Assigned::Presence(presence) => Goal::Presence {
@@ -1106,15 +1131,5 @@ impl Solve<'_> {
             goal,
             effect,
         });
-    }
-}
-
-/// A tail as the row it stands for: no labels of its own, and everything past
-/// them. What a tail is compared and bound as, since the sort a row variable
-/// has is the row sort.
-fn bare(rest: &Rest) -> Row {
-    Row {
-        labels: IndexMap::new(),
-        rest: rest.clone(),
     }
 }

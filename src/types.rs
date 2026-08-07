@@ -371,10 +371,7 @@ impl Assigned {
         match self {
             Assigned::Row(row) => (**row).clone(),
             Assigned::Ty(ty) => match (&ty.core, ty.fields.is_trivial()) {
-                (Core::Var(var), true) => Row {
-                    labels: IndexMap::new(),
-                    rest: Rest::Var(*var),
-                },
+                (Core::Var(var), true) => Row::of(Rest::Var(*var)),
                 _ => ty.row(shape),
             },
             Assigned::Presence(_) => Row::closed(),
@@ -401,10 +398,7 @@ impl Assigned {
     pub fn variable(&self, var: TyVar) -> Self {
         match self {
             Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::plain(Core::Var(var)))),
-            Assigned::Row(_) => Assigned::Row(Rc::new(Row {
-                labels: IndexMap::new(),
-                rest: Rest::Var(var),
-            })),
+            Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Var(var)))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Var(var)),
         }
     }
@@ -415,10 +409,7 @@ impl Assigned {
     pub fn undecided(&self) -> Self {
         match self {
             Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::default())),
-            Assigned::Row(_) => Assigned::Row(Rc::new(Row {
-                labels: IndexMap::new(),
-                rest: Rest::Undecided,
-            })),
+            Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Undecided),
         }
     }
@@ -453,13 +444,6 @@ impl Ty {
         Self::plain(Core::Unit)
     }
 
-    /// The sum nothing inhabits: no cases, and no more to come.
-    ///
-    /// [`unit`](Self::unit)'s counterpart, and here for the same reason.
-    pub fn empty_sum() -> Self {
-        Self::plain(Core::Sum(Row::closed()))
-    }
-
     /// The row a row parameter written in a position of this shape stands for:
     /// a struct's own fields, a sum's cases.
     ///
@@ -471,18 +455,30 @@ impl Ty {
         match (shape, &self.core) {
             (Shape::Struct, Core::Unit) => self.fields.clone(),
             (Shape::Sum, Core::Sum(cases)) => cases.clone(),
-            _ => Row {
-                labels: IndexMap::new(),
-                rest: Rest::Undecided,
-            },
+            _ => Row::of(Rest::Undecided),
         }
     }
 }
 
 impl Row {
+    /// A row that names nothing of its own, and then whatever `rest` allows.
+    ///
+    /// What a tail *is*, written as the row it stands for: the sort a row
+    /// variable has is the row sort, so a tail is compared and bound as a row
+    /// with no labels in front of it. Also what every "nothing yet" row is —
+    /// the undecided one a failure abandons a tail to, and the fresh one a
+    /// variable stands for — so there is one spelling of a bare row instead of
+    /// six copies of a literal that have to agree.
+    pub fn of(rest: Rest) -> Self {
+        Self {
+            labels: IndexMap::new(),
+            rest,
+        }
+    }
+
     /// The row that names nothing and allows nothing more.
     pub fn closed() -> Self {
-        Self::default()
+        Self::of(Rest::Closed)
     }
 
     /// Whether this row says nothing at all: no labels, and no room for any.

@@ -48,7 +48,7 @@ use crate::{
     ir, parse,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
-    types::{Assigned, Core, Presence, Prim, Rest, Row, Scheme, Sense, Shape, Ty},
+    types::{Assigned, Core, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape, Ty},
 };
 
 /// The note a duplicate definition points back with, printed against the span
@@ -141,6 +141,21 @@ impl<'a> Path<'a> {
     pub(crate) fn new(mint: &'a Mint, symbol: Symbol) -> Self {
         Self { mint, symbol }
     }
+}
+
+/// A row read as one of the two shapes: a struct's fields in braces, a sum's
+/// cases with their backticks.
+///
+/// What a spliced tail prints as, and the one place a row's notation is chosen
+/// by something other than the position the row sits in. A tail is written by
+/// the row it ends — see [`tail_of`] — so the shape travels down from the type
+/// whose row it is, and `` `Err Nat | ..`Ok Nat `` never comes out spelled with
+/// a colon. See [`Display for Labels`](Labels) for the two writers it picks
+/// between, and [`Display for Row`](Row) for what a row with no shape to hand
+/// down falls back to.
+struct Labels<'a> {
+    shape: Shape,
+    row: &'a Row,
 }
 
 impl token::ErrorKind {
@@ -587,22 +602,7 @@ impl fmt::Display for Core {
             Core::Unit => write_fields(f, &Row::closed()),
             Core::Nat => f.write_str(Prim::Nat.name()),
             Core::Arrow(from, to) => write_arrow(f, &**from, &**to),
-            // A sum reads as its cases: absent not at all, undecided as
-            // `` `A? T ``, and the tail after them. The one thing it has that a
-            // struct has not is a case carrying unit, which prints as no
-            // payload at all — `` `None `` is how it was written, and
-            // `` `None {} `` is the same type spelled longer.
-            Core::Sum(Row { labels, rest }) => {
-                let cases = labels
-                    .iter()
-                    .filter_map(|(name, field)| match &field.presence {
-                        Presence::Absent => None,
-                        Presence::Present => Some((name, false, payload(&field.ty))),
-                        _ => Some((name, true, payload(&field.ty))),
-                    });
-                let tail = tail_of(rest);
-                write_sum(f, cases, tail.as_ref().map(shown))
-            }
+            Core::Sum(cases) => write_cases(f, cases),
             // A declared type prints as what the user called it rather than as
             // what it stands for, applied to whatever it was given. It is
             // shorter, it is what they wrote, and it is the only way a type
@@ -623,16 +623,36 @@ impl fmt::Display for Core {
 /// A row prints as what it says about the labels it names and about the ones it
 /// does not.
 ///
-/// Written in the struct's own notation, because a row standing alone is always
-/// a tail — what a solver step bound a row variable to, or what two rows were
-/// asked to agree on — and a tail has no shape of its own to be read in. A row
-/// that names nothing prints as its rest alone, so closing one reads `?4 := ∅`
-/// rather than as an empty pair of braces standing for the same thing.
+/// Written in the struct's notation, because a row reaching here has no shape to
+/// be read in. Where one does is the solver's own record — what a step bound a
+/// row variable to, and what two rows were asked to agree on — and a [`Row`]
+/// does not say which of the two shapes it is: the shape is a reading the
+/// position hands down, and a row that has been lifted out of its position has
+/// nobody left to hand it one. So a sum's tail bound in the Solve tab reads
+/// `?2 := { B: Nat }` rather than in cases, and the braces there are notation
+/// for a set of labels rather than a claim that they are fields. Everywhere a
+/// shape *is* known the row goes through [`Labels`] instead, which is every row
+/// printed as part of a type.
+///
+/// A row that names nothing prints as its rest alone, so closing one reads
+/// `?4 := ∅` rather than as an empty pair of braces standing for the same
+/// thing.
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.labels.is_empty() {
             true => self.rest.fmt(f),
             false => write_fields(f, self),
+        }
+    }
+}
+
+/// A row in the notation of the shape it belongs to, which is the one thing
+/// [`Display for Row`](Row) cannot know.
+impl fmt::Display for Labels<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.shape {
+            Shape::Struct => write_fields(f, self.row),
+            Shape::Sum => write_cases(f, self.row),
         }
     }
 }
@@ -654,7 +674,30 @@ fn write_fields(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
             Presence::Present => Some((name, false, &field.ty)),
             _ => Some((name, true, &field.ty)),
         });
-    write_row(f, entries, tail_of(&row.rest).as_ref().map(shown))
+    write_row(
+        f,
+        entries,
+        tail_of(Shape::Struct, &row.rest).as_ref().map(shown),
+    )
+}
+
+/// [`write_fields`] about the other shape: the cases of a row and its tail, each
+/// wearing the backtick that makes it one.
+///
+/// Absent not at all, undecided as `` `A? T ``, and the tail after them. The one
+/// thing a sum has that a struct has not is a case carrying unit, which prints
+/// as no payload at all — `` `None `` is how it was written, and `` `None {} ``
+/// is the same type spelled longer.
+fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
+    let cases = row
+        .labels
+        .iter()
+        .filter_map(|(name, field)| match &field.presence {
+            Presence::Absent => None,
+            Presence::Present => Some((name, false, payload(&field.ty))),
+            _ => Some((name, true, payload(&field.ty))),
+        });
+    write_sum(f, cases, tail_of(Shape::Sum, &row.rest).as_ref().map(shown))
 }
 
 /// What is known about the labels a row does not name.
@@ -720,20 +763,40 @@ fn letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
     }
 }
 
-/// What follows a row's `..`, or `None` when the row is closed and no `..` is
-/// written at all: a quantified `'a`, a solver variable's `?3`, or the empty
-/// string where the rest is undecided and there is nothing to report.
+/// What follows a row's `..`, or `None` when the row allows nothing more and no
+/// `..` is written at all: a quantified `'a`, a solver variable's `?3`, the
+/// labels a tail has been decided to be, or the empty string where the rest is
+/// undecided and there is nothing to report.
 ///
-/// Shared by the two shapes because the tail is the one part of a row that
-/// reads the same either way — it stands for the labels not named, and what it
-/// stands for is spelled by what it resolved to rather than by what kind of
-/// row it ends.
-fn tail_of(rest: &Rest) -> Option<String> {
+/// A tail decided to be more labels is the one part of this the shape is needed
+/// for, and the reason it is passed down: those labels are the row's own,
+/// written in the row's own notation, so a sum's spliced tail reads
+/// `` ..`Ok Nat `` and not `..{ Ok: Nat }`. Everything else about a tail reads
+/// the same either way — it stands for the labels not named, and what it stands
+/// for is spelled by what it resolved to.
+///
+/// A splice that came to nothing is no tail. `..r` handed a closed row that
+/// names nothing leaves a tail saying exactly what [`Rest::Closed`] says, and
+/// the answer has to be the same for both: `∅` is the solver's mark for a row
+/// with nothing more to come and is never part of a printed type, so `F {}` for
+/// `type F r = { x: Nat, ..r }` prints `{ x: Nat }` — which is the type it is.
+/// A label the splice settled absent counts for nothing here, on the same
+/// grounds as everywhere else: a label that is not there is not part of what the
+/// type says.
+fn tail_of(shape: Shape, rest: &Rest) -> Option<String> {
     match rest {
         Rest::Closed => None,
+        Rest::More(row) if row.labels.values().all(absent) => tail_of(shape, &row.rest),
         Rest::Undecided => Some(String::new()),
+        Rest::More(row) => Some(Labels { shape, row }.to_string()),
         open => Some(open.to_string()),
     }
+}
+
+/// Whether one label is settled not to be there, and so is no part of what the
+/// row it sits in says.
+fn absent(field: &RowField) -> bool {
+    matches!(field.presence, Presence::Absent)
 }
 
 /// A borrowed tail as the trait object [`write_row`] and [`write_sum`] take.
@@ -754,14 +817,13 @@ fn shown(tail: &String) -> &dyn fmt::Display {
 /// prints.
 fn payload(ty: &Ty) -> Option<&Ty> {
     // A field settled absent is not part of what the type says, so a type that
-    // prints as `{}` is unit however many labels the solver left in the map.
+    // prints as `{}` is unit however many labels the solver left in the map. The
+    // tail is asked the same way a printed row asks it — whether a `..` would be
+    // written at all — so a case whose payload was spliced from a row that names
+    // nothing is still a case carrying unit, and still prints as `` `A ``.
     let empty = matches!(ty.core, Core::Unit)
-        && matches!(ty.fields.rest, Rest::Closed)
-        && ty
-            .fields
-            .labels
-            .values()
-            .all(|field| matches!(field.presence, Presence::Absent));
+        && tail_of(Shape::Struct, &ty.fields.rest).is_none()
+        && ty.fields.labels.values().all(absent);
     match empty {
         true => None,
         false => Some(ty),

@@ -1141,6 +1141,114 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
     );
 }
 
+/// A tail decided to be more labels prints as those labels, written in the
+/// notation of the row it ends — and a splice that came to nothing prints as no
+/// tail at all.
+///
+/// Both are what a row parameter leaves behind, so both are what the debugger's
+/// IR tab shows for a lambda checked against a declared type. `..r` handed a
+/// sum's cases is those cases, and spelling them with colons would show a reader
+/// a case list as if it were a set of fields. `..r` handed `{}` allows nothing
+/// more, which is what a closed row already says — and `∅` is the solver's own
+/// mark for that, never part of a printed type.
+#[test]
+fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
+    let nat = Rc::new(Ty::plain(Core::Nat));
+    let more = |labels: Vec<(&str, RowField)>, rest: Rest| {
+        Rest::More(Rc::new(Row {
+            labels: labels
+                .into_iter()
+                .map(|(name, field)| (name.to_string(), field))
+                .collect(),
+            rest,
+        }))
+    };
+
+    // A struct's spliced tail, in braces: `type F r = { x: Nat, ..r }` applied
+    // to `{}` and to `{ y: Nat }`.
+    let x_nat = || vec![("x", RowField::present(nat.clone()))];
+    assert_eq!(
+        with_fields(Core::Unit, x_nat(), more(vec![], Rest::Closed)).to_string(),
+        "{ x: Nat }"
+    );
+    assert_eq!(
+        with_fields(
+            Core::Unit,
+            x_nat(),
+            more(vec![("y", RowField::present(nat.clone()))], Rest::Closed)
+        )
+        .to_string(),
+        "{ x: Nat, ..{ y: Nat } }"
+    );
+
+    // A sum's, in cases: `type G r = `Err Nat | ..r` applied to `` `Ok Nat ``,
+    // and to `{}`, which leaves the sum closed at the case it wrote.
+    let err_nat = |rest: Rest| {
+        Rc::new(Ty::plain(Core::Sum(Row {
+            labels: [("Err".to_string(), RowField::present(nat.clone()))]
+                .into_iter()
+                .collect(),
+            rest,
+        })))
+    };
+    assert_eq!(
+        err_nat(more(
+            vec![("Ok", RowField::present(nat.clone()))],
+            Rest::Closed
+        ))
+        .to_string(),
+        "`Err Nat | ..`Ok Nat"
+    );
+    assert_eq!(err_nat(more(vec![], Rest::Closed)).to_string(), "`Err Nat");
+
+    // A case whose payload was spliced from a row naming nothing is still a
+    // case carrying unit, so it still prints with no payload at all.
+    assert_eq!(
+        Ty::plain(Core::Sum(Row {
+            labels: [(
+                "A".to_string(),
+                RowField::present(with_fields(Core::Unit, vec![], more(vec![], Rest::Closed))),
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }))
+        .to_string(),
+        "`A"
+    );
+
+    // A chain of splices is read to its end, and a label the splice settled
+    // absent counts for nothing on the way: what is written is whatever the
+    // chain still leaves open.
+    assert_eq!(
+        with_fields(
+            Core::Unit,
+            x_nat(),
+            more(vec![], more(vec![], Rest::Closed))
+        )
+        .to_string(),
+        "{ x: Nat }"
+    );
+    assert_eq!(
+        with_fields(
+            Core::Unit,
+            x_nat(),
+            more(
+                vec![(
+                    "gone",
+                    RowField {
+                        presence: Presence::Absent,
+                        ty: nat.clone(),
+                    }
+                )],
+                Rest::Var(3)
+            )
+        )
+        .to_string(),
+        "{ x: Nat, ..?3 }"
+    );
+}
+
 /// The three sorts print on their own as well as inside a type, because the
 /// solver's own record shows them there: a step binding a row variable or a
 /// presence variable has nothing but the value to show.

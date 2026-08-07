@@ -25,10 +25,10 @@ fn distinct_primitives_are_spelled_differently() {
     assert_eq!(names.len(), Prim::ALL.len());
 }
 
-/// Unit is one type with one spelling, and so is the sum nothing inhabits. A
-/// second way to build either would be a second empty type for the solver to
-/// find not quite equal to the first, which is the whole reason the
-/// constructors exist rather than the shapes being written out at each site.
+/// Unit is one type with one spelling. A second way to build it would be a
+/// second empty type for the solver to find not quite equal to the first, which
+/// is the whole reason the constructor exists rather than the shape being
+/// written out at each site.
 #[test]
 fn each_empty_type_has_one_constructor() {
     let unit = Ty::unit();
@@ -38,14 +38,6 @@ fn each_empty_type_has_one_constructor() {
     // The default type is the undecided one, which is what a term that has not
     // been inferred yet carries.
     assert!(matches!(Ty::default().core, Core::Undecided));
-
-    let empty = Ty::empty_sum();
-    let Core::Sum(cases) = &empty.core else {
-        panic!("the empty sum is a sum: {empty:?}");
-    };
-    assert!(cases.is_trivial());
-    assert!(empty.fields.is_trivial());
-    assert_eq!(empty.to_string(), "|");
 
     // And a plain core is that core carrying nothing, which is every type the
     // language can currently write.

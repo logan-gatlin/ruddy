@@ -664,30 +664,52 @@ fn the_types_tab_says_which_definitions_are_recursive() {
 /// arrow just as much when the annotation was a name for one.
 #[test]
 fn an_argument_wears_its_type_through_a_declared_type() {
-    let snapshot = snapshot("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\n");
-    assert!(
-        snapshot.diagnostics.is_empty(),
-        "{:#?}",
-        snapshot.diagnostics
+    let badge = |source: &str| -> String {
+        let snapshot = snapshot(source);
+        assert!(
+            snapshot.diagnostics.is_empty(),
+            "{:#?}",
+            snapshot.diagnostics
+        );
+        let stage = |id: &str| {
+            snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+        let badges: HashMap<u32, &str> = stage("types-ir")
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.text.as_str()))
+            .collect();
+        let arg = nodes(stage("ir"))
+            .into_iter()
+            .find(|node| node.label == "Arg")
+            .expect("the IR renders the bound name");
+        badges[&arg.id].to_string()
+    };
+
+    assert_eq!(
+        badge("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\n"),
+        "Nat"
     );
 
-    let stage = |id: &str| {
-        snapshot
-            .stages
-            .iter()
-            .find(|stage| stage.id == id)
-            .unwrap_or_else(|| panic!("{id} is registered"))
-    };
-    let badges: HashMap<u32, &str> = stage("types-ir")
-        .nodes
-        .iter()
-        .map(|node| (node.id, node.text.as_str()))
-        .collect();
-    let arg = nodes(stage("ir"))
-        .into_iter()
-        .find(|node| node.label == "Arg")
-        .expect("the IR renders the bound name");
-    assert_eq!(badges[&arg.id], "Nat");
+    // A declaration taking a row is where the badge is a type nobody wrote out:
+    // the argument is spliced into the tail the declaration left open, and the
+    // badge shows what that came to. `{}` allows nothing more, so the row is
+    // closed and no `..` belongs on it — `∅` is the solver's mark for a row with
+    // nothing left to come, and never part of a type a reader is shown.
+    assert_eq!(
+        badge("type F r = { x: Nat, ..r } -> Nat\nlet f : F {} = fn p => p.x\n"),
+        "{ x: Nat }"
+    );
+    // And a sum's tail reads in cases, because it is the row of a sum. Spelled
+    // in braces it would show a reader a case list as if it were fields.
+    assert_eq!(
+        badge("type G r = (`Err Nat | ..r) -> Nat\nlet g : G (`Ok Nat) = fn p => 1\n"),
+        "`Err Nat | ..`Ok Nat"
+    );
 }
 
 /// The strip's messages are inference's own words. They were a copy of the
