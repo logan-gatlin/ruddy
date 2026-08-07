@@ -48,7 +48,9 @@ use crate::{
     ir::{self, Program, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Assigned, Core, ParamKind, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
+    types::{
+        Assigned, Core, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar,
+    },
 };
 use constrain::Constrain;
 use solve::Solve;
@@ -176,8 +178,13 @@ pub enum Rule {
     Prim,
     /// Two arrows, taken apart into argument and result.
     Arrow,
-    /// Two structs, taken apart: the fields both name against each other, and
-    /// the fields only one names into what the other's tail allows.
+    /// A type carrying fields, taken apart: the fields both sides name against
+    /// each other, the fields only one names into what the other side allows
+    /// beyond its own, and then the two cores.
+    ///
+    /// Recorded whenever either side carries a label, whatever the cores are —
+    /// so it is over a struct against a struct, as it always was, and over the
+    /// `Nat` carrying an `x` that only a declaration can reach.
     Struct,
     /// [`Rule::Struct`] about the other shape: two sums, the cases both name
     /// against each other and the cases only one names into what the other's
@@ -186,7 +193,7 @@ pub enum Rule {
     /// One rule in the code and two here, because a reader stepping through a
     /// solve is reading about their program: a line saying "two structs" over
     /// a goal about `` `Some `` and `` `None `` describes something they never
-    /// wrote. See [`Solve::rows`], which is both.
+    /// wrote. See [`Solve::labels`], which is both.
     Sum,
     /// Whether one field is there, decided: present agrees with present and
     /// absent with absent, and a field one side must have while the other side
@@ -291,8 +298,9 @@ pub enum ErrorKind {
     /// because the type is the side that says what is allowed. The shape is
     /// carried for the reason [`ErrorKind::MissingField`]'s is.
     ///
-    /// The base need not be a struct, now that every type carries a field row.
-    /// A type whose row is closed and empty allows no label at all, so a
+    /// The base need not be a struct, now that every type carries labels. A
+    /// type whose core allows nothing more and which names none allows no label
+    /// at all, so a
     /// projection's demand landing on the *actual* side of a goal against `Nat`
     /// is refused here rather than as a missing field: `let g = fn p => p.x` and
     /// then `let b : Nat -> Nat = g` reads ``extra field `x`: the type `Nat`
@@ -432,30 +440,32 @@ struct Table {
     /// walked. It is still nobody's but the group's, because the group is
     /// finished before anything outside it is looked at.
     vars: Vec<Slot>,
-    /// What each variable may not stand for: the label names the rows it sits
-    /// at the open end of already write out.
+    /// What each variable may not stand for: the labels already written out
+    /// beside the open end it sits at.
     ///
-    /// `{ x: Nat, ..r }` reads "an `x`, and whatever else `r` is", so `r`
-    /// standing for a row with an `x` of its own would give the type two
-    /// fields of one name. Nothing in [`Row`] can express that side condition —
-    /// a tail is an ordinary [`Rest::Var`] — so it is held here, beside the
-    /// slots, and enforced at the one place a variable acquires a value.
+    /// `{ x: Nat, ..?3 }` reads "an `x`, and whatever else `?3` is", so a `?3`
+    /// standing for a type with an `x` of its own would give the type two
+    /// fields of one name. This is now the *only* way a struct's condition is
+    /// recorded, and the core variable is the only place left to put it: there
+    /// is no tail variable beside it any more, because the core is the tail.
+    /// Nothing in [`Ty`] can express the side condition, so it is held here,
+    /// beside the slots, and enforced at the one place a variable acquires a
+    /// value.
     ///
-    /// Core variables are under the same condition, for the same reason and
-    /// with the same labels: `'c with { x: Nat }` reads "some type, which also
-    /// has an `x`", so a `'c` with an `x` of its own would name the field
-    /// twice. Their shape is always [`Shape::Struct`], since a core variable
-    /// stands for a whole type and the labels forbidden of it are that type's
-    /// fields.
+    /// A sum's tail is under the same condition, for the same reason and with
+    /// its own labels: `` `A Nat | ..?3 `` reads the same sentence about cases.
+    /// So the shape says which of the two a condition came from, and a
+    /// [`Shape::Struct`] one is always on a core variable while a
+    /// [`Shape::Sum`] one is always on a tail.
     ///
-    /// Insertion-ordered, so that a row breaking the rule twice always names
-    /// the same field first and the complaint does not depend on a hash.
+    /// Insertion-ordered, so that a value breaking the rule twice always names
+    /// the same label first and the complaint does not depend on a hash.
     lacks: HashMap<TyVar, Lacks>,
     /// What each declaration's parameters stand for, in the declaration's own
     /// order. Read only by [`Table::note_lacks`], and only for the one thing a
-    /// [`ParamKind::Row`] carries that a type cannot: the labels the
-    /// declaration already names at that tail, which whatever is written there
-    /// may not name either.
+    /// [`ParamKind`] carries that a type cannot: the labels the declaration
+    /// already names beside that parameter, which whatever is written there may
+    /// not name either.
     ///
     /// Held beside the variables rather than looked up through
     /// [`Solve::aliases`] because it is a fact about the *written* declaration
@@ -774,12 +784,13 @@ impl Table {
     /// the head is resolved; a composite's children still need their own
     /// resolution, which is what [`zonk`](Self::zonk) does exhaustively.
     ///
-    /// The splice is what makes this more than a lookup. A variable stands for
-    /// a whole type, so a type written `'c with { x: Nat }` becomes, once `'c`
-    /// is known, that type's core carrying both its own labels and the `x` — the
-    /// outer labels winning, the way [`Table::canon`] settles a tail's. Every
-    /// reader of a type goes through here, so no reader has to know that a core
-    /// can stand for something with fields of its own.
+    /// The splice is what makes this more than a lookup, and it is now the only
+    /// splice a struct has. A core variable stands for a whole type, so
+    /// `{ x: Nat, ..?3 }` becomes, once `?3` is known, that type's core carrying
+    /// both its own labels and the `x` — the outer labels winning, the way
+    /// [`Table::canon`] settles a sum tail's. Every reader of a type goes
+    /// through here, so no reader has to know that a core can stand for
+    /// something with fields of its own.
     ///
     /// What guarantees this terminates is the occurs check, not anything here:
     /// [`assign`](Solve::assign) refuses every binding that would put a
@@ -807,9 +818,13 @@ impl Table {
         ty
     }
 
-    /// A row flattened: its own labels joined with every label its tail has
-    /// already accumulated, and what remains of the tail — an unbound variable,
-    /// [`Rest::Closed`] or [`Rest::Undecided`] — as far as the solver has got.
+    /// A sum's cases flattened: its own labels joined with every label its tail
+    /// has already accumulated, and what remains of the tail — an unbound
+    /// variable, [`Rest::Closed`] or [`Rest::Undecided`] — as far as the solver
+    /// has got.
+    ///
+    /// A sum's tails and nothing else, now that a struct's `..` is its core and
+    /// [`resolve`](Self::resolve) is the splice that settles one.
     ///
     /// A read and nothing else, and one an [`IndexMap`] settles: the outer
     /// row's own labels are inserted first, so a label its tail also names is
@@ -879,7 +894,20 @@ impl Table {
     /// accept two types that differ, so the one-sided error is the one to make.
     fn alike(&self, a: &Rc<Ty>, b: &Rc<Ty>) -> bool {
         let (a, b) = (self.resolve(a), self.resolve(b));
-        self.alike_row(&a.fields, &b.fields) && self.alike_core(&a.core, &b.core)
+        self.alike_labels(&a.fields, &b.fields) && self.alike_core(&a.core, &b.core)
+    }
+
+    /// [`alike`](Self::alike) about two label maps: name against name, since a
+    /// type's fields have no tail to agree about. The order the labels were
+    /// written in decides nothing.
+    fn alike_labels(&self, a: &IndexMap<String, RowField>, b: &IndexMap<String, RowField>) -> bool {
+        a.len() == b.len()
+            && a.iter().all(|(name, field)| {
+                b.get(name).is_some_and(|other| {
+                    self.alike_presence(&field.presence, &other.presence)
+                        && self.alike(&field.ty, &other.ty)
+                })
+            })
     }
 
     /// [`alike`](Self::alike) about two cores.
@@ -926,18 +954,12 @@ impl Table {
         }
     }
 
-    /// [`alike`](Self::alike) about two rows: flattened first, so that a row
-    /// spliced into a tail is recognized as the row written out flat, and then
-    /// name against name. The order the labels were written in decides nothing.
+    /// [`alike_labels`](Self::alike_labels) about a sum's cases: flattened
+    /// first, so that a row spliced into a tail is recognized as the row written
+    /// out flat, and then the tails as well.
     fn alike_row(&self, a: &Row, b: &Row) -> bool {
         let (a, b) = (self.canon(a), self.canon(b));
-        a.labels.len() == b.labels.len()
-            && a.labels.iter().all(|(name, field)| {
-                b.labels.get(name).is_some_and(|other| {
-                    self.alike_presence(&field.presence, &other.presence)
-                        && self.alike(&field.ty, &other.ty)
-                })
-            })
+        self.alike_labels(&a.labels, &b.labels)
             && match (&a.rest, &b.rest) {
                 (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
                 (Rest::Var(x), Rest::Var(y)) => x == y,
@@ -984,9 +1006,9 @@ impl Table {
     ///   of what this walk turns up is therefore of the wrong sort to be the one
     ///   being bound, and no comparison across two sorts can say yes.
     /// - The same-sort cases are turned away before a binding is ever proposed.
-    ///   Two rows that share a tail variable and differ in labels either way
-    ///   round are refused in [`Solve::rows`], where the complaint can name both
-    ///   rows instead of one variable; two tails that flatten to the same
+    ///   Two sides that share an open end and differ in labels either way round
+    ///   are refused in [`Solve::labels`], where the complaint can name both
+    ///   types instead of one variable; two tails that flatten to the same
     ///   variable are [`Rule::Same`] in [`Solve::rests`]; two presences that are
     ///   the same variable are [`Rule::Same`] in [`Solve::presences`], and both
     ///   of its callers — [`Solve::field`] and [`Solve::absorb`] — put each
@@ -1038,18 +1060,25 @@ impl Table {
             }
             Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
         }
-        self.mentions_row(&ty.fields, found);
+        self.mentions_labels(&ty.fields, found);
     }
 
-    /// Every variable `row` mentions. Every slot a row has, in one sequence: a
-    /// label's presence is as much a place a variable can hide as its type is,
-    /// and the tail is another, and none of the three is a different question.
+    /// Every variable a sum's cases mention. Every slot a row has, in one
+    /// sequence: a label's presence is as much a place a variable can hide as
+    /// its type is, and the tail is another, and none of the three is a
+    /// different question.
     fn mentions_row(&self, row: &Row, found: &mut Vec<TyVar>) {
         let row = self.canon(row);
         if let Rest::Var(var) = row.rest {
             found.push(var);
         }
-        for field in row.labels.values() {
+        self.mentions_labels(&row.labels, found);
+    }
+
+    /// [`mentions_row`](Self::mentions_row) about a label map, which has no
+    /// tail: each label's presence, and what it holds.
+    fn mentions_labels(&self, labels: &IndexMap<String, RowField>, found: &mut Vec<TyVar>) {
+        for field in labels.values() {
             self.mentions_presence(&field.presence, found);
             self.mentions_ty(&field.ty, found);
         }
@@ -1079,14 +1108,19 @@ impl Table {
     /// past them — the flattening [`Table::canon`] does, for the same reason.
     fn note_lacks(&mut self, ty: &Rc<Ty>) {
         let ty = self.resolve(ty);
-        // Every type carries fields, so every type says something here. The
-        // labels land on whatever is still open past them *and* on the type's
-        // own core variable, which stands for a type those labels are already
-        // on: `'c with { x: Nat }` reads "some type, which also has an `x`", so
-        // a `'c` with an `x` of its own would name the field twice.
-        let labels = self.note_lacks_row(&ty.fields, Shape::Struct);
+        // Every type carries fields, so every type says something here — and
+        // the core beside them is the only place there is left to say it. The
+        // labels land on the type's own core variable, which stands for a type
+        // those labels are already on: `{ x: Nat, ..?3 }` reads "an `x`, and
+        // whatever else `?3` is", so a `?3` with an `x` of its own would name
+        // the field twice.
+        let labels: IndexSet<String> = ty.fields.keys().cloned().collect();
         if let Core::Var(var) = ty.core {
             self.forbidden(var, Shape::Struct, labels);
+        }
+        for field in ty.fields.values() {
+            let field = field.ty.clone();
+            self.note_lacks(&field);
         }
         match &ty.core {
             Core::Arrow(from, to) => {
@@ -1113,17 +1147,28 @@ impl Table {
                 let (symbol, args) = (*symbol, args.clone());
                 for (at, arg) in args.iter().enumerate() {
                     // Cloned out, since forbidding borrows the table; and only
-                    // when there is something to forbid, which a type parameter
-                    // never has.
-                    let row = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
-                        Some(ParamKind::Row { shape, lacks }) if !lacks.is_empty() => {
-                            Some((*shape, lacks.clone()))
+                    // when there is something to forbid, which a parameter that
+                    // tails nothing never has.
+                    let demand = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
+                        Some(kind) if !kind.lacks().is_empty() => {
+                            Some((kind.sense(), kind.lacks().clone()))
                         }
                         _ => None,
                     };
-                    if let Some((shape, labels)) = row {
-                        let written = self.resolve(arg).row(shape);
-                        self.forbid(&written, shape, &labels);
+                    match demand {
+                        // A struct's `..` is the type's core, so the condition
+                        // lands on the argument's own core variable — the one
+                        // thing that would still be free to acquire the label.
+                        Some((Sense::Type, labels)) => {
+                            if let Core::Var(var) = self.resolve(arg).core {
+                                self.forbidden(var, Shape::Struct, labels);
+                            }
+                        }
+                        Some((Sense::Cases, labels)) => {
+                            let written = self.resolve(arg).cases();
+                            self.forbid(&written, Shape::Sum, &labels);
+                        }
+                        None => {}
                     }
                     self.note_lacks(arg);
                 }
@@ -1132,11 +1177,10 @@ impl Table {
         }
     }
 
-    /// [`note_lacks`](Self::note_lacks) about one row: every label it and its
-    /// tail name is forbidden of whatever is still open past them, and each
-    /// label's type is walked in turn. What comes back is the labels, so that a
-    /// type's core variable can be put under the same condition.
-    fn note_lacks_row(&mut self, row: &Row, shape: Shape) -> IndexSet<String> {
+    /// [`note_lacks`](Self::note_lacks) about a sum's cases: every label it and
+    /// its tail name is forbidden of whatever is still open past them, and each
+    /// label's payload is walked in turn.
+    fn note_lacks_row(&mut self, row: &Row, shape: Shape) {
         let flat = self.canon(row);
         let labels: IndexSet<String> = flat.labels.keys().cloned().collect();
         for field in flat.labels.values() {
@@ -1144,14 +1188,13 @@ impl Table {
             self.note_lacks(&ty);
         }
         if let Rest::Var(var) = flat.rest {
-            self.forbidden(var, shape, labels.clone());
+            self.forbidden(var, shape, labels);
         }
-        labels
     }
 
-    /// Record that whatever is still open past `row` may not stand for any of
-    /// `labels`: the tail chain followed to its end, and the condition put on
-    /// the variable it lands at.
+    /// Record that whatever is still open past a sum's cases may not stand for
+    /// any of `labels`: the tail chain followed to its end, and the condition
+    /// put on the variable it lands at.
     ///
     /// Nothing to do when it lands anywhere else. A closed row has no room for
     /// the labels to arrive in, and a [`Rest::Bound`] is a declaration's own
@@ -1224,11 +1267,10 @@ impl Table {
     /// definition that tied it to anything else has not kept that.
     ///
     /// Asked only of the variables an annotation left open, and a written type
-    /// can leave open only `..`, `..r` and `?` — so every variable that arrives
-    /// here is row-sorted or presence-sorted, and none is a whole type. The row
-    /// arm is written to serve the type sort too rather than to assume that,
-    /// reading a value for the row it carries the way every other lacks-shaped
-    /// reader does.
+    /// can leave open only `..`, `..r` and `?` — so a variable arriving here is
+    /// one of three things: the core a struct's `..` lowered to, the tail a
+    /// sum's did, or a presence. Each sort is asked in its own spelling of
+    /// "nothing is known", which is the whole of the three arms.
     fn narrowed(&self, var: TyVar) -> bool {
         let Slot::Bound(value) = &self.vars[var as usize] else {
             return false;
@@ -1237,9 +1279,13 @@ impl Table {
             Assigned::Presence(presence) => {
                 !matches!(self.presence_of(presence), Presence::Undecided)
             }
-            value => {
-                let flat = self.canon(&value.as_row(Shape::Struct));
+            Assigned::Row(row) => {
+                let flat = self.canon(row);
                 !(flat.labels.is_empty() && matches!(flat.rest, Rest::Undecided))
+            }
+            Assigned::Ty(ty) => {
+                let ty = self.resolve(ty);
+                !(ty.fields.is_empty() && matches!(ty.core, Core::Undecided))
             }
         }
     }
@@ -1257,11 +1303,20 @@ impl Table {
     fn repeated(&self, var: TyVar, value: &Assigned) -> Option<(Shape, String)> {
         let (shape, lacks) = self.lacks.get(&var)?;
         // Whatever labels the value would bring with it, read at the shape the
-        // condition was recorded in: a row outright, or the row a whole type
-        // carries. A presence brings none, which [`Assigned::as_row`] says by
-        // answering with a row that names nothing.
-        let named = self.canon(&value.as_row(*shape));
-        let name = named.labels.keys().find(|name| lacks.contains(*name))?;
+        // condition was recorded in: the fields of a whole type, or the cases a
+        // sum's rest stands for. A presence brings neither, which
+        // [`Assigned::as_row`] says by answering with a row that names nothing
+        // and [`Assigned::as_ty`] by answering with a type that carries none.
+        let named: Vec<String> = match shape {
+            Shape::Struct => self
+                .resolve(&value.as_ty())
+                .fields
+                .keys()
+                .cloned()
+                .collect(),
+            Shape::Sum => self.canon(&value.as_row()).labels.keys().cloned().collect(),
+        };
+        let name = named.iter().find(|name| lacks.contains(*name))?;
         Some((*shape, name.clone()))
     }
 
@@ -1278,14 +1333,20 @@ impl Table {
         let Some((shape, labels)) = self.lacks.get(&var).cloned() else {
             return;
         };
-        let row = value.as_row(shape);
-        self.forbid(&row, shape, &labels);
-        // A value that is a whole type puts the condition on its core variable
-        // as well, which stands for a type those labels are already on.
-        if let Assigned::Ty(ty) = value
-            && let Core::Var(core) = self.resolve(ty).core
-        {
-            self.forbidden(core, shape, labels);
+        match shape {
+            // A struct's condition travels through the core alone, there being
+            // no tail left to put it on: the type a core variable stands for is
+            // a type those labels are already on, so a copy of one arriving
+            // there would name the field twice.
+            Shape::Struct => {
+                if let Core::Var(core) = self.resolve(&value.as_ty()).core {
+                    self.forbidden(core, shape, labels);
+                }
+            }
+            Shape::Sum => {
+                let row = value.as_row();
+                self.forbid(&row, shape, &labels);
+            }
         }
     }
 
@@ -1344,11 +1405,18 @@ impl Table {
     /// One numbering pass over one type: over everything but the presence
     /// slots, or — when `presences` — over only them. A variable can only be one
     /// or the other, so the two passes cannot number one twice. Either way the
-    /// descent is the same: the core first and then the fields it carries, which
-    /// is what makes `'c with { x: 'r }` number its core `'a`. No special case
-    /// for a core — it is descended into exactly where it sits.
+    /// descent is the same: the fields first and then the core they sit on,
+    /// which is what makes `{ x: 'a, ..'b }` number left to right.
+    ///
+    /// Fields first because the core is what the `..` prints, and a tail is read
+    /// last. The rule used to be the other way round, when a core was one thing
+    /// a type had and its tail was another; now the core *is* the tail, so
+    /// numbering it first would call the rightmost thing on the line `'a`. No
+    /// special case for it either way — it is descended into exactly where it
+    /// sits.
     fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>, presences: bool) {
         let ty = self.resolve(ty);
+        self.quantify_labels(&ty.fields, subst, presences);
         match &ty.core {
             Core::Var(var) => {
                 if !presences {
@@ -1370,20 +1438,31 @@ impl Table {
             }
             Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
         }
-        self.quantify_row(&ty.fields, subst, presences);
     }
 
-    /// [`quantify_walk`](Self::quantify_walk) over one row.
+    /// [`quantify_walk`](Self::quantify_walk) over a sum's cases: the labels,
+    /// and then the tail, which is read last for the reason a struct's core is.
     fn quantify_row(&self, row: &Row, subst: &mut HashMap<TyVar, u32>, presences: bool) {
         let row = self.canon(row);
-        for field in row.labels.values() {
+        self.quantify_labels(&row.labels, subst, presences);
+        if !presences && let Rest::Var(var) = row.rest {
+            Self::quantify_var(var, subst);
+        }
+    }
+
+    /// [`quantify_walk`](Self::quantify_walk) over a label map: each label's
+    /// presence, on the pass that numbers those, and what it holds.
+    fn quantify_labels(
+        &self,
+        labels: &IndexMap<String, RowField>,
+        subst: &mut HashMap<TyVar, u32>,
+        presences: bool,
+    ) {
+        for field in labels.values() {
             if presences && let Presence::Var(var) = self.presence_of(&field.presence) {
                 Self::quantify_var(var, subst);
             }
             self.quantify_walk(&field.ty, subst, presences);
-        }
-        if !presences && let Rest::Var(var) = row.rest {
-            Self::quantify_var(var, subst);
         }
     }
 
@@ -1399,7 +1478,7 @@ impl Table {
     /// variable table, so it outlives the solver.
     fn zonk(&self, ty: &Rc<Ty>, subst: &HashMap<TyVar, u32>) -> Rc<Ty> {
         let ty = self.resolve(ty);
-        let fields = self.zonk_row(&ty.fields, subst);
+        let fields = self.zonk_labels(&ty.fields, subst);
         let core = match &ty.core {
             // Indexed rather than looked up: everything that zonks quantifies
             // first — see [`Table::close`] and [`Table::generalize`] — so a
@@ -1421,11 +1500,11 @@ impl Table {
         Rc::new(Ty { core, fields })
     }
 
-    /// [`zonk`](Self::zonk) over one row.
+    /// [`zonk`](Self::zonk) over a sum's cases.
     ///
     /// A tail the solve bound to a row is spliced in, so that what outlives the
-    /// solver is one flat row rather than a chain of them: `{ x: Nat, ..{ y:
-    /// Nat } }` is not a type anyone wrote. [`canon`](Self::canon) is what does
+    /// solver is one flat row rather than a chain of them:
+    /// `` `A | ..(`B) `` is not a type anyone wrote. [`canon`](Self::canon) is what does
     /// that, and it is lossless: a tail stands for the labels its row does not
     /// write out, and [`Solve::assign`] refuses to bind one to a row that
     /// writes out one of them, so by the time a solve is over no chain of rows
@@ -1434,8 +1513,22 @@ impl Table {
     /// type it had never been shown to have.
     fn zonk_row(&self, row: &Row, subst: &HashMap<TyVar, u32>) -> Row {
         let row = self.canon(row);
-        let labels = row
-            .labels
+        let labels = self.zonk_labels(&row.labels, subst);
+        let rest = match row.rest {
+            Rest::Var(var) => Rest::Bound(subst[&var]),
+            decided => decided,
+        };
+        Row { labels, rest }
+    }
+
+    /// [`zonk`](Self::zonk) over a label map: each presence resolved to what it
+    /// came to, and each label's type zonked in turn.
+    fn zonk_labels(
+        &self,
+        labels: &IndexMap<String, RowField>,
+        subst: &HashMap<TyVar, u32>,
+    ) -> IndexMap<String, RowField> {
+        labels
             .iter()
             .map(|(name, field)| {
                 let field = RowField {
@@ -1447,12 +1540,7 @@ impl Table {
                 };
                 (name.clone(), field)
             })
-            .collect();
-        let rest = match row.rest {
-            Rest::Var(var) => Rest::Bound(subst[&var]),
-            decided => decided,
-        };
-        Row { labels, rest }
+            .collect()
     }
 
     /// [`zonk`](Self::zonk) applied to every type the walk wrote into a
@@ -1563,8 +1651,8 @@ impl Table {
 /// rely on: it is why they may stop at a name rather than descend into what it
 /// stands for.
 fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
-    let mut rows: HashMap<String, Rest> = HashMap::new();
-    let lowered = lower(mint, table, &mut rows, ty);
+    let mut tails = Tails::default();
+    let lowered = lower(mint, table, &mut tails, ty);
     // A tail stands for the fields its row did not write out, and this is
     // where that is first true of a written one: `{ x: Nat, ..r }` says `r`
     // has no `x`. See [`Table::lacks`].
@@ -1572,9 +1660,20 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
     lowered
 }
 
+/// Every `..r` an annotation has written so far, by name, in the two sorts a
+/// named tail can be: the core a struct's `..` stands for, and the rest a sum's
+/// does. Two maps rather than one because the two are two sorts of value —
+/// lowering has already refused a name used at both, so no name is ever in both.
+/// See [`ir::ErrorKind::MixedTail`](crate::ir::ErrorKind::MixedTail).
+#[derive(Default)]
+struct Tails {
+    cores: HashMap<String, Core>,
+    rows: HashMap<String, Rest>,
+}
+
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
 /// scope.
-fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rest>, ty: &Type) -> Rc<Ty> {
+fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty> {
     let core = match &ty.tracked {
         TypeKind::Prim(prim) => (*prim).into(),
         TypeKind::Ident(symbol) => Core::Named {
@@ -1589,15 +1688,16 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rest>, ty: &
             name: mint.name(*head).into(),
             args: args
                 .iter()
-                .map(|arg| lower(mint, table, rows, arg))
+                .map(|arg| lower(mint, table, tails, arg))
                 .collect(),
         },
         // A parameter is the position it was declared at, which is what
         // unfolding hands an argument to. See [`Core::Bound`].
         TypeKind::Param { index, .. } => Core::Bound(*index),
-        TypeKind::Arrow { from, to } => {
-            Core::Arrow(lower(mint, table, rows, from), lower(mint, table, rows, to))
-        }
+        TypeKind::Arrow { from, to } => Core::Arrow(
+            lower(mint, table, tails, from),
+            lower(mint, table, tails, to),
+        ),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it.
         TypeKind::Struct { fields, tail } => {
@@ -1605,18 +1705,18 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rest>, ty: &
             for (name, field) in fields {
                 let lowered = RowField {
                     presence: presence(table, field.optional),
-                    ty: lower(mint, table, rows, &field.value),
+                    ty: lower(mint, table, tails, &field.value),
                 };
                 labels.insert(name.clone(), lowered);
             }
             return Rc::new(Ty {
-                core: Core::Unit,
-                fields: row(table, rows, labels, tail),
+                core: core_tail(table, tails, tail),
+                fields: labels,
             });
         }
         // The struct arm again, about cases — except that a sum's cases are its
-        // core and its own field row is empty and closed. The one other
-        // difference is the payload a case may not have written, which is unit
+        // core and it carries no fields of its own. The one other difference is
+        // the payload a case may not have written, which is unit
         // — the same type `()` is, built here rather than in the tree so that
         // what the reader wrote and what the compiler means stay two separate
         // things. See [`ir::TermKind::Tag`](crate::ir::TermKind::Tag).
@@ -1624,7 +1724,7 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rest>, ty: &
             let mut labels = IndexMap::new();
             for (name, case) in cases {
                 let carried = match &case.payload {
-                    Some(payload) => lower(mint, table, rows, payload),
+                    Some(payload) => lower(mint, table, tails, payload),
                     None => Rc::new(Ty::unit()),
                 };
                 let lowered = RowField {
@@ -1633,7 +1733,7 @@ fn lower(mint: &Mint, table: &mut Table, rows: &mut HashMap<String, Rest>, ty: &
                 };
                 labels.insert(name.clone(), lowered);
             }
-            Core::Sum(row(table, rows, labels, tail))
+            Core::Sum(row(table, tails, labels, tail))
         }
         TypeKind::Error => Core::Undecided,
     };
@@ -1650,21 +1750,21 @@ fn presence(table: &mut Table, optional: bool) -> Presence {
     }
 }
 
-/// The labels of a written row and what its `..` stands for, assembled into the
-/// row. Shared by the two shapes, because the tail is the one part of a row
-/// that reads the same either way: `..` is a variable this definition may
-/// decide, `..r` is that variable shared across one annotation, and `..r`
-/// naming a parameter is a position an argument is handed to.
+/// The cases of a written sum and what its `..` stands for, assembled into the
+/// row. `..` is a variable this definition may decide, `..r` is that variable
+/// shared across one annotation, and `..r` naming a parameter is a position an
+/// argument is handed to.
 fn row(
     table: &mut Table,
-    rows: &mut HashMap<String, Rest>,
+    tails: &mut Tails,
     labels: IndexMap<String, RowField>,
     tail: &Option<Tail>,
 ) -> Row {
     let rest = match tail.as_ref().map(|tail| &tail.of) {
         None => Rest::Closed,
         Some(ir::Row::Anything) => table.fresh_row(),
-        Some(ir::Row::Named(name)) => rows
+        Some(ir::Row::Named(name)) => tails
+            .rows
             .entry(name.clone())
             .or_insert_with(|| table.fresh_row())
             .clone(),
@@ -1674,6 +1774,28 @@ fn row(
         Some(ir::Row::Param { index, .. }) => Rest::Bound(*index),
     };
     Row { labels, rest }
+}
+
+/// What a written struct's `..` stands for, which is the type its fields sit on.
+///
+/// [`row`] about the other shape, and shorter for it: a struct's rest is a whole
+/// type, so each of the four tails lowers to the core that already means it. No
+/// tail at all is [`Core::Unit`] — the type with nothing of its own, which
+/// allows no field it does not name. A bare `..` is a variable this definition
+/// may decide, `..r` is that variable shared across one annotation, and `..r`
+/// naming a parameter is a [`Core::Bound`], the position an argument is handed
+/// to — which is what keeps a declaration's body free of solver variables.
+fn core_tail(table: &mut Table, tails: &mut Tails, tail: &Option<Tail>) -> Core {
+    match tail.as_ref().map(|tail| &tail.of) {
+        None => Core::Unit,
+        Some(ir::Row::Anything) => Core::Var(table.fresh_core()),
+        Some(ir::Row::Named(name)) => tails
+            .cores
+            .entry(name.clone())
+            .or_insert_with(|| Core::Var(table.fresh_core()))
+            .clone(),
+        Some(ir::Row::Param { index, .. }) => Core::Bound(*index),
+    }
 }
 
 /// What a declared type stands for: [`Core::Named`] replaced by the body it was
@@ -1739,25 +1861,38 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     ty
 }
 
-/// A type whose head has been replaced by what it stands for: the inner type's
-/// core, carrying the row written outside it.
+/// A type whose core has been replaced by what it stands for: the inner type's
+/// core, carrying both sets of labels, the outer ones winning.
 ///
-/// The inner type's own fields contribute nothing, and there is no merge here
-/// because there is never anything to merge. A core stands for a whole type in
-/// exactly two places, and both of them leave one of the two rows trivial. A
-/// bare core takes what it meets entire — the line above, and
-/// [`Solve::unify`]'s bare-variable rule — so the type mentioning it names no
-/// fields of its own and the outer row is trivial. Everywhere else a core is
-/// bound to a [`Ty::plain`] built from the other side's core, which names no
-/// fields either. So the outer row is what the whole ends up with, labels and
-/// tail alike: what it leaves open is what the whole leaves open.
-fn splice(outer: &Row, inner: &Rc<Ty>) -> Rc<Ty> {
-    if outer.is_trivial() {
+/// The one splice a struct has, and the whole of what makes a core stand for a
+/// type with fields of its own. `{ x: Nat, ..?3 }` with `?3` known to be
+/// `{ y: Nat }` is `{ x: Nat, y: Nat }`; `WithX Nat` unfolded is a `Nat`
+/// carrying an `x`. Both are this.
+///
+/// The outer labels win because they are the ones written where the whole type
+/// is read. A label named on both sides would be a type naming a field twice,
+/// and there is no way left to write one: lowering refuses an argument that
+/// repeats a label the declaration it goes to already names, and
+/// [`Solve::assign`]'s lacks check refuses every route that goes through a
+/// variable. So the rule decides nothing in practice and is here to be
+/// definite about what happens if either of those is ever weakened.
+fn splice(outer: &IndexMap<String, RowField>, inner: &Rc<Ty>) -> Rc<Ty> {
+    if outer.is_empty() {
         return inner.clone();
+    }
+    if inner.fields.is_empty() {
+        return Rc::new(Ty {
+            core: inner.core.clone(),
+            fields: outer.clone(),
+        });
+    }
+    let mut fields = outer.clone();
+    for (name, field) in &inner.fields {
+        fields.entry(name.clone()).or_insert_with(|| field.clone());
     }
     Rc::new(Ty {
         core: inner.core.clone(),
-        fields: outer.clone(),
+        fields,
     })
 }
 
@@ -1770,15 +1905,18 @@ impl Ty {
     /// decided here rather than by the caller, because the position is what
     /// knows: see [`Assigned::as_row`].
     pub fn open(&self, fresh: &[Assigned]) -> Rc<Ty> {
-        let fields = self.fields.open(fresh, Shape::Struct);
+        let fields = open_labels(&self.fields, fresh);
         let core = match &self.core {
             // Not a leaf: what the variable stands for may carry fields, and
-            // the fields written outside it are kept over them.
+            // the fields written outside it are kept over them. This is what a
+            // struct's row parameter is — `type WithX r = { x: Nat, ..r }` puts
+            // its parameter here — so opening one is the substitution every
+            // other position already had.
             Core::Bound(index) => {
                 return splice(&fields, &fresh[*index as usize].as_ty());
             }
             Core::Arrow(from, to) => Core::Arrow(from.open(fresh), to.open(fresh)),
-            Core::Sum(cases) => Core::Sum(cases.open(fresh, Shape::Sum)),
+            Core::Sum(cases) => Core::Sum(cases.open(fresh)),
             // A declaration's own body reaches here holding its parameters, so
             // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.
             Core::Named { symbol, name, args } => Core::Named {
@@ -1793,27 +1931,37 @@ impl Ty {
 }
 
 impl Row {
-    /// [`Ty::open`] over one row. `shape` is what a row parameter written at
-    /// this tail stands for, which is how an argument written as a whole type
-    /// is read for the row it carries. See [`Assigned::as_row`].
-    fn open(&self, fresh: &[Assigned], shape: Shape) -> Row {
-        let labels = self
-            .labels
-            .iter()
-            .map(|(name, field)| {
-                let field = RowField {
-                    presence: field.presence.open(fresh),
-                    ty: field.ty.open(fresh),
-                };
-                (name.clone(), field)
-            })
-            .collect();
+    /// [`Ty::open`] over a sum's cases. A row parameter written at this tail
+    /// stands for the cases whatever is handed to it allows, which is how an
+    /// argument written as a whole type is read for the row it carries. See
+    /// [`Assigned::as_row`].
+    fn open(&self, fresh: &[Assigned]) -> Row {
+        let labels = open_labels(&self.labels, fresh);
         let rest = match &self.rest {
-            Rest::Bound(index) => Rest::More(Rc::new(fresh[*index as usize].as_row(shape))),
+            Rest::Bound(index) => Rest::More(Rc::new(fresh[*index as usize].as_row())),
             rest => rest.clone(),
         };
         Row { labels, rest }
     }
+}
+
+/// [`Ty::open`] over a label map: each label's presence and what it holds. The
+/// map itself has no tail to open — a struct's is the core beside it, which
+/// [`Ty::open`] handles where it sits.
+fn open_labels(
+    labels: &IndexMap<String, RowField>,
+    fresh: &[Assigned],
+) -> IndexMap<String, RowField> {
+    labels
+        .iter()
+        .map(|(name, field)| {
+            let field = RowField {
+                presence: field.presence.open(fresh),
+                ty: field.ty.open(fresh),
+            };
+            (name.clone(), field)
+        })
+        .collect()
 }
 
 impl Presence {
@@ -1835,8 +1983,9 @@ impl Presence {
 /// things.
 ///
 /// This is a gate, not the rule. Two structs that name different fields can
-/// still be one type — that is what a row's tail decides, in [`Solve::rows`]
-/// — so failing here only means checking cannot push the expected fields in
+/// still be one type — that is what the core beside them decides, in
+/// [`Solve::labels`] — so failing here only means checking cannot push the
+/// expected fields in
 /// one by one and the literal is inferred and equated instead.
 fn same_field_set<A, B>(want: &IndexMap<String, A>, have: &IndexMap<String, B>) -> bool {
     want.len() == have.len() && want.keys().all(|name| have.contains_key(name))

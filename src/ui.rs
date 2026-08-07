@@ -43,6 +43,8 @@
 
 use std::fmt;
 
+use indexmap::IndexMap;
+
 use crate::{
     inference::{self, Constraint, ConstraintKind, Effect, Goal, Rule},
     ir, parse,
@@ -143,8 +145,8 @@ impl<'a> Path<'a> {
     }
 }
 
-/// A row read as one of the two shapes: a struct's fields in braces, a sum's
-/// cases with their backticks.
+/// A row read as one of the two shapes: labels in braces, or cases with their
+/// backticks.
 ///
 /// What a spliced tail prints as, and the one place a row's notation is chosen
 /// by something other than the position the row sits in. A tail is written by
@@ -265,8 +267,9 @@ impl ir::ErrorKind {
             // [`ir::ErrorKind::Undefined`] is the other way round, and says so.
             ir::ErrorKind::MixedTail { .. } => "mixed-tail",
             ir::ErrorKind::MixedParameter { .. } => "mixed-parameter",
-            ir::ErrorKind::NotARow { .. } => "not-a-row",
+            ir::ErrorKind::NotARow => "not-a-row",
             ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
+            ir::ErrorKind::EndlessFields => "endless-fields",
         }
     }
 }
@@ -335,28 +338,34 @@ impl fmt::Display for ir::ErrorKind {
             // the span already says.
             ir::ErrorKind::MixedTail { first, second, .. } => write!(
                 f,
-                "this stands for {} in one place and for {} in another",
-                Sense::Row(*first),
-                Sense::Row(*second),
+                "this stands for {first} in one place and for {second} in another",
             ),
             ir::ErrorKind::MixedParameter { first, second } => write!(
                 f,
                 "this stands for {first} in one place and for {second} in another",
             ),
-            ir::ErrorKind::NotARow { shape } => {
-                write!(f, "{} goes here, and this is not that", Sense::Row(*shape))
+            ir::ErrorKind::NotARow => {
+                write!(f, "{} goes here, and this is not that", Sense::Cases)
             }
-            // Said as what the `..` covers, the way the solver's version of
-            // this complaint is: the reader can change the field they wrote,
-            // and the row the declaration would end up with is not a type
-            // anyone put on the page.
+            // Said as what the argument does rather than as what goes here: a
+            // struct's `..` takes any type at all, so there is no reading to
+            // open with, and what is wrong is that the label would be named
+            // twice. The reader can change the field they wrote, and the type
+            // the declaration would end up with is not one anybody put on the
+            // page.
             ir::ErrorKind::RepeatedRowField { shape, field } => write!(
                 f,
-                "{} goes here, and this names `{}`, which that {} already has",
-                Sense::Row(*shape),
+                "this names `{}`, which the {} it goes into already has",
                 label(*shape, field),
                 shape,
             ),
+            // Said as what the type does rather than as the loop the compiler
+            // noticed, the way [`ir::ErrorKind::Circular`] is: a type that adds
+            // fields to itself has more of them every time round, so there is no
+            // finite set of fields for it to have.
+            ir::ErrorKind::EndlessFields => {
+                f.write_str("this type adds fields to itself, so it never has all of them")
+            }
         }
     }
 }
@@ -417,16 +426,19 @@ impl fmt::Display for Shape {
     }
 }
 
-/// What a parameter stands for, as the phrase a complaint drops into a
-/// sentence. Read as "this stands for …", which is what
-/// [`ir::ErrorKind::MixedParameter`] says twice and
-/// [`ir::ErrorKind::NotARow`] once.
+/// What a parameter, or a named tail, stands for, as the phrase a complaint
+/// drops into a sentence. Read as "this stands for …", which is what
+/// [`ir::ErrorKind::MixedParameter`] and [`ir::ErrorKind::MixedTail`] each say
+/// twice and [`ir::ErrorKind::NotARow`] once.
+///
+/// The rest of a struct is a whole type, so it has no phrase of its own: `..r`
+/// in a struct puts whatever is written for `r` in the type's core, and there is
+/// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Sense::Type => "a whole type",
-            Sense::Row(Shape::Struct) => "the rest of a struct's fields",
-            Sense::Row(Shape::Sum) => "the rest of a sum's cases",
+            Sense::Cases => "the rest of a sum's cases",
         })
     }
 }
@@ -503,9 +515,10 @@ impl fmt::Display for Prim {
 /// How much of the surface grammar a semantic type can be.
 ///
 /// A type that carries no fields groups as its core alone, because that is all
-/// it prints as. One that carries fields is either a struct — braces close it,
-/// so it is an atom — or a `with`, whose field list extends rightward and so
-/// has to be kept off anything that could be read as continuing it.
+/// it prints as. One that carries fields is either written in braces — which
+/// close it, so it is an atom, and which is every core a `..` has a spelling for
+/// — or a `with`, whose field list extends rightward and so has to be kept off
+/// anything that could be read as continuing it.
 ///
 /// The type language has no lambda, so one of [`Prec`]'s levels never arises
 /// here. It is still the right scale to answer on: grouping is decided by
@@ -514,10 +527,11 @@ impl fmt::Display for Prim {
 /// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
-        match (self.fields.is_trivial(), &self.core) {
+        match (self.fields.is_empty(), &self.core) {
             (true, core) => core.prec(),
-            // A struct's braces close it, however many fields are inside.
-            (false, Core::Unit) => Prec::Atom,
+            // Braces close it, however many fields are inside and whatever the
+            // `..` after them says.
+            (false, Core::Unit | Core::Var(_) | Core::Bound(_) | Core::Undecided) => Prec::Atom,
             (false, _) => Prec::With,
         }
     }
@@ -560,10 +574,20 @@ impl Grouped for Core {
 /// Three forms, and which one a type takes is decided by its two halves rather
 /// than by a variant. A type carrying no fields prints as its core alone, which
 /// is every type the language had before fields were a property of all of them.
-/// A type whose core is [`Core::Unit`] prints as its fields in braces, which is
-/// how a struct has always printed. And anything else carrying fields prints as
-/// `<core> with { ... }` — a form inference can build and no source syntax can
-/// write, which is why it exists here and nowhere in the parser.
+/// A type carrying fields whose core is one a `..` can be written with —
+/// [`Core::Unit`], which writes no `..` at all, a variable, a quantified
+/// variable, or the undecided type — prints as its fields in braces, which is
+/// how a struct has always printed and is what makes `{ x: 'a, ..'b }` come out
+/// as something a reader could have written. And anything else carrying fields
+/// prints as `<core> with { ... }` — a form inference can build and no source
+/// syntax can write, which is why it exists here and nowhere in the parser, and
+/// which is reachable only through a declaration whose `..` was handed a known
+/// type.
+///
+/// The `..` spelling is [`tail_of`]'s table read off the core rather than off a
+/// tail, and that is the whole of what keeps a printed type re-lowerable to the
+/// type it was printed from: `'b with { x: 'a }` is not something the parser
+/// could read back, and `{ x: 'a, ..'b }` is.
 ///
 /// The grouping comes from [`write_arrow`] and the braces from [`write_row`]
 /// below, both of which the debugger's two tree printers also write through.
@@ -579,15 +603,40 @@ impl Grouped for Core {
 /// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.fields.is_trivial(), &self.core) {
-            (true, core) => core.fmt(f),
-            (false, Core::Unit) => write_fields(f, &self.fields),
-            (false, core) => {
-                write_grouped(f, core.prec() < Prec::With, core)?;
+        if self.fields.is_empty() {
+            return self.core.fmt(f);
+        }
+        match core_tail(&self.core) {
+            Some(tail) => write_fields(f, &self.fields, tail.as_ref().map(shown)),
+            None => {
+                write_grouped(f, self.core.prec() < Prec::With, &self.core)?;
                 f.write_str(" with ")?;
-                write_fields(f, &self.fields)
+                write_fields(f, &self.fields, None)
             }
         }
+    }
+}
+
+/// What follows a fielded type's `..`, or `None` when the core is not one a
+/// `..` can be written with at all and the type has to wear a `with` instead.
+///
+/// [`tail_of`]'s table moved from a row's tail to a type's core, which is where
+/// a struct's `..` now lives. The four it answers about are exactly the four a
+/// written `..` could stand for: nothing further at all, which writes no `..`;
+/// a solver variable; one a scheme quantified; and the undecided type, which
+/// writes the bare `..` a reader would have written.
+///
+/// `Some(None)` and `None` are two different answers and the difference matters:
+/// the first is unit, which closes the braces with no `..` in them, and the
+/// second is a `Nat`, an arrow, a sum or a declared name, none of which a `..`
+/// has a spelling for.
+fn core_tail(core: &Core) -> Option<Option<String>> {
+    match core {
+        Core::Unit => Some(None),
+        Core::Var(var) => Some(Some(format!("?{var}"))),
+        Core::Bound(index) => Some(Some(Core::Bound(*index).to_string())),
+        Core::Undecided => Some(Some(String::new())),
+        Core::Nat | Core::Arrow(..) | Core::Sum(_) | Core::Named { .. } => None,
     }
 }
 
@@ -599,7 +648,7 @@ impl fmt::Display for Core {
             // Unit falls out of this as `{}` rather than `()`, on purpose:
             // there is one type here, and one spelling for it. See
             // [`Core::Unit`].
-            Core::Unit => write_fields(f, &Row::closed()),
+            Core::Unit => write_fields(f, &IndexMap::new(), None),
             Core::Nat => f.write_str(Prim::Nat.name()),
             Core::Arrow(from, to) => write_arrow(f, &**from, &**to),
             Core::Sum(cases) => write_cases(f, cases),
@@ -641,7 +690,7 @@ impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.labels.is_empty() {
             true => self.rest.fmt(f),
-            false => write_fields(f, self),
+            false => write_braced(f, self),
         }
     }
 }
@@ -651,37 +700,47 @@ impl fmt::Display for Row {
 impl fmt::Display for Labels<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.shape {
-            Shape::Struct => write_fields(f, self.row),
+            Shape::Struct => write_braced(f, self.row),
             Shape::Sum => write_cases(f, self.row),
         }
     }
 }
 
-/// The labels of a row and its tail, in braces.
+/// A whole [`Row`] in braces: its labels, and its tail read as a struct's would
+/// be. What the solver's own record of a row falls back to, and what a spliced
+/// tail prints as where the shape says fields.
+fn write_braced(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
+    write_fields(
+        f,
+        &row.labels,
+        tail_of(Shape::Struct, &row.rest).as_ref().map(shown),
+    )
+}
+
+/// A set of labels and whatever follows their `..`, in braces.
 ///
 /// A field prints by what its presence resolved to: there for certain as
 /// `name: T`, absent not at all — a field that is not there is not part of what
 /// the type says — and anything still undecided as `name?: T`, the surface
-/// spelling for "may or may not be there". A tail prints after the fields as
-/// `..` and whatever stands for the rest. A closed row prints no tail, which is
-/// what makes this collapse to the old notation whenever nothing is open.
-fn write_fields(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
-    let entries = row
-        .labels
+/// spelling for "may or may not be there". `tail` is what follows the `..`, and
+/// `None` writes no `..` at all — which is what makes this collapse to the old
+/// notation whenever nothing is open.
+fn write_fields(
+    f: &mut fmt::Formatter<'_>,
+    labels: &IndexMap<String, RowField>,
+    tail: Option<&dyn fmt::Display>,
+) -> fmt::Result {
+    let entries = labels
         .iter()
         .filter_map(|(name, field)| match &field.presence {
             Presence::Absent => None,
             Presence::Present => Some((name, false, &field.ty)),
             _ => Some((name, true, &field.ty)),
         });
-    write_row(
-        f,
-        entries,
-        tail_of(Shape::Struct, &row.rest).as_ref().map(shown),
-    )
+    write_row(f, entries, tail)
 }
 
-/// [`write_fields`] about the other shape: the cases of a row and its tail, each
+/// [`write_braced`] about the other shape: the cases of a row and its tail, each
 /// wearing the backtick that makes it one.
 ///
 /// Absent not at all, undecided as `` `A? T ``, and the tail after them. The one
@@ -700,10 +759,10 @@ fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
     write_sum(f, cases, tail_of(Shape::Sum, &row.rest).as_ref().map(shown))
 }
 
-/// What is known about the labels a row does not name.
+/// What is known about the cases a row does not name.
 ///
 /// Never part of a printed scheme on its own — a closed tail is written as no
-/// `..` at all, and an open one as the `..` [`write_fields`] puts before this.
+/// `..` at all, and an open one as the `..` [`write_cases`] puts before this.
 /// Where one does surface is the solver's own record, where `∅` is how a row
 /// says it has nothing more to come.
 impl fmt::Display for Rest {
@@ -778,11 +837,14 @@ fn letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
 /// A splice that came to nothing is no tail. `..r` handed a closed row that
 /// names nothing leaves a tail saying exactly what [`Rest::Closed`] says, and
 /// the answer has to be the same for both: `∅` is the solver's mark for a row
-/// with nothing more to come and is never part of a printed type, so `F {}` for
-/// `type F r = { x: Nat, ..r }` prints `{ x: Nat }` — which is the type it is.
+/// with nothing more to come and is never part of a printed type, so
+/// `` Fallible (`Ok Nat) `` prints its cases and no `..` — which is what it is.
 /// A label the splice settled absent counts for nothing here, on the same
 /// grounds as everywhere else: a label that is not there is not part of what the
 /// type says.
+///
+/// A struct's `..` does not come through here at all any more: its tail is the
+/// core beside its fields, and [`core_tail`] is the same table read off that.
 fn tail_of(shape: Shape, rest: &Rest) -> Option<String> {
     match rest {
         Rest::Closed => None,
@@ -817,13 +879,11 @@ fn shown(tail: &String) -> &dyn fmt::Display {
 /// prints.
 fn payload(ty: &Ty) -> Option<&Ty> {
     // A field settled absent is not part of what the type says, so a type that
-    // prints as `{}` is unit however many labels the solver left in the map. The
-    // tail is asked the same way a printed row asks it — whether a `..` would be
-    // written at all — so a case whose payload was spliced from a row that names
-    // nothing is still a case carrying unit, and still prints as `` `A ``.
-    let empty = matches!(ty.core, Core::Unit)
-        && tail_of(Shape::Struct, &ty.fields.rest).is_none()
-        && ty.fields.labels.values().all(absent);
+    // prints as `{}` is unit however many labels the solver left in the map. A
+    // unit core writes no `..` after them, which is the whole of what makes this
+    // the same question a printed type asks: a case carrying a struct that came
+    // to nothing is still a case carrying unit, and still prints as `` `A ``.
+    let empty = matches!(ty.core, Core::Unit) && ty.fields.values().all(absent);
     match empty {
         true => None,
         false => Some(ty),
@@ -884,11 +944,14 @@ impl fmt::Display for Rule {
             Rule::Occurs => {
                 f.write_str("the variable is inside the type it is against, so no finite type fits")
             }
-            // In the reader's nouns, like everything else said about a row: the
-            // rest of a struct is a struct, and what it may not name is a
-            // field. Saying it about a "row" and a "label" would name the
+            // In the reader's nouns, like everything else said about a set of
+            // labels: someone who wrote braces is told about a struct and a
+            // field, and someone who wrote backticks about a sum and a case.
+            // Saying it about a "row" and a "label" would name the
             // representation the two shapes share, which is the compiler's
-            // business and nothing the reader wrote.
+            // business and nothing the reader wrote. What a struct's rest
+            // *is* — the type its fields sit on — is the compiler's business
+            // too, so the sentence keeps to what the reader can see.
             Rule::Overlap { shape } => write!(
                 f,
                 "the rest of a {shape} cannot be a {shape} naming a {} the {shape} already names",

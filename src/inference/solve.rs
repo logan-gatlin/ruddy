@@ -14,58 +14,146 @@ use super::{
     Constraint, ConstraintKind, Effect, Error, ErrorKind, Goal, Rule, Side, Slot, Step, Table,
 };
 
-/// A row a goal is about, the type it belongs to, and the shape it was matched
-/// on.
+/// What a set of labels says about the ones it does not name.
 ///
-/// The three travel together everywhere below [`Solve::rows`]: a complaint
+/// The one thing the two shapes still differ in, and so the one thing the shared
+/// label rule has to be told. A struct's fields run out where the core beside
+/// them says they do — `{ x: Nat, ..r }` is the type `r` carrying an `x` — and a
+/// sum's cases run out where its row's [`Rest`] says they do, because
+/// [`Core::Sum`] is the only core with a case row and there is nowhere else for
+/// a sum's tail to live.
+///
+/// Everything else about matching two sets of labels — the extras each way, the
+/// shared ones, the presence clashes, the noun a complaint is worded in — is the
+/// same question twice, so it is written once and reaches both through this. Two
+/// copies of it that have to agree is a defect, not an implementation choice.
+#[derive(Debug, Clone)]
+enum Tail {
+    Core(Core),
+    Rest(Rest),
+}
+
+/// A set of labels a goal is about, the type it belongs to, and the tail that
+/// says what is not named.
+///
+/// The three travel together everywhere below [`Solve::labels`]: a complaint
 /// names the whole type, and is worded in the nouns of the shape. Paired rather
 /// than read back where they are needed, so there is one reading of the shape —
-/// the goal's — and nothing further in that could come to disagree with it.
+/// the tail's — and nothing further in that could come to disagree with it.
 ///
-/// The type is carried as well as the row because a complaint is about the
-/// type. `` (`A 1).x `` is a missing *field* on a sum-cored type: the row that
-/// went wrong is that type's field row, and the type beside the word is the
-/// whole of what the reader wrote.
+/// The type is carried as well as the labels because a complaint is about the
+/// type. `` (`A 1).x `` is a missing *field* on a sum-cored type: the labels that
+/// went wrong are that type's fields, and the type beside the word is the whole
+/// of what the reader wrote.
 #[derive(Clone, Copy)]
 struct Rowed<'a> {
-    shape: Shape,
     ty: &'a Rc<Ty>,
-    row: &'a Row,
+    labels: &'a IndexMap<String, RowField>,
+    tail: &'a Tail,
+}
+
+impl Tail {
+    /// The variable this tail still is, if it is one. What the extras beside it
+    /// are absorbed into, and the whole of what makes a set of labels open.
+    fn var(&self) -> Option<TyVar> {
+        match self {
+            Tail::Core(Core::Var(var)) | Tail::Rest(Rest::Var(var)) => Some(*var),
+            _ => None,
+        }
+    }
+
+    /// Whether this tail absorbs whatever it is put against: a failure abandoned
+    /// the question, so nothing it decides is worth deciding again.
+    fn absorbs(&self) -> bool {
+        matches!(
+            self,
+            Tail::Core(Core::Undecided) | Tail::Rest(Rest::Undecided)
+        )
+    }
+
+    /// Whether this tail allows nothing more at all — every label it does not
+    /// name is absent. Neither open nor abandoned is the whole of it: `Nat`
+    /// carries the fields written beside it and no others, exactly as a closed
+    /// row of cases allows the cases it names and no others.
+    fn closed(&self) -> bool {
+        self.var().is_none() && !self.absorbs()
+    }
+
+    /// Which of the two sets of labels this is a tail of, which is the reading
+    /// every complaint under it is worded in.
+    fn shape(&self) -> Shape {
+        match self {
+            Tail::Core(_) => Shape::Struct,
+            Tail::Rest(_) => Shape::Sum,
+        }
+    }
+
+    /// This tail carrying `labels`, as the value a variable takes: a whole type
+    /// for a struct's fields, a row for a sum's cases.
+    fn value(&self, labels: IndexMap<String, RowField>) -> Assigned {
+        match self {
+            Tail::Core(core) => Assigned::Ty(Rc::new(Ty {
+                core: core.clone(),
+                fields: labels,
+            })),
+            Tail::Rest(rest) => Assigned::Row(Rc::new(Row {
+                labels,
+                rest: rest.clone(),
+            })),
+        }
+    }
+
+    /// This tail as the value a variable standing for it would take: the tail
+    /// alone, with no labels in front of it. What a goal about two tails is
+    /// worded as, so a binding reads `?1 ~ {}` rather than repeating the whole
+    /// types the step above already showed.
+    fn bare(&self) -> Assigned {
+        self.value(IndexMap::new())
+    }
 }
 
 impl<'a> Rowed<'a> {
     /// The fields a type carries, which every type has.
-    fn fields(ty: &'a Rc<Ty>) -> Self {
+    fn fields(ty: &'a Rc<Ty>, tail: &'a Tail) -> Self {
         Self {
-            shape: Shape::Struct,
             ty,
-            row: &ty.fields,
+            labels: &ty.fields,
+            tail,
         }
     }
 
     /// The cases a sum-cored type allows. The row is handed in rather than
     /// matched out, so that the one caller that knows the core is a sum is the
     /// one that says so.
-    fn cases(ty: &'a Rc<Ty>, cases: &'a Row) -> Self {
+    fn cases(ty: &'a Rc<Ty>, cases: &'a IndexMap<String, RowField>, tail: &'a Tail) -> Self {
         Self {
-            shape: Shape::Sum,
             ty,
-            row: cases,
+            labels: cases,
+            tail,
         }
     }
 
-    /// The type this row belongs to, with the row replaced. What a complaint
-    /// names: the whole type, so that a base printed beside a missing field
-    /// reads as the type the reader wrote rather than as the row the solver was
-    /// looking at.
-    fn rebuild(&self, row: Row) -> Rc<Ty> {
-        match self.shape {
-            Shape::Struct => Rc::new(Ty {
-                core: self.ty.core.clone(),
-                fields: row,
+    /// Which of the two sets of labels this is, read off the tail — the one
+    /// place the two differ, and so the one place worth reading it from.
+    fn shape(&self) -> Shape {
+        self.tail.shape()
+    }
+
+    /// The type these labels belong to, with the labels replaced. What a
+    /// complaint names: the whole type, so that a base printed beside a missing
+    /// field reads as the type the reader wrote rather than as the labels the
+    /// solver was looking at.
+    fn rebuild(&self, labels: IndexMap<String, RowField>) -> Rc<Ty> {
+        match self.tail {
+            Tail::Core(core) => Rc::new(Ty {
+                core: core.clone(),
+                fields: labels,
             }),
-            Shape::Sum => Rc::new(Ty {
-                core: Core::Sum(row),
+            Tail::Rest(rest) => Rc::new(Ty {
+                core: Core::Sum(Row {
+                    labels,
+                    rest: rest.clone(),
+                }),
                 fields: self.ty.fields.clone(),
             }),
         }
@@ -130,15 +218,24 @@ impl Solve<'_> {
     /// cannot be. Failure leaves both sides as they were: the error is
     /// recorded once and the solve continues.
     ///
-    /// Two types are equal when their cores are equal and their field rows are
-    /// equal, and that is the whole rule. Which leaves three shapes of trace.
-    /// Undecided absorbs, as it always has. A *bare* variable — a core with no
-    /// fields of its own — takes the whole type it is against, fields and all,
-    /// which is what keeps `fn x => x` inferring `'a -> 'a`. And everything
-    /// else is the core's own rule followed by the field rows, except that two
-    /// unit cores are nothing but their field rows and so record only the
-    /// struct step, byte for byte what a struct against a struct has always
-    /// recorded.
+    /// Two types are equal when they name the same labels with the same
+    /// presences and types, and their cores agree about everything else. One
+    /// function decides a type; there is no separate rule for a struct, because
+    /// a struct is a [`Core::Unit`] carrying labels and every other type carries
+    /// labels too.
+    ///
+    /// Four steps, in this order:
+    ///
+    /// 1. [`Core::Undecided`] on either side absorbs, as it always has.
+    /// 2. A *bare* variable — a [`Core::Var`] carrying no labels — takes the
+    ///    whole type it is against, fields and all, which is what keeps
+    ///    `fn x => x` inferring `'a -> 'a`. Before unfolding, so that one
+    ///    against a declared type takes the type by the name it was written as:
+    ///    a definition then reads as its annotation said, and the solver has one
+    ///    less thing to unfold later.
+    /// 3. A name beside labels is unfolded and the goal asked again. See
+    ///    [`Solve::unwrapped`].
+    /// 4. Everything else is [`Solve::fielded`]: the labels and the core.
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
@@ -148,7 +245,7 @@ impl Solve<'_> {
         };
         // One variable against itself is already the same thing, so the arms
         // below must not read it as a variable against a type and try to bind
-        // it to itself. Its field rows may still differ, which is what the
+        // it to itself. Its labels may still differ, which is what the
         // fall-through decides.
         let itself = matches!((&lhs.core, &rhs.core), (Core::Var(a), Core::Var(b)) if a == b);
         match (&lhs.core, &rhs.core) {
@@ -166,58 +263,124 @@ impl Solve<'_> {
                 self.step(span, Rule::Absorb, goal, Effect::None);
                 self.recover_ty(span, &lhs);
             }
-            // A bare variable takes the whole type. Before unfolding, so that
-            // one against a declared type takes the type by the name it was
-            // written as: what a definition is inferred to be then reads as
-            // what its annotations said, and the solver has one less thing to
-            // unfold later.
-            (Core::Var(var), _) if !itself && lhs.fields.is_trivial() => {
+            (Core::Var(var), _) if !itself && lhs.fields.is_empty() => {
                 let var = *var;
                 self.assign(span, goal, var, Assigned::Ty(rhs.clone()));
             }
-            (_, Core::Var(var)) if !itself && rhs.fields.is_trivial() => {
+            (_, Core::Var(var)) if !itself && rhs.fields.is_empty() => {
                 let var = *var;
                 self.assign(span, goal, var, Assigned::Ty(lhs.clone()));
             }
-            // Two types with nothing of their own are their fields and nothing
-            // else, so the field rows are the whole question and the struct
-            // rule is the whole step.
-            (Core::Unit, Core::Unit) => self.rows(span, Rowed::fields(&lhs), Rowed::fields(&rhs)),
-            // The core's own rule, and then — one level under it — the fields
-            // both sides carry, when either side has any to speak of. A type
-            // with no fields is every type the language can write, so this
-            // second step is invisible to every program that could be written
-            // before fields were a property of all of them.
-            //
-            // And if those fields turn out not to agree, the cores go with
-            // them: the two halves were decided by one goal, so a failure in
-            // the second half is a failure of the whole of it. See
-            // [`Solve::abandon`].
-            _ => {
-                let decided = self.cores(span, goal, &lhs, &rhs);
-                let carried = !(lhs.fields.is_trivial() && rhs.fields.is_trivial());
-                if decided && carried {
-                    let reported = self.errors.len();
-                    self.depth += 1;
-                    self.rows(span, Rowed::fields(&lhs), Rowed::fields(&rhs));
-                    self.depth -= 1;
-                    if self.errors.len() > reported {
-                        self.abandon(span, &lhs, &rhs);
-                    }
-                }
-            }
+            _ => self.fielded(span, goal, &lhs, &rhs),
         }
     }
 
-    /// Decide two cores, and say whether the field rows beside them are still
-    /// worth deciding. A goal that failed decides nothing, and one that was
-    /// replaced — an unfolding — carries its own fields along with it.
+    /// Decide two types by their labels and their cores.
     ///
-    /// A core variable bound here takes the *core* it is against and an empty
-    /// closed row, not the whole type: the fields are what the caller decides
-    /// next, and binding them in as well would decide them twice.
+    /// A type carrying no labels on either side is its core and nothing else, so
+    /// the core's own rule is the whole step and the trace reads exactly as it
+    /// did before fields were a property of every type: `Nat` against `Nat` is
+    /// one [`Rule::Prim`] and nothing more.
+    ///
+    /// Where either side carries a label there is a [`Rule::Struct`] over the
+    /// whole of it, with the label steps and the core step one level under. Two
+    /// [`Core::Unit`] cores record no step of their own — they are already the
+    /// same thing — which is what keeps a struct against a struct reading byte
+    /// for byte as it always has.
+    ///
+    /// Which of the two halves goes first is decided by whether a core variable
+    /// is involved, and only there does the order differ from what it was. A
+    /// core variable is what the extras have to be absorbed into, so the labels
+    /// have to be settled before it can be told what it stands for: `1.x`
+    /// records the fields and their failure, and no longer binds the base's core
+    /// first. Where neither core is a variable there is nothing to absorb into
+    /// and the cores are the larger question — two types that cannot be equal at
+    /// all are a mismatch of what the reader wrote, not a field missing from a
+    /// type that was never the right one — so those are decided first and the
+    /// labels only if they agreed.
+    ///
+    /// Either way the two halves are one goal, so a failure in one abandons the
+    /// other: a core bound to a fieldless type with labels it could not take
+    /// beside it is a type nothing can be. See [`Solve::abandon`].
+    fn fielded(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
+        let carried = !(lhs.fields.is_empty() && rhs.fields.is_empty());
+        let named =
+            matches!(lhs.core, Core::Named { .. }) || matches!(rhs.core, Core::Named { .. });
+        if carried && named {
+            return self.unwrapped(span, goal, lhs, rhs);
+        }
+        // The core step's goal is the two cores, each as a type carrying no
+        // labels, so a binding reads `?1 ~ {}` rather than repeating the whole
+        // types the step above already showed. With no labels on either side the
+        // two are the same thing said twice, and this is that one thing.
+        let cores = Goal::Type {
+            expected: Rc::new(Ty::plain(lhs.core.clone())),
+            actual: Rc::new(Ty::plain(rhs.core.clone())),
+        };
+        if !carried {
+            self.cores(span, cores, lhs, rhs);
+            return;
+        }
+
+        self.step(span, Rule::Struct, goal, Effect::Decomposed);
+        self.depth += 1;
+        let absorbing = matches!(lhs.core, Core::Var(_)) || matches!(rhs.core, Core::Var(_));
+        let reported = self.errors.len();
+        if absorbing || self.cores(span, cores, lhs, rhs) {
+            let (left, right) = (Tail::Core(lhs.core.clone()), Tail::Core(rhs.core.clone()));
+            self.labels(span, Rowed::fields(lhs, &left), Rowed::fields(rhs, &right));
+            if self.errors.len() > reported {
+                self.abandon(span, lhs, rhs);
+            }
+        }
+        self.depth -= 1;
+    }
+
+    /// Replace a declared type beside labels with what it stands for, and ask
+    /// the goal again.
+    ///
+    /// What a declaration stands for keeps its fields behind the name, so
+    /// binding a core variable to the name would leave the labels beside it with
+    /// nothing to be decided against — which is why this comes before the labels
+    /// rather than after. It is the rule `cores` has always applied to a name
+    /// against a shape, restated for the order the labels now go in, and it is
+    /// what keeps `a.x` working where `a : WithX { y: Nat }`.
+    ///
+    /// Recorded as [`Rule::Unfold`] with [`Effect::Decomposed`], the same rule
+    /// as [`Solve::unfold`]'s two-sided unfolding, and *not* pushed onto
+    /// [`Solve::assumed`]: that stack is keyed on a goal about two names, and
+    /// this is one side of one type.
+    ///
+    /// Termination is [`ir::build`](crate::ir)'s check and not the assumption
+    /// stack. Each unfold replaces a name with its body under the arguments
+    /// written at that mention, so the chain descends either along the
+    /// declarations' core graph, which
+    /// [`ir::ErrorKind::EndlessFields`](crate::ir::ErrorKind) makes acyclic, or
+    /// into a strictly smaller written argument. Both are finite. That is the
+    /// whole of why this rule is safe, and none of it may be relaxed without
+    /// coming back here first.
+    fn unwrapped(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
+        let lhs = self.table.unfolded(self.aliases, lhs);
+        let rhs = self.table.unfolded(self.aliases, rhs);
+        self.step(span, Rule::Unfold, goal, Effect::Decomposed);
+        self.depth += 1;
+        self.unify(span, &lhs, &rhs);
+        self.depth -= 1;
+    }
+
+    /// Decide two cores, and say whether the labels beside them are still worth
+    /// deciding. A goal that failed decides nothing, and one that was replaced —
+    /// an unfolding — carries its own fields along with it.
+    ///
+    /// A core variable bound here takes the *core* it is against and no labels,
+    /// not the whole type: the labels are the caller's to decide, and binding
+    /// them in as well would decide them twice.
     fn cores(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         match (&lhs.core, &rhs.core) {
+            // Two types with nothing of their own are already the same thing,
+            // and saying so would be a step about nothing — which is what keeps
+            // a struct against a struct recording exactly what it always did.
+            (Core::Unit, Core::Unit) => true,
             (Core::Var(a), Core::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
@@ -307,13 +470,10 @@ impl Solve<'_> {
                 self.unfold(span, goal, lhs, rhs);
                 false
             }
-            // A core variable takes the core it is against — and the type it
-            // ends up standing for is decided by that core alone, so a name
-            // must be looked through first. What a declaration stands for keeps
-            // its fields behind the name, and binding the variable to the name
-            // would leave the fields beside it with nothing to be decided
-            // against. A *bare* variable is the exception and is taken before
-            // this, in [`Solve::unify`], because there is nothing beside it.
+            // A core variable takes the core it is against. A name is looked
+            // through before this, in [`Solve::unwrapped`], for the reason that
+            // rule gives; a *bare* variable is taken before either, in
+            // [`Solve::unify`], because there is nothing beside it to decide.
             (Core::Var(var), core) => {
                 let (var, core) = (*var, core.clone());
                 self.assign(span, goal, var, Assigned::Ty(Rc::new(Ty::plain(core))));
@@ -344,7 +504,23 @@ impl Solve<'_> {
             // insides look alike, and lining their labels up would be answering
             // a question nobody asked.
             (Core::Sum(cases), Core::Sum(others)) => {
-                self.rows(span, Rowed::cases(lhs, cases), Rowed::cases(rhs, others));
+                let (want, have) = (self.table.canon(cases), self.table.canon(others));
+                let (left, right) = (Tail::Rest(want.rest.clone()), Tail::Rest(have.rest.clone()));
+                let expects = Rowed::cases(lhs, &want.labels, &left);
+                let actuals = Rowed::cases(rhs, &have.labels, &right);
+                // Flattened first and each put back in the type it came out of,
+                // which is what the goal is recorded as: a tail already bound to
+                // a row is where that differs from the rows as they arrived, and
+                // it is exactly the case where the unflattened goal cannot
+                // account for its own children — the labels under it come from a
+                // row the line above does not show.
+                let expected = expects.rebuild(want.labels.clone());
+                let actual = actuals.rebuild(have.labels.clone());
+                let goal = Goal::Type { expected, actual };
+                self.step(span, Rule::Sum, goal, Effect::Decomposed);
+                self.depth += 1;
+                self.labels(span, expects, actuals);
+                self.depth -= 1;
                 true
             }
             // Nothing applies, and the two types cannot be made equal.
@@ -377,68 +553,45 @@ impl Solve<'_> {
         false
     }
 
-    /// Make two rows of one shape the same row. [`Rule::Struct`] — or
-    /// [`Rule::Sum`], which is the same rule about the other shape — replaces
-    /// the pair with everything that has to hold of it: labels only one side
-    /// names flow into the other side's tail, and the labels both name are
-    /// decided one by one.
+    /// Make two sets of labels the same, whichever of the two shapes they are.
+    ///
+    /// The rule written once and reaching both, with the one thing that differs
+    /// abstracted into [`Tail`]: labels only one side names flow into what the
+    /// other side allows beyond its own, and the labels both name are decided
+    /// one by one. `shape` decides the nouns a complaint is worded in and
+    /// nothing else.
     ///
     /// The tails go first, the shared labels after. The other order would let
     /// a shared label's own unification bind one of the tails behind the
     /// flattened copy this function is holding — a field's type can mention
-    /// its own row's tail — and an act performed on a stale tail is an act
-    /// performed on the wrong type.
-    ///
-    /// The step comes before all of it, and everything the rule does is one
-    /// level under it. Flattening is where that used to leak: [`Table::canon`]
-    /// decided things, and it ran before the step, so what it decided appeared
-    /// in the trace above and beside the rule it belongs to rather than
-    /// beneath it. Flattening is now a read, and what it finds to decide is
-    /// decided here, in the rule's own scope.
-    ///
-    /// Which is also what the goal is recorded as: the two rows flattened, and
-    /// each put back in the type it came out of. A tail already bound to a row
-    /// is where that differs from the rows as they arrived, and it is exactly
-    /// the case where the unflattened goal cannot account for its own children
-    /// — the labels under it come from a row the line above does not show.
-    fn rows(&mut self, span: Span, lhs: Rowed<'_>, rhs: Rowed<'_>) {
-        let shape = lhs.shape;
-        let want = self.table.canon(lhs.row);
-        let have = self.table.canon(rhs.row);
-        let expected = lhs.rebuild(want.clone());
-        let actual = rhs.rebuild(have.clone());
+    /// its own tail — and an act performed on a stale tail is an act performed
+    /// on the wrong type.
+    fn labels(&mut self, span: Span, lhs: Rowed<'_>, rhs: Rowed<'_>) {
         let goal = Goal::Type {
-            expected: expected.clone(),
-            actual: actual.clone(),
+            expected: lhs.ty.clone(),
+            actual: rhs.ty.clone(),
         };
 
-        let rule = match shape {
-            Shape::Struct => Rule::Struct,
-            Shape::Sum => Rule::Sum,
-        };
-        self.step(span, rule, goal.clone(), Effect::Decomposed);
-        self.depth += 1;
-
-        let only_want: IndexMap<String, RowField> = want
+        let only_want: IndexMap<String, RowField> = lhs
             .labels
             .iter()
-            .filter(|(name, _)| !have.labels.contains_key(*name))
+            .filter(|(name, _)| !rhs.labels.contains_key(*name))
             .map(|(name, field)| (name.clone(), field.clone()))
             .collect();
-        let only_have: IndexMap<String, RowField> = have
+        let only_have: IndexMap<String, RowField> = rhs
             .labels
             .iter()
-            .filter(|(name, _)| !want.labels.contains_key(*name))
+            .filter(|(name, _)| !lhs.labels.contains_key(*name))
             .map(|(name, field)| (name.clone(), field.clone()))
             .collect();
 
-        // Two rows sharing one tail cannot differ in labels: whatever the
+        // Two sides sharing one tail cannot differ in labels: whatever the
         // tail absorbed from one side it would grow on the other, and the
-        // rows would chase each other forever. The occurs check inside
+        // two would chase each other forever. The occurs check inside
         // `assign` refuses the binding when only one side has extras, but the
         // both-sided case binds cleanly every round and never converges, so
         // the pair is refused here — the same cycle, caught one level up.
-        if let (Rest::Var(a), Rest::Var(b)) = (&want.rest, &have.rest)
+        if let (Some(a), Some(b)) = (lhs.tail.var(), rhs.tail.var())
             && a == b
             && !(only_want.is_empty() && only_have.is_empty())
         {
@@ -447,79 +600,98 @@ impl Solve<'_> {
                 kind: ErrorKind::Recursive,
             };
             let abandoned = [
-                Assigned::Row(Rc::new(want.clone())),
-                Assigned::Row(Rc::new(have.clone())),
+                lhs.tail.value(lhs.labels.clone()),
+                rhs.tail.value(rhs.labels.clone()),
             ];
             self.fail(span, Rule::Occurs, goal, error, &abandoned);
-            self.depth -= 1;
             return;
         }
 
-        let expects = Rowed {
-            shape,
-            ty: &expected,
-            row: &want,
-        };
-        let actuals = Rowed {
-            shape,
-            ty: &actual,
-            row: &have,
-        };
-
         match (only_want.is_empty(), only_have.is_empty()) {
-            // The rows name the same labels, so the tails are simply each
-            // other. Two closed tails already agree, and saying so would be
-            // a step about nothing.
+            // The two name the same labels, so what each allows beyond them is
+            // simply the other. Two closed tails already agree, and saying so
+            // would be a step about nothing.
             (true, true) => {
-                if !matches!((&want.rest, &have.rest), (Rest::Closed, Rest::Closed)) {
-                    self.rests(span, &want.rest, &have.rest);
+                if !(lhs.tail.closed() && rhs.tail.closed()) {
+                    self.tails(span, lhs.tail, rhs.tail);
                 }
             }
-            (true, false) => self.absorb(
-                span,
-                Side::Expected,
-                &want.rest,
-                only_have,
-                &have.rest,
-                expects,
-            ),
-            (false, true) => self.absorb(
-                span,
-                Side::Actual,
-                &have.rest,
-                only_want,
-                &want.rest,
-                actuals,
-            ),
-            // Extras both ways continue as one fresh tail, which is what
-            // makes the two rows end as the same row rather than merely
-            // overlapping ones.
+            (true, false) => self.absorb(span, Side::Expected, only_have, rhs.tail, lhs),
+            (false, true) => self.absorb(span, Side::Actual, only_want, lhs.tail, rhs),
+            // Extras both ways continue as one fresh tail, which is what makes
+            // the two sides end as one rather than merely overlapping — and
+            // what closes both sides against each other where neither has room
+            // for them, since the tail one closes then closes the other.
             (false, false) => {
-                let rest = self.table.fresh_row();
-                self.absorb(span, Side::Expected, &want.rest, only_have, &rest, expects);
-                self.absorb(span, Side::Actual, &have.rest, only_want, &rest, actuals);
+                let rest = self.fresh_tail(lhs.shape());
+                self.absorb(span, Side::Expected, only_have, &rest, lhs);
+                self.absorb(span, Side::Actual, only_want, &rest, rhs);
             }
         }
 
-        let shared: Vec<_> = want
+        let shared: Vec<_> = lhs
             .labels
             .iter()
             .filter_map(|(name, field)| {
-                have.labels
+                rhs.labels
                     .get(name)
                     .map(|other| (name.clone(), field.clone(), other.clone()))
             })
             .collect();
         for (name, want, have) in shared {
-            self.field(span, &name, expects, actuals, &want, &have);
+            self.field(span, &name, lhs, rhs, &want, &have);
         }
-        self.depth -= 1;
     }
 
-    /// Make two tails the same tail: a variable takes the other, and an
-    /// undecided one absorbs it.
+    /// A variable standing for whatever a set of labels of this shape allows
+    /// beyond the ones it names: a fresh core for a struct's fields, a fresh
+    /// tail for a sum's cases. One variable table and one sort per position, as
+    /// everywhere else.
+    fn fresh_tail(&mut self, shape: Shape) -> Tail {
+        match shape {
+            Shape::Struct => Tail::Core(Core::Var(self.table.fresh_core())),
+            Shape::Sum => Tail::Rest(self.table.fresh_row()),
+        }
+    }
+
+    /// Decide what two tails allow beyond the labels their sides name, in
+    /// whichever sort they are: the core rule for a struct's fields, and
+    /// [`Solve::rests`] for a sum's cases.
     ///
-    /// Only reached where the two rows name the same labels, so there is
+    /// The one place the shared rule has to know which shape it is on, and the
+    /// reason it is one line: everything above this is the same question about
+    /// two sets of labels, and everything below it is a question the two shapes
+    /// answer with different machinery.
+    fn tails(&mut self, span: Span, lhs: &Tail, rhs: &Tail) {
+        match (lhs, rhs) {
+            (Tail::Rest(left), Tail::Rest(right)) => self.rests(span, left, right),
+            // Two cores, and nothing else can reach here: which shape a set of
+            // labels is, is decided by the syntax that wrote it, and the two
+            // sides of a goal were matched on it before either arrived. So the
+            // pair is read as the two types the cores are, which is what a
+            // struct's tail *is*.
+            //
+            // Resolved, because a core reaching here may be a variable this very
+            // rule closed a moment ago — [`Solve::absorb`] settles both sides of
+            // a pair one after the other, and the second must see what the first
+            // decided rather than bind the variable twice.
+            (left, right) => {
+                let left = self.table.resolve(&left.bare().as_ty());
+                let right = self.table.resolve(&right.bare().as_ty());
+                let goal = Goal::Type {
+                    expected: left.clone(),
+                    actual: right.clone(),
+                };
+                self.cores(span, goal, &left, &right);
+            }
+        }
+    }
+
+    /// Make two of a sum's tails the same tail: a variable takes the other, and
+    /// an undecided one absorbs it. The struct's half of [`Solve::tails`] is the
+    /// core rule; this is the other.
+    ///
+    /// Only reached where the two rows name the same cases, so there is
     /// nothing to push into either side and the question is what the two allow
     /// beyond them. Each tail is flattened first, because one of them may be a
     /// tail this very rule has just closed — [`Solve::absorb`] shuts both sides
@@ -563,11 +735,13 @@ impl Solve<'_> {
         }
     }
 
-    /// A row as it reads at this moment: the tail spliced in as far as it has
-    /// been decided, every presence fixed at what it has been decided to
-    /// be — still open becomes undecided, which prints as the `?` the user
-    /// would have written and which nothing downstream will rewrite — and the
-    /// whole put back into the type the row belongs to.
+    /// A set of labels as it reads at this moment: every presence fixed at what
+    /// it has been decided to be — still open becomes undecided, which prints as
+    /// the `?` the user would have written and which nothing downstream will
+    /// rewrite — and the whole put back into the type the labels belong to.
+    ///
+    /// Already flattened by the time it arrives: [`Solve::labels`] is handed a
+    /// sum's cases canonical and a type's fields have no chain to follow.
     ///
     /// For the payload of a complaint, and only for that. A complaint's types
     /// are otherwise resolved at the end of the definition, on purpose: a
@@ -583,8 +757,7 @@ impl Solve<'_> {
     /// decided by the failing goal's siblings, and later knowledge about them
     /// is knowledge the reader wants.
     fn frozen(&self, row: Rowed<'_>) -> Rc<Ty> {
-        let flat = self.table.canon(row.row);
-        let labels = flat
+        let labels = row
             .labels
             .iter()
             .map(|(name, field)| {
@@ -599,10 +772,7 @@ impl Solve<'_> {
                 (name.clone(), field)
             })
             .collect();
-        row.rebuild(Row {
-            labels,
-            rest: flat.rest,
-        })
+        row.rebuild(labels)
     }
 
     /// Decide one label both rows name: whether it is there must agree, and
@@ -611,10 +781,9 @@ impl Solve<'_> {
     /// has, never as `present` against `absent` — the label's name is known
     /// here, and the complaint should name it.
     ///
-    /// Which noun the rule is read in is handed down from [`Solve::rows`], the
-    /// way [`Solve::absorb`]'s is: the shape is what the two rows were matched
-    /// on, so passing it costs nothing and leaves no second reading of it here
-    /// to drift.
+    /// Which noun the rule is read in comes off the tail the side carries, the
+    /// way [`Solve::absorb`]'s does: the shape is what the two sides were
+    /// matched on, so there is one reading of it and nothing here to drift.
     fn field(
         &mut self,
         span: Span,
@@ -624,7 +793,7 @@ impl Solve<'_> {
         want: &RowField,
         have: &RowField,
     ) {
-        let shape = expected.shape;
+        let shape = expected.shape();
         let p1 = self.table.presence_of(&want.presence);
         let p2 = self.table.presence_of(&have.presence);
         let goal = Goal::Presence {
@@ -716,16 +885,17 @@ impl Solve<'_> {
         }
     }
 
-    /// Push the labels only one row names into the other row's tail, to
-    /// continue as `rest`. `side` says which side of the goal the tail sits
-    /// on, so that every act performed on its behalf keeps the direction the
-    /// constraint was worded in, and `base` is the type the tail's row belongs
-    /// to, which is what a complaint names and the shape it is worded in.
+    /// Push the labels only one side names into what the other side allows
+    /// beyond its own, to continue as `rest`. `side` says which side of the goal
+    /// the absorbing tail sits on, so that every act performed on its behalf
+    /// keeps the direction the constraint was worded in, and `base` is the side
+    /// itself — the type a complaint names, and the tail doing the absorbing.
     ///
-    /// An open tail takes the row whole — one binding, occurs-checked like
+    /// An open tail takes the labels whole — one binding, occurs-checked like
     /// any other. A closed tail takes nothing: each label must turn out
     /// absent, one that certainly is not is a missing or extra label by
-    /// `side`, and whatever would have continued as `rest` is closed too.
+    /// `side`, and whatever would have continued as `rest` is decided against
+    /// this side's own tail, which allows nothing more either.
     ///
     /// Both complaints are reachable from one projection, and `side` is the
     /// whole of the difference. `1.x` and `let b : Nat -> Nat = fn p => p.x`
@@ -741,31 +911,28 @@ impl Solve<'_> {
         &mut self,
         span: Span,
         side: Side,
-        tail: &Rest,
         extras: IndexMap<String, RowField>,
-        rest: &Rest,
+        rest: &Tail,
         base: Rowed<'_>,
     ) {
-        let shape = base.shape;
-        if !matches!(tail, Rest::Closed) {
-            let row = Rc::new(Row {
-                labels: extras,
-                rest: rest.clone(),
-            });
+        let shape = base.shape();
+        let tail = base.tail;
+        if !tail.closed() {
+            let value = rest.value(extras);
             let (expected, actual) = match side {
-                Side::Expected => (Rc::new(Row::of(tail.clone())), row.clone()),
-                Side::Actual => (row.clone(), Rc::new(Row::of(tail.clone()))),
+                Side::Expected => (tail.bare(), value.clone()),
+                Side::Actual => (value.clone(), tail.bare()),
             };
-            let goal = Goal::Row { expected, actual };
-            // Not a second row rule: what the extras are was decided above, and
-            // this is the act of putting them somewhere. A variable takes them;
-            // an undecided tail absorbs them, and everything they would have
-            // decided is abandoned with them.
-            match tail {
-                Rest::Var(var) => self.assign(span, goal, *var, Assigned::Row(row)),
-                _ => {
+            let goal = goal_of(expected, actual);
+            // Not a second label rule: what the extras are was decided above,
+            // and this is the act of putting them somewhere. A variable takes
+            // them; an undecided tail absorbs them, and everything they would
+            // have decided is abandoned with them.
+            match tail.var() {
+                Some(var) => self.assign(span, goal, var, value),
+                None => {
                     self.step(span, Rule::Absorb, goal, Effect::None);
-                    self.recover(span, &Assigned::Row(row));
+                    self.recover(span, &value);
                 }
             }
             return;
@@ -811,10 +978,14 @@ impl Solve<'_> {
                 (_, Side::Actual) => self.presences(span, &presence, &Presence::Absent),
             }
         }
-        if !matches!(rest, Rest::Closed) {
+        // And whatever would have continued past them allows nothing more
+        // either, which is this side's own tail said of it. Skipped where
+        // `rest` already allows nothing more, which would be a step saying what
+        // both sides had already said.
+        if !rest.closed() {
             match side {
-                Side::Expected => self.rests(span, &Rest::Closed, rest),
-                Side::Actual => self.rests(span, rest, &Rest::Closed),
+                Side::Expected => self.tails(span, tail, rest),
+                Side::Actual => self.tails(span, rest, tail),
             }
         }
     }
@@ -989,8 +1160,7 @@ impl Solve<'_> {
         }
     }
 
-    /// Abandon the cores of two types whose field rows could not be made to
-    /// agree.
+    /// Abandon the cores of two types whose labels could not be made to agree.
     ///
     /// [`fail`](Self::fail) abandons what a failing rule was about, and a core
     /// is the one thing it cannot reach. A type is its core and its fields, both
@@ -1016,6 +1186,16 @@ impl Solve<'_> {
         for core in [&lhs.core, &rhs.core] {
             if let Core::Var(var) = core {
                 let var = *var;
+                // Unless the failure already reached it. [`fail`](Self::fail)
+                // abandons the values the rule was about, and where the labels
+                // go first those values are whole types with these very cores
+                // in them — so a core may already be pointed at the undecided
+                // type, and settling it again would show a reader one act as
+                // two. Which also covers the two sides being one variable.
+                let settled = self.table.resolve(&Rc::new(Ty::plain(Core::Var(var))));
+                if matches!(settled.core, Core::Undecided) {
+                    continue;
+                }
                 self.settle(span, var, Assigned::Ty(Rc::new(Ty::default())));
             }
         }
@@ -1069,21 +1249,26 @@ impl Solve<'_> {
             Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
         }
         let fields = ty.fields.clone();
-        self.recover_row(span, &fields);
+        self.recover_labels(span, &fields);
     }
 
-    /// [`recover`](Self::recover) over a row. A label is abandoned whole: its
-    /// presence and its type, and then the tail saying what else the row might
-    /// have had. Missing one would leave a variable unbound for generalization
-    /// to quantify.
+    /// [`recover`](Self::recover) over a sum's cases: every label, and then the
+    /// tail saying what else the row might have had.
     fn recover_row(&mut self, span: Span, row: &Row) {
         let row = self.table.canon(row);
-        for field in row.labels.values() {
+        self.recover_labels(span, &row.labels);
+        self.recover_rest(span, &row.rest);
+    }
+
+    /// [`recover`](Self::recover) over a label map: each label whole, its
+    /// presence and its type. Missing one would leave a variable unbound for
+    /// generalization to quantify.
+    fn recover_labels(&mut self, span: Span, labels: &IndexMap<String, RowField>) {
+        for field in labels.values() {
             let (presence, ty) = (field.presence.clone(), field.ty.clone());
             self.recover_presence(span, &presence);
             self.recover_ty(span, &ty);
         }
-        self.recover_rest(span, &row.rest);
     }
 
     /// [`recover`](Self::recover) over a tail.
@@ -1131,5 +1316,24 @@ impl Solve<'_> {
             goal,
             effect,
         });
+    }
+}
+
+/// A goal about two values of one sort, worded in that sort.
+///
+/// What [`Solve::absorb`] records, and the one place the shared label rule has
+/// to say which sort it is holding: a struct's tail is a whole type and a sum's
+/// is a row, so the same act is a [`Goal::Type`] on one shape and a [`Goal::Row`]
+/// on the other.
+fn goal_of(expected: Assigned, actual: Assigned) -> Goal {
+    match (expected, actual) {
+        (Assigned::Row(expected), Assigned::Row(actual)) => Goal::Row { expected, actual },
+        // Anything else is two types. A presence never reaches here — nothing
+        // builds one out of a tail — and two values of different sorts never
+        // meet, for the reason [`Solve::tails`] gives.
+        (expected, actual) => Goal::Type {
+            expected: expected.as_ty(),
+            actual: actual.as_ty(),
+        },
     }
 }

@@ -1273,8 +1273,10 @@ fn the_types_tab_says_which_parameters_are_rows() {
         vec![("'a", "A"), ("'b", "..r (struct) without it")]
     );
 
-    // A row beside no fields at all forbids nothing, and says so by saying
-    // nothing.
+    // A struct's `..` beside no fields at all forbids nothing, and there is
+    // nothing else about it to show: the rest of a struct *is* a whole type, so
+    // a parameter with an empty lacks set is a type parameter and the row says
+    // so by saying only the name.
     let snap = snapshot("type Bare r = { ..r }");
     let stage = snap
         .stages
@@ -1285,7 +1287,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "..r (struct)");
+    assert_eq!(bare.children[0].text, "r");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -1386,21 +1388,21 @@ fn sums_reach_every_stage() {
     assert!(types.contains(&"Fallible (`Ok Nat)"), "{types:?}");
 }
 
-/// A type carrying fields its core is not unit for reaches every tab that
-/// shows a type, because they all print through the compiler's own printer.
-/// `fn p => p.x` is the whole program that produces one: the base is
-/// polymorphic in its core, so the scheme wears a `with` and the badge on the
-/// lambda's argument does too.
+/// A type carrying fields reaches every tab that shows a type, because they all
+/// print through the compiler's own printer.
+///
+/// Two shapes of it, and one program each. `fn p => p.x` carries fields on a
+/// *variable* core, which is the commonest type in the language and prints with
+/// a `..` — the spelling a reader could have written back. And a declaration
+/// whose `..` was handed a known type carries them on that: `WithX Nat` unfolds
+/// to `Nat with { x: Nat }`, which no source syntax writes and only the solve
+/// can show.
 #[test]
 fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
-    let snapshot = snapshot("let getx = fn p => p.x\n");
-    assert!(
-        snapshot.diagnostics.is_empty(),
-        "{:#?}",
-        snapshot.diagnostics
-    );
+    let open = snapshot("let getx = fn p => p.x\n");
+    assert!(open.diagnostics.is_empty(), "{:#?}", open.diagnostics);
 
-    let types = snapshot
+    let types = open
         .stages
         .iter()
         .find(|stage| stage.id == "types")
@@ -1408,13 +1410,13 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
     let scheme = nodes(types)
         .iter()
         .map(|node| node.text.clone())
-        .find(|text| text.contains("with"))
-        .expect("the scheme prints with a `with`");
-    assert_eq!(scheme, "'a with { x: 'b, ..'c } -> 'b");
+        .find(|text| text.contains(".."))
+        .expect("the scheme prints an open end");
+    assert_eq!(scheme, "{ x: 'a, ..'b } -> 'a");
 
     // And the IR tab's inline badges, which the types stage paints on: the
     // binder `p` wears the base's own type.
-    let badges = snapshot
+    let badges = open
         .stages
         .iter()
         .find(|stage| stage.annotates == Some("ir"))
@@ -1422,20 +1424,46 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
     assert!(
         nodes(badges)
             .iter()
-            .any(|node| node.text == "'a with { x: 'b, ..'c }"),
+            .any(|node| node.text == "{ x: 'a, ..'b }"),
         "{:#?}",
         nodes(badges)
     );
 
     // The Solve tab shows the same form in its goals, so a reader stepping
     // through the solve sees the type the scheme reports.
-    let solve = snapshot
+    let solve = open
         .stages
         .iter()
         .find(|stage| stage.id == "solve")
         .expect("the solve tab");
     assert!(
-        nodes(solve).iter().any(|node| node.text.contains("with")),
+        nodes(solve).iter().any(|node| node.text.contains("..")),
+        "{:#?}",
+        nodes(solve)
+    );
+
+    // The `with` form, reached the one way source can reach it: a struct's `..`
+    // handed a type that is not a struct. The solve unfolds the name to decide
+    // the projection against it, and the goal it asks shows what the name
+    // stands for.
+    let unfolded = snapshot(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX Nat -> Nat = fn p => p.x\n",
+    );
+    assert!(
+        unfolded.diagnostics.is_empty(),
+        "{:#?}",
+        unfolded.diagnostics
+    );
+    let solve = unfolded
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve tab");
+    assert!(
+        nodes(solve)
+            .iter()
+            .any(|node| node.text.contains("Nat with { x: Nat }")),
         "{:#?}",
         nodes(solve)
     );

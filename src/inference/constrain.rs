@@ -8,7 +8,7 @@ use crate::{
     ir::{Term, TermKind},
     symbol::Symbol,
     tracking::Span,
-    types::{Assigned, Core, Presence, Rest, Row, RowField, Scheme, Ty},
+    types::{Assigned, Core, Presence, Row, RowField, Scheme, Ty},
 };
 
 use super::{Binding, Constraint, ConstraintKind, Table, same_field_set};
@@ -134,10 +134,7 @@ impl Constrain<'_> {
                 // unit carrying fields rather than a shape of its own.
                 Rc::new(Ty {
                     core: Core::Unit,
-                    fields: Row {
-                        labels: tys,
-                        rest: Rest::Closed,
-                    },
+                    fields: tys,
                 })
             }
             // A tag is one case of a sum, and which sum is not for the literal
@@ -173,28 +170,24 @@ impl Constrain<'_> {
             // The walk cannot name the type it produced — which type `.field`
             // has depends on a base the walk is in no position to know — but
             // it can say everything a projection demands of the base: a type
-            // that has the field, whatever else it may also have. The core,
-            // the field's type and the tail are all variables, so `fn p => p.x`
-            // is not a base waiting to be explained; it is a definition
-            // polymorphic in everything but the field it reads.
+            // that has the field, whatever else it may also have. Two variables
+            // say that — the core the field sits on, and the field's own type —
+            // so `fn p => p.x` is not a base waiting to be explained; it is a
+            // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
                 let result = self.table.fresh_type();
                 let core = Core::Var(self.table.fresh_core());
-                let rest = self.table.fresh_row();
                 let want = Rc::new(Ty {
                     core,
-                    fields: Row {
-                        labels: [(field.tracked.clone(), RowField::present(result.clone()))]
-                            .into_iter()
-                            .collect(),
-                        rest,
-                    },
+                    fields: [(field.tracked.clone(), RowField::present(result.clone()))]
+                        .into_iter()
+                        .collect(),
                 });
-                // "Whatever else it may also have" is everything but the field
-                // just read, so both the tail and the core minted for it lack
-                // that name — the core because it stands for a type the field
-                // is already on, and a second copy of it could disagree.
+                // "Whatever else it may also have" is the core beside the
+                // field, and it lacks that name: it stands for a type the field
+                // is already on, and a second copy of it could disagree. One
+                // variable says this where two used to.
                 self.table.note_lacks(&want);
                 let actual = base.ty.clone();
                 // The field name is the only thing the user can fix about a
@@ -239,16 +232,14 @@ impl Constrain<'_> {
             // gate reads the written type's own syntax, never the table, so
             // generation stays a description of the term.
             (TermKind::Struct(fields), Core::Unit)
-                if matches!(shape.fields.rest, Rest::Closed)
-                    && shape
-                        .fields
-                        .labels
-                        .values()
-                        .all(|field| matches!(field.presence, Presence::Present))
-                    && same_field_set(fields, &shape.fields.labels) =>
+                if shape
+                    .fields
+                    .values()
+                    .all(|field| matches!(field.presence, Presence::Present))
+                    && same_field_set(fields, &shape.fields) =>
             {
                 for (name, field) in fields.iter_mut() {
-                    let want = shape.fields.labels[name].ty.clone();
+                    let want = shape.fields[name].ty.clone();
                     self.check_term(&mut field.value, &want);
                 }
                 term.ty = expected.clone();

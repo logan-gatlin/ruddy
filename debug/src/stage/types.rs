@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use ruddy::{
     ir::Program,
     symbol::{Mint, Symbol},
-    types::{Core, Rest, Row, Scheme, Ty},
+    types::{Core, Rest, Row, RowField, Scheme, Ty},
 };
 
 use crate::{
@@ -228,18 +228,26 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
         Core::Sum(cases) => names_in_row(cases, out),
         Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
     }
-    names_in_row(&ty.fields, out);
+    names_in_labels(&ty.fields, out);
 }
 
-/// [`names_in`] over one row: what each label holds, and whatever a tail
-/// already spliced in holds. A presence never holds a name, but a tail bound to
-/// more labels does, and one missed there would not show as recursive.
+/// [`names_in`] over a sum's cases: what each case carries, and whatever a tail
+/// already spliced in carries. A presence never holds a name, but a tail bound
+/// to more cases does, and one missed there would not show as recursive.
 fn names_in_row(row: &Row, out: &mut Vec<Symbol>) {
-    for field in row.labels.values() {
-        names_in(&field.ty, out);
-    }
+    names_in_labels(&row.labels, out);
     if let Rest::More(more) = &row.rest {
         names_in_row(more, out);
+    }
+}
+
+/// [`names_in`] over a label map: what each label holds. A type's fields are one
+/// — they have no tail of their own, their tail being the core beside them,
+/// which [`names_in`] descends where it sits. So a name sitting in a core under
+/// fields, as `WithX Nat with { y: Nat }` has, is still found.
+fn names_in_labels(labels: &IndexMap<String, RowField>, out: &mut Vec<Symbol>) {
+    for field in labels.values() {
+        names_in(&field.ty, out);
     }
 }
 
