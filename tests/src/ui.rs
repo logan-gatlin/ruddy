@@ -1380,6 +1380,24 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
         "{ x?: Nat, .. }"
     );
 
+    // A field the solver settled absent is not part of what the type says, so
+    // it is not written at all — and a type whose every field settled absent is
+    // its `..` alone, with no comma in front of it separating it from the
+    // nothing that precedes it.
+    let gone = || {
+        vec![(
+            "x",
+            RowField {
+                presence: Presence::Absent,
+                ty: nat.clone(),
+            },
+        )]
+    };
+    assert_eq!(with_fields(Core::Var(3), gone()).to_string(), "{ ..?3 }");
+    assert_eq!(with_fields(Core::Undecided, gone()).to_string(), "{ .. }");
+    // And one whose core names no others either is unit, which it prints as.
+    assert_eq!(with_fields(Core::Unit, gone()).to_string(), "{}");
+
     // Labels, and a core a `..` has no spelling for: the `with` form, with the
     // core bracketed wherever it extends rightward.
     assert_eq!(
