@@ -8,7 +8,7 @@ use ruddy::{
     inference,
     ir::{Decl, Row, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
-    types::Ty,
+    types::Core,
 };
 
 use crate::{
@@ -162,7 +162,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             let shape = cx
                 .inference
                 .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
-            if let Some(Ty::Arrow(from, _)) = shape.as_deref() {
+            if let Some(Core::Arrow(from, _)) = shape.as_deref().map(|ty| &ty.core) {
                 trace.terms.push((bound.id, from.clone()));
             }
             Node {

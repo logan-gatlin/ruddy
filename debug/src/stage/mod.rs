@@ -20,7 +20,7 @@ use ruddy::{
     parse::Stmt,
     symbol::{Mint, Symbol},
     token::Token,
-    types::Ty,
+    types::{Shape, Ty},
     ui,
 };
 
@@ -258,27 +258,34 @@ pub fn plural(count: usize, noun: &str) -> String {
 
 /// What one parameter of a `type` declaration stands for, as a row of the IR
 /// and Types tabs reads it: the name it was written as, a `..` in front of it
-/// when it stands for the rest of a row, which kind of row that is, and — when
-/// there is one — the labels an argument written there may not name.
+/// when it tails a row, which of the two readings it has, and — when there is
+/// one — the labels an argument written there may not name.
 ///
 /// Both tabs show a parameter and neither can show one usefully without this:
-/// the meaning column spells every parameter `'a` alike, and which of them can
-/// be handed a row, what kind, and what that row may not contain, is nowhere
-/// else on the page. Written once so the two cannot spell it differently.
+/// the meaning column spells every parameter `'a` alike, and which of them tails
+/// something, what kind, and what may not be in it, is nowhere else on the page.
+/// Written once so the two cannot spell it differently.
+///
+/// A parameter that tails a *struct* stands for a whole type, so it is shown as
+/// one — with the fields it may not name beside it, since that is the whole of
+/// what its `..` still demands. Only a sum's rest is a reading of its own.
 ///
 /// The labels are spelled the way their own shape spells them — a field bare, a
 /// case with its backtick — through [`ui::label`], so this row and the
 /// compiler's own complaint about the same parameter name it the same way.
 pub fn stands_for(mint: &Mint, param: &Param) -> String {
     let name = mint.name(param.symbol);
-    let Some((shape, lacks)) = param.kind.row() else {
-        return name.to_string();
+    let lacks = param.kind.lacks();
+    let (opener, shape) = match param.kind.cases() {
+        Some(_) => (format!("..{name} (sum)"), Shape::Sum),
+        None if lacks.is_empty() => return name.to_string(),
+        None => (format!("..{name} (struct)"), Shape::Struct),
     };
     if lacks.is_empty() {
-        return format!("..{name} ({shape})");
+        return opener;
     }
     let labels: Vec<String> = lacks.iter().map(|label| ui::label(shape, label)).collect();
-    format!("..{name} ({shape}) without {}", labels.join(", "))
+    format!("{opener} without {}", labels.join(", "))
 }
 
 /// A stage whose input never arrived.

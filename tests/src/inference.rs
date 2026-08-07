@@ -9,7 +9,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Ty, TyVar},
+    types::{Core, Presence, Rest, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -129,26 +129,39 @@ fn body_types(term: &Term) -> Vec<String> {
 }
 
 /// Whether a type still names one of the solver's variables anywhere inside
-/// it. `Ty::Undecided` does not count: it is a type, and it prints as one.
+/// it. An undecided core does not count: it is a type, and it prints as one.
 fn mentions_a_variable(ty: &Ty) -> bool {
-    match ty {
-        Ty::Var(_) => true,
-        Ty::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
-        Ty::Row { fields, rest, .. } => {
-            fields
-                .values()
-                .any(|field| mentions_a_variable(&field.presence) || mentions_a_variable(&field.ty))
-                || mentions_a_variable(rest)
-        }
+    let core = match &ty.core {
+        Core::Var(_) => true,
+        Core::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
+        Core::Sum(cases) => row_mentions_a_variable(cases),
         // A declared type's body is not looked inside, for the reason the
         // compiler's own walks do not: what one stands for was lowered from
         // what the user wrote, and no solver variable can reach it. Its
         // arguments are another matter — they were written at the use site and
         // hold whatever it held, so this has to descend or it would pass while
         // the leak it exists to catch is right there.
-        Ty::Named { args, .. } => args.iter().any(|arg| mentions_a_variable(arg)),
-        Ty::Nat | Ty::Bound(_) | Ty::Undecided | Ty::Present | Ty::Absent | Ty::Empty => false,
-    }
+        Core::Named { args, .. } => args.iter().any(|arg| mentions_a_variable(arg)),
+        Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => false,
+    };
+    core || labels_mention_a_variable(&ty.fields)
+}
+
+/// [`mentions_a_variable`] over a sum's cases: every label, and the tail —
+/// both are places a variable can survive into a scheme. A type's fields have
+/// no tail of their own; their tail is the core beside them, which
+/// [`mentions_a_variable`] reaches where it sits.
+fn row_mentions_a_variable(row: &ruddy::types::Row) -> bool {
+    matches!(row.rest, Rest::Var(_))
+        || matches!(&row.rest, Rest::More(more) if row_mentions_a_variable(more))
+        || labels_mention_a_variable(&row.labels)
+}
+
+/// [`mentions_a_variable`] over a label map.
+fn labels_mention_a_variable(labels: &indexmap::IndexMap<String, ruddy::types::RowField>) -> bool {
+    labels
+        .values()
+        .any(|field| matches!(field.presence, Presence::Var(_)) || mentions_a_variable(&field.ty))
 }
 
 #[test]
@@ -400,6 +413,46 @@ fn a_failed_definition_is_undecided_rather_than_polymorphic() {
     );
 }
 
+/// A definition whose fields could not be made to agree publishes a type
+/// something can satisfy, so the mistake is reported where it was made and not
+/// again at every use.
+///
+/// The core is why this needs saying. A projection demands a fresh core carrying
+/// the field, and asking the same base for something else — to be a function,
+/// say — binds that core to the something else. If the fields then turn out not
+/// to fit on it, the binding was part of the goal that failed: left standing it
+/// makes the parameter a function that also carries an `x`, which no term can
+/// be and no annotation can write, and every call is then refused for a mistake
+/// already reported one line up.
+#[test]
+fn a_definition_whose_fields_failed_is_not_refused_again_at_every_use() {
+    let src = "let f = fn p => { a: p.x, b: p 1 }\nlet g = f { x: 1 }\nlet h = f (fn n => n)";
+    let (mint, _, output) = infer_src(src);
+    let messages: Vec<String> = output
+        .errors
+        .iter()
+        .map(|error| error.kind.to_string())
+        .collect();
+    assert_eq!(
+        messages,
+        ["extra field `x`: the type `Nat -> 'a` lists every field it allows"],
+        "{:#?}",
+        output.errors
+    );
+    // What `f` takes is abandoned rather than published: the core is undecided,
+    // which unifies with anything, so both calls go through.
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ x: ?, .. } -> { a: ?, b: 'a }"
+    );
+
+    // The same shape one binder further out, where the two projections share a
+    // core and the failure is about the other binder's.
+    let src = "let z = fn a => fn b => { l: a.m, r: b.m, e: a b }\nlet w = z { m: 1 } { m: 2 }";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
 /// The occurs check failing is not a variable taking a type. A step naming
 /// `Rule::Bind` above an effect reading "this type would have to contain itself" tells whoever is
 /// stepping through the solve the opposite of what happened.
@@ -443,7 +496,7 @@ fn a_missing_field_names_the_struct() {
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    let ErrorKind::MissingField { base, field } = &error.kind else {
+    let ErrorKind::MissingField { base, field, .. } = &error.kind else {
         panic!("expected a missing field: {:#?}", error.kind);
     };
     assert_eq!(base.to_string(), "{ x: Nat }");
@@ -457,10 +510,10 @@ fn a_missing_field_names_the_struct() {
 
 #[test]
 fn an_unannotated_projection_infers_an_open_row() {
-    // `p.x` says everything a projection demands of its base: a struct with
-    // an `x`, whatever else it may also have. That is a type, so nothing here
-    // needs an annotation — the definition is polymorphic in the field's type
-    // and in the rest of the row.
+    // `p.x` says everything a projection demands of its base: some type at all,
+    // carrying an `x`, and whatever else it may also have. That is a type, so
+    // nothing here needs an annotation — the definition is polymorphic in the
+    // base's core, in the field's type and in the rest of the row.
     let (mint, _, output) = inferred("let f = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "f"), "{ x: 'a, ..'b } -> 'a");
 
@@ -677,14 +730,15 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
 }
 
 /// One mistake is one complaint. Everything a failure abandons it also
-/// decides — recovery points it at `Ty::Undecided`, which is a binding like
+/// decides — recovery points it at the undecided value of its own sort, which
+/// is a binding like
 /// any other — so a definition that already said something has its annotation
 /// left alone rather than blamed for the fallout.
 #[test]
 fn a_definition_that_already_failed_is_not_also_told_off_for_its_annotation() {
     // A complaint from another phase entirely: nothing inference reported, so
     // the suppression above cannot be what saves this one. The annotation's
-    // variables were bound — to `Ty::Undecided`, by the recovery that follows
+    // variables were bound — to the undecided row, by the recovery that follows
     // absorbing the error term — and that is not a narrowing.
     let (_, out, output) = infer_src("let f : { x?: Nat, .. } -> Nat = fn p => nope p");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
@@ -749,10 +803,7 @@ fn a_tail_may_not_take_a_field_its_own_row_names() {
     // And the scheme no longer claims the narrowing it was never entitled to:
     // the abandoned tail is undecided, which is what `..` with nothing after
     // it means.
-    assert_eq!(
-        scheme(&mint, &output, "h"),
-        "{ x: { y: Nat, .. } } -> { .. }"
-    );
+    assert_eq!(scheme(&mint, &output, "h"), "{ x: { y: Nat, .. } } -> ?");
 
     // The same contradiction reached through a call rather than through a
     // body. The scheme quantifies the shared tail, so instantiating it has to
@@ -932,23 +983,19 @@ fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
     }
 }
 
-/// Reading a field off something that has none names the thing that has none,
-/// and stops there. What was asked of it — a struct with that field and an
-/// open tail — is a shape the solver made up to ask the question with, so
-/// quoting it back as the expectation reads as though the user had written
-/// `{ x: ?, .. }` somewhere and got it wrong. An open row is how a demand is
-/// told apart from a written type: no closed type has a tail.
+/// Reading a field off something that has none is a missing field, whatever
+/// the thing is. A projection demands a fresh core carrying the field, so it
+/// fits any type at all — and what fails is the field row, which is the one
+/// complaint that reads correctly for every base. There is no second wording
+/// for a base that "is not a struct", because every type has fields.
 #[test]
 fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
     let (_, _, output) = infer_src("let n = 1\nlet bad = n.x");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "not-a-struct");
-    assert_eq!(
-        error.kind.to_string(),
-        "`Nat` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(error.kind.to_string(), "no field `x` on `Nat`");
 
     // The other side of the goal, and the other type with no fields: here the
     // demand is the `actual` half, because what the base turned out to be is
@@ -957,11 +1004,17 @@ fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "not-a-struct");
-    assert_eq!(
-        error.kind.to_string(),
-        "`? -> ?` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(error.kind.to_string(), "no field `b` on `'a -> 'b`");
+
+    // And a sum-cored base, which is the case that decides the noun: the row
+    // that went wrong is the type's *fields*, so the reader is told about a
+    // field even though the type beside it is written in cases.
+    let (_, _, output) = infer_src("let bad = (`A 1).x");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.to_string(), "no field `x` on ``A Nat | ..\'a`");
 
     // A closed struct against a `Nat` stays an ordinary mismatch, both ways
     // round: the reader wrote both of those types, and naming both is more
@@ -984,51 +1037,93 @@ fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
     }
 }
 
-/// The two ways a projection can be wrong are wrong in two different places.
-/// A struct that lacks the field is about the name that was read — see
-/// [`a_missing_field_names_the_struct`] — but something that is not a struct
-/// at all is about the base: renaming the field would leave it just as wrong,
-/// so the base is the term the reader has to change.
+/// The same projection, refused from the other side of the goal, is an extra
+/// field rather than a missing one. `g` demands a base carrying an `x`, and the
+/// annotation on `b` is what the demand is checked against — so the `x` is a
+/// label the checked-against type does not allow, and the closed empty field
+/// row of `Nat` pushes it out as an extra. This used to be `not-a-struct`, and
+/// which of the two complaints it becomes is decided by where the annotation
+/// sits, not by anything the projection did. Pinned so the direction stays
+/// deliberate.
 #[test]
-fn a_projection_off_a_non_struct_is_reported_at_the_base() {
+fn a_projection_checked_against_a_fieldless_annotation_is_an_extra_field() {
+    let src = "let g = fn p => p.x\nlet b : Nat -> Nat = g";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "extra-field");
+    assert_eq!(
+        error.kind.to_string(),
+        "extra field `x`: the type `Nat` lists every field it allows"
+    );
+
+    // Underlining the definition, which is the side the demand came from.
+    assert_eq!(error.span.start, 41);
+    assert_eq!(error.span.width, 1);
+
+    // And the same thing written as one definition is the *other* complaint: the
+    // annotation pushes the `Nat` down onto `p`, so the demand is the expected
+    // side and the `Nat` the actual one. Two doc comments used to disagree about
+    // this program; the compiler never did.
+    let (_, _, output) = infer_src("let b : Nat -> Nat = fn p => p.x");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(error.kind.to_string(), "no field `x` on `Nat`");
+}
+
+/// Every projection complaint underlines the field name, whatever the base is.
+/// There is one way for a projection to be wrong now — the base has not got the
+/// field — and one place to say it: the name that was read. A base that used to
+/// be "not a struct" is a base carrying no such field, and the field is still
+/// the thing on the page to change.
+#[test]
+fn a_projection_complaint_underlines_the_field() {
     let src = "let n = 1\nlet bad = n.x";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "not-a-struct");
-    assert_eq!(error.span.start, src.find("n.x").expect("the base"));
+    assert_eq!(error.kind.code(), "missing-field");
+    assert_eq!(error.span.start, src.find(".x").expect("the field") + 1);
     assert_eq!(error.span.width, 1);
 
-    // Whatever stands to the left of the dot, not just a name: the complaint
-    // takes the base term's own span, so it points at an expression as
-    // readily as at a name.
+    // Including a projection straight off a literal, which is where the base
+    // and the field used to be told apart.
+    let src = "let bad = 1.x";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected exactly one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.span.start, src.find(".x").expect("the field") + 1);
+
+    // And one whose base is a whole expression rather than a name: the span is
+    // the field's either way, so the base's own span is never needed.
     let src = "let h = fn g => (fn z => g z).b";
     let (mint, out, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "not-a-struct");
     let TermKind::Fn { body, .. } = &term_decl(&mint, &out, "h").value.kind else {
         panic!("expected a function");
     };
-    let TermKind::Project { base, .. } = &body.kind else {
+    let TermKind::Project { base, field } = &body.kind else {
         panic!("expected a projection");
     };
-    assert_eq!(error.span, base.span);
+    assert_ne!(error.span, base.span);
+    assert_eq!(error.span, field.span);
 }
 
 /// A chain of projections off a base that failed is one complaint. The
-/// complaint recovers the field's type to `Ty::Undecided`, and every link
+/// complaint recovers the field's type to the undecided type, and every link
 /// after the first absorbs rather than echoes.
 #[test]
 fn a_projection_chain_complains_once() {
     let (_, _, output) = infer_src("let n = 1\nlet r = n.a.b.c");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
-    assert_eq!(
-        output.errors[0].kind.to_string(),
-        "`Nat` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(output.errors[0].kind.to_string(), "no field `a` on `Nat`");
 }
 
 #[test]
@@ -1304,15 +1399,15 @@ fn lowering_errors_are_absorbed_not_echoed() {
     assert_eq!(scheme(&mint, &output, "point"), "{ x: ? }");
 }
 
-/// An argument that cannot stand for a set of fields is refused and absorbed.
+/// An argument that cannot stand for a set of cases is refused and absorbed.
 /// Lowering said it once; inference must not say it again in words about the
 /// empty row, which is the failure `lowering_errors_are_absorbed_not_echoed`
 /// was written to prevent.
 #[test]
 fn a_bad_row_argument_is_absorbed_not_echoed() {
     let (_, out, output) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
-         let f : WithX Nat -> Nat = fn p => p.x",
+        "type Or r = `A | ..r\n\
+         let f : Or Nat -> Nat = fn p => 1",
     );
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "not-a-row");
@@ -1326,39 +1421,76 @@ fn a_bad_row_argument_is_absorbed_not_echoed() {
 #[test]
 fn the_solve_is_recorded_rule_by_rule() {
     let (mint, _, output) = inferred("let fst : { x: Nat } -> Nat = fn p => p.x");
-    // The projection's open row meets the annotation's closed struct: the
-    // struct rule decomposes the pair, the open tail closes — the annotation
-    // allows nothing more — and the field's type is bound. The annotation's
-    // demand on the result is then already answered.
+    // The projection's demand meets the annotation's closed struct. The
+    // labels go first, since the demand's core is what the annotation's extras
+    // would have to be absorbed into — there are none here — and the core step
+    // follows: the demand's `..` takes the unit the annotation says it is, and
+    // the field's type is bound. The annotation's demand on the result is then
+    // already answered.
     assert_eq!(
         steps(&mint, &output, "fst"),
         [
             "struct  { x: ?0, ..?1 } ~ { x: Nat } => replaced by the goals below",
-            "  bind  ?1 ~ ∅ => ?1 := ∅",
+            "  bind  ?1 ~ {} => ?1 := {}",
             "  bind  ?0 ~ Nat => ?0 := Nat",
             "prim  Nat ~ Nat => no change",
         ]
     );
+
+    // And two types that are nothing but their fields record the struct rule
+    // and nothing else, which is what a struct against a struct has always
+    // recorded: no core step above it, because there is no core to speak of.
+    let (mint, _, output) = inferred("let v : { x: Nat } -> { x: Nat } = fn p => p");
+    assert_eq!(
+        steps(&mint, &output, "v"),
+        [
+            "struct  { x: Nat } ~ { x: Nat } => replaced by the goals below",
+            "  prim  Nat ~ Nat => no change",
+        ]
+    );
+
+    // A `Nat` against a `Nat` is one step, for the same reason: neither
+    // carries a field, so there is no second row to decide.
+    let (mint, _, output) = inferred("let w : Nat = 1");
+    assert_eq!(steps(&mint, &output, "w"), ["prim  Nat ~ Nat => no change"]);
 }
 
-/// Two closed rows that each name a field the other does not still continue
-/// as one row, and that row is closed — twice, once from each side. The second
-/// time is the one place the solver is asked whether the closed tail equals
-/// itself, and it is a rule of its own rather than a mismatch: the first side
-/// bound the shared continuation to `∅`, and the second finds it already
-/// there.
+/// Two closed sets of labels that each name one the other does not still
+/// continue as one, and what they continue as allows nothing — twice, once from
+/// each side. The second time is the one place the solver is asked whether a
+/// tail that allows nothing equals itself, and it is a rule of its own rather
+/// than a mismatch: the first side settled the shared continuation, and the
+/// second finds it already there.
 #[test]
 fn closing_a_row_from_both_sides_agrees_with_itself() {
+    // For a struct the continuation is a core, and what closes it is unit.
     let (mint, _, output) = infer_src("let p : { a: Nat } = { b: 1 }");
     assert_eq!(
         steps(&mint, &output, "p"),
         [
             "struct  { a: Nat } ~ { b: Nat } => replaced by the goals below",
             "  presence  absent ~ present => extra field `b`: the type `{ a: Nat }` lists every field it allows",
-            "  bind  ∅ ~ ?0 => ?0 := ∅",
+            "  bind  {} ~ ?0 => ?0 := {}",
             "  presence  present ~ absent => no field `a` on `{ b: Nat }`",
-            "  same  ∅ ~ ∅ => no change",
         ]
+    );
+
+    // For a sum it is still a tail, and both halves of the closing show: the
+    // first side binds the shared continuation to `∅`, and the second finds it
+    // already there and says so.
+    let (mint, _, output) = infer_src(
+        "let f : (`A Nat) -> Nat = fn p => 1\n\
+         let g : (`B Nat) -> Nat = fn p => 1\n\
+         let h = fn v => { one: f v, two: g v }",
+    );
+    let taken = steps(&mint, &output, "h");
+    assert!(
+        taken.contains(&"  bind  ∅ ~ ?2 => ?2 := ∅".to_string()),
+        "{taken:#?}"
+    );
+    assert!(
+        taken.contains(&"  same  ∅ ~ ∅ => no change".to_string()),
+        "{taken:#?}"
     );
 }
 
@@ -1379,13 +1511,16 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
         steps(&mint, &output, "f"),
         [
             // `?0` is the definition itself, minted before its body was walked;
-            // `?1` is `p`.
+            // `?1` is `p`. The first projection's demand is a bare variable's
+            // whole value, fields and all.
             "bind  { x: ?2, ..?3 } ~ ?1 => ?1 := { x: ?2, ..?3 }",
+            // The next two each decide the labels first and let the cores take
+            // what is left, since a core variable is what the extras go into.
             "struct  { y: ?4, ..?5 } ~ { x: ?2, ..?3 } => replaced by the goals below",
             "  bind  ?5 ~ { x: ?2, ..?8 } => ?5 := { x: ?2, ..?8 }",
             "  bind  { y: ?4, ..?8 } ~ ?3 => ?3 := { y: ?4, ..?8 }",
-            // The base is `{ x: ?2, ..?3 }` and `?3` is `{ y: ?4, ..?8 }`; the
-            // goal says so rather than leaving the reader to remember it.
+            // The base carries `x` and, behind `?3`, `y`; the goal says so
+            // rather than leaving the reader to remember it.
             "struct  { z: ?6, ..?7 } ~ { x: ?2, y: ?4, ..?8 } => replaced by the goals below",
             "  bind  ?7 ~ { x: ?2, y: ?4, ..?9 } => ?7 := { x: ?2, y: ?4, ..?9 }",
             "  bind  { z: ?6, ..?9 } ~ ?8 => ?8 := { z: ?6, ..?9 }",
@@ -1458,9 +1593,9 @@ fn no_goal_is_ever_put_back_for_later() {
             "bind  { inner: ?4, ..?5 } ~ ?0 => ?0 := { inner: ?4, ..?5 }",
             "bind  { x: ?2, ..?3 } ~ ?4 => ?4 := { x: ?2, ..?3 }",
             "struct  { inner: ?4, ..?5 } ~ { inner: { x: Nat } } => replaced by the goals below",
-            "  bind  ?5 ~ ∅ => ?5 := ∅",
+            "  bind  ?5 ~ {} => ?5 := {}",
             "  struct  { x: ?2, ..?3 } ~ { x: Nat } => replaced by the goals below",
-            "    bind  ?3 ~ ∅ => ?3 := ∅",
+            "    bind  ?3 ~ {} => ?3 := {}",
             "    bind  ?2 ~ Nat => ?2 := Nat",
             "prim  Nat ~ Nat => no change",
         ]
@@ -1504,19 +1639,28 @@ fn a_failure_is_a_step_that_failed() {
 
 #[test]
 fn giving_up_on_a_goal_is_a_step_of_its_own() {
-    // The projection demands a struct of something that is a `Nat`, so the
-    // goal is abandoned and everything it would have decided — the field's
-    // type and the row's tail — is pointed at `?`. That changes the solution,
-    // so each one has to be a step: otherwise a reader watching the state
+    // The labels go first, because the demand's core is what a `Nat`'s extras
+    // would have to be absorbed into — and the labels are where it fails: a
+    // `Nat` carries no fields and allows none. The goal is abandoned and the
+    // field's type is pointed at `?`, while the demand's own core takes the
+    // `Nat`, since that is what the other side said it allows. Each change to
+    // the solution has to be a step: otherwise a reader watching the state
     // would see a variable acquire a value that no rule they were shown gave
     // it.
     let (mint, _, output) = infer_src("let n = 1\nlet bad = n.x");
     assert_eq!(
         steps(&mint, &output, "bad"),
         [
-            "mismatch  { x: ?2, ..?3 } ~ Nat => `Nat` is not a struct, so it has no fields to read",
-            "recover  ?2 ~ ? => ?2 := ?",
-            "recover  ?3 ~ ? => ?3 := ?",
+            "struct  { x: ?2, ..?3 } ~ Nat => replaced by the goals below",
+            "  presence  present ~ absent => no field `x` on `Nat`",
+            "  recover  ?2 ~ ? => ?2 := ?",
+            "  bind  ?3 ~ Nat => ?3 := Nat",
+            // And then the core, which the step above bound to the `Nat` and
+            // the failure took back: a type is its core and its fields, one
+            // goal decided both, and a core standing for a type that carries a
+            // field it cannot carry is a type nothing satisfies. Said as a step
+            // like every other change to the solution.
+            "  recover  ?3 ~ ? => ?3 := ?",
             // And the definition is what its abandoned body is, which absorbs
             // — and abandons `bad`'s own variable with it, so nothing later
             // reads it as still open.
@@ -2238,16 +2382,13 @@ fn a_struct_and_a_sum_are_never_the_same_type() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "type-mismatch");
 
-    // And a sum is not something a field can be read off, so a projection
-    // against one says what it has rather than quoting the shape the solver
-    // asked for.
+    // And a sum carries no fields of its own, so a projection against one is
+    // a missing *field* — the noun follows the row that went wrong, which is
+    // the type's field row, not the cases the type prints as.
     let (_, _, out) = infer_src("let f : (`A Nat) -> Nat = fn s => s.a");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind.code(), "not-a-struct");
-    assert_eq!(
-        out.errors[0].kind.to_string(),
-        "``A Nat` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(out.errors[0].kind.code(), "missing-field");
+    assert_eq!(out.errors[0].kind.to_string(), "no field `a` on ``A Nat`");
 }
 
 /// The row machinery is one machinery, so a declaration takes the rest of a
@@ -2291,9 +2432,11 @@ fn the_solve_names_the_shape_it_took_apart() {
         "{taken:#?}"
     );
 
-    // A case carrying nothing carries unit, which is a struct — so the struct
-    // rule does appear under the sum's, and about a type the reader did write,
-    // just not in the syntax they wrote it in.
+    // A case carrying nothing carries unit, and two units are already the same
+    // thing — no labels on either side, and a core that is unit both ways — so
+    // the payload records no step at all. Which is the whole of why a struct
+    // against a struct reads as it always has: the core step under a
+    // [`Rule::Struct`] is silent whenever the two cores are unit.
     let (mint, _, out) = inferred(
         "type Flag = `On | `Off\n\
          let v = `On\n\
@@ -2301,7 +2444,11 @@ fn the_solve_names_the_shape_it_took_apart() {
     );
     let carrying_unit = steps(&mint, &out, "g");
     assert!(
-        carrying_unit.iter().any(|step| step.contains("struct")),
+        !carrying_unit.iter().any(|step| step.contains("struct")),
+        "{carrying_unit:#?}"
+    );
+    assert!(
+        carrying_unit.iter().any(|step| step.contains("sum")),
         "{carrying_unit:#?}"
     );
 }
@@ -2450,6 +2597,115 @@ fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
     );
 }
 
+/// Nothing is decided twice, in every sort: the value a failure leaves behind
+/// absorbs whatever a later goal puts it against, and abandons it. A presence
+/// and a sum's tail are the two sorts that were previously only ever abandoned
+/// at the end of a solve, so this is where they are asked to do the absorbing —
+/// and a struct's open end is now a *core*, which absorbs at the top of the
+/// rule rather than under it.
+#[test]
+fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
+    // `nope` is a name lowering complained about, so its type says nothing and
+    // the application abandons the whole type the annotation wrote — the `?`
+    // and the core its `..` lowered to. The recursive call then puts that type
+    // against a struct with a field it does not name, and the abandoned core
+    // takes the whole of it. One mistake, and inference adds nothing to it.
+    let (mint, out, output) = infer_src("let f : { x?: Nat, .. } -> Nat = fn p => f { y: nope p }");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.contains(&"recover  ?1 ~ ? => ?1 := ?".to_string()),
+        "the core the `..` lowered to is abandoned: {taken:#?}"
+    );
+    assert!(
+        taken.contains(&"recover  ?0 ~ ? => ?0 := ?".to_string()),
+        "and the `?` beside it: {taken:#?}"
+    );
+    assert!(
+        taken.contains(&"absorb  { x?: Nat, .. } ~ { y: ?3 } => no change".to_string()),
+        "an abandoned core takes whatever meets it: {taken:#?}"
+    );
+
+    // A sum's tail is still a tail, and an abandoned one still absorbs where it
+    // stands: the annotation's `..r` is thrown away by the same bad
+    // application, and the closed sum it is then asked to be meets it there.
+    let (mint, out, output) = infer_src(
+        "let g : Nat -> (`A Nat) -> Nat = fn a => fn b => 1\n\
+         let f : (`A Nat | ..r) -> Nat = fn p => g (nope p) p",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.iter().any(|step| step.contains("absorb  ∅ ~ ?")),
+        "{taken:#?}"
+    );
+
+    // And with the undecided side on the right, which is the same rule read
+    // from the other end: here the closed struct is what the annotation is
+    // asked to be, so `{}` is the expected side and the abandoned core the
+    // actual.
+    let (mint, out, output) = infer_src(
+        "let g : Nat -> { } -> Nat = fn a => fn b => 1\n\
+         let f : { x?: Nat, .. } -> Nat = fn p => g (nope p) p",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.contains(&"absorb  {} ~ { x?: Nat, .. } => no change".to_string()),
+        "{taken:#?}"
+    );
+}
+
+/// Two presences that are one variable are already the same thing, and saying
+/// so is [`Rule::Same`] rather than a binding of a variable to itself — which
+/// is the presence sort's version of what a tail and a type each get.
+#[test]
+fn a_presence_against_itself_is_already_the_same_presence() {
+    // A recursive call is monomorphic, so the parameter's row meets itself:
+    // one `?` on both sides, and one tail on both sides.
+    let (mint, _, output) = inferred("let f : { x?: Nat, .. } -> Nat = fn p => f p");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..\'a } -> Nat");
+    assert_eq!(
+        steps(&mint, &output, "f"),
+        [
+            "struct  { x?: Nat, ..?1 } ~ { x?: Nat, ..?1 } => replaced by the goals below",
+            "  same  ?1 ~ ?1 => no change",
+            "  same  ?0 ~ ?0 => no change",
+            "  prim  Nat ~ Nat => no change",
+            "prim  Nat ~ Nat => no change",
+        ]
+    );
+}
+
+/// Two presences already decided the same way agree without a word about the
+/// label, because there is no label in sight to word it about: a clash of the
+/// constants is intercepted where the name is known, so what is left here is a
+/// pair that already agrees.
+#[test]
+fn two_presences_that_already_agree_need_no_rule_of_their_own() {
+    // `closed` settles the `?` away, and then `both` puts the row against
+    // itself through a tail it shares — so the field settled absent is named on
+    // both sides of one goal, absent on both.
+    let (mint, _, output) = inferred(
+        "let optional : { x?: Nat, y: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : { y: Nat } -> Nat = fn p => 1\n\
+         let both : { y: Nat, ..s } -> { y: Nat, ..s } -> Nat = fn p => fn q => 1\n\
+         let f = fn r => { a: optional r, b: closed r, c: both r r }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ y: Nat } -> { a: Nat, b: Nat, c: Nat }"
+    );
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.contains(&"  same  absent ~ absent => no change".to_string()),
+        "{taken:#?}"
+    );
+}
+
 /// A declaration whose parameter is its whole rest names nothing beside it, so
 /// there is no label an argument could repeat and nothing to forbid. The
 /// condition is recorded only where there is one.
@@ -2480,17 +2736,19 @@ fn a_recursive_constructor_carrying_an_arrow_comes_back_round() {
 /// which side it lands on is decided by whoever emitted the constraint rather
 /// than by the projection. Reading a field off a definition the annotation
 /// says is a `Nat` puts the demand on the `actual` half — and it is still the
-/// `Nat` that has no fields, worded exactly as it is the other way round.
+/// `Nat` that has no such field, said as the extra field it would need rather
+/// than as the one it is missing, since it is the annotation that says what is
+/// allowed.
 #[test]
 fn a_demand_on_the_actual_side_still_names_the_type_with_no_fields() {
     let (_, _, output) = infer_src("let g = fn p => p.x\nlet v : Nat -> Nat = g");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "not-a-struct");
+    assert_eq!(error.kind.code(), "extra-field");
     assert_eq!(
         error.kind.to_string(),
-        "`Nat` is not a struct, so it has no fields to read"
+        "extra field `x`: the type `Nat` lists every field it allows"
     );
 }
 
@@ -2513,6 +2771,60 @@ fn an_assumption_matches_through_a_variable_the_two_sides_share() {
         scheme(&mint, &output, "q"),
         "Tree { x?: Nat } -> { a: Nat, b: Nat }"
     );
+}
+
+/// Recognizing a goal already open compares whatever an argument can be, and an
+/// argument is any type: a variable the solve has not decided, a sum, a row
+/// still open at its tail, and a row whose tail is not the other's. Each of
+/// these programs reaches one pair of declarations twice, so the comparison
+/// runs — and each is a program that types, so the comparison is right.
+#[test]
+fn an_assumption_compares_arguments_of_every_shape() {
+    // An argument still holding a variable. `use` pins the two declarations to
+    // one row, and the row picked up a field whose type nothing decides, so the
+    // comparison reaches a variable against itself.
+    let (mint, _, output) = inferred(
+        "type A r = { next: B r, ..r }\n\
+         type B r = { next: A r, ..r }\n\
+         let use : { ..s } -> A { ..s } -> B { ..s } -> Nat = fn c => fn x => fn y => 1\n\
+         let n = fn z => fn w => use { j: w } z z",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { j: \'a } -> \'a -> Nat");
+
+    // An argument that is a sum, compared case by case.
+    let (mint, _, output) = inferred(
+        "type A a = { v: a, next: B a }\n\
+         type B a = { v: a, next: A a }\n\
+         let f : A (`X | `Y) -> Nat = fn p => 1\n\
+         let g : B (`X | `Y) -> Nat = fn p => 1\n\
+         let h = fn z => { a: f z, b: g z }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "h"),
+        "A (`X | `Y) -> { a: Nat, b: Nat }"
+    );
+
+    // Two rows still open, at the same tail: the same row, so the goal is the
+    // one already on the stack.
+    let (mint, _, output) = inferred(
+        "type A r = { next: B r, ..r }\n\
+         type B r = { next: A r, ..r }\n\
+         let use : A { p: Nat, ..s } -> B { p: Nat, ..s } -> Nat = fn x => fn y => 1\n\
+         let n = fn z => use z z",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { p: Nat, ..\'a } -> Nat");
+
+    // And two rows whose tails are not each other, which is the answer that has
+    // to be no: the declarations name themselves at a closed argument as well
+    // as at the open one they were reached with, and assuming the one for the
+    // other would answer a question nobody asked.
+    let (mint, _, output) = inferred(
+        "type A r = { next: B r, alt: B { p: Nat }, ..r }\n\
+         type B r = { next: A r, alt: A { p: Nat }, ..r }\n\
+         let use : A { p: Nat, ..s } -> B { p: Nat, ..s } -> Nat = fn x => fn y => 1\n\
+         let n = fn z => use z z",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { p: Nat, ..\'a } -> Nat");
 }
 
 /// One declaration against itself is the same declaration however it was
@@ -2788,4 +3100,527 @@ fn a_recursive_definition_may_still_promise_too_much() {
     let (_, _, output) = infer_src("let f : { x?: Nat } -> Nat = fn r => f { x: r.y }");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "missing-field");
+}
+
+/// Every scheme the change is meant to produce, pinned. Most of these are the
+/// schemes the language already had: a type carrying no fields prints as its
+/// core, so nothing wears a `with` unless a projection left a base unexplained.
+#[test]
+fn fields_on_every_type_change_only_the_schemes_a_projection_reaches() {
+    let (mint, _, output) = inferred(
+        "let id = fn x => x\n\
+         let getx = fn p => p.x\n\
+         let both = fn p => { a: p.x, b: p.y }\n\
+         let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x\n\
+         let n = getx { x: 1, y: 2 }\n\
+         let u = {}\n\
+         let opened : { small: Nat, ..extra } -> Nat = fn s => s.small\n",
+    );
+    // Unchanged: a bare variable still takes a whole type, fields and all.
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
+    // Changed: the base is polymorphic in its core rather than fixed to a
+    // struct, which is the whole of what the change buys.
+    assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
+    assert_eq!(
+        scheme(&mint, &output, "both"),
+        "{ x: 'a, y: 'b, ..'c } -> { a: 'a, b: 'b }"
+    );
+    // Unchanged: the annotation pins the core to unit, so nothing prints with
+    // a `with`.
+    assert_eq!(scheme(&mint, &output, "fst"), "{ x: Nat, y: Nat } -> Nat");
+    // The core variable binds to unit, `x` matches, `y` flows into the tail.
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+    // Unit is one type with one spelling.
+    assert_eq!(scheme(&mint, &output, "u"), "{}");
+    assert_eq!(
+        scheme(&mint, &output, "opened"),
+        "{ small: Nat, ..'a } -> Nat"
+    );
+
+    // A sum's own field row is empty and closed, so nothing about sums prints
+    // with a `with` either — and a declaration taking a row is untouched.
+    let (mint, _, output) = inferred(
+        "type Option T = `Some T | `None\n\
+         let some = `Some 1\n\
+         type Tagged r = { tag: Nat, ..r }\n\
+         let tag : Tagged { note: Nat } -> Nat = fn t => t.tag\n",
+    );
+    assert_eq!(scheme(&mint, &output, "some"), "`Some Nat | ..'a");
+    assert_eq!(scheme(&mint, &output, "tag"), "Tagged { note: Nat } -> Nat");
+}
+
+/// Two projections on one binder are two demands about one base, so they share
+/// the core variable as well as the row: `p` is one type, and both readings of
+/// it have to be about the same one.
+#[test]
+fn two_projections_on_one_binder_share_a_core_variable() {
+    let (mint, _, output) = inferred("let both = fn p => { a: p.x, b: p.y }");
+    let scheme = scheme(&mint, &output, "both");
+    assert_eq!(scheme, "{ x: 'a, y: 'b, ..'c } -> { a: 'a, b: 'b }");
+    // One open end, not two: a second would print as its own `..`, and the
+    // argument would read as two unrelated bases.
+    assert_eq!(scheme.matches("..").count(), 1, "{scheme}");
+
+    // The demand each projection makes is what generation asked for, and the
+    // two name different variables *there* — sharing is what the solve
+    // decides, not what generation writes down.
+    let asked = constraints(&mint, &output, "both");
+    assert_eq!(
+        asked[0..2],
+        [
+            "equal: { x: ?2, ..?3 } ~ ?1".to_string(),
+            "equal: { y: ?4, ..?5 } ~ ?1".to_string(),
+        ]
+    );
+}
+
+/// Generalization numbers variables in plain first-occurrence order, reading a
+/// type's labels and then the core beneath them — which is the order they print
+/// in, since the core is what a `..` spells and a tail is written last. No
+/// special case for a core: the field's type of an accessor is `'a` because it
+/// is the first variable a reader meets, and the base's core is `'b` because it
+/// is the second.
+#[test]
+fn variables_are_numbered_in_the_order_they_are_read() {
+    let (mint, _, output) = inferred("let getx = fn p => p.x");
+    assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
+
+    // Presences keep their second pass, so a `?` never takes a letter another
+    // variable would have had: `f`'s one letter is its core, and `g`'s are the
+    // field's type and then the core it sits on.
+    let (mint, _, output) = inferred(
+        "let f : { x?: Nat, .. } -> Nat = fn p => 1\nlet g = fn p => { got: p.y, more: p }",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
+    assert_eq!(
+        scheme(&mint, &output, "g"),
+        "{ y: 'a, ..'b } -> { got: 'a, more: { y: 'a, ..'b } }"
+    );
+}
+
+/// A projection demands a fresh core carrying the field, and that core is
+/// forbidden from naming it: the core stands for a type the field is already on,
+/// so a second copy could disagree with the first. One variable says what two
+/// used to, and one condition sits on it.
+///
+/// The refusal below is the core's, and it is now the only one a struct has:
+/// there is no tail variable left to put the condition on, so `Table::repeated`
+/// finds the label by reading the fields of whatever the core is being bound to.
+/// That is what makes `let bad : { ..r } -> { x: Nat, ..r }` a complaint about
+/// the annotation's own core rather than about a tail nobody wrote.
+#[test]
+fn a_projection_demands_a_core_that_may_not_name_the_field() {
+    let (mint, _, output) = inferred("let getx = fn p => p.x");
+    // `?1` is `p`, `?2` the field's type and `?3` the demanded core, which is
+    // the whole of what the base may also have. There is no fourth.
+    assert_eq!(
+        constraints(&mint, &output, "getx"),
+        ["equal: { x: ?2, ..?3 } ~ ?1", "equal: ?0 ~ ?1 -> ?2"]
+    );
+
+    // The core may not come back naming the field, which is the condition a
+    // projection has always imposed: the accessor's own open end is forbidden
+    // the field it reads, so a scheme whose `..` is asked to cover it again is
+    // refused. `?3` above is the variable refused here — the annotation's `..r`
+    // reaches it, and the binding that would give it an `x` is a whole type
+    // pushed into a core rather than a row pushed into a tail.
+    let (_, _, output) = infer_src(
+        "let getx = fn p => p.x\n\
+         let bad : { ..r } -> { x: Nat, ..r } = fn q => { x: getx q }",
+    );
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| error.kind.code() == "repeated-field"),
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// The occurs check reaches a core variable inside the fields beside it. A
+/// base that would have to carry itself is the row's version of `fn x => x x`,
+/// and it is refused for the same reason.
+#[test]
+fn the_occurs_check_reaches_through_a_core_variable() {
+    let (_, _, output) = infer_src("let bad = fn p => p.x p");
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| error.kind.code() == "recursive-type"),
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// Every error the change touches, with the span it is reported at. The
+/// projection complaints all underline the field name now — there is one way a
+/// projection can be wrong, so there is one place to say it.
+#[test]
+fn every_projection_complaint_underlines_the_field_it_read() {
+    for (src, message) in [
+        ("let a = 1.x", "no field `x` on `Nat`"),
+        ("let a = (fn x => x).y", "no field `y` on `'a -> 'a`"),
+        ("let a = (`A 1).x", "no field `x` on ``A Nat | ..'a`"),
+        ("let a = { y: 1 }.x", "no field `x` on `{ y: Nat }`"),
+    ] {
+        let (_, _, output) = infer_src(src);
+        let [error] = output.errors.as_slice() else {
+            panic!("expected one error for {src}: {:#?}", output.errors);
+        };
+        assert_eq!(error.kind.to_string(), message, "{src}");
+        assert_eq!(error.kind.code(), "missing-field", "{src}");
+        let dot = src.rfind('.').expect("the projection");
+        assert_eq!(error.span.start, dot + 1, "{src}");
+    }
+
+    // And the complaints a projection is not involved in are exactly as they
+    // were, including the core mismatch that names two whole types.
+    for (src, code, message) in [
+        (
+            "let a : { x: Nat } = { y: 1 }",
+            "missing-field",
+            "no field `x` on `{ y: Nat }`",
+        ),
+        (
+            "let a : Nat = { x: 1 }",
+            "type-mismatch",
+            "type mismatch: expected `Nat`, found `{ x: Nat }`",
+        ),
+        (
+            "let a = fn x => x x",
+            "recursive-type",
+            "this type would have to contain itself",
+        ),
+    ] {
+        let (_, _, output) = infer_src(src);
+        let found = output
+            .errors
+            .iter()
+            .find(|error| error.kind.code() == code)
+            .unwrap_or_else(|| panic!("no {code} for {src}: {:#?}", output.errors));
+        assert_eq!(found.kind.to_string(), message, "{src}");
+    }
+}
+
+/// A row variable and a presence variable are abandoned the way a type
+/// variable is: pointed at the nothing of their own sort, each as a step, so a
+/// reader replaying the solve is never shown a variable acquiring a value no
+/// rule gave it.
+#[test]
+fn a_row_and_a_presence_are_abandoned_in_their_own_sorts() {
+    // The projection's field row fails against a `Nat`, which abandons the
+    // field's type and closes the tail — and the presence that the annotation
+    // left open is settled in the same decomposition.
+    let (mint, _, output) = infer_src("let bad : { y?: Nat } = { y: 1 }.x");
+    let recovered: Vec<String> = output
+        .steps
+        .iter()
+        .filter(|step| matches!(step.rule, Rule::Recover))
+        .map(|step| step.goal.to_string())
+        .collect();
+    assert!(!recovered.is_empty(), "{:#?}", output.steps);
+    let _ = mint;
+
+    // A presence variable the solve never decided, abandoned by the failure
+    // beside it.
+    let (_, _, output) = infer_src("let bad : { y?: Nat, .. } -> Nat = fn p => p.y.q");
+    let sorts: Vec<String> = output
+        .steps
+        .iter()
+        .filter_map(|step| match &step.effect {
+            Effect::Bound { value, .. } => Some(value.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(sorts.iter().any(|value| value == "?"), "{sorts:?}");
+}
+
+/// Lowering a written type builds the new shapes: a struct is unit carrying
+/// the fields that were written, and a sum is a sum core carrying its cases
+/// with a field row of its own that is empty and closed.
+#[test]
+fn a_written_struct_lowers_to_unit_and_a_written_sum_to_a_sum_core() {
+    let (mint, _, output) = inferred(
+        "type Rec = { x: Nat }\n\
+         type Sum = `A Nat | `B\n",
+    );
+    let rec = symbol_named(&mint, output.aliases.keys().copied(), "Rec");
+    let body = output.aliases[&rec].body();
+    assert!(matches!(body.core, Core::Unit), "{body:?}");
+    assert_eq!(body.fields.len(), 1);
+
+    let sum = symbol_named(&mint, output.aliases.keys().copied(), "Sum");
+    let body = output.aliases[&sum].body();
+    let Core::Sum(cases) = &body.core else {
+        panic!("a written sum lowers to a sum core: {body:?}");
+    };
+    assert_eq!(cases.labels.len(), 2);
+    // The sum carries no fields of its own, which is what keeps it printing as
+    // its cases alone.
+    assert!(body.fields.is_empty(), "{body:?}");
+}
+
+/// Deciding the labels of two types is the row rule it has always been, with
+/// the tail read off the core. One test per row of it.
+#[test]
+fn the_labels_of_two_types_are_decided_by_what_their_cores_allow() {
+    // Two different core variables, extras only one way: the variable takes the
+    // other side's core with the labels only that side named.
+    let (mint, _, output) = inferred(
+        "let one : { x: Nat, ..r } -> Nat = fn p => 1\n\
+         let two : { x: Nat, y: Nat, ..s } -> Nat = fn p => 1\n\
+         let both = fn v => { a: one v, b: two v }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "both"),
+        "{ x: Nat, y: Nat, ..'a } -> { a: Nat, b: Nat }"
+    );
+
+    // Extras both ways: the two continue as one fresh core, so what comes out
+    // names every field either side did.
+    let (mint, _, output) = inferred(
+        "let one : { x: Nat, ..r } -> Nat = fn p => 1\n\
+         let two : { y: Nat, ..s } -> Nat = fn p => 1\n\
+         let both = fn v => { a: one v, b: two v }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "both"),
+        "{ x: Nat, y: Nat, ..'a } -> { a: Nat, b: Nat }"
+    );
+
+    // A variable against a core that allows nothing more: every label only the
+    // variable's side names must be absent, and the variable takes the closed
+    // core with the labels only *it* named.
+    let (mint, _, output) = inferred(
+        "let one : { x: Nat, ..r } -> Nat = fn p => 1\n\
+         let two : { x: Nat, y: Nat } -> Nat = fn p => 1\n\
+         let both = fn v => { a: one v, b: two v }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "both"),
+        "{ x: Nat, y: Nat } -> { a: Nat, b: Nat }"
+    );
+
+    // Two cores that both allow nothing more: every label only one side names
+    // must be absent, by side, and then the cores decide each other.
+    let (_, _, output) = infer_src("let a : { x: Nat } = { x: 1, y: 2 }");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "extra-field");
+
+    // One variable on both sides, with extras either way: no finite type fits,
+    // so it is the occurs check rather than a binding that grows forever.
+    let (_, _, output) = infer_src(
+        "let g : { x: Nat, ..r } -> { y: Nat, ..r } -> Nat = fn a => fn b => 1\n\
+         let h = fn c => g c c",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "recursive-type");
+
+    // And the same variable with no extras either way is already the same
+    // thing, which is what a recursive call asks.
+    let (mint, _, output) = inferred("let f : { x: Nat, ..r } -> Nat = fn p => f p");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
+}
+
+/// A struct's `..` handed a type that is not a struct is a type inference can
+/// build and no source syntax can write, and the solve shows it: the name is
+/// unfolded where the labels beside it have to be decided, and what it stands
+/// for is the argument carrying the declaration's own fields.
+#[test]
+fn a_struct_tail_handed_a_known_type_unfolds_to_a_with() {
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX Nat -> Nat = fn p => p.x",
+    );
+    // The scheme reads as the name the reader wrote.
+    assert_eq!(scheme(&mint, &output, "f"), "WithX Nat -> Nat");
+    // And the solve shows what that name stands for, once, where the
+    // projection's demand had to be decided against it.
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken
+            .iter()
+            .any(|step| step.contains("Nat with { x: Nat }")),
+        "{taken:#?}"
+    );
+
+    // A declared type carrying no fields of its own is the ordinary case and
+    // wears no `with` at all.
+    let (mint, _, output) = inferred(
+        "type WithX r = { x: Nat, ..r }\n\
+         type Foo = { y: Nat }\n\
+         let g : WithX Foo -> Nat = fn p => p.y\n\
+         let a : WithX { y: Nat } = { x: 1, y: 2 }\n\
+         let n = (fn p => p.x) a",
+    );
+    assert_eq!(scheme(&mint, &output, "g"), "WithX Foo -> Nat");
+    assert_eq!(scheme(&mint, &output, "a"), "WithX { y: Nat }");
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+
+    // A parameter read as a field's type and as the `..` is one reading twice,
+    // so the declaration means what both said and unfolds to it.
+    let (mint, _, output) = inferred(
+        "type W r = { f: r, ..r }\n\
+         let w : W { y: Nat } = { f: { y: 3 }, y: 4 }",
+    );
+    assert_eq!(scheme(&mint, &output, "w"), "W { y: Nat }");
+}
+
+/// A sum's tail is still a tail, so every act about one is still an act about a
+/// row: taking the other side's, being already the same variable, and absorbing
+/// a set of cases where the tail was abandoned.
+#[test]
+fn a_sums_tail_is_decided_as_a_row() {
+    // Two open sums naming the same cases: one tail takes the other.
+    let (mint, _, output) = inferred(
+        "let f : (`A Nat | ..r) -> Nat = fn p => 1\n\
+         let g : (`A Nat | ..s) -> Nat = fn p => 1\n\
+         let h = fn v => { one: f v, two: g v }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "h"),
+        "`A Nat | ..'a -> { one: Nat, two: Nat }"
+    );
+
+    // A recursive call meets its own tail, which is already the same thing.
+    let (mint, _, output) = inferred("let f : (`A Nat | ..r) -> Nat = fn p => f p");
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.contains(&"  same  ?0 ~ ?0 => no change".to_string()),
+        "{taken:#?}"
+    );
+
+    // An abandoned tail on the expected side absorbs what it is asked to be.
+    let (mint, out, output) = infer_src(
+        "let mk : Nat -> (`A Nat) = fn n => `A n\n\
+         let f : (`A Nat | ..r) -> Nat = fn p => f (mk (nope p))",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken.iter().any(|step| step.contains("absorb  ? ~ ∅")),
+        "{taken:#?}"
+    );
+
+    // And an abandoned tail takes a case only the other side names, then
+    // abandons it in turn rather than deciding anything with it.
+    let (mint, out, output) = infer_src(
+        "let g : Nat -> (`A Nat | `B) -> Nat = fn a => fn b => 1\n\
+         let f : (`A Nat | ..r) -> Nat = fn p => g (nope p) p",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken
+            .iter()
+            .any(|step| step.contains("absorb  { B: {} } ~ ?")),
+        "{taken:#?}"
+    );
+}
+
+/// A `?` the solve abandoned absorbs whatever a later goal puts it against,
+/// from either side, and abandons it in turn.
+#[test]
+fn an_abandoned_presence_absorbs_from_either_side() {
+    let (mint, out, output) = infer_src(
+        "let mk : Nat -> (`A Nat) = fn n => `A n\n\
+         let f : (`A? Nat | ..r) -> Nat = fn p => f (mk (nope p))",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken
+            .iter()
+            .any(|step| step.contains("absorb  ? ~ present")),
+        "{taken:#?}"
+    );
+
+    let (mint, out, output) = infer_src(
+        "let g : Nat -> (`A Nat) -> Nat = fn a => fn b => 1\n\
+         let f : (`A? Nat | ..r) -> Nat = fn p => g (nope p) p",
+    );
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let taken = steps(&mint, &output, "f");
+    assert!(
+        taken
+            .iter()
+            .any(|step| step.contains("absorb  present ~ ?")),
+        "{taken:#?}"
+    );
+}
+
+/// A sum's `..` in an annotation is a variable this definition may decide, and
+/// deciding it is the annotation promising more than the definition keeps.
+#[test]
+fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
+    let (mint, _, output) = inferred("let f : (`A Nat | ..) -> Nat = fn p => 1");
+    assert_eq!(scheme(&mint, &output, "f"), "`A Nat | ..'a -> Nat");
+
+    // Narrowed, and told about: the tail the annotation left open came back
+    // naming a case, so the contract it looked like was never checked.
+    let (_, _, output) = infer_src("let f : (`A Nat | ..r) -> Nat = fn p => f (`B 1)");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "annotation-too-open");
+
+    // And narrowed the other way: the tail came back allowing nothing more,
+    // which names no case at all and is still not what the annotation said.
+    let (_, _, output) = infer_src(
+        "let g : (`A Nat) -> Nat = fn p => 1\n\
+         let f : (`A Nat | ..r) -> Nat = fn p => g p",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "annotation-too-open");
+}
+
+/// What a sum's row parameter may not name travels to whatever is written at
+/// it, including a row that is itself left open: the tail of the argument ends
+/// up where the declaration's own tail sat, so it inherits the condition.
+#[test]
+fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
+    let (_, out, output) = infer_src(
+        "type Or r = `A | ..r\n\
+         let f : Or (`B Nat | ..s) -> Nat = fn p => 1",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+
+    // And the condition bites where the argument's own tail would have to take
+    // the case the declaration already names.
+    let (_, _, output) = infer_src(
+        "type Or r = `A | ..r\n\
+         let mk : (`A) -> Nat = fn p => 1\n\
+         let f : Or (`B Nat | ..s) -> Nat = fn p => f p",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+/// An assumption is compared to the goal in front of it argument by argument,
+/// and an argument that is a *sum* is compared as one: the cases it names, and
+/// what it allows past them.
+///
+/// Every way that can answer is here. `other` hands on a sum naming a case the
+/// open annotation does not, so the labels settle it. `head` hands on one whose
+/// cases agree but whose tail does not — closed against a variable — so the
+/// tails do. And `tail` hands the parameter straight on, so both halves agree
+/// and the goal is assumed rather than asked again.
+#[test]
+fn an_assumption_compares_a_sum_argument_as_a_sum() {
+    let (mint, _, output) = inferred(
+        "type Tree a = { value: a, kids: Nest a }\n\
+         type Nest a = { head: Tree (`A Nat), other: Tree (`C Nat), tail: Nest a }\n\
+         type Wood a = { value: a, kids: Grove a }\n\
+         type Grove a = { head: Wood (`A Nat), other: Wood (`C Nat), tail: Grove a }\n\
+         let f : Tree (`A Nat | ..r) -> Nat = fn t => 1\n\
+         let g : Wood (`A Nat | ..r) -> Nat = fn w => 1\n\
+         let h = fn v => { one: f v, two: g v }",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let taken = steps(&mint, &output, "h");
+    assert!(
+        taken.iter().any(|step| step.contains("assume")),
+        "{taken:#?}"
+    );
 }

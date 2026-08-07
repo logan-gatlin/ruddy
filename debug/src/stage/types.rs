@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use ruddy::{
     ir::Program,
     symbol::{Mint, Symbol},
-    types::{Scheme, Ty},
+    types::{Core, Rest, Row, RowField, Scheme, Ty},
 };
 
 use crate::{
@@ -79,7 +79,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // the meaning column cannot say.
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
-                    let letter = Ty::Bound(index as u32).to_string();
+                    let letter = Core::Bound(index as u32).to_string();
                     let mut row =
                         Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
                     if let Some(index) = cx.symbols.get(&param.symbol) {
@@ -204,38 +204,50 @@ fn walk(
 /// Every declaration a type mentions, in the order it mentions them. Stops at
 /// a name rather than looking up what it stands for — following one is the
 /// caller's business, and the reason this cannot run away.
+///
+/// Both halves of a type, since both can name one: the core it is, and the
+/// fields it carries. A type carrying fields is one inference built rather than
+/// one anybody wrote, but it prints in this tab like any other and a declared
+/// name inside its fields is mentioned just as much.
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
-    match ty {
+    match &ty.core {
         // The arguments are walked though the body is not: a declaration
         // reached only through one — `type Rose a = { kids: List (Rose a) }` —
         // is mentioned just as much as one written bare, and a row that missed
         // it would not show as recursive.
-        Ty::Named { symbol, args, .. } => {
+        Core::Named { symbol, args, .. } => {
             out.push(*symbol);
             for arg in args.iter() {
                 names_in(arg, out);
             }
         }
-        Ty::Arrow(from, to) => {
+        Core::Arrow(from, to) => {
             names_in(from, out);
             names_in(to, out);
         }
-        Ty::Row { fields, rest, .. } => {
-            for field in fields.values() {
-                names_in(&field.ty, out);
-            }
-            // A presence never holds a name, but the tail could only fail to
-            // be walked by accident; today it is a variable or empty, and
-            // either way there is nothing in it to find.
-            names_in(rest, out);
-        }
-        Ty::Nat
-        | Ty::Var(_)
-        | Ty::Bound(_)
-        | Ty::Undecided
-        | Ty::Present
-        | Ty::Absent
-        | Ty::Empty => {}
+        Core::Sum(cases) => names_in_row(cases, out),
+        Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+    }
+    names_in_labels(&ty.fields, out);
+}
+
+/// [`names_in`] over a sum's cases: what each case carries, and whatever a tail
+/// already spliced in carries. A presence never holds a name, but a tail bound
+/// to more cases does, and one missed there would not show as recursive.
+fn names_in_row(row: &Row, out: &mut Vec<Symbol>) {
+    names_in_labels(&row.labels, out);
+    if let Rest::More(more) = &row.rest {
+        names_in_row(more, out);
+    }
+}
+
+/// [`names_in`] over a label map: what each label holds. A type's fields are one
+/// — they have no tail of their own, their tail being the core beside them,
+/// which [`names_in`] descends where it sits. So a name sitting in a core under
+/// fields, as `WithX Nat with { y: Nat }` has, is still found.
+fn names_in_labels(labels: &IndexMap<String, RowField>, out: &mut Vec<Symbol>) {
+    for field in labels.values() {
+        names_in(&field.ty, out);
     }
 }
 

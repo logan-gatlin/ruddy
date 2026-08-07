@@ -26,6 +26,8 @@ let tag : Tagged { note: Nat } -> Nat = fn t => t.tag
 
 let tagged = tag { tag: 7, note: 8 }
 
+let boxed : Tagged Nat -> Nat = fn b => b.tag
+
 let after = id point
 
 let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x

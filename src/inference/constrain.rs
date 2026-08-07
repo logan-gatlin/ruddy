@@ -8,7 +8,7 @@ use crate::{
     ir::{Term, TermKind},
     symbol::Symbol,
     tracking::Span,
-    types::{RowField, Scheme, Shape, Ty},
+    types::{Assigned, Core, Presence, Row, RowField, Scheme, Ty},
 };
 
 use super::{Binding, Constraint, ConstraintKind, Table, same_field_set};
@@ -43,23 +43,8 @@ impl Constrain<'_> {
     /// `expected, actual` pair got applications backwards and told the reader
     /// their annotation was the mistake.
     fn checks(&mut self, span: Span, actual: &Rc<Ty>, expected: &Rc<Ty>) {
-        self.checks_base(span, None, actual, expected);
-    }
-
-    /// [`checks`](Self::checks) for a demand two spans can be right for. See
-    /// [`Constraint::base_span`]: a projection asks one question with two ways
-    /// of failing, and which of them the solver arrives at decides which of the
-    /// two spans the reader is shown.
-    fn checks_base(
-        &mut self,
-        span: Span,
-        base_span: Option<Span>,
-        actual: &Rc<Ty>,
-        expected: &Rc<Ty>,
-    ) {
         self.out.push(Constraint {
             span,
-            base_span,
             kind: ConstraintKind::Equal {
                 expected: expected.clone(),
                 actual: actual.clone(),
@@ -73,8 +58,8 @@ impl Constrain<'_> {
         term.ty = match &mut term.kind {
             // The error term absorbs: it unifies with anything, so the one
             // diagnostic lowering already reported stays the only one.
-            TermKind::Error => Rc::new(Ty::Undecided),
-            TermKind::Natural(_) => Rc::new(Ty::Nat),
+            TermKind::Error => Rc::new(Ty::default()),
+            TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
             TermKind::Ident(symbol) => {
                 let symbol = *symbol;
                 self.lookup(symbol)
@@ -87,14 +72,14 @@ impl Constrain<'_> {
                 // applied as the arrow it stands for. The arrow the arm then
                 // works with is the unfolded one, which is the only shape a
                 // call site can take apart.
-                match &*self.table.unfolded(self.aliases, &applied) {
+                match &self.table.unfolded(self.aliases, &applied).core {
                     // The function already knows what it takes, so the demand
                     // on the argument is the parameter type and the result is
                     // the arrow's own. Written this way round, a mismatch
                     // reads "expected <parameter>, found <argument>": the
                     // parameter is what the context asked for, and the
                     // argument is the term the reader can change.
-                    Ty::Arrow(from, to) => {
+                    Core::Arrow(from, to) => {
                         let (from, to) = (from.clone(), to.clone());
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &from);
@@ -121,9 +106,9 @@ impl Constrain<'_> {
                     // written into, since [`Solve::fail`] cannot tell which
                     // half of a demand the failure was about.
                     _ => {
-                        let param = self.table.fresh();
-                        let result = self.table.fresh();
-                        let wanted = Rc::new(Ty::Arrow(param.clone(), result.clone()));
+                        let param = self.table.fresh_type();
+                        let result = self.table.fresh_type();
+                        let wanted = Rc::new(Ty::plain(Core::Arrow(param.clone(), result.clone())));
                         self.checks(span, &applied, &wanted);
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &param);
@@ -132,10 +117,10 @@ impl Constrain<'_> {
                 }
             }
             TermKind::Fn { arg, body } => {
-                let param = self.table.fresh();
+                let param = self.table.fresh_type();
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
                 self.infer_term(body);
-                Rc::new(Ty::Arrow(param, body.ty.clone()))
+                Rc::new(Ty::plain(Core::Arrow(param, body.ty.clone())))
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
@@ -145,10 +130,11 @@ impl Constrain<'_> {
                 }
                 // A literal's fields are all there, and are all it has: the
                 // tail is closed. Openness belongs to demands, not to values.
-                Rc::new(Ty::Row {
-                    shape: Shape::Struct,
+                // Nothing of its own beside them, which is what makes a struct
+                // unit carrying fields rather than a shape of its own.
+                Rc::new(Ty {
+                    core: Core::Unit,
                     fields: tys,
-                    rest: Rc::new(Ty::Empty),
                 })
             }
             // A tag is one case of a sum, and which sum is not for the literal
@@ -167,16 +153,15 @@ impl Constrain<'_> {
                         self.infer_term(payload);
                         payload.ty.clone()
                     }
-                    None => Rc::new(Shape::Struct.empty()),
+                    None => Rc::new(Ty::unit()),
                 };
-                let rest = self.table.fresh();
-                let ty = Rc::new(Ty::Row {
-                    shape: Shape::Sum,
-                    fields: [(name.tracked.clone(), RowField::present(carried))]
+                let rest = self.table.fresh_row();
+                let ty = Rc::new(Ty::plain(Core::Sum(Row {
+                    labels: [(name.tracked.clone(), RowField::present(carried))]
                         .into_iter()
                         .collect(),
                     rest,
-                });
+                })));
                 // "However many the context allows" is every case but this
                 // one, so the tail minted for it lacks this name.
                 self.table.note_lacks(&ty);
@@ -184,30 +169,30 @@ impl Constrain<'_> {
             }
             // The walk cannot name the type it produced — which type `.field`
             // has depends on a base the walk is in no position to know — but
-            // it can say everything a projection demands of the base: a
-            // struct that has the field, whatever else it may also have. The
-            // field's type and the tail are variables, so `fn p => p.x` is
-            // not a base waiting to be explained; it is a definition
-            // polymorphic in everything but the field it reads.
+            // it can say everything a projection demands of the base: a type
+            // that has the field, whatever else it may also have. Two variables
+            // say that — the core the field sits on, and the field's own type —
+            // so `fn p => p.x` is not a base waiting to be explained; it is a
+            // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
                 self.infer_term(base);
-                let result = self.table.fresh();
-                let rest = self.table.fresh();
-                let want = Rc::new(Ty::Row {
-                    shape: Shape::Struct,
+                let result = self.table.fresh_type();
+                let core = Core::Var(self.table.fresh_core());
+                let want = Rc::new(Ty {
+                    core,
                     fields: [(field.tracked.clone(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
-                    rest,
                 });
-                // "Whatever else it may also have" is everything but the field
-                // just read, so the tail minted for it lacks that name.
+                // "Whatever else it may also have" is the core beside the
+                // field, and it lacks that name: it stands for a type the field
+                // is already on, and a second copy of it could disagree. One
+                // variable says this where two used to.
                 self.table.note_lacks(&want);
                 let actual = base.ty.clone();
                 // The field name is the only thing the user can fix about a
-                // struct that does not have it — and the base is the only
-                // thing they can fix about something that is not a struct.
-                self.checks_base(field.span, Some(base.span), &actual, &want);
+                // type that does not have it, whatever kind of type that is.
+                self.checks(field.span, &actual, &want);
                 result
             }
         };
@@ -231,8 +216,8 @@ impl Constrain<'_> {
         // than from this, so the term keeps the name the user wrote and prints
         // as it.
         let shape = self.table.unfolded(self.aliases, expected);
-        match (&mut term.kind, &*shape) {
-            (TermKind::Fn { arg, body }, Ty::Arrow(from, to)) => {
+        match (&mut term.kind, &shape.core) {
+            (TermKind::Fn { arg, body }, Core::Arrow(from, to)) => {
                 let (from, to) = (from.clone(), to.clone());
                 self.env.insert(arg.tracked, Binding::Mono(from));
                 self.check_term(body, &to);
@@ -246,21 +231,15 @@ impl Constrain<'_> {
             // same things, just without the better spans pushing gives. The
             // gate reads the written type's own syntax, never the table, so
             // generation stays a description of the term.
-            (
-                TermKind::Struct(fields),
-                Ty::Row {
-                    shape: Shape::Struct,
-                    fields: tys,
-                    rest,
-                },
-            ) if matches!(&**rest, Ty::Empty)
-                && tys
+            (TermKind::Struct(fields), Core::Unit)
+                if shape
+                    .fields
                     .values()
-                    .all(|field| matches!(&*field.presence, Ty::Present))
-                && same_field_set(fields, tys) =>
+                    .all(|field| matches!(field.presence, Presence::Present))
+                    && same_field_set(fields, &shape.fields) =>
             {
                 for (name, field) in fields.iter_mut() {
-                    let want = tys[name].ty.clone();
+                    let want = shape.fields[name].ty.clone();
                     self.check_term(&mut field.value, &want);
                 }
                 term.ty = expected.clone();
@@ -276,18 +255,13 @@ impl Constrain<'_> {
             // ever have; a tag has one case out of however many, so a sum with
             // more cases than the literal names is the ordinary case rather
             // than the one to fall back on.
-            (
-                TermKind::Tag { name, payload },
-                Ty::Row {
-                    shape: Shape::Sum,
-                    fields: cases,
-                    ..
-                },
-            ) if cases
-                .get(&name.tracked)
-                .is_some_and(|case| matches!(&*case.presence, Ty::Present)) =>
+            (TermKind::Tag { name, payload }, Core::Sum(cases))
+                if cases
+                    .labels
+                    .get(&name.tracked)
+                    .is_some_and(|case| matches!(case.presence, Presence::Present)) =>
             {
-                let want = cases[&name.tracked].ty.clone();
+                let want = cases.labels[&name.tracked].ty.clone();
                 match payload {
                     Some(payload) => self.check_term(payload, &want),
                     // Nothing written is unit, and the case has to carry one.
@@ -295,7 +269,7 @@ impl Constrain<'_> {
                     // no term here to push into — and worded with the tag's own
                     // span, which is the whole of what the reader wrote.
                     None => {
-                        let carried = Rc::new(Shape::Struct.empty());
+                        let carried = Rc::new(Ty::unit());
                         self.checks(name.span, &carried, &want);
                     }
                 }
@@ -327,7 +301,12 @@ impl Constrain<'_> {
     }
 
     fn instantiate(&mut self, scheme: &Scheme) -> Rc<Ty> {
-        let fresh: Vec<_> = (0..scheme.count()).map(|_| self.table.fresh()).collect();
+        // One fresh variable per position the scheme bound, handed over as a
+        // bare type: which sort each one is, is decided where it lands, since
+        // that is what a scheme records. See [`Assigned::as_row`].
+        let fresh: Vec<Assigned> = (0..scheme.count())
+            .map(|_| Assigned::Ty(self.table.fresh_type()))
+            .collect();
         let ty = scheme.body().open(&fresh);
         // A scheme's body says which of its rows a quantified tail is the tail
         // of, but the condition that follows from that is not part of the

@@ -664,30 +664,52 @@ fn the_types_tab_says_which_definitions_are_recursive() {
 /// arrow just as much when the annotation was a name for one.
 #[test]
 fn an_argument_wears_its_type_through_a_declared_type() {
-    let snapshot = snapshot("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\n");
-    assert!(
-        snapshot.diagnostics.is_empty(),
-        "{:#?}",
-        snapshot.diagnostics
+    let badge = |source: &str| -> String {
+        let snapshot = snapshot(source);
+        assert!(
+            snapshot.diagnostics.is_empty(),
+            "{:#?}",
+            snapshot.diagnostics
+        );
+        let stage = |id: &str| {
+            snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == id)
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+        let badges: HashMap<u32, &str> = stage("types-ir")
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.text.as_str()))
+            .collect();
+        let arg = nodes(stage("ir"))
+            .into_iter()
+            .find(|node| node.label == "Arg")
+            .expect("the IR renders the bound name");
+        badges[&arg.id].to_string()
+    };
+
+    assert_eq!(
+        badge("type Endo = Nat -> Nat\nlet id : Endo = fn x => x\n"),
+        "Nat"
     );
 
-    let stage = |id: &str| {
-        snapshot
-            .stages
-            .iter()
-            .find(|stage| stage.id == id)
-            .unwrap_or_else(|| panic!("{id} is registered"))
-    };
-    let badges: HashMap<u32, &str> = stage("types-ir")
-        .nodes
-        .iter()
-        .map(|node| (node.id, node.text.as_str()))
-        .collect();
-    let arg = nodes(stage("ir"))
-        .into_iter()
-        .find(|node| node.label == "Arg")
-        .expect("the IR renders the bound name");
-    assert_eq!(badges[&arg.id], "Nat");
+    // A declaration taking a row is where the badge is a type nobody wrote out:
+    // the argument is spliced into the tail the declaration left open, and the
+    // badge shows what that came to. `{}` allows nothing more, so the row is
+    // closed and no `..` belongs on it — `∅` is the solver's mark for a row with
+    // nothing left to come, and never part of a type a reader is shown.
+    assert_eq!(
+        badge("type F r = { x: Nat, ..r } -> Nat\nlet f : F {} = fn p => p.x\n"),
+        "{ x: Nat }"
+    );
+    // And a sum's tail reads in cases, because it is the row of a sum. Spelled
+    // in braces it would show a reader a case list as if it were fields.
+    assert_eq!(
+        badge("type G r = (`Err Nat | ..r) -> Nat\nlet g : G (`Ok Nat) = fn p => 1\n"),
+        "`Err Nat | ..`Ok Nat"
+    );
 }
 
 /// The strip's messages are inference's own words. They were a copy of the
@@ -751,7 +773,7 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(
         field(overlap, "_rule"),
         Some(
-            "the rest of a struct cannot be a struct naming a field the struct already names"
+            "the rest of a struct cannot be a type naming a field the struct already names"
                 .to_string()
         )
     );
@@ -768,11 +790,8 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     let [diagnostic] = flat.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", flat.diagnostics);
     };
-    assert_eq!(diagnostic.code, "not-a-struct");
-    assert_eq!(
-        diagnostic.message,
-        "`Nat` is not a struct, so it has no fields to read"
-    );
+    assert_eq!(diagnostic.code, "missing-field");
+    assert_eq!(diagnostic.message, "no field `x` on `Nat`");
 }
 
 /// The solver assumes a goal it is already in the middle of, and what it is
@@ -1254,8 +1273,10 @@ fn the_types_tab_says_which_parameters_are_rows() {
         vec![("'a", "A"), ("'b", "..r (struct) without it")]
     );
 
-    // A row beside no fields at all forbids nothing, and says so by saying
-    // nothing.
+    // A struct's `..` beside no fields at all forbids nothing, and there is
+    // nothing else about it to show: the rest of a struct *is* a whole type, so
+    // a parameter with an empty lacks set is a type parameter and the row says
+    // so by saying only the name.
     let snap = snapshot("type Bare r = { ..r }");
     let stage = snap
         .stages
@@ -1266,7 +1287,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "..r (struct)");
+    assert_eq!(bare.children[0].text, "r");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -1365,4 +1386,85 @@ fn sums_reach_every_stage() {
         .map(|node| node.text.as_str())
         .collect();
     assert!(types.contains(&"Fallible (`Ok Nat)"), "{types:?}");
+}
+
+/// A type carrying fields reaches every tab that shows a type, because they all
+/// print through the compiler's own printer.
+///
+/// Two shapes of it, and one program each. `fn p => p.x` carries fields on a
+/// *variable* core, which is the commonest type in the language and prints with
+/// a `..` — the spelling a reader could have written back. And a declaration
+/// whose `..` was handed a known type carries them on that: `WithX Nat` unfolds
+/// to `Nat with { x: Nat }`, which no source syntax writes and only the solve
+/// can show.
+#[test]
+fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
+    let open = snapshot("let getx = fn p => p.x\n");
+    assert!(open.diagnostics.is_empty(), "{:#?}", open.diagnostics);
+
+    let types = open
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .expect("the types tab");
+    let scheme = nodes(types)
+        .iter()
+        .map(|node| node.text.clone())
+        .find(|text| text.contains(".."))
+        .expect("the scheme prints an open end");
+    assert_eq!(scheme, "{ x: 'a, ..'b } -> 'a");
+
+    // And the IR tab's inline badges, which the types stage paints on: the
+    // binder `p` wears the base's own type.
+    let badges = open
+        .stages
+        .iter()
+        .find(|stage| stage.annotates == Some("ir"))
+        .expect("the ir annotator");
+    assert!(
+        nodes(badges)
+            .iter()
+            .any(|node| node.text == "{ x: 'a, ..'b }"),
+        "{:#?}",
+        nodes(badges)
+    );
+
+    // The Solve tab shows the same form in its goals, so a reader stepping
+    // through the solve sees the type the scheme reports.
+    let solve = open
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve tab");
+    assert!(
+        nodes(solve).iter().any(|node| node.text.contains("..")),
+        "{:#?}",
+        nodes(solve)
+    );
+
+    // The `with` form, reached the one way source can reach it: a struct's `..`
+    // handed a type that is not a struct. The solve unfolds the name to decide
+    // the projection against it, and the goal it asks shows what the name
+    // stands for.
+    let unfolded = snapshot(
+        "type WithX r = { x: Nat, ..r }\n\
+         let f : WithX Nat -> Nat = fn p => p.x\n",
+    );
+    assert!(
+        unfolded.diagnostics.is_empty(),
+        "{:#?}",
+        unfolded.diagnostics
+    );
+    let solve = unfolded
+        .stages
+        .iter()
+        .find(|stage| stage.id == "solve")
+        .expect("the solve tab");
+    assert!(
+        nodes(solve)
+            .iter()
+            .any(|node| node.text.contains("Nat with { x: Nat }")),
+        "{:#?}",
+        nodes(solve)
+    );
 }
