@@ -1014,6 +1014,8 @@ impl ConstraintKind {
     pub fn code(&self) -> &'static str {
         match self {
             ConstraintKind::Equal { .. } => "equal",
+            ConstraintKind::Let { .. } => "let",
+            ConstraintKind::Instance { .. } => "instance",
         }
     }
 }
@@ -1030,6 +1032,22 @@ impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
+            // A header rather than a line, because a `let` carries two lists of
+            // constraints and a list is not a line: what it says of itself is
+            // what the name was bound to while its value was walked, and the
+            // level everything the value still leaves open is quantified at. The
+            // two lists are rows of their own — see the debugger's Constraints
+            // tab, which is where a constraint that has children is read.
+            ConstraintKind::Let { bound, level, .. } => {
+                write!(f, "{bound} generalized at level {level}")
+            }
+            // The name is not spelled: a symbol needs the mint to name it, and
+            // nothing here has one. The type is what a reader is following
+            // through the tab anyway, and the row it is a child of says which
+            // binding it is a copy of.
+            ConstraintKind::Instance { ty, .. } => {
+                write!(f, "{ty} ~ a fresh copy of what this name was bound to")
+            }
         }
     }
 }
@@ -1288,6 +1306,29 @@ pub fn write_tag<V: Grouped>(
         }
         None => Ok(()),
     }
+}
+
+/// Render `let <name> [: <type>] = <value> in <body>` — a name given a value
+/// for the length of one expression, in whichever tree it is being read from.
+///
+/// Nothing is grouped, and nothing here has to be. `in` begins no atom, so an
+/// expression written as the value ends in front of the `in` of its own accord,
+/// however far right it would otherwise run; and the body is the last thing on
+/// the line, so there is nothing after it to be drawn into. A `let` that needs
+/// parentheses needs them from whatever it was written inside, which is what
+/// [`Prec::Lambda`] says of it.
+pub fn write_let(
+    f: &mut fmt::Formatter<'_>,
+    name: &str,
+    ty: Option<impl fmt::Display>,
+    value: &impl fmt::Display,
+    body: &impl fmt::Display,
+) -> fmt::Result {
+    write!(f, "let {name}")?;
+    if let Some(ty) = ty {
+        write!(f, " : {ty}")?;
+    }
+    write!(f, " = {value} in {body}")
 }
 
 /// Render `base.field`. Projection binds tighter than everything that follows a

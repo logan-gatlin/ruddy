@@ -19,8 +19,8 @@
 //! not the node, that implements [`Grouped`].
 
 pub use ruddy::ui::{
-    Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
-    write_sum, write_tag,
+    Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project, write_row,
+    write_struct, write_sum, write_tag,
 };
 
 pub mod ast;

@@ -26,6 +26,15 @@
 //! have to be solved at once, and everything else gets a scheme of its own. See
 //! [`Group`](crate::ir::Group).
 //!
+//! A nested `let` generalizes inside all that, and cannot be another turn of
+//! the same alternation: it sits in the middle of one definition's walk, which
+//! is over before anything is solved. So the scoping it needs is written down
+//! instead — [`ConstraintKind::Let`] carries the two lists and the order they
+//! go in, and the solver does the generalizing where it can. Which is what
+//! keeps generation's invariant above true of the one construct that would
+//! otherwise have had to break it. See [`Table::levels`] for what decides which
+//! variables such a generalization may take.
+//!
 //! Inference runs after lowering and mutates the [`Program`] it is handed:
 //! every [`Term`]'s `ty` goes from [`Core::Undecided`] to what was inferred for
 //! it, fully resolved, so nothing downstream ever needs the solver's variable
@@ -71,6 +80,20 @@ pub struct Output {
     pub aliases: IndexMap<Symbol, Scheme>,
     /// The scheme each top-level term was inferred, or checked, to have.
     pub schemes: IndexMap<Symbol, Scheme>,
+    /// The scheme each nested `let` was inferred, in the order the lets were
+    /// walked.
+    ///
+    /// Beside [`Output::schemes`] rather than in it, so that a reader of that
+    /// map is still reading the definitions of the file: a local binding is not
+    /// a definition, and nothing that consumes the program's exports has any
+    /// business seeing one.
+    ///
+    /// Numbered on its own. A local's scheme may leave an enclosing binder's
+    /// variables free, and those are spelled here as letters past its own
+    /// quantifiers rather than as the `?3` the solver knew them by — see
+    /// [`Table::published`] — so two rows of this map spelling `'a` are two
+    /// unrelated variables, exactly as two schemes are.
+    pub locals: IndexMap<Symbol, Scheme>,
     /// What generation asked of each definition, in the order it asked, and
     /// exactly as it was asked: these are the constraints *before* the solver
     /// ran, so a variable in one prints as the variable it was. Solving is what
@@ -254,6 +277,32 @@ pub enum ConstraintKind {
     /// `actual` is what the term turned out to be, which is the order a
     /// mismatch is worded in.
     Equal { expected: Rc<Ty>, actual: Rc<Ty> },
+    /// A name bound for the length of a body, and generalized before the body
+    /// is looked at.
+    ///
+    /// The scoping a nested `let` needs, said in the constraint language rather
+    /// than done by the walk — which is what keeps generation a description of
+    /// the term and nothing else. See [`Constrain`].
+    Let {
+        symbol: Symbol,
+        /// What the name stands for while its own value is walked: the
+        /// annotation, or a variable standing for whatever the value turns out
+        /// to be. Monomorphic there, so a recursive use is the one type being
+        /// decided, and the type generalization is taken of once it is.
+        bound: Rc<Ty>,
+        /// The level the value was walked at. Everything still unbound at or
+        /// above it when the value is solved is the value's to quantify.
+        level: u32,
+        /// What the value requires, including that it match the annotation when
+        /// one was written. Solved first, at `level`.
+        value: Vec<Constraint>,
+        /// What the rest of the term requires, with `symbol` bound to the
+        /// scheme generalization produced. Solved at `level - 1`.
+        body: Vec<Constraint>,
+    },
+    /// A use of a let-bound name: `ty` is a fresh copy of whatever scheme the
+    /// enclosing [`ConstraintKind::Let`] published for `symbol`.
+    Instance { symbol: Symbol, ty: Rc<Ty> },
 }
 
 #[derive(Debug, Clone)]
@@ -359,10 +408,14 @@ enum Slot {
 type Lacks = (Shape, IndexSet<String>);
 
 /// Everything a solve can change about a [`Table`]: what the variables are
-/// known to be, and what they may not stand for. Taken and put back by
-/// [`Rule::Congruent`], which is the one rule that asks a question before it is
-/// sure the question is the right one to have asked.
-type Known = (Vec<Slot>, HashMap<TyVar, Lacks>);
+/// known to be, which level each belongs to, and what they may not stand for.
+/// Taken and put back by [`Rule::Congruent`], which is the one rule that asks a
+/// question before it is sure the question is the right one to have asked.
+///
+/// The levels travel with the slots rather than beside them: the two lists are
+/// indexed by the same variable, so putting one back without the other would
+/// leave a variable minted since the snapshot with a level and no slot.
+type Known = (Vec<Slot>, Vec<u32>, HashMap<TyVar, Lacks>);
 
 /// What one name in scope means. Private for the same reason as [`Slot`]: a
 /// binding exists only while a definition is being walked, and what survives
@@ -371,6 +424,14 @@ type Known = (Vec<Slot>, HashMap<TyVar, Lacks>);
 enum Binding {
     Mono(Rc<Ty>),
     Poly(Scheme),
+    /// A name a nested `let` bound, whose scheme only the solver will know.
+    ///
+    /// Generation cannot name what a use of one is a copy of: the scheme is
+    /// what solving the value produces, and generation has solved nothing. So
+    /// it says only that this use is a copy — a
+    /// [`ConstraintKind::Instance`] — and the solver, which by then has the
+    /// scheme, makes it.
+    Local,
 }
 
 /// Which side of a goal a row's tail sits on. [`Solve::unify`] decomposes
@@ -402,6 +463,22 @@ struct Scoped {
     opened: Range<TyVar>,
 }
 
+/// One annotation written on a nested `let`, kept aside while the definition it
+/// is in is solved.
+///
+/// The one thing about a nested binding that the constraint language has no
+/// room for, and rightly so: whether an annotation promised more than the value
+/// kept is a question about a *written type*, asked once the solve is over, and
+/// the solver has never seen a written anything. [`Scoped::opened`] is the same
+/// pair about a definition's own annotation, checked in the same place.
+struct Annotated {
+    /// The annotation's span, which is the line the reader has to change.
+    span: Span,
+    /// The variables it minted, which are the ones it left for the value to
+    /// decide. See [`Table::narrowed`].
+    opened: Range<TyVar>,
+}
+
 /// One member of a binding group once it has been walked and solved, waiting
 /// for the group to end so that it can be generalized.
 struct Solved {
@@ -412,6 +489,12 @@ struct Solved {
     /// What generation asked of it, kept exactly as it was asked. See
     /// [`Output::constraints`].
     generated: Vec<Constraint>,
+    /// Every annotation written on a nested `let` inside it. See [`Annotated`].
+    annotated: Vec<Annotated>,
+    /// Where the schemes this definition's nested lets published begin in the
+    /// shared list, so that each can be numbered for printing once the group is
+    /// solved. See [`Table::published`].
+    locals: usize,
     /// Where this definition's own complaints begin in the shared list. Each is
     /// resolved against the substitution its own definition ends with, so which
     /// ones are whose has to be marked before the next member's solve appends
@@ -427,19 +510,31 @@ struct Solved {
 struct Table {
     /// One slot per variable; [`Core::Var`] indexes into it.
     ///
-    /// There is no generalization level beside it. A binding group is the only
-    /// thing this language generalizes at and there is no `let` inside one, so
-    /// every variable still unsolved when a group ends was minted by that group
-    /// and is its members' to quantify. Rémy-style levels are what decides this
-    /// where a definition can nest, and are what a nested `let` would have to
-    /// bring back with it.
-    ///
     /// A group rather than a definition, and the difference is only where the
     /// line falls: two definitions that name each other are solved together, so
     /// a variable one of them minted may still be open while the other is being
     /// walked. It is still nobody's but the group's, because the group is
     /// finished before anything outside it is looked at.
     vars: Vec<Slot>,
+    /// The generalization level each variable was minted at, parallel to
+    /// `vars`. A binding group is level 0, a nested `let`'s value is one deeper
+    /// than whatever it was written in, and everything still unbound at or
+    /// above a level when the thing that owns it is solved is that thing's to
+    /// quantify.
+    ///
+    /// Rémy's levels, and the whole of what a nested `let` had to bring back
+    /// with it. Where a definition could not nest there was nothing to decide:
+    /// every variable still unsolved when a group ended was minted by that
+    /// group. Now `fn p => let q = p.x in q` mints the field's variable inside
+    /// the let and must still not quantify it — see [`Table::demote`], which is
+    /// what puts it back where it belongs, and why a range of minted variables
+    /// is no substitute for this.
+    levels: Vec<u32>,
+    /// The level being walked, or solved, at. Both passes set it: generation
+    /// raises it over a nested `let`'s value, and solving sets it from the
+    /// level each [`ConstraintKind::Let`] carries, so a variable minted at
+    /// either point belongs to wherever it was written.
+    level: u32,
     /// What each variable may not stand for: the labels already written out
     /// beside the open end it sits at.
     ///
@@ -517,6 +612,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     }
 
     let mut schemes = IndexMap::new();
+    let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
     let mut steps = Vec::new();
     // The groups are read out before anything is solved: solving mutates the
@@ -584,9 +680,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             let decl = &mut program.terms[&scoped.symbol];
             let mut constrain = Constrain {
                 table: &mut table,
+                mint,
                 env: &mut env,
                 aliases: &aliases,
                 out: Vec::new(),
+                annotated: Vec::new(),
             };
             // Checked against exactly what the rest of the group sees this
             // definition as. For an annotated one that is the annotation, as it
@@ -596,11 +694,13 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // ties the name the body used to the type the body has.
             constrain.check_term(&mut decl.value, &scoped.bound);
             let generated = constrain.out;
+            let annotated = constrain.annotated;
             let ty = match &decl.annotation {
                 Some(_) => scoped.bound.clone(),
                 None => decl.value.ty.clone(),
             };
             let reported = errors.len();
+            let published = locals.len();
 
             Solve {
                 table: &mut table,
@@ -611,6 +711,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 definition: scoped.symbol,
                 depth: 0,
                 assumed: Vec::new(),
+                schemes: HashMap::new(),
+                locals: &mut locals,
             }
             .run(&generated);
 
@@ -618,7 +720,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 scoped,
                 ty,
                 generated,
+                annotated,
                 reported,
+                locals: published,
             });
         }
 
@@ -626,14 +730,18 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // begin — and, for the last, where the group left the list.
         let mut bounds: Vec<usize> = solved.iter().map(|member| member.reported).collect();
         bounds.push(errors.len());
+        // The same, for the schemes each member's nested lets published.
+        let mut published: Vec<usize> = solved.iter().map(|member| member.locals).collect();
+        published.push(locals.len());
 
         // Generalization, once the whole group is solved and not before: a
         // member's type is not settled while another member of its own group
         // can still constrain it. Each is then quantified into a scheme of its
         // own. Two members can share a variable and each quantify it
-        // separately, which loses the sharing — and there is no scope outside
-        // for that to matter to, because this language has no `let` inside a
-        // definition.
+        // separately, which loses the sharing — and there is no scope outside a
+        // group for that to matter to, a group being the outermost thing there
+        // is. A nested `let` is inside one and so keeps the sharing: what its
+        // level leaves free is a [`Core::Var`] the enclosing binder still owns.
         for (at, member) in solved.into_iter().enumerate() {
             let symbol = member.scoped.symbol;
             let (from, to) = (bounds[at], bounds[at + 1]);
@@ -665,8 +773,32 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     kind: ErrorKind::AnnotationTooOpen,
                 });
             }
+            // An annotation on a nested binding is the same promise about a
+            // smaller scope, and is kept or broken on the same terms — so it is
+            // checked here, beside the definition's own, rather than by the
+            // solver, which has never seen a written type. Held back by the
+            // definition's own silence for the reason the one above is: a
+            // complaint about the fallout of a failure is one mistake said
+            // twice.
+            for annotated in &member.annotated {
+                if from == to && annotated.opened.clone().any(|var| table.narrowed(var)) {
+                    errors.push(Error {
+                        span: annotated.span,
+                        kind: ErrorKind::AnnotationTooOpen,
+                    });
+                }
+            }
 
-            let (scheme, mut subst) = table.generalize(&member.ty);
+            // What its nested lets came to, numbered for a reader now that
+            // nothing can bind their variables again. See [`Table::published`].
+            for at in published[at]..published[at + 1] {
+                let (_, scheme) = locals
+                    .get_index_mut(at)
+                    .expect("the range is this member's own");
+                *scheme = table.published(scheme);
+            }
+
+            let (scheme, mut subst) = table.generalize(&member.ty, 0);
             // With the substitution in hand, resolve every type the walk wrote
             // into the body, so a term's type and its definition's scheme spell
             // the same variable the same way.
@@ -711,6 +843,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     Output {
         aliases,
         schemes,
+        locals,
         constraints,
         steps,
         errors,
@@ -726,7 +859,7 @@ impl Table {
     /// honest; this is one line, and the one caller takes it per congruence
     /// between two applications rather than per binding.
     fn snapshot(&self) -> Known {
-        (self.vars.clone(), self.lacks.clone())
+        (self.vars.clone(), self.levels.clone(), self.lacks.clone())
     }
 
     /// Put back what [`snapshot`](Self::snapshot) took.
@@ -734,17 +867,19 @@ impl Table {
     /// The variables minted since go with it. Nothing can still be pointing at
     /// one: a fresh variable reaches the rest of the solve only by being bound
     /// into something, and every binding made since is being undone here too.
-    fn restore(&mut self, (vars, lacks): Known) {
+    fn restore(&mut self, (vars, levels, lacks): Known) {
         self.vars = vars;
+        self.levels = levels;
         self.lacks = lacks;
     }
 
-    /// One more variable, of no sort yet. A variable's sort is fixed by the
-    /// position it was minted for, and the four functions below are those
-    /// positions; nothing else may call this.
+    /// One more variable, of no sort yet, at the level being walked. A
+    /// variable's sort is fixed by the position it was minted for, and the four
+    /// functions below are those positions; nothing else may call this.
     fn mint(&mut self) -> TyVar {
         let var = self.vars.len() as TyVar;
         self.vars.push(Slot::Unbound);
+        self.levels.push(self.level);
         var
     }
 
@@ -1025,6 +1160,33 @@ impl Table {
         mentioned.contains(&var)
     }
 
+    /// Lower the level of everything `value` mentions to no more than `var`'s
+    /// own, which is what binding a variable does to the variables inside what
+    /// it takes.
+    ///
+    /// The whole of why generalization at a level is right. A variable stands
+    /// for a type the binder that minted `var` may see, so everything inside
+    /// that type is as old as `var` is however recently it was written:
+    /// `fn p => let q = p.x in q` mints the field's variable inside the let and
+    /// then binds `p`'s — minted outside it — to a type carrying the field, at
+    /// which point the field is the lambda's and not the let's. Generalizing
+    /// the variables minted inside a let would quantify it; generalizing the
+    /// ones still at or above the let's level does not.
+    ///
+    /// Walked the way the occurs check is walked, and by the same walk: the two
+    /// ask about the variables one value mentions, and asking once per position
+    /// is what would make either of them a rule with a branch nobody can
+    /// exercise. See [`Table::occurs`].
+    fn demote(&mut self, var: TyVar, value: &Assigned) {
+        let level = self.levels[var as usize];
+        let mut mentioned = Vec::new();
+        self.mentions(value, &mut mentioned);
+        for var in mentioned {
+            let at = &mut self.levels[var as usize];
+            *at = (*at).min(level);
+        }
+    }
+
     /// Collect every variable `value` mentions, whichever sort it is.
     fn mentions(&self, value: &Assigned, found: &mut Vec<TyVar>) {
         match value {
@@ -1228,6 +1390,30 @@ impl Table {
         recorded.extend(labels);
     }
 
+    /// One fresh copy of a scheme, minted at the level the table is being
+    /// walked or solved at.
+    ///
+    /// Two callers, and they are the two ways a name can stand for a scheme:
+    /// generation opening an earlier definition's, and the solver opening the
+    /// one a nested `let` published — which generation could not have opened,
+    /// there being nothing to open until the value is solved. One function
+    /// because it is one act.
+    fn instantiate(&mut self, scheme: &Scheme) -> Rc<Ty> {
+        // One fresh variable per position the scheme bound, handed over as a
+        // bare type: which sort each one is, is decided where it lands, since
+        // that is what a scheme records. See [`Assigned::as_row`].
+        let fresh: Vec<Assigned> = (0..scheme.count())
+            .map(|_| Assigned::Ty(self.fresh_type()))
+            .collect();
+        let ty = scheme.body().open(&fresh);
+        // A scheme's body says which of its rows a quantified tail is the tail
+        // of, but the condition that follows from that is not part of the
+        // body: it lived beside the variables the scheme closed over, and this
+        // copy's variables are new. Said again, of them.
+        self.note_lacks(&ty);
+        ty
+    }
+
     /// [`unfold`] with the row conditions its result implies recorded against
     /// this table's variables.
     ///
@@ -1380,14 +1566,44 @@ impl Table {
         }
     }
 
-    /// Quantify everything in `ty` still unsolved deeper than the current
-    /// level. Returns the scheme and the substitution that built it, so the
-    /// caller can spell the same variables the same way elsewhere.
-    fn generalize(&self, ty: &Rc<Ty>) -> (Scheme, HashMap<TyVar, u32>) {
+    /// Quantify everything in `ty` still unsolved at or above `level`.
+    /// Returns the scheme and the substitution that built it, so the caller can
+    /// spell the same variables the same way elsewhere.
+    ///
+    /// A variable below the level is left where it stands, as a [`Core::Var`]
+    /// in the scheme's body: it belongs to an enclosing binder, so every use of
+    /// this scheme is to share it rather than get a copy. That is the whole of
+    /// what makes `fn p => let q = p.x in q` one type rather than two — see
+    /// [`Table::demote`] — and it is why a scheme published here may still
+    /// mention the table. A definition's own scheme never does: its level is 0,
+    /// and nothing is below that.
+    fn generalize(&self, ty: &Rc<Ty>, level: u32) -> (Scheme, HashMap<TyVar, u32>) {
         let mut subst = HashMap::new();
-        self.quantify(ty, &mut subst);
+        self.quantify(ty, &mut subst, level);
         let body = self.zonk(ty, &subst);
         (Scheme::new(subst.len() as u32, body), subst)
+    }
+
+    /// A local binding's scheme as it is published: everything it left free
+    /// numbered on past its own quantifiers, so that a reader is shown letters
+    /// rather than the solver's `?3`.
+    ///
+    /// Only for [`Output::locals`], and only once the solve that could still
+    /// bind those variables is over. The scheme the solver instantiates is the
+    /// one [`generalize`](Self::generalize) produced, free variables and all;
+    /// numbering them would hand each use a copy of a variable it is meant to
+    /// share.
+    fn published(&self, scheme: &Scheme) -> Scheme {
+        let mut subst = HashMap::new();
+        self.quantify(scheme.body(), &mut subst, 0);
+        // Its own quantifiers already occupy the first `count` positions, so
+        // what was free numbers on from there.
+        let shifted: HashMap<TyVar, u32> = subst
+            .into_iter()
+            .map(|(var, at)| (var, scheme.count() + at))
+            .collect();
+        let count = scheme.count() + shifted.len() as u32;
+        Scheme::new(count, self.zonk(scheme.body(), &shifted))
     }
 
     /// Number the generalizable variables of `ty` in first-occurrence order —
@@ -1397,9 +1613,9 @@ impl Table {
     /// walk. A presence prints as the `?` on its field rather than as a
     /// letter, so numbering one in line would leave a visible gap: the scheme
     /// of `{ x?: Nat } -> 'a` should not call its one letter `'b`.
-    fn quantify(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>) {
-        self.quantify_walk(ty, subst, false);
-        self.quantify_walk(ty, subst, true);
+    fn quantify(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>, level: u32) {
+        self.quantify_walk(ty, subst, level, false);
+        self.quantify_walk(ty, subst, level, true);
     }
 
     /// One numbering pass over one type: over everything but the presence
@@ -1414,26 +1630,32 @@ impl Table {
     /// numbering it first would call the rightmost thing on the line `'a`. No
     /// special case for it either way — it is descended into exactly where it
     /// sits.
-    fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>, presences: bool) {
+    fn quantify_walk(
+        &self,
+        ty: &Rc<Ty>,
+        subst: &mut HashMap<TyVar, u32>,
+        level: u32,
+        presences: bool,
+    ) {
         let ty = self.resolve(ty);
-        self.quantify_labels(&ty.fields, subst, presences);
+        self.quantify_labels(&ty.fields, subst, level, presences);
         match &ty.core {
             Core::Var(var) => {
                 if !presences {
-                    Self::quantify_var(*var, subst);
+                    self.quantify_var(*var, subst, level);
                 }
             }
             Core::Arrow(from, to) => {
-                self.quantify_walk(from, subst, presences);
-                self.quantify_walk(to, subst, presences);
+                self.quantify_walk(from, subst, level, presences);
+                self.quantify_walk(to, subst, level, presences);
             }
-            Core::Sum(cases) => self.quantify_row(cases, subst, presences),
+            Core::Sum(cases) => self.quantify_row(cases, subst, level, presences),
             // An argument left open is the definition's to quantify, the same
             // as one written anywhere else: `WithX ..'a -> Nat` names its tail
             // because this descends.
             Core::Named { args, .. } => {
                 for arg in args.iter() {
-                    self.quantify_walk(arg, subst, presences);
+                    self.quantify_walk(arg, subst, level, presences);
                 }
             }
             Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
@@ -1442,11 +1664,17 @@ impl Table {
 
     /// [`quantify_walk`](Self::quantify_walk) over a sum's cases: the labels,
     /// and then the tail, which is read last for the reason a struct's core is.
-    fn quantify_row(&self, row: &Row, subst: &mut HashMap<TyVar, u32>, presences: bool) {
+    fn quantify_row(
+        &self,
+        row: &Row,
+        subst: &mut HashMap<TyVar, u32>,
+        level: u32,
+        presences: bool,
+    ) {
         let row = self.canon(row);
-        self.quantify_labels(&row.labels, subst, presences);
+        self.quantify_labels(&row.labels, subst, level, presences);
         if !presences && let Rest::Var(var) = row.rest {
-            Self::quantify_var(var, subst);
+            self.quantify_var(var, subst, level);
         }
     }
 
@@ -1456,34 +1684,44 @@ impl Table {
         &self,
         labels: &IndexMap<String, RowField>,
         subst: &mut HashMap<TyVar, u32>,
+        level: u32,
         presences: bool,
     ) {
         for field in labels.values() {
             if presences && let Presence::Var(var) = self.presence_of(&field.presence) {
-                Self::quantify_var(var, subst);
+                self.quantify_var(var, subst, level);
             }
-            self.quantify_walk(&field.ty, subst, presences);
+            self.quantify_walk(&field.ty, subst, level, presences);
         }
     }
 
-    /// Number one variable, unless it already has a number. Every variable
-    /// this reaches is one the definition may quantify; see [`Table::vars`].
-    fn quantify_var(var: TyVar, subst: &mut HashMap<TyVar, u32>) {
+    /// Number one variable, unless it already has a number or belongs to a
+    /// binder further out. See [`Table::levels`].
+    fn quantify_var(&self, var: TyVar, subst: &mut HashMap<TyVar, u32>, level: u32) {
+        if self.levels[var as usize] < level {
+            return;
+        }
         let next = subst.len() as u32;
         subst.entry(var).or_insert(next);
     }
 
     /// Resolve a type all the way down, replacing each variable in `subst`
-    /// with its quantified stand-in. What comes back never mentions the
-    /// variable table, so it outlives the solver.
+    /// with its quantified stand-in. What comes back mentions the variable
+    /// table only where the caller chose to leave it mentioning one — see
+    /// [`Table::generalize`], whose scheme keeps an enclosing binder's
+    /// variables free — so everything published at level 0 outlives the solver.
     fn zonk(&self, ty: &Rc<Ty>, subst: &HashMap<TyVar, u32>) -> Rc<Ty> {
         let ty = self.resolve(ty);
         let fields = self.zonk_labels(&ty.fields, subst);
         let core = match &ty.core {
-            // Indexed rather than looked up: everything that zonks quantifies
-            // first — see [`Table::close`] and [`Table::generalize`] — so a
-            // variable this walk can reach has a number by the time it does.
-            Core::Var(var) => Core::Bound(subst[var]),
+            // A variable with no number is one quantifying was asked to leave
+            // alone: it belongs to a binder further out, and standing for
+            // itself is exactly what a scheme of a nested binding has to say
+            // about it.
+            Core::Var(var) => match subst.get(var) {
+                Some(at) => Core::Bound(*at),
+                None => ty.core.clone(),
+            },
             Core::Arrow(from, to) => Core::Arrow(self.zonk(from, subst), self.zonk(to, subst)),
             Core::Sum(cases) => Core::Sum(self.zonk_row(cases, subst)),
             // Rebuilt rather than handed back, because an argument may hold a
@@ -1515,7 +1753,12 @@ impl Table {
         let row = self.canon(row);
         let labels = self.zonk_labels(&row.labels, subst);
         let rest = match row.rest {
-            Rest::Var(var) => Rest::Bound(subst[&var]),
+            // Left standing where it has no number, for the reason a core
+            // variable is; see [`Table::zonk`].
+            Rest::Var(var) => match subst.get(&var) {
+                Some(at) => Rest::Bound(*at),
+                None => Rest::Var(var),
+            },
             decided => decided,
         };
         Row { labels, rest }
@@ -1533,7 +1776,10 @@ impl Table {
             .map(|(name, field)| {
                 let field = RowField {
                     presence: match self.presence_of(&field.presence) {
-                        Presence::Var(var) => Presence::Bound(subst[&var]),
+                        Presence::Var(var) => match subst.get(&var) {
+                            Some(at) => Presence::Bound(*at),
+                            None => Presence::Var(var),
+                        },
                         decided => decided,
                     },
                     ty: self.zonk(&field.ty, subst),
@@ -1558,8 +1804,12 @@ impl Table {
     /// numbering on from `subst` so that a variable the scheme already named
     /// keeps that name. The one rule everything outliving the solver goes
     /// through, so no two of them can spell one variable differently.
+    /// At level 0, because this is the last word: whatever a term or a
+    /// complaint still mentions when the group is done belongs to nobody
+    /// further out, so every variable left in it is named rather than left for
+    /// a reader to resolve.
     fn close(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>) -> Rc<Ty> {
-        self.quantify(ty, subst);
+        self.quantify(ty, subst, 0);
         self.zonk(ty, subst)
     }
 
@@ -1571,6 +1821,10 @@ impl Table {
                 self.zonk_term(arg, subst);
             }
             TermKind::Fn { body, .. } => self.zonk_term(body, subst),
+            TermKind::Let { value, body, .. } => {
+                self.zonk_term(value, subst);
+                self.zonk_term(body, subst);
+            }
             TermKind::Struct(fields) => {
                 for field in fields.values_mut() {
                     self.zonk_term(&mut field.value, subst);

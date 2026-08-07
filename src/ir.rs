@@ -112,6 +112,20 @@ pub enum TermKind {
         arg: Tracked<Symbol>,
         body: Box<Term>,
     },
+    /// A name given a value for the length of a body.
+    ///
+    /// Kept as a node of its own rather than desugared into a lambda applied
+    /// to the value: an application is monomorphic, and a nested binding gets a
+    /// scheme — see [`inference`](crate::inference) — so the two are not the
+    /// same term. It is also what the reader wrote, which is what the IR is for.
+    Let {
+        /// The name this binds, and where it was written.
+        name: Tracked<Symbol>,
+        /// The written type, lowered, when the binding was ascribed one.
+        annotation: Option<Type>,
+        value: Box<Term>,
+        body: Box<Term>,
+    },
     Struct(IndexMap<String, Field<Term>>),
     /// `` `Some 1 `` — one case of a sum, with what it carries.
     ///
@@ -718,6 +732,15 @@ struct Loops {
 /// and the set of everything found on a loop.
 struct Chain<'a> {
     terms: &'a IndexMap<Symbol, Decl<Term>>,
+    /// The value each nested `let` in the program binds its name to.
+    ///
+    /// A local symbol is no definition, so the table above has no key for it —
+    /// and a nested `let` given as itself is the same mistake a definition
+    /// given as itself is, so the walk has to be able to follow one. Collected
+    /// over the whole program before anything is followed, for the reason
+    /// definitions are hoisted: which of the two maps a name comes out of is
+    /// not something the walk should have to reach the binder to know.
+    locals: HashMap<Symbol, &'a Term>,
     /// What each definition was found to stand for; [`Stands::Loop`] absorbs,
     /// exactly as it does for [`Follow`].
     done: HashMap<Symbol, Stands>,
@@ -910,6 +933,21 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // one. Read back off the table in definition order, so the reports come in
     // the order the reader wrote them.
     let circling = circling(&program.terms);
+    // The nested bindings on a loop first, since a definition that is on one
+    // too has its whole value erased below and would take them with it. Each
+    // is reported where the top-level walk reports one: at the value's span.
+    let mut nested_loops = Vec::new();
+    for decl in program.terms.values_mut() {
+        erase_circular(&mut decl.value, &circling, &mut nested_loops);
+    }
+    for span in nested_loops {
+        b.error(
+            span,
+            ErrorKind::Circular {
+                namespace: Namespace::Terms,
+            },
+        );
+    }
     let circular: Vec<_> = program
         .terms
         .keys()
@@ -1117,9 +1155,24 @@ impl Follow<'_> {
 /// reads a field out of whatever `b` is, so it is not `b`; a loop closing
 /// through one still describes a value, and whether it can be typed is
 /// [`inference`](crate::inference)'s occurs check to answer.
+///
+/// A nested `let` is followed too, and by the same rules: `let x = x in x`
+/// says no more about what `x` is than `let x = x` at the top level does. What
+/// a `let` expression stands for is what its *body* stands for, since a body
+/// that is a bare name is a value given as that name.
 fn circling(terms: &IndexMap<Symbol, Decl<Term>>) -> IndexSet<Symbol> {
+    let mut locals = HashMap::new();
+    for decl in terms.values() {
+        nested(&decl.value, &mut locals);
+    }
+    // Every nested binding is followed from itself as well as from the
+    // definitions, because a definition's value stops at the first `fn` it
+    // meets: without this, a loop written inside a lambda would be found only
+    // if something outside it happened to lead there.
+    let bound: Vec<Symbol> = locals.keys().copied().collect();
     let mut chain = Chain {
         terms,
+        locals,
         done: HashMap::new(),
         open: Vec::new(),
         looping: IndexSet::new(),
@@ -1127,7 +1180,86 @@ fn circling(terms: &IndexMap<Symbol, Decl<Term>>) -> IndexSet<Symbol> {
     for symbol in terms.keys() {
         chain.def(*symbol);
     }
+    for symbol in bound {
+        chain.def(symbol);
+    }
     chain.looping
+}
+
+/// Erase the value of every nested `let` on a loop, and collect the span each
+/// is to be reported at.
+///
+/// [`build`]'s treatment of a circular definition, said about a binding written
+/// inside one: the value is replaced by [`TermKind::Error`], which absorbs, and
+/// the span reported is the value's — the same span, and the same complaint,
+/// that `let x = x` gets at the top level.
+///
+/// Innermost first, because a loop can close through a binding written inside
+/// another binding's value — `let x = let y = x in y in x` is two bindings on
+/// one loop — and erasing the outer one takes the inner one's value out of the
+/// program with it. Every binding on the loop is told, which is what the
+/// top-level walk already does.
+fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Span>) {
+    match &mut term.kind {
+        TermKind::Let {
+            name, value, body, ..
+        } => {
+            erase_circular(value, looping, out);
+            if looping.contains(&name.tracked) {
+                out.push(value.span);
+                **value = TermKind::Error.with_span(value.span);
+            }
+            erase_circular(body, looping, out);
+        }
+        TermKind::Apply { func, arg } => {
+            erase_circular(func, looping, out);
+            erase_circular(arg, looping, out);
+        }
+        TermKind::Fn { body, .. } => erase_circular(body, looping, out),
+        TermKind::Struct(fields) => {
+            for field in fields.values_mut() {
+                erase_circular(&mut field.value, looping, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                erase_circular(payload, looping, out);
+            }
+        }
+        TermKind::Project { base, .. } => erase_circular(base, looping, out),
+        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+    }
+}
+
+/// Every nested `let` in a term, as the symbol it binds and the value it binds
+/// it to. See [`Chain::locals`].
+fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
+    match &term.kind {
+        TermKind::Let {
+            name, value, body, ..
+        } => {
+            out.insert(name.tracked, value);
+            nested(value, out);
+            nested(body, out);
+        }
+        TermKind::Apply { func, arg } => {
+            nested(func, out);
+            nested(arg, out);
+        }
+        TermKind::Fn { body, .. } => nested(body, out),
+        TermKind::Struct(fields) => {
+            for field in fields.values() {
+                nested(&field.value, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                nested(payload, out);
+            }
+        }
+        TermKind::Project { base, .. } => nested(base, out),
+        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+    }
 }
 
 impl Chain<'_> {
@@ -1142,24 +1274,34 @@ impl Chain<'_> {
             self.looping.extend(self.open[at..].iter().copied());
             return Stands::Loop;
         }
-        // Every symbol a value can name bare was defined, and every definition
-        // that was made is in this table: a name that repeats one binds nothing
-        // and so is never written into a term at all, and a lambda's argument
-        // is only in scope under the `fn` that binds it, which this walk stops
-        // at.
-        let decl = &self.terms[&symbol];
+        // A name written bare is a definition, a nested binding, or a lambda's
+        // argument, and only the first two have a value here to follow. An
+        // argument is handed one at every call site rather than given one where
+        // it is written, so it ends the chain the way a shape does — there is
+        // nothing about it that could lead back round.
+        let value = match self.terms.get(&symbol) {
+            Some(decl) => &decl.value,
+            None => match self.locals.get(&symbol) {
+                Some(value) => value,
+                None => return Stands::Shape,
+            },
+        };
         self.open.push(symbol);
-        let stands = self.value(&decl.value);
+        let stands = self.value(value);
         self.open.pop();
         self.done.insert(symbol, stands);
         stands
     }
 
-    /// What one value stands for. Every kind but a bare name is a shape, which
-    /// is the whole rule.
+    /// What one value stands for. Every kind but a bare name and a nested
+    /// `let` is a shape, which is the whole rule.
     fn value(&mut self, term: &Term) -> Stands {
         match &term.kind {
             TermKind::Ident(symbol) => self.def(*symbol),
+            // A `let` is whatever its body is: the value it binds is beside the
+            // question, and a body written as a bare name is a value given as
+            // that name.
+            TermKind::Let { body, .. } => self.value(body),
             TermKind::Apply { .. }
             | TermKind::Fn { .. }
             | TermKind::Struct(_)
@@ -1279,6 +1421,14 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
         // a use of the binder inside it is a symbol this walk pushes and
         // [`grouping`] then drops, since it is in no definition table.
         TermKind::Fn { body, .. } => references(body, out),
+        // Both halves, and no filtering of its own: the name a nested `let`
+        // binds is a local, so a use of it is pushed here and dropped by
+        // [`grouping`] along with a lambda argument's, and a top-level name
+        // mentioned from inside one still lands in the right group.
+        TermKind::Let { value, body, .. } => {
+            references(value, out);
+            references(body, out);
+        }
         TermKind::Struct(fields) => {
             for field in fields.values() {
                 references(&field.value, out);
@@ -1702,8 +1852,53 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         if let Some(annotation) = decl.annotation.as_mut() {
             walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
         }
+        // And so is a nested binding's, which is a place to write one as much
+        // as a definition's is. An annotation this walk never reaches is a
+        // [`ErrorKind::RepeatedRowField`] never reported.
+        annotations(&mut decl.value, &mut |annotation| {
+            walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
+        });
     }
     out
+}
+
+/// Every annotation written inside a term, in the order they were written.
+///
+/// A nested binding is the one place a written type appears anywhere but at the
+/// top level of a definition, so this is where the passes that ask something of
+/// every written type reach the ones inside a body.
+fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
+    match &mut term.kind {
+        TermKind::Let {
+            annotation,
+            value,
+            body,
+            ..
+        } => {
+            if let Some(annotation) = annotation {
+                out(annotation);
+            }
+            annotations(value, out);
+            annotations(body, out);
+        }
+        TermKind::Apply { func, arg } => {
+            annotations(func, out);
+            annotations(arg, out);
+        }
+        TermKind::Fn { body, .. } => annotations(body, out),
+        TermKind::Struct(fields) => {
+            for field in fields.values_mut() {
+                annotations(&mut field.value, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                annotations(payload, out);
+            }
+        }
+        TermKind::Project { base, .. } => annotations(base, out),
+        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+    }
 }
 
 /// Whether a written type could stand for the cases a sum does not name.
@@ -2555,6 +2750,35 @@ impl Builder<'_> {
                     }
                     .with_span(span)
                 })
+            }
+            // The name is bound before the value is lowered, so a nested `let`
+            // may name itself the way a definition may; and released after the
+            // body, so nothing written past the expression can see it. Bound
+            // rather than declared, which is what makes it shadow silently: two
+            // definitions of one name are a repeat, and a scope inside one is
+            // not.
+            ExprKind::Let {
+                name,
+                ty,
+                value,
+                body,
+            } => {
+                let annotation = ty.map(|ty| self.written(*ty, Place::Annotation));
+                let mark = self.terms.mark();
+                let symbol = self
+                    .mint
+                    .local(self.module, Namespace::Terms, &name.tracked);
+                self.terms.bind(name.tracked, symbol, name.span);
+                let value = self.term(*value);
+                let body = self.term(*body);
+                self.terms.release(mark);
+                TermKind::Let {
+                    name: name.span.track(symbol),
+                    annotation,
+                    value: Box::new(value),
+                    body: Box::new(body),
+                }
+                .with_span(span)
             }
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)

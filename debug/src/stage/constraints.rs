@@ -10,6 +10,8 @@
 //! A constraint that already showed its answer would say nothing about the
 //! pass that produced it, and the answer is one tab away.
 
+use ruddy::inference::{Constraint, ConstraintKind};
+
 use crate::{
     stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
@@ -31,11 +33,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // definition that constrains nothing is still visible as the empty group
     // it is rather than missing from the tab.
     for (symbol, constraints) in &output.constraints {
-        total += constraints.len();
+        let asked = counted(constraints);
+        total += asked;
         let mut node = Node::new(
             ids.next(),
             format!("let {}", mint.name(*symbol)),
-            plural(constraints.len(), "constraint"),
+            plural(asked, "constraint"),
         );
         if let Some(decl) = program.terms.get(symbol) {
             node = node.at(decl.name_span);
@@ -43,12 +46,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         if let Some(index) = cx.symbols.get(symbol) {
             node = node.symbol(*index);
         }
-        // Each constraint wears the span the program said it at, which is what
-        // lets clicking one highlight the term that demanded it.
-        node = node.children(constraints.iter().map(|constraint| {
-            Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
-                .at(constraint.span)
-        }));
+        node = node.children(rows(&mut ids, constraints));
         nodes.push(node);
     }
 
@@ -60,4 +58,42 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         debug: format!("{:#?}", output.constraints),
         ..spec.stage(cx.status(), plural(total, "constraint"))
     }
+}
+
+/// One row per constraint, in the order generation emitted them.
+///
+/// A list, until a nested `let` made it a tree: a `let` holds what its value
+/// requires and what its body requires, solved in that order and at two
+/// different levels, so its two lists sit beneath it rather than in line with
+/// it. That nesting *is* the solve order, which is the whole reason the tab
+/// shows it.
+fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
+    constraints
+        .iter()
+        .map(|constraint| {
+            // Each constraint wears the span the program said it at, which is
+            // what lets clicking one highlight the term that demanded it.
+            let node = Node::new(ids.next(), constraint.kind.code(), constraint.to_string())
+                .at(constraint.span);
+            match &constraint.kind {
+                ConstraintKind::Let { value, body, .. } => {
+                    node.children(rows(ids, value)).children(rows(ids, body))
+                }
+                ConstraintKind::Equal { .. } | ConstraintKind::Instance { .. } => node,
+            }
+        })
+        .collect()
+}
+
+/// How many constraints a list holds, counting the ones a nested `let` carries
+/// under it. The summary is a count of what the tab shows, and a `let` shows
+/// everything inside it.
+fn counted(constraints: &[Constraint]) -> usize {
+    constraints
+        .iter()
+        .map(|constraint| match &constraint.kind {
+            ConstraintKind::Let { value, body, .. } => 1 + counted(value) + counted(body),
+            ConstraintKind::Equal { .. } | ConstraintKind::Instance { .. } => 1,
+        })
+        .sum()
 }

@@ -1,6 +1,9 @@
 //! Pass two: solving. See [`Solve`].
 
-use std::{collections::HashSet, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use indexmap::IndexMap;
 
@@ -200,6 +203,12 @@ pub struct Solve<'a> {
     /// rather than by identity, since unfolding rebuilds an argument each round
     /// rather than passing the same allocation on. See [`Solve::unfold`].
     pub assumed: Vec<(Rc<Ty>, Rc<Ty>)>,
+    /// The scheme each nested `let` currently in scope published, for as long
+    /// as its body is being solved. [`Constrain`](super::Constrain)'s
+    /// environment, about the one kind of name generation could not decide.
+    pub schemes: HashMap<Symbol, Scheme>,
+    /// Every scheme published, kept. [`Output::locals`](super::Output::locals).
+    pub locals: &'a mut IndexMap<Symbol, Scheme>,
 }
 
 impl Solve<'_> {
@@ -209,9 +218,71 @@ impl Solve<'_> {
     /// nothing has to wait for a later round to know what its base is.
     pub fn run(&mut self, constraints: &[Constraint]) {
         for constraint in constraints {
-            let ConstraintKind::Equal { expected, actual } = &constraint.kind;
-            self.unify(constraint.span, expected, actual);
+            let span = constraint.span;
+            match &constraint.kind {
+                ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
+                ConstraintKind::Let {
+                    symbol,
+                    bound,
+                    level,
+                    value,
+                    body,
+                } => self.bind_local(*symbol, bound, *level, value, body),
+                ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
+            }
         }
+    }
+
+    /// A name bound for the length of a body: solve what its value requires,
+    /// generalize, and solve the body with the scheme in scope.
+    ///
+    /// The order is the whole of it, and it is the order the constraint records
+    /// rather than one the walk could have kept: generation had solved nothing
+    /// when it met the `let`, so it could no more generalize the value than
+    /// name the scheme a use of the name is a copy of.
+    ///
+    /// The level is set from the constraint rather than counted here, so that a
+    /// variable minted while the value is solved is minted where the value was
+    /// written — and dropped again for the body, which is one binder further
+    /// out. Everything still unbound at or above it is the value's to quantify;
+    /// what an enclosing binder owns was pushed below it by
+    /// [`Table::demote`](super::Table) as the value was solved.
+    ///
+    /// The scheme is released when the body ends, the way lowering released the
+    /// name. Nothing could reach it afterwards — a symbol is unique — but a
+    /// scope that is not closed is a scope that is not a scope.
+    fn bind_local(
+        &mut self,
+        symbol: Symbol,
+        bound: &Rc<Ty>,
+        level: u32,
+        value: &[Constraint],
+        body: &[Constraint],
+    ) {
+        self.table.level = level;
+        self.run(value);
+        let (scheme, _) = self.table.generalize(bound, level);
+        self.table.level = level - 1;
+        self.locals.insert(symbol, scheme.clone());
+        self.schemes.insert(symbol, scheme);
+        self.run(body);
+        self.schemes.remove(&symbol);
+    }
+
+    /// A use of a let-bound name: a fresh copy of the scheme it was published
+    /// with, equated with the variable generation minted for the term.
+    ///
+    /// Indexed rather than looked up, and that is an invariant rather than a
+    /// diagnostic: generation emits this only for a name it bound itself, and
+    /// the constraint sits inside the body of the `let` that bound it, so a
+    /// symbol with no scheme in scope cannot arise.
+    fn instance(&mut self, span: Span, symbol: Symbol, ty: &Rc<Ty>) {
+        let scheme = self.schemes[&symbol].clone();
+        // At the level of the use site, which is where the table is: a copy is
+        // as new as the place it was made, whatever the scheme was generalized
+        // at.
+        let copy = self.table.instantiate(&scheme);
+        self.unify(span, &copy, ty);
     }
 
     /// Make `expected` and `actual` the same type, or report where they
@@ -1135,6 +1206,10 @@ impl Solve<'_> {
             return;
         }
         self.table.inherit_lacks(var, &value);
+        // And the levels travel the same way the conditions do: what this
+        // variable stands for is as old as this variable is, so everything
+        // inside it belongs no deeper. See [`Table::demote`](super::Table).
+        self.table.demote(var, &value);
         self.table.vars[var as usize] = Slot::Bound(value.clone());
         self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
     }

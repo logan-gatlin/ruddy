@@ -964,8 +964,11 @@ fn a_printer_reports_a_writer_that_refuses_it() {
 
     // And the term printers, which have forms of their own: an application and
     // a projection, neither of which a type can be.
+    // And a nested `let`, which writes its name, its ascription and its two
+    // halves in pieces the way a path does.
     let source = "type Pair a b = { first: a, second: b }\n\
                   let f = fn g => fn p => g p.first\n\
+                  let h = let n : Nat = 1 in n\n\
                   let v : { first: Nat, second: Nat } = { first: 1, second: 2 }";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
@@ -1506,4 +1509,75 @@ fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
         })),
     };
     assert_eq!(row.to_string(), "{ x: Nat, ..{ y: Nat } }");
+}
+
+/// A constraint kind is coded the way an error kind is, and for the same
+/// reason: the Constraints tab labels a row with it, and two kinds sharing a
+/// code would make two different demands read as one.
+#[test]
+fn no_two_kinds_of_constraint_are_coded_the_same() {
+    let nat = Rc::new(Ty::plain(Core::Nat));
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
+    let symbol = mint.local(None, Namespace::Terms, "x");
+
+    let kinds = [
+        ConstraintKind::Equal {
+            expected: nat.clone(),
+            actual: nat.clone(),
+        },
+        ConstraintKind::Let {
+            symbol,
+            bound: nat.clone(),
+            level: 1,
+            value: Vec::new(),
+            body: Vec::new(),
+        },
+        ConstraintKind::Instance {
+            symbol,
+            ty: nat.clone(),
+        },
+    ];
+    let codes: HashSet<_> = kinds.iter().map(|kind| kind.code()).collect();
+    let messages: HashSet<_> = kinds.iter().map(|kind| kind.to_string()).collect();
+    assert_eq!(codes.len(), kinds.len());
+    assert_eq!(messages.len(), kinds.len());
+    for kind in &kinds {
+        assert!(!kind.to_string().is_empty(), "{}", kind.code());
+    }
+}
+
+/// The two kinds a nested `let` adds, read as what they say. A `let` carries
+/// two lists rather than a pair of types, so it prints as the header of the
+/// tree its children make; a use of the name it bound cannot spell the name at
+/// all, there being no mint here to spell one with, so it says what it is
+/// instead.
+#[test]
+fn the_scoping_constraints_read_as_what_they_do() {
+    let nat = Rc::new(Ty::plain(Core::Nat));
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
+    let symbol = mint.local(None, Namespace::Terms, "x");
+
+    let bound = Constraint {
+        span: Span::generated(0, 1),
+        kind: ConstraintKind::Let {
+            symbol,
+            bound: nat.clone(),
+            level: 2,
+            value: Vec::new(),
+            body: Vec::new(),
+        },
+    };
+    assert_eq!(bound.kind.code(), "let");
+    assert_eq!(bound.to_string(), "Nat generalized at level 2");
+    assert_eq!(bound.to_string(), bound.kind.to_string());
+
+    let use_site = ConstraintKind::Instance {
+        symbol,
+        ty: Rc::new(Ty::plain(Core::Var(4))),
+    };
+    assert_eq!(use_site.code(), "instance");
+    assert_eq!(
+        use_site.to_string(),
+        "?4 ~ a fresh copy of what this name was bound to"
+    );
 }

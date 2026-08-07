@@ -42,6 +42,26 @@ pub enum ExprKind {
         args: Vec<TrackedString>,
         body: Box<Expr>,
     },
+    /// `let <name> [: <type>] = <value> in <body>` — a name given a value for
+    /// the length of one expression.
+    ///
+    /// The same shape as [`StmtKind::Let`] and nothing else: a statement binds
+    /// a name for the whole file and this one binds it for the body written
+    /// after the `in`, so the two share their grammar and not a line of their
+    /// meaning.
+    Let {
+        name: TrackedString,
+        /// The written type, when the binding was ascribed one.
+        ///
+        /// Boxed, where [`StmtKind::Let`]'s is not, because this node nests
+        /// inside another expression and that one does not. An ascription is
+        /// the largest thing either can carry, so inlining it here would make
+        /// every expression in the tree the size of the one construct that has
+        /// one.
+        ty: Option<Box<Type>>,
+        value: Box<Expr>,
+        body: Box<Expr>,
+    },
     Struct(IndexMap<TrackedString, Expr>),
     /// `` `Some 1 `` — one case of a sum, with what it carries.
     ///
@@ -324,6 +344,11 @@ impl Parser {
 
     /// Whether the next token can begin an atomic expression — used to decide
     /// when to stop gathering application arguments.
+    ///
+    /// [`Kind::Let`] is deliberately not one, though [`atom`](Self::atom)
+    /// reads one: an application stops in front of a nested `let`, so
+    /// `let a = 1 let b = 2` is two definitions rather than `a` applied to
+    /// one, and a `let` handed to a function is written in parentheses.
     fn at_expr_atom(&self) -> bool {
         matches!(
             self.peek(),
@@ -390,6 +415,7 @@ impl Parser {
         let span = tok.span;
         match &tok.tracked {
             Kind::Fn => self.function_expr(),
+            Kind::Let => self.let_expr(),
             Kind::LeftBrace => self.struct_expr(),
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
@@ -488,6 +514,35 @@ impl Parser {
         let span = kw.span.merge(body.span);
         Some(span.track(ExprKind::Function {
             args,
+            body: Box::new(body),
+        }))
+    }
+
+    /// `let <name> [: <type>] = <value> in <body>` — the expression form of
+    /// [`let_stmt`](Self::let_stmt), which the two share their shape with and
+    /// nothing else.
+    ///
+    /// The body is a full expression and extends as far right as it can, the
+    /// way a `fn` body does. Nothing has to be done to stop it running past
+    /// the end of the enclosing form: `in` begins no atom, so an application
+    /// ends in front of one and a nested `let` reaches its own `in` and no
+    /// other.
+    fn let_expr(&mut self) -> Option<Expr> {
+        let kw = self.advance().expect("the caller peeked `let`");
+        let name = self.ident()?;
+        let ty = match self.eat_if(&Kind::Colon) {
+            Some(_) => Some(Box::new(self.type_expr()?)),
+            None => None,
+        };
+        self.eat(&Kind::Equal)?;
+        let value = self.expr()?;
+        self.eat(&Kind::In)?;
+        let body = self.expr()?;
+        let span = kw.span.merge(body.span);
+        Some(span.track(ExprKind::Let {
+            name,
+            ty,
+            value: Box::new(value),
             body: Box::new(body),
         }))
     }

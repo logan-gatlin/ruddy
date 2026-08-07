@@ -14,8 +14,8 @@ use ruddy::{
 };
 
 use crate::print::{
-    Grouped, Prec, write_applied, write_apply, write_arrow, write_project, write_row, write_struct,
-    write_sum, write_tag,
+    Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project, write_row,
+    write_struct, write_sum, write_tag,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -37,8 +37,9 @@ impl Grouped for Ast<'_, ExprKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             // The body runs as far right as it can, so anything appended after
-            // a bare lambda would be read as part of it.
-            ExprKind::Function { .. } => Prec::Lambda,
+            // a bare lambda would be read as part of it. A nested `let`'s body
+            // runs the same way, so it groups the same way.
+            ExprKind::Function { .. } | ExprKind::Let { .. } => Prec::Lambda,
             // A tag carrying something groups as the application it reads as:
             // anything appended to `` `A x `` would be read as applying the
             // case rather than as a second argument to it. Carrying nothing it
@@ -90,6 +91,18 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write_apply(f, &Ast(&func.tracked), &Ast(&arg.tracked))
             }
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
+            ExprKind::Let {
+                name,
+                ty,
+                value,
+                body,
+            } => write_let(
+                f,
+                &name.tracked,
+                ty.as_ref().map(|ty| Ast(&ty.tracked)),
+                &Ast(&value.tracked),
+                &Ast(&body.tracked),
+            ),
             ExprKind::Struct(fields) => write_struct(f, pairs(fields)),
             ExprKind::Project { base, field } => {
                 write_project(f, &Ast(&base.tracked), &field.tracked)

@@ -172,6 +172,33 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             .child(bound)
             .child(term_node(ids, cx, mint, body, trace))
         }
+        // The declaration's row again, about the expression. The name is a
+        // local symbol like a lambda's argument, so it cross-highlights with
+        // every use of it in the value and the body — and with the AST tab's
+        // own row for the same binding.
+        TermKind::Let {
+            name,
+            annotation,
+            value,
+            body,
+        } => {
+            let mut node = Node {
+                label: format!("Let {}", mint.name(name.tracked)),
+                ..node
+            }
+            .child(with_symbol(
+                Node::new(ids.next(), "Name", mint.name(name.tracked)).at(name.span),
+                cx,
+                name.tracked,
+            ));
+            if let Some(annotation) = annotation {
+                let mut ascribed = type_node(ids, cx, mint, annotation);
+                ascribed.label = format!("Ascribed {}", ascribed.label);
+                node = node.child(ascribed);
+            }
+            node.child(term_node(ids, cx, mint, value, trace))
+                .child(term_node(ids, cx, mint, body, trace))
+        }
         // The case names no symbol either, for the reason the field below
         // does not: it is a label scoped to whichever sum it turns out to be a
         // case of. A tag carrying nothing is a leaf.
