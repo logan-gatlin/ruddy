@@ -61,6 +61,10 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     }
     for kind in [
         IrError::DuplicateField,
+        IrError::AbsentInClosed {
+            shape: Shape::Struct,
+            label: "x".to_string(),
+        },
         IrError::OpenDeclaredType {
             shape: Shape::Struct,
         },
@@ -641,6 +645,59 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
     assert_eq!(open.code(), fields.code());
 }
 
+/// One wording for both shapes of an absence with no `..` to speak about,
+/// quoting the label the way it was written: a field bare, a case wearing the
+/// backtick that makes it one.
+#[test]
+fn an_absence_in_a_closed_type_quotes_the_label_as_written() {
+    let field = IrError::AbsentInClosed {
+        shape: Shape::Struct,
+        label: "y".to_string(),
+    };
+    assert_eq!(field.code(), "absent-in-closed");
+    assert_eq!(
+        field.to_string(),
+        "a type with no `..` already says `y` is not there"
+    );
+
+    let case = IrError::AbsentInClosed {
+        shape: Shape::Sum,
+        label: "B".to_string(),
+    };
+    assert_eq!(case.code(), field.code());
+    assert_eq!(
+        case.to_string(),
+        "a type with no `..` already says ``B` is not there"
+    );
+}
+
+/// The printer keeps dropping absent labels: a type ascribed with `\y` still
+/// prints without it, so no existing printed output changes, and what a
+/// scheme shows is what a value can have rather than what it cannot.
+#[test]
+fn a_written_absence_is_not_printed() {
+    let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
+                  let s : `Ok Nat | \\`Err | .. = `Ok 1\n";
+    let lexed = token::lex(source, FileID::GENERATED);
+    assert!(lexed.errors.is_empty(), "{:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let bundle = Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "{:#?}", built.errors);
+    let inferred = inference::infer(&mint, &mut built.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+
+    let printed: Vec<String> = built
+        .program
+        .terms
+        .keys()
+        .map(|symbol| inferred.schemes[symbol].to_string())
+        .collect();
+    assert_eq!(printed, ["{ x: Nat, ..'a } -> Nat", "`Ok Nat | ..'a"]);
+}
+
 /// A parameter read more than one way names the two readings it was found to
 /// have, so the reader is told what to choose between rather than that there
 /// was a choice.
@@ -966,10 +1023,14 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // a projection, neither of which a type can be.
     // And a nested `let`, which writes its name, its ascription and its two
     // halves in pieces the way a path does.
+    // An explicitly absent label in each shape, so a refusal inside the `\`
+    // the printers write for one comes back too.
     let source = "type Pair a b = { first: a, second: b }\n\
                   let f = fn g => fn p => g p.first\n\
                   let h = let n : Nat = 1 in n\n\
-                  let v : { first: Nat, second: Nat } = { first: 1, second: 2 }";
+                  let v : { first: Nat, second: Nat } = { first: 1, second: 2 }\n\
+                  type Gap r = { first: Nat, \\hole, ..r }\n\
+                  let w : `Ok Nat | \\`Err | .. = `Ok 1";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut program_mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid"));
@@ -979,6 +1040,19 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     every_failure_is_reported(
         "a lowered program",
         &print::ir::program(&built.program, &program_mint),
+    );
+
+    // And the parse tree's printers, which render an absence as written from
+    // the surface tree rather than the lowered one — through every form a
+    // written row can take, so a refusal at any of its writes comes back
+    // whichever form is being written.
+    let source = "let x : { first: Nat, opt?: Nat, \\hole, .. } \
+                  -> (|) -> (| ..r) -> (`Ok Nat | `Err? | \\`B | ..) -> (`A | `B) = 1";
+    let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    every_failure_is_reported(
+        "a parsed statement",
+        &print::ast::stmt(&parsed.stmts[0].tracked),
     );
 }
 

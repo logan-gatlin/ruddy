@@ -1,7 +1,7 @@
 //! Tests for [`ruddy::parse`].
 
 use ruddy::{
-    parse::{StmtKind, parse},
+    parse::{StmtKind, SumCase, Type, TypeField, TypeKind, parse},
     token::lex,
     tracking::FileID,
 };
@@ -85,6 +85,61 @@ fn optional_struct_type_fields() {
         parse_one("let x : { a?: A, b: B, ..r } = y"),
         "let x : { a?: A, b: B, ..r } = y"
     );
+}
+
+/// `\name` is accepted wherever a field may be written — first, middle, last,
+/// beside ordinary and `?` fields, before either kind of tail — and prints
+/// back as written. The parser judges nothing: a closed struct with a `\` in
+/// it parses too, and refusing it is lowering's rule.
+#[test]
+fn a_struct_field_may_be_written_absent() {
+    for src in [
+        "let x : { a: A, \\y, .. } = z",
+        "let x : { a: A, \\y, ..r } = z",
+        "let x : { \\y } = z",
+        "let x : { \\y, a: A, .. } = z",
+        "let x : { a: A, \\y, b?: B, .. } = z",
+        "let x : { a: A, b?: B, \\y, ..r } = z",
+        // Two absences of one name are both recorded, the way two fields of
+        // one name are: rejecting a repeat is the IR's job.
+        "let x : { \\y, \\y, .. } = z",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// The absent entry claims the whole `\name` as its span, so a diagnostic
+/// about it underlines the mark along with the name it marks.
+#[test]
+fn an_absent_label_spans_its_mark() {
+    let ascribed = |src: &str| -> Type {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(out.errors.is_empty(), "{src:?}: {:#?}", out.errors);
+        match &out.stmts[0].tracked {
+            StmtKind::Let { ty: Some(ty), .. } => ty.clone(),
+            other => panic!("expected an ascribed let, got {other:?}"),
+        }
+    };
+
+    let src = "let x : { a: A, \\y, .. } = z";
+    let TypeKind::Struct { fields, .. } = ascribed(src).tracked else {
+        panic!("expected a struct type");
+    };
+    let (name, field) = fields.get_index(1).expect("the absent field");
+    assert!(matches!(field, TypeField::Absent));
+    assert_eq!(name.tracked, "y");
+    assert_eq!(name.span.start, src.find("\\y").expect("the mark"));
+    assert_eq!(name.span.width, 2);
+
+    let src = "let x : `Ok Nat | \\`Err | ..r = z";
+    let TypeKind::Sum { cases, .. } = ascribed(src).tracked else {
+        panic!("expected a sum type");
+    };
+    let (name, case) = cases.get_index(1).expect("the absent case");
+    assert!(matches!(case, SumCase::Absent));
+    assert_eq!(name.tracked, "Err");
+    assert_eq!(name.span.start, src.find("\\`Err").expect("the mark"));
+    assert_eq!(name.span.width, 5);
 }
 
 #[test]
@@ -523,6 +578,56 @@ fn a_sum_may_be_left_open() {
         parse_one("type Tagged r = `Err Nat | ..r"),
         "type Tagged r = `Err Nat | ..r"
     );
+}
+
+/// `` \`Tag `` is accepted wherever a case may be written, and a leading `\`
+/// begins a sum the way a leading tag or `|` does — with or without the
+/// leading bar. The case keeps its backtick, so it is spelled the same way
+/// present or absent, and a closed sum with one parses here: refusing it is
+/// lowering's rule.
+#[test]
+fn a_sum_case_may_be_written_absent() {
+    for src in [
+        "let x : `Ok Nat | \\`Err | ..r = y",
+        "let x : \\`B | .. = y",
+        "let x : `A | \\`B = y",
+        "let x : \\`A | `B Nat | \\`C | .. = y",
+        "type NoErr r = `Ok Nat | \\`Err | ..r",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+    // The leading `|` is accepted and dropped, exactly as it is before a tag.
+    assert_eq!(
+        parse_one("let x : | \\`B | .. = y"),
+        "let x : \\`B | .. = y"
+    );
+}
+
+/// An absent label is bare: `\y` takes no `:` type and no `?`, `` \`B `` no
+/// payload and no `?`, a `\` needs a name after it, and a `\` begins no
+/// expression at all. Each is the ordinary unexpected-token report, at the
+/// token that has no place — and the statement is dropped, as for any other
+/// malformed one.
+#[test]
+fn an_absent_label_is_bare() {
+    // The tail of each source is where the complaint lands.
+    for (src, from) in [
+        ("let x : { \\y: Nat, .. } = 1", ": Nat, .. } = 1"),
+        ("let x : { \\y?, .. } = 1", "?, .. } = 1"),
+        ("let x : \\`B? | .. = 1", "? | .. = 1"),
+        ("let x : `A | \\`B Nat | .. = 1", "Nat | .. = 1"),
+        ("let x : { \\, .. } = 1", ", .. } = 1"),
+        // In a type, what follows a `\` must be a tag or a field name.
+        ("let x : \\= 1", "= 1"),
+        // In an expression, the `\` itself begins nothing.
+        ("let x = \\y", "\\y"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        let at = src.len() - from.len();
+        assert_eq!(out.errors[0].span.start, at, "{src:?}: {:#?}", out.errors);
+        assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
+    }
 }
 
 /// A case carries one atom, the same as a tag in a term does, so anything with

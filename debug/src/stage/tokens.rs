@@ -58,6 +58,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Dot => "Dot",
         Kind::DotDot => "DotDot",
         Kind::Question => "Question",
+        Kind::Backslash => "Backslash",
         Kind::Pipe => "Pipe",
         Kind::Tag(_) => "Tag",
         Kind::LeftBrace => "LeftBrace",
@@ -89,6 +90,7 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::Dot
         | Kind::DotDot
         | Kind::Question
+        | Kind::Backslash
         | Kind::Pipe
         | Kind::LeftBrace
         | Kind::RightBrace

@@ -160,6 +160,20 @@ struct Labels<'a> {
     row: &'a Row,
 }
 
+/// One label of a written row, as [`write_row`] and [`write_sum`] render it:
+/// written out with what it holds, or explicitly absent — the `\name`
+/// spelling, which writes no type, no payload and no `?`.
+///
+/// `V` is what follows a written label: a field's type for [`write_row`], and
+/// a case's optional payload for [`write_sum`]. An absent label follows with
+/// nothing whichever shape it is in, which is why the variant carries only the
+/// name.
+#[derive(Debug)]
+pub enum Entry<K, V> {
+    Written { name: K, optional: bool, holds: V },
+    Absent { name: K },
+}
+
 impl token::ErrorKind {
     /// A stable, greppable name for this kind of error. Reporters key on it
     /// rather than on the message, which is prose and may be reworded.
@@ -204,6 +218,7 @@ impl fmt::Display for Kind {
             Kind::Dot => f.write_str("."),
             Kind::DotDot => f.write_str(".."),
             Kind::Question => f.write_str("?"),
+            Kind::Backslash => f.write_str("\\"),
             Kind::Pipe => f.write_str("|"),
             // The backtick is written back on: it is how the token was
             // spelled, and a `Tag` printing as a bare name would re-lex as an
@@ -250,6 +265,10 @@ impl ir::ErrorKind {
                 Namespace::Terms | Namespace::Modules => "duplicate-term",
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
+            // The shape is not part of the code, for the reason a repeated row
+            // field's is not: the wording quotes the label the way it was
+            // written, and that already says which kind of row it sits in.
+            ir::ErrorKind::AbsentInClosed { .. } => "absent-in-closed",
             ir::ErrorKind::Circular { namespace } => match namespace {
                 Namespace::Types => "circular-type",
                 Namespace::Terms | Namespace::Modules => "circular-term",
@@ -286,6 +305,16 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
             ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),
             ir::ErrorKind::DuplicateCase => f.write_str("duplicate case"),
+            // Said as what the type already does rather than as the mark that
+            // repeats it: a `\` rules a label out of the `..` beside it, and a
+            // type with no `..` has already ruled out everything it does not
+            // name. The label is quoted the way it was written — backtick and
+            // all for a case — like every label a complaint quotes.
+            ir::ErrorKind::AbsentInClosed { shape, label } => write!(
+                f,
+                "a type with no `..` already says `{}` is not there",
+                self::label(*shape, label),
+            ),
             // Not "recursive": a definition is welcome to lead back to itself,
             // and what is wrong here is that there is nothing in the way when
             // it does. Said as what the reader can change — give it a shape —
@@ -734,8 +763,16 @@ fn write_fields(
         .iter()
         .filter_map(|(name, field)| match &field.presence {
             Presence::Absent => None,
-            Presence::Present => Some((name, false, &field.ty)),
-            _ => Some((name, true, &field.ty)),
+            Presence::Present => Some(Entry::Written {
+                name,
+                optional: false,
+                holds: &field.ty,
+            }),
+            _ => Some(Entry::Written {
+                name,
+                optional: true,
+                holds: &field.ty,
+            }),
         });
     write_row(f, entries, tail)
 }
@@ -753,8 +790,16 @@ fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
         .iter()
         .filter_map(|(name, field)| match &field.presence {
             Presence::Absent => None,
-            Presence::Present => Some((name, false, payload(&field.ty))),
-            _ => Some((name, true, payload(&field.ty))),
+            Presence::Present => Some(Entry::Written {
+                name,
+                optional: false,
+                holds: payload(&field.ty),
+            }),
+            _ => Some(Entry::Written {
+                name,
+                optional: true,
+                holds: payload(&field.ty),
+            }),
         });
     write_sum(f, cases, tail_of(Shape::Sum, &row.rest).as_ref().map(shown))
 }
@@ -1196,19 +1241,24 @@ pub fn write_struct<K: fmt::Display, V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
     fields: impl IntoIterator<Item = (K, V)>,
 ) -> fmt::Result {
-    let fields = fields.into_iter().map(|(name, value)| (name, false, value));
+    let fields = fields.into_iter().map(|(name, value)| Entry::Written {
+        name,
+        optional: false,
+        holds: value,
+    });
     write_row(f, fields, None)
 }
 
-/// Render a `{ name: value, name?: value, ..tail }` row: fields, each possibly
-/// marked optional, and then whatever is known about the fields not named.
+/// Render a `{ name: value, name?: value, \name, ..tail }` row: fields, each
+/// possibly marked optional — or written `\name`, explicitly absent, with no
+/// value at all — and then whatever is known about the fields not named.
 ///
 /// `tail` is what follows the `..` — a row variable's spelling, or nothing —
 /// and `None` means the row is closed and no `..` is written at all. The `..`
 /// itself is written here, so the callers agree on it by construction.
 pub fn write_row<K: fmt::Display, V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
-    fields: impl IntoIterator<Item = (K, bool, V)>,
+    fields: impl IntoIterator<Item = Entry<K, V>>,
     tail: Option<&dyn fmt::Display>,
 ) -> fmt::Result {
     let mut fields = fields.into_iter().peekable();
@@ -1220,13 +1270,22 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
 
     f.write_str("{ ")?;
     let mut first = true;
-    for (name, optional, value) in fields {
+    for field in fields {
         if !first {
             f.write_str(", ")?;
         }
         first = false;
-        let mark = if optional { "?" } else { "" };
-        write!(f, "{name}{mark}: {value}")?;
+        match field {
+            Entry::Written {
+                name,
+                optional,
+                holds,
+            } => {
+                let mark = if optional { "?" } else { "" };
+                write!(f, "{name}{mark}: {holds}")?;
+            }
+            Entry::Absent { name } => write!(f, "\\{name}")?,
+        }
     }
     if let Some(tail) = tail {
         if !first {
@@ -1237,9 +1296,10 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
     f.write_str(" }")
 }
 
-/// Render a `` `A Nat | `B? | ..tail `` sum: cases, each wearing a backtick and
-/// possibly a `?`, each with a payload or without one, and then whatever is
-/// known about the cases not named.
+/// Render a `` `A Nat | `B? | \`C | ..tail `` sum: cases, each wearing a
+/// backtick and possibly a `?` — or a leading `\`, explicitly absent, with no
+/// payload — each with a payload or without one, and then whatever is known
+/// about the cases not named.
 ///
 /// The counterpart of [`write_row`], and the same contract: `tail` is what
 /// follows the `..`, `None` means the sum names every case there is, and the
@@ -1252,16 +1312,23 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
 /// a bare `..r` begins no type the parser would read back.
 pub fn write_sum<K: fmt::Display, V: Grouped>(
     f: &mut fmt::Formatter<'_>,
-    cases: impl IntoIterator<Item = (K, bool, Option<V>)>,
+    cases: impl IntoIterator<Item = Entry<K, Option<V>>>,
     tail: Option<&dyn fmt::Display>,
 ) -> fmt::Result {
     let mut first = true;
-    for (name, optional, payload) in cases {
+    for case in cases {
         if !first {
             f.write_str(" | ")?;
         }
         first = false;
-        write_tag(f, &name.to_string(), optional, payload)?;
+        match case {
+            Entry::Written {
+                name,
+                optional,
+                holds,
+            } => write_tag(f, &name.to_string(), optional, holds)?,
+            Entry::Absent { name } => write!(f, "\\`{name}")?,
+        }
     }
     // The empty sum, and the sum that is nothing but its tail: neither writes a
     // case, so neither would be read back as a sum without this.

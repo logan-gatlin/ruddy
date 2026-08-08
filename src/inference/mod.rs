@@ -1971,13 +1971,24 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             lower(mint, table, tails, to),
         ),
         // A written struct is unit carrying the fields that were written: the
-        // fields are what the type says, and there is nothing else to it.
+        // fields are what the type says, and there is nothing else to it. A
+        // field written `\name` is [`Presence::Absent`] in the position it was
+        // written, its type deliberately unconstrained — a field that is not
+        // there has nothing to have a type.
         TypeKind::Struct { fields, tail } => {
             let mut labels = IndexMap::new();
             for (name, field) in fields {
-                let lowered = RowField {
-                    presence: presence(table, field.optional),
-                    ty: lower(mint, table, tails, &field.value),
+                let lowered = match field {
+                    ir::TypeField::Written {
+                        optional, value, ..
+                    } => RowField {
+                        presence: presence(table, *optional),
+                        ty: lower(mint, table, tails, value),
+                    },
+                    ir::TypeField::Absent { .. } => RowField {
+                        presence: Presence::Absent,
+                        ty: Rc::new(Ty::default()),
+                    },
                 };
                 labels.insert(name.clone(), lowered);
             }
@@ -1995,13 +2006,25 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
         TypeKind::Sum { cases, tail } => {
             let mut labels = IndexMap::new();
             for (name, case) in cases {
-                let carried = match &case.payload {
-                    Some(payload) => lower(mint, table, tails, payload),
-                    None => Rc::new(Ty::unit()),
-                };
-                let lowered = RowField {
-                    presence: presence(table, case.optional),
-                    ty: carried,
+                let lowered = match case {
+                    ir::SumCase::Written {
+                        optional, payload, ..
+                    } => {
+                        let carried = match payload {
+                            Some(payload) => lower(mint, table, tails, payload),
+                            None => Rc::new(Ty::unit()),
+                        };
+                        RowField {
+                            presence: presence(table, *optional),
+                            ty: carried,
+                        }
+                    }
+                    // The struct's absent field again: a case a value can
+                    // never be carries nothing worth constraining.
+                    ir::SumCase::Absent { .. } => RowField {
+                        presence: Presence::Absent,
+                        ty: Rc::new(Ty::default()),
+                    },
                 };
                 labels.insert(name.clone(), lowered);
             }

@@ -9,7 +9,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Core, Presence, Rest, Ty, TyVar},
+    types::{Core, Presence, Rest, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -3947,4 +3947,110 @@ fn a_local_leaves_every_sort_of_outer_variable_alone() {
             .collect();
         assert_eq!(locals, [("q", printed.to_string())], "{src}");
     }
+}
+
+/// The row entry an explicitly absent label lowers to: `Presence::Absent`,
+/// with its type deliberately unconstrained — a field that is not there has
+/// nothing to have a type.
+#[test]
+fn a_written_absence_lowers_to_an_absent_presence() {
+    let (mint, _, output) = inferred("let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x");
+    let symbol = symbol_named(&mint, output.schemes.keys().copied(), "f");
+    let body = output.schemes[&symbol].body().clone();
+    let Core::Arrow(from, _) = &body.core else {
+        panic!("expected an arrow, got {body:?}");
+    };
+    let field = &from.fields["y"];
+    assert!(matches!(field.presence, Presence::Absent), "{field:?}");
+    assert!(matches!(field.ty.core, Core::Undecided), "{field:?}");
+
+    // The sum counterpart, through the row inside the core.
+    let (mint, _, output) = inferred("let s : `Ok Nat | \\`Err | .. = `Ok 1");
+    let symbol = symbol_named(&mint, output.schemes.keys().copied(), "s");
+    let body = output.schemes[&symbol].body().clone();
+    let Core::Sum(row) = &body.core else {
+        panic!("expected a sum, got {body:?}");
+    };
+    let case = &row.labels["Err"];
+    assert!(matches!(case.presence, Presence::Absent), "{case:?}");
+    assert!(matches!(case.ty.core, Core::Undecided), "{case:?}");
+}
+
+/// Ascribing an explicitly absent field behaves as absence: an application
+/// supplying the field is refused with the existing present-vs-absent
+/// complaint, and one supplying anything else is welcome.
+#[test]
+fn an_ascribed_absence_refuses_the_field_and_nothing_else() {
+    let (mint, _, output) =
+        inferred("let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\nlet good = f { x: 1, z: 2 }");
+    assert_eq!(scheme(&mint, &output, "good"), "Nat");
+
+    let (_, out, output) =
+        infer_src("let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\nlet bad = f { x: 1, y: 2 }");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
+    assert!(
+        matches!(
+            &output.errors[0].kind,
+            ErrorKind::ExtraField {
+                shape: Shape::Struct,
+                field,
+                ..
+            } if field == "y"
+        ),
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// The sum counterpart: a value of the case a declaration writes absent is
+/// refused, and any other case the row parameter allows is welcome.
+#[test]
+fn an_ascribed_absence_refuses_the_case_and_nothing_else() {
+    let (mint, _, output) =
+        inferred("type NoErr r = `Ok Nat | \\`Err | ..r\nlet ok : NoErr (`Warn Nat) = `Ok 1");
+    assert_eq!(scheme(&mint, &output, "ok"), "NoErr (`Warn Nat)");
+
+    let (_, out, output) =
+        infer_src("type NoErr r = `Ok Nat | \\`Err | ..r\nlet bad : NoErr (`Warn Nat) = `Err 1");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert!(!output.errors.is_empty(), "the absent case was allowed");
+    assert!(
+        matches!(
+            &output.errors[0].kind,
+            ErrorKind::ExtraField {
+                shape: Shape::Sum,
+                field,
+                ..
+            } if field == "Err"
+        ),
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// The shared-rest example: both `..r` are one rest, and it lacks `y`. The
+/// definition types — the absence costs it nothing — and the condition
+/// survives instantiation, so a use that would put a `y` into the rest is
+/// refused.
+#[test]
+fn a_shared_rest_lacks_the_absent_label() {
+    let (mint, _, output) = inferred("let g : { \\y, ..r } -> { ..r } = fn a => a");
+    // The from side keeps the absent `y` in its label map, so it prints in
+    // braces with the absence dropped; the result is the bare rest, which has
+    // always printed as its core alone.
+    assert_eq!(scheme(&mint, &output, "g"), "{ ..'a } -> 'a");
+
+    let (_, out, output) =
+        infer_src("let g : { \\y, ..r } -> { ..r } = fn a => a\nlet bad = fn s => (g s).y");
+    assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
+    assert!(!output.errors.is_empty(), "the projection was allowed");
+    assert!(
+        matches!(
+            &output.errors[0].kind,
+            ErrorKind::RepeatedField { field, .. } if field == "y"
+        ),
+        "{:#?}",
+        output.errors
+    );
 }

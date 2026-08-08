@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{ErrorKind, Field, Output, Term, TermKind, TypeField, TypeKind, build},
+    ir::{ErrorKind, Field, Output, SumCase, Term, TermKind, TypeField, TypeKind, build},
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
@@ -678,10 +678,13 @@ fn duplicate_type_fields_are_rejected() {
     let fields = type_fields(&mint, &out, "T");
     assert_eq!(fields.len(), 1);
     assert_eq!(
-        fields["a"].name_span.start,
+        fields["a"].name_span().start,
         src.find("a: A").expect("the first")
     );
-    assert!(matches!(fields["a"].value.tracked, TypeKind::Ident(s) if mint.name(s) == "A"));
+    assert!(matches!(
+        fields["a"].value().map(|value| &value.tracked),
+        Some(&TypeKind::Ident(s)) if mint.name(s) == "A"
+    ));
 
     // Annotations go the same way, and the `?` only they may carry rides
     // through the re-keying with the field it was written on.
@@ -705,7 +708,10 @@ fn duplicate_type_fields_are_rejected() {
         panic!("expected a struct parameter");
     };
     assert_eq!(fields.len(), 1);
-    assert!(fields["a"].optional);
+    assert!(matches!(
+        fields["a"],
+        TypeField::Written { optional: true, .. }
+    ));
 }
 
 #[test]
@@ -783,9 +789,9 @@ fn a_declaration_binds_its_parameters() {
     };
     let indices: Vec<u32> = fields
         .values()
-        .map(|field| match field.value.tracked {
-            TypeKind::Param { index, .. } => index,
-            ref other => panic!("expected a parameter: {other:#?}"),
+        .map(|field| match field.value().map(|value| &value.tracked) {
+            Some(&TypeKind::Param { index, .. }) => index,
+            other => panic!("expected a parameter: {other:#?}"),
         })
         .collect();
     assert_eq!(indices, vec![0, 1]);
@@ -827,8 +833,8 @@ fn a_parameter_shadows_a_declared_type() {
         panic!("expected a struct: {:#?}", boxed.value);
     };
     assert!(matches!(
-        fields["it"].value.tracked,
-        TypeKind::Param { index: 0, .. }
+        fields["it"].value().map(|value| &value.tracked),
+        Some(TypeKind::Param { index: 0, .. })
     ));
 }
 
@@ -1536,9 +1542,12 @@ fn a_parameter_shadows_a_primitive() {
         panic!("expected a struct: {:#?}", boxed.value);
     };
     assert!(
-        matches!(fields["it"].value.tracked, TypeKind::Param { index: 0, .. }),
+        matches!(
+            fields["it"].value().map(|value| &value.tracked),
+            Some(TypeKind::Param { index: 0, .. })
+        ),
         "inside the body the parameter wins: {:#?}",
-        fields["it"].value
+        fields["it"]
     );
 
     let annotation = out
@@ -1566,18 +1575,31 @@ fn a_parameter_shadows_a_primitive() {
 /// it means unit, but the unit is inference's to supply, not the tree's.
 #[test]
 fn lowers_a_sum_type() {
-    let (mint, out) = built("type Option T = `Some T | `None");
+    let src = "type Option T = `Some T | `None";
+    let (mint, out) = built(src);
     let decl = &out.program.types[&type_symbol(&mint, &out, "Option")];
     let TypeKind::Sum { cases, tail } = &decl.value.tracked else {
         panic!("expected a sum, got {:#?}", decl.value.tracked);
     };
     assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Some", "None"]);
+    // The case's own span is the name it was written at, backtick included.
+    assert_eq!(
+        cases["Some"].name_span().start,
+        src.find("`Some").expect("the case")
+    );
+    assert_eq!(cases["Some"].name_span().width, 5);
     assert!(matches!(
-        cases["Some"].payload.as_ref().map(|ty| &ty.tracked),
+        cases["Some"].payload().map(|ty| &ty.tracked),
         Some(TypeKind::Param { index: 0, .. })
     ));
-    assert!(cases["None"].payload.is_none());
-    assert!(!cases["Some"].optional);
+    assert!(cases["None"].payload().is_none());
+    assert!(matches!(
+        cases["Some"],
+        SumCase::Written {
+            optional: false,
+            ..
+        }
+    ));
     // A declaration lists every case there is, so there is no tail.
     assert!(tail.is_none());
 }
@@ -2387,4 +2409,234 @@ fn displays_nested_lets() {
         display_program("let f = fn x => x  let a = f (let x = 1 in x)"),
         "let f = fn x => x\nlet a = f (let x = 1 in x)"
     );
+}
+
+/// An explicitly absent label lowers to an absent entry, in the written
+/// position among the other labels, spanning the whole `\name`.
+#[test]
+fn lowers_absent_labels_in_written_position() {
+    let src = "let f : { x: Nat, \\y, z: Nat, .. } -> Nat = fn a => a.x";
+    let (mint, out) = built(src);
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+        .annotation
+        .clone()
+        .expect("the annotation");
+    let TypeKind::Arrow { from, .. } = annotation.tracked else {
+        panic!("expected an arrow, got {:?}", annotation.tracked);
+    };
+    let TypeKind::Struct { fields, .. } = from.tracked else {
+        panic!("expected a struct parameter");
+    };
+    assert_eq!(fields.keys().collect::<Vec<_>>(), vec!["x", "y", "z"]);
+    assert!(matches!(fields["y"], TypeField::Absent { .. }));
+    assert_eq!(
+        fields["y"].name_span().start,
+        src.find("\\y").expect("the mark")
+    );
+    assert_eq!(fields["y"].name_span().width, 2);
+
+    // The sum counterpart: the case keeps its backtick, and the span keeps
+    // the `\` in front of it.
+    let src = "let x : `Ok Nat | \\`Err | .. = `Ok 1";
+    let (mint, out) = built(src);
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "x")]
+        .annotation
+        .clone()
+        .expect("the annotation");
+    let TypeKind::Sum { cases, .. } = annotation.tracked else {
+        panic!("expected a sum, got {:?}", annotation.tracked);
+    };
+    assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Ok", "Err"]);
+    assert!(matches!(cases["Err"], SumCase::Absent { .. }));
+    assert_eq!(
+        cases["Err"].name_span().start,
+        src.find("\\`Err").expect("the mark")
+    );
+    assert_eq!(cases["Err"].name_span().width, 5);
+}
+
+/// An explicitly absent label in a closed composite is refused: the `\` says
+/// the `..` beside it may not stand for the label, and a type with no `..`
+/// already says that. Reported at the `\name`, and the composite absorbs.
+#[test]
+fn an_absent_label_needs_a_tail() {
+    let src = "let x : { a: Nat, \\y } = 1";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::AbsentInClosed {
+            shape: Shape::Struct,
+            label,
+        } if label == "y"
+    ));
+    assert_eq!(out.errors[0].span.start, src.find("\\y").expect("the mark"));
+    assert_eq!(out.errors[0].span.width, 2);
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "x")]
+        .annotation
+        .clone()
+        .expect("the annotation");
+    assert!(
+        matches!(annotation.tracked, TypeKind::Error),
+        "the struct absorbs: {annotation:#?}"
+    );
+
+    let src = "let x : `A | \\`B = 1";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::AbsentInClosed {
+            shape: Shape::Sum,
+            label,
+        } if label == "B"
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("\\`B").expect("the mark")
+    );
+    assert_eq!(out.errors[0].span.width, 3);
+
+    // Every absence in the row is its own report, the way every `?` in an
+    // open declared type is: each is a mark the reader can act on.
+    let (_, out) = build_src("let x : { \\y, \\z } = 1");
+    assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
+
+    // A declaration's tail must name a parameter (the existing rule), so a
+    // `\` beside an unbound `..r` is that one complaint, unchanged — the
+    // absence itself is fine wherever the tail is.
+    let (_, out) = build_src("type T = { \\y, ..r }");
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::OpenDeclaredType {
+            shape: Shape::Struct
+        }
+    ));
+
+    // And a closed declaration gets the same complaint an annotation does.
+    let (_, out) = build_src("type T = { \\y }");
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::AbsentInClosed { .. }
+    ));
+}
+
+/// One composite naming a label both ways is a duplicate, reported where the
+/// second mention is written — and so are two absences of one name. The first
+/// occurrence is the one that survives.
+#[test]
+fn a_label_named_present_and_absent_is_a_duplicate() {
+    for (src, second) in [
+        ("let x : { x: Nat, \\x, .. } = 1", "\\x"),
+        ("let x : { \\x, x: Nat, .. } = 1", "x: Nat"),
+        ("let x : { \\x, \\x, .. } = 1", "\\x"),
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        assert!(
+            matches!(out.errors[0].kind, ErrorKind::DuplicateField),
+            "{src}: {:#?}",
+            out.errors
+        );
+        assert_eq!(
+            out.errors[0].span.start,
+            src.rfind(second).expect("the second mention"),
+            "{src}"
+        );
+    }
+
+    let src = "let x : `A | \\`A | .. = 1";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("\\`A").expect("the second mention")
+    );
+}
+
+/// An absent label joins its row parameter's lacks set exactly as a written
+/// field does: `\y` says the tail has no `y`, which is the same sentence a
+/// field named `y` makes it say.
+#[test]
+fn an_absent_label_joins_a_parameters_lacks() {
+    let (_, out) = built("type T r = { x: Nat, \\y, ..r }");
+    let decl = out.program.types.values().next().expect("the declaration");
+    assert_eq!(decl.params.len(), 1);
+    assert_eq!(decl.params[0].kind, row(&["x", "y"]));
+
+    let (_, out) = built("type NoErr r = `Ok Nat | \\`Err | ..r");
+    let decl = out.program.types.values().next().expect("the declaration");
+    assert_eq!(decl.params[0].kind, cases(&["Ok", "Err"]));
+}
+
+/// An argument naming an explicitly absent label is refused at the argument,
+/// with the existing complaint for one naming a label the declaration already
+/// names.
+#[test]
+fn an_argument_may_not_name_an_absent_label() {
+    let src = "type T r = { x: Nat, \\y, ..r }\nlet v : T { y: Nat } = { x: 1, y: 2 }";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::RepeatedRowField {
+            shape: Shape::Struct,
+            field,
+        } if field == "y"
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("{ y: Nat }").expect("the argument")
+    );
+
+    let src = "type NoErr r = `Ok Nat | \\`Err | ..r\nlet x : NoErr (`Err Nat) = `Ok 1";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        &out.errors[0].kind,
+        ErrorKind::RepeatedRowField {
+            shape: Shape::Sum,
+            field,
+        } if field == "Err"
+    ));
+
+    // An argument that names none of them is welcome.
+    let (_, out) =
+        build_src("type NoErr r = `Ok Nat | \\`Err | ..r\nlet x : NoErr (`Warn Nat) = `Ok 1");
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+}
+
+/// The IR prints an absence as written, and the rendering re-lowers to the
+/// same program.
+#[test]
+fn displays_absent_labels_as_written() {
+    assert_eq!(
+        display_program("type T r = { x: Nat, \\y, ..r }"),
+        "type T r = { x: Nat, \\y, ..r }"
+    );
+    assert_eq!(
+        display_program("type NoErr r = `Ok Nat | \\`Err | ..r"),
+        "type NoErr r = `Ok Nat | \\`Err | ..r"
+    );
+    assert_eq!(
+        display_program("let f : { \\y, ..r } -> { ..r } = fn a => a"),
+        "let f : { \\y, ..r } -> { ..r } = fn a => a"
+    );
+}
+
+/// A recursive declaration may write an absence beside its recursion: the
+/// growth walk skips an absent label, there being no argument under it to
+/// grow — in either shape.
+#[test]
+fn a_recursive_declaration_may_write_an_absence() {
+    let (_, out) = built("type T r = { \\y, next: T r, ..r }");
+    let decl = out.program.types.values().next().expect("the declaration");
+    assert_eq!(decl.params[0].kind, row(&["y", "next"]));
+
+    let (_, out) = built("type S r = `A (S r) | \\`B | ..r");
+    let decl = out.program.types.values().next().expect("the declaration");
+    assert_eq!(decl.params[0].kind, cases(&["A", "B"]));
 }

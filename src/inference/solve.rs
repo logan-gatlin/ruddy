@@ -644,13 +644,13 @@ impl Solve<'_> {
             actual: rhs.ty.clone(),
         };
 
-        let only_want: IndexMap<String, RowField> = lhs
+        let mut only_want: IndexMap<String, RowField> = lhs
             .labels
             .iter()
             .filter(|(name, _)| !rhs.labels.contains_key(*name))
             .map(|(name, field)| (name.clone(), field.clone()))
             .collect();
-        let only_have: IndexMap<String, RowField> = rhs
+        let mut only_have: IndexMap<String, RowField> = rhs
             .labels
             .iter()
             .filter(|(name, _)| !lhs.labels.contains_key(*name))
@@ -663,20 +663,39 @@ impl Solve<'_> {
         // `assign` refuses the binding when only one side has extras, but the
         // both-sided case binds cleanly every round and never converges, so
         // the pair is refused here — the same cycle, caught one level up.
+        //
+        // A label certainly absent is the exception. `{ \y, ..r }` against
+        // `{ ..r }` differs in nothing a value could have: the absence says
+        // `r` may not stand for a `y`, which is the condition the row already
+        // put on `r` when it was written — so the label grows nothing and the
+        // two sides are one row. The condition is said of the tail once more
+        // here, since this path skips the absorption that would otherwise
+        // carry it, and the labels ask nothing further.
         if let (Some(a), Some(b)) = (lhs.tail.var(), rhs.tail.var())
             && a == b
             && !(only_want.is_empty() && only_have.is_empty())
         {
-            let error = Error {
-                span,
-                kind: ErrorKind::Recursive,
+            let absent = |field: &RowField| {
+                matches!(self.table.presence_of(&field.presence), Presence::Absent)
             };
-            let abandoned = [
-                lhs.tail.value(lhs.labels.clone()),
-                rhs.tail.value(rhs.labels.clone()),
-            ];
-            self.fail(span, Rule::Occurs, goal, error, &abandoned);
-            return;
+            if only_want.values().all(&absent) && only_have.values().all(&absent) {
+                let labels: Vec<String> =
+                    only_want.keys().chain(only_have.keys()).cloned().collect();
+                self.table.forbidden(a, lhs.shape(), labels);
+                only_want.clear();
+                only_have.clear();
+            } else {
+                let error = Error {
+                    span,
+                    kind: ErrorKind::Recursive,
+                };
+                let abandoned = [
+                    lhs.tail.value(lhs.labels.clone()),
+                    rhs.tail.value(rhs.labels.clone()),
+                ];
+                self.fail(span, Rule::Occurs, goal, error, &abandoned);
+                return;
+            }
         }
 
         match (only_want.is_empty(), only_have.is_empty()) {

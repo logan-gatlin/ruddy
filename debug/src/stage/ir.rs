@@ -6,7 +6,7 @@
 
 use ruddy::{
     inference,
-    ir::{Decl, Row, Tail, Term, TermKind, Type, TypeKind},
+    ir::{Decl, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind},
     symbol::{Mint, Symbol},
     types::Core,
 };
@@ -303,16 +303,27 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
         TypeKind::Sum { cases, tail } => {
             let mut kids: Vec<Node> = cases
                 .iter()
-                .map(|(name, case)| {
-                    let mark = if case.optional { "?" } else { "" };
-                    let text = case.payload.as_ref().map_or(String::new(), |ty| {
-                        print::ir::ty(&ty.tracked, mint).to_string()
-                    });
-                    let node =
-                        Node::new(ids.next(), format!("`{name}{mark}"), text).at(case.name_span);
-                    match &case.payload {
-                        Some(payload) => node.child(type_node(ids, cx, mint, payload)),
-                        None => node,
+                .map(|(name, case)| match case {
+                    SumCase::Written {
+                        name_span,
+                        optional,
+                        payload,
+                    } => {
+                        let mark = if *optional { "?" } else { "" };
+                        let text = payload.as_ref().map_or(String::new(), |ty| {
+                            print::ir::ty(&ty.tracked, mint).to_string()
+                        });
+                        let node =
+                            Node::new(ids.next(), format!("`{name}{mark}"), text).at(*name_span);
+                        match payload {
+                            Some(payload) => node.child(type_node(ids, cx, mint, payload)),
+                            None => node,
+                        }
+                    }
+                    // An absent case is a leaf wearing the `\`, spanning the
+                    // whole `` \`Name `` for cross-highlighting.
+                    SumCase::Absent { name_span } => {
+                        Node::new(ids.next(), format!("\\`{name}"), String::new()).at(*name_span)
                     }
                 })
                 .collect();
@@ -334,15 +345,26 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
         TypeKind::Struct { fields, tail } => {
             let mut kids: Vec<Node> = fields
                 .iter()
-                .map(|(name, field)| {
-                    let mark = if field.optional { "?" } else { "" };
-                    Node::new(
-                        ids.next(),
-                        format!("{name}{mark}:"),
-                        print::ir::ty(&field.value.tracked, mint).to_string(),
-                    )
-                    .at(field.name_span)
-                    .child(type_node(ids, cx, mint, &field.value))
+                .map(|(name, field)| match field {
+                    TypeField::Written {
+                        name_span,
+                        optional,
+                        value,
+                    } => {
+                        let mark = if *optional { "?" } else { "" };
+                        Node::new(
+                            ids.next(),
+                            format!("{name}{mark}:"),
+                            print::ir::ty(&value.tracked, mint).to_string(),
+                        )
+                        .at(*name_span)
+                        .child(type_node(ids, cx, mint, value))
+                    }
+                    // An absent field is a leaf: there is no type under it,
+                    // and the span covers the whole `\name`.
+                    TypeField::Absent { name_span } => {
+                        Node::new(ids.next(), format!("\\{name}"), String::new()).at(*name_span)
+                    }
                 })
                 .collect();
             // The tail is a row of its own: it stands for the labels not

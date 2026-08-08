@@ -337,8 +337,10 @@ pub struct RowField {
 #[derive(Debug, Clone, Default)]
 pub enum Presence {
     Present,
-    /// Arises only from solving — no literal and no written type puts one in a
-    /// label map — when an open row meets a closed one that lacks the label.
+    /// The label is definitely not there. Written as `\name` in a struct type
+    /// and `` \`Name `` in a sum — the one spelling of absence the surface
+    /// syntax has — and otherwise arising from solving, when an open row meets
+    /// a closed one that lacks the label.
     Absent,
     Var(TyVar),
     /// A presence a scheme quantified, which prints as the `?` on its label.

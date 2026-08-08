@@ -27,6 +27,11 @@ pub enum Kind {
     /// `?`, marking a struct type's field — or a sum type's case — as one that
     /// may or may not be there.
     Question,
+    /// `\`, marking a struct type's field — or a sum type's case — as one that
+    /// is definitely *not* there: the `..` beside it may not stand for the
+    /// label. A bare punctuation token, so `\ y` lexes the same as `\y` — the
+    /// same separation `..` keeps from the name after it.
+    Backslash,
     /// `|`, separating the cases of a sum type. Also the whole of the empty
     /// sum, which is the one type written with nothing but punctuation.
     Pipe,
@@ -130,6 +135,12 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             }
             '|' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+                chars.next();
+            }
+            // Never a lex error, unlike `-` and the backtick: what may follow a
+            // `\` is the parser's business.
+            '\\' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Backslash));
                 chars.next();
             }
             // A backtick begins nothing on its own, so — like `-` — the only
