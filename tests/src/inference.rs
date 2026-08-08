@@ -2601,6 +2601,62 @@ fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
     );
 }
 
+/// A field already known to be absent is nothing for a *lacking tail* to
+/// refuse either, for the reason the closed row above lets it pass: it is not
+/// part of what the type says. `q` here is `{}` — its optional `x` was settled
+/// away by `closed` — and `g` asks `q` to be exactly what `p` has beyond `x`,
+/// which `{}` satisfies. The lacks check rules on presence, not on the bare
+/// name: only a label certainly there is a copy the tail could repeat, so a
+/// row the solver holds equal to `{}` binds wherever `{}` would.
+#[test]
+fn a_field_settled_absent_is_no_repeat_for_a_tail_that_lacks_it() {
+    inferred(
+        "let opt : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let g : { x: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1\n\
+         let h = fn p q => { a: opt q, b: closed q, c: g p q }",
+    );
+
+    // The same row met the other way round — the lacking tail arriving on the
+    // actual side — reaches the same check at the same binding.
+    inferred(
+        "let opt : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let closed : {} -> Nat = fn p => 1\n\
+         let g : { ..r } -> { x: Nat, ..r } -> Nat = fn a => fn b => 1\n\
+         let h = fn p q => { a: opt q, b: closed q, c: g q p }",
+    );
+}
+
+/// The sum's spelling of the test above: a case settled absent is not one of
+/// the cases a value can be, so a tail forbidden the case can still take the
+/// row. `q` can only be `` `B `` — `only` settled its optional `` `A `` away —
+/// and `g` asks `q` to be exactly the cases `p` allows beyond `` `A ``.
+#[test]
+fn a_case_settled_absent_is_no_repeat_for_a_tail_that_lacks_it() {
+    inferred(
+        "let opt : (`A? Nat | ..) -> Nat = fn p => 1\n\
+         let only : (`B Nat) -> Nat = fn p => 1\n\
+         let g : (`A Nat | ..r) -> (| ..r) -> Nat = fn a => fn b => 1\n\
+         let h = fn p q => { a: opt q, b: only q, c: g p q }",
+    );
+}
+
+/// A field whose presence is still being decided, meeting a tail that lacks
+/// it, is the presence being decided: absent is the one answer both sides
+/// allow, and it is the answer the same field gets against a closed row —
+/// `closed r` settles an undecided `x?` away without a word. A tail that
+/// lacks `x` says no more about `x` than a closed row does, so meeting one
+/// settles the presence the same way rather than refusing a program that has
+/// a type.
+#[test]
+fn an_undecided_field_meeting_a_tail_that_lacks_it_settles_absent() {
+    inferred(
+        "let opt : { x?: Nat, .. } -> Nat = fn p => 1\n\
+         let g : { x: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1\n\
+         let h = fn p q => { a: opt q, b: g p q }",
+    );
+}
+
 /// Nothing is decided twice, in every sort: the value a failure leaves behind
 /// absorbs whatever a later goal puts it against, and abandons it. A presence
 /// and a sum's tail are the two sorts that were previously only ever abandoned

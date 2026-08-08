@@ -188,10 +188,14 @@ pub enum Rule {
     /// takes the type it is against" above an effect reading "this type would have
     /// to contain itself" is being told the opposite of what happened.
     Occurs,
-    /// A variable standing for the rest of a row, against a row naming a field
-    /// the first row already names. The lacks check fired, so — for the same
-    /// reason [`Rule::Occurs`] is not a [`Rule::Bind`] — the refusal is a rule
-    /// of its own rather than a binding that did not happen.
+    /// A variable standing for the rest of a row, against a row that certainly
+    /// has a field the first row already names. The lacks check fired, so —
+    /// for the same reason [`Rule::Occurs`] is not a [`Rule::Bind`] — the
+    /// refusal is a rule of its own rather than a binding that did not happen.
+    ///
+    /// Certainly has: a label the row names settled absent is no copy at all,
+    /// and one still being decided settles absent at the binding instead — so
+    /// neither is this rule, and both bind. See [`Solve::assign`].
     ///
     /// The shape rides along for the wording, as it does on [`Rule::Presence`]:
     /// the rule is one rule, and a reader watching two sums be decided should
@@ -380,11 +384,14 @@ pub enum ErrorKind {
     AnnotationTooOpen,
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..r }` says "an `x`, plus whatever else `r` is", so `r`
-    /// standing for anything with an `x` of its own would name the field
-    /// twice — and the two copies could disagree. Only the label and what kind
-    /// of row it was found in are carried: those are the two things both
-    /// halves of the contradiction have in common, and the rows themselves are
-    /// each half a type the reader never wrote down.
+    /// standing for anything that certainly has an `x` of its own would name
+    /// the field twice — and the two copies could disagree. Certainly has,
+    /// because presence is the whole of what a second copy is: an `x` settled
+    /// absent is not part of what its type says, and one still being decided
+    /// settles absent at the binding, so neither is refused. Only the label
+    /// and what kind of row it was found in are carried: those are the two
+    /// things both halves of the contradiction have in common, and the rows
+    /// themselves are each half a type the reader never wrote down.
     RepeatedField { shape: Shape, field: String },
 }
 
@@ -963,11 +970,15 @@ impl Table {
     ///
     /// A read and nothing else, and one an [`IndexMap`] settles: the outer
     /// row's own labels are inserted first, so a label its tail also names is
-    /// the label the row wrote out. A row that names one of its tail's labels
-    /// is not a type, and there is no way left to write one — lowering refuses
-    /// a declaration handed a row that repeats a label it already names, and
-    /// [`Solve::assign`]'s lacks check refuses every route that goes through a
-    /// variable — so what arrives here is a row and its tail agreeing.
+    /// the label the row wrote out. A row whose tail certainly has one of its
+    /// labels is not a type, and there is no way left to reach one — lowering
+    /// refuses a declaration handed a row that repeats a label it already
+    /// names, and [`Solve::assign`]'s lacks check refuses every route through
+    /// a variable that would bring the label in present, settling one still
+    /// undecided absent instead. So the one copy a tail can carry here is a
+    /// label settled absent — no case a value could be — and keeping the outer
+    /// label is the flattening agreeing with the type, never a choice between
+    /// two copies that could differ.
     fn canon(&self, row: &Row) -> Row {
         let mut labels: IndexMap<String, RowField> = IndexMap::new();
         let mut row = row.clone();
@@ -1476,34 +1487,39 @@ impl Table {
         }
     }
 
-    /// The first label `var` may not stand for that `value` names, if any, and
-    /// the kind of row the condition came from: the lacks check, which
-    /// [`Solve::assign`] runs before every binding the way it runs the occurs
-    /// check.
+    /// The labels `value` names that `var` may not stand for, each with what
+    /// its presence has resolved to, and the kind of row the condition came
+    /// from: what the lacks check reads, for [`Solve::assign`] to rule on.
     ///
-    /// First in the row's own order rather than in the order the condition was
-    /// recorded, so that the complaint names the label a reader would reach
+    /// Read here and ruled on there, because the ruling depends on presence
+    /// and one of its three answers is an act only the solver can perform. A
+    /// label certainly there is the contradiction the condition exists for; a
+    /// label settled absent is not part of what the type says, and no copy of
+    /// anything; and a label still being decided has just met the thing that
+    /// decides it, which is a binding the table cannot make on its own.
+    ///
+    /// In the row's own order rather than in the order the condition was
+    /// recorded, so that a complaint names the label a reader would reach
     /// first reading the type left to right. The shape comes off the recorded
     /// condition, since a core variable's labels are the fields of whatever it
     /// is being bound to and there is no row here to read a shape from.
-    fn repeated(&self, var: TyVar, value: &Assigned) -> Option<(Shape, String)> {
+    fn lacked(&self, var: TyVar, value: &Assigned) -> Option<(Shape, Vec<(String, Presence)>)> {
         let (shape, lacks) = self.lacks.get(&var)?;
         // Whatever labels the value would bring with it, read at the shape the
         // condition was recorded in: the fields of a whole type, or the cases a
         // sum's rest stands for. A presence brings neither, which
         // [`Assigned::as_row`] says by answering with a row that names nothing
         // and [`Assigned::as_ty`] by answering with a type that carries none.
-        let named: Vec<String> = match shape {
-            Shape::Struct => self
-                .resolve(&value.as_ty())
-                .fields
-                .keys()
-                .cloned()
-                .collect(),
-            Shape::Sum => self.canon(&value.as_row()).labels.keys().cloned().collect(),
+        let labels: IndexMap<String, RowField> = match shape {
+            Shape::Struct => self.resolve(&value.as_ty()).fields.clone(),
+            Shape::Sum => self.canon(&value.as_row()).labels,
         };
-        let name = named.iter().find(|name| lacks.contains(*name))?;
-        Some((*shape, name.clone()))
+        let named = labels
+            .iter()
+            .filter(|(name, _)| lacks.contains(*name))
+            .map(|(name, field)| (name.clone(), self.presence_of(&field.presence)))
+            .collect();
+        Some((*shape, named))
     }
 
     /// Carry the lacks condition across a binding. What `var` may not stand
@@ -1745,10 +1761,12 @@ impl Table {
     /// `` `A | ..(`B) `` is not a type anyone wrote. [`canon`](Self::canon) is what does
     /// that, and it is lossless: a tail stands for the labels its row does not
     /// write out, and [`Solve::assign`] refuses to bind one to a row that
-    /// writes out one of them, so by the time a solve is over no chain of rows
-    /// repeats a name. Before the lacks check existed the splice was where a
-    /// repeated field quietly lost a copy, and a definition came out with a
-    /// type it had never been shown to have.
+    /// certainly has one of them, so the one copy a chain can repeat by the
+    /// time a solve is over is a label settled absent — not part of what the
+    /// row says, so dropping it for the outer label loses nothing. Before the
+    /// lacks check existed the splice was where a repeated *present* field
+    /// quietly lost a copy, and a definition came out with a type it had never
+    /// been shown to have.
     fn zonk_row(&self, row: &Row, subst: &HashMap<TyVar, u32>) -> Row {
         let row = self.canon(row);
         let labels = self.zonk_labels(&row.labels, subst);
@@ -2124,12 +2142,15 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 /// carrying an `x`. Both are this.
 ///
 /// The outer labels win because they are the ones written where the whole type
-/// is read. A label named on both sides would be a type naming a field twice,
-/// and there is no way left to write one: lowering refuses an argument that
-/// repeats a label the declaration it goes to already names, and
-/// [`Solve::assign`]'s lacks check refuses every route that goes through a
-/// variable. So the rule decides nothing in practice and is here to be
-/// definite about what happens if either of those is ever weakened.
+/// is read. A label *certainly there* on both sides would be a type naming a
+/// field twice, and there is no way left to reach one: lowering refuses an
+/// argument that repeats a label the declaration it goes to already names, and
+/// [`Solve::assign`]'s lacks check refuses every route through a variable that
+/// would bring the label in present. What that check lets through is a copy
+/// settled absent — not part of what the inner type says — so the one thing
+/// the rule decides in practice is to drop it for the outer label, which is
+/// the only reading, and it stays definite about what happens if either
+/// refusal is ever weakened.
 fn splice(outer: &IndexMap<String, RowField>, inner: &Rc<Ty>) -> Rc<Ty> {
     if outer.is_empty() {
         return inner.clone();
