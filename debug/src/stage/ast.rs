@@ -3,7 +3,7 @@
 //! Each node's `text` is that subtree's own `Display` output, so the tree and
 //! the rendered source can never drift apart: they are the same printer.
 
-use ruddy::parse::{Expr, ExprKind, Stmt, StmtKind, Type, TypeKind};
+use ruddy::parse::{Expr, ExprKind, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind};
 
 use crate::{
     print,
@@ -169,15 +169,23 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         TypeKind::Struct { fields, tail } => {
             let mut kids: Vec<Node> = fields
                 .iter()
-                .map(|(name, field)| {
-                    let mark = if field.optional { "?" } else { "" };
-                    Node::new(
-                        ids.next(),
-                        format!("{}{mark}:", name.tracked),
-                        print::ast::ty(&field.value.tracked).to_string(),
-                    )
-                    .at(name.span)
-                    .child(type_node(ids, &field.value))
+                .map(|(name, field)| match field {
+                    TypeField::Written { optional, value } => {
+                        let mark = if *optional { "?" } else { "" };
+                        Node::new(
+                            ids.next(),
+                            format!("{}{mark}:", name.tracked),
+                            print::ast::ty(&value.tracked).to_string(),
+                        )
+                        .at(name.span)
+                        .child(type_node(ids, value))
+                    }
+                    // An absent field is a leaf: there is no type under it,
+                    // and the key's span covers the whole `\name`.
+                    TypeField::Absent => {
+                        Node::new(ids.next(), format!("\\{}", name.tracked), String::new())
+                            .at(name.span)
+                    }
                 })
                 .collect();
             // The tail is a row of its own: it stands for the fields not
@@ -197,17 +205,24 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         TypeKind::Sum { cases, tail } => {
             let mut kids: Vec<Node> = cases
                 .iter()
-                .map(|(name, case)| {
-                    let mark = if case.optional { "?" } else { "" };
-                    let text = case
-                        .payload
-                        .as_ref()
-                        .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());
-                    let node = Node::new(ids.next(), format!("`{}{mark}", name.tracked), text)
-                        .at(name.span);
-                    match &case.payload {
-                        Some(payload) => node.child(type_node(ids, payload)),
-                        None => node,
+                .map(|(name, case)| match case {
+                    SumCase::Written { optional, payload } => {
+                        let mark = if *optional { "?" } else { "" };
+                        let text = payload
+                            .as_ref()
+                            .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());
+                        let node = Node::new(ids.next(), format!("`{}{mark}", name.tracked), text)
+                            .at(name.span);
+                        match payload {
+                            Some(payload) => node.child(type_node(ids, payload)),
+                            None => node,
+                        }
+                    }
+                    // The struct's absent field again: a leaf wearing the `\`,
+                    // spanning the whole `` \`Name ``.
+                    SumCase::Absent => {
+                        Node::new(ids.next(), format!("\\`{}", name.tracked), String::new())
+                            .at(name.span)
                     }
                 })
                 .collect();

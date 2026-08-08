@@ -9,14 +9,14 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{Field, Program, Row, Term, TermKind, TypeKind},
+    ir::{Field, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind},
     symbol::Mint,
     tracking::Tracked,
 };
 
 use crate::print::{
-    Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project, write_row,
-    write_struct, write_sum, write_tag,
+    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project,
+    write_row, write_struct, write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -226,9 +226,15 @@ impl fmt::Display for Show<'_, TypeKind> {
                 args.iter().map(|arg| self.show(arg)),
             ),
             TypeKind::Sum { cases, tail } => {
-                let cases = cases.iter().map(|(name, case)| {
-                    let payload = case.payload.as_ref().map(|ty| self.show(ty));
-                    (name, case.optional, payload)
+                let cases = cases.iter().map(|(name, case)| match case {
+                    SumCase::Written {
+                        optional, payload, ..
+                    } => Entry::Written {
+                        name,
+                        optional: *optional,
+                        holds: payload.as_ref().map(|ty| self.show(ty)),
+                    },
+                    SumCase::Absent { .. } => Entry::Absent { name },
                 });
                 // The tail renders as it does for a struct, and a row
                 // parameter as the name it was declared with.
@@ -246,9 +252,16 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Prim(prim) => f.write_str(prim.name()),
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
             TypeKind::Struct { fields, tail } => {
-                let fields = fields
-                    .iter()
-                    .map(|(name, field)| (name, field.optional, self.show(&field.value)));
+                let fields = fields.iter().map(|(name, field)| match field {
+                    TypeField::Written {
+                        optional, value, ..
+                    } => Entry::Written {
+                        name,
+                        optional: *optional,
+                        holds: self.show(value),
+                    },
+                    TypeField::Absent { .. } => Entry::Absent { name },
+                });
                 // The tail renders as what follows the `..`: a name, or
                 // nothing for the anonymous one. `write_row` writes the dots.
                 let tail = tail.as_ref().map(|tail| match &tail.of {

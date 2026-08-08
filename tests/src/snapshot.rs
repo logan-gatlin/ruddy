@@ -1539,3 +1539,58 @@ fn a_nested_let_reaches_every_stage() {
         .unwrap_or_else(|| panic!("no local row: {definition:#?}"));
     assert_eq!(local.text, "Nat -> Nat");
 }
+
+/// Every tab renders a program using explicit absence without error: the
+/// Tokens tab shows the backslash like any other punctuation token, the AST
+/// and IR tabs render `\y` and `` \`Err `` as written, and the type tabs take
+/// the absent entries in stride.
+#[test]
+fn every_stage_reports_on_explicit_absence() {
+    let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
+                  type NoErr r = `Ok Nat | \\`Err | ..r\n\
+                  let ok : NoErr (`Warn Nat) = `Ok 1\n";
+    let snapshot = snapshot(source);
+    assert!(snapshot.panic.is_none());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    for stage in &snapshot.stages {
+        assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
+    }
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("no {id} stage"))
+    };
+
+    let tokens: Vec<_> = nodes(stage("tokens"))
+        .into_iter()
+        .filter(|node| node.label == "Backslash")
+        .collect();
+    assert_eq!(tokens.len(), 2, "{tokens:#?}");
+    assert!(tokens.iter().all(|node| node.text == "\\"), "{tokens:#?}");
+
+    let ast = nodes(stage("ast"));
+    assert!(
+        ast.iter().any(|node| node.label == "\\y"),
+        "the AST tab renders the absent field"
+    );
+    assert!(
+        ast.iter().any(|node| node.label == "\\`Err"),
+        "the AST tab renders the absent case"
+    );
+
+    let ir = nodes(stage("ir"));
+    assert!(
+        ir.iter().any(|node| node.label == "\\y"),
+        "the IR tab renders the absent field"
+    );
+    assert!(
+        ir.iter().any(|node| node.label == "\\`Err"),
+        "the IR tab renders the absent case"
+    );
+}

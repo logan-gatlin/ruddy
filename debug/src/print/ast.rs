@@ -9,13 +9,13 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    parse::{ExprKind, StmtKind, TypeKind},
+    parse::{ExprKind, StmtKind, SumCase, TypeField, TypeKind},
     tracking::Tracked,
 };
 
 use crate::print::{
-    Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project, write_row,
-    write_struct, write_sum, write_tag,
+    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project,
+    write_row, write_struct, write_sum, write_tag,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -130,8 +130,15 @@ impl fmt::Display for Ast<'_, TypeKind> {
         match self.0 {
             TypeKind::Arrow { from, to } => write_arrow(f, &Ast(&from.tracked), &Ast(&to.tracked)),
             TypeKind::Struct { fields, tail } => {
-                let fields = fields.iter().map(|(name, field)| {
-                    (&name.tracked, field.optional, Ast(&field.value.tracked))
+                let fields = fields.iter().map(|(name, field)| match field {
+                    TypeField::Written { optional, value } => Entry::Written {
+                        name: &name.tracked,
+                        optional: *optional,
+                        holds: Ast(&value.tracked),
+                    },
+                    TypeField::Absent => Entry::Absent {
+                        name: &name.tracked,
+                    },
                 });
                 // The tail renders as what follows the `..`: a name, or
                 // nothing for the anonymous one. `write_row` writes the dots.
@@ -145,9 +152,15 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 )
             }
             TypeKind::Sum { cases, tail } => {
-                let cases = cases.iter().map(|(name, case)| {
-                    let payload = case.payload.as_ref().map(|ty| Ast(&ty.tracked));
-                    (&name.tracked, case.optional, payload)
+                let cases = cases.iter().map(|(name, case)| match case {
+                    SumCase::Written { optional, payload } => Entry::Written {
+                        name: &name.tracked,
+                        optional: *optional,
+                        holds: payload.as_ref().map(|ty| Ast(&ty.tracked)),
+                    },
+                    SumCase::Absent => Entry::Absent {
+                        name: &name.tracked,
+                    },
                 });
                 // The tail renders as it does for a struct: what follows the
                 // `..`, with `write_sum` writing the dots and the bars.

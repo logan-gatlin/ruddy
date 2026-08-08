@@ -101,7 +101,8 @@ pub enum TypeKind {
     /// known about the cases not written out, and its absence says the type
     /// lists every case there is. Written with no brackets around it, so the
     /// empty sum — no cases at all — is spelled `|`, and the parser reaches
-    /// here on a leading `|` as much as on a leading tag.
+    /// here on a leading `|` as much as on a leading tag or the `\` of a case
+    /// written absent.
     Sum {
         cases: IndexMap<TrackedString, SumCase>,
         tail: Option<Tail>,
@@ -131,16 +132,22 @@ pub enum TypeKind {
     Unit,
 }
 
-/// One field of a struct type: its type, and whether it was marked `?` — a
-/// field that may or may not be there, with this type when it is.
+/// One field of a struct type: its type and the `?` it may wear, or the `\`
+/// that says the label is not there at all.
 #[derive(Debug, Clone)]
-pub struct TypeField {
-    pub optional: bool,
-    pub value: Type,
+pub enum TypeField {
+    /// `name[?]: T` — a field that is there, or (`?`) may be, with this type
+    /// when it is.
+    Written { optional: bool, value: Type },
+    /// `\name` — the label is definitely absent: the `..` beside it may not
+    /// stand for it. No type and no `?`, so this variant carries nothing; the
+    /// map key's span covers the whole `\name`, which is what a diagnostic
+    /// about the entry underlines.
+    Absent,
 }
 
-/// One case of a sum type: what it carries, and whether it was marked `?` — a
-/// case a value may or may not be, carrying this when it is.
+/// One case of a sum type: what it carries and the `?` it may wear, or the `\`
+/// that says the case is not there at all.
 ///
 /// The `?` is not what a `..` tail says. `` `A? Nat | `B `` allows `A` and
 /// nothing else beyond `B`; `` `B | ..r `` allows anything at all beyond `B`.
@@ -150,9 +157,16 @@ pub struct TypeField {
 /// thing `()` means — but it is recorded as the nothing it was written as, so
 /// that printing the tree gives back the source it was parsed from.
 #[derive(Debug, Clone)]
-pub struct SumCase {
-    pub optional: bool,
-    pub payload: Option<Type>,
+pub enum SumCase {
+    /// `` `Name[?] [T] `` — a case a value may be, carrying this when it is.
+    Written {
+        optional: bool,
+        payload: Option<Type>,
+    },
+    /// `` \`Name `` — the case is definitely absent. No payload and no `?`,
+    /// exactly as [`TypeField::Absent`]: the map key's span covers the whole
+    /// `` \`Name ``.
+    Absent,
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -585,18 +599,23 @@ impl Parser {
     /// `['|'] <case> ('|' <case>)*` — a sum type, or whatever
     /// [`type_apply`](Self::type_apply) makes of a type that is not one.
     ///
-    /// A sum is recognised by how it starts and by nothing else: a `|` or a
-    /// tag. The leading `|` is optional, as it is in every language that
-    /// writes sums this way, and it is what makes the two degenerate forms
-    /// writable — `|` alone is the sum with no cases, and `| ..r` is the sum
-    /// that is nothing but its tail.
+    /// A sum is recognised by how it starts and by nothing else: a `|`, a
+    /// tag, or the `\` of a case written absent. The leading `|` is optional,
+    /// as it is in every language that writes sums this way, and it is what
+    /// makes the two degenerate forms writable — `|` alone is the sum with no
+    /// cases, and `| ..r` is the sum that is nothing but its tail.
     ///
     /// The tail is the `..` a struct type already has, standing for the cases
     /// not written out rather than the fields, and it comes last for the same
     /// reason: what it covers has no place among the cases that are named.
     fn type_sum(&mut self) -> Option<Type> {
         let bar = self.eat_if(&Kind::Pipe);
-        if bar.is_none() && !matches!(self.peek().map(|t| &t.tracked), Some(Kind::Tag(_))) {
+        if bar.is_none()
+            && !matches!(
+                self.peek().map(|t| &t.tracked),
+                Some(Kind::Tag(_) | Kind::Backslash)
+            )
+        {
             return self.type_apply();
         }
 
@@ -606,7 +625,7 @@ impl Parser {
             Some(bar) => bar.span,
             // A sum written with no leading `|` starts at its first case, and
             // the loop below is about to read it.
-            None => self.peek().expect("a tag is next").span,
+            None => self.peek().expect("a case is next").span,
         };
         // The `|` that separated the last case from what comes next, when the
         // loop has read one. The leading `|` is not one of these: it may be
@@ -625,38 +644,54 @@ impl Parser {
                 tail = Some(Tail { span: at, name });
                 break;
             }
-            // `|` with nothing after it is the empty sum, and `| ..r` broke out
-            // above, so the only thing left that a case can begin with is a
-            // tag. Anything else ends the sum rather than failing: a `->` or a
-            // `)` after the last case is somebody else's token.
-            //
-            // Unless a `|` between cases promised another one. Nothing came,
-            // so the bar is reported and the cases read so far stand: the
-            // reader has one thing to delete, and the sum they wrote is still
-            // there to be checked.
-            let Some(name) = self.tag() else {
-                if let Some(bar) = separator {
-                    self.error(bar);
-                }
-                break;
-            };
-            span = span.merge(name.span);
-            let optional = self.eat_if(&Kind::Question).is_some();
-            // What a case carries is one atom, which is the same rule
-            // [`tag_expr`](Self::tag_expr) keeps for a term: a tag carries one
-            // thing, and anything with a space in it takes parentheses. So
-            // `` `Some Pair A B `` is not a case with three payloads, and
-            // `` `A Nat -> Nat `` is a function from the sum rather than a case
-            // carrying an arrow.
-            let payload = match self.at_type_atom() {
-                true => {
-                    let payload = self.type_atom()?;
-                    span = span.merge(payload.span);
-                    Some(payload)
-                }
-                false => None,
-            };
-            cases.insert(name, SumCase { optional, payload });
+            if let Some(slash) = self.eat_if(&Kind::Backslash) {
+                // A `\` promises a case, so anything but a tag after it is
+                // reported — the case keeps its backtick, spelled the same
+                // way present or absent. No payload and no `?` either;
+                // whatever follows but a `|` is somebody else's token to
+                // refuse, exactly as it is after a written case's payload.
+                let Some(name) = self.tag() else {
+                    return self.unexpected();
+                };
+                span = span.merge(name.span);
+                // The key's span is the whole `` \`Name ``, for the reason a
+                // struct's absent field's is.
+                let key = slash.span.merge(name.span).track(name.tracked);
+                cases.insert(key, SumCase::Absent);
+            } else {
+                // `|` with nothing after it is the empty sum, and `| ..r` broke
+                // out above, so the only thing left that a case can begin with
+                // is a tag. Anything else ends the sum rather than failing: a
+                // `->` or a `)` after the last case is somebody else's token.
+                //
+                // Unless a `|` between cases promised another one. Nothing
+                // came, so the bar is reported and the cases read so far stand:
+                // the reader has one thing to delete, and the sum they wrote is
+                // still there to be checked.
+                let Some(name) = self.tag() else {
+                    if let Some(bar) = separator {
+                        self.error(bar);
+                    }
+                    break;
+                };
+                span = span.merge(name.span);
+                let optional = self.eat_if(&Kind::Question).is_some();
+                // What a case carries is one atom, which is the same rule
+                // [`tag_expr`](Self::tag_expr) keeps for a term: a tag carries
+                // one thing, and anything with a space in it takes parentheses.
+                // So `` `Some Pair A B `` is not a case with three payloads,
+                // and `` `A Nat -> Nat `` is a function from the sum rather
+                // than a case carrying an arrow.
+                let payload = match self.at_type_atom() {
+                    true => {
+                        let payload = self.type_atom()?;
+                        span = span.merge(payload.span);
+                        Some(payload)
+                    }
+                    false => None,
+                };
+                cases.insert(name, SumCase::Written { optional, payload });
+            }
 
             match self.eat_if(&Kind::Pipe) {
                 Some(pipe) => separator = Some(pipe.span),
@@ -729,11 +764,13 @@ impl Parser {
         }
     }
 
-    /// `{ <field>[?]: <type>, ..., [..[<name>]] }` with an optional trailing
-    /// comma among the fields. The `?` marks a field that may or may not be
-    /// there; the `..` tail, when present, comes last — the fields it stands
-    /// for have no order among the named ones to claim — and takes no comma
-    /// after it.
+    /// `{ <field>[?]: <type> | \<field>, ..., [..[<name>]] }` with an optional
+    /// trailing comma among the fields. The `?` marks a field that may or may
+    /// not be there; `\name` one that definitely is not, which takes no type
+    /// and no `?` — whatever follows it but a comma or the brace is the
+    /// unexpected token it looks like, since nothing here reads one. The `..`
+    /// tail, when present, comes last — the fields it stands for have no order
+    /// among the named ones to claim — and takes no comma after it.
     fn struct_type(&mut self) -> Option<Type> {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
@@ -754,11 +791,20 @@ impl Parser {
                 tail = Some(Tail { span, name });
                 break;
             }
-            let name = self.ident()?;
-            let optional = self.eat_if(&Kind::Question).is_some();
-            self.eat(&Kind::Colon)?;
-            let value = self.type_expr()?;
-            fields.insert(name, TypeField { optional, value });
+            if let Some(slash) = self.eat_if(&Kind::Backslash) {
+                // The key's span is the whole `\name`, so a complaint about
+                // the entry — a repeat, a `\` in a closed struct — underlines
+                // the absence mark along with the name it marks.
+                let name = self.ident()?;
+                let key = slash.span.merge(name.span).track(name.tracked);
+                fields.insert(key, TypeField::Absent);
+            } else {
+                let name = self.ident()?;
+                let optional = self.eat_if(&Kind::Question).is_some();
+                self.eat(&Kind::Colon)?;
+                let value = self.type_expr()?;
+                fields.insert(name, TypeField::Written { optional, value });
+            }
 
             // A comma separates fields; its absence ends the field list.
             if self.eat_if(&Kind::Comma).is_none() {

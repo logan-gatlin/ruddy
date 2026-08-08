@@ -179,6 +179,36 @@ fn a_backtick_that_begins_no_name_is_unrecognized() {
 }
 
 #[test]
+fn lexes_the_backslash() {
+    // One byte, and never a lex error on its own: what may follow a `\` is
+    // the parser's business.
+    assert!(matches!(kinds("\\")[..], [Kind::Backslash]));
+    // `\y` is the mark and then the name, two tokens — the same separation
+    // `..` keeps from the name after it — so `\ y` lexes identically.
+    assert!(matches!(
+        &kinds("\\y")[..],
+        [Kind::Backslash, Kind::Identifier(name)] if name == "y"
+    ));
+    assert!(matches!(
+        &kinds("\\ y")[..],
+        [Kind::Backslash, Kind::Identifier(name)] if name == "y"
+    ));
+    // A case keeps its backtick, so `` \`B `` is the mark and then a tag.
+    assert!(matches!(
+        &kinds("\\`B")[..],
+        [Kind::Backslash, Kind::Tag(name)] if name == "B"
+    ));
+
+    let out = lex("{ \\y, .. }", FileID::GENERATED);
+    let slash = &out.tokens[1];
+    assert!(matches!(slash.tracked, Kind::Backslash));
+    assert_eq!(slash.span.start, 2);
+    assert_eq!(slash.span.width, 1);
+    // Printing writes the `\` back, so the stream re-lexes to itself.
+    assert_eq!(slash.tracked.to_string(), "\\");
+}
+
+#[test]
 fn lexes_the_case_separator() {
     assert!(matches!(
         &kinds("`A | `B")[..],

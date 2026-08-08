@@ -417,8 +417,7 @@ input {
 /* A stage that ran but has something to say about it — a failed check of its
    own, or an earlier phase's errors. Findable without opening every tab, and
    only the border, because on a program with any error at all this is every
-   tab: what it says is the tab's tooltip, and the pane bar prints it in full
-   for the stage the pane is on. */
+   tab: what it says is the tab's tooltip. */
 .tab.warn {
   border-color: var(--symbol);
 }
@@ -428,21 +427,6 @@ input {
 }
 .tab.on .key {
   color: var(--accent);
-}
-
-/* What the showing stage counted, in the pane bar beside its tab. One per
-   pane rather than one per tab: it is about the stage this pane is on. */
-.summary {
-  flex: none;
-  color: var(--fg-faint);
-  padding: 0 8px;
-  white-space: nowrap;
-}
-.summary.warn {
-  color: var(--symbol);
-}
-.summary.bad {
-  color: var(--error);
 }
 
 .pane-bar .grow {

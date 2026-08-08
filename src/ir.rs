@@ -222,26 +222,42 @@ pub enum TypeKind {
 }
 
 /// One field of a struct type: the [`Field`] split of spans, plus whether the
-/// field was marked `?` — there or not, with this type when it is.
+/// field was marked `?` — there or not, with this type when it is — or `\` —
+/// definitely not there, with no type at all.
 #[derive(Debug, Clone)]
-pub struct TypeField {
-    pub name_span: Span,
-    pub optional: bool,
-    pub value: Type,
+pub enum TypeField {
+    /// `name[?]: T`, as written.
+    Written {
+        name_span: Span,
+        optional: bool,
+        value: Type,
+    },
+    /// `\name` — the label is explicitly absent, so there is no type here to
+    /// carry: what the entry lowers to is [`Presence::Absent`](crate::types::Presence)
+    /// with its type deliberately unconstrained. `name_span` covers the whole
+    /// `\name`, which is where a complaint about the entry points.
+    Absent { name_span: Span },
 }
 
 /// One case of a sum type: the [`Field`] split of spans, whether the case was
-/// marked `?` — a case a value may or may not be — and what it carries.
+/// marked `?` — a case a value may or may not be — and what it carries; or the
+/// `\` that says the case is definitely absent, [`TypeField::Absent`]'s twin.
 ///
 /// `payload` keeps the `None` the parser gave it, for the reason
 /// [`TermKind::Tag`] does: a case written bare means unit, and saying so here
 /// would be this pass writing a type nobody wrote into the tree the debugger
 /// shows.
 #[derive(Debug, Clone)]
-pub struct SumCase {
-    pub name_span: Span,
-    pub optional: bool,
-    pub payload: Option<Type>,
+pub enum SumCase {
+    /// `` `Name[?] [T] ``, as written.
+    Written {
+        name_span: Span,
+        optional: bool,
+        payload: Option<Type>,
+    },
+    /// `` \`Name `` — the case is explicitly absent, carrying nothing.
+    /// `name_span` covers the whole `` \`Name ``.
+    Absent { name_span: Span },
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -303,6 +319,22 @@ pub enum ErrorKind {
     DuplicateField,
     /// A second case of a name in one sum.
     DuplicateCase,
+    /// An explicitly absent label in a composite with no `..` tail, as in
+    /// `{ a: Nat, \y }` or `` `A | \`B ``.
+    ///
+    /// A `\` says the `..` beside it may not stand for the label, and a type
+    /// with no `..` already says that of every label it does not name — so
+    /// there is nothing here for the mark to rule out. Refused rather than
+    /// dropped: the mark says something about a tail that is not there, and a
+    /// reader who wrote it meant one of the two to change.
+    ///
+    /// The shape and the label are carried for the wording alone, the way
+    /// [`ErrorKind::RepeatedRowField`] carries them: the complaint quotes the
+    /// label the way it was written, backtick and all for a case.
+    AbsentInClosed {
+        shape: Shape,
+        label: String,
+    },
     /// A definition given as a name that leads back to itself with nothing in
     /// between: `type t = t`, `let x = x`, or a pair each given as the other.
     ///
@@ -748,6 +780,44 @@ struct Chain<'a> {
     open: Vec<Symbol>,
     /// Every definition found to be on a loop, in the order they were found.
     looping: IndexSet<Symbol>,
+}
+
+impl TypeField {
+    /// Where the label was written: the name of an ordinary field, the whole
+    /// `\name` of an absent one.
+    pub fn name_span(&self) -> Span {
+        match self {
+            TypeField::Written { name_span, .. } | TypeField::Absent { name_span } => *name_span,
+        }
+    }
+
+    /// The written type, when the field has one. An absent label writes none,
+    /// which is what lets every walk over a struct's fields visit exactly the
+    /// types that are there.
+    pub fn value(&self) -> Option<&Type> {
+        match self {
+            TypeField::Written { value, .. } => Some(value),
+            TypeField::Absent { .. } => None,
+        }
+    }
+}
+
+impl SumCase {
+    /// Where the label was written: the [`TypeField::name_span`] of a case.
+    pub fn name_span(&self) -> Span {
+        match self {
+            SumCase::Written { name_span, .. } | SumCase::Absent { name_span } => *name_span,
+        }
+    }
+
+    /// The written payload, when the case has one — which an absent case never
+    /// does, any more than a case written bare.
+    pub fn payload(&self) -> Option<&Type> {
+        match self {
+            SumCase::Written { payload, .. } => payload.as_ref(),
+            SumCase::Absent { .. } => None,
+        }
+    }
 }
 
 impl TermKind {
@@ -1619,7 +1689,9 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
         )),
         TypeKind::Struct { fields, tail } => {
             for field in fields.values() {
-                constrain(&field.value, out);
+                if let Some(value) = field.value() {
+                    constrain(value, out);
+                }
             }
             if let Some(Tail {
                 of: Row::Param { index, .. },
@@ -1633,16 +1705,20 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                 //
                 // The fields written beside it are exactly what it may not
                 // name: they are already named here, and a `..` covers what is
-                // not.
+                // not. An absent label is named as surely as a written one —
+                // `\y` says the tail has no `y`, which is the same sentence a
+                // field named `y` makes it say — and sits in the same map, so
+                // the keys are the whole set.
                 let lacks = fields.keys().cloned().collect();
                 out(Fact::Says(*index, ParamKind::Type { lacks }));
             }
         }
         // The struct arm again, about cases: a payload is a type position, and
-        // the cases written beside a tail are what it may not name.
+        // the cases written beside a tail — absent ones included — are what it
+        // may not name.
         TypeKind::Sum { cases, tail } => {
             for case in cases.values() {
-                if let Some(payload) = &case.payload {
+                if let Some(payload) = case.payload() {
                     constrain(payload, out);
                 }
             }
@@ -1807,12 +1883,18 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             }
             TypeKind::Struct { fields, .. } => {
                 for field in fields.values_mut() {
-                    walk(&mut field.value, kinds, carries, rows, out);
+                    if let TypeField::Written { value, .. } = field {
+                        walk(value, kinds, carries, rows, out);
+                    }
                 }
             }
             TypeKind::Sum { cases, .. } => {
                 for case in cases.values_mut() {
-                    if let Some(payload) = case.payload.as_mut() {
+                    if let SumCase::Written {
+                        payload: Some(payload),
+                        ..
+                    } = case
+                    {
                         walk(payload, kinds, carries, rows, out);
                     }
                 }
@@ -2177,7 +2259,9 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
             TypeKind::Param { index, .. } => out(*index, under),
             TypeKind::Struct { fields, tail } => {
                 for field in fields.values() {
-                    occurrences(&field.value, under, out);
+                    if let Some(value) = field.value() {
+                        occurrences(value, under, out);
+                    }
                 }
                 if let Some(Tail {
                     of: Row::Param { index, .. },
@@ -2189,7 +2273,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
             }
             TypeKind::Sum { cases, tail } => {
                 for case in cases.values() {
-                    if let Some(payload) = &case.payload {
+                    if let Some(payload) = case.payload() {
                         occurrences(payload, under, out);
                     }
                 }
@@ -2267,12 +2351,14 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
         }
         TypeKind::Struct { fields, .. } => {
             for field in fields.values() {
-                mentioned(&field.value, out);
+                if let Some(value) = field.value() {
+                    mentioned(value, out);
+                }
             }
         }
         TypeKind::Sum { cases, .. } => {
             for case in cases.values() {
-                if let Some(payload) = &case.payload {
+                if let Some(payload) = case.payload() {
                     mentioned(payload, out);
                 }
             }
@@ -2331,12 +2417,14 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
         }
         TypeKind::Struct { fields, .. } => {
             for field in fields.values() {
-                grows(&field.value, group, report);
+                if let Some(value) = field.value() {
+                    grows(value, group, report);
+                }
             }
         }
         TypeKind::Sum { cases, .. } => {
             for case in cases.values() {
-                if let Some(payload) = &case.payload {
+                if let Some(payload) = case.payload() {
                     grows(payload, group, report);
                 }
             }
@@ -2362,13 +2450,13 @@ fn mentions_a_parameter(ty: &Type) -> bool {
             tails_a_parameter(tail)
                 || fields
                     .values()
-                    .any(|field| mentions_a_parameter(&field.value))
+                    .any(|field| field.value().is_some_and(mentions_a_parameter))
         }
         TypeKind::Sum { cases, tail } => {
             tails_a_parameter(tail)
                 || cases
                     .values()
-                    .any(|case| case.payload.as_ref().is_some_and(mentions_a_parameter))
+                    .any(|case| case.payload().is_some_and(mentions_a_parameter))
         }
         TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => false,
     }
@@ -2620,6 +2708,32 @@ impl Builder<'_> {
         false
     }
 
+    /// Whether a row's explicit absences have a `..` to speak about. A `\`
+    /// says the tail beside it may not stand for the label, and a row with no
+    /// tail already says that of every label it does not name — so each one in
+    /// a closed row is reported where it was written, and the row absorbs. See
+    /// [`ErrorKind::AbsentInClosed`].
+    ///
+    /// [`closed`](Self::closed)'s sibling, and one rule for both shapes for
+    /// the same reason: the two arms of [`ty`](Self::ty) that call it differ
+    /// in the nouns they are written about and in nothing else.
+    fn tailed(
+        &mut self,
+        shape: Shape,
+        absences: impl IntoIterator<Item = (String, Span)>,
+        tail: &Option<Tail>,
+    ) -> bool {
+        if tail.is_some() {
+            return true;
+        }
+        let mut tailed = true;
+        for (label, span) in absences {
+            self.error(span, ErrorKind::AbsentInClosed { shape, label });
+            tailed = false;
+        }
+        tailed
+    }
+
     /// How many arguments a declared type takes. A symbol with no entry is one
     /// whose declaration was refused, and counting against it would be a second
     /// complaint about the first thing that went wrong.
@@ -2863,40 +2977,57 @@ impl Builder<'_> {
                 // name inside an open declared type is still reported: the
                 // reader should not have to fix the `..` to be told about it.
                 //
-                // A type's field has a `?` to it that [`Field`] has no room
-                // for, so the mark rides down with the value and the pair is
+                // A type's field has a `?` and a `\` to it that [`Field`] has
+                // no room for, so the marks ride down with the value and are
                 // taken apart again here. Re-keying and repeats are the same
                 // question they are for a struct literal, and are asked in the
                 // one place that answers it.
                 let lowered: IndexMap<String, TypeField> = self
-                    .fields(fields, |b, field| {
-                        (field.optional, b.ty(field.value, place))
+                    .fields(fields, |b, field| match field {
+                        parse::TypeField::Written { optional, value } => {
+                            Some((optional, b.ty(value, place)))
+                        }
+                        parse::TypeField::Absent => None,
                     })
                     .into_iter()
                     .map(|(name, field)| {
-                        let (optional, value) = field.value;
-                        (
-                            name,
-                            TypeField {
+                        let lowered = match field.value {
+                            Some((optional, value)) => TypeField::Written {
                                 name_span: field.name_span,
                                 optional,
                                 value,
                             },
-                        )
+                            None => TypeField::Absent {
+                                name_span: field.name_span,
+                            },
+                        };
+                        (name, lowered)
                     })
                     .collect();
                 let tail = match self.tail(tail, place, Shape::Struct) {
                     Ok(tail) => tail,
                     Err(()) => return span.track(TypeKind::Error),
                 };
-                // Where a declaration is held to being closed; see
-                // [`closed`](Self::closed), which is the same check the sum
-                // arm below makes.
-                let marks = lowered
-                    .values()
-                    .filter(|field| field.optional)
-                    .map(|field| field.name_span);
-                if !self.closed(place, Shape::Struct, marks, &tail) {
+                // Where a declaration is held to being closed, and where a `\`
+                // is held to having a `..` to speak about; see
+                // [`closed`](Self::closed) and [`tailed`](Self::tailed), the
+                // same two checks the sum arm below makes. Both run, so a row
+                // wrong both ways is told about both.
+                let marks = lowered.values().filter_map(|field| match field {
+                    TypeField::Written {
+                        optional: true,
+                        name_span,
+                        ..
+                    } => Some(*name_span),
+                    _ => None,
+                });
+                let closed = self.closed(place, Shape::Struct, marks, &tail);
+                let absences = lowered.iter().filter_map(|(name, field)| match field {
+                    TypeField::Absent { name_span } => Some((name.clone(), *name_span)),
+                    TypeField::Written { .. } => None,
+                });
+                let tailed = self.tailed(Shape::Struct, absences, &tail);
+                if !closed || !tailed {
                     return span.track(TypeKind::Error);
                 }
                 span.track(TypeKind::Struct {
@@ -2911,32 +3042,46 @@ impl Builder<'_> {
             // case may not have.
             parse::TypeKind::Sum { cases, tail } => {
                 let lowered: IndexMap<String, SumCase> = self
-                    .labels(cases, ErrorKind::DuplicateCase, |b, case| {
-                        let payload = case.payload.map(|payload| b.ty(payload, place));
-                        (case.optional, payload)
+                    .labels(cases, ErrorKind::DuplicateCase, |b, case| match case {
+                        parse::SumCase::Written { optional, payload } => {
+                            Some((optional, payload.map(|payload| b.ty(payload, place))))
+                        }
+                        parse::SumCase::Absent => None,
                     })
                     .into_iter()
                     .map(|(name, case)| {
-                        let (optional, payload) = case.value;
-                        (
-                            name,
-                            SumCase {
+                        let lowered = match case.value {
+                            Some((optional, payload)) => SumCase::Written {
                                 name_span: case.name_span,
                                 optional,
                                 payload,
                             },
-                        )
+                            None => SumCase::Absent {
+                                name_span: case.name_span,
+                            },
+                        };
+                        (name, lowered)
                     })
                     .collect();
                 let tail = match self.tail(tail, place, Shape::Sum) {
                     Ok(tail) => tail,
                     Err(()) => return span.track(TypeKind::Error),
                 };
-                let marks = lowered
-                    .values()
-                    .filter(|case| case.optional)
-                    .map(|case| case.name_span);
-                if !self.closed(place, Shape::Sum, marks, &tail) {
+                let marks = lowered.values().filter_map(|case| match case {
+                    SumCase::Written {
+                        optional: true,
+                        name_span,
+                        ..
+                    } => Some(*name_span),
+                    _ => None,
+                });
+                let closed = self.closed(place, Shape::Sum, marks, &tail);
+                let absences = lowered.iter().filter_map(|(name, case)| match case {
+                    SumCase::Absent { name_span } => Some((name.clone(), *name_span)),
+                    SumCase::Written { .. } => None,
+                });
+                let tailed = self.tailed(Shape::Sum, absences, &tail);
+                if !closed || !tailed {
                     return span.track(TypeKind::Error);
                 }
                 span.track(TypeKind::Sum {

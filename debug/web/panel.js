@@ -43,7 +43,6 @@ function createPane(root, app, index) {
   pane.innerHTML = `
     <div class="pane-bar">
       <span class="tabs"></span>
-      <span class="summary"></span>
       <span class="grow"></span>
       <span class="views"></span>
       <button class="chip" data-act="collapse" title="Collapse to top level">⊟</button>
@@ -54,7 +53,6 @@ function createPane(root, app, index) {
   root.appendChild(pane);
 
   const tabs = pane.querySelector(".tabs");
-  const summary = pane.querySelector(".summary");
   const views = pane.querySelector(".views");
   const filter = pane.querySelector(".filter");
   const rows = pane.querySelector(".rows");
@@ -223,7 +221,6 @@ function createPane(root, app, index) {
     const snapshot = app.state.snapshot;
     if (!snapshot) {
       setRows(`<div class="pane-note">waiting for the first compile…</div>`);
-      summary.textContent = "";
       return;
     }
 
@@ -464,22 +461,18 @@ function createPane(root, app, index) {
     if (panel.count === 0) panel.el.innerHTML = NOTHING_YET;
   }
 
-  /// The tab strip, and the showing stage's summary beside it.
+  /// The tab strip.
   ///
-  /// A tab is a selector and nothing more: its shortcut and its name. The
-  /// summary belongs to whichever stage a pane is showing, and a tab strip is
-  /// repeated once per pane — printing every stage's count in the strip put
-  /// them all in every pane, twice over and about panes that were not showing
-  /// them. So one summary per pane, for the one stage the pane is on.
+  /// A tab is a selector and nothing more: its shortcut and its name. What a
+  /// stage counted hangs off its tab as the tooltip rather than printing in
+  /// the bar, where a long count crowded the tabs themselves out.
   ///
   /// A stage that annotates another owns no tab; its content shows up as
   /// badges on the stage it decorates.
   ///
-  /// The counts are what a stage says about itself, and one of them is a
-  /// warning — `3 demangle mismatch`, a check the stage ran and failed. That
-  /// has to be findable without visiting every tab, so a stage reporting
-  /// anything short of `ok` marks its tab and hangs its summary off it as the
-  /// tab's tooltip.
+  /// One of the counts can be a warning — `3 demangle mismatch`, a check the
+  /// stage ran and failed. That has to be findable without visiting every
+  /// tab, so a stage reporting anything short of `ok` marks its tab.
   function renderTabs(snapshot) {
     tabs.innerHTML = snapshot.stages
       .filter((s) => !s.annotates)
@@ -492,10 +485,6 @@ function createPane(root, app, index) {
         );
       })
       .join("");
-
-    summary.textContent = stage.summary;
-    summary.classList.toggle("bad", stage.status === "panicked");
-    summary.classList.toggle("warn", stage.status === "partial");
   }
 
   function renderViews() {
