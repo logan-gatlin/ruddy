@@ -30,6 +30,16 @@ Pick a short kebab-case `<slug>` from the feature name (`sum-types`, `let-polymo
 `span-tracking`). If that directory already exists, you are revising: read the existing
 spec and treat this as an amendment pass.
 
+If HEAD is the repository's default branch (`git branch --show-current` says `main`),
+check out a new branch named after the slug before writing anything:
+
+```bash
+git switch -c <slug>
+```
+
+If a branch by that name already exists, switch to it instead. If HEAD is already on a
+non-default branch, stay there — the user chose it.
+
 ## 2. Ground yourself before asking anything
 
 Read `CLAUDE.md`, then read enough of the codebase to know which phases the
