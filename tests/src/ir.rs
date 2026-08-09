@@ -3356,3 +3356,108 @@ fn counting_steps_over_a_field_before_the_column() {
     // catch-all is join-pointed.
     assert!(printed.contains("%join"), "{printed}");
 }
+
+/// A struct row whose column test could take the same values as an earlier
+/// merged row breaks out of the merge when that earlier row can still fail on
+/// another field: the earlier row's other-field failure has to reach the
+/// later row's own test, not skip past it, so the later row becomes the run's
+/// fallthrough instead of a second piece of the same column group.
+#[test]
+fn an_overlapping_column_test_breaks_the_merged_run() {
+    // The first row's `b` can fail, and the second row tests `a` with the
+    // same tag: the second row is the fallthrough, reached from both the
+    // column's failure and `b`'s, through one join — and nothing here is
+    // unreachable or unhandled.
+    assert_eq!(
+        lowered("let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => 2 end"),
+        "let f = fn e => \
+         let %scrut = e in \
+         let %join = fn %fall => \
+         match %fall.a with | `A %case => let %unit : {} = %case in let k = %fall.b in 2 end in \
+         match %scrut.a with \
+         | `A %case => let %unit : {} = %case in \
+         match %scrut.b with | 0 => 1 | %fall => %join %scrut end \
+         | %fall => %join %scrut end"
+    );
+
+    // With a catch-all after the pair, a value the second row takes still
+    // reaches it before the catch-all, and every written body appears once.
+    let printed = lowered(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `A, b: k } => 2 | w => 3 end",
+    );
+    assert_eq!(
+        printed,
+        "let f = fn e => \
+         let %scrut = e in \
+         let %join = fn %fall => \
+         match %fall.a with \
+         | `A %case => let %unit : {} = %case in let k = %fall.b in 2 \
+         | %fall => let w = %fall in 3 end in \
+         match %scrut.a with \
+         | `A %case => let %unit : {} = %case in \
+         match %scrut.b with | 0 => 1 | %fall => %join %scrut end \
+         | %fall => %join %scrut end"
+    );
+    for body in ["=> 1", "in 2", "in 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // The same break when the overlapping column tests carry deeper payloads,
+    // and when they are equal numbers.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with | { a: `A `X, b: 0 } => 1 | { a: `A `X, b: k } => 2 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: 0, b: `X } => 1 | { a: 0, b: k } => 2 | w => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["in 1", "in 2", "in 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // The counting mirror breaks at the same row when the overlapping pair is
+    // a merged tag's payload, so join placement and edge counting agree.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | `P { a: `A, b: 0 } => 1 | `P { a: `A, b: k } => 2 | r => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2", "fn r => 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+}
+
+/// The break only fires when an earlier merged row can still fail past its
+/// column: rows with nothing else refutable keep merging, so a row a previous
+/// one fully covers is still reported unreachable, a mixed column is still
+/// the mixed complaint, and rows that do not test the column still fall
+/// through in order.
+#[test]
+fn a_run_without_other_failures_still_merges() {
+    // Nothing but the column can fail in the first row, so the second is a
+    // genuine duplicate and unreachable.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with | { a: `A, b: x } => 1 | { a: `A, b: y } => 2 end",
+    );
+    assert_eq!(errors, ["unreachable-arm@54"], "{errors:#?}");
+
+    // A number against a tag in one column is still the mixed complaint.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with | { a: `A, b: x } => 1 | { a: 0, b: y } => 2 end",
+    );
+    assert_eq!(errors, ["mixed-match@16"], "{errors:#?}");
+
+    // A row that does not test the column at all still falls out of the merge
+    // the way it always did, catch-all and all.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | `A { x: 0, y: `Y } => 1 | `A { x: k, y: `Y } => 2 | q => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+}

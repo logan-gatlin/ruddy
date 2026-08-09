@@ -1907,15 +1907,29 @@ fn rows_edges(pats: &[&Pat]) -> usize {
         }
         Pat::Sieve { fields, .. } => {
             // The merged struct run, mirrored: the column the first row tests
-            // first, merged across every row that tests it, and every other
-            // field failing on its own.
+            // first, merged across every row that tests it, every other field
+            // failing on its own — and the run breaking at a row whose column
+            // test [`overlaps`] an earlier merged row that can still fail on
+            // another field, exactly where [`Builder::sieve`] breaks it.
             let column_name = sieve_column(fields);
             let mut column: Vec<&Pat> = Vec::new();
+            // Whether each merged row keeps a refutable field beside the
+            // column — whether its failures fall through past the group.
+            let mut open: Vec<bool> = Vec::new();
             let mut others = 0;
             let mut at = 0;
             while at < pats.len() {
                 match pats[at] {
                     Pat::Sieve { fields, .. } if tests_field(fields, column_name) => {
+                        let test = column_test(fields, column_name);
+                        if column
+                            .iter()
+                            .zip(&open)
+                            .any(|(prior, &fallible)| fallible && overlaps(prior, test))
+                        {
+                            break;
+                        }
+                        let mut row_others = 0;
                         let mut taken = false;
                         for (name, pat) in fields {
                             if !taken
@@ -1925,9 +1939,11 @@ fn rows_edges(pats: &[&Pat]) -> usize {
                                 column.push(pat);
                                 taken = true;
                             } else {
-                                others += pat.edges();
+                                row_others += pat.edges();
                             }
                         }
+                        open.push(row_others > 0);
+                        others += row_others;
                         at += 1;
                     }
                     _ => break,
@@ -1958,6 +1974,32 @@ fn tests_field(fields: &[(TrackedString, Pat)], column: &str) -> bool {
     fields
         .iter()
         .any(|(name, pat)| name.tracked == column && !matches!(pat, Pat::Calm(_)))
+}
+
+/// The test a struct row puts on the named column: the first entry of that
+/// name whose pattern can fail — the one [`Builder::sieve`] pulls out as the
+/// row's own column pattern. Only asked of rows [`tests_field`] accepted.
+fn column_test<'p>(fields: &'p [(TrackedString, Pat)], column: &str) -> &'p Pat {
+    fields
+        .iter()
+        .find(|(name, pat)| name.tracked == column && !matches!(pat, Pat::Calm(_)))
+        .map(|(_, pat)| pat)
+        .expect("only rows that test the column are asked for their test")
+}
+
+/// Whether two column tests can take the same value. Two tags with different
+/// names cannot, nor can two different numbers; every other pair — the same
+/// tag whatever the payloads, equal literals, anything harder to decide — is
+/// counted as able to. What breaks a merged struct run: an earlier merged row
+/// that could take the same column values and still fail on another field must
+/// fall through to the later row, so the later row cannot sit in the same
+/// column group.
+fn overlaps(a: &Pat, b: &Pat) -> bool {
+    match (a, b) {
+        (Pat::Tag { name: a, .. }, Pat::Tag { name: b, .. }) => a.tracked == b.tracked,
+        (Pat::Natural { value: a, .. }, Pat::Natural { value: b, .. }) => a == b,
+        _ => true,
+    }
 }
 
 /// The one row a fallthrough often is: a bare name taking the whole value.
@@ -4481,7 +4523,19 @@ impl Builder<'_> {
         // field.
         let mut fspan: Option<Span> = None;
         for row in run {
-            if unmerged.is_empty() && tests_field(&row.fields, &column) {
+            // A row joins the group only while its column test cannot take a
+            // value an earlier merged row could — one that still has another
+            // field able to fail. That earlier row's other-field failure must
+            // fall through to this row first, so this row breaks the run and
+            // becomes the fallthrough instead, written order preserved.
+            let joins = unmerged.is_empty() && tests_field(&row.fields, &column) && {
+                let test = column_test(&row.fields, &column);
+                !pieces.iter().any(|piece| {
+                    overlaps(&piece.fpat, test)
+                        && piece.others.iter().any(|(_, pat)| pat.edges() > 0)
+                })
+            };
+            if joins {
                 let mut fpat = None;
                 let mut others = Vec::new();
                 for (name, pat) in row.fields {

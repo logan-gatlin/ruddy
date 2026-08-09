@@ -4259,6 +4259,28 @@ fn a_struct_fallthrough_keeps_the_enclosing_rows_open() {
     );
 }
 
+/// A struct row broken out of the merge — its column test overlaps an earlier
+/// row that can still fail on another field — is live: the field it leaves
+/// unconstrained stays open, so a case neither row lists is the use site's to
+/// supply, not an extra case.
+#[test]
+fn a_broken_off_struct_row_keeps_its_field_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `A, b: k } => 2 end\n\
+         let u = f { a: `A, b: `Z }",
+    );
+    assert_eq!(scheme(&mint, &output, "u"), "Nat");
+
+    // A type error in the broken-off fallthrough's body — bound once as the
+    // join — is reported exactly once.
+    let (_, _, output) = infer_src(
+        "let wants_nat : Nat -> Nat = fn n => n\n\
+         let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => wants_nat {} end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
 /// A sibling tag group after one whose nesting borrowed the fallthrough: the
 /// sibling's inner level still falls through to the catch-all, so an unlisted
 /// inner case type-checks instead of closing the row.
