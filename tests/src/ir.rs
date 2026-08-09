@@ -3357,27 +3357,25 @@ fn counting_steps_over_a_field_before_the_column() {
     assert!(printed.contains("%join"), "{printed}");
 }
 
-/// A struct row whose column test could take the same values as an earlier
-/// merged row breaks out of the merge when that earlier row can still fail on
-/// another field: the earlier row's other-field failure has to reach the
-/// later row's own test, not skip past it, so the later row becomes the run's
-/// fallthrough instead of a second piece of the same column group.
+/// A struct row whose column test an earlier merged row already answers —
+/// same test, nothing bound from it — rides that row when it can still fail
+/// on another field: the row is compiled where the other field fails, column
+/// test stripped, so no second match on the column projection ever lists
+/// fewer cases than the run itself.
 #[test]
-fn an_overlapping_column_test_breaks_the_merged_run() {
+fn an_overlapping_column_test_rides_the_earlier_row() {
     // The first row's `b` can fail, and the second row tests `a` with the
-    // same tag: the second row is the fallthrough, reached from both the
-    // column's failure and `b`'s, through one join — and nothing here is
-    // unreachable or unhandled.
+    // same tag: the second row rides the first, compiled at `b`'s one failure
+    // path with the `a` test stripped — and nothing here is unreachable or
+    // unhandled.
     assert_eq!(
         lowered("let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => 2 end"),
         "let f = fn e => \
          let %scrut = e in \
-         let %join = fn %fall => \
-         match %fall.a with | `A %case => let %unit : {} = %case in let k = %fall.b in 2 end in \
          match %scrut.a with \
          | `A %case => let %unit : {} = %case in \
-         match %scrut.b with | 0 => 1 | %fall => %join %scrut end \
-         | %fall => %join %scrut end"
+         match %scrut.b with | 0 => 1 \
+         | %fall => let %struct = %scrut in let k = %struct.b in 2 end end"
     );
 
     // With a catch-all after the pair, a value the second row takes still
@@ -3390,20 +3388,17 @@ fn an_overlapping_column_test_breaks_the_merged_run() {
         printed,
         "let f = fn e => \
          let %scrut = e in \
-         let %join = fn %fall => \
-         match %fall.a with \
-         | `A %case => let %unit : {} = %case in let k = %fall.b in 2 \
-         | %fall => let w = %fall in 3 end in \
          match %scrut.a with \
          | `A %case => let %unit : {} = %case in \
-         match %scrut.b with | 0 => 1 | %fall => %join %scrut end \
-         | %fall => %join %scrut end"
+         match %scrut.b with | 0 => 1 \
+         | %fall => let %struct = %scrut in let k = %struct.b in 2 end \
+         | %fall => let w = %scrut in 3 end"
     );
     for body in ["=> 1", "in 2", "in 3"] {
         assert_eq!(printed.matches(body).count(), 1, "{printed}");
     }
 
-    // The same break when the overlapping column tests carry deeper payloads,
+    // The same ride when the overlapping column tests carry deeper payloads,
     // and when they are equal numbers.
     let (printed, errors) = lowered_with_errors(
         "let f = fn e => match e with | { a: `A `X, b: 0 } => 1 | { a: `A `X, b: k } => 2 end",
@@ -3421,11 +3416,180 @@ fn an_overlapping_column_test_breaks_the_merged_run() {
         assert_eq!(printed.matches(body).count(), 1, "{printed}");
     }
 
-    // The counting mirror breaks at the same row when the overlapping pair is
+    // The counting mirror rides at the same row when the overlapping pair is
     // a merged tag's payload, so join placement and edge counting agree.
     let (printed, errors) = lowered_with_errors(
         "let f = fn e => match e with \
          | `P { a: `A, b: 0 } => 1 | `P { a: `A, b: k } => 2 | r => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2", "fn r => 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+}
+
+/// The ride without a catch-all: the run stays one match over the column, so
+/// the whole arm list decides the column's cases and every arm is reachable —
+/// the round-3 regression, in each of its three orderings.
+#[test]
+fn a_ridden_run_stays_whole_without_a_catch_all() {
+    // Two tags in the column, the second split by `b`: one match on `a`
+    // listing both, the riding row at `b`'s failure path.
+    let printed = lowered(
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
+    );
+    assert_eq!(
+        printed,
+        "let f = fn e => \
+         let %scrut = e in \
+         match %scrut.a with \
+         | `A %case => let %unit : {} = %case in let x = %scrut.b in 1 \
+         | `B %case => let %unit : {} = %case in \
+         match %scrut.b with | 0 => 2 \
+         | %fall => let %struct = %scrut in let k = %struct.b in 3 end end"
+    );
+    assert_eq!(printed.matches("match %scrut.a").count(), 1, "{printed}");
+
+    // Mirror ordering: the riding row is separated from the row it rides by
+    // a different tag, and still lands on the right piece.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2", "in 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+    assert_eq!(printed.matches("match %scrut.a").count(), 1, "{printed}");
+
+    // Nested in a tag's payload, so the counting mirror rides too.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["in 1", "=> 2", "in 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // The three shapes again with a trailing catch-all, still clean.
+    for src in [
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 | w => 4 end",
+    ] {
+        let (printed, errors) = lowered_with_errors(src);
+        assert!(errors.is_empty(), "{src}: {errors:#?}");
+        assert_eq!(printed.matches("4").count(), 1, "{printed}");
+    }
+}
+
+/// The corners of riding: a row that would ride more than one failure path is
+/// bound once as a join point; a riding row's own failures fall through to
+/// the run's shared fallthrough; a row past one that absorbs its path is
+/// unreachable; and a duplicate column entry survives the strip.
+#[test]
+fn riding_rows_share_join_points_and_fall_through() {
+    // The ridden row's other field fails two ways — the tag and its payload —
+    // so the riding row is a join point applied at both.
+    let printed = lowered(
+        "let f = fn e => match e with | { a: `A, b: `X `Y } => 1 | { a: `A, b: k } => 2 end",
+    );
+    for body in ["in 1", "in 2"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+    assert_eq!(printed.matches("%join %scrut").count(), 2, "{printed}");
+
+    // A riding row that can itself fail leaks to the shared fallthrough, so
+    // the catch-all is join-pointed and every body appears once.
+    let printed = lowered(
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: 1 } => 3 | w => 4 end",
+    );
+    for body in ["in 1", "=> 2", "=> 3", "fn w => 4"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // A row after one that absorbs its whole failure path can match nothing.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `A, b: k } => 2 | { a: `A, b: 5 } => 3 end",
+    );
+    assert_eq!(errors, ["unreachable-arm@77"], "{errors:#?}");
+
+    // A duplicate column entry is the struct pattern's complaint, and the
+    // strip removes only the entry the run tested, keeping the rest.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `A, a: `B, b: k } => 2 | w => 3 end",
+    );
+    assert_eq!(errors, ["duplicate-field@63"], "{errors:#?}");
+
+    // The strip keeps a calm field written before the column, and steps over
+    // a calm entry of the column's own name on the way to the tested one.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { x, a: `A, b: k } => 2 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert_eq!(printed.matches("in 2").count(), 1, "{printed}");
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: p, a: `A, b: k } => 2 | w => 3 end",
+    );
+    assert_eq!(errors, ["duplicate-field@62"], "{errors:#?}");
+}
+
+/// The run still breaks — the later row compiled as the fallthrough, order
+/// preserved — when the earlier row's column test does not already answer the
+/// later one: a different payload, a payload the later row binds from, a
+/// payload of another kind, or differing payload numbers.
+#[test]
+fn an_unanswered_overlap_still_breaks_the_run() {
+    // Same tag, different payload tags: matching `` `A `X `` says nothing
+    // about `` `A `Y ``, so the second row breaks off.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A `X, b: 0 } => 1 | { a: `A `Y, b: k } => 2 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // A payload the later row binds cannot be stripped: there is no value to
+    // bind it to on the ridden path.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `A x, b: k } => 2 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    for body in ["=> 1", "in 2"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+
+    // A bare tag answers a unit payload, not a tagged one — and differing
+    // payload numbers answer nothing.
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `A `Q, b: k } => 2 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | { a: `A 0, b: `X } => 1 | { a: `A 1, b: k } => 2 | w => 3 end",
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    // The counting mirror breaks at the same row when the run sits in a
+    // merged tag's payload.
+    let (printed, errors) = lowered_with_errors(
+        "let f = fn e => match e with \
+         | `T { a: `A `X, b: 0 } => 1 | `T { a: `A `Y, b: k } => 2 | r => 3 end",
     );
     assert!(errors.is_empty(), "{errors:#?}");
     for body in ["=> 1", "in 2", "fn r => 3"] {

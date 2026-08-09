@@ -4281,6 +4281,70 @@ fn a_broken_off_struct_row_keeps_its_field_open() {
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
 }
 
+/// A run whose later row rides an earlier one — same column test, the
+/// earlier row still able to fail on another field — stays one match over
+/// the column: with no catch-all, the column's cases close over every tag
+/// the run lists, and every arm is reachable. The round-3 regression, in
+/// each of its three orderings.
+#[test]
+fn a_ridden_run_closes_the_column_over_every_listed_case() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // Mirror ordering: the riding row lands past a different tag and the
+    // column still closes over both.
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // Nested in a tag's payload: the outer sum closes over the one tag, the
+    // payload's column over both of its own.
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`T { a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // The same three shapes with a trailing catch-all still build clean.
+    for src in [
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 | w => 4 end",
+    ] {
+        let (_, out, output) = infer_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(output.errors.is_empty(), "{src}: {:#?}", output.errors);
+    }
+
+    // A type error in a body shared across the riding row's failure paths is
+    // reported exactly once: the row rides as a join point when the ridden
+    // row fails more than one way.
+    let (_, _, output) = infer_src(
+        "let wants_nat : Nat -> Nat = fn n => n\n\
+         let f = fn e => match e with \
+         | { a: `A, b: `X `Y } => 1 | { a: `A, b: k } => wants_nat {} end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
 /// A sibling tag group after one whose nesting borrowed the fallthrough: the
 /// sibling's inner level still falls through to the catch-all, so an unlisted
 /// inner case type-checks instead of closing the row.

@@ -856,7 +856,7 @@ struct Loops {
 /// inside it, so a `Pat` that is not `Pat::Calm` can fail and a [`Calm`] never
 /// can. Keeping them apart is what lets the binding walk take a value that
 /// cannot fail and match nothing it would have to call unreachable.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Pat {
     /// A pattern that cannot fail — matching it is only binding.
     Calm(Calm),
@@ -880,7 +880,7 @@ enum Pat {
 /// A pattern that cannot fail: a bare name, `()`, or a struct pattern all of
 /// whose fields cannot fail either. What a `let` accepts, and what a match arm
 /// that accepts everything is.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Calm {
     /// Binds the whole value.
     Bind(Tracked<Symbol>),
@@ -936,11 +936,14 @@ struct Merged {
 }
 
 /// One struct row of a merged run, taken apart around the column being tested:
-/// the pattern for that field, every other field in written order, and the
-/// row's body and span.
+/// the pattern for that field, every other field in written order, the rows
+/// riding it — later rows whose column test this row's already answers, each
+/// stripped of that test and compiled where this row's other fields fail
+/// (see [`settled`]) — and the row's body and span.
 struct Piece {
     fpat: Pat,
     others: Vec<(TrackedString, Pat)>,
+    residual: Vec<Clause>,
     body: Term,
     span: Span,
 }
@@ -1908,43 +1911,52 @@ fn rows_edges(pats: &[&Pat]) -> usize {
         Pat::Sieve { fields, .. } => {
             // The merged struct run, mirrored: the column the first row tests
             // first, merged across every row that tests it, every other field
-            // failing on its own — and the run breaking at a row whose column
-            // test [`overlaps`] an earlier merged row that can still fail on
-            // another field, exactly where [`Builder::sieve`] breaks it.
+            // failing on its own. A row whose column test [`overlaps`] an
+            // earlier merged row that can still fail on another field either
+            // rides that row when [`settled`] — counted by what is left of it
+            // once the column test is stripped — or breaks the run, exactly
+            // where [`Builder::sieve`] rides and breaks.
             let column_name = sieve_column(fields);
             let mut column: Vec<&Pat> = Vec::new();
-            // Whether each merged row keeps a refutable field beside the
-            // column — whether its failures fall through past the group.
-            let mut open: Vec<bool> = Vec::new();
-            let mut others = 0;
+            // Per merged row: how many ways its other fields can fail, and
+            // the stripped rows riding it — the failures that fall past the
+            // run are the riders' own once a row carries any.
+            let mut others: Vec<usize> = Vec::new();
+            let mut riding: Vec<Vec<Pat>> = Vec::new();
             let mut at = 0;
             while at < pats.len() {
                 match pats[at] {
-                    Pat::Sieve { fields, .. } if tests_field(fields, column_name) => {
+                    Pat::Sieve { span, fields } if tests_field(fields, column_name) => {
                         let test = column_test(fields, column_name);
-                        if column
+                        let blocked = column
                             .iter()
-                            .zip(&open)
-                            .any(|(prior, &fallible)| fallible && overlaps(prior, test))
-                        {
-                            break;
-                        }
-                        let mut row_others = 0;
-                        let mut taken = false;
-                        for (name, pat) in fields {
-                            if !taken
-                                && name.tracked == *column_name
-                                && !matches!(pat, Pat::Calm(_))
-                            {
-                                column.push(pat);
-                                taken = true;
-                            } else {
-                                row_others += pat.edges();
+                            .zip(&others)
+                            .position(|(prior, &fallible)| fallible > 0 && overlaps(prior, test));
+                        match blocked {
+                            Some(prior) if settled(column[prior], test) => {
+                                riding[prior].push(strip_column(*span, fields, column_name));
+                                at += 1;
+                            }
+                            Some(_) => break,
+                            None => {
+                                let mut row_others = 0;
+                                let mut taken = false;
+                                for (name, pat) in fields {
+                                    if !taken
+                                        && name.tracked == *column_name
+                                        && !matches!(pat, Pat::Calm(_))
+                                    {
+                                        column.push(pat);
+                                        taken = true;
+                                    } else {
+                                        row_others += pat.edges();
+                                    }
+                                }
+                                others.push(row_others);
+                                riding.push(Vec::new());
+                                at += 1;
                             }
                         }
-                        open.push(row_others > 0);
-                        others += row_others;
-                        at += 1;
                     }
                     _ => break,
                 }
@@ -1952,7 +1964,18 @@ fn rows_edges(pats: &[&Pat]) -> usize {
             if at < pats.len() {
                 rows_edges(&pats[at..])
             } else {
-                rows_edges(&column) + others
+                rows_edges(&column)
+                    + others
+                        .iter()
+                        .zip(&riding)
+                        .map(|(&row_others, rows)| match rows.is_empty() {
+                            true => row_others,
+                            false => {
+                                let pats: Vec<&Pat> = rows.iter().collect();
+                                rows_edges(&pats)
+                            }
+                        })
+                        .sum::<usize>()
             }
         }
     }
@@ -1999,6 +2022,62 @@ fn overlaps(a: &Pat, b: &Pat) -> bool {
         (Pat::Tag { name: a, .. }, Pat::Tag { name: b, .. }) => a.tracked == b.tracked,
         (Pat::Natural { value: a, .. }, Pat::Natural { value: b, .. }) => a == b,
         _ => true,
+    }
+}
+
+/// Whether a later row's column test is already answered by an earlier merged
+/// row's: every value the earlier test takes, the later test takes too, and
+/// the later binds nothing from that field. Such a row rides the earlier one
+/// instead of breaking the merged run — on the earlier row's other-field
+/// failure the column needs no second look, so the row is compiled there with
+/// the column test stripped ([`strip_column`]). Testing the column again
+/// there would list fewer cases than the whole match handles on the same
+/// projection, and inference would close the field's row too early. See
+/// [`Builder::sieve`], and [`rows_edges`] for the count's mirror.
+fn settled(prior: &Pat, test: &Pat) -> bool {
+    let mut bound = Vec::new();
+    test.binders(&mut bound);
+    bound.is_empty() && satisfied(prior, test)
+}
+
+/// Whether every value the first pattern accepts satisfies the second.
+/// Conservative: `false` wherever the answer takes more than a walk down the
+/// two spines together.
+fn satisfied(prior: &Pat, test: &Pat) -> bool {
+    match (prior, test) {
+        (Pat::Calm(Calm::Unit(_)), Pat::Calm(Calm::Unit(_))) => true,
+        (
+            Pat::Tag {
+                name: a,
+                payload: p,
+            },
+            Pat::Tag {
+                name: b,
+                payload: q,
+            },
+        ) => a.tracked == b.tracked && satisfied(p, q),
+        (Pat::Natural { value: a, .. }, Pat::Natural { value: b, .. }) => a == b,
+        _ => false,
+    }
+}
+
+/// A riding row minus its column test: the same struct pattern without the
+/// entry the merged run already answered — [`column_test`]'s pick — rebuilt
+/// calm when nothing refutable is left. What [`settled`] rows are compiled
+/// as, on the path whose column test they ride.
+fn strip_column(span: Span, fields: &[(TrackedString, Pat)], column: &str) -> Pat {
+    let mut taken = false;
+    let mut acc = StructAcc::Calm(Vec::new());
+    for (name, pat) in fields {
+        if !taken && name.tracked == column && !matches!(pat, Pat::Calm(_)) {
+            taken = true;
+        } else {
+            acc = acc.add(name.clone(), pat.clone());
+        }
+    }
+    match acc {
+        StructAcc::Calm(fields) => Pat::Calm(Calm::Struct { span, fields }),
+        StructAcc::Mixed(fields) => Pat::Sieve { span, fields },
     }
 }
 
@@ -4464,8 +4543,9 @@ impl Builder<'_> {
 
     /// The struct segment of a level: the run of struct rows merged on the
     /// column the first row tests, every other field of each row folded
-    /// inside its own branch, and everything the run cannot match falling
-    /// through together.
+    /// inside its own branch, later rows riding the earlier ones that
+    /// already answer their column test ([`settled`]), and everything the
+    /// run cannot match falling through together.
     #[allow(clippy::too_many_arguments)]
     fn sieve(
         &mut self,
@@ -4526,57 +4606,90 @@ impl Builder<'_> {
             // A row joins the group only while its column test cannot take a
             // value an earlier merged row could — one that still has another
             // field able to fail. That earlier row's other-field failure must
-            // fall through to this row first, so this row breaks the run and
-            // becomes the fallthrough instead, written order preserved.
-            let joins = unmerged.is_empty() && tests_field(&row.fields, &column) && {
-                let test = column_test(&row.fields, &column);
-                !pieces.iter().any(|piece| {
-                    overlaps(&piece.fpat, test)
-                        && piece.others.iter().any(|(_, pat)| pat.edges() > 0)
-                })
+            // fall through to this row first: when the failure already
+            // answers this row's own column test ([`settled`]), the row rides
+            // the earlier one — compiled where that other field fails, column
+            // test stripped — and otherwise it breaks the run and becomes the
+            // fallthrough instead, written order preserved.
+            let tests = unmerged.is_empty() && tests_field(&row.fields, &column);
+            let blocked = match tests {
+                true => {
+                    let test = column_test(&row.fields, &column);
+                    pieces.iter().position(|piece| {
+                        overlaps(&piece.fpat, test)
+                            && piece.others.iter().any(|(_, pat)| pat.edges() > 0)
+                    })
+                }
+                false => None,
             };
-            if joins {
-                let mut fpat = None;
-                let mut others = Vec::new();
-                for (name, pat) in row.fields {
-                    if fpat.is_none() && name.tracked == column && !matches!(pat, Pat::Calm(_)) {
-                        fpat = Some((name, pat));
-                    } else {
-                        others.push((name, pat));
+            match (tests, blocked) {
+                (true, Some(prior))
+                    if settled(&pieces[prior].fpat, column_test(&row.fields, &column)) =>
+                {
+                    let pat = strip_column(row.pspan, &row.fields, &column);
+                    pieces[prior].residual.push(Clause {
+                        pat,
+                        body: row.body,
+                        span: row.span,
+                    });
+                }
+                (true, None) => {
+                    let mut fpat = None;
+                    let mut others = Vec::new();
+                    for (name, pat) in row.fields {
+                        if fpat.is_none() && name.tracked == column && !matches!(pat, Pat::Calm(_))
+                        {
+                            fpat = Some((name, pat));
+                        } else {
+                            others.push((name, pat));
+                        }
                     }
+                    let (fname, fpat) =
+                        fpat.expect("the merge rule picked rows that test the column");
+                    if fspan.is_none() {
+                        fspan = Some(fname.span);
+                    }
+                    pieces.push(Piece {
+                        fpat,
+                        others,
+                        residual: Vec::new(),
+                        body: row.body,
+                        span: row.span,
+                    });
                 }
-                let (fname, fpat) = fpat.expect("the merge rule picked rows that test the column");
-                if fspan.is_none() {
-                    fspan = Some(fname.span);
-                }
-                pieces.push(Piece {
-                    fpat,
-                    others,
-                    body: row.body,
-                    span: row.span,
-                });
-            } else {
-                unmerged.push(Clause {
+                _ => unmerged.push(Clause {
                     pat: Pat::Sieve {
                         span: row.pspan,
                         fields: row.fields,
                     },
                     body: row.body,
                     span: row.span,
-                });
+                }),
             }
         }
         let fspan = fspan.expect("the first row tests the column");
+        // A piece's riding rows are that path's own little arm list: one that
+        // accepts everything ends it, and anything written past that one is
+        // unreachable.
+        for piece in &mut pieces {
+            self.prune(&mut piece.residual);
+        }
         let mut rest2: Vec<Clause> = unmerged;
         rest2.extend(rest);
         // How many paths can fall out of the merged run: the column's own
-        // failures, and every other field's. One means the fallthrough is
-        // compiled at that path; more means a join point.
+        // failures, and per piece, whatever escapes it — its other fields'
+        // failures, or its riding rows' own once it carries any. One means
+        // the fallthrough is compiled at that path; more means a join point.
         let column_pats: Vec<&Pat> = pieces.iter().map(|piece| &piece.fpat).collect();
         let other_edges: usize = pieces
             .iter()
-            .flat_map(|piece| piece.others.iter())
-            .map(|(_, pat)| pat.edges())
+            .map(|piece| match piece.residual.is_empty() {
+                true => piece.others.iter().map(|(_, pat)| pat.edges()).sum(),
+                false => {
+                    let pats: Vec<&Pat> = piece.residual.iter().map(|row| &row.pat).collect();
+                    rows_edges(&pats)
+                }
+            })
             .sum();
         let total = rows_edges(&column_pats) + other_edges;
         drop(column_pats);
@@ -4618,8 +4731,49 @@ impl Builder<'_> {
         };
         let mut frows = Vec::new();
         for piece in pieces {
-            let mut inner = piece.body;
-            for (name, sub) in piece.others.into_iter().rev() {
+            let Piece {
+                fpat,
+                others,
+                residual,
+                body,
+                span,
+            } = piece;
+            // A piece with rows riding it hands its other-field failures to
+            // them first, and they fall through to whatever the whole run
+            // does: a join point when those failures take more than one path,
+            // the rows compiled at the one path otherwise.
+            let ridden = !residual.is_empty();
+            let mut owned_ride: Option<Fail> = None;
+            if ridden {
+                let held = base.expect("a ridden piece has another field, forcing the scrutinee");
+                let paths: usize = others.iter().map(|(_, pat)| pat.edges()).sum();
+                if paths > 1 {
+                    let (join, func) = self.join(residual, sub_fail, at, false);
+                    prefix.push((join, func));
+                    owned_ride = Some(Fail::Jump {
+                        join: join.tracked,
+                        arg: held,
+                        at,
+                    });
+                } else {
+                    let leaks = {
+                        let pats: Vec<&Pat> = residual.iter().map(|row| &row.pat).collect();
+                        rows_edges(&pats)
+                    };
+                    owned_ride = Some(Fail::Rows {
+                        scrut: held,
+                        rows: residual,
+                        then: Box::new(handed(sub_fail, leaks)),
+                        written: false,
+                    });
+                }
+            }
+            let piece_fail: &mut Option<Fail> = match ridden {
+                true => &mut owned_ride,
+                false => &mut *sub_fail,
+            };
+            let mut inner = body;
+            for (name, sub) in others.into_iter().rev() {
                 let held = base.expect("a second field forced the scrutinee to a name");
                 let base = TermKind::Ident(held.tracked).with_span(name.span);
                 let value = TermKind::Project {
@@ -4634,18 +4788,18 @@ impl Builder<'_> {
                         vec![Clause {
                             pat,
                             body: inner,
-                            span: piece.span,
+                            span,
                         }],
-                        sub_fail,
+                        piece_fail,
                         at,
                         false,
                     ),
                 };
             }
             frows.push(Clause {
-                pat: piece.fpat,
+                pat: fpat,
                 body: inner,
-                span: piece.span,
+                span,
             });
         }
         let base = match base {
