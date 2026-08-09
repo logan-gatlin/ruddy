@@ -307,6 +307,50 @@ impl fmt::Display for parse::PatternKind {
     }
 }
 
+/// A witness groups by what it prints as: a case carrying something reads as
+/// the application it looks like, a bare one is still waiting for a payload,
+/// and the two prose forms — "anything", "anything other than …" — group
+/// lowest, so a payload position always brackets them and they never read as
+/// part of what follows.
+impl Grouped for ir::Witness {
+    fn prec(&self) -> Prec {
+        match self {
+            ir::Witness::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            ir::Witness::Tag { payload: None, .. } => Prec::Tag,
+            ir::Witness::Natural(_) | ir::Witness::Struct(_) => Prec::Atom,
+            ir::Witness::Any | ir::Witness::Other(_) => Prec::Lambda,
+        }
+    }
+}
+
+/// A witness prints as the example value it is, in source syntax, so the
+/// unhandled-values complaint shows the reader something they could write an
+/// arm for. The two forms no value literal spells — a position anything
+/// serves for, and an open row's "anything else" — print as the plain English
+/// they mean.
+impl fmt::Display for ir::Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ir::Witness::Any => f.write_str("anything"),
+            ir::Witness::Natural(value) => write!(f, "{value}"),
+            ir::Witness::Tag { name, payload } => write_tag(f, name, false, payload.as_deref()),
+            ir::Witness::Struct(fields) => write_struct(f, fields),
+            ir::Witness::Other(cases) => {
+                f.write_str("anything other than ")?;
+                for (at, case) in cases.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(" or ")?;
+                    }
+                    write!(f, "`{case}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl ir::ErrorKind {
     /// A stable, greppable name for this kind of error. The namespace is part
     /// of the code rather than only of the message: a reporter that wants to
@@ -353,6 +397,10 @@ impl ir::ErrorKind {
             ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
             ir::ErrorKind::UnreachableArm => "unreachable-arm",
             ir::ErrorKind::MisplacedCatchAll => "misplaced-catch-all",
+            // The witness is not part of the code, only of the wording: what
+            // went wrong is the match, and the example only shows a value it
+            // misses.
+            ir::ErrorKind::UnhandledValues { .. } => "unhandled-values",
             ir::ErrorKind::UnhandledNumbers => "unhandled-numbers",
             ir::ErrorKind::MixedMatch => "mixed-match",
             ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
@@ -483,6 +531,12 @@ impl fmt::Display for ir::ErrorKind {
             }
             ir::ErrorKind::MisplacedCatchAll => f.write_str(
                 "this arm accepts everything, so the arms after it can never be reached",
+            ),
+            // The example is the complaint: a value no arm accepts, written in
+            // source syntax so the reader can see what to add an arm for.
+            ir::ErrorKind::UnhandledValues { witness } => write!(
+                f,
+                "some values are not handled — for example `{witness}`; add an arm for them or a final arm naming the rest",
             ),
             ir::ErrorKind::UnhandledNumbers => f.write_str(
                 "numbers not listed here are not handled; add a final arm that names the rest",

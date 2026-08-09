@@ -97,6 +97,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::UnreachableArm,
         IrError::MisplacedCatchAll,
+        IrError::UnhandledValues {
+            witness: ir::Witness::Tag {
+                name: "A".to_string(),
+                payload: None,
+            },
+        },
         IrError::UnhandledNumbers,
         IrError::MixedMatch,
         IrError::DuplicateBinding {
@@ -1710,6 +1716,37 @@ fn the_pattern_complaints_say_what_was_written() {
         "numbers not listed here are not handled; add a final arm that names the rest"
     );
 
+    // The unhandled-values complaint renders its witness in source syntax:
+    // the hole's own example value, backticks and braces as a reader would
+    // write them.
+    let hole = IrError::UnhandledValues {
+        witness: ir::Witness::Struct(
+            [
+                (
+                    "a".to_string(),
+                    ir::Witness::Tag {
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    ir::Witness::Tag {
+                        name: "Y".to_string(),
+                        payload: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    };
+    assert_eq!(hole.code(), "unhandled-values");
+    assert_eq!(
+        hole.to_string(),
+        "some values are not handled — for example `{ a: `A, b: `Y }`; add an arm for them or a final arm naming the rest"
+    );
+
     assert_eq!(IrError::MixedMatch.code(), "mixed-match");
     assert_eq!(
         IrError::MixedMatch.to_string(),
@@ -1721,6 +1758,78 @@ fn the_pattern_complaints_say_what_was_written() {
     };
     assert_eq!(bound.code(), "duplicate-binding");
     assert_eq!(bound.to_string(), "this binds `x` twice");
+}
+
+/// Every shape a witness takes, rendered: numbers as themselves, tags bare
+/// and carrying — a carried prose form bracketed, so the example still reads
+/// as one value — an open position as "anything other than …", and the
+/// position nothing constrains as "anything".
+#[test]
+fn a_witness_renders_in_source_syntax() {
+    assert_eq!(ir::Witness::Natural(2).to_string(), "2");
+    assert_eq!(ir::Witness::Any.to_string(), "anything");
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Natural(1))),
+        }
+        .to_string(),
+        "`A 1"
+    );
+    // A payload that is itself a tag — bare or carrying — or prose, is
+    // bracketed: the example has to read back as the one value it is.
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Tag {
+                name: "X".to_string(),
+                payload: Some(Box::new(ir::Witness::Natural(1))),
+            })),
+        }
+        .to_string(),
+        "`A (`X 1)"
+    );
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Tag {
+                name: "X".to_string(),
+                payload: None,
+            })),
+        }
+        .to_string(),
+        "`A (`X)"
+    );
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "B".to_string(),
+            payload: Some(Box::new(ir::Witness::Other(vec![
+                "X".to_string(),
+                "Y".to_string()
+            ]))),
+        }
+        .to_string(),
+        "`B (anything other than `X or `Y)"
+    );
+    // A struct witness beside a prose field: the field list reads on.
+    assert_eq!(
+        ir::Witness::Struct(
+            [
+                (
+                    "a".to_string(),
+                    ir::Witness::Tag {
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                ),
+                ("b".to_string(), ir::Witness::Other(vec!["X".to_string()]),),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .to_string(),
+        "{ a: `A, b: anything other than `X }"
+    );
 }
 
 /// The prose a person meets stays in their words: the compiler's own names

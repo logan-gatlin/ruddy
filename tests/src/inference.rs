@@ -123,16 +123,9 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
                 out.extend(body_tys(payload));
             }
         }
-        TermKind::Match {
-            scrutinee,
-            arms,
-            default,
-        } => {
+        TermKind::Match { scrutinee, arms } => {
             out.extend(body_tys(scrutinee));
-            for arm in arms {
-                out.extend(body_tys(&arm.body));
-            }
-            if let Some((_, body)) = default {
+            for (_, body) in arms {
                 out.extend(body_tys(body));
             }
         }
@@ -4102,9 +4095,10 @@ fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
     );
 }
 
-/// R7's nuance: a tag only partially handled — a refutable payload — reaches
-/// the catch-all through a join point applied to the whole scrutinee, so the
-/// binder's type keeps that case present rather than ruling it out.
+/// R7's nuance: a tag only partially handled — a refutable payload — is not
+/// fully handled by the arms above the catch-all, so the binder's type keeps
+/// that case present rather than ruling it out: an `A`-tagged value whose
+/// payload is not `X` reaches it.
 #[test]
 fn a_partially_handled_case_stays_present_for_the_catch_all() {
     let (mint, _, output) = inferred(
@@ -4166,6 +4160,29 @@ fn a_natural_match_is_about_numbers() {
     assert_eq!(scheme(&mint, &output, "same"), "Nat -> Nat");
 }
 
+/// The column-union program — the shape that broke revision 1 — types clean:
+/// `a` closes over its one tag, `b` over the two the two arms list between
+/// them, and `c` is unconstrained, because positions type as the union of
+/// what the whole match tests there, never per-arm.
+#[test]
+fn columns_type_as_unions_across_arms() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: `X, c: x } => 1 | { a: `A, b: `Y, c: y } => 2 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A, b: `X | `Y, c: 'a, ..'b } -> Nat"
+    );
+}
+
+/// `()` as a pattern demands unit of its position, in a match as on a `let`.
+#[test]
+fn a_unit_pattern_demands_unit() {
+    let (mint, _, output) = inferred("let f = fn v => match v with () => 1 end");
+    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
+}
+
 /// The empty match eliminates the empty sum: the scrutinee is `|`, and the
 /// match's own type is anything at all.
 #[test]
@@ -4206,10 +4223,11 @@ fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
     }
 }
 
-/// A body two failure paths share is bound once as a join point, so a type
-/// error inside it is reported exactly once.
+/// Every written body appears exactly once in the IR — there is no
+/// duplication and no join point — so a type error inside one is reported
+/// exactly once, trivially.
 #[test]
-fn an_error_in_a_join_pointed_body_is_reported_once() {
+fn an_error_in_an_arm_body_is_reported_once() {
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
          let f = fn e => match e with | `A `X x => 1 | r => wants_nat {} end",
@@ -4229,11 +4247,11 @@ fn a_natural_match_without_a_default_still_types() {
     assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat");
 }
 
-/// Three levels of nesting keep the written catch-all reachable: every inner
-/// row stays open, so a case none of the inner arms list is the catch-all's
-/// to take, not an extra case.
+/// Three levels of nesting under a written catch-all: the catch-all is
+/// irrefutable at every position, so every inner row stays open, and a case
+/// none of the inner arms list is the catch-all's to take, not an extra case.
 #[test]
-fn a_deeply_nested_fallthrough_keeps_the_rows_open() {
+fn a_catch_all_keeps_nested_rows_open() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with | `A `B `C 0 => 1 | `A `B r => 2 | q => 3 end\n\
          let user = f (`A `Z)",
@@ -4244,11 +4262,11 @@ fn a_deeply_nested_fallthrough_keeps_the_rows_open() {
     );
 }
 
-/// The same through a struct payload: the leftover rows carry the enclosing
-/// jump as a copy, so the tag above the struct stays partially handled and
-/// open rather than closing.
+/// The same through a struct payload: the positions inside the struct are
+/// open under the catch-all too, so the tag above the struct stays partially
+/// handled and open rather than closing.
 #[test]
-fn a_struct_fallthrough_keeps_the_enclosing_rows_open() {
+fn a_catch_all_keeps_struct_payload_rows_open() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with | `P `A { x: `X } => 1 | `P `A w => 2 | q => 3 end\n\
          let user = f (`P `Z)",
@@ -4259,20 +4277,19 @@ fn a_struct_fallthrough_keeps_the_enclosing_rows_open() {
     );
 }
 
-/// A struct row broken out of the merge — its column test overlaps an earlier
-/// row that can still fail on another field — is live: the field it leaves
-/// unconstrained stays open, so a case neither row lists is the use site's to
-/// supply, not an extra case.
+/// Overlapping struct arms — the same tag at one field, a binder at the
+/// other in the later arm: the binder keeps its field's position open, so a
+/// case neither arm lists is the use site's to supply, not an extra case.
 #[test]
-fn a_broken_off_struct_row_keeps_its_field_open() {
+fn an_overlapping_struct_arm_keeps_its_field_open() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `A, b: k } => 2 end\n\
          let u = f { a: `A, b: `Z }",
     );
     assert_eq!(scheme(&mint, &output, "u"), "Nat");
 
-    // A type error in the broken-off fallthrough's body — bound once as the
-    // join — is reported exactly once.
+    // A type error in the later arm's body — on the page exactly once — is
+    // reported exactly once.
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
          let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => wants_nat {} end",
@@ -4281,13 +4298,12 @@ fn a_broken_off_struct_row_keeps_its_field_open() {
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
 }
 
-/// A run whose later row rides an earlier one — same column test, the
-/// earlier row still able to fail on another field — stays one match over
-/// the column: with no catch-all, the column's cases close over every tag
-/// the run lists, and every arm is reachable. The round-3 regression, in
-/// each of its three orderings.
+/// Columns type as the union of what the whole match tests there, never
+/// per-arm: with no catch-all, a column's cases close over every tag any arm
+/// lists — the revision-1 breaker shapes, in each of their orderings, now
+/// clean.
 #[test]
-fn a_ridden_run_closes_the_column_over_every_listed_case() {
+fn a_column_closes_over_every_listed_case() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
          | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
@@ -4333,9 +4349,8 @@ fn a_ridden_run_closes_the_column_over_every_listed_case() {
         assert!(output.errors.is_empty(), "{src}: {:#?}", output.errors);
     }
 
-    // A type error in a body shared across the riding row's failure paths is
-    // reported exactly once: the row rides as a join point when the ridden
-    // row fails more than one way.
+    // A type error in a body reachable past an overlapping earlier arm is
+    // still one body on the page, so it is reported exactly once.
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
          let f = fn e => match e with \
@@ -4345,11 +4360,11 @@ fn a_ridden_run_closes_the_column_over_every_listed_case() {
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
 }
 
-/// A sibling tag group after one whose nesting borrowed the fallthrough: the
-/// sibling's inner level still falls through to the catch-all, so an unlisted
+/// Two tags with nested tests before one catch-all: the catch-all keeps
+/// every nested position open, whichever tag it sits under, so an unlisted
 /// inner case type-checks instead of closing the row.
 #[test]
-fn a_sibling_group_still_falls_through_to_the_catch_all() {
+fn a_sibling_tags_positions_stay_open_under_the_catch_all() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
          | `A `B `C 0 => 1 | `A `B r => 2 | `D `E 0 => 4 | q => 5 end\n\

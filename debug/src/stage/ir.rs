@@ -6,7 +6,9 @@
 
 use ruddy::{
     inference,
-    ir::{Decl, Row, SumCase, Tail, Term, TermKind, Test, Type, TypeField, TypeKind},
+    ir::{
+        Decl, Pattern, PatternKind, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind,
+    },
     symbol::{Mint, Symbol},
     types::Core,
 };
@@ -221,51 +223,20 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
         }
         .child(term_node(ids, cx, mint, base, trace))
         .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
-        // The scrutinee, then one test per arm — the binder a symbol like a
-        // lambda's argument, so it cross-highlights with its uses — and the
-        // default's binder and body last. Reading this beside the AST tab's
-        // match is how the compilation is seen.
-        TermKind::Match {
-            scrutinee,
-            arms,
-            default,
-        } => {
+        // The scrutinee, then each written arm: its normalized pattern — the
+        // binders symbols like a lambda's argument, so they cross-highlight
+        // with their uses — and its body. Reading this beside the AST tab's
+        // match shows the normalization: puns expanded, symbols minted, and
+        // nothing else changed, because nothing else is.
+        TermKind::Match { scrutinee, arms } => {
             let mut match_node = Node {
                 label: "Match".into(),
                 ..node
             }
             .child(term_node(ids, cx, mint, scrutinee, trace));
-            for arm in arms {
-                let case = match &arm.test {
-                    // Spanned at the binder, which for a reader's own name is
-                    // where it was written — the span a symbol-carrying node
-                    // has to sit at for cross-highlighting to point true.
-                    Test::Tag { name, binder } => with_symbol(
-                        Node::new(
-                            ids.next(),
-                            "Case",
-                            format!("`{} {}", name.tracked, mint.name(binder.tracked)),
-                        )
-                        .at(binder.span),
-                        cx,
-                        binder.tracked,
-                    ),
-                    Test::Natural(value) => {
-                        Node::new(ids.next(), "Case", value.to_string()).at(arm.body.span)
-                    }
-                };
+            for (pattern, body) in arms {
                 match_node = match_node
-                    .child(case)
-                    .child(term_node(ids, cx, mint, &arm.body, trace));
-            }
-            if let Some((binder, body)) = default {
-                let bound = with_symbol(
-                    Node::new(ids.next(), "Default", mint.name(binder.tracked)).at(binder.span),
-                    cx,
-                    binder.tracked,
-                );
-                match_node = match_node
-                    .child(bound)
+                    .child(pattern_node(ids, cx, mint, pattern))
                     .child(term_node(ids, cx, mint, body, trace));
             }
             match_node
@@ -290,6 +261,67 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 ..node
             }
             .children(wrappers)
+        }
+    }
+}
+
+/// One normalized pattern as a row per node, mirroring the AST tab's pattern
+/// wrappers: the text is the pattern printed as source, and a binder carries
+/// its symbol so it cross-highlights with every use in the arm's body.
+fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node {
+    let node = Node::new(
+        ids.next(),
+        "",
+        print::ir::pattern(&pattern.tracked, mint).to_string(),
+    )
+    .at(pattern.span);
+    match &pattern.tracked {
+        PatternKind::Bind(name) => with_symbol(
+            Node {
+                label: "Bind".into(),
+                ..node
+            },
+            cx,
+            name.tracked,
+        ),
+        PatternKind::Natural(_) => Node {
+            label: "Natural".into(),
+            ..node
+        },
+        PatternKind::Unit => Node {
+            label: "Unit".into(),
+            ..node
+        },
+        // A bare tag is a leaf: the unit it constrains its payload to is the
+        // type's business, and nothing here was written to show.
+        PatternKind::Tag { payload, .. } => {
+            let node = Node {
+                label: "Tag".into(),
+                ..node
+            };
+            match payload {
+                Some(payload) => node.child(pattern_node(ids, cx, mint, payload)),
+                None => node,
+            }
+        }
+        PatternKind::Struct(fields) => {
+            let kids: Vec<Node> = fields
+                .iter()
+                .map(|(name, field)| {
+                    Node::new(
+                        ids.next(),
+                        format!("{name}:"),
+                        print::ir::pattern(&field.value.tracked, mint).to_string(),
+                    )
+                    .at(field.name_span)
+                    .child(pattern_node(ids, cx, mint, &field.value))
+                })
+                .collect();
+            Node {
+                label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
         }
     }
 }

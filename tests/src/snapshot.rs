@@ -1598,13 +1598,16 @@ fn every_stage_reports_on_explicit_absence() {
 }
 
 /// A program with a match and a pattern `let` reaches every stage: the AST
-/// tab shows the written arms and patterns, the IR tab shows the one shallow
-/// `Match` beside the `let`s and join point it compiled into, and the fresh
-/// symbols the compilation minted sit in the symbols tab like any other.
+/// tab shows the written arms and patterns, the IR tab shows the one matrix
+/// `Match` — scrutinee, each arm's normalized pattern with its binder
+/// symbols, and body — beside the definitions the pattern `let` desugared
+/// into, and the `let`'s fresh temporary sits in the symbols tab like any
+/// other. No tree exists to show: the lowering-visible transformation is the
+/// desugar and the normalization.
 #[test]
 fn a_match_and_a_pattern_let_reach_every_stage() {
     let source = "let {x, y} = { x: 1, y: 2 }\n\
-                  let f = fn e => match e with | `A `X a => x | r => y end\n";
+                  let f = fn e => match e with | `A `X a => x | { g: `G p } => p | r => y end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     let stage = |id: &str| {
@@ -1625,16 +1628,32 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
         assert!(ast.contains(&label), "ast lacks {label}: {ast:?}");
     }
 
-    // The IR tab renders the compiled form: the shallow match's cases and
-    // default, and the definitions the struct pattern became.
+    // The IR tab renders the matrix node: the arms' normalized patterns —
+    // tags, struct fields, binders — and the definitions the struct pattern
+    // `let` became. No node of any compiled tree is on the page.
     let ir = nodes(stage("ir"));
     let labels: Vec<&str> = ir.iter().map(|node| node.label.as_str()).collect();
-    for label in ["Match", "Case", "Default", "let x", "let y", "let %struct"] {
+    for label in [
+        "Match",
+        "Tag",
+        "Bind",
+        "Struct",
+        "g:",
+        "let x",
+        "let y",
+        "let %struct",
+    ] {
         assert!(labels.contains(&label), "ir lacks {label}: {labels:?}");
     }
-    // The join point the shared fallthrough became is on the page too.
+    for artifact in ["Case", "Default", "Let %join"] {
+        assert!(!labels.contains(&artifact), "{labels:?}");
+    }
+
+    // The arm binders carry their symbols, so they cross-highlight with the
+    // uses in their bodies.
     assert!(
-        ir.iter().any(|node| node.label == "Let %join"),
+        ir.iter()
+            .any(|node| node.label == "Bind" && node.symbol.is_some()),
         "{labels:?}"
     );
 
@@ -1651,14 +1670,18 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
         }
     }
 
-    // The fresh symbols print recognizably — the `%` no identifier can spell —
-    // and sit in the symbols tab beside the source's own names.
+    // The pattern `let`'s fresh temporary prints recognizably — the `%` no
+    // identifier can spell — and sits in the symbols tab beside the source's
+    // own names; the match minted nothing beyond what its patterns bind.
     let symbols: Vec<&str> = stage("symbols")
         .nodes
         .iter()
         .map(|node| node.label.as_str())
         .collect();
-    for name in ["%struct", "%join", "%scrut", "x", "y", "r"] {
+    for name in ["%struct", "x", "y", "a", "p", "r"] {
         assert!(symbols.contains(&name), "symbols lack {name}: {symbols:?}");
+    }
+    for artifact in ["%join", "%scrut", "%fall", "%case"] {
+        assert!(!symbols.contains(&artifact), "{symbols:?}");
     }
 }

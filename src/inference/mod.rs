@@ -1854,16 +1854,9 @@ impl Table {
                     self.zonk_term(payload, subst);
                 }
             }
-            TermKind::Match {
-                scrutinee,
-                arms,
-                default,
-            } => {
+            TermKind::Match { scrutinee, arms } => {
                 self.zonk_term(scrutinee, subst);
-                for arm in arms {
-                    self.zonk_term(&mut arm.body, subst);
-                }
-                if let Some((_, body)) = default {
+                for (_, body) in arms {
                     self.zonk_term(body, subst);
                 }
             }

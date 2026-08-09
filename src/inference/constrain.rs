@@ -5,9 +5,9 @@ use std::{collections::HashMap, rc::Rc};
 use indexmap::IndexMap;
 
 use crate::{
-    ir::{Term, TermKind, Test},
+    ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
-    tracking::Span,
+    tracking::{Span, Tracked},
     types::{Core, Presence, Rest, Row, RowField, Scheme, Ty, TyVar},
 };
 
@@ -36,6 +36,27 @@ pub struct Constrain<'a> {
     /// Every annotation this walk lowered for a nested `let`, and the variables
     /// each left open. See [`Annotated`].
     pub annotated: Vec<Annotated>,
+}
+
+/// One entry of a match's column at one position: the sub-pattern an arm wrote
+/// there, or the unit a bare tag's payload demands without anything having
+/// been written — `` `None `` is `` `None () `` to the types, and only to the
+/// types. Each entry remembers which arm it came from, because a binder's view
+/// is refined against the arms *above its own*; see [`Constrain::position`].
+enum Col<'a> {
+    Pattern(&'a ir::Pattern),
+    Unit,
+}
+
+/// Everything one match's columns are read against: the tests-by-position the
+/// written matrix makes — the universes behind the handled-case refinement —
+/// and the arms' patterns in order, so a binder in arm `i` can ask what the
+/// arms before `i` fully handle. The span is the scrutinee's, where every
+/// demand the columns build is aimed.
+struct Columns<'a> {
+    matrix: ir::Matrix,
+    patterns: Vec<&'a ir::Pattern>,
+    at: Span,
 }
 
 impl Constrain<'_> {
@@ -275,90 +296,45 @@ impl Constrain<'_> {
                 self.checks(field.span, &actual, &want);
                 result
             }
-            // The scrutinee is what its arms together say it is. Tag arms
-            // build a sum row — each listed case present, carrying a fresh
-            // type its binder is bound to, monomorphically, like a lambda's
-            // argument — and the row's rest is closed when the arms are the
-            // whole story, or a fresh variable when a default takes whatever
-            // is left. Natural arms say only that the scrutinee is a number.
-            // Zero arms close the row over nothing: the scrutinee is the
-            // empty sum, and the match's own type stays the fresh variable
-            // minted below — the empty sum's eliminator.
-            TermKind::Match {
-                scrutinee,
-                arms,
-                default,
-            } => {
+            // The scrutinee is what the written matrix, read column-wise,
+            // says it is: at every position, the union over all arms of what
+            // is tested there — never any one arm's view. The demand that
+            // builds is checked against the scrutinee, each binder is bound
+            // monomorphically to its position's type — refined so a case the
+            // earlier arms fully handle is absent in its view — and every
+            // arm's body unifies with the match's own type. Zero arms close
+            // the row over nothing: the scrutinee is the empty sum, and the
+            // match's own type stays the fresh variable minted below — the
+            // empty sum's eliminator. See [`Constrain::position`] for the
+            // column rule.
+            TermKind::Match { scrutinee, arms } => {
                 self.infer_term(scrutinee);
                 let result = self.table.fresh_type();
-                let mut labels = IndexMap::new();
-                let mut numbers = false;
-                for arm in arms.iter() {
-                    match &arm.test {
-                        Test::Tag { name, binder } => {
-                            let payload = self.table.fresh_type();
-                            self.env
-                                .insert(binder.tracked, Binding::Mono(payload.clone()));
-                            labels.insert(name.tracked.clone(), RowField::present(payload));
-                        }
-                        Test::Natural(_) => numbers = true,
-                    }
-                }
-                let actual = scrutinee.ty.clone();
-                if numbers {
-                    let nat = Rc::new(Ty::plain(Core::Nat));
-                    self.checks(scrutinee.span, &actual, &nat);
-                    // Whatever number the arms did not list is still a number.
-                    if let Some((binder, _)) = default {
-                        self.env.insert(binder.tracked, Binding::Mono(nat));
-                    }
-                } else {
-                    let rest = match default {
-                        Some(_) => self.table.fresh_row(),
-                        None => Rest::Closed,
-                    };
-                    let expected = Rc::new(Ty::plain(Core::Sum(Row {
-                        labels: labels.clone(),
-                        rest: rest.clone(),
-                    })));
-                    // The rest stands for the cases not listed, so it lacks
-                    // the listed names — what a tag literal's tail says, said
-                    // of the arms'.
-                    self.table.note_lacks(&expected);
-                    self.checks(scrutinee.span, &actual, &expected);
-                    // The default sees the sum with every handled case ruled
-                    // out: the listed cases absent, over the same rest. An
-                    // absent case's type is deliberately unconstrained — a
-                    // case the value cannot be carries nothing.
-                    if let Some((binder, _)) = default {
-                        let absent: IndexMap<String, RowField> = labels
-                            .keys()
-                            .map(|name| {
-                                (
-                                    name.clone(),
-                                    RowField {
-                                        presence: Presence::Absent,
-                                        ty: Rc::new(Ty::default()),
-                                    },
-                                )
-                            })
+                let expected = match arms.is_empty() {
+                    true => Rc::new(Ty::plain(Core::Sum(Row {
+                        labels: IndexMap::new(),
+                        rest: Rest::Closed,
+                    }))),
+                    false => {
+                        let columns = Columns {
+                            matrix: ir::Matrix::new(arms.iter().map(|(pattern, _)| pattern)),
+                            patterns: arms.iter().map(|(pattern, _)| pattern).collect(),
+                            at: scrutinee.span,
+                        };
+                        let root: Vec<(usize, Col)> = columns
+                            .patterns
+                            .iter()
+                            .enumerate()
+                            .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
                             .collect();
-                        let minus = Rc::new(Ty::plain(Core::Sum(Row {
-                            labels: absent,
-                            rest,
-                        })));
-                        self.env.insert(binder.tracked, Binding::Mono(minus));
+                        self.position(&columns, &mut Vec::new(), &root)
                     }
-                }
+                };
+                let actual = scrutinee.ty.clone();
+                self.checks(scrutinee.span, &actual, &expected);
                 // Whichever arm a value picks is what the match comes to, so
-                // every body — the default's included — is the one type the
-                // match has.
-                for arm in arms.iter_mut() {
-                    self.infer_term(&mut arm.body);
-                    let actual = arm.body.ty.clone();
-                    self.checks(arm.body.span, &actual, &result);
-                }
-                if let Some((_, body)) = default {
+                // every body is the one type the match has.
+                for (_, body) in arms.iter_mut() {
                     self.infer_term(body);
                     let actual = body.ty.clone();
                     self.checks(body.span, &actual, &result);
@@ -366,6 +342,163 @@ impl Constrain<'_> {
                 result
             }
         };
+    }
+
+    /// The type of one position of a match, from the column of sub-patterns
+    /// the arms wrote there — R7's rule, one recursive step per position.
+    ///
+    /// The demand is the union of what the whole column tests, never any one
+    /// arm's view: the tags tested here are the listed cases of one sum row,
+    /// each payload typed by the same rule one level down across every arm
+    /// that tests it; a natural test demands `Nat`; a struct pattern demands
+    /// its named fields of the position — the same demand a projection makes,
+    /// with the same lacks note — each field's type from the sub-position; and
+    /// `()` or a bare tag's payload demands unit. The row is closed over its
+    /// listed cases iff no arm is irrefutable at the position — a binder at or
+    /// above it — and otherwise its rest is a fresh row variable that lacks
+    /// the listed names, as a tag literal's tail does.
+    ///
+    /// A position tested two ways at once — cases and fields, say — is one
+    /// value asked to be two things; the demands are equated against each
+    /// other at the scrutinee, and the mismatch falls out of the solve. The
+    /// mixes worth their own words were already refused at lowering.
+    ///
+    /// Binders are bound here, monomorphically, to the position's type — for a
+    /// position with cases, refined so that every listed case *fully handled*
+    /// by the arms above the binder's own is absent in the binder's view. A
+    /// case is fully handled iff those arms alone leave it no unhandled
+    /// values, which is the same analysis the lowering checks run
+    /// ([`ir::Matrix::handled`]). That is what gives the classic catch-all
+    /// after `` `Some x `` its sum-without-`Some`, and it degrades correctly:
+    /// after `` `A `X ``, a later catch-all still sees `` `A `` present,
+    /// because `` `A `` values with other payloads reach it.
+    fn position(
+        &mut self,
+        columns: &Columns,
+        path: &mut Vec<ir::Step>,
+        entries: &[(usize, Col)],
+    ) -> Rc<Ty> {
+        let mut binds: Vec<(usize, Tracked<Symbol>)> = Vec::new();
+        let mut unit = false;
+        let mut naturals = false;
+        let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
+        let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
+        for (arm, entry) in entries {
+            match entry {
+                Col::Unit => unit = true,
+                Col::Pattern(pattern) => match &pattern.tracked {
+                    ir::PatternKind::Bind(name) => binds.push((*arm, *name)),
+                    ir::PatternKind::Unit => unit = true,
+                    ir::PatternKind::Natural(_) => naturals = true,
+                    ir::PatternKind::Tag { name, payload } => {
+                        let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
+                        tags.entry(name.tracked.as_str())
+                            .or_default()
+                            .push((*arm, payload));
+                    }
+                    ir::PatternKind::Struct(named) => {
+                        for (name, field) in named {
+                            fields
+                                .entry(name.as_str())
+                                .or_default()
+                                .push((*arm, Col::Pattern(&field.value)));
+                        }
+                    }
+                },
+            }
+        }
+        // Whether an arm is irrefutable here — a binder at or above, or a
+        // catch-all arm — which is what decides whether the row closes. Read
+        // off the matrix rather than tracked down the recursion, so this and
+        // the lowering checks answer from one place.
+        let open = columns.matrix.open(path);
+        let mut demands: Vec<Rc<Ty>> = Vec::new();
+        // The listed cases, kept beside their row's rest for the binder views
+        // below: a view is the same labels re-read, not a second demand.
+        let mut listed: Option<(IndexMap<String, RowField>, Rest)> = None;
+        if !tags.is_empty() {
+            let mut labels = IndexMap::new();
+            for (name, payloads) in &tags {
+                path.push(ir::Step::Payload(name.to_string()));
+                let payload = self.position(columns, path, payloads);
+                path.pop();
+                labels.insert(name.to_string(), RowField::present(payload));
+            }
+            let rest = match open {
+                true => self.table.fresh_row(),
+                false => Rest::Closed,
+            };
+            let ty = Rc::new(Ty::plain(Core::Sum(Row {
+                labels: labels.clone(),
+                rest: rest.clone(),
+            })));
+            // The rest stands for the cases not listed, so it lacks the
+            // listed names — what a tag literal's tail says, said of a
+            // column's.
+            self.table.note_lacks(&ty);
+            listed = Some((labels, rest));
+            demands.push(ty);
+        }
+        if naturals {
+            demands.push(Rc::new(Ty::plain(Core::Nat)));
+        }
+        if !fields.is_empty() {
+            let mut named = IndexMap::new();
+            for (name, subs) in &fields {
+                path.push(ir::Step::Field(name.to_string()));
+                let field = self.position(columns, path, subs);
+                path.pop();
+                named.insert(name.to_string(), RowField::present(field));
+            }
+            let ty = Rc::new(Ty {
+                core: Core::Var(self.table.fresh_core()),
+                fields: named,
+            });
+            self.table.note_lacks(&ty);
+            demands.push(ty);
+        }
+        if unit {
+            demands.push(Rc::new(Ty::unit()));
+        }
+        let mut demands = demands.into_iter();
+        // A column that only binds demands nothing: the position is a fresh
+        // type the scrutinee decides — the `c` of the column-union example.
+        let ty = demands.next().unwrap_or_else(|| self.table.fresh_type());
+        for also in demands {
+            self.checks(columns.at, &also, &ty);
+        }
+        for (arm, binder) in binds {
+            let view = match &listed {
+                // The refinement: every case the arms above this one fully
+                // handle is absent in the binder's view — the value reaching
+                // it cannot be one — over the same payloads and the same
+                // rest. An absent case's type is deliberately unconstrained;
+                // a case the value cannot be carries nothing.
+                Some((labels, rest)) => {
+                    let earlier = &columns.patterns[..arm];
+                    let refined = labels
+                        .iter()
+                        .map(|(name, field)| {
+                            let field = match columns.matrix.handled(earlier, path, name) {
+                                true => RowField {
+                                    presence: Presence::Absent,
+                                    ty: Rc::new(Ty::default()),
+                                },
+                                false => field.clone(),
+                            };
+                            (name.clone(), field)
+                        })
+                        .collect();
+                    Rc::new(Ty::plain(Core::Sum(Row {
+                        labels: refined,
+                        rest: rest.clone(),
+                    })))
+                }
+                None => ty.clone(),
+            };
+            self.env.insert(binder.tracked, Binding::Mono(view));
+        }
+        ty
     }
 
     /// Check `term` against a type the context already knows. Checking pushes
