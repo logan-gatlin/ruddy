@@ -3,7 +3,9 @@
 //! Each node's `text` is that subtree's own `Display` output, so the tree and
 //! the rendered source can never drift apart: they are the same printer.
 
-use ruddy::parse::{Expr, ExprKind, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind};
+use ruddy::parse::{
+    Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
+};
 
 use crate::{
     print,
@@ -37,12 +39,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
     let node = Node::new(ids.next(), "", print::ast::stmt(&stmt.tracked).to_string()).at(stmt.span);
     match &stmt.tracked {
-        StmtKind::Let { name, ty, body } => {
+        StmtKind::Let { pattern, ty, body } => {
             let mut let_node = Node {
                 label: "Let".into(),
                 ..node
             }
-            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            .child(pattern_node(ids, pattern));
             // The ascription sits between the name and the body, where it was
             // written; a `let` without one simply has one child fewer. Its role
             // goes on the type's own node rather than on a wrapper around it: a
@@ -93,16 +95,16 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         // the type it was ascribed, the value and the body. Labelled with the
         // name, since that is what a reader scanning the tree is looking for.
         ExprKind::Let {
-            name,
+            pattern,
             ty,
             value,
             body,
         } => {
             let mut let_node = Node {
-                label: format!("Let {}", name.tracked),
+                label: format!("Let {}", pattern.tracked),
                 ..node
             }
-            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            .child(pattern_node(ids, pattern));
             if let Some(ty) = ty {
                 let mut ascribed = type_node(ids, ty);
                 ascribed.label = format!("Ascribed {}", ascribed.label);
@@ -147,6 +149,24 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         }
         .child(expr_node(ids, base))
         .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
+        // The scrutinee first, then one wrapper per arm holding the arm's
+        // pattern and body — the shape the reader wrote, before flattening.
+        ExprKind::Match { scrutinee, arms } => {
+            let mut match_node = Node {
+                label: "Match".into(),
+                ..node
+            }
+            .child(expr_node(ids, scrutinee));
+            for arm in &arms[..] {
+                let span = arm.pattern.span.merge(arm.body.span);
+                let arm_node = Node::new(ids.next(), "Arm", format!("{}", arm.pattern.tracked))
+                    .at(span)
+                    .child(pattern_node(ids, &arm.pattern))
+                    .child(expr_node(ids, &arm.body));
+                match_node = match_node.child(arm_node);
+            }
+            match_node
+        }
         ExprKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node
@@ -160,6 +180,58 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "Unit".into(),
             ..node
         },
+    }
+}
+
+/// One written pattern, as a tree: each node's text is the pattern's own
+/// `Display`, the same rule the expression nodes keep. A pun is a leaf wearing
+/// the field's name; a renamed field holds its sub-pattern.
+fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
+    let node = Node::new(ids.next(), "", pattern.tracked.to_string()).at(pattern.span);
+    match &pattern.tracked {
+        PatternKind::Ident { name } => Node {
+            label: "Bind".into(),
+            ..node
+        }
+        .at(name.span),
+        PatternKind::Natural(_) => Node {
+            label: "Natural".into(),
+            ..node
+        },
+        PatternKind::Unit => Node {
+            label: "Unit".into(),
+            ..node
+        },
+        PatternKind::Tag { name, payload } => {
+            let tag_node = Node {
+                label: "Tag".into(),
+                ..node
+            }
+            .at(name.span);
+            match payload {
+                Some(payload) => tag_node.child(pattern_node(ids, payload)),
+                None => tag_node,
+            }
+        }
+        PatternKind::Struct(fields) => Node {
+            label: "Struct".into(),
+            ..node
+        }
+        .children(
+            fields
+                .iter()
+                .map(|(name, sub)| match sub {
+                    Some(sub) => Node::new(
+                        ids.next(),
+                        format!("{}:", name.tracked),
+                        sub.tracked.to_string(),
+                    )
+                    .at(name.span)
+                    .child(pattern_node(ids, sub)),
+                    None => Node::new(ids.next(), "Bind", name.tracked.clone()).at(name.span),
+                })
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 

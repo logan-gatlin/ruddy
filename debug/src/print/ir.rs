@@ -9,14 +9,14 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{Field, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind},
+    ir::{Field, Program, Row, SumCase, Term, TermKind, Test, TypeField, TypeKind},
     symbol::Mint,
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project,
-    write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
+    write_project, write_row, write_struct, write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -64,6 +64,23 @@ impl<'a, T> Show<'a, T> {
             node: node.kind(),
             mint: self.mint,
         }
+    }
+
+    /// One arm's test as the pattern it prints as: the tag with its binder's
+    /// name — the binder is a name, so it groups as one — or the literal.
+    fn test(&self, test: &Test) -> String {
+        struct Pattern<'a>(&'a Test, &'a Mint);
+        impl fmt::Display for Pattern<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self.0 {
+                    Test::Tag { name, binder } => {
+                        write_tag(f, &name.tracked, false, Some(self.1.name(binder.tracked)))
+                    }
+                    Test::Natural(value) => write!(f, "{value}"),
+                }
+            }
+        }
+        Pattern(test, self.mint).to_string()
     }
 
     /// The fields of a struct as [`write_struct`] wants them. Unlike the parse
@@ -130,6 +147,10 @@ impl Grouped for Show<'_, TermKind> {
             // group alike. The parse tree's printer says the same, because it
             // is the same syntax.
             TermKind::Fn { .. } | TermKind::Let { .. } => Prec::Lambda,
+            // Self-delimiting on the right but not an application argument by
+            // grammar; the parse tree's printer says the same, because it is
+            // the same syntax.
+            TermKind::Match { .. } => Prec::Apply,
             // A tag carrying something groups as the application it reads as;
             // carrying nothing it groups below one, because the argument would
             // be read as the payload it has not got. The parse tree's printer
@@ -190,7 +211,7 @@ impl fmt::Display for Show<'_, TermKind> {
                 body,
             } => write_let(
                 f,
-                self.mint.name(name.tracked),
+                &self.mint.name(name.tracked),
                 annotation.as_ref().map(|ty| self.show(ty)),
                 &self.show(&**value),
                 &self.show(&**body),
@@ -207,6 +228,27 @@ impl fmt::Display for Show<'_, TermKind> {
             ),
             TermKind::Project { base, field } => {
                 write_project(f, &self.show(&**base), &field.tracked)
+            }
+            // The arms print as the surface arms they compile from — a tag
+            // with its binder, a literal, and the default as the bare name it
+            // binds — so the shallow match reads back as a match. The pattern
+            // half of each arm is rendered up front: the three shapes of arm
+            // would otherwise be three iterator types for one writer.
+            TermKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let arms = arms
+                    .iter()
+                    .map(|arm| (self.test(&arm.test), self.show(&arm.body)))
+                    .chain(default.iter().map(|(binder, body)| {
+                        (
+                            self.mint.name(binder.tracked).to_string(),
+                            self.show(&**body),
+                        )
+                    }));
+                write_match(f, &self.show(&**scrutinee), arms)
             }
         }
     }

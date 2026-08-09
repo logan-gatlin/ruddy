@@ -6,7 +6,7 @@
 
 use ruddy::{
     inference,
-    ir::{Decl, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind},
+    ir::{Decl, Row, SumCase, Tail, Term, TermKind, Test, Type, TypeField, TypeKind},
     symbol::{Mint, Symbol},
     types::Core,
 };
@@ -221,6 +221,55 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
         }
         .child(term_node(ids, cx, mint, base, trace))
         .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
+        // The scrutinee, then one test per arm — the binder a symbol like a
+        // lambda's argument, so it cross-highlights with its uses — and the
+        // default's binder and body last. Reading this beside the AST tab's
+        // match is how the compilation is seen.
+        TermKind::Match {
+            scrutinee,
+            arms,
+            default,
+        } => {
+            let mut match_node = Node {
+                label: "Match".into(),
+                ..node
+            }
+            .child(term_node(ids, cx, mint, scrutinee, trace));
+            for arm in arms {
+                let case = match &arm.test {
+                    // Spanned at the binder, which for a reader's own name is
+                    // where it was written — the span a symbol-carrying node
+                    // has to sit at for cross-highlighting to point true.
+                    Test::Tag { name, binder } => with_symbol(
+                        Node::new(
+                            ids.next(),
+                            "Case",
+                            format!("`{} {}", name.tracked, mint.name(binder.tracked)),
+                        )
+                        .at(binder.span),
+                        cx,
+                        binder.tracked,
+                    ),
+                    Test::Natural(value) => {
+                        Node::new(ids.next(), "Case", value.to_string()).at(arm.body.span)
+                    }
+                };
+                match_node = match_node
+                    .child(case)
+                    .child(term_node(ids, cx, mint, &arm.body, trace));
+            }
+            if let Some((binder, body)) = default {
+                let bound = with_symbol(
+                    Node::new(ids.next(), "Default", mint.name(binder.tracked)).at(binder.span),
+                    cx,
+                    binder.tracked,
+                );
+                match_node = match_node
+                    .child(bound)
+                    .child(term_node(ids, cx, mint, body, trace));
+            }
+            match_node
+        }
         TermKind::Struct(fields) => {
             // Built eagerly rather than through `children`: the closure a lazy
             // iterator would need borrows the trace for as long as it lives.

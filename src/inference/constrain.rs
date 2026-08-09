@@ -5,10 +5,10 @@ use std::{collections::HashMap, rc::Rc};
 use indexmap::IndexMap;
 
 use crate::{
-    ir::{Term, TermKind},
+    ir::{Term, TermKind, Test},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Presence, Row, RowField, Scheme, Ty, TyVar},
+    types::{Core, Presence, Rest, Row, RowField, Scheme, Ty, TyVar},
 };
 
 use super::{Annotated, Binding, Constraint, ConstraintKind, Table, lower_type, same_field_set};
@@ -273,6 +273,96 @@ impl Constrain<'_> {
                 // The field name is the only thing the user can fix about a
                 // type that does not have it, whatever kind of type that is.
                 self.checks(field.span, &actual, &want);
+                result
+            }
+            // The scrutinee is what its arms together say it is. Tag arms
+            // build a sum row — each listed case present, carrying a fresh
+            // type its binder is bound to, monomorphically, like a lambda's
+            // argument — and the row's rest is closed when the arms are the
+            // whole story, or a fresh variable when a default takes whatever
+            // is left. Natural arms say only that the scrutinee is a number.
+            // Zero arms close the row over nothing: the scrutinee is the
+            // empty sum, and the match's own type stays the fresh variable
+            // minted below — the empty sum's eliminator.
+            TermKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                self.infer_term(scrutinee);
+                let result = self.table.fresh_type();
+                let mut labels = IndexMap::new();
+                let mut numbers = false;
+                for arm in arms.iter() {
+                    match &arm.test {
+                        Test::Tag { name, binder } => {
+                            let payload = self.table.fresh_type();
+                            self.env
+                                .insert(binder.tracked, Binding::Mono(payload.clone()));
+                            labels.insert(name.tracked.clone(), RowField::present(payload));
+                        }
+                        Test::Natural(_) => numbers = true,
+                    }
+                }
+                let actual = scrutinee.ty.clone();
+                if numbers {
+                    let nat = Rc::new(Ty::plain(Core::Nat));
+                    self.checks(scrutinee.span, &actual, &nat);
+                    // Whatever number the arms did not list is still a number.
+                    if let Some((binder, _)) = default {
+                        self.env.insert(binder.tracked, Binding::Mono(nat));
+                    }
+                } else {
+                    let rest = match default {
+                        Some(_) => self.table.fresh_row(),
+                        None => Rest::Closed,
+                    };
+                    let expected = Rc::new(Ty::plain(Core::Sum(Row {
+                        labels: labels.clone(),
+                        rest: rest.clone(),
+                    })));
+                    // The rest stands for the cases not listed, so it lacks
+                    // the listed names — what a tag literal's tail says, said
+                    // of the arms'.
+                    self.table.note_lacks(&expected);
+                    self.checks(scrutinee.span, &actual, &expected);
+                    // The default sees the sum with every handled case ruled
+                    // out: the listed cases absent, over the same rest. An
+                    // absent case's type is deliberately unconstrained — a
+                    // case the value cannot be carries nothing.
+                    if let Some((binder, _)) = default {
+                        let absent: IndexMap<String, RowField> = labels
+                            .keys()
+                            .map(|name| {
+                                (
+                                    name.clone(),
+                                    RowField {
+                                        presence: Presence::Absent,
+                                        ty: Rc::new(Ty::default()),
+                                    },
+                                )
+                            })
+                            .collect();
+                        let minus = Rc::new(Ty::plain(Core::Sum(Row {
+                            labels: absent,
+                            rest,
+                        })));
+                        self.env.insert(binder.tracked, Binding::Mono(minus));
+                    }
+                }
+                // Whichever arm a value picks is what the match comes to, so
+                // every body — the default's included — is the one type the
+                // match has.
+                for arm in arms.iter_mut() {
+                    self.infer_term(&mut arm.body);
+                    let actual = arm.body.ty.clone();
+                    self.checks(arm.body.span, &actual, &result);
+                }
+                if let Some((_, body)) = default {
+                    self.infer_term(body);
+                    let actual = body.ty.clone();
+                    self.checks(body.span, &actual, &result);
+                }
                 result
             }
         };

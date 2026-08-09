@@ -1854,6 +1854,19 @@ impl Table {
                     self.zonk_term(payload, subst);
                 }
             }
+            TermKind::Match {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                self.zonk_term(scrutinee, subst);
+                for arm in arms {
+                    self.zonk_term(&mut arm.body, subst);
+                }
+                if let Some((_, body)) = default {
+                    self.zonk_term(body, subst);
+                }
+            }
             TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
         }
     }

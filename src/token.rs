@@ -11,6 +11,10 @@ pub enum Kind {
     Type,
     End,
     With,
+    /// `match`, opening a `match <expr> with <arms> end`. The `with` and `end`
+    /// around it were reserved long before this keyword existed; this is what
+    /// they were reserved for.
+    Match,
     Fn,
     Equal,
     FatArrow,
@@ -199,6 +203,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "type" => Kind::Type,
                     "end" => Kind::End,
                     "with" => Kind::With,
+                    "match" => Kind::Match,
                     "fn" => Kind::Fn,
                     _ => Kind::Identifier(ident),
                 };
