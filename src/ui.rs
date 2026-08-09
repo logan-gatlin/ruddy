@@ -209,6 +209,7 @@ impl fmt::Display for Kind {
             Kind::Type => f.write_str("type"),
             Kind::End => f.write_str("end"),
             Kind::With => f.write_str("with"),
+            Kind::Match => f.write_str("match"),
             Kind::Fn => f.write_str("fn"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
@@ -246,6 +247,107 @@ impl parse::Error {
 impl fmt::Display for parse::Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("unexpected token")
+    }
+}
+
+/// How much of the surface grammar a pattern can be, on the same ladder the
+/// expressions it mirrors use: a bare tag is still waiting for its payload, a
+/// tag carrying one reads as the application it looks like, and everything
+/// else closes itself.
+impl Grouped for parse::PatternKind {
+    fn prec(&self) -> Prec {
+        match self {
+            parse::PatternKind::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            parse::PatternKind::Tag { payload: None, .. } => Prec::Tag,
+            parse::PatternKind::Ident { .. }
+            | parse::PatternKind::Natural(_)
+            | parse::PatternKind::Unit
+            | parse::PatternKind::Struct(_) => Prec::Atom,
+        }
+    }
+}
+
+/// A pattern prints as it was written, so a printed match or pattern `let`
+/// re-parses to the tree it was printed from. A pun stays a pun — the field's
+/// name alone — and a tag's payload is grouped by the same rule a tag
+/// expression's is.
+impl fmt::Display for parse::PatternKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
+            parse::PatternKind::Natural(value) => write!(f, "{value}"),
+            parse::PatternKind::Unit => f.write_str("()"),
+            parse::PatternKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                false,
+                payload.as_deref().map(|payload| &payload.tracked),
+            ),
+            parse::PatternKind::Struct(fields) => {
+                if fields.is_empty() {
+                    return f.write_str("{}");
+                }
+                f.write_str("{ ")?;
+                let mut first = true;
+                for (name, sub) in fields {
+                    if !first {
+                        f.write_str(", ")?;
+                    }
+                    first = false;
+                    match sub {
+                        Some(sub) => write!(f, "{}: {}", name.tracked, sub.tracked)?,
+                        None => f.write_str(&name.tracked)?,
+                    }
+                }
+                f.write_str(" }")
+            }
+        }
+    }
+}
+
+/// A witness groups by what it prints as: a case carrying something reads as
+/// the application it looks like, a bare one is still waiting for a payload,
+/// and the two prose forms — "anything", "anything other than …" — group
+/// lowest, so a payload position always brackets them and they never read as
+/// part of what follows.
+impl Grouped for ir::Witness {
+    fn prec(&self) -> Prec {
+        match self {
+            ir::Witness::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            ir::Witness::Tag { payload: None, .. } => Prec::Tag,
+            ir::Witness::Natural(_) | ir::Witness::Struct(_) => Prec::Atom,
+            ir::Witness::Any | ir::Witness::Other(_) => Prec::Lambda,
+        }
+    }
+}
+
+/// A witness prints as the example value it is, in source syntax, so the
+/// unhandled-values complaint shows the reader something they could write an
+/// arm for. The two forms no value literal spells — a position anything
+/// serves for, and an open row's "anything else" — print as the plain English
+/// they mean.
+impl fmt::Display for ir::Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ir::Witness::Any => f.write_str("anything"),
+            ir::Witness::Natural(value) => write!(f, "{value}"),
+            ir::Witness::Tag { name, payload } => write_tag(f, name, false, payload.as_deref()),
+            ir::Witness::Struct(fields) => write_struct(f, fields),
+            ir::Witness::Other(cases) => {
+                f.write_str("anything other than ")?;
+                for (at, case) in cases.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(" or ")?;
+                    }
+                    write!(f, "`{case}")?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -289,6 +391,19 @@ impl ir::ErrorKind {
             ir::ErrorKind::NotARow => "not-a-row",
             ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
             ir::ErrorKind::EndlessFields => "endless-fields",
+            // What refuted the binding is not part of the code, only of the
+            // wording: what went wrong is the binding, and the quoted tag or
+            // number only points at where.
+            ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
+            ir::ErrorKind::UnreachableArm => "unreachable-arm",
+            ir::ErrorKind::MisplacedCatchAll => "misplaced-catch-all",
+            // The witness is not part of the code, only of the wording: what
+            // went wrong is the match, and the example only shows a value it
+            // misses.
+            ir::ErrorKind::UnhandledValues { .. } => "unhandled-values",
+            ir::ErrorKind::UnhandledNumbers => "unhandled-numbers",
+            ir::ErrorKind::MixedMatch => "mixed-match",
+            ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
         }
     }
 }
@@ -394,6 +509,43 @@ impl fmt::Display for ir::ErrorKind {
             // finite set of fields for it to have.
             ir::ErrorKind::EndlessFields => {
                 f.write_str("this type adds fields to itself, so it never has all of them")
+            }
+            // Said as what a binding has to do — take whatever arrives — with
+            // the tag or number that breaks the promise quoted the way it was
+            // written. Two sentences for the two, because a case is something
+            // a value might not be and a number is something it might not
+            // equal.
+            ir::ErrorKind::RefutableBinding { found } => match found {
+                ir::Refuter::Case(name) => write!(
+                    f,
+                    "this binding has to accept every value, but a value here might not be `{}`",
+                    label(Shape::Sum, name),
+                ),
+                ir::Refuter::Number(value) => write!(
+                    f,
+                    "this binding has to accept every value, but the number `{value}` makes it able to fail",
+                ),
+            },
+            ir::ErrorKind::UnreachableArm => {
+                f.write_str("this case is already handled by the arms above it")
+            }
+            ir::ErrorKind::MisplacedCatchAll => f.write_str(
+                "this arm accepts everything, so the arms after it can never be reached",
+            ),
+            // The example is the complaint: a value no arm accepts, written in
+            // source syntax so the reader can see what to add an arm for.
+            ir::ErrorKind::UnhandledValues { witness } => write!(
+                f,
+                "some values are not handled — for example `{witness}`; add an arm for them or a final arm naming the rest",
+            ),
+            ir::ErrorKind::UnhandledNumbers => f.write_str(
+                "numbers not listed here are not handled; add a final arm that names the rest",
+            ),
+            ir::ErrorKind::MixedMatch => f.write_str(
+                "this compares against both numbers and cases, and no value can be both",
+            ),
+            ir::ErrorKind::DuplicateBinding { name } => {
+                write!(f, "this binds `{name}` twice")
             }
         }
     }
@@ -1386,16 +1538,37 @@ pub fn write_tag<V: Grouped>(
 /// [`Prec::Lambda`] says of it.
 pub fn write_let(
     f: &mut fmt::Formatter<'_>,
-    name: &str,
+    binder: &impl fmt::Display,
     ty: Option<impl fmt::Display>,
     value: &impl fmt::Display,
     body: &impl fmt::Display,
 ) -> fmt::Result {
-    write!(f, "let {name}")?;
+    write!(f, "let {binder}")?;
     if let Some(ty) = ty {
         write!(f, " : {ty}")?;
     }
     write!(f, " = {value} in {body}")
+}
+
+/// Render `match <scrutinee> with | <pattern> => <body> ... end` — one
+/// writer for both trees, so the punctuation of a match is one rule.
+///
+/// Nothing here needs grouping. The scrutinee ends at the `with` however far
+/// right it runs, each arm's body ends at the next `|` or the `end` — none of
+/// the three begins an atom — and the `end` closes the whole form. The
+/// leading `|` is written on every arm, first included; the grammar makes it
+/// optional there, so the printed form re-parses, and a match with no arms is
+/// `match <scrutinee> with end` with no bar at all.
+pub fn write_match<P: fmt::Display, B: fmt::Display>(
+    f: &mut fmt::Formatter<'_>,
+    scrutinee: &dyn fmt::Display,
+    arms: impl IntoIterator<Item = (P, B)>,
+) -> fmt::Result {
+    write!(f, "match {scrutinee} with")?;
+    for (pattern, body) in arms {
+        write!(f, " | {pattern} => {body}")?;
+    }
+    f.write_str(" end")
 }
 
 /// Render `base.field`. Projection binds tighter than everything that follows a

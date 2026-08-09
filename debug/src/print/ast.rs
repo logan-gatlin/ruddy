@@ -14,8 +14,8 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project,
-    write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
+    write_project, write_row, write_struct, write_sum, write_tag,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -40,6 +40,11 @@ impl Grouped for Ast<'_, ExprKind> {
             // a bare lambda would be read as part of it. A nested `let`'s body
             // runs the same way, so it groups the same way.
             ExprKind::Function { .. } | ExprKind::Let { .. } => Prec::Lambda,
+            // Self-delimiting on the right — the `end` closes it — so it may
+            // head an application and be projected from; but it is not an
+            // application *argument* by grammar, so an argument position
+            // brackets it. Below `Atom` is exactly that split.
+            ExprKind::Match { .. } => Prec::Apply,
             // A tag carrying something groups as the application it reads as:
             // anything appended to `` `A x `` would be read as applying the
             // case rather than as a second argument to it. Carrying nothing it
@@ -66,8 +71,8 @@ impl fmt::Display for Ast<'_, StmtKind> {
         match self.0 {
             // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence
             // the doubled `.tracked` to reach the `ExprKind`.
-            StmtKind::Let { name, ty, body } => {
-                write!(f, "let {}", name.tracked)?;
+            StmtKind::Let { pattern, ty, body } => {
+                write!(f, "let {}", pattern.tracked)?;
                 if let Some(ty) = ty {
                     write!(f, " : {}", Ast(&ty.tracked))?;
                 }
@@ -92,16 +97,24 @@ impl fmt::Display for Ast<'_, ExprKind> {
             }
             ExprKind::Function { args, body } => write_function(f, args, &Ast(&body.tracked)),
             ExprKind::Let {
-                name,
+                pattern,
                 ty,
                 value,
                 body,
             } => write_let(
                 f,
-                &name.tracked,
+                &pattern.tracked,
                 ty.as_ref().map(|ty| Ast(&ty.tracked)),
                 &Ast(&value.tracked),
                 &Ast(&body.tracked),
+            ),
+            // The pattern prints through the compiler's own `Display`, so the
+            // arm a match shows is the arm the parser read.
+            ExprKind::Match { scrutinee, arms } => write_match(
+                f,
+                &Ast(&scrutinee.tracked),
+                arms.iter()
+                    .map(|arm| (&arm.pattern.tracked, Ast(&arm.body.tracked))),
             ),
             ExprKind::Struct(fields) => write_struct(f, pairs(fields)),
             ExprKind::Project { base, field } => {

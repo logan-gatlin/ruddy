@@ -10,7 +10,15 @@ pub type Stmt = Tracked<StmtKind>;
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let {
-        name: TrackedString,
+        /// What the definition binds: a bare name, which is every definition
+        /// the language had before patterns, or a pattern that takes the value
+        /// apart. Which names it binds is [`ir`](crate::ir)'s to work out; the
+        /// parser records what was written.
+        ///
+        /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a
+        /// pattern is a tree of its own, and inlining one here would grow
+        /// every statement to the size of the largest thing a binding can be.
+        pattern: Box<Pattern>,
         /// The written type, when the definition was ascribed one.
         ty: Option<Type>,
         body: Tracked<Expr>,
@@ -50,7 +58,9 @@ pub enum ExprKind {
     /// after the `in`, so the two share their grammar and not a line of their
     /// meaning.
     Let {
-        name: TrackedString,
+        /// What the binding binds — a bare name, or a pattern taking the value
+        /// apart — exactly as [`StmtKind::Let`] records it.
+        pattern: Pattern,
         /// The written type, when the binding was ascribed one.
         ///
         /// Boxed, where [`StmtKind::Let`]'s is not, because this node nests
@@ -61,6 +71,17 @@ pub enum ExprKind {
         ty: Option<Box<Type>>,
         value: Box<Expr>,
         body: Box<Expr>,
+    },
+    /// `match <expr> with [|] <pattern> => <expr> (| <pattern> => <expr>)* end`
+    /// — dispatch on what a value is.
+    ///
+    /// The scrutinee is a full expression: it ends at the `with` of its own
+    /// accord, because `with` begins no atom. Zero arms parse — the empty
+    /// match is the empty sum's eliminator — and the leading `|` before the
+    /// first arm is optional, the same convention a sum type keeps.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<Arm>,
     },
     Struct(IndexMap<TrackedString, Expr>),
     /// `` `Some 1 `` — one case of a sum, with what it carries.
@@ -83,6 +104,44 @@ pub enum ExprKind {
     },
     Natural(u128),
     Unit,
+}
+
+/// One arm of a match: a pattern and the expression it chooses.
+#[derive(Debug, Clone)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub body: Expr,
+}
+
+pub type Pattern = Tracked<PatternKind>;
+
+/// What a value may be taken apart as, mirroring the expression grammar's
+/// shape: a name binds, a literal matches itself, `()` matches unit, a struct
+/// pattern reaches into fields, and a tag pattern asks which case a sum is.
+/// Grouping parentheses are discarded here exactly as [`Parser::paren_expr`]
+/// discards them, so no grouping node exists to reach the IR.
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    /// A bare name: binds the whole value, matches anything.
+    Ident { name: TrackedString },
+    /// A natural literal: matches exactly that number.
+    Natural(u128),
+    /// `()`: matches unit, binds nothing.
+    Unit,
+    /// `{ f, g: <pattern>, ... }` — reach into a struct's fields. A bare field
+    /// name puns, binding the field to its own name, so the value is `None`;
+    /// `name: <pattern>` matches the field against the sub-pattern. `{}` is
+    /// allowed and binds nothing.
+    Struct(IndexMap<TrackedString, Option<Pattern>>),
+    /// `` `Name [<pattern>] `` — one case of a sum. The payload pattern is
+    /// taken greedily, exactly as [`Parser::tag_expr`] takes a payload, so
+    /// `` `A `B x `` is `` `A `` carrying `` (`B x) ``. Written bare, the case
+    /// is constrained to carry unit and binds nothing — the convention
+    /// `` `None `` follows as an expression.
+    Tag {
+        name: TrackedString,
+        payload: Option<Box<Pattern>>,
+    },
 }
 
 pub type Type = Tracked<TypeKind>;
@@ -320,11 +379,13 @@ impl Parser {
         }
     }
 
-    /// `let <name> [: <type>] = <expr>`. The ascription is optional: without it
-    /// the definition's type is whatever is inferred for its body.
+    /// `let <pattern> [: <type>] = <expr>`. The ascription is optional: without
+    /// it the definition's type is whatever is inferred for its body. What is
+    /// bound is a pattern — a bare name being the ordinary case, and a struct
+    /// pattern taking the value apart into several definitions at once.
     fn let_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `let`");
-        let name = self.ident()?;
+        let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
             Some(_) => Some(self.type_expr()?),
             None => None,
@@ -333,7 +394,11 @@ impl Parser {
         let expr = self.expr()?;
         let body = expr.span.track(expr);
         let span = kw.span.merge(body.span);
-        Some(span.track(StmtKind::Let { name, ty, body }))
+        Some(span.track(StmtKind::Let {
+            pattern: Box::new(pattern),
+            ty,
+            body,
+        }))
     }
 
     /// `type <name> <param>* = <type>`. The parameters are plain names, and the
@@ -430,6 +495,11 @@ impl Parser {
         match &tok.tracked {
             Kind::Fn => self.function_expr(),
             Kind::Let => self.let_expr(),
+            // Reachable from atom position, like a nested `let` — and, like
+            // one, deliberately absent from `at_expr_atom`, so `f match ... end`
+            // is not `f` applied to a match. Projection off the `end` works
+            // because the projection loop sits above this call.
+            Kind::Match => self.match_expr(),
             Kind::LeftBrace => self.struct_expr(),
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
@@ -543,7 +613,7 @@ impl Parser {
     /// other.
     fn let_expr(&mut self) -> Option<Expr> {
         let kw = self.advance().expect("the caller peeked `let`");
-        let name = self.ident()?;
+        let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
             Some(_) => Some(Box::new(self.type_expr()?)),
             None => None,
@@ -554,11 +624,151 @@ impl Parser {
         let body = self.expr()?;
         let span = kw.span.merge(body.span);
         Some(span.track(ExprKind::Let {
-            name,
+            pattern,
             ty,
             value: Box::new(value),
             body: Box::new(body),
         }))
+    }
+
+    /// `match <expr> with [|] <arm> (| <arm>)* end`, where an arm is
+    /// `<pattern> => <expr>`.
+    ///
+    /// The leading `|` is optional and a trailing one is refused, the same
+    /// convention a sum type keeps; a `|` between arms promises another arm,
+    /// so nothing after one is reported where the missing pattern was
+    /// expected. Zero arms parse — `match e with end` — and the leading `|`
+    /// with no arm after it does not: the bar promised one.
+    ///
+    /// Each arm's body is a full expression and extends as far right as it
+    /// can; it ends in front of the next `|` or the `end` of its own accord,
+    /// because neither begins an atom.
+    fn match_expr(&mut self) -> Option<Expr> {
+        let kw = self.advance().expect("the caller peeked `match`");
+        let scrutinee = self.expr()?;
+        self.eat(&Kind::With)?;
+        let mut arms = Vec::new();
+        let leading = self.eat_if(&Kind::Pipe).is_some();
+        if leading || !matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::End)) {
+            loop {
+                let pattern = self.pattern()?;
+                self.eat(&Kind::FatArrow)?;
+                let body = self.expr()?;
+                arms.push(Arm { pattern, body });
+                if self.eat_if(&Kind::Pipe).is_none() {
+                    break;
+                }
+            }
+        }
+        let close = self.eat(&Kind::End)?;
+        let span = kw.span.merge(close.span);
+        Some(span.track(ExprKind::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        }))
+    }
+
+    /// Whether the next token can begin a pattern — what decides whether a tag
+    /// pattern has a payload, the same question [`at_expr_atom`](Self::at_expr_atom)
+    /// answers for a tag expression.
+    fn at_pattern(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(tok) if matches!(
+                tok.tracked,
+                Kind::Identifier(_)
+                    | Kind::Natural(_)
+                    | Kind::Tag(_)
+                    | Kind::LeftBrace
+                    | Kind::LeftParen
+            )
+        )
+    }
+
+    /// One pattern: a name, a natural, `()`, a parenthesized pattern, a struct
+    /// pattern, or a tag pattern carrying another. See [`PatternKind`].
+    fn pattern(&mut self) -> Option<Pattern> {
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
+        let span = tok.span;
+        match &tok.tracked {
+            // The payload is taken greedily, like a tag expression's: a tag
+            // carries one thing, and the recursion through `pattern` is what
+            // makes `` `A `B x `` come out as `` `A `` carrying `` (`B x) ``.
+            Kind::Tag(_) => {
+                let name = self.tag().expect("the caller peeked a tag");
+                let payload = match self.at_pattern() {
+                    true => Some(self.pattern()?),
+                    false => None,
+                };
+                let span = payload
+                    .as_ref()
+                    .map_or(name.span, |payload| name.span.merge(payload.span));
+                Some(span.track(PatternKind::Tag {
+                    name,
+                    payload: payload.map(Box::new),
+                }))
+            }
+            Kind::Identifier(name) => {
+                let name = span.track(name.clone());
+                self.advance();
+                Some(span.track(PatternKind::Ident { name }))
+            }
+            &Kind::Natural(value) => {
+                self.advance();
+                Some(span.track(PatternKind::Natural(value)))
+            }
+            Kind::LeftBrace => self.struct_pattern(),
+            Kind::LeftParen => self.paren_pattern(),
+            // Nothing here begins a pattern — an arm written `=> 1` is missing
+            // one, and this is where it is told so.
+            _ => self.unexpected(),
+        }
+    }
+
+    /// `{ <field>, <field>: <pattern>, ... }` with an optional trailing comma —
+    /// the struct expression's shape, with a bare name allowed to pun.
+    fn struct_pattern(&mut self) -> Option<Pattern> {
+        let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
+        let mut fields = IndexMap::new();
+
+        while !matches!(
+            self.peek().map(|t| &t.tracked),
+            Some(Kind::RightBrace) | None
+        ) {
+            let name = self.ident()?;
+            // A colon gives the field a sub-pattern; its absence puns, binding
+            // the field to its own name. What punning means is not decided
+            // here: the parser records that nothing was written.
+            let value = match self.eat_if(&Kind::Colon) {
+                Some(_) => Some(self.pattern()?),
+                None => None,
+            };
+            fields.insert(name, value);
+
+            // A comma separates fields; its absence ends the field list.
+            if self.eat_if(&Kind::Comma).is_none() {
+                break;
+            }
+        }
+
+        let close = self.eat(&Kind::RightBrace)?;
+        let span = open.span.merge(close.span);
+        Some(span.track(PatternKind::Struct(fields)))
+    }
+
+    /// `( <pattern> )` — grouping only, discarded exactly as
+    /// [`paren_expr`](Self::paren_expr) discards it. An empty pair is the unit
+    /// pattern.
+    fn paren_pattern(&mut self) -> Option<Pattern> {
+        let open = self.eat(&Kind::LeftParen).expect("the caller peeked `(`");
+        if let Some(close) = self.eat_if(&Kind::RightParen) {
+            return Some(open.span.merge(close.span).track(PatternKind::Unit));
+        }
+        let inner = self.pattern()?;
+        let close = self.eat(&Kind::RightParen)?;
+        Some(open.span.merge(close.span).track(inner.tracked))
     }
 
     /// The `<arg>+ =>` header of a function: gather the argument identifiers,

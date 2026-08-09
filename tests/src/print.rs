@@ -342,6 +342,43 @@ fn recursion_and_forward_references_round_trip() {
     }
 }
 
+/// A match prints back as the surface syntax it was written as — the leading
+/// `|` on every arm, each pattern in the grammar it was read by — and the
+/// printed form re-parses and re-lowers to the same thing. Every kind of
+/// pattern is on the page: names, naturals, `()`, `{}`, struct patterns with
+/// renaming and nesting, tags bare and carrying, and the greedy payload that
+/// needs its parentheses back.
+#[test]
+fn a_match_and_its_patterns_round_trip() {
+    for source in [
+        "let f = fn v => match v with | `Some x => x | `None => 0 end",
+        "let f = fn v => match v with | 0 => 1 | 1 => 2 | k => k end",
+        "let f = fn v => match v with | () => 1 end",
+        "let f = fn v => match v with | {} => 1 end",
+        "let f = fn v => match v with | { a: `A, b: { c: x } } => x | r => 0 end",
+        "let f = fn v => match v with | `A (`X x) => x | `A w => 0 | r => 1 end",
+        "let f = fn v => match v with end",
+        "let f = fn v => (match v with | w => w end).x",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+
+        let (_, again) = printed(&ir);
+        assert_eq!(again, ir, "{source} did not round-trip");
+    }
+
+    // The one printing the IR spells differently from the AST: a pun is
+    // expanded by lowering, so the IR prints the field twice-named while the
+    // AST keeps the spelling — and the IR's form still re-lowers to itself.
+    let source = "let f = fn v => match v with | { x, y: a } => x end";
+    let (ast, ir) = printed(source);
+    assert_eq!(ast, source);
+    assert_eq!(ir, "let f = fn v => match v with | { x: x, y: a } => x end");
+    let (_, again) = printed(&ir);
+    assert_eq!(again, ir);
+}
+
 /// A nested `let` prints back as the surface syntax it was written as, in both
 /// trees, and the printed form re-parses and re-lowers to the same thing.
 ///

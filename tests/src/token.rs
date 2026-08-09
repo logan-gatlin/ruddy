@@ -217,3 +217,23 @@ fn lexes_the_case_separator() {
     // The empty sum is one token and no name at all.
     assert!(matches!(kinds("|")[..], [Kind::Pipe]));
 }
+
+/// `match` is a keyword now — the spending of the reserved `with` and `end` —
+/// so it lexes as its own kind and can no longer be an identifier.
+#[test]
+fn match_lexes_as_a_keyword() {
+    assert!(matches!(kinds("match")[..], [Kind::Match]));
+    assert!(matches!(
+        kinds("match x with end")[..],
+        [Kind::Match, Kind::Identifier(_), Kind::With, Kind::End]
+    ));
+}
+
+/// Only the exact word is the keyword: a name that merely starts with it is
+/// still a name, because the lexer reads whole words.
+#[test]
+fn names_containing_match_are_still_names() {
+    assert!(matches!(&kinds("matches")[..], [Kind::Identifier(name)] if name == "matches"));
+    assert!(matches!(&kinds("matchbox")[..], [Kind::Identifier(name)] if name == "matchbox"));
+    assert!(matches!(&kinds("rematch")[..], [Kind::Identifier(name)] if name == "rematch"));
+}

@@ -9,14 +9,14 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{Field, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind},
+    ir::{Field, PatternKind, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind},
     symbol::Mint,
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_project,
-    write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
+    write_project, write_row, write_struct, write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -130,6 +130,10 @@ impl Grouped for Show<'_, TermKind> {
             // group alike. The parse tree's printer says the same, because it
             // is the same syntax.
             TermKind::Fn { .. } | TermKind::Let { .. } => Prec::Lambda,
+            // Self-delimiting on the right but not an application argument by
+            // grammar; the parse tree's printer says the same, because it is
+            // the same syntax.
+            TermKind::Match { .. } => Prec::Apply,
             // A tag carrying something groups as the application it reads as;
             // carrying nothing it groups below one, because the argument would
             // be read as the payload it has not got. The parse tree's printer
@@ -144,6 +148,44 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Ident(_)
             | TermKind::Natural(_)
             | TermKind::Error => Prec::Atom,
+        }
+    }
+}
+
+/// A normalized pattern groups exactly as the surface pattern it prints as —
+/// the same ladder the parse tree's patterns read.
+impl Grouped for Show<'_, PatternKind> {
+    fn prec(&self) -> Prec {
+        match self.node {
+            PatternKind::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            PatternKind::Tag { payload: None, .. } => Prec::Tag,
+            PatternKind::Bind(_)
+            | PatternKind::Natural(_)
+            | PatternKind::Unit
+            | PatternKind::Struct(_) => Prec::Atom,
+        }
+    }
+}
+
+/// A normalized pattern prints as surface syntax, the binders named through
+/// the mint. A pun does not come back — lowering expanded it, so `{x}` prints
+/// as `{ x: x }` — but the printed form re-parses to the same normalized
+/// pattern, which is the round-trip that matters here.
+impl fmt::Display for Show<'_, PatternKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.node {
+            PatternKind::Bind(name) => f.write_str(self.mint.name(name.tracked)),
+            PatternKind::Natural(value) => write!(f, "{value}"),
+            PatternKind::Unit => f.write_str("()"),
+            PatternKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                false,
+                payload.as_deref().map(|payload| self.show(payload)),
+            ),
+            PatternKind::Struct(fields) => write_struct(f, self.pairs(fields)),
         }
     }
 }
@@ -190,7 +232,7 @@ impl fmt::Display for Show<'_, TermKind> {
                 body,
             } => write_let(
                 f,
-                self.mint.name(name.tracked),
+                &self.mint.name(name.tracked),
                 annotation.as_ref().map(|ty| self.show(ty)),
                 &self.show(&**value),
                 &self.show(&**body),
@@ -207,6 +249,15 @@ impl fmt::Display for Show<'_, TermKind> {
             ),
             TermKind::Project { base, field } => {
                 write_project(f, &self.show(&**base), &field.tracked)
+            }
+            // The arms print as they stand: the normalized pattern — binders
+            // named through the mint, puns already expanded — and the body,
+            // one arm per written arm.
+            TermKind::Match { scrutinee, arms } => {
+                let arms = arms
+                    .iter()
+                    .map(|(pattern, body)| (self.show(pattern), self.show(body)));
+                write_match(f, &self.show(&**scrutinee), arms)
             }
         }
     }
@@ -298,5 +349,11 @@ pub fn term<'a>(kind: &'a TermKind, mint: &'a Mint) -> impl fmt::Display + 'a {
 
 /// Render one type, the [`term`] counterpart.
 pub fn ty<'a>(kind: &'a TypeKind, mint: &'a Mint) -> impl fmt::Display + 'a {
+    Show { node: kind, mint }
+}
+
+/// Render one normalized pattern, the [`term`] counterpart for the arms of a
+/// match.
+pub fn pattern<'a>(kind: &'a PatternKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
 }

@@ -92,6 +92,22 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             field: "x".to_string(),
         },
         IrError::EndlessFields,
+        IrError::RefutableBinding {
+            found: ir::Refuter::Case("Some".to_string()),
+        },
+        IrError::UnreachableArm,
+        IrError::MisplacedCatchAll,
+        IrError::UnhandledValues {
+            witness: ir::Witness::Tag {
+                name: "A".to_string(),
+                payload: None,
+            },
+        },
+        IrError::UnhandledNumbers,
+        IrError::MixedMatch,
+        IrError::DuplicateBinding {
+            name: "x".to_string(),
+        },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -729,6 +745,7 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         TokenKind::Type,
         TokenKind::End,
         TokenKind::With,
+        TokenKind::Match,
         TokenKind::Fn,
         TokenKind::Equal,
         TokenKind::FatArrow,
@@ -1654,4 +1671,180 @@ fn the_scoping_constraints_read_as_what_they_do() {
         use_site.to_string(),
         "?4 ~ a fresh copy of what this name was bound to"
     );
+}
+
+/// The complaints pattern matching added, worded and coded. The wording quotes
+/// what the reader wrote — the tag with its backtick, the number as itself,
+/// the name that was bound twice — and the codes are the stable names the
+/// error tests in `ir.rs` key on.
+#[test]
+fn the_pattern_complaints_say_what_was_written() {
+    let case = IrError::RefutableBinding {
+        found: ir::Refuter::Case("Some".to_string()),
+    };
+    assert_eq!(case.code(), "binding-can-fail");
+    assert_eq!(
+        case.to_string(),
+        "this binding has to accept every value, but a value here might not be ``Some`"
+    );
+    // A number is the same complaint made about the other kind of test, and
+    // the same code: what went wrong is the binding either way.
+    let number = IrError::RefutableBinding {
+        found: ir::Refuter::Number(0),
+    };
+    assert_eq!(number.code(), "binding-can-fail");
+    assert_eq!(
+        number.to_string(),
+        "this binding has to accept every value, but the number `0` makes it able to fail"
+    );
+
+    assert_eq!(IrError::UnreachableArm.code(), "unreachable-arm");
+    assert_eq!(
+        IrError::UnreachableArm.to_string(),
+        "this case is already handled by the arms above it"
+    );
+
+    assert_eq!(IrError::MisplacedCatchAll.code(), "misplaced-catch-all");
+    assert_eq!(
+        IrError::MisplacedCatchAll.to_string(),
+        "this arm accepts everything, so the arms after it can never be reached"
+    );
+
+    assert_eq!(IrError::UnhandledNumbers.code(), "unhandled-numbers");
+    assert_eq!(
+        IrError::UnhandledNumbers.to_string(),
+        "numbers not listed here are not handled; add a final arm that names the rest"
+    );
+
+    // The unhandled-values complaint renders its witness in source syntax:
+    // the hole's own example value, backticks and braces as a reader would
+    // write them.
+    let hole = IrError::UnhandledValues {
+        witness: ir::Witness::Struct(
+            [
+                (
+                    "a".to_string(),
+                    ir::Witness::Tag {
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    ir::Witness::Tag {
+                        name: "Y".to_string(),
+                        payload: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    };
+    assert_eq!(hole.code(), "unhandled-values");
+    assert_eq!(
+        hole.to_string(),
+        "some values are not handled — for example `{ a: `A, b: `Y }`; add an arm for them or a final arm naming the rest"
+    );
+
+    assert_eq!(IrError::MixedMatch.code(), "mixed-match");
+    assert_eq!(
+        IrError::MixedMatch.to_string(),
+        "this compares against both numbers and cases, and no value can be both"
+    );
+
+    let bound = IrError::DuplicateBinding {
+        name: "x".to_string(),
+    };
+    assert_eq!(bound.code(), "duplicate-binding");
+    assert_eq!(bound.to_string(), "this binds `x` twice");
+}
+
+/// Every shape a witness takes, rendered: numbers as themselves, tags bare
+/// and carrying — a carried prose form bracketed, so the example still reads
+/// as one value — an open position as "anything other than …", and the
+/// position nothing constrains as "anything".
+#[test]
+fn a_witness_renders_in_source_syntax() {
+    assert_eq!(ir::Witness::Natural(2).to_string(), "2");
+    assert_eq!(ir::Witness::Any.to_string(), "anything");
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Natural(1))),
+        }
+        .to_string(),
+        "`A 1"
+    );
+    // A payload that is itself a tag — bare or carrying — or prose, is
+    // bracketed: the example has to read back as the one value it is.
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Tag {
+                name: "X".to_string(),
+                payload: Some(Box::new(ir::Witness::Natural(1))),
+            })),
+        }
+        .to_string(),
+        "`A (`X 1)"
+    );
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "A".to_string(),
+            payload: Some(Box::new(ir::Witness::Tag {
+                name: "X".to_string(),
+                payload: None,
+            })),
+        }
+        .to_string(),
+        "`A (`X)"
+    );
+    assert_eq!(
+        ir::Witness::Tag {
+            name: "B".to_string(),
+            payload: Some(Box::new(ir::Witness::Other(vec![
+                "X".to_string(),
+                "Y".to_string()
+            ]))),
+        }
+        .to_string(),
+        "`B (anything other than `X or `Y)"
+    );
+    // A struct witness beside a prose field: the field list reads on.
+    assert_eq!(
+        ir::Witness::Struct(
+            [
+                (
+                    "a".to_string(),
+                    ir::Witness::Tag {
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                ),
+                ("b".to_string(), ir::Witness::Other(vec!["X".to_string()]),),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .to_string(),
+        "{ a: `A, b: anything other than `X }"
+    );
+}
+
+/// The prose a person meets stays in their words: the compiler's own names
+/// for the machinery — refutability, scrutinees, join points, pattern
+/// matrices — appear in no diagnostic. Checked over every complaint the
+/// compiler can raise, not just the new ones, so a reworded message cannot
+/// quietly pick the jargon up.
+#[test]
+fn no_complaint_speaks_in_pattern_jargon() {
+    for (phase, code, message) in diagnostics() {
+        for jargon in ["refutable", "scrutinee", "join point", "pattern matrix"] {
+            assert!(
+                !message.to_lowercase().contains(jargon),
+                "{phase}/{code}: {message}"
+            );
+        }
+    }
 }

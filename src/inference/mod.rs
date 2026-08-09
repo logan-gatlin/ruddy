@@ -1854,6 +1854,12 @@ impl Table {
                     self.zonk_term(payload, subst);
                 }
             }
+            TermKind::Match { scrutinee, arms } => {
+                self.zonk_term(scrutinee, subst);
+                for (_, body) in arms {
+                    self.zonk_term(body, subst);
+                }
+            }
             TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
         }
     }

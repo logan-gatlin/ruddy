@@ -190,6 +190,14 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
             }
         }
         TermKind::Project { base, .. } => walk_locals(base, out),
+        // A match's binders are lambda-argument-like — no scheme is published
+        // for one — so only what sits inside is walked.
+        TermKind::Match { scrutinee, arms } => {
+            walk_locals(scrutinee, out);
+            for (_, body) in arms {
+                walk_locals(body, out);
+            }
+        }
         TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
     }
 }

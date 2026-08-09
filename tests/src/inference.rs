@@ -123,6 +123,12 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
                 out.extend(body_tys(payload));
             }
         }
+        TermKind::Match { scrutinee, arms } => {
+            out.extend(body_tys(scrutinee));
+            for (_, body) in arms {
+                out.extend(body_tys(body));
+            }
+        }
         TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
     }
     out
@@ -4052,5 +4058,321 @@ fn a_shared_rest_lacks_the_absent_label() {
         ),
         "{:#?}",
         output.errors
+    );
+}
+
+/// A match with no default closes the row: the listed cases are the whole
+/// sum, and the annotation's own spelling unfolds to exactly that.
+#[test]
+fn a_match_without_a_default_closes_the_sum() {
+    let (mint, _, output) = inferred(
+        "type Option T = `Some T | `None\n\
+         let get = fn opt => match opt with | `Some x => x | `None => 0 end",
+    );
+    assert_eq!(scheme(&mint, &output, "get"), "`Some Nat | `None -> Nat");
+}
+
+/// With a default the row stays open — the rest a fresh tail lacking the
+/// listed cases — and the default's binder sees the sum with every handled
+/// case ruled out.
+#[test]
+fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
+    let (mint, _, output) = inferred(
+        "let handle = fn r => 0\n\
+         let first = fn v => match v with | `Some x => x | rest => handle rest end",
+    );
+    // The scrutinee allows `Some` and whatever else; the binder's sum has
+    // `Some` absent — not part of what the type says, so it prints as the
+    // bare rest — over the same tail.
+    assert_eq!(scheme(&mint, &output, "first"), "`Some Nat | ..'a -> Nat");
+    let (mint, _, output) =
+        inferred("let rest_of = fn v => match v with | `Some x => x | rest => rest end");
+    // Binding the result to both the payload and the leftover sum ties them
+    // together: what `Some` carries is the sum without `Some`.
+    assert_eq!(
+        scheme(&mint, &output, "rest_of"),
+        "`Some (| ..'a) | ..'a -> | ..'a"
+    );
+}
+
+/// R7's nuance: a tag only partially handled — a refutable payload — is not
+/// fully handled by the arms above the catch-all, so the binder's type keeps
+/// that case present rather than ruling it out: an `A`-tagged value whose
+/// payload is not `X` reaches it.
+#[test]
+fn a_partially_handled_case_stays_present_for_the_catch_all() {
+    let (mint, _, output) = inferred(
+        "let keep = fn r => 0\n\
+         let f = fn e => match e with | `A `X x => 1 | r => keep r end",
+    );
+    // `A` is still in the sum the binder sees: an `A`-tagged value whose
+    // payload is not `X` reaches it.
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`A (`X 'a | ..'b) | ..'c -> Nat"
+    );
+    let (mint, _, output) =
+        inferred("let g = fn e => match e with | `A `X x => `Nothing | r => r end");
+    // Handing the binder back out shows the same nuance from the result side:
+    // the sum the match evaluates to still allows `A`.
+    assert_eq!(
+        scheme(&mint, &output, "g"),
+        "`A (`X 'a | ..'b) | `Nothing | ..'c -> `Nothing | `A (`X 'a | ..'b) | ..'c"
+    );
+}
+
+/// What a case carries flows to the arm's binder, nesting included, and a
+/// bare tag arm constrains its payload to unit.
+#[test]
+fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
+    let (mint, _, output) = inferred(
+        "let pick = fn l => match l with \
+         | `Cons { head: `Some x, tail: t } => x \
+         | `Cons { head: `None, tail: t } => 0 \
+         | `Nil => 0 \
+         end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "pick"),
+        "`Cons { head: `Some Nat | `None, tail: 'a, ..'b } | `Nil -> Nat"
+    );
+    // The bare `` `None `` and `` `Nil `` both carry unit: supplying a
+    // payload to one is the ordinary mismatch.
+    let (_, _, output) = infer_src(
+        "let f = fn v => match v with | `None => 0 | r => 1 end\n\
+         let bad = f (`None 5)",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// Natural arms constrain the scrutinee — and the default's binder — to
+/// `Nat`; the result is whatever the bodies agree on.
+#[test]
+fn a_natural_match_is_about_numbers() {
+    let (mint, _, output) =
+        inferred("let describe = fn n => match n with | 0 => `Zero | 1 => `One | k => `Many end");
+    assert_eq!(
+        scheme(&mint, &output, "describe"),
+        "Nat -> `Zero | `One | `Many | ..'a"
+    );
+    let (mint, _, output) = inferred("let same = fn n => match n with | 0 => 1 | k => k end");
+    assert_eq!(scheme(&mint, &output, "same"), "Nat -> Nat");
+}
+
+/// The column-union program — the shape that broke revision 1 — types clean:
+/// `a` closes over its one tag, `b` over the two the two arms list between
+/// them, and `c` is unconstrained, because positions type as the union of
+/// what the whole match tests there, never per-arm.
+#[test]
+fn columns_type_as_unions_across_arms() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: `X, c: x } => 1 | { a: `A, b: `Y, c: y } => 2 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A, b: `X | `Y, c: 'a, ..'b } -> Nat"
+    );
+}
+
+/// `()` as a pattern demands unit of its position, in a match as on a `let`.
+#[test]
+fn a_unit_pattern_demands_unit() {
+    let (mint, _, output) = inferred("let f = fn v => match v with () => 1 end");
+    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
+}
+
+/// The empty match eliminates the empty sum: the scrutinee is `|`, and the
+/// match's own type is anything at all.
+#[test]
+fn an_empty_match_eliminates_the_empty_sum() {
+    let (mint, _, output) = inferred("let absurd = fn v => match v with end");
+    assert_eq!(scheme(&mint, &output, "absurd"), "| -> 'a");
+}
+
+/// Every arm's body — the default's included — unifies with the match's own
+/// type, so bodies that cannot agree are the mismatch, reported at the body.
+#[test]
+fn arm_bodies_unify_with_the_match() {
+    let (mint, _, output) = inferred("let sole = fn v => match v with w => w end");
+    assert_eq!(scheme(&mint, &output, "sole"), "'a -> 'a");
+
+    let (_, _, output) = infer_src("let f = fn v => match v with | `A x => 0 | `B y => {} end");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// A case the arms do not list is refused at the use site that supplies it —
+/// the ordinary mismatch against the closed sum, not a rule of the match's
+/// own.
+#[test]
+fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
+    let (_, _, output) = infer_src(
+        "let f = fn opt => match opt with | `Some x => x end\n\
+         let bad = f `None",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    match &output.errors[0].kind {
+        ErrorKind::ExtraField { shape, base, field } => {
+            assert_eq!(*shape, Shape::Sum);
+            assert_eq!(base.to_string(), "`Some 'a");
+            assert_eq!(field, "None");
+        }
+        other => panic!("expected an extra case, got {other:?}"),
+    }
+}
+
+/// Every written body appears exactly once in the IR — there is no
+/// duplication and no join point — so a type error inside one is reported
+/// exactly once, trivially.
+#[test]
+fn an_error_in_an_arm_body_is_reported_once() {
+    let (_, _, output) = infer_src(
+        "let wants_nat : Nat -> Nat = fn n => n\n\
+         let f = fn e => match e with | `A `X x => 1 | r => wants_nat {} end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// A natural match with no default still types — the scrutinee and the arms
+/// are numbers — even though lowering already complained that the numbers not
+/// listed are unhandled; one mistake, one complaint, and no echo from here.
+#[test]
+fn a_natural_match_without_a_default_still_types() {
+    let (mint, out, output) = infer_src("let f = fn n => match n with | 0 => 1 end");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat");
+}
+
+/// Three levels of nesting under a written catch-all: the catch-all is
+/// irrefutable at every position, so every inner row stays open, and a case
+/// none of the inner arms list is the catch-all's to take, not an extra case.
+#[test]
+fn a_catch_all_keeps_nested_rows_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | `A `B `C 0 => 1 | `A `B r => 2 | q => 3 end\n\
+         let user = f (`A `Z)",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`A (`B (`C Nat | ..'a) | ..'b) | ..'c -> Nat"
+    );
+}
+
+/// The same through a struct payload: the positions inside the struct are
+/// open under the catch-all too, so the tag above the struct stays partially
+/// handled and open rather than closing.
+#[test]
+fn a_catch_all_keeps_struct_payload_rows_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | `P `A { x: `X } => 1 | `P `A w => 2 | q => 3 end\n\
+         let user = f (`P `Z)",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`P (`A { x: `X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
+    );
+}
+
+/// Overlapping struct arms — the same tag at one field, a binder at the
+/// other in the later arm: the binder keeps its field's position open, so a
+/// case neither arm lists is the use site's to supply, not an extra case.
+#[test]
+fn an_overlapping_struct_arm_keeps_its_field_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `A, b: k } => 2 end\n\
+         let u = f { a: `A, b: `Z }",
+    );
+    assert_eq!(scheme(&mint, &output, "u"), "Nat");
+
+    // A type error in the later arm's body — on the page exactly once — is
+    // reported exactly once.
+    let (_, _, output) = infer_src(
+        "let wants_nat : Nat -> Nat = fn n => n\n\
+         let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => wants_nat {} end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// Columns type as the union of what the whole match tests there, never
+/// per-arm: with no catch-all, a column's cases close over every tag any arm
+/// lists — the revision-1 breaker shapes, in each of their orderings, now
+/// clean.
+#[test]
+fn a_column_closes_over_every_listed_case() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // Mirror ordering: the riding row lands past a different tag and the
+    // column still closes over both.
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // Nested in a tag's payload: the outer sum closes over the one tag, the
+    // payload's column over both of its own.
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`T { a: `A | `B, b: Nat, ..'a } -> Nat"
+    );
+
+    // The same three shapes with a trailing catch-all still build clean.
+    for src in [
+        "let f = fn e => match e with \
+         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 | w => 4 end",
+        "let f = fn e => match e with \
+         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 | w => 4 end",
+    ] {
+        let (_, out, output) = infer_src(src);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        assert!(output.errors.is_empty(), "{src}: {:#?}", output.errors);
+    }
+
+    // A type error in a body reachable past an overlapping earlier arm is
+    // still one body on the page, so it is reported exactly once.
+    let (_, _, output) = infer_src(
+        "let wants_nat : Nat -> Nat = fn n => n\n\
+         let f = fn e => match e with \
+         | { a: `A, b: `X `Y } => 1 | { a: `A, b: k } => wants_nat {} end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// Two tags with nested tests before one catch-all: the catch-all keeps
+/// every nested position open, whichever tag it sits under, so an unlisted
+/// inner case type-checks instead of closing the row.
+#[test]
+fn a_sibling_tags_positions_stay_open_under_the_catch_all() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | `A `B `C 0 => 1 | `A `B r => 2 | `D `E 0 => 4 | q => 5 end\n\
+         let user = f (`D `F)\n\
+         let deep = f (`D (`E 7))",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`A (`B (`C Nat | ..'a) | ..'b) | `D (`E Nat | ..'c) | ..'d -> Nat"
     );
 }

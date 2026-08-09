@@ -1494,8 +1494,10 @@ fn a_nested_let_reaches_every_stage() {
     // Both trees label the node with the name it binds, and both print it back
     // as the source it stands for.
     // The two trees name a lambda differently — one has the surface form and
-    // the other the curried one — and agree about everything else.
-    for (id, lambda) in [("ast", "Function"), ("ir", "Fn")] {
+    // the other the curried one — and a binder differently too: the parse
+    // tree's is a pattern, which a bare name is the simplest of, and the IR's
+    // is the resolved name. They agree about everything else.
+    for (id, lambda, binder) in [("ast", "Function", "Bind"), ("ir", "Fn", "Name")] {
         let node = nodes(stage(id))
             .into_iter()
             .find(|node| node.label == "Let id")
@@ -1508,7 +1510,7 @@ fn a_nested_let_reaches_every_stage() {
             .iter()
             .map(|child| child.label.as_str())
             .collect();
-        assert_eq!(labels, ["Name", "Ascribed Arrow", lambda, "Apply"], "{id}");
+        assert_eq!(labels, [binder, "Ascribed Arrow", lambda, "Apply"], "{id}");
     }
 
     // The Constraints tab is a tree: the `let` is a row, and what its value and
@@ -1593,4 +1595,93 @@ fn every_stage_reports_on_explicit_absence() {
         ir.iter().any(|node| node.label == "\\`Err"),
         "the IR tab renders the absent case"
     );
+}
+
+/// A program with a match and a pattern `let` reaches every stage: the AST
+/// tab shows the written arms and patterns, the IR tab shows the one matrix
+/// `Match` — scrutinee, each arm's normalized pattern with its binder
+/// symbols, and body — beside the definitions the pattern `let` desugared
+/// into, and the `let`'s fresh temporary sits in the symbols tab like any
+/// other. No tree exists to show: the lowering-visible transformation is the
+/// desugar and the normalization.
+#[test]
+fn a_match_and_a_pattern_let_reach_every_stage() {
+    let source = "let {x, y} = { x: 1, y: 2 }\n\
+                  let f = fn e => match e with | `A `X a => x | { g: `G p } => p | r => y end\n";
+    let snapshot = snapshot(source);
+    assert!(snapshot.panic.is_none());
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+
+    // The AST tab renders the match as written: the scrutinee, one wrapper
+    // per arm, and the patterns inside them.
+    let ast: Vec<&str> = nodes(stage("ast"))
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    for label in ["Match", "Arm", "Tag", "Bind", "Struct"] {
+        assert!(ast.contains(&label), "ast lacks {label}: {ast:?}");
+    }
+
+    // The IR tab renders the matrix node: the arms' normalized patterns —
+    // tags, struct fields, binders — and the definitions the struct pattern
+    // `let` became. No node of any compiled tree is on the page.
+    let ir = nodes(stage("ir"));
+    let labels: Vec<&str> = ir.iter().map(|node| node.label.as_str()).collect();
+    for label in [
+        "Match",
+        "Tag",
+        "Bind",
+        "Struct",
+        "g:",
+        "let x",
+        "let y",
+        "let %struct",
+    ] {
+        assert!(labels.contains(&label), "ir lacks {label}: {labels:?}");
+    }
+    for artifact in ["Case", "Default", "Let %join"] {
+        assert!(!labels.contains(&artifact), "{labels:?}");
+    }
+
+    // The arm binders carry their symbols, so they cross-highlight with the
+    // uses in their bodies.
+    assert!(
+        ir.iter()
+            .any(|node| node.label == "Bind" && node.symbol.is_some()),
+        "{labels:?}"
+    );
+
+    // Every span the two tabs hand out is a real position in this source.
+    for id in ["ast", "ir"] {
+        for node in nodes(stage(id)) {
+            if let Some([start, end]) = node.span {
+                assert!(
+                    source.get(start..end).is_some(),
+                    "{id}: {} at {start}..{end}",
+                    node.label
+                );
+            }
+        }
+    }
+
+    // The pattern `let`'s fresh temporary prints recognizably — the `%` no
+    // identifier can spell — and sits in the symbols tab beside the source's
+    // own names; the match minted nothing beyond what its patterns bind.
+    let symbols: Vec<&str> = stage("symbols")
+        .nodes
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    for name in ["%struct", "x", "y", "a", "p", "r"] {
+        assert!(symbols.contains(&name), "symbols lack {name}: {symbols:?}");
+    }
+    for artifact in ["%join", "%scrut", "%fall", "%case"] {
+        assert!(!symbols.contains(&artifact), "{symbols:?}");
+    }
 }

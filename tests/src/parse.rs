@@ -889,3 +889,197 @@ fn a_let_expression_reports_where_it_fails() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
 }
+
+/// The match expression, printed back as written: leading `|` on every arm —
+/// the grammar makes the first one optional, so both spellings read back to
+/// one printed form — zero arms, a sole arm, and projection off the `end`.
+#[test]
+fn parses_match_expressions() {
+    assert_eq!(
+        parse_one("let a = match x with `Some y => y | `None => 0 end"),
+        "let a = match x with | `Some y => y | `None => 0 end"
+    );
+    // The leading bar is optional and not recorded: both spellings are one
+    // tree.
+    assert_eq!(
+        parse_one("let a = match x with | `Some y => y end"),
+        "let a = match x with | `Some y => y end"
+    );
+    assert_eq!(
+        parse_one("let a = match x with end"),
+        "let a = match x with end"
+    );
+    assert_eq!(
+        parse_one("let a = match x with w => w end"),
+        "let a = match x with | w => w end"
+    );
+    // The scrutinee is a full expression, ending at the `with` of its own
+    // accord.
+    assert_eq!(
+        parse_one("let a = match f x with | y => y end"),
+        "let a = match f x with | y => y end"
+    );
+    // Projection off the `end` works the way it does off a parenthesized
+    // expression; printing brackets the match, which reads back as the same
+    // tree.
+    assert_eq!(
+        parse_one("let a = match x with | w => w end.field"),
+        "let a = (match x with | w => w end).field"
+    );
+}
+
+/// A match may head an application — it is reachable from atom position — but
+/// is not an application argument: `f match ... end` ends the application at
+/// `f` and leaves the `match` as the token nothing can use.
+#[test]
+fn a_match_is_not_an_application_argument() {
+    assert_eq!(
+        parse_one("let a = f (match x with | w => w end)"),
+        "let a = f (match x with | w => w end)"
+    );
+    assert_eq!(
+        parse_one("let a = match x with | w => w end 1"),
+        "let a = match x with | w => w end 1"
+    );
+    let src = "let a = f match x with | w => w end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("match").expect("the match")
+    );
+}
+
+/// Every kind of pattern, everywhere a pattern goes: puns, renames, nesting,
+/// naturals, `()`, and the tag payload taken greedily — `` `A `B x `` is
+/// `` `A `` carrying `` (`B x) ``, which the printer brackets and the grammar
+/// reads back the same.
+#[test]
+fn parses_every_kind_of_pattern() {
+    for (src, printed) in [
+        (
+            "let a = match x with { p, q: r } => r end",
+            "let a = match x with | { p, q: r } => r end",
+        ),
+        (
+            "let a = match x with {} => 1 end",
+            "let a = match x with | {} => 1 end",
+        ),
+        // A trailing comma among the fields is allowed, as in a struct
+        // expression.
+        (
+            "let a = match x with { p, } => p end",
+            "let a = match x with | { p } => p end",
+        ),
+        (
+            "let a = match x with { pos: { x, y } } => x end",
+            "let a = match x with | { pos: { x, y } } => x end",
+        ),
+        (
+            "let a = match x with `A `B y => y end",
+            "let a = match x with | `A (`B y) => y end",
+        ),
+        // The parenthesized spelling is the same tree.
+        (
+            "let a = match x with `A (`B y) => y end",
+            "let a = match x with | `A (`B y) => y end",
+        ),
+        (
+            "let a = match x with 0 => 1 | k => k end",
+            "let a = match x with | 0 => 1 | k => k end",
+        ),
+        (
+            "let a = match x with () => 1 end",
+            "let a = match x with | () => 1 end",
+        ),
+        // Grouping parentheses around a pattern are discarded, as around an
+        // expression.
+        (
+            "let a = match x with (w) => w end",
+            "let a = match x with | w => w end",
+        ),
+        (
+            "let a = match x with `Cons { head: `Some y, tail: t } => y end",
+            "let a = match x with | `Cons { head: `Some y, tail: t } => y end",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src}");
+    }
+}
+
+/// A `let` — statement and expression — takes a pattern where it took a name.
+#[test]
+fn parses_pattern_lets() {
+    assert_eq!(parse_one("let {x, y} = p"), "let { x, y } = p");
+    assert_eq!(
+        parse_one("let {x: a} : { x: Nat } = p"),
+        "let { x: a } : { x: Nat } = p"
+    );
+    assert_eq!(parse_one("let () = p"), "let () = p");
+    assert_eq!(
+        parse_one("let f = fn p => let {pos: {x, y}} = p in x"),
+        "let f = fn p => let { pos: { x, y } } = p in x"
+    );
+    // The parser records what was written and judges nothing: a refutable
+    // pattern on a `let` parses, and refusing it is lowering's rule.
+    assert_eq!(parse_one("let `Some x = opt"), "let `Some x = opt");
+    assert_eq!(parse_one("let 0 = n"), "let 0 = n");
+}
+
+/// Every way a match can fail to parse, reported at the token that had no
+/// reading: the missing `end`, the missing pattern, the arm without a body,
+/// the trailing `|` that promised another arm, and `match` where a name goes.
+#[test]
+fn a_match_reports_where_it_fails() {
+    for (src, from) in [
+        // An arm needs a pattern, and `=>` does not begin one.
+        ("let a = match x with => 1 end", "=> 1 end"),
+        // A `|` between arms promises another one; `end` is where the promise
+        // breaks.
+        ("let a = match x with `A y => 1 | end", "end"),
+        // An arm without a body: `|` begins no expression.
+        (
+            "let a = match x with `A y => | `B z => 2 end",
+            "| `B z => 2 end",
+        ),
+        // `match` is a keyword now, so it no longer names anything.
+        ("let match = 1", "match = 1"),
+        // Patterns on function arguments do not exist.
+        ("let f = fn {x} => x", "{x} => x"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        let at = src.len() - from.len();
+        assert_eq!(out.errors[0].span.start, at, "{src:?}");
+    }
+
+    // A match with no `end` runs out of input, and is reported there.
+    let src = "let a = match x with `A y => 1";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].span.start, src.len());
+    assert_eq!(out.errors[0].span.width, 0);
+}
+
+/// A pattern position at the end of input is reported there — `let` alone,
+/// and a match cut off at its arm.
+#[test]
+fn a_pattern_at_the_end_of_input_is_reported_there() {
+    for src in ["let", "let a = match x with |"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert_eq!(out.errors[0].span.start, src.len(), "{src:?}");
+        assert_eq!(out.errors[0].span.width, 0, "{src:?}");
+    }
+}
+
+/// A bare tag as another tag's payload is bracketed when printed — it would
+/// otherwise swallow whatever follows as the payload it has not got — and the
+/// bracketed form reads back to the same tree.
+#[test]
+fn a_bare_tag_payload_is_bracketed() {
+    assert_eq!(
+        parse_one("let a = match x with `A `B => 1 end"),
+        "let a = match x with | `A (`B) => 1 end"
+    );
+}
