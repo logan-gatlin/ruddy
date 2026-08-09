@@ -47,7 +47,7 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
     Function {
-        args: Vec<TrackedString>,
+        args: Vec<Arg>,
         body: Box<Expr>,
     },
     /// `let <name> [: <type>] = <value> in <body>` — a name given a value for
@@ -113,6 +113,21 @@ pub struct Arm {
     pub body: Expr,
 }
 
+/// One argument of a `fn` header: the name it binds, or the `_` that binds
+/// nothing. Not a pattern — the header takes plain names and the one discard,
+/// and a struct pattern written there stays the parse error it has always
+/// been — so this records which of the two was written and nothing more.
+pub type Arg = Tracked<ArgKind>;
+
+#[derive(Debug, Clone)]
+pub enum ArgKind {
+    /// A name, bound over the body as every `fn` argument always was.
+    Name(String),
+    /// `_` — the argument arrives, is typechecked, and is thrown away;
+    /// nothing in the body can name it.
+    Wildcard,
+}
+
 pub type Pattern = Tracked<PatternKind>;
 
 /// What a value may be taken apart as, mirroring the expression grammar's
@@ -124,6 +139,10 @@ pub type Pattern = Tracked<PatternKind>;
 pub enum PatternKind {
     /// A bare name: binds the whole value, matches anything.
     Ident { name: TrackedString },
+    /// `_`: matches anything and binds nothing. What a name does minus the
+    /// name, so it can never collide with a binder and can never be repeated
+    /// too often.
+    Wildcard,
     /// A natural literal: matches exactly that number.
     Natural(u128),
     /// `()`: matches unit, binds nothing.
@@ -240,6 +259,40 @@ pub struct Tail {
 #[derive(Debug, Clone)]
 pub struct Error {
     pub span: Span,
+    pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// A token no production had a reading for, or input that ran out where
+    /// more was needed. The parser's one complaint before the wildcard got
+    /// its own.
+    Unexpected,
+    /// `_` written where nothing is being thrown away: an expression, a field
+    /// name, a projection, a type. One meaning wherever it lands — `_` stands
+    /// for a value being discarded, so it can never be *used* — with the
+    /// position carried for the wording alone. See [`Place`].
+    Wildcard { place: Place },
+}
+
+/// Where a stray `_` was written, carried so [`ui`](crate::ui) can word the
+/// complaint for the position. The meaning may not vary with it; only the
+/// phrasing does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// Expression position — `let x = _`, `f _` — and every position with no
+    /// better name, since a value is what `_` most nearly fails to be.
+    Value,
+    /// A struct's field name, in an expression or a pattern: `{ _: 1 }`.
+    Field,
+    /// A struct pattern's pun, `{ _ }`: a pun binds a field to its own name,
+    /// and `_` is not a name.
+    Pun,
+    /// A projection: `x._`.
+    Projection,
+    /// A type expression, a `type` declaration's name, or one of its
+    /// parameters.
+    Type,
 }
 
 #[derive(Debug, Clone)]
@@ -301,8 +354,8 @@ impl Parser {
         tok
     }
 
-    fn error(&mut self, span: Span) {
-        self.errors.push(Error { span });
+    fn error(&mut self, span: Span, kind: ErrorKind) {
+        self.errors.push(Error { span, kind });
     }
 
     /// The zero-width position just past the last token, so that running out of
@@ -317,12 +370,39 @@ impl Parser {
     /// here, and fail. Every path that gives up goes through this: a production
     /// that returned `None` quietly would drop the statement it was parsing and
     /// leave the run looking successful.
+    ///
+    /// A `_` at the cursor gets the wildcard's own complaint rather than the
+    /// generic one, so every position it trips is told what the token means
+    /// rather than only that it did not fit. The positions with a better
+    /// wording — a field name, a pun, a projection, a type — say so before
+    /// falling through to here.
     fn unexpected<T>(&mut self) -> Option<T> {
+        if self.at_wildcard() {
+            return self.wildcard(Place::Value);
+        }
         let span = match self.peek() {
             Some(tok) => tok.span,
             None => self.eof_span(),
         };
-        self.error(span);
+        self.error(span, ErrorKind::Unexpected);
+        None
+    }
+
+    /// Whether the next token is the wildcard `_`.
+    fn at_wildcard(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(tok) if matches!(tok.tracked, Kind::Underscore)
+        )
+    }
+
+    /// Report the `_` at the cursor as one that discards nothing here, and
+    /// fail — [`unexpected`](Self::unexpected) with the R9 wording in place of
+    /// the generic one. The caller says which position tripped; the meaning is
+    /// the same in all of them.
+    fn wildcard<T>(&mut self, place: Place) -> Option<T> {
+        let span = self.peek().expect("the caller peeked an underscore").span;
+        self.error(span, ErrorKind::Wildcard { place });
         None
     }
 
@@ -407,6 +487,12 @@ impl Parser {
     /// no parameters is the ordinary case.
     fn type_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `type`");
+        // A declaration's name and parameters are names: a `_` is not one, and
+        // a type is nothing a value could be thrown away from, so it gets the
+        // wildcard complaint worded for a type rather than the generic one.
+        if self.at_wildcard() {
+            return self.wildcard(Place::Type);
+        }
         let name = self.ident()?;
         let mut params = Vec::new();
         while matches!(
@@ -414,6 +500,9 @@ impl Parser {
             Some(Kind::Identifier(_))
         ) {
             params.push(self.ident().expect("the loop peeked a name"));
+        }
+        if self.at_wildcard() {
+            return self.wildcard(Place::Type);
         }
         self.eat(&Kind::Equal)?;
         let body = self.type_expr()?;
@@ -428,6 +517,11 @@ impl Parser {
     /// reads one: an application stops in front of a nested `let`, so
     /// `let a = 1 let b = 2` is two definitions rather than `a` applied to
     /// one, and a `let` handed to a function is written in parentheses.
+    ///
+    /// [`Kind::Underscore`] is one, though no expression can ever be made of
+    /// it: `f _` is somebody reaching for a discard where a value goes, and
+    /// stopping in front of it would leave the complaint to whatever comes
+    /// after the application instead of pointing at the `_` itself.
     fn at_expr_atom(&self) -> bool {
         matches!(
             self.peek(),
@@ -439,6 +533,7 @@ impl Parser {
                     | Kind::Fn
                     | Kind::LeftBrace
                     | Kind::LeftParen
+                    | Kind::Underscore
             )
         )
     }
@@ -477,6 +572,11 @@ impl Parser {
             }
             if self.eat_if(&Kind::Dot).is_none() {
                 return Some(base);
+            }
+            // `x._` reads a field named nothing: the complaint is the
+            // wildcard's, worded for the projection it sits in.
+            if self.at_wildcard() {
+                return self.wildcard(Place::Projection);
             }
             let field = self.ident()?;
             let span = base.span.merge(field.span);
@@ -527,6 +627,11 @@ impl Parser {
             self.peek().map(|t| &t.tracked),
             Some(Kind::RightBrace) | None
         ) {
+            // `{ _: 1 }` names a field nothing: the complaint is the
+            // wildcard's, worded for the field name it fails to be.
+            if self.at_wildcard() {
+                return self.wildcard(Place::Field);
+            }
             let name = self.ident()?;
             self.eat(&Kind::Colon)?;
             let value = self.expr()?;
@@ -681,6 +786,7 @@ impl Parser {
                     | Kind::Tag(_)
                     | Kind::LeftBrace
                     | Kind::LeftParen
+                    | Kind::Underscore
             )
         )
     }
@@ -715,6 +821,12 @@ impl Parser {
                 self.advance();
                 Some(span.track(PatternKind::Ident { name }))
             }
+            // The one position `_` is at home in: it matches anything, the way
+            // a name does, and binds nothing, which is the point of it.
+            Kind::Underscore => {
+                self.advance();
+                Some(span.track(PatternKind::Wildcard))
+            }
             &Kind::Natural(value) => {
                 self.advance();
                 Some(span.track(PatternKind::Natural(value)))
@@ -737,6 +849,17 @@ impl Parser {
             self.peek().map(|t| &t.tracked),
             Some(Kind::RightBrace) | None
         ) {
+            // A `_` here is a field named nothing — or, with no colon after
+            // it, a pun of nothing: a pun binds a field to its own name, and
+            // `_` is not a name. Which of the two decides the wording, and
+            // one token of lookahead decides which.
+            if self.at_wildcard() {
+                let place = match self.toks.get(self.pos + 1).map(|tok| &tok.tracked) {
+                    Some(Kind::Colon) => Place::Field,
+                    _ => Place::Pun,
+                };
+                return self.wildcard(place);
+            }
             let name = self.ident()?;
             // A colon gives the field a sub-pattern; its absence puns, binding
             // the field to its own name. What punning means is not decided
@@ -771,18 +894,25 @@ impl Parser {
         Some(open.span.merge(close.span).track(inner.tracked))
     }
 
-    /// The `<arg>+ =>` header of a function: gather the argument identifiers,
-    /// then consume the `=>` arrow. A function must bind at least one argument,
-    /// so an empty list is a parse error.
-    fn function_args(&mut self) -> Option<Vec<TrackedString>> {
+    /// The `<arg>+ =>` header of a function: gather the arguments — names, and
+    /// the `_` that binds nothing — then consume the `=>` arrow. A function
+    /// must take at least one argument, so an empty list is a parse error;
+    /// `fn _ => e` takes one and discards it, which is not the same thing.
+    fn function_args(&mut self) -> Option<Vec<Arg>> {
         let mut args = Vec::new();
-        while matches!(self.peek().map(|t| &t.tracked), Some(Kind::Identifier(_))) {
-            args.push(self.ident().expect("the loop peeked a name"));
+        while let Some(tok) = self.peek() {
+            let arg = match &tok.tracked {
+                Kind::Identifier(name) => tok.span.track(ArgKind::Name(name.clone())),
+                Kind::Underscore => tok.span.track(ArgKind::Wildcard),
+                _ => break,
+            };
+            self.advance();
+            args.push(arg);
         }
         let arrow = self.eat(&Kind::FatArrow)?;
         if args.is_empty() {
-            // `fn => ...` binds nothing; reject it at the arrow.
-            self.error(arrow.span);
+            // `fn => ...` takes nothing; reject it at the arrow.
+            self.error(arrow.span, ErrorKind::Unexpected);
             return None;
         }
         Some(args)
@@ -880,7 +1010,7 @@ impl Parser {
                 // still there to be checked.
                 let Some(name) = self.tag() else {
                     if let Some(bar) = separator {
-                        self.error(bar);
+                        self.error(bar, ErrorKind::Unexpected);
                     }
                     break;
                 };
@@ -941,13 +1071,16 @@ impl Parser {
 
     /// Whether the next token can begin an atomic type — the type-level
     /// counterpart of [`at_expr_atom`](Self::at_expr_atom), and what decides
-    /// where an application stops.
+    /// where an application stops. `_` is one for the reason it is an
+    /// expression atom: no type can be made of it — there is no inferred-type
+    /// hole — and reading it here is what points the complaint at the `_`
+    /// rather than at whatever follows the type.
     fn at_type_atom(&self) -> bool {
         matches!(
             self.peek(),
             Some(tok) if matches!(
                 tok.tracked,
-                Kind::Identifier(_) | Kind::LeftBrace | Kind::LeftParen
+                Kind::Identifier(_) | Kind::LeftBrace | Kind::LeftParen | Kind::Underscore
             )
         )
     }
@@ -968,6 +1101,9 @@ impl Parser {
                 self.advance();
                 Some(span.track(TypeKind::Ident { name }))
             }
+            // There is no inferred-type hole: `_` in a type is refused, with
+            // the wildcard's complaint worded for the position.
+            Kind::Underscore => self.wildcard(Place::Type),
             // As in [`atom`](Self::atom): a type position with no type in it is
             // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
             _ => self.unexpected(),

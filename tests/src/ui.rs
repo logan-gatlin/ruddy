@@ -41,8 +41,17 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("lex", kind.code(), kind.to_string()));
     }
 
-    let unexpected = parse::Error { span };
-    all.push(("parse", unexpected.code(), unexpected.to_string()));
+    // Every kind and, for the wildcard, every position it can be worded for:
+    // one meaning, five phrasings, and each has to hold to the phrase rules.
+    for kind in [
+        parse::ErrorKind::Unexpected,
+        parse::ErrorKind::Wildcard {
+            place: parse::Place::Value,
+        },
+    ] {
+        let error = parse::Error { span, kind };
+        all.push(("parse", error.code(), error.to_string()));
+    }
 
     // Both namespaces of all three name errors: the namespace is part of the
     // code, so an undefined type and an undefined term are two diagnostics
@@ -756,6 +765,7 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         TokenKind::DotDot,
         TokenKind::Question,
         TokenKind::Pipe,
+        TokenKind::Underscore,
         TokenKind::LeftBrace,
         TokenKind::RightBrace,
         TokenKind::LeftParen,
@@ -1846,5 +1856,64 @@ fn no_complaint_speaks_in_pattern_jargon() {
                 "{phase}/{code}: {message}"
             );
         }
+    }
+}
+
+/// The misplaced wildcard is one meaning worded five ways: every position's
+/// phrasing opens with what `_` stands for, every wording is distinct, all
+/// share one code, and each holds to the phrase rules like any diagnostic.
+/// The wording per position is pinned so a reworded meaning cannot slip by.
+#[test]
+fn a_misplaced_wildcard_is_worded_for_its_position() {
+    let span = Span::generated(0, 1);
+    let said = |place: parse::Place| {
+        let error = parse::Error {
+            span,
+            kind: parse::ErrorKind::Wildcard { place },
+        };
+        assert_eq!(error.code(), "misplaced-wildcard", "{place:?}");
+        error.to_string()
+    };
+
+    assert_eq!(
+        said(parse::Place::Value),
+        "`_` stands for a value being thrown away, so it can't be used as a value here"
+    );
+    assert_eq!(
+        said(parse::Place::Field),
+        "`_` stands for a value being thrown away, so it can't be a field's name"
+    );
+    assert_eq!(
+        said(parse::Place::Pun),
+        "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
+    );
+    assert_eq!(
+        said(parse::Place::Projection),
+        "`_` stands for a value being thrown away, so it can't name a field to read"
+    );
+    assert_eq!(
+        said(parse::Place::Type),
+        "`_` stands for a value being thrown away, so it can't be used as a type"
+    );
+
+    // One meaning, five phrasings: each opens with what `_` stands for, no
+    // two are the same sentence, and each is a placeable phrase — no leading
+    // capital, no trailing period — that names no machinery.
+    let places = [
+        parse::Place::Value,
+        parse::Place::Field,
+        parse::Place::Pun,
+        parse::Place::Projection,
+        parse::Place::Type,
+    ];
+    let wordings: HashSet<String> = places.iter().map(|place| said(*place)).collect();
+    assert_eq!(wordings.len(), places.len(), "{wordings:?}");
+    for wording in &wordings {
+        assert!(
+            wording.starts_with("`_` stands for a value being thrown away"),
+            "{wording}"
+        );
+        assert!(!wording.ends_with('.'), "{wording}");
+        assert!(!wording.to_lowercase().contains("wildcard"), "{wording}");
     }
 }

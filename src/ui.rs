@@ -230,23 +230,51 @@ impl fmt::Display for Kind {
             Kind::LeftParen => f.write_str("("),
             Kind::RightParen => f.write_str(")"),
             Kind::Identifier(name) => f.write_str(name),
+            Kind::Underscore => f.write_str("_"),
             Kind::Natural(value) => write!(f, "{value}"),
         }
     }
 }
 
 impl parse::Error {
-    /// The parser raises one kind of error, so this is a constant — but it is
-    /// still spelled out here, so that a reporter reaches every phase's errors
-    /// the same way and a second kind has somewhere to go.
+    /// A stable, greppable name for this kind of error, the way every other
+    /// phase's are coded. One code for the wildcard wherever it landed: what
+    /// went wrong is the `_`, and the position only polishes the wording.
     pub fn code(&self) -> &'static str {
-        "unexpected-token"
+        match self.kind {
+            parse::ErrorKind::Unexpected => "unexpected-token",
+            parse::ErrorKind::Wildcard { .. } => "misplaced-wildcard",
+        }
     }
 }
 
+/// What the parser could not read, in a phrase. The wildcard's five wordings
+/// are one meaning — `_` stands for a value being thrown away, so it can't be
+/// *used* — said in the noun of the position it landed in.
 impl fmt::Display for parse::Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("unexpected token")
+        match self.kind {
+            parse::ErrorKind::Unexpected => f.write_str("unexpected token"),
+            parse::ErrorKind::Wildcard { place } => f.write_str(match place {
+                parse::Place::Value => {
+                    "`_` stands for a value being thrown away, so it can't be used as a value here"
+                }
+                parse::Place::Field => {
+                    "`_` stands for a value being thrown away, so it can't be a field's name"
+                }
+                // A pun binds a field to its own name, so what is missing here
+                // is the name — the value never gets a say.
+                parse::Place::Pun => {
+                    "`_` stands for a value being thrown away, and a field written bare binds to its own name, so there is no name here to bind"
+                }
+                parse::Place::Projection => {
+                    "`_` stands for a value being thrown away, so it can't name a field to read"
+                }
+                parse::Place::Type => {
+                    "`_` stands for a value being thrown away, so it can't be used as a type"
+                }
+            }),
+        }
     }
 }
 
@@ -262,6 +290,7 @@ impl Grouped for parse::PatternKind {
             } => Prec::Apply,
             parse::PatternKind::Tag { payload: None, .. } => Prec::Tag,
             parse::PatternKind::Ident { .. }
+            | parse::PatternKind::Wildcard
             | parse::PatternKind::Natural(_)
             | parse::PatternKind::Unit
             | parse::PatternKind::Struct(_) => Prec::Atom,
@@ -277,6 +306,7 @@ impl fmt::Display for parse::PatternKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
+            parse::PatternKind::Wildcard => f.write_str("_"),
             parse::PatternKind::Natural(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tag { name, payload } => write_tag(

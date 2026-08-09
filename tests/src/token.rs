@@ -229,6 +229,48 @@ fn match_lexes_as_a_keyword() {
     ));
 }
 
+/// `_` is its own token now: a discard, not a name. Only the exact word — the
+/// lexer reads whole words, so nothing shorter than the whole of `__` can
+/// change what it is.
+#[test]
+fn a_lone_underscore_lexes_as_the_wildcard() {
+    assert!(matches!(kinds("_")[..], [Kind::Underscore]));
+    assert!(matches!(
+        kinds("let _ = 1")[..],
+        [Kind::Let, Kind::Underscore, Kind::Equal, Kind::Natural(1)]
+    ));
+
+    // Spanned at the one byte it is, and printed back as it.
+    let out = lex("let _ = 1", FileID::GENERATED);
+    let wild = &out.tokens[1];
+    assert_eq!(wild.span.start, 4);
+    assert_eq!(wild.span.width, 1);
+    assert_eq!(wild.tracked.to_string(), "_");
+}
+
+/// Words that merely contain underscores are the identifiers they always
+/// were: `__`, `_x`, `x_` and `_1` all still name things.
+#[test]
+fn words_of_underscores_are_still_names() {
+    for word in ["__", "_x", "x_", "_1"] {
+        assert!(
+            matches!(&kinds(word)[..], [Kind::Identifier(name)] if name == word),
+            "{word}"
+        );
+    }
+}
+
+/// The tag `` `_ `` is untouched: a tag's name runs over identifier
+/// characters, and the keyword rule never sees it.
+#[test]
+fn the_underscore_tag_is_still_a_tag() {
+    assert!(matches!(&kinds("`_")[..], [Kind::Tag(name)] if name == "_"));
+    assert!(matches!(
+        &kinds("`_ _")[..],
+        [Kind::Tag(name), Kind::Underscore] if name == "_"
+    ));
+}
+
 /// Only the exact word is the keyword: a name that merely starts with it is
 /// still a name, because the lexer reads whole words.
 #[test]

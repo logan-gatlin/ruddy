@@ -44,6 +44,13 @@ pub enum Kind {
     LeftParen,
     RightParen,
     Identifier(String),
+    /// `_`, the wildcard: a value being thrown away. Its own kind rather than
+    /// an identifier because it binds nothing and can never be referred to —
+    /// the parser has to tell a discard from a name, and a lexeme the two
+    /// could share would leave it guessing. Only the exact word: `__`, `_x`
+    /// and `_1` remain ordinary identifiers, read by the keyword rule that
+    /// already keeps `matches` a name.
+    Underscore,
     /// `` `Some `` — one of a sum type's cases, named. One token rather than a
     /// backtick beside a name, because that is what it is: a label with no
     /// spaces allowed inside it, and a span a reader can select in one go. The
@@ -205,6 +212,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "with" => Kind::With,
                     "match" => Kind::Match,
                     "fn" => Kind::Fn,
+                    "_" => Kind::Underscore,
                     _ => Kind::Identifier(ident),
                 };
                 tokens.push(span.track(kind));

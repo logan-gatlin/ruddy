@@ -1,7 +1,7 @@
 //! Tests for [`ruddy::parse`].
 
 use ruddy::{
-    parse::{StmtKind, SumCase, Type, TypeField, TypeKind, parse},
+    parse::{ErrorKind, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse},
     token::lex,
     tracking::FileID,
 };
@@ -1082,4 +1082,103 @@ fn a_bare_tag_payload_is_bracketed() {
         parse_one("let a = match x with `A `B => 1 end"),
         "let a = match x with | `A (`B) => 1 end"
     );
+}
+
+/// `_` parses wherever a pattern does — a whole arm, a struct sub-pattern, a
+/// tag's payload, inside grouping parentheses, and the pattern of a `let` in
+/// both forms — and prints back as the `_` it was written as.
+#[test]
+fn a_wildcard_parses_in_every_pattern_position() {
+    for (src, printed) in [
+        // A whole arm, and grouping parentheses discarded around one.
+        (
+            "let a = match x with _ => 1 end",
+            "let a = match x with | _ => 1 end",
+        ),
+        (
+            "let a = match x with (_) => 1 end",
+            "let a = match x with | _ => 1 end",
+        ),
+        // A struct pattern's sub-pattern, beside a pun and a named binder.
+        (
+            "let a = match x with { p: _, q } => q end",
+            "let a = match x with | { p: _, q } => q end",
+        ),
+        // A tag's payload, taken greedily like any other.
+        (
+            "let a = match x with `Some _ => 1 | `None => 0 end",
+            "let a = match x with | `Some _ => 1 | `None => 0 end",
+        ),
+        // The pattern of a `let`, statement and expression.
+        ("let _ = f 1", "let _ = f 1"),
+        ("let _ : Nat = g 3", "let _ : Nat = g 3"),
+        ("let a = let _ = f 1 in 2", "let a = let _ = f 1 in 2"),
+        // Nested, and repeated: two `_` in one pattern parse — whether that
+        // binds anything twice is not a question, since it binds nothing.
+        (
+            "let a = match x with `Pair { a: _, b: _ } => 1 | _ => 2 end",
+            "let a = match x with | `Pair { a: _, b: _ } => 1 | _ => 2 end",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src}");
+    }
+}
+
+/// `fn _ => e` is legal — the argument is taken and thrown away — and so is
+/// any mix of `_` with names. The printed form re-parses to the same tree.
+#[test]
+fn a_fn_argument_may_be_a_wildcard() {
+    assert_eq!(parse_one("let f = fn _ => 1"), "let f = fn _ => 1");
+    assert_eq!(parse_one("let f = fn _ _ => 1"), "let f = fn _ _ => 1");
+    assert_eq!(parse_one("let f = fn _ x _ => x"), "let f = fn _ x _ => x");
+    assert_eq!(
+        parse_one("let const = fn x _ => x"),
+        "let const = fn x _ => x"
+    );
+}
+
+/// `_` anywhere it is not legal gets the dedicated complaint — `_` stands for
+/// a value being thrown away — worded for the position, at the `_` itself.
+/// The statement is dropped like any other malformed one.
+#[test]
+fn a_misplaced_wildcard_gets_its_own_complaint() {
+    for (src, place) in [
+        // Expression position: a definition's value, and an application's
+        // argument.
+        ("let x = _", Place::Value),
+        ("let y = f _", Place::Value),
+        // A field's name, in a struct expression and a struct pattern.
+        ("let v = {_: 1}", Place::Field),
+        ("let a = match x with { _: 1 } => 0 end", Place::Field),
+        // The pun: a field bound to its own name, which `_` is not.
+        ("let a = match x with {_} => 0 end", Place::Pun),
+        // A projection.
+        ("let p = x._", Place::Projection),
+        // A `type` declaration's name and parameters, and a type expression —
+        // there is no inferred-type hole.
+        ("type _ = Nat", Place::Type),
+        ("type T _ = Nat", Place::Type),
+        ("let f : _ -> Nat = fn x => x", Place::Type),
+        ("let f : List _ = nil", Place::Type),
+        ("let f : `Some _ | `None = nothing", Place::Type),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
+        let error = &out.errors[0];
+        assert_eq!(
+            error.kind,
+            ErrorKind::Wildcard { place },
+            "{src:?}: {:#?}",
+            out.errors
+        );
+        // At the `_` itself: every one of these sources writes its stray `_`
+        // last-but-something, so find the last one.
+        assert_eq!(
+            error.span.start,
+            src.rfind('_').expect("the `_`"),
+            "{src:?}"
+        );
+        assert_eq!(error.span.width, 1, "{src:?}");
+    }
 }

@@ -185,6 +185,12 @@ pub type Pattern = Tracked<PatternKind>;
 pub enum PatternKind {
     /// An identifier: binds the whole value at this position.
     Bind(Tracked<Symbol>),
+    /// `_`: accepts the whole value at this position and binds nothing. A
+    /// variant of its own rather than a fresh [`Bind`](PatternKind::Bind), so
+    /// the tree still says what was written: printing gives back the `_`, the
+    /// debugger shows one, and no invented name has to be kept out of every
+    /// duplicate check by hand — there is none.
+    Wildcard,
     /// Field name → sub-pattern. Puns are expanded here: surface `{x}`
     /// arrives as field "x" → Bind(x's symbol).
     Struct(IndexMap<String, Field<Pattern>>),
@@ -889,6 +895,10 @@ struct Loops {
 enum Calm {
     /// Binds the whole value.
     Bind(Tracked<Symbol>),
+    /// `_`: binds nothing and constrains nothing. The value is still held —
+    /// by a fresh definition nothing can name — so it is still typechecked;
+    /// see [`Builder::destructure_stmt`] and R5/R6 of the wildcard spec.
+    Wildcard(Span),
     /// Binds nothing, and constrains the value to unit.
     Unit(Span),
     /// Reaches into fields, each with a pattern that cannot fail.
@@ -1717,7 +1727,7 @@ impl Chain<'_> {
 /// refutable iff it contains a tag or a natural anywhere inside it.
 fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
     match &pattern.tracked {
-        PatternKind::Bind(_) | PatternKind::Unit => None,
+        PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
         PatternKind::Tag { name, .. } => Some((name.span, Refuter::Case(name.tracked.clone()))),
         PatternKind::Natural(value) => Some((pattern.span, Refuter::Number(*value))),
         PatternKind::Struct(fields) => fields.values().find_map(|field| refuter(&field.value)),
@@ -1731,6 +1741,7 @@ fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
 fn calm(pattern: &Pattern) -> Option<Calm> {
     match &pattern.tracked {
         PatternKind::Bind(name) => Some(Calm::Bind(*name)),
+        PatternKind::Wildcard => Some(Calm::Wildcard(pattern.span)),
         PatternKind::Unit => Some(Calm::Unit(pattern.span)),
         PatternKind::Struct(fields) => {
             let mut lowered = Vec::with_capacity(fields.len());
@@ -1752,7 +1763,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
     match &pattern.tracked {
         PatternKind::Bind(name) => out.push(*name),
-        PatternKind::Unit | PatternKind::Natural(_) => {}
+        PatternKind::Wildcard | PatternKind::Unit | PatternKind::Natural(_) => {}
         PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 pattern_binders(payload, out);
@@ -1792,7 +1803,7 @@ fn bound_to_errors(names: Vec<Tracked<Symbol>>, body: Term) -> Term {
 /// — which reaches into nothing — is a wildcard too.
 fn mat(pattern: &Pattern) -> Mat {
     match &pattern.tracked {
-        PatternKind::Bind(_) | PatternKind::Unit => Mat::Wild,
+        PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => Mat::Wild,
         PatternKind::Natural(value) => Mat::Natural(*value),
         PatternKind::Tag { name, payload } => Mat::Tag {
             name: name.tracked.clone(),
@@ -1832,10 +1843,12 @@ impl Matrix {
         matrix
     }
 
-    /// One arm's contribution: its tests by position, and where it binds.
+    /// One arm's contribution: its tests by position, and where it binds. A
+    /// wildcard is a binder minus the name, and the name is no part of what
+    /// this reads: the position is open either way.
     fn collect(&mut self, pattern: &Pattern, path: &mut Vec<Step>) {
         match &pattern.tracked {
-            PatternKind::Bind(_) => self.binds.push(path.clone()),
+            PatternKind::Bind(_) | PatternKind::Wildcard => self.binds.push(path.clone()),
             PatternKind::Unit => {}
             PatternKind::Natural(value) => {
                 self.tests
@@ -2162,7 +2175,11 @@ fn tag_witness(name: String, payload: Witness) -> Witness {
 fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
     match &pattern.tracked {
         parse::PatternKind::Ident { name } => out.push(name.clone()),
-        parse::PatternKind::Natural(_) | parse::PatternKind::Unit => {}
+        // A wildcard binds nothing, so there is nothing here to declare — and
+        // nothing for a duplicate check, anywhere, to ever meet.
+        parse::PatternKind::Wildcard
+        | parse::PatternKind::Natural(_)
+        | parse::PatternKind::Unit => {}
         parse::PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 pattern_names(payload, out);
@@ -3658,8 +3675,18 @@ impl Builder<'_> {
                 let mut bound = Vec::with_capacity(args.len());
                 for arg in args {
                     let span = arg.span;
-                    let symbol = self.mint.local(self.module, Namespace::Terms, &arg.tracked);
-                    self.terms.bind(arg.tracked, symbol, span);
+                    // A name is bound over the body; a `_` gets a fresh symbol
+                    // that goes into no scope, so the argument is typechecked —
+                    // the arrow still has a domain — and nothing can name it.
+                    // The node keeps its shape either way.
+                    let symbol = match arg.tracked {
+                        parse::ArgKind::Name(name) => {
+                            let symbol = self.mint.local(self.module, Namespace::Terms, &name);
+                            self.terms.bind(name, symbol, span);
+                            symbol
+                        }
+                        parse::ArgKind::Wildcard => self.fresh("%discard", span).tracked,
+                    };
                     bound.push(span.track(symbol));
                 }
                 let body = self.term(*body);
@@ -4074,6 +4101,10 @@ impl Builder<'_> {
             parse::PatternKind::Ident { name } => {
                 span.track(PatternKind::Bind(self.bound(name, seen, binders)))
             }
+            // Nothing to resolve and nothing to repeat: a wildcard never goes
+            // through [`bound`](Self::bound), which is the whole of how it
+            // stays out of the duplicate-binder check.
+            parse::PatternKind::Wildcard => span.track(PatternKind::Wildcard),
             parse::PatternKind::Natural(value) => span.track(PatternKind::Natural(value)),
             parse::PatternKind::Unit => span.track(PatternKind::Unit),
             // A bare tag keeps its `None`: what it constrains the payload to —
@@ -4155,6 +4186,21 @@ impl Builder<'_> {
                 }
                 .with_span(span)
             }
+            // The binding a name would have made, made to a name nothing can
+            // write: the value keeps its place — typechecked, its mistakes
+            // still its own complaints, the annotation still its contract —
+            // and the body cannot reach it.
+            Calm::Wildcard(span) => {
+                let held = self.fresh("%discard", span);
+                let at = span.merge(inner.span);
+                TermKind::Let {
+                    name: held,
+                    annotation,
+                    value: Box::new(value),
+                    body: Box::new(inner),
+                }
+                .with_span(at)
+            }
             Calm::Unit(span) => match annotation {
                 // The written type is the contract on the whole value, and the
                 // pattern's own demand — unit — goes on a second binding of
@@ -4228,6 +4274,23 @@ impl Builder<'_> {
                     name.tracked,
                     Decl {
                         name_span: name.span,
+                        annotation,
+                        params: Vec::new(),
+                        value,
+                    },
+                );
+            }
+            // The definition a name would have made, made under a name nothing
+            // can write. The value is still an ordinary definition — inferred,
+            // checked against the annotation when one was written — so
+            // `let _ : T = e` is a type assertion; and the name being fresh is
+            // what lets any number of `let _` stand side by side.
+            Calm::Wildcard(span) => {
+                let held = self.fresh("%discard", span);
+                out.insert(
+                    held.tracked,
+                    Decl {
+                        name_span: span,
                         annotation,
                         params: Vec::new(),
                         value,

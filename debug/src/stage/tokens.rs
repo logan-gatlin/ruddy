@@ -67,6 +67,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::LeftParen => "LeftParen",
         Kind::RightParen => "RightParen",
         Kind::Identifier(_) => "Identifier",
+        Kind::Underscore => "Underscore",
         Kind::Natural(_) => "Natural",
     }
 }

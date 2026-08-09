@@ -24,7 +24,7 @@ use ruddy::{
     ui,
 };
 
-use crate::wire::{Stage, Status, View};
+use crate::wire::{Node, Stage, Status, View};
 
 /// Everything a stage may look at. Each field is `None` when the phase that
 /// would have produced it did not run, which is what a stage reports as
@@ -286,6 +286,21 @@ pub fn stands_for(mint: &Mint, param: &Param) -> String {
     }
     let labels: Vec<String> = lacks.iter().map(|label| ui::label(shape, label)).collect();
     format!("{opener} without {}", labels.join(", "))
+}
+
+/// Attach a symbol to the node that stands for it. A source name is an
+/// occurrence — the page paints the node's span in the editor as a use of the
+/// name — while the compiler's own `%`-named fresh symbols, the hidden
+/// definitions a pattern `let` or a wildcard mints, are spelled nowhere in
+/// the source: a node about one gets the association without the span. See
+/// [`Node::symbol`] and [`Node::owner`], whose contract this is; written once
+/// so no two stages can read it differently.
+pub fn with_symbol(node: Node, cx: &Cx, mint: &Mint, symbol: Symbol) -> Node {
+    match cx.symbols.get(&symbol) {
+        Some(index) if mint.name(symbol).starts_with('%') => node.owner(*index),
+        Some(index) => node.symbol(*index),
+        None => node,
+    }
 }
 
 /// A stage whose input never arrived.

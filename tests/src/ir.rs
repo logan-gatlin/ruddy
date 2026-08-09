@@ -2727,6 +2727,222 @@ fn a_struct_let_expression_chains_through_a_temporary() {
     );
 }
 
+/// R4/R5 of the wildcard spec: `let _ = e` is a definition under a name
+/// nothing can write, so any number of them coexist — with each other, and
+/// with every named definition — and no duplicate complaint can ever mention
+/// `_`. The annotation rides on the hidden definition, so `let _ : T = e` is
+/// a type assertion.
+#[test]
+fn a_wildcard_let_statement_defines_a_hidden_fresh_name() {
+    assert_eq!(lowered("let _ = 1"), "let %discard = 1");
+    // The headline: two of them, plus a third asserting a type — no
+    // duplicate-definition error anywhere.
+    assert_eq!(
+        lowered("let _ = f 1  let _ = f 2  let _ : Nat = f 3  let f = fn x => x"),
+        "let %discard = f 1\nlet %discard = f 2\nlet %discard : Nat = f 3\nlet f = fn x => x"
+    );
+    // Nor a collision with a named definition of any spelling.
+    assert_eq!(
+        lowered("let x = 1  let _ = 2  let x2 = 3"),
+        "let x = 1\nlet %discard = 2\nlet x2 = 3"
+    );
+
+    // The hidden definitions are distinct symbols, each holding its own value.
+    let (mint, out) = built("let _ = 1  let _ = 2");
+    let discards: Vec<Symbol> = out
+        .program
+        .terms
+        .keys()
+        .copied()
+        .filter(|symbol| mint.name(*symbol) == "%discard")
+        .collect();
+    assert_eq!(discards.len(), 2);
+    assert_ne!(discards[0], discards[1]);
+}
+
+/// R5's expression half: `let _ = e in b` is a `Let` through a fresh symbol —
+/// the value still on the page, typechecked, and nothing in `b` able to name
+/// it, because there is no name.
+#[test]
+fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
+    assert_eq!(
+        lowered("let a = let _ = f 1 in 2  let f = fn x => x"),
+        "let a = let %discard = f 1 in 2\nlet f = fn x => x"
+    );
+    // The annotation stays the contract on the value.
+    assert_eq!(
+        lowered("let a = let _ : Nat = 1 in 2"),
+        "let a = let %discard : Nat = 1 in 2"
+    );
+
+    // The fresh symbol is bound into no scope: the body's `2` aside, nothing
+    // references it, and the tree says so.
+    let (mint, out) = built("let a = let _ = 1 in 2");
+    let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
+        panic!("a lowers to a let");
+    };
+    let mut names = Vec::new();
+    references_of(body, &mut names);
+    assert!(!names.contains(&name.tracked), "the body names the discard");
+}
+
+/// Every symbol a term mentions, for the wildcard tests to assert nothing
+/// mentions a hidden one.
+fn references_of(term: &Term, out: &mut Vec<Symbol>) {
+    match &term.kind {
+        TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Apply { func, arg } => {
+            references_of(func, out);
+            references_of(arg, out);
+        }
+        TermKind::Fn { body, .. } => references_of(body, out),
+        TermKind::Let { value, body, .. } => {
+            references_of(value, out);
+            references_of(body, out);
+        }
+        TermKind::Struct(fields) => {
+            for field in fields.values() {
+                references_of(&field.value, out);
+            }
+        }
+        TermKind::Tag { payload, .. } => {
+            if let Some(payload) = payload {
+                references_of(payload, out);
+            }
+        }
+        TermKind::Project { base, .. } => references_of(base, out),
+        TermKind::Match { scrutinee, arms } => {
+            references_of(scrutinee, out);
+            for (_, body) in arms {
+                references_of(body, out);
+            }
+        }
+        TermKind::Natural(_) | TermKind::Error => {}
+    }
+}
+
+/// R6: a wildcard leaf of a struct-pattern `let` keeps the field demand — a
+/// hidden fresh definition holds the projection — while binding nothing. Both
+/// forms of the `let`.
+#[test]
+fn a_wildcard_struct_leaf_keeps_the_projection() {
+    assert_eq!(
+        lowered("let {x: _, y} = { x: 1, y: 2 }"),
+        "let %struct = { x: 1, y: 2 }\nlet %discard = %struct.x\nlet y = %struct.y"
+    );
+    assert_eq!(
+        lowered("let use_y = fn p => let {x: _, y} = p in y"),
+        "let use_y = fn p => let %struct = p in let %discard = %struct.x in let y = %struct.y in y"
+    );
+}
+
+/// R3: `_` never joins the duplicate-binder check — `{a: _, b: _}` is legal,
+/// and `_` beside a named binder is too — while a real name bound twice is
+/// still the R13 mistake it was.
+#[test]
+fn a_wildcard_is_exempt_from_the_duplicate_binder_check() {
+    assert_eq!(
+        lowered("let f = fn e => match e with | `Pair { a: _, b: _ } => 1 | _ => 2 end"),
+        "let f = fn e => match e with | `Pair { a: _, b: _ } => 1 | _ => 2 end"
+    );
+    assert_eq!(
+        lowered("let f = fn e => match e with { a: _, b: x } => x end"),
+        "let f = fn e => match e with | { a: _, b: x } => x end"
+    );
+
+    // The same pattern with a name where the wildcards were still fails.
+    let (_, errors) = lowered_with_errors("let f = fn e => match e with { a: x, b: x } => x end");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].starts_with("duplicate-binding@"), "{errors:#?}");
+}
+
+/// R7: `fn _ => e` lowers to the ordinary `Fn` node with a fresh symbol
+/// nothing references — the shape does not change — and any number of `_`
+/// arguments mix with names.
+#[test]
+fn a_wildcard_fn_argument_binds_a_symbol_nothing_references() {
+    let (mint, out) = built("let f = fn _ => 1");
+    let TermKind::Fn { arg, body } = term_value(&mint, &out, "f") else {
+        panic!("f is a function");
+    };
+    assert_eq!(mint.name(arg.tracked), "%discard");
+    let mut names = Vec::new();
+    references_of(body, &mut names);
+    assert!(!names.contains(&arg.tracked));
+
+    // Mixing works, and the middle name still resolves to its own argument.
+    assert_eq!(
+        lowered("let f = fn _ x _ => x"),
+        "let f = fn %discard => fn x => fn %discard => x"
+    );
+    let (mint, out) = built("let f = fn _ x _ => x");
+    let TermKind::Fn { arg: first, body } = term_value(&mint, &out, "f") else {
+        panic!("f is a function");
+    };
+    let TermKind::Fn { arg: x, body } = &body.kind else {
+        panic!("a second argument");
+    };
+    let TermKind::Fn { arg: second, body } = &body.kind else {
+        panic!("a third argument");
+    };
+    // Two discards, two symbols.
+    assert_ne!(first.tracked, second.tracked);
+    assert!(matches!(&body.kind, TermKind::Ident(symbol) if *symbol == x.tracked));
+}
+
+/// R8: a wildcard does not launder the refutability of what surrounds it —
+/// `` let `Some _ = e `` is still the refutable-binding error, in both forms,
+/// with the unchanged wording.
+#[test]
+fn a_wildcard_does_not_make_a_refutable_binding_calm() {
+    let src = "let `Some _ = opt  let opt = `Some 1";
+    let (_, errors) = lowered_with_errors(src);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(
+        errors[0],
+        format!("binding-can-fail@{}", src.find("`Some").expect("the tag"))
+    );
+
+    let src = "let a = let `Some _ = opt in 1  let opt = `Some 1";
+    let (_, errors) = lowered_with_errors(src);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(errors[0].starts_with("binding-can-fail@"), "{errors:#?}");
+}
+
+/// R8: a bare `_` arm is a catch-all, so the placement rules hold — anywhere
+/// but last is the existing misplaced-catch-all complaint, at the `_` arm,
+/// including a second `_` arm after a first.
+#[test]
+fn a_wildcard_arm_is_a_catch_all_and_must_be_last() {
+    let src = "let f = fn n => match n with _ => 1 | 0 => 2 end";
+    let (_, errors) = lowered_with_errors(src);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(
+        errors[0],
+        format!(
+            "misplaced-catch-all@{}",
+            src.find("_ => 1").expect("the arm")
+        )
+    );
+
+    let src = "let f = fn e => match e with _ => 1 | _ => 2 end";
+    let (_, errors) = lowered_with_errors(src);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(
+        errors[0],
+        format!(
+            "misplaced-catch-all@{}",
+            src.find("_ => 1").expect("the first arm")
+        )
+    );
+
+    // Last, it is what a named catch-all is: exhaustive, and clean.
+    assert_eq!(
+        lowered("let f = fn n => match n with 0 => 1 | _ => 2 end"),
+        "let f = fn n => match n with | 0 => 1 | _ => 2 end"
+    );
+}
+
 /// R5: a match lowers to the one matrix node, arms as written and normalized
 /// — puns expanded, symbols resolved, each body exactly once — and prints
 /// back as the match the reader wrote.
