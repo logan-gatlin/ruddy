@@ -2829,6 +2829,88 @@ fn a_join_point_is_minted_exactly_when_a_body_is_needed_twice() {
     assert_eq!(thrice.matches("=> 3").count(), 1, "{thrice}");
 }
 
+/// Three levels of nesting: a join point minted deep inside borrows the
+/// enclosing level's fallthrough without consuming it, so the level in
+/// between still gets its default and the written catch-all takes everything
+/// the inner arms refuse.
+#[test]
+fn a_nested_join_leaves_the_enclosing_fallthrough_in_place() {
+    let printed =
+        lowered("let f = fn e => match e with | `A `B `C 0 => 1 | `A `B r => 2 | q => 3 end");
+    assert_eq!(
+        printed,
+        "let f = fn e => \
+         let %scrut = e in \
+         let %join = fn q => 3 in \
+         match %scrut with \
+         | `A %case => match %case with \
+         | `B %case => let %join = fn r => 2 in match %case with \
+         | `C %case => match %case with | 0 => 1 | %fall => %join %case end \
+         | %fall => %join %case end \
+         | %fall => %join %scrut end \
+         | %fall => %join %scrut end"
+    );
+    // Every written body appears exactly once.
+    for body in ["=> 1", "=> 2", "fn q => 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+}
+
+/// The same borrowing when the fallthrough is carried as rows: a struct row's
+/// leftover rows take the enclosing jump as a copy, so the level above still
+/// falls through to the catch-all.
+#[test]
+fn fallthrough_rows_take_the_enclosing_jump_as_a_copy() {
+    let printed =
+        lowered("let f = fn e => match e with | `P `A { x: `X } => 1 | `P `A w => 2 | q => 3 end");
+    assert_eq!(
+        printed,
+        "let f = fn e => \
+         let %scrut = e in \
+         let %join = fn q => 3 in \
+         match %scrut with \
+         | `P %case => match %case with \
+         | `A %case => match %case.x with \
+         | `X %case => let %unit : {} = %case in 1 \
+         | %fall => let w = %case in 2 end \
+         | %fall => %join %scrut end \
+         | %fall => %join %scrut end"
+    );
+    for body in ["in 1", "in 2", "fn q => 3"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+}
+
+/// A later sibling tag group still sees the shared fallthrough after an
+/// earlier group's nesting borrowed it: the `E` level's default jumps to the
+/// same join point.
+#[test]
+fn a_sibling_group_keeps_the_shared_fallthrough() {
+    let printed = lowered(
+        "let f = fn e => match e with \
+         | `A `B `C 0 => 1 | `A `B r => 2 | `D `E 0 => 4 | q => 5 end",
+    );
+    assert_eq!(
+        printed,
+        "let f = fn e => \
+         let %scrut = e in \
+         let %join = fn q => 5 in \
+         match %scrut with \
+         | `A %case => match %case with \
+         | `B %case => let %join = fn r => 2 in match %case with \
+         | `C %case => match %case with | 0 => 1 | %fall => %join %case end \
+         | %fall => %join %case end \
+         | %fall => %join %scrut end \
+         | `D %case => match %case with \
+         | `E %case => match %case with | 0 => 4 | %fall => %join %scrut end \
+         | %fall => %join %scrut end \
+         | %fall => %join %scrut end"
+    );
+    for body in ["=> 1", "=> 2", "=> 4", "fn q => 5"] {
+        assert_eq!(printed.matches(body).count(), 1, "{printed}");
+    }
+}
+
 /// Natural arms group by value; the final name takes the rest, as the
 /// default's own binder.
 #[test]
@@ -2958,6 +3040,39 @@ fn natural_arms_need_a_final_catch_all() {
 
     // A refutable last arm is not the rest either.
     let (_, errors) = lowered_with_errors("let f = fn n => match n with | 0 => 1 | 1 => 2 end");
+    assert_eq!(errors, ["unhandled-numbers@16"], "{errors:#?}");
+}
+
+/// A number pattern nested inside a tag or a struct leaves the numbers not
+/// listed unhandled at its own level: the complaint points at the number
+/// itself, and a level that inherits a catch-all has nothing to complain
+/// about.
+#[test]
+fn nested_natural_arms_need_a_fallthrough_too() {
+    let (printed, errors) = lowered_with_errors("let f = fn e => match e with | `A 0 => 1 end");
+    assert_eq!(errors, ["unhandled-numbers@34"], "{errors:#?}");
+    // Lowering stays total: the level is still emitted, default and all.
+    assert_eq!(
+        printed,
+        "let f = fn e => match e with | `A %case => match %case with | 0 => 1 end end"
+    );
+
+    let (_, errors) = lowered_with_errors("let f = fn e => match e with | { n: 0 } => 1 end");
+    assert_eq!(errors, ["unhandled-numbers@36"], "{errors:#?}");
+
+    // The nested level inherits the written catch-all through the join.
+    let (_, errors) = lowered_with_errors("let f = fn e => match e with | `A 0 => 1 | q => 2 end");
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    // Written natural arms carried into a struct row's fallthrough are still
+    // the match's own, already vouched for at the match — one complaint about
+    // them, not two.
+    let (_, errors) =
+        lowered_with_errors("let f = fn e => match e with | { n: 1 } => 1 | 0 => 2 end");
+    assert_eq!(errors, ["unhandled-numbers@16"], "{errors:#?}");
+    let (_, errors) = lowered_with_errors(
+        "let f = fn e => match e with | { a: `P, b: `Q } => 1 | 0 => 2 | 1 => 3 end",
+    );
     assert_eq!(errors, ["unhandled-numbers@16"], "{errors:#?}");
 }
 

@@ -846,13 +846,6 @@ struct Loops {
     endless: IndexSet<Symbol>,
 }
 
-/// [`Follow`] about definitions: following what each one's value stands for,
-/// once, remembering the loops closed on the way.
-///
-/// The twin rather than the same walk, because the two languages are different
-/// enough that one walk over both would be a match on which it was in every
-/// arm. What they share is the shape: a memo, a stack of what is still open,
-/// and the set of everything found on a loop.
 /// A surface pattern, lowered: binders resolved to symbols, punning expanded,
 /// bare tags carrying the unit they constrain their payload to, and grouping
 /// long gone. What the pattern compiler works on; nothing of it survives into
@@ -976,6 +969,10 @@ enum Fail {
         scrut: Tracked<Symbol>,
         rows: Vec<Clause>,
         then: Box<Option<Fail>>,
+        /// Whether the rows are written arms of the match itself — carried so
+        /// compiling them keeps the `written` flag
+        /// [`Builder::compile_level`] takes.
+        written: bool,
     },
 }
 
@@ -993,6 +990,13 @@ struct Scrut {
 /// temporary, then any join points, outermost first.
 type Prefix = Vec<(Tracked<Symbol>, Term)>;
 
+/// [`Follow`] about definitions: following what each one's value stands for,
+/// once, remembering the loops closed on the way.
+///
+/// The twin rather than the same walk, because the two languages are different
+/// enough that one walk over both would be a match on which it was in every
+/// arm. What they share is the shape: a memo, a stack of what is still open,
+/// and the set of everything found on a loop.
 struct Chain<'a> {
     terms: &'a IndexMap<Symbol, Decl<Term>>,
     /// The value each nested `let` in the program binds its name to.
@@ -1975,6 +1979,28 @@ fn as_bind(rows: &mut Vec<Clause>) -> Option<(Tracked<Symbol>, Term)> {
             });
             None
         }
+    }
+}
+
+/// Hand a nested level the fallthrough it compiles against, without robbing
+/// the level that still holds it. A jump serves every path — the join point is
+/// already bound — so the nested level gets a copy and the original stays for
+/// the holder's own default and its later groups. Rows are owned bodies that
+/// exactly one path consumes (a second path would have promoted them to a join
+/// point), so they move — and only when the nested level actually reaches for
+/// them: `reaches` is [`rows_edges`] over the nested rows, and a nested level
+/// that cannot fail past its own rows is handed nothing.
+fn handed(fail: &mut Option<Fail>, reaches: usize) -> Option<Fail> {
+    if reaches == 0 {
+        return None;
+    }
+    match fail {
+        Some(Fail::Jump { join, arg, at }) => Some(Fail::Jump {
+            join: *join,
+            arg: *arg,
+            at: *at,
+        }),
+        fail => fail.take(),
     }
 }
 
@@ -4138,7 +4164,7 @@ impl Builder<'_> {
             self.error(span, ErrorKind::UnhandledNumbers);
         }
         let mut fail = None;
-        let mut term = self.compile_level(Scrut::value(scrutinee), rows, &mut fail, span);
+        let mut term = self.compile_level(Scrut::value(scrutinee), rows, &mut fail, span, true);
         // Whatever shape the compilation settled on, the term stands where the
         // match was written — a complaint about the whole of it underlines the
         // whole of it.
@@ -4156,12 +4182,18 @@ impl Builder<'_> {
     /// segment is the fallthrough the segment's failures reach: bound as a
     /// join point when more than one path needs it, compiled in place when
     /// exactly one does. See [`Fail`], and [`rows_edges`] for the count.
+    ///
+    /// `written` says the rows are the match's own arm list — which the match
+    /// already checked for unlisted numbers — rather than a level flattening
+    /// minted. It follows the rows: a level's rest keeps it, a payload or a
+    /// field starts over.
     fn compile_level(
         &mut self,
         mut scrut: Scrut,
         rows: Vec<Clause>,
         fail: &mut Option<Fail>,
         at: Span,
+        written: bool,
     ) -> Term {
         // One match compares one kind of thing: numbers and cases at one
         // level answer to different types, and no value is both, so the mix
@@ -4250,7 +4282,7 @@ impl Builder<'_> {
                         // bound once as a join point and every path applies
                         // it to the scrutinee.
                         let arg = self.force(&mut scrut, &mut prefix);
-                        let (join, func) = self.join(rest, fail.take(), at);
+                        let (join, func) = self.join(rest, fail, at, written);
                         prefix.push((join, func));
                         owned = Some(Fail::Jump {
                             join: join.tracked,
@@ -4264,7 +4296,7 @@ impl Builder<'_> {
                         // Only the default can reach the rest, so it is
                         // compiled right there, against the default's own
                         // binder.
-                        let (binder, body) = self.default_rows(rest, fail, at);
+                        let (binder, body) = self.default_rows(rest, fail, at, written);
                         default = Some((binder, Box::new(body)));
                     }
                 }
@@ -4335,7 +4367,7 @@ impl Builder<'_> {
                 // fail: only the default reaches whatever follows it.
                 let default = match rest.is_empty() {
                     false => {
-                        let (binder, body) = self.default_rows(rest, fail, at);
+                        let (binder, body) = self.default_rows(rest, fail, at, written);
                         Some((binder, Box::new(body)))
                     }
                     true => match fail.is_some() {
@@ -4347,6 +4379,13 @@ impl Builder<'_> {
                         false => None,
                     },
                 };
+                // A run with no default leaves every number not listed with
+                // nowhere to go. The written arm list was already checked at
+                // the match, whole; a run reached by flattening — a payload,
+                // a field — is checked here and points at itself.
+                if !written && default.is_none() {
+                    self.error(span, ErrorKind::UnhandledNumbers);
+                }
                 TermKind::Match {
                     scrutinee: Box::new(self.scrut_term(&mut scrut)),
                     arms,
@@ -4364,6 +4403,7 @@ impl Builder<'_> {
                 rows,
                 fail,
                 at,
+                written,
             ),
         };
         // The scrutinee temporary first, then the join points, outermost
@@ -4396,6 +4436,7 @@ impl Builder<'_> {
         rows: Vec<Clause>,
         fail: &mut Option<Fail>,
         at: Span,
+        written: bool,
     ) -> Term {
         struct SieveRow {
             pspan: Span,
@@ -4490,7 +4531,7 @@ impl Builder<'_> {
         if fell_through {
             let arg = self.force(&mut scrut, prefix);
             if total > 1 {
-                let (join, func) = self.join(rest2, fail.take(), at);
+                let (join, func) = self.join(rest2, fail, at, written);
                 prefix.push((join, func));
                 owned = Some(Fail::Jump {
                     join: join.tracked,
@@ -4498,10 +4539,15 @@ impl Builder<'_> {
                     at,
                 });
             } else {
+                let reaches = {
+                    let pats: Vec<&Pat> = rest2.iter().map(|row| &row.pat).collect();
+                    rows_edges(&pats)
+                };
                 owned = Some(Fail::Rows {
                     scrut: arg,
                     rows: rest2,
-                    then: Box::new(fail.take()),
+                    then: Box::new(handed(fail, reaches)),
+                    written,
                 });
             }
         }
@@ -4538,6 +4584,7 @@ impl Builder<'_> {
                         }],
                         sub_fail,
                         at,
+                        false,
                     ),
                 };
             }
@@ -4556,7 +4603,7 @@ impl Builder<'_> {
             field: fspan.track(column),
         }
         .with_span(fspan);
-        self.compile_level(Scrut::value(field), frows, sub_fail, at)
+        self.compile_level(Scrut::value(field), frows, sub_fail, at, false)
     }
 
     /// Report every row past one that accepts everything — nothing can reach
@@ -4582,7 +4629,7 @@ impl Builder<'_> {
             Some((binder, body)) => (binder, body),
             None => {
                 let binder = self.fresh("%case", group.name.span);
-                let body = self.compile_level(Scrut::sym(binder), rows, fail, at);
+                let body = self.compile_level(Scrut::sym(binder), rows, fail, at, false);
                 (binder, body)
             }
         };
@@ -4604,6 +4651,7 @@ impl Builder<'_> {
         rest: Vec<Clause>,
         fail: &mut Option<Fail>,
         at: Span,
+        written: bool,
     ) -> (Tracked<Symbol>, Term) {
         let mut rest = rest;
         self.prune(&mut rest);
@@ -4611,7 +4659,7 @@ impl Builder<'_> {
             Some((binder, body)) => (binder, body),
             None => {
                 let binder = self.fresh("%fall", at);
-                let body = self.compile_level(Scrut::sym(binder), rest, fail, at);
+                let body = self.compile_level(Scrut::sym(binder), rest, fail, at, written);
                 (binder, body)
             }
         }
@@ -4620,16 +4668,27 @@ impl Builder<'_> {
     /// A join point over a fallthrough: `let j = fn r => body`, with the
     /// reader's own binder as the parameter when the fallthrough is one
     /// bare-name arm. Returns the point's name and the function it is bound
-    /// to; the caller wraps the `let`.
-    fn join(&mut self, rest: Vec<Clause>, then: Option<Fail>, at: Span) -> (Tracked<Symbol>, Term) {
+    /// to; the caller wraps the `let`. `fail` is what the level itself would
+    /// have fallen through to, [`handed`] on so the level still holds it.
+    fn join(
+        &mut self,
+        rest: Vec<Clause>,
+        fail: &mut Option<Fail>,
+        at: Span,
+        written: bool,
+    ) -> (Tracked<Symbol>, Term) {
         let mut rest = rest;
         self.prune(&mut rest);
-        let mut then = then;
         let (param, body) = match as_bind(&mut rest) {
             Some((binder, body)) => (binder, body),
             None => {
                 let param = self.fresh("%fall", at);
-                let body = self.compile_level(Scrut::sym(param), rest, &mut then, at);
+                let reaches = {
+                    let pats: Vec<&Pat> = rest.iter().map(|row| &row.pat).collect();
+                    rows_edges(&pats)
+                };
+                let mut then = handed(fail, reaches);
+                let body = self.compile_level(Scrut::sym(param), rest, &mut then, at, written);
                 (param, body)
             }
         };
@@ -4659,7 +4718,8 @@ impl Builder<'_> {
                 scrut,
                 rows,
                 mut then,
-            } => self.compile_level(Scrut::sym(scrut), rows, &mut then, at),
+                written,
+            } => self.compile_level(Scrut::sym(scrut), rows, &mut then, at, written),
         }
     }
 

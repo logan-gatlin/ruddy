@@ -4228,3 +4228,50 @@ fn a_natural_match_without_a_default_still_types() {
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat");
 }
+
+/// Three levels of nesting keep the written catch-all reachable: every inner
+/// row stays open, so a case none of the inner arms list is the catch-all's
+/// to take, not an extra case.
+#[test]
+fn a_deeply_nested_fallthrough_keeps_the_rows_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | `A `B `C 0 => 1 | `A `B r => 2 | q => 3 end\n\
+         let user = f (`A `Z)",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`A (`B (`C Nat | ..'a) | ..'b) | ..'c -> Nat"
+    );
+}
+
+/// The same through a struct payload: the leftover rows carry the enclosing
+/// jump as a copy, so the tag above the struct stays partially handled and
+/// open rather than closing.
+#[test]
+fn a_struct_fallthrough_keeps_the_enclosing_rows_open() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with | `P `A { x: `X } => 1 | `P `A w => 2 | q => 3 end\n\
+         let user = f (`P `Z)",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`P (`A { x: `X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
+    );
+}
+
+/// A sibling tag group after one whose nesting borrowed the fallthrough: the
+/// sibling's inner level still falls through to the catch-all, so an unlisted
+/// inner case type-checks instead of closing the row.
+#[test]
+fn a_sibling_group_still_falls_through_to_the_catch_all() {
+    let (mint, _, output) = inferred(
+        "let f = fn e => match e with \
+         | `A `B `C 0 => 1 | `A `B r => 2 | `D `E 0 => 4 | q => 5 end\n\
+         let user = f (`D `F)\n\
+         let deep = f (`D (`E 7))",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "`A (`B (`C Nat | ..'a) | ..'b) | `D (`E Nat | ..'c) | ..'d -> Nat"
+    );
+}
