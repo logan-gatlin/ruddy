@@ -13,7 +13,7 @@
 use ruddy::inference::{Constraint, ConstraintKind};
 
 use crate::{
-    stage::{Cx, Ids, Spec, plural},
+    stage::{Cx, Ids, Spec, plural, with_symbol},
     wire::{Node, Stage},
 };
 
@@ -43,9 +43,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         if let Some(decl) = program.terms.get(symbol) {
             node = node.at(decl.name_span);
         }
-        if let Some(index) = cx.symbols.get(symbol) {
-            node = node.symbol(*index);
-        }
+        node = with_symbol(node, cx, mint, *symbol);
         node = node.children(rows(&mut ids, constraints));
         nodes.push(node);
     }

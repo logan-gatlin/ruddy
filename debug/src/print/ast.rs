@@ -9,7 +9,7 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    parse::{ExprKind, StmtKind, SumCase, TypeField, TypeKind},
+    parse::{Arg, ArgKind, ExprKind, StmtKind, SumCase, TypeField, TypeKind},
     tracking::Tracked,
 };
 
@@ -213,16 +213,20 @@ pub fn ty(kind: &TypeKind) -> impl fmt::Display + '_ {
     Ast(kind)
 }
 
-/// Render a `fn a b c => body` anonymous function. Only the parse tree needs
-/// this: lowering curries, so the IR has no multi-argument function to print.
+/// Render a `fn a b c => body` anonymous function — a `_` argument as the `_`
+/// it was written as. Only the parse tree needs this: lowering curries, so the
+/// IR has no multi-argument function to print.
 fn write_function(
     f: &mut fmt::Formatter<'_>,
-    args: &[Tracked<String>],
+    args: &[Arg],
     body: &dyn fmt::Display,
 ) -> fmt::Result {
     f.write_str("fn")?;
     for arg in args {
-        write!(f, " {}", arg.tracked)?;
+        match &arg.tracked {
+            ArgKind::Name(name) => write!(f, " {name}")?,
+            ArgKind::Wildcard => f.write_str(" _")?,
+        }
     }
     write!(f, " => {body}")
 }

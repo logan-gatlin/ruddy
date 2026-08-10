@@ -4,7 +4,8 @@
 //! the rendered source can never drift apart: they are the same printer.
 
 use ruddy::parse::{
-    Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
+    ArgKind, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField,
+    TypeKind,
 };
 
 use crate::{
@@ -82,14 +83,19 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         }
         .child(expr_node(ids, func))
         .child(expr_node(ids, arg)),
+        // A `_` argument's row reads as the `_` it was written as; it binds
+        // nothing, so there is no name for the row to carry instead.
         ExprKind::Function { args, body } => Node {
             label: "Function".into(),
             ..node
         }
-        .children(
-            args.iter()
-                .map(|arg| Node::new(ids.next(), "Arg", arg.tracked.clone()).at(arg.span)),
-        )
+        .children(args.iter().map(|arg| {
+            let text = match &arg.tracked {
+                ArgKind::Name(name) => name.clone(),
+                ArgKind::Wildcard => "_".to_string(),
+            };
+            Node::new(ids.next(), "Arg", text).at(arg.span)
+        }))
         .child(expr_node(ids, body)),
         // The statement's row again, about the expression: the name it binds,
         // the type it was ascribed, the value and the body. Labelled with the
@@ -194,6 +200,12 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
             ..node
         }
         .at(name.span),
+        // A leaf like a binder, minus the symbol a binder would carry: there
+        // is nothing to cross-highlight, because nothing can use it.
+        PatternKind::Wildcard => Node {
+            label: "Wildcard".into(),
+            ..node
+        },
         PatternKind::Natural(_) => Node {
             label: "Natural".into(),
             ..node

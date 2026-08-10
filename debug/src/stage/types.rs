@@ -19,7 +19,7 @@ use ruddy::{
 };
 
 use crate::{
-    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for, with_symbol},
     wire::{Node, Stage},
 };
 
@@ -69,9 +69,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(span) = name_span {
                 node = node.at(span);
             }
-            if let Some(index) = cx.symbols.get(&symbol) {
-                node = node.symbol(*index);
-            }
+            node = with_symbol(node, cx, mint, symbol);
             // A declaration's parameters print as `'a`, `'b` in the meaning
             // above, because that is what they are once the body is lowered.
             // Which is unreadable on its own: these rows are what map each
@@ -81,12 +79,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
                     let letter = Core::Bound(index as u32).to_string();
-                    let mut row =
-                        Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
-                    if let Some(index) = cx.symbols.get(&param.symbol) {
-                        row = row.symbol(*index);
-                    }
-                    node = node.child(row);
+                    let row = Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
+                    node = node.child(with_symbol(row, cx, mint, param.symbol));
                 }
             }
             // A recursive declaration says so under itself, naming the loop it
@@ -123,16 +117,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                         // its value was erased.
                         None => String::new(),
                     };
-                    let mut row = Node::new(
+                    let row = Node::new(
                         ids.next(),
                         format!("local {}", mint.name(local.tracked)),
                         scheme,
                     )
                     .at(local.span);
-                    if let Some(index) = cx.symbols.get(&local.tracked) {
-                        row = row.symbol(*index);
-                    }
-                    node = node.child(row);
+                    node = node.child(with_symbol(row, cx, mint, local.tracked));
                 }
             }
             node

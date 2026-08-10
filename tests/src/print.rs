@@ -407,3 +407,45 @@ fn a_nested_let_round_trips() {
         assert_eq!(again, ir, "{source} did not round-trip");
     }
 }
+
+/// A wildcard pattern prints as the `_` it was written as, in both trees, and
+/// the printed form re-parses and re-lowers to the same thing — every pattern
+/// position it can sit in.
+#[test]
+fn a_wildcard_pattern_round_trips() {
+    for source in [
+        "let f = fn v => match v with | `Some x => x | _ => 0 end",
+        "let f = fn v => match v with | `Some _ => 1 | `None => 0 end",
+        "let f = fn v => match v with | { a: _, b: x } => x end",
+        "let f = fn v => match v with | `Pair { a: _, b: _ } => 1 | _ => 2 end",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+    }
+
+    // A struct-pattern `let` desugars, so only the AST keeps the `_` on the
+    // page; the IR shows the hidden projection it became.
+    let source = "let f = fn p => let { x: _, y } = p in y";
+    let (ast, ir) = printed(source);
+    assert_eq!(ast, source);
+    assert_eq!(
+        ir,
+        "let f = fn p => let %struct = p in let %discard = %struct.x in let y = %struct.y in y"
+    );
+}
+
+/// A `_` fn argument prints as written in the AST; the IR spells the fresh
+/// symbol it lowered to, marked with the `%` no identifier can spell — the
+/// same convention every pattern-`let` temporary keeps.
+#[test]
+fn a_wildcard_fn_argument_prints_as_written_and_as_lowered() {
+    let (ast, ir) = printed("let const = fn x _ => x");
+    assert_eq!(ast, "let const = fn x _ => x");
+    assert_eq!(ir, "let const = fn x => fn %discard => x");
+
+    // The hidden definitions of a discarded `let` read the same way.
+    let (ast, ir) = printed("let _ : Nat = 1");
+    assert_eq!(ast, "let _ : Nat = 1");
+    assert_eq!(ir, "let %discard : Nat = 1");
+}

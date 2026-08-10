@@ -15,7 +15,7 @@ use ruddy::{
 
 use crate::{
     print,
-    stage::{Cx, Ids, Spec, Trace, plural, stands_for},
+    stage::{Cx, Ids, Spec, Trace, plural, stands_for, with_symbol},
     wire::{Node, Stage},
 };
 
@@ -79,15 +79,17 @@ fn decl_node<T>(
     decl: &Decl<T>,
     value: impl FnOnce(&mut Ids, &Cx, &Mint, &T) -> Node,
 ) -> Node {
-    let mut node = Node::new(
-        ids.next(),
-        format!("{keyword} {}", mint.name(symbol)),
-        mint.path(symbol).to_string(),
-    )
-    .at(decl.name_span);
-    if let Some(index) = cx.symbols.get(&symbol) {
-        node = node.symbol(*index);
-    }
+    let mut node = with_symbol(
+        Node::new(
+            ids.next(),
+            format!("{keyword} {}", mint.name(symbol)),
+            mint.path(symbol).to_string(),
+        )
+        .at(decl.name_span),
+        cx,
+        mint,
+        symbol,
+    );
     // Only a term is ever ascribed one, so this child is simply absent on a
     // `type` declaration rather than empty. Labelled the way the AST panel
     // labels the same thing: the role on the type's own node, not a wrapper
@@ -108,6 +110,7 @@ fn decl_node<T>(
         node = node.child(with_symbol(
             Node::new(ids.next(), "Param", stands_for(mint, param)).at(param.span),
             cx,
+            mint,
             param.symbol,
         ));
     }
@@ -137,6 +140,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 ..node
             },
             cx,
+            mint,
             *symbol,
         ),
         // A literal names nothing, so this is the one leaf of the term tree
@@ -155,6 +159,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             let bound = with_symbol(
                 Node::new(ids.next(), "Arg", mint.name(arg.tracked)).at(arg.span),
                 cx,
+                mint,
                 arg.tracked,
             );
             // The bound name has no term of its own to carry a type, but the
@@ -191,6 +196,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             .child(with_symbol(
                 Node::new(ids.next(), "Name", mint.name(name.tracked)).at(name.span),
                 cx,
+                mint,
                 name.tracked,
             ));
             if let Some(annotation) = annotation {
@@ -282,8 +288,15 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
                 ..node
             },
             cx,
+            mint,
             name.tracked,
         ),
+        // The AST tab's wildcard leaf again, surviving normalization as the
+        // `_` it is: no symbol, since nothing can use it.
+        PatternKind::Wildcard => Node {
+            label: "Wildcard".into(),
+            ..node
+        },
         PatternKind::Natural(_) => Node {
             label: "Natural".into(),
             ..node
@@ -340,6 +353,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                 ..node
             },
             cx,
+            mint,
             *symbol,
         ),
         // A parameter is a local symbol like a lambda's argument, so it
@@ -350,6 +364,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                 ..node
             },
             cx,
+            mint,
             *symbol,
         ),
         TypeKind::Apply {
@@ -360,6 +375,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             let head = with_symbol(
                 Node::new(ids.next(), "Head", mint.name(*head).to_string()).at(*head_span),
                 cx,
+                mint,
                 *head,
             );
             Node {
@@ -472,11 +488,4 @@ fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail) -> Node {
         Row::Param { symbol, .. } => mint.name(*symbol).to_string(),
     };
     Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span)
-}
-
-fn with_symbol(node: Node, cx: &Cx, symbol: Symbol) -> Node {
-    match cx.symbols.get(&symbol) {
-        Some(index) => node.symbol(*index),
-        None => node,
-    }
 }

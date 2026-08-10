@@ -4376,3 +4376,95 @@ fn a_sibling_tags_positions_stay_open_under_the_catch_all() {
         "`A (`B (`C Nat | ..'a) | ..'b) | `D (`E Nat | ..'c) | ..'d -> Nat"
     );
 }
+
+/// R7 of the wildcard spec: a `_` argument is typechecked — the arrow keeps
+/// an unconstrained domain — and binds nothing. The `const` example, and the
+/// mixes around it.
+#[test]
+fn a_wildcard_fn_argument_still_has_a_domain() {
+    let (mint, _, output) = inferred("let f = fn _ => 1");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> Nat");
+
+    let (mint, _, output) = inferred("let const = fn x _ => x");
+    assert_eq!(scheme(&mint, &output, "const"), "'a -> 'b -> 'a");
+
+    let (mint, _, output) = inferred("let f = fn _ _ => 1  let g = fn _ x _ => x");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'b -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "'a -> 'b -> 'c -> 'b");
+
+    // Two discarded arguments are two domains: applying to two different
+    // types is fine, which one shared binder would refuse.
+    let (mint, _, output) = inferred("let f = fn _ _ => 1  let n = f 1 {}");
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+}
+
+/// R5: the value of a `let _` is still typechecked in both forms — its own
+/// mistakes are still reported — and `let _ : T = e` asserts `e : T`.
+#[test]
+fn a_discarded_value_is_still_typechecked() {
+    // The assertion holding, statement and expression.
+    let (_, _, output) = inferred("let _ : Nat = 3  let a = let _ : Nat = 4 in 5");
+    assert!(output.errors.is_empty());
+
+    // And failing: a lambda is not a Nat, discarded or not.
+    let (_, _, output) = infer_src("let _ : Nat = fn x => x");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+
+    // A mistake inside the value needs no annotation to surface: applying a
+    // number is one wherever the result goes.
+    let (_, _, output) = infer_src("let _ = 1 2");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+    let (_, _, output) = infer_src("let a = let _ = 1 2 in 3");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// R6: a wildcard leaf of a struct-pattern `let` keeps the field demand. The
+/// spec's `use_y`: both fields demanded of `p`, `x`'s type unconstrained,
+/// `y`'s returned — exactly the demand the equivalent match makes.
+#[test]
+fn a_wildcard_struct_leaf_still_demands_its_field() {
+    let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
+    assert_eq!(
+        scheme(&mint, &output, "use_y"),
+        "{ x: 'a, y: 'b, ..'c } -> 'b"
+    );
+
+    let (mint, _, output) = inferred("let use_y = fn p => match p with {x: _, y} => y end");
+    assert_eq!(
+        scheme(&mint, &output, "use_y"),
+        "{ x: 'a, y: 'b, ..'c } -> 'b"
+    );
+}
+
+/// R8: in a match, `_` types exactly as a named, unused catch-all does — the
+/// spec's `get`, with the root row open either way — and it introduces no
+/// binding for anything to constrain.
+#[test]
+fn a_wildcard_arm_types_as_a_named_catch_all() {
+    let with_wildcard = "type Option T = `Some T | `None\n\
+                         let get = fn opt => match opt with | `Some x => x | _ => 0 end";
+    let with_name = "type Option T = `Some T | `None\n\
+                     let get = fn opt => match opt with | `Some x => x | z => 0 end";
+    let (mint, _, output) = inferred(with_wildcard);
+    let wild = scheme(&mint, &output, "get");
+    let (mint, _, output) = inferred(with_name);
+    assert_eq!(wild, scheme(&mint, &output, "get"));
+    // The root row stays open past the listed case, so `get` takes any
+    // `Option Nat` — and more.
+    assert_eq!(wild, "`Some Nat | ..'a -> Nat");
+
+    let (mint, _, output) = inferred(
+        "type Option T = `Some T | `None\n\
+         let get : Option Nat -> Nat = fn opt => match opt with | `Some x => x | _ => 0 end",
+    );
+    assert_eq!(scheme(&mint, &output, "get"), "Option Nat -> Nat");
+
+    // In a sub-position too: `` `Some _ `` demands the case and leaves its
+    // payload to the scrutinee.
+    let (mint, _, output) =
+        inferred("let has = fn opt => match opt with | `Some _ => 1 | `None => 0 end");
+    assert_eq!(scheme(&mint, &output, "has"), "`Some 'a | `None -> Nat");
+}

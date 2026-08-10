@@ -96,6 +96,15 @@ let shadowing =
   let count = { v: 1 } in
   count
 
+let _ = id 7
+
+let konst = fn x _ => x
+
+let unwrap = fn opt => match opt with
+  | `Some x => x
+  | _ => 0
+  end
+
 let bad = @
 
 let malformed = 12abc

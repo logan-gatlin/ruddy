@@ -1685,3 +1685,120 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
         assert!(!symbols.contains(&artifact), "{symbols:?}");
     }
 }
+
+/// A program full of wildcards reaches every affected tab: the token tab
+/// shows the `Underscore` token, the AST tab renders `_` patterns and `fn _`
+/// arguments as the `_` they are, the IR tab renders the IR wildcard pattern
+/// as `_`, and the hidden fresh definitions of `let _` and a wildcard's
+/// projection sit beside the pattern-`let` temporaries the way they always
+/// have. No new tab.
+#[test]
+fn a_wildcard_reaches_every_stage() {
+    let source = "let _ = 1\n\
+                  let const = fn x _ => x\n\
+                  let use_y = fn p => let { x: _, y } = p in y\n\
+                  let f = fn e => match e with | `Some _ => 1 | _ => 0 end\n";
+    let snapshot = snapshot(source);
+    assert!(snapshot.panic.is_none());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+    };
+
+    // The token tab shows the new kind, spelled as the `_` it lexed from.
+    let tokens = nodes(stage("tokens"));
+    assert!(
+        tokens
+            .iter()
+            .any(|node| node.label == "Underscore" && node.text == "_"),
+        "no underscore token"
+    );
+
+    // The AST tab renders wildcard patterns as `_` — the arm, the payload,
+    // the struct sub-pattern, the `let` — and the `fn _` argument as one.
+    let ast = nodes(stage("ast"));
+    assert!(
+        ast.iter()
+            .any(|node| node.label == "Wildcard" && node.text == "_"),
+        "ast lacks a wildcard leaf"
+    );
+    assert!(
+        ast.iter()
+            .any(|node| node.label == "Arg" && node.text == "_"),
+        "ast lacks the `_` argument"
+    );
+
+    // The IR tab renders the surviving wildcard patterns as `_`, and the
+    // hidden definitions the way pattern-`let` temporaries appear.
+    let ir = nodes(stage("ir"));
+    assert!(
+        ir.iter()
+            .any(|node| node.label == "Wildcard" && node.text == "_"),
+        "ir lacks a wildcard leaf"
+    );
+    let labels: Vec<&str> = ir.iter().map(|node| node.label.as_str()).collect();
+    for label in ["let %discard", "Let %struct", "Let %discard"] {
+        assert!(labels.contains(&label), "ir lacks {label}: {labels:?}");
+    }
+
+    // A wildcard names nothing, so no wildcard row claims a symbol.
+    for id in ["ast", "ir"] {
+        for node in nodes(stage(id)) {
+            if node.label == "Wildcard" {
+                assert!(node.symbol.is_none(), "{id}: a wildcard claims a symbol");
+            }
+        }
+    }
+
+    // The hidden names sit in the symbols tab like any other local, and every
+    // span every tab hands out is a real position in this source.
+    let symbols: Vec<&str> = stage("symbols")
+        .nodes
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    assert!(symbols.contains(&"%discard"), "{symbols:?}");
+    for stage in &snapshot.stages {
+        for node in nodes(stage) {
+            if let Some([start, end]) = node.span {
+                assert!(
+                    source.get(start..end).is_some(),
+                    "{}: {} at {start}..{end}",
+                    stage.id,
+                    node.label
+                );
+            }
+        }
+    }
+}
+
+/// The misplaced-wildcard complaint reaches the strip coded and worded, at
+/// the `_` it is about.
+#[test]
+fn a_misplaced_wildcard_reaches_the_strip() {
+    let source = "let x = _\n";
+    let snapshot = snapshot(source);
+    let diagnostic = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "misplaced-wildcard")
+        .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
+    assert_eq!(diagnostic.stage, "parse");
+    assert!(
+        diagnostic
+            .message
+            .starts_with("`_` stands for a value being thrown away"),
+        "{}",
+        diagnostic.message
+    );
+    let at = source.find('_').expect("the `_`");
+    assert_eq!(diagnostic.span, Some([at, at + 1]));
+}

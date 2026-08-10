@@ -162,6 +162,7 @@ impl Grouped for Show<'_, PatternKind> {
             } => Prec::Apply,
             PatternKind::Tag { payload: None, .. } => Prec::Tag,
             PatternKind::Bind(_)
+            | PatternKind::Wildcard
             | PatternKind::Natural(_)
             | PatternKind::Unit
             | PatternKind::Struct(_) => Prec::Atom,
@@ -177,6 +178,9 @@ impl fmt::Display for Show<'_, PatternKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
             PatternKind::Bind(name) => f.write_str(self.mint.name(name.tracked)),
+            // The `_` as written: it names no symbol, so there is nothing for
+            // the mint to spell.
+            PatternKind::Wildcard => f.write_str("_"),
             PatternKind::Natural(value) => write!(f, "{value}"),
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(

@@ -388,6 +388,11 @@ impl Constrain<'_> {
                 Col::Unit => unit = true,
                 Col::Pattern(pattern) => match &pattern.tracked {
                     ir::PatternKind::Bind(name) => binds.push((*arm, *name)),
+                    // A binder minus the binding: it demands nothing of the
+                    // position and leaves its row open — the matrix already
+                    // counts it among the binds — and there is no name here
+                    // for any environment to learn.
+                    ir::PatternKind::Wildcard => {}
                     ir::PatternKind::Unit => unit = true,
                     ir::PatternKind::Natural(_) => naturals = true,
                     ir::PatternKind::Tag { name, payload } => {
