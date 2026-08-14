@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use ruddy::{
-    inference, ir, parse,
+    inference, ir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
@@ -41,9 +41,13 @@ fn main() -> ExitCode {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     let inferred = inference::infer(&mint, &mut built.program);
+    let checked = patterns::check(&built.program, &inferred);
 
-    let errors =
-        lexed.errors.len() + parsed.errors.len() + built.errors.len() + inferred.errors.len();
+    let errors = lexed.errors.len()
+        + parsed.errors.len()
+        + built.errors.len()
+        + inferred.errors.len()
+        + checked.errors.len();
     if errors == 0 {
         println!("built successfully with no errors");
         return ExitCode::SUCCESS;
@@ -71,6 +75,9 @@ fn main() -> ExitCode {
         }
     }
     for err in &inferred.errors {
+        report(&source, err.span, &err.kind.to_string());
+    }
+    for err in &checked.errors {
         report(&source, err.span, &err.kind.to_string());
     }
     ExitCode::FAILURE

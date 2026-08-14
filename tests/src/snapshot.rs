@@ -46,6 +46,7 @@ fn every_stage_reports_on_the_demo() {
             "constraints",
             "solve",
             "types",
+            "patterns",
             "symbols",
             "types-ir"
         ]
@@ -76,6 +77,7 @@ fn every_stage_reports_on_the_demo() {
             "Constraints",
             "Solve",
             "Types",
+            "Patterns",
             "Symbols"
         ]
     );
@@ -1061,7 +1063,10 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             .map(|stage| stage.id)
             .collect()
     };
-    assert_eq!(ids(true), ["tokens", "ast", "ir", "types", "symbols"]);
+    assert_eq!(
+        ids(true),
+        ["tokens", "ast", "ir", "types", "patterns", "symbols"]
+    );
     assert_eq!(ids(false), ["constraints", "solve", "types-ir"]);
 }
 
@@ -1559,6 +1564,11 @@ fn every_stage_reports_on_explicit_absence() {
         snapshot.diagnostics
     );
     for stage in &snapshot.stages {
+        // The Patterns tab has one section per match, and this program
+        // matches nothing — an honest emptiness rather than a failure.
+        if stage.id == "patterns" {
+            continue;
+        }
         assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
     }
     let stage = |id: &str| {

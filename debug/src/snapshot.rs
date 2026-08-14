@@ -16,7 +16,7 @@ use std::{
 };
 
 use ruddy::{
-    inference, ir, parse,
+    inference, ir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
@@ -106,6 +106,20 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         out
     });
 
+    // The pattern checks read the program inference just finished writing
+    // solved types into, and run only when both phases did.
+    let checked = match (&built, &inferred) {
+        (Some(built), Some(inferred)) => {
+            let started = Instant::now();
+            let out = guard("patterns", &mut panicked, || {
+                patterns::check(&built.program, inferred)
+            });
+            micros.patterns = started.elapsed().as_micros() as u64;
+            out
+        }
+        _ => None,
+    };
+
     // Every phase words and codes its own errors in `ruddy::ui`, so the strip
     // and the CLI driver cannot describe the same program differently, and a
     // new error kind reaches both the moment it exists. What is added here is
@@ -149,6 +163,16 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
             )
         }));
     }
+    if let Some(checked) = &checked {
+        diagnostics.extend(checked.errors.iter().map(|error| {
+            raw(
+                "patterns",
+                error.kind.code(),
+                error.kind.to_string(),
+                Some(error.span),
+            )
+        }));
+    }
 
     // Sorted by where the reader would look for them, then numbered, so a
     // diagnostic's id matches its position in the strip.
@@ -164,6 +188,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         stmts: parsed.as_ref().map(|parsed| parsed.stmts.as_slice()),
         program: built.as_ref().map(|built| &built.program),
         inference: inferred.as_ref(),
+        patterns: checked.as_ref(),
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,

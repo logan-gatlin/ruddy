@@ -317,8 +317,8 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
                 None => node,
             }
         }
-        PatternKind::Struct(fields) => {
-            let kids: Vec<Node> = fields
+        PatternKind::Struct { fields, rest } => {
+            let mut kids: Vec<Node> = fields
                 .iter()
                 .map(|(name, field)| {
                     Node::new(
@@ -330,6 +330,12 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
                     .child(pattern_node(ids, cx, mint, &field.value))
                 })
                 .collect();
+            // The `..` survives normalization as itself, and is shown the way
+            // the AST tab shows it: a row of its own, beside the fields it
+            // stands apart from.
+            if let Some(rest) = rest {
+                kids.push(Node::new(ids.next(), "Rest", "..").at(*rest));
+            }
             Node {
                 label: "Struct".into(),
                 ..node
@@ -347,6 +353,13 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             ..node
         }
         .error(),
+        // The hole a pattern's exact demand leaves for the solver: nothing
+        // was written, so there is nothing to cross-highlight, and it is not
+        // the error its rendering superficially resembles.
+        TypeKind::Any => Node {
+            label: "Any".into(),
+            ..node
+        },
         TypeKind::Ident(symbol) => with_symbol(
             Node {
                 label: "Ident".into(),

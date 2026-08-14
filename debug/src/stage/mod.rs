@@ -8,6 +8,7 @@
 pub mod ast;
 pub mod constraints;
 pub mod ir;
+pub mod patterns;
 pub mod solve;
 pub mod symbols;
 pub mod tokens;
@@ -38,6 +39,7 @@ pub struct Cx<'a> {
     pub stmts: Option<&'a [Stmt]>,
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,
+    pub patterns: Option<&'a ruddy::patterns::Output>,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -55,6 +57,7 @@ pub struct Phases {
     pub parse: u64,
     pub build: u64,
     pub infer: u64,
+    pub patterns: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -175,6 +178,18 @@ pub const REGISTRY: &[Spec] = &[
         scoped: true,
         annotates: None,
         build: Build::Panel(types::build),
+    },
+    Spec {
+        id: "patterns",
+        title: "Patterns",
+        view: View::Tree,
+        // The solved scrutinee types render in the type language, so the
+        // variables light up the way the Types tab's do — and scope the same
+        // way, since each match's types were zonked with its own definition.
+        highlight: Some(VARIABLES),
+        scoped: true,
+        annotates: None,
+        build: Build::Panel(patterns::build),
     },
     Spec {
         id: "symbols",

@@ -162,3 +162,92 @@ fn every_annotator_reads_a_trace_published_before_it() {
 fn position(id: &str) -> Option<usize> {
     REGISTRY.iter().position(|spec: &Spec| spec.id == id)
 }
+
+/// The Patterns tab: one section per match, the solved scrutinee type on the
+/// match's row, one row per arm wearing its verdict, and the coverage line —
+/// exhaustive, or the witness — with the skipped honesty when the typing
+/// failed and the checks stood aside.
+#[test]
+fn the_patterns_tab_renders_verdicts_and_coverage() {
+    use ruddy_debug::{
+        snapshot::compile,
+        wire::{BundleSpec, CompileRequest, Node},
+    };
+
+    let tab = |source: &str| -> Vec<Node> {
+        let snapshot = compile(
+            &CompileRequest {
+                source: source.to_string(),
+                revision: 0,
+                bundle: BundleSpec::default(),
+            },
+            0,
+        );
+        let stage = snapshot
+            .stages
+            .into_iter()
+            .find(|stage| stage.id == "patterns")
+            .expect("the patterns stage is registered");
+        stage.nodes
+    };
+
+    // A misplaced catch-all: the arm rows carry the verdicts, the scrutinee
+    // type is the match row's text, and the match stays exhaustive.
+    let nodes = tab("let f = fn n => match n with | x => 1 | 2 => 3 | 4 => 5 end");
+    assert_eq!(nodes.len(), 1, "{nodes:#?}");
+    let rows: Vec<(&str, &str)> = nodes[0]
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(nodes[0].label, "match");
+    assert_eq!(nodes[0].text, "Nat");
+    assert_eq!(
+        rows,
+        [
+            ("scrutinee", "Nat"),
+            ("reachable", "x"),
+            ("starved", "2"),
+            ("starved", "4"),
+            ("coverage", "exhaustive"),
+        ],
+        "{nodes:#?}"
+    );
+
+    // An unhandled match: the coverage row carries the witness, marked as the
+    // error it reports.
+    let nodes = tab("let p = fn a => match a with | {a, b} => 1 | {} => 2 end");
+    let coverage = nodes[0]
+        .children
+        .iter()
+        .find(|child| child.label == "coverage")
+        .expect("a coverage row");
+    assert_eq!(coverage.text, "unhandled: { a }");
+    assert!(coverage.error);
+
+    // An unreachable arm is marked as the error its row reports.
+    let nodes = tab("let f = fn e => match e with | `A x => 1 | `A y => 2 end");
+    let unreachable = nodes[0]
+        .children
+        .iter()
+        .find(|child| child.label == "unreachable")
+        .expect("an unreachable row");
+    assert!(unreachable.error);
+    assert_eq!(unreachable.text, "`A y");
+
+    // A mixed match: the checks stood aside, and the tab says so per arm and
+    // for the coverage.
+    let nodes = tab("let f = fn e => match e with | 1 => 2 | `A => 3 end");
+    let verdicts: Vec<&str> = nodes[0]
+        .children
+        .iter()
+        .map(|child| child.label.as_str())
+        .collect();
+    assert_eq!(
+        verdicts,
+        ["scrutinee", "skipped", "skipped", "coverage"],
+        "{nodes:#?}"
+    );
+    let coverage = nodes[0].children.last().expect("a coverage row");
+    assert_eq!(coverage.text, "skipped");
+}

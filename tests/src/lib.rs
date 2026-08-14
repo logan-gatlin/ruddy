@@ -13,6 +13,7 @@ mod docs;
 mod inference;
 mod ir;
 mod parse;
+mod patterns;
 mod print;
 mod snapshot;
 mod stage;

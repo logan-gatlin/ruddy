@@ -425,13 +425,16 @@ fn a_wildcard_pattern_round_trips() {
     }
 
     // A struct-pattern `let` desugars, so only the AST keeps the `_` on the
-    // page; the IR shows the hidden projection it became.
+    // page; the IR shows the hidden projection it became, and the exact
+    // pattern's demand — its named fields, each type a hole — as the
+    // annotation on the temporary.
     let source = "let f = fn p => let { x: _, y } = p in y";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);
     assert_eq!(
         ir,
-        "let f = fn p => let %struct = p in let %discard = %struct.x in let y = %struct.y in y"
+        "let f = fn p => let %struct : { x: ?, y: ? } = p in \
+         let %discard = %struct.x in let y = %struct.y in y"
     );
 }
 
@@ -448,4 +451,26 @@ fn a_wildcard_fn_argument_prints_as_written_and_as_lowered() {
     let (ast, ir) = printed("let _ : Nat = 1");
     assert_eq!(ast, "let _ : Nat = 1");
     assert_eq!(ir, "let %discard : Nat = 1");
+}
+
+/// The `..` that makes a struct pattern open renders in both trees — as
+/// written in the AST, and surviving normalization in the IR — last in the
+/// braces, after the trailing comma, so the printed form re-parses.
+#[test]
+fn both_trees_render_a_pattern_rest() {
+    let (ast, ir) = printed("let f = fn v => match v with | { x, .. } => x | {} => 0 end");
+    assert_eq!(
+        ast,
+        "let f = fn v => match v with | { x, .. } => x | {} => 0 end"
+    );
+    // The pun expands in the IR, and the `..` stays put.
+    assert_eq!(
+        ir,
+        "let f = fn v => match v with | { x: x, .. } => x | {} => 0 end"
+    );
+
+    // Bare, the open pattern is nothing but its `..`.
+    let (ast, ir) = printed("let g = fn v => match v with | { .. } => 1 end");
+    assert_eq!(ast, "let g = fn v => match v with | { .. } => 1 end");
+    assert_eq!(ir, "let g = fn v => match v with | { .. } => 1 end");
 }
