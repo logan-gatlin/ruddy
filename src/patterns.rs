@@ -147,16 +147,39 @@ enum Cell {
     /// Past widening only: the field this presence column stands for must be
     /// there, matching the carried cell.
     Present(Box<Cell>),
-    /// Past widening only: the field must not be there.
+    /// Past widening only: the field must not be there — or, in the rest
+    /// column, no field beyond the ones the type names may be, which is what
+    /// an exact pattern demands of the rest.
     Absent,
 }
 
 /// One column of the typed matrix: a whole position with its solved type, or —
-/// past widening — one field's presence.
+/// past widening — one field's presence, or the position's rest: whatever
+/// fields the value has beyond the ones the type names.
 #[derive(Clone)]
 enum Col {
     Whole(Rc<Ty>),
-    Field { presence: Presence, ty: Rc<Ty> },
+    Field {
+        presence: Presence,
+        ty: Rc<Ty>,
+    },
+    /// The fields beyond the named ones. `open` says whether the solved row
+    /// admits any — a core still free or quantified does, the fieldless unit
+    /// an exact column closed to does not.
+    Rest {
+        open: bool,
+    },
+}
+
+/// Which question a usefulness walk is answering. The two differ only at the
+/// rest column: reachability credits an arm with the values only its `..`
+/// accepts — fields the type never named — while exhaustiveness does not
+/// demand those values covered, or the open arm `{x, ..}` backed by `{}`
+/// would be reported unhandled for values no pattern could name.
+#[derive(Clone, Copy)]
+enum Mode {
+    Reachability,
+    Exhaustiveness,
 }
 
 /// The walk's context: the aliases, for looking through a declared name to
@@ -417,7 +440,7 @@ impl Check<'_> {
                 _ => {
                     let rows: Vec<Vec<Cell>> =
                         cells[..at].iter().map(|cell| vec![cell.clone()]).collect();
-                    match self.useful(&rows, &cols, &[cells[at].clone()]) {
+                    match self.useful(&rows, &cols, &[cells[at].clone()], Mode::Reachability) {
                         Some(_) => Verdict::Reachable,
                         None => {
                             out.errors.push(Error {
@@ -440,7 +463,7 @@ impl Check<'_> {
         // with the example written out — worded about numbers when the
         // example is one, since no one number is worth quoting.
         let rows: Vec<Vec<Cell>> = cells.iter().map(|cell| vec![cell.clone()]).collect();
-        let coverage = match self.useful(&rows, &cols, &[Cell::Wild]) {
+        let coverage = match self.useful(&rows, &cols, &[Cell::Wild], Mode::Exhaustiveness) {
             Some(mut wits) => {
                 let witness = wits.remove(0).unwrap_or(Witness::Any);
                 let kind = match &witness {
@@ -534,13 +557,20 @@ impl Check<'_> {
     /// The witness comes back one entry per column: the value the position
     /// takes, or `None` where a field column settled on absence — which the
     /// struct fold above it turns into a field left out.
-    fn useful(&self, rows: &[Vec<Cell>], cols: &[Col], q: &[Cell]) -> Option<Vec<Option<Witness>>> {
+    fn useful(
+        &self,
+        rows: &[Vec<Cell>],
+        cols: &[Col],
+        q: &[Cell],
+        mode: Mode,
+    ) -> Option<Vec<Option<Witness>>> {
         let Some((col, later)) = cols.split_first() else {
             return rows.is_empty().then(Vec::new);
         };
         match col {
-            Col::Whole(ty) => self.whole(rows, ty, later, q),
-            Col::Field { presence, ty } => self.field(rows, presence, ty, later, q),
+            Col::Whole(ty) => self.whole(rows, ty, later, q, mode),
+            Col::Field { presence, ty } => self.field(rows, presence, ty, later, q, mode),
+            Col::Rest { open } => self.rest(rows, *open, later, q, mode),
         }
     }
 
@@ -554,30 +584,34 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         let ty = self.shape(ty);
         let structs = std::iter::once(&q[0])
             .chain(rows.iter().map(|row| &row[0]))
             .any(|cell| matches!(cell, Cell::Struct { .. }));
         if structs {
-            return self.widened(rows, &ty, later, q);
+            return self.widened(rows, &ty, later, q, mode);
         }
-        self.core(rows, &ty, later, q)
+        self.core(rows, &ty, later, q, mode)
     }
 
     /// The widening step: the fields the solved type names become one
     /// presence column apiece — an exact pattern demands absence of every one
-    /// it does not mention, an open one says nothing — and the core keeps a
-    /// column of its own for the tags and numbers. The witness folds back the
-    /// other way: the fields settled present in braces, presence kept even
-    /// where any value serves, since under exactness the presence is the
-    /// information.
+    /// it does not mention, an open one says nothing — the core keeps a
+    /// column of its own for the tags and numbers, and a rest column carries
+    /// what each pattern says about fields beyond the named ones: an exact
+    /// struct demands there are none, everything else accepts any. The
+    /// witness folds back the other way: the fields settled present in
+    /// braces, presence kept even where any value serves, since under
+    /// exactness the presence is the information.
     fn widened(
         &self,
         rows: &[Vec<Cell>],
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         let mut named: Vec<(String, Presence, Rc<Ty>)> = ty
             .fields
@@ -597,7 +631,7 @@ impl Check<'_> {
             }
         }
         let widen = |cell: &Cell| -> Vec<Cell> {
-            let mut wide = Vec::with_capacity(named.len() + 1);
+            let mut wide = Vec::with_capacity(named.len() + 2);
             match cell {
                 Cell::Struct { fields, exact } => {
                     for (name, _, _) in &named {
@@ -612,10 +646,20 @@ impl Check<'_> {
                     // fields; what it demanded of the row, the types already
                     // enforced.
                     wide.push(Cell::Wild);
+                    // The rest, though, is the pattern's to speak to: exact
+                    // means no field beyond the mentioned ones, and the
+                    // mentioned ones beyond the type's are provably absent
+                    // columns of their own above — so beyond the *named*
+                    // ones. `..` accepts whatever else there is.
+                    wide.push(match exact {
+                        true => Cell::Absent,
+                        false => Cell::Wild,
+                    });
                 }
                 cell => {
                     wide.extend(std::iter::repeat_with(|| Cell::Wild).take(named.len()));
                     wide.push(cell.clone());
+                    wide.push(Cell::Wild);
                 }
             }
             wide
@@ -628,6 +672,15 @@ impl Check<'_> {
             })
             .collect();
         wide_cols.push(Col::Whole(Rc::new(Ty::plain(ty.core.clone()))));
+        // Whether fields beyond the named ones exist to be had. The fieldless
+        // unit an exact column closes the row to admits none; any other core
+        // leaves the question to the value. (A settled core like `Nat` only
+        // solves beside open struct patterns — an exact one would have pinned
+        // it to unit or failed — so no cell demands its rest empty and the
+        // flag is moot there.)
+        wide_cols.push(Col::Rest {
+            open: !matches!(ty.core, Core::Unit),
+        });
         wide_cols.extend(later.iter().cloned());
         let wide_rows: Vec<Vec<Cell>> = rows
             .iter()
@@ -640,8 +693,12 @@ impl Check<'_> {
         let mut wide_q = widen(&q[0]);
         wide_q.extend(q[1..].iter().cloned());
 
-        let mut wits = self.useful(&wide_rows, &wide_cols, &wide_q)?;
-        let after = wits.split_off(named.len() + 1);
+        let mut wits = self.useful(&wide_rows, &wide_cols, &wide_q, mode)?;
+        let after = wits.split_off(named.len() + 2);
+        // The rest entry has nothing to print: its empty half witnesses as
+        // `None`, and its nonempty half is only walked judging reachability,
+        // whose witness is discarded.
+        wits.pop();
         let core = wits.pop().flatten().unwrap_or(Witness::Any);
         let fields: IndexMap<String, Witness> = named
             .iter()
@@ -668,6 +725,7 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         // The present half of the universe: the rows demanding absence drop,
         // and the question moves into what the field holds — whose column
@@ -694,7 +752,7 @@ impl Check<'_> {
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
             sub_q.extend(q[1..].iter().cloned());
-            self.useful(&rows, &cols, &sub_q)
+            self.useful(&rows, &cols, &sub_q, mode)
         };
         // The absent half: the rows demanding the field drop, and the field
         // contributes nothing further to the value.
@@ -707,7 +765,7 @@ impl Check<'_> {
                 .filter(|row| matches!(&row[0], Cell::Absent | Cell::Wild))
                 .map(|row| wild_row(row))
                 .collect();
-            let wits = self.useful(&rows, later, &q[1..])?;
+            let wits = self.useful(&rows, later, &q[1..], mode)?;
             Some(std::iter::once(None).chain(wits).collect())
         };
         match &q[0] {
@@ -720,6 +778,59 @@ impl Check<'_> {
         }
     }
 
+    /// The rest of a widened position: whatever fields the value carries
+    /// beyond the ones the type names. Its universe has an empty half always —
+    /// no extra fields — and a nonempty half only where the row is open. An
+    /// exact cell demands the empty half; a wildcard accepts either, but the
+    /// nonempty half is only *asked* judging reachability: an open arm behind
+    /// an exact one is reached by the values with extra fields, while
+    /// exhaustiveness does not demand those values covered — no pattern could
+    /// name the fields a witness for them would have to show.
+    fn rest(
+        &self,
+        rows: &[Vec<Cell>],
+        open: bool,
+        later: &[Col],
+        q: &[Cell],
+        mode: Mode,
+    ) -> Option<Vec<Option<Witness>>> {
+        // The empty half: a value with no extra fields, which the exact and
+        // the indifferent rows both accept. Nothing extra means nothing to
+        // print, so the witness entry is `None`.
+        let empty = || -> Option<Vec<Option<Witness>>> {
+            let rows: Vec<Vec<Cell>> = rows
+                .iter()
+                .filter(|row| matches!(&row[0], Cell::Absent | Cell::Wild))
+                .map(|row| wild_row(row))
+                .collect();
+            let wits = self.useful(&rows, later, &q[1..], mode)?;
+            Some(std::iter::once(None).chain(wits).collect())
+        };
+        // The nonempty half: some field beyond the named ones, which only the
+        // indifferent rows accept. Its witness is never printed — the half is
+        // walked judging reachability alone — so any value serves.
+        let nonempty = || -> Option<Vec<Option<Witness>>> {
+            if !open {
+                return None;
+            }
+            let rows: Vec<Vec<Cell>> = rows
+                .iter()
+                .filter(|row| matches!(&row[0], Cell::Wild))
+                .map(|row| wild_row(row))
+                .collect();
+            let wits = self.useful(&rows, later, &q[1..], mode)?;
+            Some(std::iter::once(Some(Witness::Any)).chain(wits).collect())
+        };
+        match &q[0] {
+            Cell::Absent => empty(),
+            // A wildcard — the widening put nothing else here.
+            _ => match mode {
+                Mode::Reachability => empty().or_else(nonempty),
+                Mode::Exhaustiveness => empty(),
+            },
+        }
+    }
+
     /// One position's core, the fields already peeled off: numbers when it is
     /// `Nat`, cases when it is a sum, and nothing testable otherwise — a core
     /// the arms cannot reach into is covered by the wildcards that got here.
@@ -729,17 +840,18 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         match &ty.core {
-            Core::Nat => self.naturals(rows, later, q),
-            Core::Sum(row) => self.cases(rows, &flat(row), later, q),
+            Core::Nat => self.naturals(rows, later, q, mode),
+            Core::Sum(row) => self.cases(rows, &flat(row), later, q, mode),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
             // flattened every struct — so every cell here is a wildcard, the
             // column is consumed, and any value serves.
             _ => {
                 let rows: Vec<Vec<Cell>> = rows.iter().map(|row| wild_row(row)).collect();
-                let wits = self.useful(&rows, later, &q[1..])?;
+                let wits = self.useful(&rows, later, &q[1..], mode)?;
                 Some(std::iter::once(Some(Witness::Any)).chain(wits).collect())
             }
         }
@@ -753,6 +865,7 @@ impl Check<'_> {
         rows: &[Vec<Cell>],
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         let narrow = |value: u128| -> Vec<Vec<Cell>> {
             rows.iter()
@@ -765,7 +878,7 @@ impl Check<'_> {
         };
         match &q[0] {
             Cell::Natural(value) => {
-                let wits = self.useful(&narrow(*value), later, &q[1..])?;
+                let wits = self.useful(&narrow(*value), later, &q[1..], mode)?;
                 Some(
                     std::iter::once(Some(Witness::Natural(*value)))
                         .chain(wits)
@@ -783,7 +896,7 @@ impl Check<'_> {
                     })
                     .collect();
                 for value in &listed {
-                    if let Some(wits) = self.useful(&narrow(*value), later, &q[1..]) {
+                    if let Some(wits) = self.useful(&narrow(*value), later, &q[1..], mode) {
                         return Some(
                             std::iter::once(Some(Witness::Natural(*value)))
                                 .chain(wits)
@@ -799,7 +912,7 @@ impl Check<'_> {
                     .filter(|row| matches!(&row[0], Cell::Wild))
                     .map(|row| wild_row(row))
                     .collect();
-                let wits = self.useful(&rows, later, &q[1..])?;
+                let wits = self.useful(&rows, later, &q[1..], mode)?;
                 Some(
                     std::iter::once(Some(Witness::Natural(unlisted)))
                         .chain(wits)
@@ -818,6 +931,7 @@ impl Check<'_> {
         row: &Row,
         later: &[Col],
         q: &[Cell],
+        mode: Mode,
     ) -> Option<Vec<Option<Witness>>> {
         let narrow = |name: &str| -> Vec<Vec<Cell>> {
             rows.iter()
@@ -838,7 +952,7 @@ impl Check<'_> {
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
             sub_q.extend(q[1..].iter().cloned());
-            let mut wits = self.useful(&narrow(name), &cols, &sub_q)?;
+            let mut wits = self.useful(&narrow(name), &cols, &sub_q, mode)?;
             let payload = wits.remove(0).unwrap_or(Witness::Any);
             Some(
                 std::iter::once(Some(tag_witness(name, payload)))
@@ -879,7 +993,7 @@ impl Check<'_> {
                         .filter(|row| matches!(&row[0], Cell::Wild))
                         .map(|row| wild_row(row))
                         .collect();
-                    let wits = self.useful(&rows, later, &q[1..])?;
+                    let wits = self.useful(&rows, later, &q[1..], mode)?;
                     let listed: Vec<String> =
                         universe.iter().map(|(name, _)| (*name).clone()).collect();
                     // "Anything other than" needs something to be other than;

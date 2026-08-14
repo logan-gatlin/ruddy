@@ -589,3 +589,100 @@ fn an_empty_match_over_a_real_sum_is_skipped() {
     assert!(matches!(report.coverage, Coverage::Skipped));
     assert!(report.arms.is_empty());
 }
+
+/// An arm only the values with extra fields reach is reachable: exactness is
+/// the earlier arm's demand, not the later one's ceiling. `{}` takes the
+/// fieldless value and `{..}` everything carrying a field, so neither is
+/// unreachable — and the same reasoning reaches a binder behind the exact
+/// empty pattern.
+#[test]
+fn an_open_arm_behind_an_exact_one_is_reachable() {
+    // Bare `{..}` after the exact empty pattern.
+    let checks = clean("let f = fn v => match v with | {} => 1 | {..} => 2 end");
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
+
+    // An open arm naming the same field the exact one names: a value with
+    // `a` and anything else gets past the first arm.
+    let checks = clean("let f = fn v => match v with | {a} => 1 | {a, ..} => 2 end");
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
+
+    // A binder behind the exact empty pattern takes the values with fields.
+    let checks = clean("let f = fn v => match v with | {} => 1 | x => 2 end");
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Reachable]);
+}
+
+/// A column of exact arms closes the row, and over the closed row a duplicate
+/// exact arm has nothing left to take: the rest column with no nonempty half.
+#[test]
+fn a_duplicate_exact_arm_over_a_closed_row_is_unreachable() {
+    let src = "let f = fn v => match v with | {a} => 1 | {a} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.rfind("{a} => 2").expect("the duplicate")
+        )],
+        "{checks:#?}"
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Unreachable]);
+}
+
+/// The other direction: an exact arm behind an open one covering its field is
+/// unreachable — every value with `a`, extra fields or none, is the open
+/// arm's, so the exact demand for an empty rest finds nothing left.
+#[test]
+fn an_exact_arm_behind_a_covering_open_one_is_unreachable() {
+    let src = "let f = fn v => match v with | {a, ..} => 1 | {a} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.rfind("{a} => 2").expect("the exact arm")
+        )],
+        "{checks:#?}"
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable, Verdict::Unreachable]);
+}
+
+/// A nested position closed by its own exact sub-column keeps its rest shut
+/// even when the outer row is open: with `b` proved present everywhere, a
+/// second `{b, ..}` arm is left nothing — not even a value whose `a` carries
+/// fields the inner exact `{}` never named, because the inner row has none to
+/// carry.
+#[test]
+fn a_closed_nested_rest_offers_no_escape() {
+    let src = "let f = fn v => match v with \
+               | {a: {}, b} => 1 | {b, ..} => 2 | {b, ..} => 3 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.rfind("{b, ..} => 3").expect("the shadowed arm")
+        )],
+        "{checks:#?}"
+    );
+    let report = sole_report(&checks);
+    assert_eq!(
+        verdicts(report),
+        [Verdict::Reachable, Verdict::Reachable, Verdict::Unreachable]
+    );
+}
