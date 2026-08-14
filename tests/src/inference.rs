@@ -701,6 +701,22 @@ fn an_annotation_may_not_be_narrowed_by_its_definition() {
         };
         assert_eq!(error.kind.code(), "annotation-too-open", "{src}");
     }
+
+    // Two slots the definition made into one. Neither is decided — both are
+    // still a variable, and the scheme still quantifies it — so nothing here is
+    // caught by asking about one of them at a time. What the reader wrote was
+    // two independent promises, and the type has one.
+    for src in [
+        "let f : { ..r } -> { ..s } -> { ..r } = fn p => fn q => q",
+        "let f : { x when a: Nat } -> { x when b: Nat } -> { x when a: Nat } \
+         = fn p => fn q => q",
+    ] {
+        let (_, _, output) = infer_src(src);
+        let [error] = output.errors.as_slice() else {
+            panic!("expected exactly one error for {src}: {:#?}", output.errors);
+        };
+        assert_eq!(error.kind.code(), "annotation-too-open", "{src}");
+    }
 }
 
 /// What the check must not catch. Each of these leaves the annotation's own
@@ -738,6 +754,43 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     );
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "Nat");
+
+    // Two slots that stay two, even though both were bound: a definition that
+    // ties one of its `..`s to a variable of somebody else's has not narrowed
+    // anything, and the scheme prints the type that was written.
+    let (mint, _, output) = inferred("let f : { ..r } -> { ..s } -> { ..r } = fn p => fn q => p");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'b -> 'a");
+
+    // Which is what a binding group turns on. Two definitions that name each
+    // other are solved together and monomorphically, so the annotated one's
+    // presences are unified with the variables standing in for its partner
+    // before either body is read — and the scheme still quantifies both, so
+    // the type the reader wrote is the type that was checked. Either way round,
+    // since which member is walked first decides which side of that unification
+    // gets bound.
+    let annotated = "let f : { x when a: Nat, y when b: Nat } -> {} where a != b = fn v => g v";
+    let matching = "let g = fn v => match v with | {x} => {} | {y} => f v end";
+    for src in [
+        format!("{annotated}\n{matching}"),
+        format!("{matching}\n{annotated}"),
+    ] {
+        let (mint, _, output) = inferred(&src);
+        assert_eq!(
+            scheme(&mint, &output, "f"),
+            "{ x when a: Nat, y when b: Nat } -> {} where a != b"
+        );
+    }
+
+    // And the same for a tail rather than a presence: two members of a group,
+    // each promising its own open sum, unify the two the moment either body is
+    // read. One of the two tails is bound to the other and both are still open,
+    // which is the type each of them says it has.
+    let (mint, _, output) = inferred(
+        "let f : (`A Nat | ..r) -> Nat = fn p => g p\n\
+         let g : (`A Nat | ..s) -> Nat = fn p => f p",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "`A Nat | ..'a -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "`A Nat | ..'a -> Nat");
 }
 
 /// One mistake is one complaint. Everything a failure abandons it also

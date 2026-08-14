@@ -614,6 +614,25 @@ enum Side {
     Actual,
 }
 
+/// What a variable an annotation left open came back as, once the group it was
+/// in is solved. See [`Table::residue`].
+#[derive(Debug, Clone, Copy)]
+enum Residue {
+    /// Still a variable of its own sort with nothing attached, and which one:
+    /// the annotation kept its promise about this slot, whatever the variable
+    /// ended up being called. Named rather than a bare yes, because two slots
+    /// that came back as one variable are the case a bare yes cannot see.
+    Open(TyVar),
+    /// The undecided value of its own sort: abandoned by a failure rather than
+    /// solved by the definition. Something already went wrong and pointed it
+    /// here, and a complaint about the annotation would be that failure said
+    /// again in words about the wrong line.
+    Nothing,
+    /// Something the reader could have written instead. The annotation said
+    /// this slot was open and the definition closed it.
+    Decided,
+}
+
 /// One member of a binding group as it goes into scope, before anything in the
 /// group has been walked.
 ///
@@ -1021,7 +1040,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // to be decided, so there is no promise here to hold anyone to.
                 && !synthetic(&annotation.ty)
                 && from == to
-                && member.scoped.opened.clone().any(|var| table.narrowed(var))
+                && table.narrowed(member.scoped.opened.clone())
             {
                 errors.push(Error {
                     span: annotation.ty.span,
@@ -1063,7 +1082,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // complaint about the fallout of a failure is one mistake said
             // twice.
             for annotated in &member.annotated {
-                if from == to && annotated.opened.clone().any(|var| table.narrowed(var)) {
+                if from == to && table.narrowed(annotated.opened.clone()) {
                     errors.push(Error {
                         span: annotated.span,
                         kind: ErrorKind::AnnotationTooOpen,
@@ -2146,39 +2165,75 @@ impl Table {
         unfolded
     }
 
-    /// Whether a variable an annotation left open came back decided.
+    /// Whether the variables an annotation left open came back narrower than it
+    /// promised — either because the definition decided one of them, or because
+    /// it made two of them into one.
     ///
-    /// Bound is decided, with one exception: a variable that resolves to the
-    /// undecided value of its own sort was abandoned rather than solved —
-    /// which is the same question asked three ways, since the sorts have three
-    /// spellings for "nothing is known". Something already
-    /// failed and pointed it there, and a second complaint saying the
-    /// annotation promised too much would be that failure said again in words
-    /// about the wrong line. Bound to another variable still counts, unbound
-    /// or not: the annotation said this part of the type was its own, and a
-    /// definition that tied it to anything else has not kept that.
+    /// Asked of the whole range at once rather than a variable at a time, and
+    /// that is the point. Openness is not a property a variable has by itself:
+    /// a `when` that came back as somebody else's still-open presence is a
+    /// `when` the reader's type keeps, because the scheme quantifies whatever
+    /// is left free and prints it under the name the annotation gave it. Two
+    /// `when`s that came back as the *same* still-open presence are one `when`,
+    /// however open it is, and the type the reader wrote is not the type the
+    /// definition has. Only a range can tell those apart.
     ///
-    /// Asked only of the variables an annotation left open, and a written type
-    /// can leave open only `..`, `..r` and `when` — so a variable arriving here is
-    /// one of three things: the core a struct's `..` lowered to, the tail a
-    /// sum's did, or a presence. Each sort is asked in its own spelling of
-    /// "nothing is known", which is the whole of the three arms.
-    fn narrowed(&self, var: TyVar) -> bool {
+    /// Which is what a binding group turns on. Two definitions that name each
+    /// other are solved together and monomorphically, so an annotated member's
+    /// presences are unified with the variables standing in for its partner's
+    /// almost immediately — and read one at a time that is indistinguishable
+    /// from a body pinning them down, so every mutually recursive annotated
+    /// definition was told to rewrite a type it had in fact kept.
+    ///
+    /// See [`Table::residue`] for what one variable coming back is.
+    fn narrowed(&self, opened: Range<TyVar>) -> bool {
+        let mut open: Vec<TyVar> = Vec::new();
+        for var in opened {
+            match self.residue(var) {
+                Residue::Decided => return true,
+                Residue::Nothing => {}
+                Residue::Open(var) => match open.contains(&var) {
+                    true => return true,
+                    false => open.push(var),
+                },
+            }
+        }
+        false
+    }
+
+    /// What one variable an annotation left open came back as.
+    ///
+    /// A written type can leave open only `..`, `..r` and `when`, so a variable
+    /// arriving here is one of three things: the core a struct's `..` lowered
+    /// to, the tail a sum's did, or a presence. Each sort is read in its own
+    /// two spellings of "still nothing but a variable" and "nothing is known",
+    /// which is the whole of the three arms.
+    fn residue(&self, var: TyVar) -> Residue {
         let Slot::Bound(value) = &self.vars[var as usize] else {
-            return false;
+            return Residue::Open(var);
         };
         match value {
-            Assigned::Presence(presence) => {
-                !matches!(self.presence_of(presence), Presence::Undecided)
-            }
-            Assigned::Row(row) => {
-                let flat = self.canon(row);
-                !(flat.labels.is_empty() && matches!(flat.rest, Rest::Undecided))
-            }
-            Assigned::Ty(ty) => {
-                let ty = self.resolve(ty);
-                !(ty.fields.is_empty() && matches!(ty.core, Core::Undecided))
-            }
+            Assigned::Presence(presence) => match self.presence_of(presence) {
+                Presence::Undecided => Residue::Nothing,
+                Presence::Var(var) => Residue::Open(var),
+                _ => Residue::Decided,
+            },
+            Assigned::Row(row) => match self.canon(row) {
+                flat if !flat.labels.is_empty() => Residue::Decided,
+                flat => match flat.rest {
+                    Rest::Undecided => Residue::Nothing,
+                    Rest::Var(var) => Residue::Open(var),
+                    _ => Residue::Decided,
+                },
+            },
+            Assigned::Ty(ty) => match self.resolve(ty) {
+                ty if !ty.fields.is_empty() => Residue::Decided,
+                ty => match ty.core {
+                    Core::Undecided => Residue::Nothing,
+                    Core::Var(var) => Residue::Open(var),
+                    _ => Residue::Decided,
+                },
+            },
         }
     }
 
