@@ -12,3 +12,4 @@ members = ["debug", "tests"]
 indexmap = "2"
 semver = "1.0.28"
 twox-hash = { version = "2.1.3", default-features = false, features = ["xxhash3_64"] }
+varisat = "0.2.2"

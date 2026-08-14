@@ -46,11 +46,14 @@ use std::fmt;
 use indexmap::IndexMap;
 
 use crate::{
-    inference::{self, Constraint, ConstraintKind, Effect, Goal, Rule},
+    inference::{self, Constraint, ConstraintKind, Effect, Goal, Origin, Rule},
     ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
-    types::{Assigned, Core, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape, Ty},
+    types::{
+        Assigned, Atom, Core, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape,
+        Ty,
+    },
 };
 
 /// The note a duplicate definition points back with, printed against the span
@@ -162,7 +165,7 @@ struct Labels<'a> {
 
 /// One label of a written row, as [`write_row`] and [`write_sum`] render it:
 /// written out with what it holds, or explicitly absent — the `\name`
-/// spelling, which writes no type, no payload and no `?`.
+/// spelling, which writes no type, no payload and no mark.
 ///
 /// `V` is what follows a written label: a field's type for [`write_row`], and
 /// a case's optional payload for [`write_sum`]. An absent label follows with
@@ -170,8 +173,48 @@ struct Labels<'a> {
 /// name.
 #[derive(Debug)]
 pub enum Entry<K, V> {
-    Written { name: K, optional: bool, holds: V },
-    Absent { name: K },
+    Written {
+        name: K,
+        mark: Option<Mark>,
+        holds: V,
+    },
+    Absent {
+        name: K,
+    },
+}
+
+/// How a label wears a presence that is neither certainly there nor certainly
+/// absent.
+///
+/// Two answers where there used to be one. The `?` retired as *syntax* — no
+/// source spells it any more — but it survives as the one thing the printer
+/// still has to be able to say about a presence a failure abandoned. Everything
+/// else a presence can be has a name, and prints as the `when` clause that
+/// names it.
+#[derive(Debug)]
+pub enum Mark {
+    /// `?` — the undecided-presence failure artifact. Nothing parses it, so a
+    /// type wearing one does not read back, and that is exactly what it is
+    /// reporting.
+    Undecided,
+    /// `when a`, or `when ?3` for one the solve still owns: the presence has a
+    /// name, and the `where` clause beside the type can talk about it.
+    When(String),
+}
+
+/// A formula written in the reader's own nouns.
+///
+/// The `where` clause of a *scheme* names presence variables, because that is
+/// what the type's `when` clauses bound. A complaint about a use site names the
+/// labels instead — "this value needs `x != y` among its fields" — because the
+/// reader wrote `x` and `y` and never saw the variable that decides them. Same
+/// formula, two vocabularies, one writer.
+struct Named<'a> {
+    formula: &'a Formula,
+    /// Which label each presence decides, where a label decides one. Empty
+    /// spells every atom as the presence itself, which is what a scheme's
+    /// clause wants.
+    labels: &'a [(String, Presence)],
 }
 
 impl token::ErrorKind {
@@ -218,7 +261,7 @@ impl fmt::Display for Kind {
             Kind::Comma => f.write_str(","),
             Kind::Dot => f.write_str("."),
             Kind::DotDot => f.write_str(".."),
-            Kind::Question => f.write_str("?"),
+            Kind::NotEqual => f.write_str("!="),
             Kind::Backslash => f.write_str("\\"),
             Kind::Pipe => f.write_str("|"),
             // The backtick is written back on: it is how the token was
@@ -312,7 +355,7 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
-                false,
+                None,
                 payload.as_deref().map(|payload| &payload.tracked),
             ),
             parse::PatternKind::Struct { fields, rest } => {
@@ -374,7 +417,7 @@ impl fmt::Display for ir::Witness {
         match self {
             ir::Witness::Any => f.write_str("anything"),
             ir::Witness::Natural(value) => write!(f, "{value}"),
-            ir::Witness::Tag { name, payload } => write_tag(f, name, false, payload.as_deref()),
+            ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
             // pun-style — under exactness the presence *is* the information,
             // so `{a}` says what `{}` would deny.
@@ -433,6 +476,11 @@ impl ir::ErrorKind {
                 Namespace::Terms | Namespace::Modules => "circular-term",
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
+            ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
+            // The name is not part of the code, only of the wording: what went
+            // wrong is that the clause names something the type does not bind,
+            // and which name it was is the span's to show.
+            ir::ErrorKind::UnboundPresence { .. } => "unbound-presence",
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
@@ -492,12 +540,21 @@ impl fmt::Display for ir::ErrorKind {
                 }
             },
             // The noun follows the shape that was written: someone who wrote
-            // backticks is told about cases, and the `?` and the `..` are the
+            // backticks is told about cases, and the `when` and the `..` are the
             // same two marks either way.
             ir::ErrorKind::OpenDeclaredType { shape } => write!(
                 f,
-                "a declared type must list its {}s exactly; `..` and `?` belong in annotations",
+                "a declared type must list its {}s exactly; `..` and `when` belong in annotations",
                 noun(*shape),
+            ),
+            // The same refusal about the clause beside the type rather than
+            // about a label inside it, so it has no noun to be worded in.
+            ir::ErrorKind::ClauseInDeclaration => f.write_str(
+                "a declared type says the same thing wherever it is used, so there is nothing here for a `where` clause to decide; it belongs in an annotation",
+            ),
+            ir::ErrorKind::UnboundPresence { name } => write!(
+                f,
+                "this clause names `{name}`, but nothing in the type beside it binds that name with a `when`",
             ),
             // Counted in words, and said as what the type takes rather than as
             // what the reader failed to supply — the count is the fact, and
@@ -861,7 +918,7 @@ impl Grouped for Core {
 /// below, both of which the debugger's two tree printers also write through.
 /// So the punctuation a type is written with is one rule rather than two
 /// copies of a rule agreeing: where a diagnostic puts a parenthesis, a comma
-/// or a `?`, the debugger's IR tab puts one too.
+/// or a `when` clause, the debugger's IR tab puts one too.
 ///
 /// Not the whole string, though, and deliberately not. A tail is written by
 /// whoever knows what it stands for, and the two readers know different
@@ -1000,16 +1057,11 @@ fn write_fields(
 ) -> fmt::Result {
     let entries = labels
         .iter()
-        .filter_map(|(name, field)| match &field.presence {
-            Presence::Absent => None,
-            Presence::Present => Some(Entry::Written {
+        .filter_map(|(name, field)| match mark(&field.presence) {
+            Absence::Absent => None,
+            Absence::There(mark) => Some(Entry::Written {
                 name,
-                optional: false,
-                holds: &field.ty,
-            }),
-            _ => Some(Entry::Written {
-                name,
-                optional: true,
+                mark,
                 holds: &field.ty,
             }),
         });
@@ -1027,16 +1079,11 @@ fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
     let cases = row
         .labels
         .iter()
-        .filter_map(|(name, field)| match &field.presence {
-            Presence::Absent => None,
-            Presence::Present => Some(Entry::Written {
+        .filter_map(|(name, field)| match mark(&field.presence) {
+            Absence::Absent => None,
+            Absence::There(mark) => Some(Entry::Written {
                 name,
-                optional: false,
-                holds: payload(&field.ty),
-            }),
-            _ => Some(Entry::Written {
-                name,
-                optional: true,
+                mark,
                 holds: payload(&field.ty),
             }),
         });
@@ -1066,17 +1113,29 @@ impl fmt::Display for Rest {
 
 /// Whether one label is there.
 ///
-/// Never part of a printed scheme either: a field wears its presence as the `?`
-/// on its name, or as nothing. Where one surfaces is the solver's record, where
-/// a step deciding a presence reads `?3 := absent`.
+/// Never part of a printed scheme either: a field wears its presence as the
+/// `when` clause on its name, or as nothing. Where one surfaces is the solver's
+/// record, where a step deciding a presence reads `?3 := absent`.
 impl fmt::Display for Presence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Presence::Present => f.write_str("present"),
             Presence::Absent => f.write_str("absent"),
             Presence::Var(var) => write!(f, "?{var}"),
-            Presence::Bound(index) => letter(f, *index),
+            Presence::Bound(index) => presence_letter(f, *index),
             Presence::Undecided => f.write_str("?"),
+        }
+    }
+}
+
+/// One variable a formula names, in the spelling its reading has: the solver's
+/// own `?3` for one it still owns, and the bare `a` of a `when` clause for one
+/// a scheme quantified.
+impl fmt::Display for Atom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Atom::Var(var) => write!(f, "?{var}"),
+            Atom::Bound(index) => presence_letter(f, *index),
         }
     }
 }
@@ -1095,14 +1154,172 @@ impl fmt::Display for Assigned {
 }
 
 /// A quantified variable, by its position: `'a` through `'z`, and then `'a1`
-/// once the letters run out. One spelling for all three sorts, since they share
-/// one numbering — a presence usually prints as the `?` on its label instead,
-/// but the letter is what it falls back to.
+/// once the letters run out. Types and rows share this alphabet; presences have
+/// [`presence_letter`] instead.
 fn letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
+    write!(f, "'{}", name_at(index))
+}
+
+/// A quantified presence, by its position: `a` through `z`, then `a1`. The same
+/// letters and no quote, which is the whole of what tells the two alphabets
+/// apart — and they are separate pools, so a type's `'a` and a presence's `a`
+/// in one scheme are unrelated by construction rather than by luck.
+fn presence_letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
+    f.write_str(&name_at(index))
+}
+
+/// The `a`, `b`, … `a1` sequence both alphabets are built from.
+fn name_at(index: u32) -> String {
     let letter = (b'a' + (index % 26) as u8) as char;
     match index / 26 {
-        0 => write!(f, "'{letter}"),
-        round => write!(f, "'{letter}{round}"),
+        0 => letter.to_string(),
+        round => format!("{letter}{round}"),
+    }
+}
+
+/// Whether a label is part of what its type says, and — when it is — the mark
+/// it wears.
+///
+/// Three presences and two answers: absent is no part of the type at all, and
+/// everything else is there with whatever mark says how sure that is.
+enum Absence {
+    Absent,
+    There(Option<Mark>),
+}
+
+/// How one presence prints on the label it belongs to.
+///
+/// A presence certainly there wears nothing, absent is not written, and
+/// everything else is a `when` clause naming it — a letter for one a scheme
+/// quantified, and the solver's own `?3` for one still open. The single
+/// exception is the presence a failure abandoned, which keeps the `?` no syntax
+/// reads: what it reports is precisely that there is nothing to write.
+fn mark(presence: &Presence) -> Absence {
+    match presence {
+        Presence::Absent => Absence::Absent,
+        Presence::Present => Absence::There(None),
+        Presence::Undecided => Absence::There(Some(Mark::Undecided)),
+        decided => Absence::There(Some(Mark::When(decided.to_string()))),
+    }
+}
+
+/// How tightly a printed formula binds, on the `where` grammar's own ladder:
+/// `0` for the non-associative `=` and `!=`, `1` for `or`, `2` for `and`, `3`
+/// for `not`, `4` for a name.
+///
+/// A number rather than a [`Prec`] of its own, because it is its own grammar:
+/// nothing in a formula can be a type and nothing in a type can be a formula,
+/// so a shared ladder would only invite one to be compared against the other —
+/// and there is nothing here for a named level to disambiguate that the four
+/// call sites do not already say.
+fn prec(formula: &Formula) -> u8 {
+    match formula {
+        Formula::Iff(..) | Formula::Xor(..) => 0,
+        Formula::Or(..) => 1,
+        Formula::And(..) => 2,
+        Formula::Not(_) => 3,
+        Formula::True | Formula::False | Formula::Atom(_) => 4,
+    }
+}
+
+/// A formula in the surface `where` grammar, with exactly the parentheses
+/// re-parsing needs and no others.
+///
+/// The two-variable special cases are not decided here: they are decided when
+/// the canonical form is taken, so what arrives is already `a = b` or `a != b`
+/// where that is what the formula is.
+impl fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.at(f, self.formula, 0)
+    }
+}
+
+impl Named<'_> {
+    /// Write `formula` for a position that binds at least as tightly as
+    /// `level`, bracketing it when it does not.
+    fn at(&self, f: &mut fmt::Formatter<'_>, formula: &Formula, level: u8) -> fmt::Result {
+        let parens = prec(formula) < level;
+        if parens {
+            f.write_str("(")?;
+        }
+        match formula {
+            // Neither constant has a spelling in the grammar, and neither has
+            // to: a formula that says nothing writes no clause at all, and one
+            // nothing satisfies is a complaint rather than a type. They print
+            // as the words they are, for the debugger and for a message that
+            // has to show one.
+            Formula::True => f.write_str("always")?,
+            Formula::False => f.write_str("never")?,
+            Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
+            Formula::Not(inner) => {
+                f.write_str("not ")?;
+                self.at(f, inner, 3)?;
+            }
+            // Left-associative, so the right side is written one level tighter
+            // and a right-nested `or` inside an `or` keeps its parentheses.
+            Formula::And(left, right) => {
+                self.at(f, left, 2)?;
+                f.write_str(" and ")?;
+                self.at(f, right, 3)?;
+            }
+            Formula::Or(left, right) => {
+                self.at(f, left, 1)?;
+                f.write_str(" or ")?;
+                self.at(f, right, 2)?;
+            }
+            // Non-associative, so both sides are written one level tighter: a
+            // comparison inside a comparison takes parentheses, because the
+            // grammar refuses to read one without them.
+            Formula::Iff(left, right) => {
+                self.at(f, left, 1)?;
+                f.write_str(" = ")?;
+                self.at(f, right, 1)?;
+            }
+            Formula::Xor(left, right) => {
+                self.at(f, left, 1)?;
+                f.write_str(" != ")?;
+                self.at(f, right, 1)?;
+            }
+        }
+        if parens {
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+
+    /// How one atom is spelled: the label it decides, where this reading has
+    /// one, and the presence itself otherwise.
+    fn spell(&self, atom: Atom) -> String {
+        let presence = match atom {
+            Atom::Var(var) => Presence::Var(var),
+            Atom::Bound(index) => Presence::Bound(index),
+        };
+        self.labels
+            .iter()
+            .find(|(_, decides)| *decides == presence)
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| atom.to_string())
+    }
+}
+
+/// A formula written in the labels its presences decide, for a complaint that
+/// has to quote one to a reader who never saw a presence variable.
+///
+/// An empty `labels` spells every atom as the presence itself, which is what a
+/// scheme's own `where` clause wants.
+pub fn in_labels(formula: &Formula, labels: &[(String, Presence)]) -> String {
+    Named { formula, labels }.to_string()
+}
+
+/// A formula as a scheme's `where` clause writes it: its presences by the names
+/// their `when` clauses gave them.
+impl fmt::Display for Formula {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Named {
+            formula: self,
+            labels: &[],
+        }
+        .fmt(f)
     }
 }
 
@@ -1174,11 +1391,21 @@ fn payload(ty: &Ty) -> Option<&Ty> {
     }
 }
 
-/// A scheme prints as its body: the quantifier is implied by the `'a`s that
-/// appear, the way ML type printers have always done it.
+/// A scheme prints as its body and what it requires of its presences: the
+/// quantifier is implied by the `'a`s and the `when` names that appear, the way
+/// ML type printers have always done it.
+///
+/// The `where` clause follows the whole type, and is left off entirely when the
+/// formula says nothing — which is every scheme in a program with no qualifying
+/// match and no written clause, so R13's "behaves exactly as before" is what
+/// falls out of the ordinary case.
 impl fmt::Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.body().fmt(f)
+        self.body().fmt(f)?;
+        if self.formula().is_true() {
+            return Ok(());
+        }
+        write!(f, " where {}", self.formula())
     }
 }
 
@@ -1365,6 +1592,9 @@ impl inference::ErrorKind {
             inference::ErrorKind::ExtraField { .. } => "extra-field",
             inference::ErrorKind::AnnotationTooOpen => "annotation-too-open",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
+            inference::ErrorKind::PresenceRequired { .. } => "presence-required",
+            inference::ErrorKind::PresenceImpossible { .. } => "presence-impossible",
+            inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
         }
     }
 }
@@ -1394,7 +1624,7 @@ impl fmt::Display for inference::ErrorKind {
             // not as the variable the solve bound, which is a thing the
             // annotation stood for rather than anything on the page.
             inference::ErrorKind::AnnotationTooOpen => f.write_str(
-                "this type promises a `..` or a `?` that the definition does not leave open: write the type it actually has"
+                "this type promises a `..` or a `when` that the definition does not leave open: write the type it actually has"
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the
@@ -1405,7 +1635,48 @@ impl fmt::Display for inference::ErrorKind {
                 noun(*shape),
                 label(*shape, field),
             ),
+            // Said in the labels the reader wrote rather than in the presence
+            // variables the compiler gave them: what has to change is the value
+            // on this line, and its fields are the whole of what they can
+            // change about it.
+            inference::ErrorKind::PresenceRequired { formula } => write!(
+                f,
+                "this value needs `{formula}` among its fields, and it does not have that",
+            ),
+            inference::ErrorKind::PresenceImpossible { formula } => write!(
+                f,
+                "nothing can satisfy `{formula}`: what this definition does with the type has already ruled it out",
+            ),
+            inference::ErrorKind::AnnotationAllows { allowed, required } => write!(
+                f,
+                "the annotation allows `{allowed}`, but the definition requires `{required}`",
+            ),
         }
+    }
+}
+
+impl Origin {
+    /// A stable, greppable name for why a batch is in the store, the way every
+    /// other kind in this file is coded. The debugger's Presence tab labels its
+    /// rows with it rather than with prose that may be reworded.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Origin::Coverage(_) => "match-coverage",
+            Origin::Instance(_) => "use-site",
+            Origin::Annotation(_) => "annotation",
+        }
+    }
+}
+
+/// Why a batch is in the store, in a phrase — what the Presence tab prints
+/// beside each one.
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Origin::Coverage(_) => "what this match's arms cover between them",
+            Origin::Instance(_) => "what this use of a name requires of its presences",
+            Origin::Annotation(_) => "what this annotation's `where` clause promises",
+        })
     }
 }
 
@@ -1482,7 +1753,7 @@ pub fn write_struct<K: fmt::Display, V: fmt::Display>(
 ) -> fmt::Result {
     let fields = fields.into_iter().map(|(name, value)| Entry::Written {
         name,
-        optional: false,
+        mark: None,
         holds: value,
     });
     write_row(f, fields, None)
@@ -1515,14 +1786,13 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
         }
         first = false;
         match field {
-            Entry::Written {
-                name,
-                optional,
-                holds,
-            } => {
-                let mark = if optional { "?" } else { "" };
-                write!(f, "{name}{mark}: {holds}")?;
-            }
+            Entry::Written { name, mark, holds } => match mark {
+                Some(Mark::Undecided) => write!(f, "{name}?: {holds}")?,
+                // Bare between the label and the colon: the colon is what ends
+                // the clause, which is why a struct's needs no parentheses.
+                Some(Mark::When(name_of)) => write!(f, "{name} when {name_of}: {holds}")?,
+                None => write!(f, "{name}: {holds}")?,
+            },
             Entry::Absent { name } => write!(f, "\\{name}")?,
         }
     }
@@ -1536,7 +1806,7 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
 }
 
 /// Render a `` `A Nat | `B? | \`C | ..tail `` sum: cases, each wearing a
-/// backtick and possibly a `?` — or a leading `\`, explicitly absent, with no
+/// backtick and possibly a `when` clause — or a leading `\`, explicitly absent, with no
 /// payload — each with a payload or without one, and then whatever is known
 /// about the cases not named.
 ///
@@ -1561,11 +1831,9 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
         }
         first = false;
         match case {
-            Entry::Written {
-                name,
-                optional,
-                holds,
-            } => write_tag(f, &name.to_string(), optional, holds)?,
+            Entry::Written { name, mark, holds } => {
+                write_tag(f, &name.to_string(), mark.as_ref(), holds)?
+            }
             Entry::Absent { name } => write!(f, "\\`{name}")?,
         }
     }
@@ -1585,7 +1853,7 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
     }
 }
 
-/// Render one case of a sum — `` `Name ``, the `?` it may wear, and what it
+/// Render one case of a sum — `` `Name ``, the mark it may wear, and what it
 /// carries — grouped so that a payload nothing can be appended to is left
 /// bare and anything else is bracketed.
 ///
@@ -1600,11 +1868,18 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
 pub fn write_tag<V: Grouped>(
     f: &mut fmt::Formatter<'_>,
     name: &str,
-    optional: bool,
+    mark: Option<&Mark>,
     payload: Option<V>,
 ) -> fmt::Result {
-    let mark = if optional { "?" } else { "" };
-    write!(f, "`{name}{mark}")?;
+    write!(f, "`{name}")?;
+    // A case has no colon to end a bare clause, so its `when` takes
+    // parentheses — one token of lookahead would otherwise not tell
+    // `` `A (when a) `` from `` `A when `` carrying a type called `when`.
+    match mark {
+        Some(Mark::Undecided) => f.write_str("?")?,
+        Some(Mark::When(name_of)) => write!(f, " (when {name_of})")?,
+        None => {}
+    }
     match payload {
         Some(payload) => {
             f.write_str(" ")?;

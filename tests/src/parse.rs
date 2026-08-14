@@ -78,13 +78,175 @@ fn open_struct_types() {
     assert_eq!(parse_one("let x : { ..r } = y"), "let x : { ..r } = y");
 }
 
+/// A struct field writes its `when` clause bare between the label and the
+/// colon: the colon is what ends the clause, so there is nothing for
+/// parentheses to disambiguate.
 #[test]
-fn optional_struct_type_fields() {
-    assert_eq!(parse_one("let x : { a?: A } = y"), "let x : { a?: A } = y");
+fn a_struct_field_may_name_its_presence() {
+    for src in [
+        "let x : { a when a: A } = y",
+        "let x : { a when a: A, b: B, ..r } = y",
+        // `when _` is the anonymous presence: a variable this definition
+        // decides that no formula can name.
+        "let x : { a when _: A } = y",
+        // Two labels of one name share one presence, which is how a type says
+        // two fields are there together.
+        "let x : { a when p: A, b when p: B } = y",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// One token of lookahead is the whole disambiguation: a field *called* `when`
+/// has already spent its `when` on the name, so the next token is the colon.
+#[test]
+fn a_label_may_be_called_when() {
     assert_eq!(
-        parse_one("let x : { a?: A, b: B, ..r } = y"),
-        "let x : { a?: A, b: B, ..r } = y"
+        parse_one("let x : { when: A } = y"),
+        "let x : { when: A } = y"
     );
+    assert_eq!(
+        parse_one("let x : { when when a: A } = y"),
+        "let x : { when when a: A } = y"
+    );
+}
+
+/// The contextual keywords are ordinary identifiers everywhere but the type
+/// positions that read them, so terms and labels of those names still work.
+#[test]
+fn the_clause_keywords_are_contextual() {
+    for src in [
+        "let when = 1",
+        "let where = 1",
+        "let or = 1",
+        "let and = 1",
+        "let not = 1",
+        "let x = fn when => when",
+        "let x = { when: 1, where: 2, or: 3, and: 4, not: 5 }",
+        "let x : { when: A, where: B, or: C, and: D, not: E } = y",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// A sum case has no colon to end a bare clause, so its `when` takes
+/// parentheses — and two tokens of lookahead tell one from a parenthesized
+/// payload, since only the clause has `when` inside it.
+#[test]
+fn a_sum_case_parenthesizes_its_presence() {
+    for src in [
+        "let x : `A (when a) Nat | `B = y",
+        "let x : `A (when a) | `B (when b) Nat = y",
+        "let x : `A (when _) Nat = y",
+        // A parenthesized payload is still a payload: nothing has changed
+        // about a case carrying a type that needed brackets.
+        "let x : `A (Nat -> Nat) = y",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// A `when` promises a name or the discard, and a case's clause promises its
+/// closing parenthesis; anything else is reported where it was written.
+#[test]
+fn a_when_clause_must_name_something() {
+    for (src, at) in [
+        ("let x : { a when: A } = y", ": A } = y"),
+        ("let x : { a when 1: A } = y", "1: A } = y"),
+        ("let x : `A (when a Nat = y", "Nat = y"),
+        // Unparenthesized in a sum, the `when` is read as the payload type it
+        // looks like and the name after it is nobody's token.
+        ("let x : `A when a = y", "a = y"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert_eq!(
+            out.errors[0].span.start,
+            src.len() - at.len(),
+            "{src:?}: {:#?}",
+            out.errors
+        );
+    }
+}
+
+/// The `where` grammar, at every level and with the parentheses re-parsing
+/// needs. Printing goes through the shared writer, so a clause that comes back
+/// out of the printer and in again is the clause it started as.
+#[test]
+fn where_clauses_read_at_every_level() {
+    for src in [
+        "let x : { a when a: A } where a = y",
+        "let x : { a when a: A } where not a = y",
+        "let x : { a when a: A } where not not a = y",
+        "let x : { a when a: A, b when b: B } where a and b = y",
+        "let x : { a when a: A, b when b: B } where a or b = y",
+        "let x : { a when a: A, b when b: B } where a = b = y",
+        "let x : { a when a: A, b when b: B } where a != b = y",
+        // `and` binds tighter than `or`, which binds tighter than the
+        // comparison — so these need no parentheses at all.
+        "let x : { a when a: A, b when b: B, c when c: C } where a or b and c = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where a and b or c = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where a = b or c = y",
+        // And these do, because the grammar reads them the other way round
+        // without them.
+        "let x : { a when a: A, b when b: B, c when c: C } where (a or b) and c = y",
+        "let x : { a when a: A, b when b: B } where not (a and b) = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where a and (b or c) = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where (a = b) or c = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where a != (b = c) = y",
+        // A clause ends a whole written type, so it sits outside the arrow.
+        "let x : { a when a: A } -> B where a = y",
+        // And a declaration's body reads one too, for lowering to refuse.
+        "type T = { a when a: A } where a",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// The comparison is non-associative: a chain has no reading, so it is refused
+/// rather than folded one way or the other.
+///
+/// A definition's own `=` is the exception, and not the grammar bending: in
+/// `where a != b = v` the `=` is what introduces the value, and the clause has
+/// already ended. What tells the clause's `=` from that one is that the
+/// clause's is followed by it.
+#[test]
+fn a_comparison_does_not_chain() {
+    for src in [
+        "type T = { a when a: A, b when b: B, c when c: C } where a = b = c",
+        "type T = { a when a: A, b when b: B, c when c: C } where a != b != c",
+        "let x : { a when a: A, b when b: B, c when c: C } where a != b != c = y",
+        "let x : { a when a: A, b when b: B, c when c: C } where (a = b = c) = y",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    }
+
+    // A single comparison over a definition still reads, with the `=` after it
+    // introducing the value.
+    assert_eq!(
+        parse_one("let x : { a when a: A, b when b: B } where a = b = y"),
+        "let x : { a when a: A, b when b: B } where a = b = y"
+    );
+    // And so does a clause of one name, whose `=` is the definition's alone.
+    assert_eq!(
+        parse_one("let x : { a when a: A } where a = y"),
+        "let x : { a when a: A } where a = y"
+    );
+}
+
+/// `_` names nothing, so a formula cannot be about it: `when _` mints a
+/// presence no clause may mention, and the `_` written in one gets the
+/// wildcard's own complaint worded for the type position it sits in.
+#[test]
+fn a_clause_may_not_name_the_discard() {
+    let src = "let x : { a when _: A } where _ = y";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert_eq!(error.kind, ErrorKind::Wildcard { place: Place::Type });
+    assert_eq!(error.span.start, src.rfind('_').expect("the discard"));
 }
 
 /// `\name` is accepted wherever a field may be written — first, middle, last,
@@ -98,8 +260,8 @@ fn a_struct_field_may_be_written_absent() {
         "let x : { a: A, \\y, ..r } = z",
         "let x : { \\y } = z",
         "let x : { \\y, a: A, .. } = z",
-        "let x : { a: A, \\y, b?: B, .. } = z",
-        "let x : { a: A, b?: B, \\y, ..r } = z",
+        "let x : { a: A, \\y, b when a: B, .. } = z",
+        "let x : { a: A, b when a: B, \\y, ..r } = z",
         // Two absences of one name are both recorded, the way two fields of
         // one name are: rejecting a repeat is the IR's job.
         "let x : { \\y, \\y, .. } = z",
@@ -116,7 +278,7 @@ fn an_absent_label_spans_its_mark() {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src:?}: {:#?}", out.errors);
         match &out.stmts[0].tracked {
-            StmtKind::Let { ty: Some(ty), .. } => ty.clone(),
+            StmtKind::Let { ty: Some(ty), .. } => ty.ty.clone(),
             other => panic!("expected an ascribed let, got {other:?}"),
         }
     };
@@ -523,8 +685,8 @@ fn sum_types() {
     assert_eq!(parse_one("type Just = `It Nat"), "type Just = `It Nat");
     // And a case may be marked `?`, which no tail can say for it.
     assert_eq!(
-        parse_one("let x : `A? Nat | `B = y"),
-        "let x : `A? Nat | `B = y"
+        parse_one("let x : `A (when a) Nat | `B = y"),
+        "let x : `A (when a) Nat | `B = y"
     );
 }
 
@@ -613,8 +775,8 @@ fn an_absent_label_is_bare() {
     // The tail of each source is where the complaint lands.
     for (src, from) in [
         ("let x : { \\y: Nat, .. } = 1", ": Nat, .. } = 1"),
-        ("let x : { \\y?, .. } = 1", "?, .. } = 1"),
-        ("let x : \\`B? | .. = 1", "? | .. = 1"),
+        ("let x : { \\y when a, .. } = 1", "when a, .. } = 1"),
+        ("let x : \\`B (when a) | .. = 1", "(when a) | .. = 1"),
         ("let x : `A | \\`B Nat | .. = 1", "Nat | .. = 1"),
         ("let x : { \\, .. } = 1", ", .. } = 1"),
         // In a type, what follows a `\` must be a tag or a field name.

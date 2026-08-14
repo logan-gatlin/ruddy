@@ -35,6 +35,22 @@
 //! otherwise have had to break it. See [`Table::levels`] for what decides which
 //! variables such a generalization may take.
 //!
+//! Beside the two passes there is a third thing being decided, and it is not a
+//! question about types: which *combinations* of a value's labels are allowed.
+//! `{x} | {y}` says exactly one of two fields is there, which no unconstrained
+//! type can say, so the demand goes into a [`Store`] of propositional formulas
+//! over presence variables instead — grown by a match's coverage, by a
+//! constrained scheme's instantiation and by an annotation's `where` clause,
+//! and decided by [`sat`].
+//!
+//! Staging is what keeps that terminating, and it is the whole discipline:
+//! unification never consults the solver, matches emit only finite formulas,
+//! and SAT runs at generalization boundaries, at the use-site and annotation
+//! checks, and — through [`Output::store`] — in the patterns phase. A
+//! [`Scheme`] therefore carries a formula as well as a body, which is a
+//! constrained scheme in the HM(X) sense: it is what makes a principal type
+//! exist for the programs above.
+//!
 //! Inference runs after lowering and mutates the [`Program`] it is handed:
 //! every [`Term`]'s `ty` goes from [`Core::Undecided`] to what was inferred for
 //! it, fully resolved, so nothing downstream ever needs the solver's variable
@@ -43,6 +59,7 @@
 //! that one mistake is reported once rather than echoed by every consumer.
 
 mod constrain;
+pub mod sat;
 mod solve;
 
 use std::{
@@ -54,11 +71,12 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
-    ir::{self, Program, Tail, Term, TermKind, Type, TypeKind},
+    ir::{self, Annotation, Clause, ClauseKind, Program, Tail, Term, TermKind, Type, TypeKind},
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{
-        Assigned, Core, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar,
+        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
+        Shape, Ty, TyVar,
     },
 };
 use constrain::Constrain;
@@ -105,7 +123,84 @@ pub struct Output {
     /// variable table is shared, so replaying the effects in this order — and
     /// only in this order — reconstructs what the solver knew at any point.
     pub steps: Vec<Step>,
+    /// What the program requires of its presence variables, in the order it
+    /// required it. See [`Store`].
+    pub store: Store,
     pub errors: Vec<Error>,
+}
+
+/// The propositional constraint store: every formula the program emitted about
+/// which combinations of labels may be there, in program order.
+///
+/// The one piece of inference's state that outlives it, beyond the schemes:
+/// [`patterns`](crate::patterns) reads it to decide reachability and
+/// exhaustiveness for the columns that qualified, and the debugger's Presence
+/// tab renders it whole.
+///
+/// Order is the whole of what makes a complaint attributable. Conjunction does
+/// not care what order it is asked in, but *which batch made the store
+/// unsatisfiable* does — so the batches are kept as a sequence, replayed in it,
+/// and the first one that flips the verdict owns the error. See [`Batch`].
+#[derive(Debug, Clone, Default)]
+pub struct Store {
+    pub batches: Vec<Batch>,
+}
+
+/// One tagged batch of the store: where the program said it, why, and what it
+/// said.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    /// Where the program said it: the match, the use site, or the annotation.
+    pub span: Span,
+    pub origin: Origin,
+    /// What it requires, over the presence variables that existed when it was
+    /// emitted. Kept as it was emitted, not as the solve later resolved it —
+    /// the debugger shows the pass being read rather than its result, exactly
+    /// as [`Output::constraints`] does.
+    pub formula: Formula,
+    /// Whether conjoining this batch is what made the store unsatisfiable. At
+    /// most one batch in a store is, which is the cascade rule: the first flip
+    /// owns the single resulting error and everything after it is suppressed.
+    pub flipped: bool,
+}
+
+/// Why a batch is in the store.
+#[derive(Debug, Clone)]
+pub enum Origin {
+    /// A match's arms, read as the presences they cover. See [`Coverage`].
+    Coverage(Coverage),
+    /// A use of a constrained scheme: its formula, with fresh variables
+    /// substituted for the ones it quantified.
+    Instance(Named),
+    /// An annotation's own `where` clause.
+    Annotation(Named),
+}
+
+/// What a match-coverage batch carries beyond its formula, so that the two
+/// readers who need more than "is this satisfiable" have it.
+#[derive(Debug, Clone)]
+pub struct Coverage {
+    /// One disjunct per written arm, in order: the conjunction of presence
+    /// literals that arm covers. The batch's formula is their disjunction; the
+    /// patterns phase asks about them one at a time, which is what makes
+    /// reachability a SAT query.
+    pub arms: Vec<Formula>,
+    /// The scrutinee's labels and what decides whether each is there, so a
+    /// model of `store ∧ ¬covered` can be written out as a value.
+    pub fields: Vec<(String, Presence)>,
+}
+
+/// What a batch carries so that a complaint about it can be worded in the
+/// reader's own nouns.
+///
+/// "this value needs `x != y` among its fields" — the reader never wrote the
+/// presence variable, only the field it governs. A use site reads the pairs off
+/// the type it instantiated, which is the one place both are in hand; an
+/// annotation reads them off the `when` clauses it wrote, which is what its own
+/// formula was written in.
+#[derive(Debug, Clone)]
+pub struct Named {
+    pub labels: Vec<(String, Presence)>,
 }
 
 /// One act of the solver: the rule it applied, what it applied it to, and what
@@ -372,7 +467,7 @@ pub enum ErrorKind {
         base: Rc<Ty>,
         field: String,
     },
-    /// An annotation left something open with `..` or `?` that the definition
+    /// An annotation left something open with `..` or `when` that the definition
     /// then decided. The type the definition was checked against is not the
     /// type it has, so the contract the annotation looked like — works for any
     /// rest, works whether or not the field is there — was never checked and
@@ -393,6 +488,35 @@ pub enum ErrorKind {
     /// things both halves of the contradiction have in common, and the rows
     /// themselves are each half a type the reader never wrote down.
     RepeatedField { shape: Shape, field: String },
+    /// A use of a definition whose type requires a combination of labels the
+    /// value written there cannot have: `p {}` where `p` accepts exactly one of
+    /// `x` and `y`.
+    ///
+    /// The one complaint unification could never make. Each label on its own is
+    /// perfectly consistent — `{}` has neither, and neither is required alone —
+    /// so nothing goes wrong until the two are asked about together, which is
+    /// what the constraint store is for.
+    ///
+    /// The formula is carried already worded in the reader's own nouns: the
+    /// labels their type names, rather than the presence variables the compiler
+    /// gave them.
+    PresenceRequired { formula: String },
+    /// An annotation whose `where` clause nothing can satisfy once the
+    /// definition under it has had its say.
+    ///
+    /// [`ErrorKind::PresenceRequired`]'s twin at the other end: there the
+    /// contradiction is between a scheme and a use, here between an annotation
+    /// and the body it is written over.
+    PresenceImpossible { formula: String },
+    /// An annotation whose `where` clause allows more than the definition
+    /// under it does — `where a or b` over a body that needs `a`.
+    ///
+    /// The annotation is the contract, and every use of the name sees it, so a
+    /// body requiring more than it promises would let a use through that the
+    /// definition cannot serve. Refused at the annotation, which is the line
+    /// the reader has to change: both formulas are carried so the complaint can
+    /// show what was promised beside what is needed.
+    AnnotationAllows { allowed: String, required: String },
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -468,6 +592,18 @@ struct Scoped {
     /// definition to decide. Empty for a definition with no annotation. See
     /// [`Table::narrowed`].
     opened: Range<TyVar>,
+    /// What the annotation's `where` clause promised, over the presence
+    /// variables the annotation minted. [`Formula::True`] for a definition with
+    /// no clause, which promises nothing.
+    promised: Formula,
+    /// The presence names the annotation bound, and what each one lowered to —
+    /// what a complaint about the clause quotes it in, since the reader wrote
+    /// `a` and never saw the variable.
+    names: Vec<(String, Presence)>,
+    /// Where this definition's batches begin in the store. What the R10 check
+    /// reads: the conjuncts the *body* contributed, as against the clause the
+    /// annotation promised.
+    batches: usize,
 }
 
 /// One annotation written on a nested `let`, kept aside while the definition it
@@ -490,6 +626,10 @@ struct Annotated {
 /// for the group to end so that it can be generalized.
 struct Solved {
     scoped: Scoped,
+    /// Where this definition's batches end in the store. Its own stretch and
+    /// nobody else's: a definition sharing a group with another is not the one
+    /// whose annotation the other's matches have to agree with.
+    batches: usize,
     /// The type this definition publishes: its annotation, which is the
     /// contract, or what its body turned out to be.
     ty: Rc<Ty>,
@@ -575,6 +715,32 @@ struct Table {
     /// its parameter sat in is an ordinary row and the condition has to have
     /// been said already.
     params: HashMap<Symbol, Vec<ParamKind>>,
+    /// What the program has required of its presences so far. Grown by
+    /// generation (a match's coverage), by instantiation (a constrained
+    /// scheme's formula) and by lowering (an annotation's `where` clause), and
+    /// consulted only where R8 allows: at a generalization boundary, at the
+    /// use-site and annotation checks, and — through
+    /// [`Output::store`] — in the patterns phase. Never by unification.
+    store: Store,
+    /// Whether some batch has already flipped the store unsatisfiable. The
+    /// cascade rule: that batch owns the single resulting error, and every
+    /// later SAT-dependent complaint — a use-site violation, an annotation
+    /// disagreement, a scheme's `where` clause — is suppressed, because all of
+    /// them would be the same contradiction said again.
+    unsat: bool,
+}
+
+/// Which quantified position each variable was given, in the two alphabets a
+/// scheme has: `'a` for a type or a row, and the bare `a` of a `when` clause
+/// for a presence.
+///
+/// Two maps rather than one, for the reason [`Scheme`] gives: one numbering
+/// would leave a visible gap in whichever alphabet came second. A variable's
+/// sort is fixed where it was minted, so no variable is ever in both.
+#[derive(Debug, Default, Clone)]
+struct Subst {
+    types: HashMap<TyVar, u32>,
+    presences: HashMap<TyVar, u32>,
 }
 
 /// Assign a type to every term in the program, in place, and return the
@@ -652,7 +818,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 //
                 // Which is only honest while the body cannot decide the parts
                 // of it the annotation left open. Nothing stops it: a `..`, a
-                // `..r` and a `?` each lower to an ordinary variable, and a
+                // `..r` and a `when` each lower to an ordinary variable, and a
                 // variable is something the solve is free to bind. So the
                 // variables this lowering mints are counted off here and
                 // checked once the group is solved — see [`Table::narrowed`].
@@ -663,17 +829,36 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // annotation anyway. Checking says the same thing, at the one
                 // place that knows which variables came from where.
                 let from = table.vars.len() as TyVar;
-                let annotated = program.terms[symbol]
-                    .annotation
-                    .as_ref()
-                    .map(|annotation| lower_type(mint, &mut table, annotation));
+                let batches = table.store.batches.len();
+                let annotated = program.terms[symbol].annotation.as_ref().map(|annotation| {
+                    let (ty, formula, names) = lower_annotation(mint, &mut table, annotation);
+                    // The clause goes into the store as its own batch, so that
+                    // it is what a use of this name sees and what the body is
+                    // held to. See R10.
+                    if !formula.is_true() {
+                        let origin = Origin::Annotation(Named {
+                            labels: names.clone(),
+                        });
+                        table.require(annotation.ty.span, origin, formula.clone());
+                    }
+                    (ty, formula, names)
+                });
                 let opened = from..table.vars.len() as TyVar;
-                let bound = annotated.unwrap_or_else(|| table.fresh_type());
+                let promised = annotated
+                    .as_ref()
+                    .map_or(Formula::True, |(_, formula, _)| formula.clone());
+                let names = annotated
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, _, names)| names.clone());
+                let bound = annotated.map_or_else(|| table.fresh_type(), |(ty, _, _)| ty);
                 env.insert(*symbol, Binding::Mono(bound.clone()));
                 Scoped {
                     symbol: *symbol,
                     bound,
                     opened,
+                    promised,
+                    names,
+                    batches,
                 }
             })
             .collect();
@@ -723,7 +908,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             }
             .run(&generated);
 
+            // The store's verdict, once this definition's constraints are in:
+            // the first batch that leaves it with no model owns the single
+            // resulting error, and everything after it is suppressed. Asked
+            // here rather than at the end of the group so that the batch is
+            // named while the definition it came from is still the one being
+            // read.
+            report_flip(&mut table, &mut errors);
+
             solved.push(Solved {
+                batches: table.store.batches.len(),
                 scoped,
                 ty,
                 generated,
@@ -756,7 +950,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
 
             // One complaint per definition, not per variable: an annotation
             // that is too open is one thing to rewrite however many of its
-            // `..`s and `?`s the body pinned down, and the reader is being sent
+            // `..`s and `when`s the body pinned down, and the reader is being sent
             // to the same line either way. Held back when *this* definition
             // already said something, because everything a failure abandons it
             // also decides — pointing it at the undecided type is a binding like
@@ -774,13 +968,35 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             if let Some(annotation) = &decl.annotation
                 // A synthetic annotation — a pattern's exact demand — is meant
                 // to be decided, so there is no promise here to hold anyone to.
-                && !synthetic(annotation)
+                && !synthetic(&annotation.ty)
                 && from == to
                 && member.scoped.opened.clone().any(|var| table.narrowed(var))
             {
                 errors.push(Error {
-                    span: annotation.span,
+                    span: annotation.ty.span,
                     kind: ErrorKind::AnnotationTooOpen,
+                });
+            }
+            // An annotation's `where` clause is the contract, so the body may
+            // not need more of its presences than the clause allows: a use of
+            // the name sees the clause and nothing of the body, and one that
+            // the clause admits but the body cannot serve would be let through.
+            // Silent once something has already flipped the store, and once
+            // this definition has already failed some other way — both for the
+            // reason the check above is.
+            if let Some(annotation) = &decl.annotation
+                && annotation.clause.is_some()
+                && from == to
+                && !table.unsat
+                && let Some((allowed, required)) = table.disagreement(
+                    &member.scoped.promised,
+                    &member.scoped.names,
+                    member.scoped.batches..member.batches,
+                )
+            {
+                errors.push(Error {
+                    span: annotation.ty.span,
+                    kind: ErrorKind::AnnotationAllows { allowed, required },
                 });
             }
             // An annotation on a nested binding is the same promise about a
@@ -808,7 +1024,23 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 *scheme = table.published(scheme);
             }
 
-            let (scheme, mut subst) = table.generalize(&member.ty, 0);
+            // Fold-back, first of everything generalization does: a presence
+            // the store has already decided is no variable at all, so it is
+            // settled here rather than quantified and printed as one.
+            table.fold_back(&member.ty);
+            // What the scheme requires of what is left. An annotated definition
+            // publishes its *annotation's* clause rather than what its body
+            // worked out — the annotation is the contract, and R10 has already
+            // held the body to it.
+            let required = match decl.annotation.as_ref().map(|_| &member.scoped.promised) {
+                // Silent once something has flipped the store: the cascade rule
+                // reaches an annotated definition's clause exactly as it
+                // reaches an inferred one's.
+                Some(promised) if !promised.is_true() && !table.unsat => table.resolved(promised),
+                Some(_) if table.unsat => Formula::True,
+                _ => table.required(&member.ty),
+            };
+            let (scheme, mut subst) = table.generalize(&member.ty, 0, required);
             // With the substitution in hand, resolve every type the walk wrote
             // into the body, so a term's type and its definition's scheme spell
             // the same variable the same way.
@@ -850,14 +1082,57 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // solver found them in.
     errors.sort_by_key(|error| error.span.start);
 
+    // The store as the finished solve reads it: every variable followed to what
+    // it was decided to be, so that what leaves inference can be reasoned about
+    // without the variable table that is about to go away. The batches keep
+    // their order, their origins and their flip marks; only what they *say* is
+    // brought up to date, which is the difference between `a != b` as it was
+    // emitted and the contradiction it turned out to be.
+    let store = table.settled();
+
     Output {
         aliases,
         schemes,
         locals,
         constraints,
         steps,
+        store,
         errors,
     }
+}
+
+/// Record the first batch that left the store without a model, and say so where
+/// the batch's own origin asks it to be said.
+///
+/// A match's coverage says nothing here: the complaint belongs to the patterns
+/// phase, which words it as the unhandled values it is and reads a witness off a
+/// model. The other two are inference's own, and both are about a contradiction
+/// unification could never have found — each half is consistent, and only the
+/// two together are not.
+fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
+    if table.unsat {
+        return;
+    }
+    let Some(at) = table.flip() else {
+        return;
+    };
+    table.unsat = true;
+    table.store.batches[at].flipped = true;
+    let batch = table.store.batches[at].clone();
+    let kind = match &batch.origin {
+        Origin::Coverage(_) => return,
+        Origin::Instance(named) | Origin::Annotation(named) => {
+            let formula = crate::ui::in_labels(&batch.formula, &named.labels);
+            match &batch.origin {
+                Origin::Annotation(_) => ErrorKind::PresenceImpossible { formula },
+                _ => ErrorKind::PresenceRequired { formula },
+            }
+        }
+    };
+    errors.push(Error {
+        span: batch.span,
+        kind,
+    });
 }
 
 impl Table {
@@ -1223,7 +1498,7 @@ impl Table {
             // A declared type is descended into as far as its arguments and no
             // further, here and in every walk below. What one stands for was
             // lowered from what the user wrote and mentions no variable at all
-            // — lowering refuses a `..` or a `?` in a declaration for exactly
+            // — lowering refuses a `..` or a `when` in a declaration for exactly
             // this reason — so there is nothing in the body to find and nothing
             // to rebuild; and stopping there is what keeps a walk over a type
             // that names itself finite. The arguments are the other half: they
@@ -1404,6 +1679,262 @@ impl Table {
         recorded.extend(labels);
     }
 
+    /// Record one more thing the program requires of its presences.
+    ///
+    /// A batch that requires nothing is still recorded when it carries an
+    /// origin the readers downstream need — a match's coverage is what the
+    /// patterns phase asks its reachability questions of, whether or not the
+    /// arms happened to relate anything.
+    fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
+        self.store.batches.push(Batch {
+            span,
+            origin,
+            formula,
+            flipped: false,
+        });
+    }
+
+    /// Point the use-site batches emitted since `from`, and still carrying
+    /// `at`, at `span` instead. See [`Constrain::infer_term`]'s application
+    /// arm, which is the one caller and the whole of the rule.
+    fn aim(&mut self, from: usize, at: Span, span: Span) {
+        for batch in &mut self.store.batches[from..] {
+            if matches!(batch.origin, Origin::Instance(_)) && batch.span == at {
+                batch.span = span;
+            }
+        }
+    }
+
+    /// One formula with every variable followed to what the solve decided it
+    /// stands for.
+    ///
+    /// The bridge between the two halves of the answer. A batch is written
+    /// about the variables that existed when it was emitted; unification then
+    /// decides some of them outright and ties others together, and neither of
+    /// those facts is in the store. Reading a batch through this is what puts
+    /// them back: `p {}` conjoins `a != b` and then binds both to absent, and
+    /// the contradiction only exists once the two are read together.
+    fn resolved(&self, formula: &Formula) -> Formula {
+        formula.rename(&|var| self.presence_of(&Presence::Var(var)).formula())
+    }
+
+    /// The store with everything the solve decided folded into it — what
+    /// inference publishes. See the comment at the end of [`infer`].
+    fn settled(&self) -> Store {
+        let batches = self
+            .store
+            .batches
+            .iter()
+            .map(|batch| Batch {
+                span: batch.span,
+                origin: match &batch.origin {
+                    Origin::Coverage(coverage) => Origin::Coverage(Coverage {
+                        arms: coverage.arms.iter().map(|arm| self.resolved(arm)).collect(),
+                        fields: coverage
+                            .fields
+                            .iter()
+                            .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
+                            .collect(),
+                    }),
+                    Origin::Instance(named) => Origin::Instance(self.settled_names(named)),
+                    Origin::Annotation(named) => Origin::Annotation(self.settled_names(named)),
+                },
+                formula: self.resolved(&batch.formula),
+                flipped: batch.flipped,
+            })
+            .collect();
+        Store { batches }
+    }
+
+    /// One batch's label pairs with every presence followed to what the solve
+    /// decided it is.
+    fn settled_names(&self, named: &Named) -> Named {
+        Named {
+            labels: named
+                .labels
+                .iter()
+                .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
+                .collect(),
+        }
+    }
+
+    /// Everything the store says, read as the solve now stands.
+    fn known(&self) -> Formula {
+        Formula::all(
+            self.store
+                .batches
+                .iter()
+                .map(|batch| self.resolved(&batch.formula)),
+        )
+    }
+
+    /// The first batch conjoining which leaves the store with no model, if the
+    /// store has none.
+    ///
+    /// Replayed from the start every time rather than accumulated, because what
+    /// a batch *says* changes as the solve goes: an earlier batch can become
+    /// the flipping one once a variable it names is decided. The formulas are
+    /// tiny and there is one batch per match, use and annotation, so replaying
+    /// is cheaper than keeping a second copy of the solve honest.
+    fn flip(&self) -> Option<usize> {
+        let mut accumulated = Formula::True;
+        for (at, batch) in self.store.batches.iter().enumerate() {
+            accumulated = accumulated.and(self.resolved(&batch.formula));
+            if !sat::satisfiable(&accumulated) {
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// Everything the store says about `atoms` and about whatever those reach:
+    /// the batches that mention one of them, the batches that mention *those*
+    /// variables, and so on until nothing more joins.
+    ///
+    /// The whole store would be sound and useless: a definition's scheme would
+    /// carry every other definition's constraints, all of them about variables
+    /// its type never mentions. Following the connections instead keeps a
+    /// scheme's formula about the scheme.
+    fn component(&self, atoms: &[Atom]) -> Formula {
+        let mut wanted: IndexSet<Atom> = atoms.iter().copied().collect();
+        let mut taken = vec![false; self.store.batches.len()];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (at, batch) in self.store.batches.iter().enumerate() {
+                if taken[at] {
+                    continue;
+                }
+                let formula = self.resolved(&batch.formula);
+                let mut named = Vec::new();
+                formula.atoms(&mut named);
+                if !named.iter().any(|atom| wanted.contains(atom)) {
+                    continue;
+                }
+                taken[at] = true;
+                grew = true;
+                wanted.extend(named);
+            }
+        }
+        Formula::all(
+            self.store
+                .batches
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| taken[*at])
+                .map(|(_, batch)| self.resolved(&batch.formula)),
+        )
+    }
+
+    /// Whether an annotation's `where` clause allows more than the definition
+    /// under it does, and — when it does — the two formulas to quote.
+    ///
+    /// The clause is the contract, so it has to *entail* what the body needs:
+    /// every combination the clause admits must be one the definition serves. A
+    /// body needing more is the disagreement, and it is reported at the
+    /// annotation because that is the line the reader changes — the body is
+    /// doing what it says.
+    ///
+    /// The body's side is projected onto the clause's own variables first:
+    /// a match inside the definition may relate presences the annotation never
+    /// mentions, and those are its own business.
+    fn disagreement(
+        &self,
+        promised: &Formula,
+        names: &[(String, Presence)],
+        batches: Range<usize>,
+    ) -> Option<(String, String)> {
+        let allowed = self.resolved(promised);
+        let needed = Formula::all(
+            self.store.batches[batches]
+                .iter()
+                .filter(|batch| matches!(batch.origin, Origin::Coverage(_)))
+                .map(|batch| self.resolved(&batch.formula)),
+        );
+        let mut atoms = Vec::new();
+        allowed.atoms(&mut atoms);
+        let needed = sat::project(&needed, &atoms);
+        if sat::entails(&allowed, &needed) {
+            return None;
+        }
+        Some((
+            crate::ui::in_labels(&sat::project(&allowed, &atoms), names),
+            crate::ui::in_labels(&needed, names),
+        ))
+    }
+
+    /// Settle every presence in `ty` the store has already decided.
+    ///
+    /// The fold-back R8 asks for. A variable whose literal the store entails is
+    /// not a variable at all — every model of the program agrees about it — so
+    /// it is bound here, once, at the boundary where SAT is allowed to run. The
+    /// binding is permanent and sound: the store only ever grows, and
+    /// entailment survives conjunction.
+    ///
+    /// What this buys is the whole of the `h` example: a `let` pattern forces
+    /// `x` present, the match's `a != b` then forces `y` absent, and the
+    /// definition generalizes to `{x: 'a} -> {}` with no variables and no
+    /// `where` clause left over.
+    fn fold_back(&mut self, ty: &Rc<Ty>) {
+        let known = self.known();
+        if !sat::satisfiable(&known) {
+            return;
+        }
+        let mut found = IndexSet::new();
+        self.presences_in(ty, &mut found);
+        for var in found {
+            let literal = Formula::var(var);
+            let settled = if sat::entails(&known, &literal) {
+                Presence::Present
+            } else if sat::entails(&known, &literal.clone().not()) {
+                Presence::Absent
+            } else {
+                continue;
+            };
+            self.vars[var as usize] = Slot::Bound(Assigned::Presence(settled));
+        }
+    }
+
+    /// Every presence variable a type still mentions, in the order it mentions
+    /// them — which is the order the printed alphabet follows.
+    ///
+    /// A set, because a type may mention one variable twice — two labels
+    /// sharing a presence is the whole of what a `when` name buys — and the
+    /// order is the first mention's.
+    fn presences_in(&self, ty: &Rc<Ty>, found: &mut IndexSet<TyVar>) {
+        let ty = self.resolve(ty);
+        for field in ty.fields.values() {
+            if let Presence::Var(var) = self.presence_of(&field.presence) {
+                found.insert(var);
+            }
+            let held = field.ty.clone();
+            self.presences_in(&held, found);
+        }
+        match &ty.core {
+            Core::Arrow(from, to) => {
+                let (from, to) = (from.clone(), to.clone());
+                self.presences_in(&from, found);
+                self.presences_in(&to, found);
+            }
+            Core::Sum(cases) => {
+                let row = self.canon(cases);
+                for field in row.labels.values() {
+                    if let Presence::Var(var) = self.presence_of(&field.presence) {
+                        found.insert(var);
+                    }
+                    let held = field.ty.clone();
+                    self.presences_in(&held, found);
+                }
+            }
+            Core::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.presences_in(arg, found);
+                }
+            }
+            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+        }
+    }
+
     /// One fresh copy of a scheme, minted at the level the table is being
     /// walked or solved at.
     ///
@@ -1412,20 +1943,71 @@ impl Table {
     /// one a nested `let` published — which generation could not have opened,
     /// there being nothing to open until the value is solved. One function
     /// because it is one act.
-    fn instantiate(&mut self, scheme: &Scheme) -> Rc<Ty> {
+    fn instantiate(&mut self, span: Span, scheme: &Scheme) -> Rc<Ty> {
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
-        // that is what a scheme records. See [`Assigned::as_row`].
+        // that is what a scheme records. See [`Assigned::as_row`]. A presence
+        // is minted in its own alphabet, for the reason [`Scheme`] gives.
         let fresh: Vec<Assigned> = (0..scheme.count())
             .map(|_| Assigned::Ty(self.fresh_type()))
             .collect();
-        let ty = scheme.body().open(&fresh);
+        let presences: Vec<Presence> = (0..scheme.presences())
+            .map(|_| self.fresh_presence())
+            .collect();
+        let ty = scheme.body().open(&fresh, &presences);
         // A scheme's body says which of its rows a quantified tail is the tail
         // of, but the condition that follows from that is not part of the
         // body: it lived beside the variables the scheme closed over, and this
         // copy's variables are new. Said again, of them.
         self.note_lacks(&ty);
+        // And so is what it requires of its presences. Per instance, never per
+        // scheme: two uses of one definition with different field sets are both
+        // legal exactly when each instance's formula is separately satisfiable.
+        let formula = scheme.formula().open(&presences);
+        if !formula.is_true() {
+            let mut labels = IndexMap::new();
+            self.labels_in(&ty, &mut labels);
+            let labels = labels.into_iter().collect();
+            self.require(span, Origin::Instance(Named { labels }), formula);
+        }
         ty
+    }
+
+    /// Every label a type names and what decides whether it is there, in the
+    /// order the type names them — what a use-site complaint quotes its formula
+    /// in. The first spelling of a label wins, which is the one a reader
+    /// reading the type left to right meets.
+    fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, Presence>) {
+        let ty = self.resolve(ty);
+        for (name, field) in &ty.fields {
+            found
+                .entry(name.clone())
+                .or_insert_with(|| self.presence_of(&field.presence));
+            let held = field.ty.clone();
+            self.labels_in(&held, found);
+        }
+        match &ty.core {
+            Core::Arrow(from, to) => {
+                let (from, to) = (from.clone(), to.clone());
+                self.labels_in(&from, found);
+                self.labels_in(&to, found);
+            }
+            Core::Sum(cases) => {
+                for (name, field) in &self.canon(cases).labels {
+                    found
+                        .entry(name.clone())
+                        .or_insert_with(|| self.presence_of(&field.presence));
+                    let held = field.ty.clone();
+                    self.labels_in(&held, found);
+                }
+            }
+            Core::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.labels_in(arg, found);
+                }
+            }
+            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+        }
     }
 
     /// [`unfold`] with the row conditions its result implies recorded against
@@ -1467,7 +2049,7 @@ impl Table {
     /// definition that tied it to anything else has not kept that.
     ///
     /// Asked only of the variables an annotation left open, and a written type
-    /// can leave open only `..`, `..r` and `?` — so a variable arriving here is
+    /// can leave open only `..`, `..r` and `when` — so a variable arriving here is
     /// one of three things: the core a struct's `..` lowered to, the tail a
     /// sum's did, or a presence. Each sort is asked in its own spelling of
     /// "nothing is known", which is the whole of the three arms.
@@ -1596,11 +2178,38 @@ impl Table {
     /// [`Table::demote`] — and it is why a scheme published here may still
     /// mention the table. A definition's own scheme never does: its level is 0,
     /// and nothing is below that.
-    fn generalize(&self, ty: &Rc<Ty>, level: u32) -> (Scheme, HashMap<TyVar, u32>) {
-        let mut subst = HashMap::new();
+    fn generalize(&self, ty: &Rc<Ty>, level: u32, formula: Formula) -> (Scheme, Subst) {
+        let mut subst = Subst::default();
         self.quantify(ty, &mut subst, level);
         let body = self.zonk(ty, &subst);
-        (Scheme::new(subst.len() as u32, body), subst)
+        let formula = quantify_formula(&formula, &subst);
+        (
+            Scheme::constrained(
+                subst.types.len() as u32,
+                subst.presences.len() as u32,
+                body,
+                formula,
+            ),
+            subst,
+        )
+    }
+
+    /// What the scheme of a type generalized here should require of its
+    /// presences: everything the store says about the presences the type still
+    /// mentions, with every other variable existentially eliminated, in the
+    /// canonical form R12 prints.
+    ///
+    /// Silent once something has already flipped the store: the cascade rule.
+    /// A `where false` on every scheme downstream of one contradiction is the
+    /// same mistake said in as many places as the program has definitions.
+    fn required(&self, ty: &Rc<Ty>) -> Formula {
+        if self.unsat {
+            return Formula::True;
+        }
+        let mut presences = IndexSet::new();
+        self.presences_in(ty, &mut presences);
+        let atoms: Vec<Atom> = presences.into_iter().map(Atom::Var).collect();
+        sat::project(&self.component(&atoms), &atoms)
     }
 
     /// A local binding's scheme as it is published: everything it left free
@@ -1613,16 +2222,31 @@ impl Table {
     /// numbering them would hand each use a copy of a variable it is meant to
     /// share.
     fn published(&self, scheme: &Scheme) -> Scheme {
-        let mut subst = HashMap::new();
+        let mut subst = Subst::default();
         self.quantify(scheme.body(), &mut subst, 0);
-        // Its own quantifiers already occupy the first `count` positions, so
-        // what was free numbers on from there.
-        let shifted: HashMap<TyVar, u32> = subst
-            .into_iter()
-            .map(|(var, at)| (var, scheme.count() + at))
-            .collect();
-        let count = scheme.count() + shifted.len() as u32;
-        Scheme::new(count, self.zonk(scheme.body(), &shifted))
+        // Its own quantifiers already occupy the first positions of each
+        // alphabet, so what was free numbers on from there — in its own
+        // alphabet, since the two do not share a numbering.
+        let shifted = Subst {
+            types: subst
+                .types
+                .into_iter()
+                .map(|(var, at)| (var, scheme.count() + at))
+                .collect(),
+            presences: subst
+                .presences
+                .into_iter()
+                .map(|(var, at)| (var, scheme.presences() + at))
+                .collect(),
+        };
+        let count = scheme.count() + shifted.types.len() as u32;
+        let presences = scheme.presences() + shifted.presences.len() as u32;
+        Scheme::constrained(
+            count,
+            presences,
+            self.zonk(scheme.body(), &shifted),
+            quantify_formula(scheme.formula(), &shifted),
+        )
     }
 
     /// Number the generalizable variables of `ty` in first-occurrence order —
@@ -1632,7 +2256,7 @@ impl Table {
     /// walk. A presence prints as the `?` on its field rather than as a
     /// letter, so numbering one in line would leave a visible gap: the scheme
     /// of `{ x?: Nat } -> 'a` should not call its one letter `'b`.
-    fn quantify(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>, level: u32) {
+    fn quantify(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32) {
         self.quantify_walk(ty, subst, level, false);
         self.quantify_walk(ty, subst, level, true);
     }
@@ -1649,13 +2273,7 @@ impl Table {
     /// numbering it first would call the rightmost thing on the line `'a`. No
     /// special case for it either way — it is descended into exactly where it
     /// sits.
-    fn quantify_walk(
-        &self,
-        ty: &Rc<Ty>,
-        subst: &mut HashMap<TyVar, u32>,
-        level: u32,
-        presences: bool,
-    ) {
+    fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32, presences: bool) {
         let ty = self.resolve(ty);
         self.quantify_labels(&ty.fields, subst, level, presences);
         match &ty.core {
@@ -1683,13 +2301,7 @@ impl Table {
 
     /// [`quantify_walk`](Self::quantify_walk) over a sum's cases: the labels,
     /// and then the tail, which is read last for the reason a struct's core is.
-    fn quantify_row(
-        &self,
-        row: &Row,
-        subst: &mut HashMap<TyVar, u32>,
-        level: u32,
-        presences: bool,
-    ) {
+    fn quantify_row(&self, row: &Row, subst: &mut Subst, level: u32, presences: bool) {
         let row = self.canon(row);
         self.quantify_labels(&row.labels, subst, level, presences);
         if !presences && let Rest::Var(var) = row.rest {
@@ -1702,13 +2314,13 @@ impl Table {
     fn quantify_labels(
         &self,
         labels: &IndexMap<String, RowField>,
-        subst: &mut HashMap<TyVar, u32>,
+        subst: &mut Subst,
         level: u32,
         presences: bool,
     ) {
         for field in labels.values() {
             if presences && let Presence::Var(var) = self.presence_of(&field.presence) {
-                self.quantify_var(var, subst, level);
+                self.quantify_presence(var, subst, level);
             }
             self.quantify_walk(&field.ty, subst, level, presences);
         }
@@ -1716,12 +2328,22 @@ impl Table {
 
     /// Number one variable, unless it already has a number or belongs to a
     /// binder further out. See [`Table::levels`].
-    fn quantify_var(&self, var: TyVar, subst: &mut HashMap<TyVar, u32>, level: u32) {
+    fn quantify_var(&self, var: TyVar, subst: &mut Subst, level: u32) {
         if self.levels[var as usize] < level {
             return;
         }
-        let next = subst.len() as u32;
-        subst.entry(var).or_insert(next);
+        let next = subst.types.len() as u32;
+        subst.types.entry(var).or_insert(next);
+    }
+
+    /// [`quantify_var`](Self::quantify_var) in the other alphabet: a presence
+    /// is numbered `a`, `b`, … among presences alone.
+    fn quantify_presence(&self, var: TyVar, subst: &mut Subst, level: u32) {
+        if self.levels[var as usize] < level {
+            return;
+        }
+        let next = subst.presences.len() as u32;
+        subst.presences.entry(var).or_insert(next);
     }
 
     /// Resolve a type all the way down, replacing each variable in `subst`
@@ -1729,7 +2351,7 @@ impl Table {
     /// table only where the caller chose to leave it mentioning one — see
     /// [`Table::generalize`], whose scheme keeps an enclosing binder's
     /// variables free — so everything published at level 0 outlives the solver.
-    fn zonk(&self, ty: &Rc<Ty>, subst: &HashMap<TyVar, u32>) -> Rc<Ty> {
+    fn zonk(&self, ty: &Rc<Ty>, subst: &Subst) -> Rc<Ty> {
         let ty = self.resolve(ty);
         let fields = self.zonk_labels(&ty.fields, subst);
         let core = match &ty.core {
@@ -1737,7 +2359,7 @@ impl Table {
             // alone: it belongs to a binder further out, and standing for
             // itself is exactly what a scheme of a nested binding has to say
             // about it.
-            Core::Var(var) => match subst.get(var) {
+            Core::Var(var) => match subst.types.get(var) {
                 Some(at) => Core::Bound(*at),
                 None => ty.core.clone(),
             },
@@ -1770,13 +2392,13 @@ impl Table {
     /// lacks check existed the splice was where a repeated *present* field
     /// quietly lost a copy, and a definition came out with a type it had never
     /// been shown to have.
-    fn zonk_row(&self, row: &Row, subst: &HashMap<TyVar, u32>) -> Row {
+    fn zonk_row(&self, row: &Row, subst: &Subst) -> Row {
         let row = self.canon(row);
         let labels = self.zonk_labels(&row.labels, subst);
         let rest = match row.rest {
             // Left standing where it has no number, for the reason a core
             // variable is; see [`Table::zonk`].
-            Rest::Var(var) => match subst.get(&var) {
+            Rest::Var(var) => match subst.types.get(&var) {
                 Some(at) => Rest::Bound(*at),
                 None => Rest::Var(var),
             },
@@ -1790,14 +2412,14 @@ impl Table {
     fn zonk_labels(
         &self,
         labels: &IndexMap<String, RowField>,
-        subst: &HashMap<TyVar, u32>,
+        subst: &Subst,
     ) -> IndexMap<String, RowField> {
         labels
             .iter()
             .map(|(name, field)| {
                 let field = RowField {
                     presence: match self.presence_of(&field.presence) {
-                        Presence::Var(var) => match subst.get(&var) {
+                        Presence::Var(var) => match subst.presences.get(&var) {
                             Some(at) => Presence::Bound(*at),
                             None => Presence::Var(var),
                         },
@@ -1829,12 +2451,12 @@ impl Table {
     /// complaint still mentions when the group is done belongs to nobody
     /// further out, so every variable left in it is named rather than left for
     /// a reader to resolve.
-    fn close(&self, ty: &Rc<Ty>, subst: &mut HashMap<TyVar, u32>) -> Rc<Ty> {
+    fn close(&self, ty: &Rc<Ty>, subst: &mut Subst) -> Rc<Ty> {
         self.quantify(ty, subst, 0);
         self.zonk(ty, subst)
     }
 
-    fn zonk_term(&self, term: &mut Term, subst: &mut HashMap<TyVar, u32>) {
+    fn zonk_term(&self, term: &mut Term, subst: &mut Subst) {
         term.ty = self.close(&term.ty, subst);
         match &mut term.kind {
             TermKind::Apply { func, arg } => {
@@ -1880,7 +2502,7 @@ impl Table {
     /// reader as `?7`, which names the solver's bookkeeping rather than
     /// anything they wrote, and would spell as `?7` a type the scheme beside
     /// it spells `'a`.
-    fn zonk_error(&self, kind: &ErrorKind, subst: &mut HashMap<TyVar, u32>) -> ErrorKind {
+    fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
             ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
                 expected: self.close(expected, subst),
@@ -1898,12 +2520,41 @@ impl Table {
                 field: field.clone(),
             },
             ErrorKind::AnnotationTooOpen => ErrorKind::AnnotationTooOpen,
+            // The three presence complaints carry prose rather than types:
+            // their formulas were already worded, at the moment the variables
+            // in them still had labels to be named by. There is nothing here
+            // for a later substitution to improve.
+            ErrorKind::PresenceRequired { formula } => ErrorKind::PresenceRequired {
+                formula: formula.clone(),
+            },
+            ErrorKind::PresenceImpossible { formula } => ErrorKind::PresenceImpossible {
+                formula: formula.clone(),
+            },
+            ErrorKind::AnnotationAllows { allowed, required } => ErrorKind::AnnotationAllows {
+                allowed: allowed.clone(),
+                required: required.clone(),
+            },
             ErrorKind::RepeatedField { shape, field } => ErrorKind::RepeatedField {
                 shape: *shape,
                 field: field.clone(),
             },
         }
     }
+}
+
+/// One formula with each variable a scheme quantified replaced by the position
+/// it was given — [`Table::zonk`] about a formula rather than about a type.
+///
+/// A variable with no number is left standing, for the same reason a
+/// [`Core::Var`] is: it belongs to a binder further out, and a conjunct linking
+/// a quantified presence to an outer one moves into the scheme with the outer
+/// one kept free. That is standard HM(X), and the level machinery is what
+/// decided the entitlement.
+fn quantify_formula(formula: &Formula, subst: &Subst) -> Formula {
+    formula.rename(&|var| match subst.presences.get(&var) {
+        Some(at) => Formula::bound(*at),
+        None => Formula::var(var),
+    })
 }
 
 /// The semantic type a written type denotes. A declared type stays the name it
@@ -1950,6 +2601,63 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
 struct Tails {
     cores: HashMap<String, Core>,
     rows: HashMap<String, Rest>,
+    /// Every `when a` the annotation has written so far, by name. The same
+    /// scope and the same rule: two labels wearing one name share one presence
+    /// variable, which is how a type says two fields are there together, and
+    /// what the `where` clause beside them resolves against.
+    presences: HashMap<String, Presence>,
+}
+
+/// The semantic type and formula a written annotation denotes: [`lower_type`]
+/// with the `where` clause the type's `when`s bind the names of.
+///
+/// The clause is read after the type, whatever order a reader's eye takes them
+/// in, because there is nothing to resolve a name against until the labels that
+/// bind it are lowered.
+fn lower_annotation(
+    mint: &Mint,
+    table: &mut Table,
+    annotation: &Annotation,
+) -> (Rc<Ty>, Formula, Vec<(String, Presence)>) {
+    let mut tails = Tails::default();
+    let lowered = lower(mint, table, &mut tails, &annotation.ty);
+    table.note_lacks(&lowered);
+    let formula = match &annotation.clause {
+        Some(clause) => clause_formula(&tails, clause),
+        None => Formula::True,
+    };
+    // In the order the reader wrote them, so a complaint about the clause names
+    // its presences the way the annotation does.
+    let mut names: Vec<(String, Presence)> = tails.presences.into_iter().collect();
+    names.sort_by(|(one, _), (other, _)| one.cmp(other));
+    (lowered, formula, names)
+}
+
+/// One lowered `where` clause as the formula it denotes, over the presence
+/// variables the annotation's `when`s minted.
+///
+/// A name with no variable behind it is one whose label did not survive
+/// lowering — a row refused for some other reason lowers to the error type, and
+/// the labels inside it go with it — so it claims nothing rather than being
+/// looked up and found missing. The first complaint already speaks.
+fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
+    match &clause.tracked {
+        ClauseKind::Name(name) => tails
+            .presences
+            .get(name)
+            .map_or(Formula::True, Presence::formula),
+        ClauseKind::Not(inner) => clause_formula(tails, inner).not(),
+        ClauseKind::And(left, right) => {
+            clause_formula(tails, left).and(clause_formula(tails, right))
+        }
+        ClauseKind::Or(left, right) => clause_formula(tails, left).or(clause_formula(tails, right)),
+        ClauseKind::Equal(left, right) => {
+            clause_formula(tails, left).iff(clause_formula(tails, right))
+        }
+        ClauseKind::NotEqual(left, right) => {
+            clause_formula(tails, left).xor(clause_formula(tails, right))
+        }
+    }
 }
 
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
@@ -1988,10 +2696,8 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             let mut labels = IndexMap::new();
             for (name, field) in fields {
                 let lowered = match field {
-                    ir::TypeField::Written {
-                        optional, value, ..
-                    } => RowField {
-                        presence: presence(table, *optional),
+                    ir::TypeField::Written { when, value, .. } => RowField {
+                        presence: presence(table, tails, when),
                         ty: lower(mint, table, tails, value),
                     },
                     ir::TypeField::Absent { .. } => RowField {
@@ -2016,15 +2722,14 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             let mut labels = IndexMap::new();
             for (name, case) in cases {
                 let lowered = match case {
-                    ir::SumCase::Written {
-                        optional, payload, ..
-                    } => {
+                    ir::SumCase::Written { when, payload, .. } => {
+                        let presence = presence(table, tails, when);
                         let carried = match payload {
                             Some(payload) => lower(mint, table, tails, payload),
                             None => Rc::new(Ty::unit()),
                         };
                         RowField {
-                            presence: presence(table, *optional),
+                            presence,
                             ty: carried,
                         }
                     }
@@ -2072,14 +2777,22 @@ pub(crate) fn synthetic(ty: &Type) -> bool {
     }
 }
 
-/// Whether one label is there, as the written `?` says it: a mark means the
-/// definition decides, so the presence is a fresh variable, and no mark means
-/// it is simply there.
-fn presence(table: &mut Table, optional: bool) -> Presence {
-    match optional {
-        true => table.fresh_presence(),
-        false => Presence::Present,
-    }
+/// Whether one label is there, as its `when` clause says it: no clause means it
+/// is simply there, a named one is the variable everything of that name in this
+/// annotation shares, and `when _` is a variable of its own that nothing can
+/// name.
+fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) -> Presence {
+    let Some(when) = when else {
+        return Presence::Present;
+    };
+    let Some(name) = &when.name else {
+        return table.fresh_presence();
+    };
+    tails
+        .presences
+        .entry(name.clone())
+        .or_insert_with(|| table.fresh_presence())
+        .clone()
 }
 
 /// The cases of a written sum and what its `..` stands for, assembled into the
@@ -2188,7 +2901,9 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
         let fresh: Vec<Assigned> = args.iter().map(|arg| Assigned::Ty(arg.clone())).collect();
         // The name's own fields ride along: unfolding decides what the core
         // stands for and says nothing about the fields written outside it.
-        ty = splice(&ty.fields, &scheme.body().open(&fresh));
+        // A declaration binds no presence — lowering refuses a `when` in one —
+        // so there is no presence list for unfolding to supply.
+        ty = splice(&ty.fields, &scheme.body().open(&fresh, &[]));
     }
     ty
 }
@@ -2239,8 +2954,8 @@ impl Ty {
     /// the argument written at the use site. Which sort a position needs is
     /// decided here rather than by the caller, because the position is what
     /// knows: see [`Assigned::as_row`].
-    pub fn open(&self, fresh: &[Assigned]) -> Rc<Ty> {
-        let fields = open_labels(&self.fields, fresh);
+    pub fn open(&self, fresh: &[Assigned], presences: &[Presence]) -> Rc<Ty> {
+        let fields = open_labels(&self.fields, fresh, presences);
         let core = match &self.core {
             // Not a leaf: what the variable stands for may carry fields, and
             // the fields written outside it are kept over them. This is what a
@@ -2250,14 +2965,16 @@ impl Ty {
             Core::Bound(index) => {
                 return splice(&fields, &fresh[*index as usize].as_ty());
             }
-            Core::Arrow(from, to) => Core::Arrow(from.open(fresh), to.open(fresh)),
-            Core::Sum(cases) => Core::Sum(cases.open(fresh)),
+            Core::Arrow(from, to) => {
+                Core::Arrow(from.open(fresh, presences), to.open(fresh, presences))
+            }
+            Core::Sum(cases) => Core::Sum(cases.open(fresh, presences)),
             // A declaration's own body reaches here holding its parameters, so
             // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.
             Core::Named { symbol, name, args } => Core::Named {
                 symbol: *symbol,
                 name: name.clone(),
-                args: args.iter().map(|arg| arg.open(fresh)).collect(),
+                args: args.iter().map(|arg| arg.open(fresh, presences)).collect(),
             },
             Core::Unit | Core::Nat | Core::Var(_) | Core::Undecided => self.core.clone(),
         };
@@ -2270,8 +2987,8 @@ impl Row {
     /// stands for the cases whatever is handed to it allows, which is how an
     /// argument written as a whole type is read for the row it carries. See
     /// [`Assigned::as_row`].
-    fn open(&self, fresh: &[Assigned]) -> Row {
-        let labels = open_labels(&self.labels, fresh);
+    fn open(&self, fresh: &[Assigned], presences: &[Presence]) -> Row {
+        let labels = open_labels(&self.labels, fresh, presences);
         let rest = match &self.rest {
             Rest::Bound(index) => Rest::More(Rc::new(fresh[*index as usize].as_row())),
             rest => rest.clone(),
@@ -2286,13 +3003,14 @@ impl Row {
 fn open_labels(
     labels: &IndexMap<String, RowField>,
     fresh: &[Assigned],
+    presences: &[Presence],
 ) -> IndexMap<String, RowField> {
     labels
         .iter()
         .map(|(name, field)| {
             let field = RowField {
-                presence: field.presence.open(fresh),
-                ty: field.ty.open(fresh),
+                presence: field.presence.open(presences),
+                ty: field.ty.open(fresh, presences),
             };
             (name.clone(), field)
         })
@@ -2300,10 +3018,12 @@ fn open_labels(
 }
 
 impl Presence {
-    /// [`Ty::open`] over one presence.
-    fn open(&self, fresh: &[Assigned]) -> Presence {
+    /// [`Ty::open`] over one presence, in the presence alphabet: a scheme
+    /// numbers its `when` names apart from its `'a`s, so a bound presence
+    /// indexes its own list.
+    fn open(&self, presences: &[Presence]) -> Presence {
         match self {
-            Presence::Bound(index) => fresh[*index as usize].as_presence(),
+            Presence::Bound(index) => presences[*index as usize].clone(),
             decided => decided.clone(),
         }
     }

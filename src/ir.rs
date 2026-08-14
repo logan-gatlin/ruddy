@@ -55,7 +55,7 @@ pub struct Decl<T> {
     /// The written type the definition is to be checked against, when it was
     /// ascribed one. Always `None` for a `type` declaration: that *is* a type,
     /// so there is nothing to check it against.
-    pub annotation: Option<Type>,
+    pub annotation: Option<Annotation>,
     /// The parameters a `type` declaration binds, in order. Always empty for a
     /// term, which binds none of its own — a lambda's argument is bound inside
     /// its body rather than by the definition.
@@ -122,7 +122,7 @@ pub enum TermKind {
         /// The name this binds, and where it was written.
         name: Tracked<Symbol>,
         /// The written type, lowered, when the binding was ascribed one.
-        annotation: Option<Type>,
+        annotation: Option<Annotation>,
         value: Box<Term>,
         body: Box<Term>,
     },
@@ -287,15 +287,15 @@ pub enum TypeKind {
     Error,
 }
 
-/// One field of a struct type: the [`Field`] split of spans, plus whether the
-/// field was marked `?` — there or not, with this type when it is — or `\` —
-/// definitely not there, with no type at all.
+/// One field of a struct type: the [`Field`] split of spans, plus the `when`
+/// clause it may wear — there or not, as the named presence decides — or the
+/// `\` that says it is definitely not there, with no type at all.
 #[derive(Debug, Clone)]
 pub enum TypeField {
-    /// `name[?]: T`, as written.
+    /// `name [when a]: T`, as written.
     Written {
         name_span: Span,
-        optional: bool,
+        when: Option<Box<When>>,
         value: Type,
     },
     /// `\name` — the label is explicitly absent, so there is no type here to
@@ -305,8 +305,55 @@ pub enum TypeField {
     Absent { name_span: Span },
 }
 
-/// One case of a sum type: the [`Field`] split of spans, whether the case was
-/// marked `?` — a case a value may or may not be — and what it carries; or the
+/// The `when` clause on one label, lowered.
+///
+/// The name stays a string for the reason [`Row::Named`] does: it is scoped to
+/// the one written type it appears in, resolved by inference into the presence
+/// variable the type's labels share, and nothing outside that type can refer to
+/// it. `None` is `when _`, the anonymous presence — a variable minted like any
+/// other and named by nothing, so no [`Clause`] can mention it.
+#[derive(Debug, Clone)]
+pub struct When {
+    pub span: Span,
+    pub name: Option<String>,
+}
+
+/// A `where` clause, lowered: a formula over the names the written type's
+/// `when` clauses bound.
+///
+/// Every name in it is one the type binds — lowering refuses the rest, which is
+/// what [`ErrorKind::UnboundPresence`] is — so inference can resolve one
+/// without a lookup that could fail. Kept as the tree it was written as rather
+/// than as a normal form, because an annotation is a contract and prints back
+/// as itself; normalizing is generalization's, once.
+pub type Clause = Tracked<ClauseKind>;
+
+#[derive(Debug, Clone)]
+pub enum ClauseKind {
+    Name(String),
+    Not(Box<Clause>),
+    And(Box<Clause>, Box<Clause>),
+    Or(Box<Clause>, Box<Clause>),
+    /// `a = b` — both there or neither.
+    Equal(Box<Clause>, Box<Clause>),
+    /// `a != b` — exactly one of them there.
+    NotEqual(Box<Clause>, Box<Clause>),
+}
+
+/// A written type and the `where` clause that followed it, lowered together.
+///
+/// One value rather than two fields wherever an ascription is kept, because the
+/// clause is meaningless without the type whose `when`s bind its names: the two
+/// are one contract, and a reader of either half alone is reading half of what
+/// the definition promised.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub ty: Type,
+    pub clause: Option<Clause>,
+}
+
+/// One case of a sum type: the [`Field`] split of spans, the `when` clause it
+/// may wear — a case a value may or may not be — and what it carries; or the
 /// `\` that says the case is definitely absent, [`TypeField::Absent`]'s twin.
 ///
 /// `payload` keeps the `None` the parser gave it, for the reason
@@ -315,10 +362,10 @@ pub enum TypeField {
 /// shows.
 #[derive(Debug, Clone)]
 pub enum SumCase {
-    /// `` `Name[?] [T] ``, as written.
+    /// `` `Name [(when a)] [T] ``, as written.
     Written {
         name_span: Span,
-        optional: bool,
+        when: Option<Box<When>>,
         payload: Option<Type>,
     },
     /// `` \`Name `` — the case is explicitly absent, carrying nothing.
@@ -425,13 +472,13 @@ pub enum ErrorKind {
     Circular {
         namespace: Namespace,
     },
-    /// A `?` field inside a `type` declaration, or a `..` tail there that does
-    /// not name one of the declaration's own parameters — as in
+    /// A `when` clause inside a `type` declaration, or a `..` tail there that
+    /// does not name one of the declaration's own parameters — as in
     /// `type t = { x: Nat, .. }`.
     ///
     /// What a declaration stands for is lowered once, before any definition,
-    /// and holds for all of them; a `?` or a bare `..` stands for something a
-    /// definition gets to decide, so there is nothing for one to mean here.
+    /// and holds for all of them; a `when` or a bare `..` stands for something
+    /// a definition gets to decide, so there is nothing for one to mean here.
     ///
     /// A tail naming a row parameter is the exception, and the reason the rule
     /// is worth stating this precisely rather than as "a declaration is
@@ -441,11 +488,32 @@ pub enum ErrorKind {
     /// declaration's body mentions no solver variable, which is what lets every
     /// walk stop at a name instead of descending into what it stands for.
     ///
-    /// The shape is carried for the wording alone: `` type X = `A? Nat `` is the
-    /// same mistake made about cases, and a complaint that said "fields" to
-    /// someone who wrote backticks would be describing a type they never wrote.
+    /// The shape is carried for the wording alone: `` type X = `A (when a) Nat ``
+    /// is the same mistake made about cases, and a complaint that said "fields"
+    /// to someone who wrote backticks would be describing a type they never
+    /// wrote.
     OpenDeclaredType {
         shape: Shape,
+    },
+    /// A `where` clause on a `type` declaration's body, as in
+    /// `type T = { x: Nat } where a`.
+    ///
+    /// [`ErrorKind::OpenDeclaredType`]'s sibling and refused for the same
+    /// reason: a declaration holds for every definition, so it has no presence
+    /// of its own left open for a formula to relate. It is a complaint of its
+    /// own rather than that one because a clause sits beside the type rather
+    /// than inside a row, so there is no shape to word it in.
+    ClauseInDeclaration,
+    /// A `where` clause naming something no `when` in the same type bound, as
+    /// in `{ x when a: Nat } where c`.
+    ///
+    /// A presence name is scoped to the one written type that binds it — the
+    /// rule a named `..r` already keeps — so a name nothing binds stands for
+    /// nothing at all. Refused rather than read as a fresh variable: a formula
+    /// about a presence the type never mentions constrains nothing, and a
+    /// reader who wrote one meant a name they also wrote.
+    UnboundPresence {
+        name: String,
     },
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
@@ -717,6 +785,16 @@ struct Builder<'a> {
     /// One rest stands for one thing, and this is what says so. See
     /// [`ErrorKind::MixedTail`].
     tails: HashMap<String, (Sense, Span)>,
+    /// Every name a `when` in the written type being lowered bound. Cleared for
+    /// every written type, which is the whole scope of a presence name — the
+    /// same scope [`Builder::tails`] keeps, and for the same reason: `when a`
+    /// twice in one annotation is one presence, and another annotation's `a` is
+    /// unrelated.
+    ///
+    /// What the `where` clause is checked against; see
+    /// [`ErrorKind::UnboundPresence`]. The anonymous `when _` binds nothing and
+    /// so puts nothing here, which is the whole of what makes it unnameable.
+    whens: IndexSet<String>,
 }
 
 /// Which symbol a name means, for one namespace.
@@ -1074,6 +1152,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         arities: HashMap::new(),
         params: HashMap::new(),
         tails: HashMap::new(),
+        whens: IndexSet::new(),
     };
     let mut program = Program {
         terms: IndexMap::new(),
@@ -1123,7 +1202,10 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // language's only binder, and its only scope.
         let mark = b.types.mark();
         b.scope_params(&params);
-        let value = b.written(body, Place::Declaration);
+        // A declaration's body is read as an annotation so that a `where`
+        // written there can be refused rather than misparsed; what survives is
+        // the type, since a refused clause is dropped.
+        let value = b.written(body, Place::Declaration).ty;
         b.types.release(mark);
         if let Some(symbol) = symbol {
             program.types.insert(
@@ -1815,19 +1897,28 @@ fn bound_to_errors(names: Vec<Tracked<Symbol>>, body: Term) -> Term {
 /// travels: the unit pattern's `()` goes the same way, and inference needs no
 /// new rule to enforce this one. The holes are what mark it as the compiler's
 /// own — see [`TypeKind::Any`].
-fn exact_demand(span: Span, fields: &[(TrackedString, Calm)]) -> Type {
+fn exact_demand(span: Span, fields: &[(TrackedString, Calm)]) -> Annotation {
     let fields = fields
         .iter()
         .map(|(name, _)| {
             let field = TypeField::Written {
                 name_span: name.span,
-                optional: false,
+                when: None,
                 value: name.span.track(TypeKind::Any),
             };
             (name.tracked.clone(), field)
         })
         .collect();
-    span.track(TypeKind::Struct { fields, tail: None })
+    demand(span.track(TypeKind::Struct { fields, tail: None }))
+}
+
+/// A type the compiler wrote itself, as the annotation it travels in.
+///
+/// Never a `where` clause: a demand is about which labels are there, one at a
+/// time, and the compiler has nothing to say about their combinations that the
+/// pattern it came from did not already say by naming them.
+fn demand(ty: Type) -> Annotation {
+    Annotation { ty, clause: None }
 }
 
 /// A normalized pattern as the matrix walk matches it: everything that only
@@ -2694,7 +2785,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // by being a parameter — but it is every bit as much a place to apply a
     // declaration, and was the way this check was first written round.
     for decl in program.terms.values_mut() {
-        if let Some(annotation) = decl.annotation.as_mut() {
+        if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
             walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
         }
         // And so is a nested binding's, which is a place to write one as much
@@ -2721,7 +2812,7 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
             ..
         } => {
             if let Some(annotation) = annotation {
-                out(annotation);
+                out(&mut annotation.ty);
             }
             annotations(value, out);
             annotations(body, out);
@@ -3408,14 +3499,88 @@ impl Builder<'_> {
         Some(Row::Named(name.tracked))
     }
 
-    /// Lower one whole written type — a declaration's body, or a definition's
-    /// annotation — which is the scope a tail's name lives in and so the scope
-    /// this clears. Every other caller of [`ty`](Self::ty) is inside one of
-    /// these and shares its scope, which is exactly what makes two `..r` in one
-    /// annotation stand for one rest.
-    fn written(&mut self, ty: parse::Type, place: Place) -> Type {
+    /// Lower one whole written type and the `where` clause that followed it — a
+    /// declaration's body, or a definition's annotation — which is the scope a
+    /// tail's and a presence's name live in, and so the scope this clears. Every
+    /// other caller of [`ty`](Self::ty) is inside one of these and shares its
+    /// scope, which is exactly what makes two `..r` in one annotation stand for
+    /// one rest and two `when a` for one presence.
+    ///
+    /// The type first and the clause after it, whatever order a reader's eye
+    /// takes them in: the clause's names are resolved against what the type
+    /// bound, so there is nothing to resolve them against until the type is in.
+    fn written(&mut self, written: parse::Annotation, place: Place) -> Annotation {
         self.tails.clear();
-        self.ty(ty, place)
+        self.whens.clear();
+        let ty = self.ty(written.ty, place);
+        let clause = written.clause.and_then(|clause| match place {
+            // A declaration says the same thing wherever it is used, so it has
+            // no presence of its own for a formula to relate. Refused where it
+            // was written, and dropped — the type beside it stands, exactly as
+            // a declaration with a refused `..` keeps everything else it said.
+            Place::Declaration => {
+                self.error(clause.span, ErrorKind::ClauseInDeclaration);
+                None
+            }
+            Place::Annotation => self.clause(clause),
+        });
+        Annotation { ty, clause }
+    }
+
+    /// Lower one `where` clause, resolving each name against the `when`s the
+    /// type beside it bound.
+    ///
+    /// `None` when any name was unbound: the clause absorbs whole rather than
+    /// keeping the half that resolved, for the reason every other row mistake
+    /// absorbs — a formula missing one of its conjuncts is a contract nobody
+    /// wrote, and holding the definition to it would be a second complaint
+    /// about the first one.
+    fn clause(&mut self, clause: parse::Clause) -> Option<Clause> {
+        let span = clause.span;
+        let kind = match clause.tracked {
+            parse::ClauseKind::Name(name) => {
+                if !self.whens.contains(&name) {
+                    self.error(span, ErrorKind::UnboundPresence { name });
+                    return None;
+                }
+                ClauseKind::Name(name)
+            }
+            parse::ClauseKind::Not(inner) => ClauseKind::Not(Box::new(self.clause(*inner)?)),
+            parse::ClauseKind::And(left, right) => {
+                // Both sides are lowered before either is judged, so a clause
+                // naming two unbound presences reports both: the precedent
+                // [`ty`](Self::ty) sets for an open declared type.
+                let (left, right) = (self.clause(*left), self.clause(*right));
+                ClauseKind::And(Box::new(left?), Box::new(right?))
+            }
+            parse::ClauseKind::Or(left, right) => {
+                let (left, right) = (self.clause(*left), self.clause(*right));
+                ClauseKind::Or(Box::new(left?), Box::new(right?))
+            }
+            parse::ClauseKind::Equal(left, right) => {
+                let (left, right) = (self.clause(*left), self.clause(*right));
+                ClauseKind::Equal(Box::new(left?), Box::new(right?))
+            }
+            parse::ClauseKind::NotEqual(left, right) => {
+                let (left, right) = (self.clause(*left), self.clause(*right));
+                ClauseKind::NotEqual(Box::new(left?), Box::new(right?))
+            }
+        };
+        Some(span.track(kind))
+    }
+
+    /// Lower one label's `when` clause, recording the name it binds so the
+    /// `where` clause beside it can be resolved.
+    fn when(&mut self, when: Option<Box<parse::When>>) -> Option<Box<When>> {
+        let when = when?;
+        let name = when.name.map(|name| {
+            self.whens.insert(name.tracked.clone());
+            name.tracked
+        });
+        Some(Box::new(When {
+            span: when.span,
+            name,
+        }))
     }
 
     /// The `..` a row was written with, lowered, or `Err` when it named a rest
@@ -3441,7 +3606,7 @@ impl Builder<'_> {
     /// closed, except through a parameter, and everything else may be as open
     /// as it likes. See [`ErrorKind::OpenDeclaredType`].
     ///
-    /// `marks` is where each `?` was written — every one is its own report,
+    /// `marks` is where each `when` was written — every one is its own report,
     /// since every one is a label the reader can close — and `tail` is the `..`
     /// the row ended with, which has already reported for itself in
     /// [`row`](Self::row), because only there is it known which of the three a
@@ -3809,24 +3974,27 @@ impl Builder<'_> {
                 // name inside an open declared type is still reported: the
                 // reader should not have to fix the `..` to be told about it.
                 //
-                // A type's field has a `?` and a `\` to it that [`Field`] has
+                // A type's field has a `when` and a `\` to it that [`Field`] has
                 // no room for, so the marks ride down with the value and are
                 // taken apart again here. Re-keying and repeats are the same
                 // question they are for a struct literal, and are asked in the
                 // one place that answers it.
                 let lowered: IndexMap<String, TypeField> = self
                     .fields(fields, |b, field| match field {
-                        parse::TypeField::Written { optional, value } => {
-                            Some((optional, b.ty(value, place)))
+                        parse::TypeField::Written { when, value } => {
+                            // The clause before the value, so that a presence
+                            // name is bound in the order the reader wrote it.
+                            let when = b.when(when);
+                            Some((when, b.ty(value, place)))
                         }
                         parse::TypeField::Absent => None,
                     })
                     .into_iter()
                     .map(|(name, field)| {
                         let lowered = match field.value {
-                            Some((optional, value)) => TypeField::Written {
+                            Some((when, value)) => TypeField::Written {
                                 name_span: field.name_span,
-                                optional,
+                                when,
                                 value,
                             },
                             None => TypeField::Absent {
@@ -3847,10 +4015,8 @@ impl Builder<'_> {
                 // wrong both ways is told about both.
                 let marks = lowered.values().filter_map(|field| match field {
                     TypeField::Written {
-                        optional: true,
-                        name_span,
-                        ..
-                    } => Some(*name_span),
+                        when: Some(when), ..
+                    } => Some(when.span),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Struct, marks, &tail);
@@ -3875,17 +4041,18 @@ impl Builder<'_> {
             parse::TypeKind::Sum { cases, tail } => {
                 let lowered: IndexMap<String, SumCase> = self
                     .labels(cases, ErrorKind::DuplicateCase, |b, case| match case {
-                        parse::SumCase::Written { optional, payload } => {
-                            Some((optional, payload.map(|payload| b.ty(payload, place))))
+                        parse::SumCase::Written { when, payload } => {
+                            let when = b.when(when);
+                            Some((when, payload.map(|payload| b.ty(payload, place))))
                         }
                         parse::SumCase::Absent => None,
                     })
                     .into_iter()
                     .map(|(name, case)| {
                         let lowered = match case.value {
-                            Some((optional, payload)) => SumCase::Written {
+                            Some((when, payload)) => SumCase::Written {
                                 name_span: case.name_span,
-                                optional,
+                                when,
                                 payload,
                             },
                             None => SumCase::Absent {
@@ -3901,10 +4068,8 @@ impl Builder<'_> {
                 };
                 let marks = lowered.values().filter_map(|case| match case {
                     SumCase::Written {
-                        optional: true,
-                        name_span,
-                        ..
-                    } => Some(*name_span),
+                        when: Some(when), ..
+                    } => Some(when.span),
                     _ => None,
                 });
                 let closed = self.closed(place, Shape::Sum, marks, &tail);
@@ -4121,7 +4286,7 @@ impl Builder<'_> {
         &mut self,
         calm: Calm,
         value: Term,
-        annotation: Option<Type>,
+        annotation: Option<Annotation>,
         inner: Term,
     ) -> Term {
         match calm {
@@ -4168,10 +4333,10 @@ impl Builder<'_> {
                     .with_span(at)
                 }
                 None => {
-                    let unit = span.track(TypeKind::Struct {
+                    let unit = demand(span.track(TypeKind::Struct {
                         fields: IndexMap::new(),
                         tail: None,
-                    });
+                    }));
                     let name = self.fresh("%unit", span);
                     let at = span.merge(inner.span);
                     TermKind::Let {
@@ -4240,7 +4405,7 @@ impl Builder<'_> {
     fn destructure_stmt(
         &mut self,
         calm: Calm,
-        annotation: Option<Type>,
+        annotation: Option<Annotation>,
         value: Term,
         out: &mut IndexMap<Symbol, Decl<Term>>,
     ) {
@@ -4289,10 +4454,10 @@ impl Builder<'_> {
                     self.destructure_stmt(Calm::Unit(span), None, again, out);
                 }
                 None => {
-                    let unit = span.track(TypeKind::Struct {
+                    let unit = demand(span.track(TypeKind::Struct {
                         fields: IndexMap::new(),
                         tail: None,
-                    });
+                    }));
                     let name = self.fresh("%unit", span);
                     out.insert(
                         name.tracked,

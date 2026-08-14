@@ -28,9 +28,11 @@ pub enum Kind {
     /// struct is written closed. Distinct from two [`Dot`](Kind::Dot)s the way
     /// [`FatArrow`](Kind::FatArrow) is distinct from `=` then `>`.
     DotDot,
-    /// `?`, marking a struct type's field — or a sum type's case — as one that
-    /// may or may not be there.
-    Question,
+    /// `!=`, the "these two presences differ" of a `where` clause. One token
+    /// rather than a `!` beside an `=`, the way [`Arrow`](Kind::Arrow) is one
+    /// token: a lone `!` begins nothing, so the only thing it can be is the
+    /// head of this.
+    NotEqual,
     /// `\`, marking a struct type's field — or a sum type's case — as one that
     /// is definitely *not* there: the `..` beside it may not stand for the
     /// label. A bare punctuation token, so `\ y` lexes the same as `\y` — the
@@ -140,9 +142,20 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 1).track(Kind::Dot));
                 }
             }
-            '?' => {
-                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Question));
+            // `!` begins nothing on its own — there is no negation operator —
+            // so, like `-`, the only thing it can be is the head of something
+            // longer, and a lone one is reported where it was written.
+            '!' => {
                 chars.next();
+                if let Some(&(_, '=')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::NotEqual));
+                } else {
+                    errors.push(Error {
+                        span: file_id.span(start, 1),
+                        kind: ErrorKind::Unrecognized,
+                    });
+                }
             }
             '|' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));

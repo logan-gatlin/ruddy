@@ -3,7 +3,8 @@
 use indexmap::IndexMap;
 use ruddy::{
     ir::{
-        ErrorKind, Field, Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind, build,
+        ClauseKind, ErrorKind, Field, Output, PatternKind, SumCase, Term, TermKind, TypeField,
+        TypeKind, build,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -361,7 +362,7 @@ fn an_ascription_resolves_in_the_type_namespace() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
 }
 
 #[test]
@@ -411,7 +412,7 @@ fn types_are_hoisted_above_terms_and_above_each_other() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.tracked, TypeKind::Ident(_)));
+    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(_)));
 
     // Which holds for a name of the program's own just the same.
     let (mint, out) = built("let u : T = ()  type T = ()");
@@ -419,7 +420,7 @@ fn types_are_hoisted_above_terms_and_above_each_other() {
         .annotation
         .as_ref()
         .expect("the ascription was lowered");
-    assert!(matches!(annotation.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
+    assert!(matches!(annotation.ty.tracked, TypeKind::Ident(s) if mint.name(s) == "T"));
 }
 
 #[test]
@@ -688,23 +689,23 @@ fn duplicate_type_fields_are_rejected() {
         Some(&TypeKind::Ident(s)) if mint.name(s) == "A"
     ));
 
-    // Annotations go the same way, and the `?` only they may carry rides
-    // through the re-keying with the field it was written on.
-    let src = "let f : { a?: Nat, a: Nat } -> Nat = fn p => p.a";
+    // Annotations go the same way, and the `when` clause only they may carry
+    // rides through the re-keying with the field it was written on.
+    let src = "let f : { a when a: Nat, a: Nat } -> Nat = fn p => p.a";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
     assert_eq!(
         out.errors[0].span.start,
-        src.find("a: Nat").expect("the repeat")
+        src.rfind("a: Nat").expect("the repeat")
     );
 
     let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = annotation.tracked else {
-        panic!("expected an arrow, got {:?}", annotation.tracked);
+    let TypeKind::Arrow { from, .. } = annotation.ty.tracked else {
+        panic!("expected an arrow, got {:?}", annotation.ty.tracked);
     };
     let TypeKind::Struct { fields, .. } = from.tracked else {
         panic!("expected a struct parameter");
@@ -712,19 +713,19 @@ fn duplicate_type_fields_are_rejected() {
     assert_eq!(fields.len(), 1);
     assert!(matches!(
         fields["a"],
-        TypeField::Written { optional: true, .. }
+        TypeField::Written { when: Some(_), .. }
     ));
 }
 
 #[test]
 fn a_declared_type_must_be_closed() {
-    // A tail or an optional field stands for something a definition gets to
-    // decide, and a declaration decides for everyone: each `..` and `?` is
+    // A tail or a `when` clause stands for something a definition gets to
+    // decide, and a declaration decides for everyone: each `..` and `when` is
     // refused, and the struct that carried it lowers to the error type.
     for src in [
         "type T = { x: Nat, .. }",
         "type T = { x: Nat, ..r }",
-        "type T = { x?: Nat }",
+        "type T = { x when a: Nat }",
         "type T = { a: { b: Nat, .. } }",
     ] {
         let (_, out) = build_src(src);
@@ -741,7 +742,7 @@ fn a_declared_type_must_be_closed() {
     }
 
     // One report per marker, in source order.
-    let (_, out) = build_src("type T = { x?: Nat, y?: Nat, .. }");
+    let (_, out) = build_src("type T = { x when a: Nat, y when b: Nat, .. }");
     assert_eq!(out.errors.len(), 3, "errors: {:#?}", out.errors);
     assert!(
         out.errors.iter().all(|error| matches!(
@@ -760,7 +761,7 @@ fn a_declared_type_must_be_closed() {
     assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
 
     // An annotation is where openness belongs, and it passes through whole.
-    let (_, out) = build_src("let f : { x?: Nat, ..r } -> Nat = fn p => p.x");
+    let (_, out) = build_src("let f : { x when a: Nat, ..r } -> Nat = fn p => p.x");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -889,7 +890,7 @@ fn a_head_that_cannot_be_applied_is_still_lowered() {
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(codes, ["not-a-type-constructor", "open-declared-type"]);
 
-    let (_, out) = build_src("type A = { x?: Nat } Nat");
+    let (_, out) = build_src("type A = { x when a: Nat } Nat");
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(codes, ["not-a-type-constructor", "open-declared-type"]);
 }
@@ -1514,7 +1515,7 @@ fn a_declaration_is_open_only_through_a_parameter() {
         "type T = { x: Nat, .. }",
         "type T = { x: Nat, ..r }",
         "type T A = { x: Nat, ..r }",
-        "type T r = { x?: Nat, ..r }",
+        "type T r = { x when a: Nat, ..r }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1559,7 +1560,7 @@ fn a_parameter_shadows_a_primitive() {
         .next()
         .and_then(|decl| decl.annotation.as_ref())
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = &annotation.tracked else {
+    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
         panic!("expected an arrow: {annotation:#?}");
     };
     let TypeKind::Apply { args, .. } = &from.tracked else {
@@ -1595,13 +1596,7 @@ fn lowers_a_sum_type() {
         Some(TypeKind::Param { index: 0, .. })
     ));
     assert!(cases["None"].payload().is_none());
-    assert!(matches!(
-        cases["Some"],
-        SumCase::Written {
-            optional: false,
-            ..
-        }
-    ));
+    assert!(matches!(cases["Some"], SumCase::Written { when: None, .. }));
     // A declaration lists every case there is, so there is no tail.
     assert!(tail.is_none());
 }
@@ -1655,7 +1650,7 @@ fn a_declared_sum_must_list_its_cases() {
     for src in [
         "type T = `A Nat | ..",
         "type T = `A Nat | ..r",
-        "type T = `A? Nat | `B",
+        "type T = `A (when a) Nat | `B",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -2423,8 +2418,8 @@ fn lowers_absent_labels_in_written_position() {
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Arrow { from, .. } = annotation.tracked else {
-        panic!("expected an arrow, got {:?}", annotation.tracked);
+    let TypeKind::Arrow { from, .. } = annotation.ty.tracked else {
+        panic!("expected an arrow, got {:?}", annotation.ty.tracked);
     };
     let TypeKind::Struct { fields, .. } = from.tracked else {
         panic!("expected a struct parameter");
@@ -2445,8 +2440,8 @@ fn lowers_absent_labels_in_written_position() {
         .annotation
         .clone()
         .expect("the annotation");
-    let TypeKind::Sum { cases, .. } = annotation.tracked else {
-        panic!("expected a sum, got {:?}", annotation.tracked);
+    let TypeKind::Sum { cases, .. } = annotation.ty.tracked else {
+        panic!("expected a sum, got {:?}", annotation.ty.tracked);
     };
     assert_eq!(cases.keys().collect::<Vec<_>>(), vec!["Ok", "Err"]);
     assert!(matches!(cases["Err"], SumCase::Absent { .. }));
@@ -2479,7 +2474,7 @@ fn an_absent_label_needs_a_tail() {
         .clone()
         .expect("the annotation");
     assert!(
-        matches!(annotation.tracked, TypeKind::Error),
+        matches!(annotation.ty.tracked, TypeKind::Error),
         "the struct absorbs: {annotation:#?}"
     );
 
@@ -3315,4 +3310,140 @@ fn pattern_let_corners() {
     let (printed, errors) = lowered_with_errors("let a = let {p: {q}, r: `Bad} = {} in q");
     assert_eq!(errors, ["binding-can-fail@24"], "{errors:#?}");
     assert_eq!(printed, "let a = let %value = {} in let q = <error> in q");
+}
+
+/// A `where` clause survives lowering as the formula it was written as, over
+/// the names the type's `when`s bound — and prints back as itself, since an
+/// annotation is a contract and a contract that came out spelled differently
+/// would be a different one.
+#[test]
+fn an_annotation_keeps_its_clause() {
+    let (mint, out) = built("let f : { x when a: Nat, y when b: Nat } where a != b = { x: 1 }");
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+        .annotation
+        .as_ref()
+        .expect("the annotation");
+    let clause = annotation.clause.as_ref().expect("the clause");
+    assert!(matches!(clause.tracked, ClauseKind::NotEqual(..)));
+    assert_eq!(
+        print::ir::clause(&clause.tracked, &mint).to_string(),
+        "a != b"
+    );
+
+    // And the labels keep the names they were written with, which is what the
+    // clause resolves against.
+    let TypeKind::Struct { fields, .. } = &annotation.ty.tracked else {
+        panic!("expected a struct annotation");
+    };
+    let names: Vec<Option<&str>> = fields
+        .values()
+        .map(|field| match field {
+            TypeField::Written { when, .. } => when.as_ref().and_then(|w| w.name.as_deref()),
+            TypeField::Absent { .. } => None,
+        })
+        .collect();
+    assert_eq!(names, [Some("a"), Some("b")]);
+}
+
+/// `when _` binds nothing, which is the whole of what makes it unnameable: the
+/// presence is minted like any other and no clause can be about it.
+#[test]
+fn the_anonymous_presence_binds_no_name() {
+    let (mint, out) = built("let f : { x when _: Nat } = { x: 1 }");
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+        .annotation
+        .as_ref()
+        .expect("the annotation");
+    let TypeKind::Struct { fields, .. } = &annotation.ty.tracked else {
+        panic!("expected a struct annotation");
+    };
+    let TypeField::Written {
+        when: Some(when), ..
+    } = &fields["x"]
+    else {
+        panic!("expected a written field with a clause");
+    };
+    assert!(when.name.is_none());
+
+    let (_, out) = build_src("let f : { x when _: Nat } where x = { x: 1 }");
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["unbound-presence"]
+    );
+}
+
+/// A clause names presences the type beside it binds, and nothing else: a name
+/// no `when` bound stands for nothing at all, so it is refused where it was
+/// written and the clause absorbs whole.
+#[test]
+fn a_clause_may_not_name_what_the_type_does_not_bind() {
+    let src = "let f : { x when a: Nat } where c = { x: 1 }";
+    let (mint, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(
+        &error.kind,
+        ErrorKind::UnboundPresence { name } if name == "c"
+    ));
+    assert_eq!(error.span.start, src.rfind('c').expect("the name"));
+
+    // The clause absorbs rather than keeping the half that resolved: half a
+    // contract is a contract nobody wrote.
+    let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+        .annotation
+        .as_ref()
+        .expect("the annotation");
+    assert!(annotation.clause.is_none());
+
+    // Both sides are lowered before either is judged, so a clause naming two
+    // unbound presences reports both — and the clause still absorbs whole,
+    // through every connective one can be written with.
+    for (src, count) in [
+        ("let f : { x when a: Nat } where c or d = { x: 1 }", 2),
+        ("let f : { x when a: Nat } where c and d = { x: 1 }", 2),
+        ("let f : { x when a: Nat } where c = d = { x: 1 }", 2),
+        ("let f : { x when a: Nat } where c != d = { x: 1 }", 2),
+        ("let f : { x when a: Nat } where not c = { x: 1 }", 1),
+        ("let f : { x when a: Nat } where a or c = { x: 1 }", 1),
+        ("let f : { x when a: Nat } where a and c = { x: 1 }", 1),
+        ("let f : { x when a: Nat } where a = c = { x: 1 }", 1),
+        ("let f : { x when a: Nat } where a != c = { x: 1 }", 1),
+    ] {
+        let (mint, out) = build_src(src);
+        assert_eq!(out.errors.len(), count, "{src}: {:#?}", out.errors);
+        let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
+            .annotation
+            .as_ref()
+            .expect("the annotation");
+        assert!(annotation.clause.is_none(), "{src}");
+    }
+}
+
+/// A declaration says the same thing wherever it is used, so it has no presence
+/// of its own for a clause to relate — the refusal `..` already gets, about the
+/// thing beside the type rather than a label inside it.
+#[test]
+fn a_declaration_may_not_carry_a_clause() {
+    let src = "type T = { x: Nat } where a";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::ClauseInDeclaration));
+    assert_eq!(error.span.start, src.rfind('a').expect("the clause"));
+
+    // A `when` inside one is the same refusal about a label, and it is the one
+    // `..` already gets: the declaration's body lowers to the error type.
+    let (_, out) = build_src("type T = `A (when a) Nat");
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["open-declared-type"]
+    );
 }

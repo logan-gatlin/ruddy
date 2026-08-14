@@ -15,6 +15,7 @@ mod ir;
 mod parse;
 mod patterns;
 mod print;
+mod sat;
 mod snapshot;
 mod stage;
 mod symbol;

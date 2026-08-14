@@ -9,12 +9,15 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    parse::{Arg, ArgKind, ExprKind, StmtKind, SumCase, TypeField, TypeKind},
+    parse::{
+        Annotation, Arg, ArgKind, ClauseKind, ExprKind, StmtKind, SumCase, TypeField, TypeKind,
+        When,
+    },
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
+    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
     write_project, write_row, write_struct, write_sum, write_tag,
 };
 
@@ -74,7 +77,7 @@ impl fmt::Display for Ast<'_, StmtKind> {
             StmtKind::Let { pattern, ty, body } => {
                 write!(f, "let {}", pattern.tracked)?;
                 if let Some(ty) = ty {
-                    write!(f, " : {}", Ast(&ty.tracked))?;
+                    write!(f, " : {}", annotation(ty))?;
                 }
                 write!(f, " = {}", Ast(&body.tracked.tracked))
             }
@@ -83,10 +86,96 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 for param in params {
                     write!(f, " {}", param.tracked)?;
                 }
-                write!(f, " = {}", Ast(&body.tracked))
+                write!(f, " = {}", annotation(body))
             }
         }
     }
+}
+
+/// Render a written type and the `where` clause after it — an ascription as it
+/// was written, so a printed annotation re-parses to the one it came from.
+///
+/// The clause follows the whole type, which is where the grammar puts it, and
+/// is left off entirely when none was written.
+pub fn annotation(annotation: &Annotation) -> impl fmt::Display + '_ {
+    Written(annotation)
+}
+
+struct Written<'a>(&'a Annotation);
+
+impl fmt::Display for Written<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", Ast(&self.0.ty.tracked))?;
+        match &self.0.clause {
+            Some(clause) => write!(f, " where {}", Ast(&clause.tracked)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A written `where` clause, with exactly the parentheses re-parsing needs.
+///
+/// Its own ladder rather than [`Prec`], for the reason the compiler's own
+/// formula printer keeps one: nothing in a clause can be a type, so there is
+/// nothing here for the type language's levels to be compared against.
+impl fmt::Display for Ast<'_, ClauseKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        clause_at(f, self.0, 0)
+    }
+}
+
+/// How tightly one clause binds: `0` for a comparison, `1` for `or`, `2` for
+/// `and`, `3` for `not`, `4` for a name.
+fn clause_prec(clause: &ClauseKind) -> u8 {
+    match clause {
+        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) => 0,
+        ClauseKind::Or(..) => 1,
+        ClauseKind::And(..) => 2,
+        ClauseKind::Not(_) => 3,
+        ClauseKind::Name(_) => 4,
+    }
+}
+
+/// Write `clause` for a position that binds at least as tightly as `level`,
+/// bracketing it when it does not.
+fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt::Result {
+    let parens = clause_prec(clause) < level;
+    if parens {
+        f.write_str("(")?;
+    }
+    match clause {
+        ClauseKind::Name(name) => f.write_str(name)?,
+        ClauseKind::Not(inner) => {
+            f.write_str("not ")?;
+            clause_at(f, &inner.tracked, 3)?;
+        }
+        // Left-associative, so the right side is written one level tighter.
+        ClauseKind::And(left, right) => {
+            clause_at(f, &left.tracked, 2)?;
+            f.write_str(" and ")?;
+            clause_at(f, &right.tracked, 3)?;
+        }
+        ClauseKind::Or(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" or ")?;
+            clause_at(f, &right.tracked, 2)?;
+        }
+        // Non-associative, so both sides go one level tighter.
+        ClauseKind::Equal(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" = ")?;
+            clause_at(f, &right.tracked, 1)?;
+        }
+        ClauseKind::NotEqual(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" != ")?;
+            clause_at(f, &right.tracked, 1)?;
+        }
+    }
+    if parens {
+        f.write_str(")")?;
+    }
+    Ok(())
 }
 
 impl fmt::Display for Ast<'_, ExprKind> {
@@ -104,7 +193,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             } => write_let(
                 f,
                 &pattern.tracked,
-                ty.as_ref().map(|ty| Ast(&ty.tracked)),
+                ty.as_ref().map(|ty| annotation(ty)),
                 &Ast(&value.tracked),
                 &Ast(&body.tracked),
             ),
@@ -122,13 +211,13 @@ impl fmt::Display for Ast<'_, ExprKind> {
             }
             // A term's tag is written by the same rule a type's case is, so
             // `` `Some 1 `` and `` `Some Nat `` cannot come out spelled
-            // differently. It never wears a `?`: that says a case may or may
+            // differently. It never wears a `when`: that says a case may or may
             // not be allowed, which is a claim about a type and not something
             // a value can be.
             ExprKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
-                false,
+                None,
                 payload.as_ref().map(|payload| Ast(&payload.tracked)),
             ),
             ExprKind::Ident { name } => f.write_str(&name.tracked),
@@ -144,9 +233,9 @@ impl fmt::Display for Ast<'_, TypeKind> {
             TypeKind::Arrow { from, to } => write_arrow(f, &Ast(&from.tracked), &Ast(&to.tracked)),
             TypeKind::Struct { fields, tail } => {
                 let fields = fields.iter().map(|(name, field)| match field {
-                    TypeField::Written { optional, value } => Entry::Written {
+                    TypeField::Written { when, value } => Entry::Written {
                         name: &name.tracked,
-                        optional: *optional,
+                        mark: mark(when),
                         holds: Ast(&value.tracked),
                     },
                     TypeField::Absent => Entry::Absent {
@@ -166,9 +255,9 @@ impl fmt::Display for Ast<'_, TypeKind> {
             }
             TypeKind::Sum { cases, tail } => {
                 let cases = cases.iter().map(|(name, case)| match case {
-                    SumCase::Written { optional, payload } => Entry::Written {
+                    SumCase::Written { when, payload } => Entry::Written {
                         name: &name.tracked,
-                        optional: *optional,
+                        mark: mark(when),
                         holds: payload.as_ref().map(|ty| Ast(&ty.tracked)),
                     },
                     SumCase::Absent => Entry::Absent {
@@ -197,6 +286,18 @@ impl fmt::Display for Ast<'_, TypeKind> {
     }
 }
 
+/// The `when` clause a written label wears, as the compiler's own row printer
+/// takes it. `when _` is the anonymous presence, spelled back as the `_` it was
+/// written as; nothing in a parse tree is ever the undecided-presence artifact,
+/// which only a failed inference produces.
+fn mark(when: &Option<Box<When>>) -> Option<Mark> {
+    let when = when.as_ref()?;
+    Some(Mark::When(match &when.name {
+        Some(name) => name.tracked.clone(),
+        None => "_".to_string(),
+    }))
+}
+
 /// Render one statement, `let` or `type`, as it was written.
 pub fn stmt(kind: &StmtKind) -> impl fmt::Display + '_ {
     Ast(kind)
@@ -205,6 +306,12 @@ pub fn stmt(kind: &StmtKind) -> impl fmt::Display + '_ {
 /// Render one expression, for the tree view, which labels a node with the source
 /// it stands for.
 pub fn expr(kind: &ExprKind) -> impl fmt::Display + '_ {
+    Ast(kind)
+}
+
+/// Render one written `where` clause, the [`ty`] counterpart for the formula
+/// beside an annotation.
+pub fn clause(kind: &ClauseKind) -> impl fmt::Display + '_ {
     Ast(kind)
 }
 

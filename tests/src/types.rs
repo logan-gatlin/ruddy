@@ -2,7 +2,9 @@
 
 use std::rc::Rc;
 
-use ruddy::types::{Assigned, Core, ParamKind, Presence, Prim, Rest, Row, RowField, Sense, Ty};
+use ruddy::types::{
+    Assigned, Atom, Core, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Sense, Ty,
+};
 
 #[test]
 fn every_primitive_round_trips_through_its_name() {
@@ -104,23 +106,19 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
     // now, so it takes no shape to be read at.
     assert_eq!(nat.as_ty().to_string(), "Nat");
     assert_eq!(row.as_row().labels.len(), 1);
-    assert!(matches!(presence.as_presence(), Presence::Absent));
 
     // A type at a row or a presence position is read for what it carries: the
     // cases it allows, and — for a bare variable, which is what instantiating a
     // scheme hands over — the variable itself.
     let fresh = Assigned::Ty(Rc::new(Ty::plain(Core::Var(7))));
     assert!(matches!(fresh.as_row().rest, Rest::Var(7)));
-    assert!(matches!(fresh.as_presence(), Presence::Var(7)));
     assert!(matches!(nat.as_row().rest, Rest::Undecided));
-    assert!(matches!(nat.as_presence(), Presence::Undecided));
 
     // And the pairs no position can produce say nothing rather than inventing
     // an answer.
     assert!(matches!(row.as_ty().core, Core::Undecided));
     assert!(matches!(presence.as_ty().core, Core::Undecided));
     assert!(matches!(presence.as_row().rest, Rest::Closed));
-    assert!(matches!(row.as_presence(), Presence::Undecided));
 }
 
 /// A refused binding abandons the variable it would have bound as well as the
@@ -202,5 +200,70 @@ fn a_primitive_lowers_to_its_core() {
     for &prim in Prim::ALL {
         let core: Core = prim.into();
         assert_eq!(core.to_string(), prim.name());
+    }
+}
+
+/// The formula language's own walks, over every shape a formula can take.
+///
+/// [`Formula::substitute`] is the one of them the others are written in terms
+/// of — opening a scheme's formula, reading one through what a solve decided,
+/// and quantifying one into a scheme are all it — so it is what has to be right
+/// about every connective.
+#[test]
+fn a_formula_is_walked_by_one_substitution() {
+    let swap = |atom: Atom| match atom {
+        Atom::Var(var) => Formula::bound(var),
+        Atom::Bound(index) => Formula::var(index),
+    };
+    let a = Formula::var(0);
+    let b = Formula::var(1);
+    for (formula, swapped) in [
+        (Formula::True, "always"),
+        (Formula::False, "never"),
+        (a.clone(), "a"),
+        (a.clone().not(), "not a"),
+        (a.clone().and(b.clone()), "a and b"),
+        (a.clone().or(b.clone()), "a or b"),
+        (a.clone().iff(b.clone()), "a = b"),
+        (a.clone().xor(b.clone()), "a != b"),
+    ] {
+        assert_eq!(formula.substitute(&swap).to_string(), swapped);
+    }
+}
+
+/// Renaming touches the solver's variables alone: a variable a scheme
+/// quantified is left where it stands, because a store is written about
+/// variables that exist and has nothing to say about one that does not.
+#[test]
+fn renaming_leaves_the_quantified_variables_alone() {
+    let formula = Formula::var(0).and(Formula::bound(1));
+    let renamed = formula.rename(&|var| Formula::var(var + 10));
+    assert_eq!(renamed.to_string(), "?10 and b");
+}
+
+/// Opening a scheme's formula hands each variable it quantified whatever
+/// instantiation minted for it — and a presence already decided folds to the
+/// constant it is, which is what makes a use of a settled label claim nothing.
+#[test]
+fn opening_a_formula_substitutes_what_was_minted() {
+    let formula = Formula::bound(0).xor(Formula::bound(1));
+    assert_eq!(
+        formula
+            .open(&[Presence::Var(7), Presence::Var(8)])
+            .to_string(),
+        "?7 != ?8"
+    );
+    // A variable the scheme did not quantify is left standing.
+    assert_eq!(Formula::var(3).open(&[Presence::Present]).to_string(), "?3");
+    // Each presence reads as the literal it is.
+    for (presence, printed) in [
+        (Presence::Present, "always"),
+        (Presence::Absent, "never"),
+        (Presence::Var(2), "?2"),
+        (Presence::Bound(1), "b"),
+        // A failure abandoned the question, so there is nothing to require.
+        (Presence::Undecided, "always"),
+    ] {
+        assert_eq!(presence.formula().to_string(), printed, "{presence}");
     }
 }

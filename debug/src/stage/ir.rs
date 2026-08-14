@@ -7,7 +7,8 @@
 use ruddy::{
     inference,
     ir::{
-        Decl, Pattern, PatternKind, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind,
+        Annotation, Clause, ClauseKind, Decl, Pattern, PatternKind, Row, SumCase, Tail, Term,
+        TermKind, Type, TypeField, TypeKind, When,
     },
     symbol::{Mint, Symbol},
     types::Core,
@@ -95,7 +96,7 @@ fn decl_node<T>(
     // labels the same thing: the role on the type's own node, not a wrapper
     // repeating its text and span.
     if let Some(annotation) = &decl.annotation {
-        let mut ascribed = type_node(ids, cx, mint, annotation);
+        let mut ascribed = annotation_node(ids, cx, mint, annotation);
         ascribed.label = format!("Ascribed {}", ascribed.label);
         node = node.child(ascribed);
     }
@@ -200,7 +201,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 name.tracked,
             ));
             if let Some(annotation) = annotation {
-                let mut ascribed = type_node(ids, cx, mint, annotation);
+                let mut ascribed = annotation_node(ids, cx, mint, annotation);
                 ascribed.label = format!("Ascribed {}", ascribed.label);
                 node = node.child(ascribed);
             }
@@ -345,6 +346,60 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
     }
 }
 
+/// One lowered ascription: the type, and — when one was written — the `where`
+/// clause beside it, as a row of its own.
+///
+/// A sibling of the type rather than a child, exactly as the AST panel shows
+/// it: a clause constrains the presences the type's `when`s bound, and burying
+/// it under the type would say it was part of one.
+fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation) -> Node {
+    let node = type_node(ids, cx, mint, &annotation.ty);
+    match &annotation.clause {
+        Some(clause) => {
+            let row = Node::new(ids.next(), "Where", clause_text(mint, clause)).at(clause.span);
+            node.child(row.children(clause_kids(ids, mint, clause)))
+        }
+        None => node,
+    }
+}
+
+/// One clause as the source it was lowered from — through the shared printer,
+/// so this row and the type's own text cannot spell one clause two ways.
+fn clause_text(mint: &Mint, clause: &Clause) -> String {
+    print::ir::clause(&clause.tracked, mint).to_string()
+}
+
+/// The parts of a clause, each a row of its own, so a reader can cross-
+/// highlight the name a formula uses against the `when` that bound it.
+fn clause_kids(ids: &mut Ids, mint: &Mint, clause: &Clause) -> Vec<Node> {
+    let parts: Vec<&Clause> = match &clause.tracked {
+        ClauseKind::Name(_) => Vec::new(),
+        ClauseKind::Not(inner) => vec![inner],
+        ClauseKind::And(left, right)
+        | ClauseKind::Or(left, right)
+        | ClauseKind::Equal(left, right)
+        | ClauseKind::NotEqual(left, right) => vec![left, right],
+    };
+    parts
+        .into_iter()
+        .map(|part| {
+            let row = Node::new(ids.next(), "", clause_text(mint, part)).at(part.span);
+            row.children(clause_kids(ids, mint, part))
+        })
+        .collect()
+}
+
+/// The `when` clause a lowered label wears, as the row's label shows it.
+fn when_text(when: &Option<Box<When>>) -> String {
+    match when {
+        None => String::new(),
+        Some(when) => match &when.name {
+            Some(name) => format!(" when {name}"),
+            None => " when _".to_string(),
+        },
+    }
+}
+
 fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ir::ty(&ty.tracked, mint).to_string()).at(ty.span);
     match &ty.tracked {
@@ -416,10 +471,10 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                 .map(|(name, case)| match case {
                     SumCase::Written {
                         name_span,
-                        optional,
+                        when,
                         payload,
                     } => {
-                        let mark = if *optional { "?" } else { "" };
+                        let mark = when_text(when);
                         let text = payload.as_ref().map_or(String::new(), |ty| {
                             print::ir::ty(&ty.tracked, mint).to_string()
                         });
@@ -458,10 +513,10 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                 .map(|(name, field)| match field {
                     TypeField::Written {
                         name_span,
-                        optional,
+                        when,
                         value,
                     } => {
-                        let mark = if *optional { "?" } else { "" };
+                        let mark = when_text(when);
                         Node::new(
                             ids.next(),
                             format!("{name}{mark}:"),

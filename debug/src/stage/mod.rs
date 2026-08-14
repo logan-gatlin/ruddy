@@ -9,6 +9,7 @@ pub mod ast;
 pub mod constraints;
 pub mod ir;
 pub mod patterns;
+pub mod presence;
 pub mod solve;
 pub mod symbols;
 pub mod tokens;
@@ -109,8 +110,8 @@ pub struct Trace {
 /// `'a`. Everything else a type is made of — `Nat`, `->`, a struct's braces and
 /// field names — is written by the language rather than stood in for.
 ///
-/// The `?` a presence puts on its label — the one in `a?: Nat` — is the
-/// language too, not a stand-in, and the `\B` is what keeps the highlighter
+/// The `?` an abandoned presence puts on its label — the one in `a?: Nat` — is
+/// the language too, not a stand-in, and the `\B` is what keeps the highlighter
 /// off it: that `?` always follows its label's last character, while a `?`
 /// that begins a variable follows punctuation or space.
 ///
@@ -183,6 +184,21 @@ pub const REGISTRY: &[Spec] = &[
         scoped: true,
         annotates: None,
         build: Build::Panel(types::build),
+    },
+    Spec {
+        id: "presence",
+        title: "Presence",
+        view: View::Tree,
+        // A store is read by following one presence variable through it: which
+        // batch first mentions it, what the verdict was once it did, and which
+        // scheme it ended up in. Not scoped, unlike the schemes above: a
+        // presence variable in the store is the solver's own numbering, unique
+        // across the whole program, so two rows spelling `?7` really are one
+        // variable.
+        highlight: Some(VARIABLES),
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(presence::build),
     },
     Spec {
         id: "patterns",

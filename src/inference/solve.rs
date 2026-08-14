@@ -261,7 +261,12 @@ impl Solve<'_> {
     ) {
         self.table.level = level;
         self.run(value);
-        let (scheme, _) = self.table.generalize(bound, level);
+        // A nested binding's scheme carries what the store requires of the
+        // presences it quantifies, exactly as a definition's does — a `let` in
+        // the middle of a body is generalized on the same terms as one at the
+        // top of a file.
+        let required = self.table.required(bound);
+        let (scheme, _) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
         self.schemes.insert(symbol, scheme);
@@ -281,7 +286,7 @@ impl Solve<'_> {
         // At the level of the use site, which is where the table is: a copy is
         // as new as the place it was made, whatever the scheme was generalized
         // at.
-        let copy = self.table.instantiate(&scheme);
+        let copy = self.table.instantiate(span, &scheme);
         self.unify(span, &copy, ty);
     }
 
@@ -828,7 +833,7 @@ impl Solve<'_> {
 
     /// A set of labels as it reads at this moment: every presence fixed at what
     /// it has been decided to be — still open becomes undecided, which prints as
-    /// the `?` the user would have written and which nothing downstream will
+    /// the mark the user would have written and which nothing downstream will
     /// rewrite — and the whole put back into the type the labels belong to.
     ///
     /// Already flattened by the time it arrives: [`Solve::labels`] is handed a

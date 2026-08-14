@@ -78,7 +78,7 @@ fn a_presence_mark_is_not_lit_as_a_variable() {
     // The optional fields' `?`s sit against their labels and stay dark; the
     // quantified type beside them still lights.
     let matches: Vec<&str> = pattern
-        .find_iter("{ a?: Nat, b?: 'b }")
+        .find_iter("{ a when a: Nat, b when b: 'b }")
         .map(|found| found.as_str())
         .collect();
     assert_eq!(matches, vec!["'b"]);
@@ -251,13 +251,13 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
 
     // An unhandled match: the coverage row carries the witness, marked as the
     // error it reports.
-    let nodes = tab("let p = fn a => match a with | {a, b} => 1 | {} => 2 end");
+    let nodes = tab("let bad = match {x: 1, y: 2} with {x} => {} | {y} => {} end");
     let coverage = nodes[0]
         .children
         .iter()
         .find(|child| child.label == "coverage")
         .expect("a coverage row");
-    assert_eq!(coverage.text, "unhandled: { a }");
+    assert_eq!(coverage.text, "unhandled: { x, y }");
     assert!(coverage.error);
 
     // An unreachable arm is marked as the error its row reports.
@@ -285,4 +285,125 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     );
     let coverage = nodes[0].children.last().expect("a coverage row");
     assert_eq!(coverage.text, "skipped");
+}
+
+/// The Presence tab: one section per batch of the store, in program order,
+/// each with what it came from, the formula it contributed and the running
+/// verdict — and then what every definition's scheme ended up requiring.
+#[test]
+fn the_presence_tab_renders_the_store_and_the_clauses() {
+    use ruddy_debug::{
+        snapshot::compile,
+        wire::{BundleSpec, CompileRequest, Node},
+    };
+
+    let tab = |source: &str| -> Vec<Node> {
+        let snapshot = compile(
+            &CompileRequest {
+                source: source.to_string(),
+                revision: 0,
+                bundle: BundleSpec::default(),
+            },
+            0,
+        );
+        snapshot
+            .stages
+            .into_iter()
+            .find(|stage| stage.id == "presence")
+            .expect("the presence stage is registered")
+            .nodes
+    };
+
+    // A match whose column converted: one coverage batch, satisfiable, with a
+    // disjunct per arm and the labels its presences decide — and the clause
+    // the definition ends up publishing.
+    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end");
+    let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
+    assert_eq!(labels, ["match-coverage", "let p"], "{nodes:#?}");
+    assert_eq!(nodes[1].text, "where a != b");
+    let rows: Vec<(&str, &str)> = nodes[0]
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(rows[0].0, "origin");
+    assert_eq!(rows[1].0, "verdict");
+    assert!(rows[1].1.starts_with("satisfiable"), "{rows:#?}");
+    assert_eq!(rows[2].0, "arm 0");
+    assert_eq!(rows[3].0, "arm 1");
+    assert_eq!(rows[4].0, "field x");
+    assert_eq!(rows[5].0, "field y");
+    // Every row points at the match it came from, so a click lights it.
+    assert!(nodes[0].span.is_some(), "{nodes:#?}");
+
+    // A use site that cannot be satisfied: the batch that flipped the store is
+    // marked as the error it owns, and it is the only one that is.
+    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}");
+    let flipped: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node.error)
+        .map(|node| node.label.as_str())
+        .collect();
+    assert_eq!(flipped, ["use-site"], "{nodes:#?}");
+    let use_site = nodes
+        .iter()
+        .find(|node| node.label == "use-site")
+        .expect("a use-site batch");
+    let verdict = use_site
+        .children
+        .iter()
+        .find(|child| child.label == "verdict")
+        .expect("a verdict row");
+    assert!(verdict.text.starts_with("unsatisfiable"), "{nodes:#?}");
+    assert!(verdict.error);
+    // And it says which label each of its presences decides, which is how its
+    // complaint is worded.
+    assert!(
+        use_site
+            .children
+            .iter()
+            .any(|child| child.label == "label x"),
+        "{nodes:#?}"
+    );
+
+    // An annotation's own clause is a batch of its own.
+    let nodes = tab("let f : { x when a: Nat } where a = { x: 1 }");
+    assert!(
+        nodes.iter().any(|node| node.label == "annotation"),
+        "{nodes:#?}"
+    );
+
+    // A program that constrains nothing still says so, per definition: the
+    // ordinary case is a tab full of "unconstrained" rather than an empty one.
+    let nodes = tab("let id = fn x => x");
+    assert_eq!(nodes.len(), 1, "{nodes:#?}");
+    assert_eq!(nodes[0].label, "let id");
+    assert_eq!(nodes[0].text, "unconstrained");
+}
+
+/// A program that never reaches inference leaves the tab with nothing to
+/// render, and the summary says so rather than the tab pretending the store was
+/// empty on purpose.
+#[test]
+fn the_presence_tab_counts_what_it_rendered() {
+    use ruddy_debug::{
+        snapshot::compile,
+        wire::{BundleSpec, CompileRequest},
+    };
+
+    let snapshot = compile(
+        &CompileRequest {
+            source: "let p = fn a => match a with | {x} => {} | {y} => {} end".to_string(),
+            revision: 0,
+            bundle: BundleSpec::default(),
+        },
+        0,
+    );
+    let stage = snapshot
+        .stages
+        .into_iter()
+        .find(|stage| stage.id == "presence")
+        .expect("the presence stage is registered");
+    assert_eq!(stage.summary, "1 constraint");
+    assert!(stage.micros.is_some());
 }

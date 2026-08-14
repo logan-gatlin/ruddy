@@ -9,13 +9,16 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use ruddy::{
-    ir::{Field, PatternKind, Program, Row, SumCase, Term, TermKind, TypeField, TypeKind},
+    ir::{
+        Annotation, ClauseKind, Field, PatternKind, Program, Row, SumCase, Term, TermKind,
+        TypeField, TypeKind, When,
+    },
     symbol::Mint,
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
+    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
     write_project, write_row, write_struct, write_sum, write_tag,
 };
 
@@ -38,6 +41,16 @@ trait Node {
     type Kind;
 
     fn kind(&self) -> &Self::Kind;
+}
+
+/// An annotation prints as its type and the `where` clause after it, so the IR
+/// tab shows the whole of what a definition was ascribed.
+impl Node for Annotation {
+    type Kind = Annotation;
+
+    fn kind(&self) -> &Annotation {
+        self
+    }
 }
 
 impl Node for Term {
@@ -186,7 +199,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             PatternKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
-                false,
+                None,
                 payload.as_deref().map(|payload| self.show(payload)),
             ),
             // Through `write_row` rather than `write_struct`, because a
@@ -196,7 +209,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             PatternKind::Struct { fields, rest } => {
                 let fields = self.pairs(fields).map(|(name, sub)| Entry::Written {
                     name,
-                    optional: false,
+                    mark: None,
                     holds: sub,
                 });
                 let rest = rest.as_ref().map(|_| "");
@@ -265,7 +278,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Tag { name, payload } => write_tag(
                 f,
                 &name.tracked,
-                false,
+                None,
                 payload.as_ref().map(|payload| self.show(&**payload)),
             ),
             TermKind::Project { base, field } => {
@@ -302,11 +315,9 @@ impl fmt::Display for Show<'_, TypeKind> {
             ),
             TypeKind::Sum { cases, tail } => {
                 let cases = cases.iter().map(|(name, case)| match case {
-                    SumCase::Written {
-                        optional, payload, ..
-                    } => Entry::Written {
+                    SumCase::Written { when, payload, .. } => Entry::Written {
                         name,
-                        optional: *optional,
+                        mark: mark(when),
                         holds: payload.as_ref().map(|ty| self.show(ty)),
                     },
                     SumCase::Absent { .. } => Entry::Absent { name },
@@ -328,11 +339,9 @@ impl fmt::Display for Show<'_, TypeKind> {
             TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
             TypeKind::Struct { fields, tail } => {
                 let fields = fields.iter().map(|(name, field)| match field {
-                    TypeField::Written {
-                        optional, value, ..
-                    } => Entry::Written {
+                    TypeField::Written { when, value, .. } => Entry::Written {
                         name,
-                        optional: *optional,
+                        mark: mark(when),
                         holds: self.show(value),
                     },
                     TypeField::Absent { .. } => Entry::Absent { name },
@@ -356,6 +365,92 @@ impl fmt::Display for Show<'_, TypeKind> {
     }
 }
 
+/// An annotation prints as the type it ascribes and the clause after it, which
+/// is what a reader wrote and what re-parses back to it.
+impl fmt::Display for Show<'_, Annotation> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.show(&self.node.ty))?;
+        match &self.node.clause {
+            Some(clause) => write!(f, " where {}", self.show(clause)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A lowered `where` clause, with exactly the parentheses re-parsing needs. The
+/// same ladder the compiler's own formula printer keeps, and for the same
+/// reason: a clause is its own grammar, so the type language's levels have
+/// nothing here to be compared against.
+impl fmt::Display for Show<'_, ClauseKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        clause_at(f, self.node, 0)
+    }
+}
+
+/// How tightly one clause binds: `0` for a comparison, `1` for `or`, `2` for
+/// `and`, `3` for `not`, `4` for a name.
+fn clause_prec(clause: &ClauseKind) -> u8 {
+    match clause {
+        ClauseKind::Equal(..) | ClauseKind::NotEqual(..) => 0,
+        ClauseKind::Or(..) => 1,
+        ClauseKind::And(..) => 2,
+        ClauseKind::Not(_) => 3,
+        ClauseKind::Name(_) => 4,
+    }
+}
+
+/// Write `clause` for a position that binds at least as tightly as `level`,
+/// bracketing it when it does not.
+fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt::Result {
+    let parens = clause_prec(clause) < level;
+    if parens {
+        f.write_str("(")?;
+    }
+    match clause {
+        ClauseKind::Name(name) => f.write_str(name)?,
+        ClauseKind::Not(inner) => {
+            f.write_str("not ")?;
+            clause_at(f, &inner.tracked, 3)?;
+        }
+        // Left-associative, so the right side is written one level tighter.
+        ClauseKind::And(left, right) => {
+            clause_at(f, &left.tracked, 2)?;
+            f.write_str(" and ")?;
+            clause_at(f, &right.tracked, 3)?;
+        }
+        ClauseKind::Or(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" or ")?;
+            clause_at(f, &right.tracked, 2)?;
+        }
+        // Non-associative, so both sides go one level tighter.
+        ClauseKind::Equal(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" = ")?;
+            clause_at(f, &right.tracked, 1)?;
+        }
+        ClauseKind::NotEqual(left, right) => {
+            clause_at(f, &left.tracked, 1)?;
+            f.write_str(" != ")?;
+            clause_at(f, &right.tracked, 1)?;
+        }
+    }
+    if parens {
+        f.write_str(")")?;
+    }
+    Ok(())
+}
+
+/// The `when` clause a lowered label wears. `when _` is the anonymous presence,
+/// spelled back as the `_` it was written as.
+fn mark(when: &Option<Box<When>>) -> Option<Mark> {
+    let when = when.as_ref()?;
+    Some(Mark::When(match &when.name {
+        Some(name) => name.clone(),
+        None => "_".to_string(),
+    }))
+}
+
 /// Render a whole program, every type in declaration order and then every term.
 pub fn program<'a>(program: &'a Program, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show {
@@ -373,6 +468,12 @@ pub fn term<'a>(kind: &'a TermKind, mint: &'a Mint) -> impl fmt::Display + 'a {
 
 /// Render one type, the [`term`] counterpart.
 pub fn ty<'a>(kind: &'a TypeKind, mint: &'a Mint) -> impl fmt::Display + 'a {
+    Show { node: kind, mint }
+}
+
+/// Render one lowered `where` clause, the [`ty`] counterpart for the formula
+/// beside an annotation.
+pub fn clause<'a>(kind: &'a ClauseKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
 }
 

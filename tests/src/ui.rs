@@ -12,6 +12,7 @@ use std::{
     rc::Rc,
 };
 
+use indexmap::IndexMap;
 use ruddy::{
     inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Goal, Rule},
     ir::{self, ErrorKind as IrError},
@@ -20,7 +21,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
-    types::{Assigned, Core, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
+    types::{Assigned, Core, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
     ui,
 };
 use ruddy_debug::print;
@@ -108,6 +109,10 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateBinding {
             name: "x".to_string(),
         },
+        IrError::ClauseInDeclaration,
+        IrError::UnboundPresence {
+            name: "c".to_string(),
+        },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -148,6 +153,16 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         TypeError::RepeatedField {
             shape: Shape::Struct,
             field: "x".to_string(),
+        },
+        TypeError::PresenceRequired {
+            formula: "x != y".to_string(),
+        },
+        TypeError::PresenceImpossible {
+            formula: "x and y".to_string(),
+        },
+        TypeError::AnnotationAllows {
+            allowed: "a or b".to_string(),
+            required: "a".to_string(),
         },
     ] {
         all.push(("types", kind.code(), kind.to_string()));
@@ -580,7 +595,7 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
             .collect(),
         }
         .to_string(),
-        "{ x?: Nat }"
+        "{ x when a: Nat }"
     );
 
     // `{ x: Nat, .. }` does parse, and what it parses to is a row with a fresh
@@ -770,7 +785,7 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         TokenKind::Comma,
         TokenKind::Dot,
         TokenKind::DotDot,
-        TokenKind::Question,
+        TokenKind::NotEqual,
         TokenKind::Pipe,
         TokenKind::Underscore,
         TokenKind::LeftBrace,
@@ -1080,8 +1095,8 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // the surface tree rather than the lowered one — through every form a
     // written row can take, so a refusal at any of its writes comes back
     // whichever form is being written.
-    let source = "let x : { first: Nat, opt?: Nat, \\hole, .. } \
-                  -> (|) -> (| ..r) -> (`Ok Nat | `Err? | \\`B | ..) -> (`A | `B) = 1";
+    let source = "let x : { first: Nat, opt when b: Nat, \\hole, .. } \
+                  -> (|) -> (| ..r) -> (`Ok Nat | `Err (when a) | \\`B | ..) -> (`A | `B) = 1";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     every_failure_is_reported(
@@ -1286,7 +1301,9 @@ fn the_three_sorts_each_print_on_their_own() {
         (Presence::Present, "present"),
         (Presence::Absent, "absent"),
         (Presence::Var(4), "?4"),
-        (Presence::Bound(1), "'b"),
+        // A presence has its own alphabet, and no quote: the letter is the
+        // name a `when` clause gave it.
+        (Presence::Bound(1), "b"),
         (Presence::Undecided, "?"),
     ] {
         assert_eq!(presence.to_string(), printed);
@@ -1488,7 +1505,24 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
             )],
         )
         .to_string(),
+        // The one presence still written `?`: nothing parses it, and what it
+        // reports is that there is nothing to write.
         "{ x?: Nat, .. }"
+    );
+    // Every other undecided presence wears the `when` clause that names it.
+    assert_eq!(
+        with_fields(
+            Core::Undecided,
+            vec![(
+                "x",
+                RowField {
+                    presence: Presence::Bound(0),
+                    ty: nat.clone(),
+                }
+            )],
+        )
+        .to_string(),
+        "{ x when a: Nat, .. }"
     );
 
     // A field the solver settled absent is not part of what the type says, so
@@ -1953,4 +1987,150 @@ fn a_misplaced_wildcard_is_worded_for_its_position() {
         assert!(!wording.ends_with('.'), "{wording}");
         assert!(!wording.to_lowercase().contains("wildcard"), "{wording}");
     }
+}
+
+/// A formula prints in the surface `where` grammar, with exactly the
+/// parentheses re-parsing needs and no others — and the two shapes a reader
+/// wrote keep their own spellings.
+#[test]
+fn a_formula_prints_in_the_where_grammar() {
+    let a = Formula::bound(0);
+    let b = Formula::bound(1);
+    let c = Formula::bound(2);
+    for (formula, printed) in [
+        (a.clone(), "a"),
+        (a.clone().not(), "not a"),
+        (a.clone().not().not(), "a"),
+        (a.clone().and(b.clone()), "a and b"),
+        (a.clone().or(b.clone()), "a or b"),
+        (a.clone().iff(b.clone()), "a = b"),
+        (a.clone().xor(b.clone()), "a != b"),
+        // `and` binds tighter than `or`, which binds tighter than a
+        // comparison, so none of these needs a bracket.
+        (a.clone().or(b.clone().and(c.clone())), "a or b and c"),
+        (a.clone().and(b.clone()).or(c.clone()), "a and b or c"),
+        (a.clone().iff(b.clone().or(c.clone())), "a = b or c"),
+        // And these do, because the grammar reads them the other way round
+        // without them.
+        (a.clone().or(b.clone()).and(c.clone()), "(a or b) and c"),
+        (a.clone().and(b.clone()).not(), "not (a and b)"),
+        (a.clone().and(b.clone().or(c.clone())), "a and (b or c)"),
+        (a.clone().iff(b.clone()).or(c.clone()), "(a = b) or c"),
+        (a.clone().xor(b.clone().iff(c.clone())), "a != (b = c)"),
+        // Left-associative, so a right-nested one of the same level brackets.
+        (a.clone().or(b.clone().or(c.clone())), "a or (b or c)"),
+        (a.clone().and(b.clone().and(c.clone())), "a and (b and c)"),
+        // Neither constant has a spelling in the grammar, and neither has to.
+        (Formula::True, "always"),
+        (Formula::False, "never"),
+    ] {
+        assert_eq!(formula.to_string(), printed);
+    }
+}
+
+/// What a printed formula says has to be readable back, so every parenthesised
+/// form above re-parses to a clause spelling itself the same way.
+#[test]
+fn a_printed_formula_reads_back_as_itself() {
+    for clause in [
+        "a",
+        "not a",
+        "a and b",
+        "a or b",
+        "a = b",
+        "a != b",
+        "a or b and c",
+        "a and b or c",
+        "a = b or c",
+        "(a or b) and c",
+        "not (a and b)",
+        "a and (b or c)",
+        "(a = b) or c",
+        "a != (b = c)",
+        "a or (b or c)",
+        "a and (b and c)",
+    ] {
+        let src =
+            format!("type T = {{ a when a: Nat, b when b: Nat, c when c: Nat }} where {clause}");
+        let out = parse::parse(token::lex(&src, FileID::GENERATED).tokens);
+        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+        let parse::StmtKind::Type { body, .. } = &out.stmts[0].tracked else {
+            panic!("expected a declaration");
+        };
+        let written = body.clause.as_ref().expect("the clause");
+        assert_eq!(
+            print::ast::clause(&written.tracked).to_string(),
+            clause,
+            "{src}"
+        );
+    }
+}
+
+/// The `?` survives as the one thing a printer still has to be able to say
+/// about a presence a failure abandoned — on a field and on a case alike —
+/// and nothing parses it back, which is exactly what it is reporting.
+#[test]
+fn an_abandoned_presence_still_prints_as_a_question_mark() {
+    let undecided = |ty: Rc<Ty>| RowField {
+        presence: Presence::Undecided,
+        ty,
+    };
+    let nat = Rc::new(Ty::plain(Core::Nat));
+    let fields: IndexMap<String, RowField> = [("x".to_string(), undecided(nat.clone()))]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        Ty {
+            core: Core::Unit,
+            fields
+        }
+        .to_string(),
+        "{ x?: Nat }"
+    );
+
+    let cases: IndexMap<String, RowField> =
+        [("A".to_string(), undecided(nat))].into_iter().collect();
+    assert_eq!(
+        Ty::plain(Core::Sum(Row {
+            labels: cases,
+            rest: Rest::Closed,
+        }))
+        .to_string(),
+        "`A? Nat"
+    );
+}
+
+/// A presence has an alphabet of its own — the bare `a` of a `when` clause —
+/// and a type variable keeps its quote. The two pools are independent, so one
+/// scheme's `'a` and `a` are two variables however alike they look.
+#[test]
+fn the_two_alphabets_are_told_apart_by_the_quote() {
+    assert_eq!(Core::Bound(0).to_string(), "'a");
+    assert_eq!(Presence::Bound(0).to_string(), "a");
+    assert_eq!(Presence::Bound(26).to_string(), "a1");
+    assert_eq!(Formula::bound(25).to_string(), "z");
+    assert_eq!(Formula::var(3).to_string(), "?3");
+}
+
+/// A complaint about a use site quotes its formula in the labels the presences
+/// decide, because that is what the reader wrote — they never saw the variable.
+#[test]
+fn a_formula_can_be_quoted_in_its_labels() {
+    let formula = Formula::var(0).xor(Formula::var(1));
+    assert_eq!(ui::in_labels(&formula, &[]), "?0 != ?1");
+    assert_eq!(
+        ui::in_labels(
+            &formula,
+            &[
+                ("x".to_string(), Presence::Var(0)),
+                ("y".to_string(), Presence::Var(1)),
+            ]
+        ),
+        "x != y"
+    );
+    // A presence no label decides falls back to the presence itself.
+    assert_eq!(
+        ui::in_labels(&formula, &[("x".to_string(), Presence::Var(0))]),
+        "x != ?1"
+    );
 }
