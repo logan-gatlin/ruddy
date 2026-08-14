@@ -808,3 +808,76 @@ fn a_field_the_type_never_named_is_still_a_column() {
         )]
     );
 }
+
+/// R11 over a column inference did *not* convert: the walk still reads the
+/// store. The `let` above the match makes `x != y` of the scrutinee, so the
+/// value with both fields is no value at all, and the three arms below cover
+/// everything left — even though the natural test in the first of them keeps
+/// the column out of the conversion.
+#[test]
+fn a_non_qualifying_column_reads_the_store_for_exhaustiveness() {
+    let src = "let g = fn v =>\n\
+               \x20 let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20 match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+}
+
+/// The same store, the same unconverted column, and the other question: an arm
+/// demanding both fields at once demands what `x != y` forbids, so no value
+/// reaches it. Nothing about the arms above it says so — it is the store alone.
+#[test]
+fn a_non_qualifying_column_reads_the_store_for_reachability() {
+    let src = "let g = fn v =>\n\
+               \x20 let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20 match v with\n\
+               \x20 | {x: 1} => 1 | {x: n, y} => 2 | {x: n} => 3 | {y} => 4 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.find("{x: n, y}").expect("the arm the store forbids")
+        )],
+        "{checks:#?}"
+    );
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(
+        verdicts(report),
+        [
+            Verdict::Reachable,
+            Verdict::Unreachable,
+            Verdict::Reachable,
+            Verdict::Reachable
+        ]
+    );
+}
+
+/// A store with nothing in it says nothing, and the walk over an unconverted
+/// column reads exactly as it always did: R6 leaves such a column's own
+/// coverage where it was, and this path only ever reads the store.
+#[test]
+fn a_non_qualifying_column_with_no_constraints_reads_as_before() {
+    let src = "let m = fn v => match v with | {x: 1} => 1 | {y} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.store.batches.is_empty(), "{:#?}", inferred.store);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unhandled-values@{}",
+            src.find("match").expect("the match")
+        )],
+        "{checks:#?}"
+    );
+    assert_eq!(witness_of(&checks), "{ x: 1, y }");
+}

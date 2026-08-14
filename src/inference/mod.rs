@@ -2626,8 +2626,9 @@ fn lower_annotation(
         Some(clause) => clause_formula(&tails, clause),
         None => Formula::True,
     };
-    // In the order the reader wrote them, so a complaint about the clause names
-    // its presences the way the annotation does.
+    // In one fixed order, because they come out of a hash map and the order it
+    // hands them over is nobody's: a complaint about the clause names its
+    // presences the same way on every run, which alphabetical is enough for.
     let mut names: Vec<(String, Presence)> = tails.presences.into_iter().collect();
     names.sort_by(|(one, _), (other, _)| one.cmp(other));
     (lowered, formula, names)

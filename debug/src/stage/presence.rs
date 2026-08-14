@@ -9,8 +9,7 @@
 //! follows.
 //!
 //! Under the batches, what each definition's scheme came to require of the
-//! presences it quantifies — the `where` clause a reader sees on the type. A
-//! scheme requiring nothing has no row here rather than a row saying so; the
+//! presences it quantifies — the `where` clause a reader sees on the type. The
 //! ordinary program is the one with no section at all, which is what R13 asks
 //! the tab to look like.
 //!
