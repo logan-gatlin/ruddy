@@ -123,14 +123,18 @@ fn lexes_the_comparison() {
     ));
 }
 
-/// A lone `!` is reported at the `!` itself, for the reason a lone `-` is.
+/// A lone `!` is the effect row's own token, and `!=` is still the comparison:
+/// the longer lexeme wins, the way `..` beats two dots, so `a !=b` is one
+/// comparison rather than a row mark beside an assignment.
 #[test]
-fn a_lone_bang_is_unrecognized() {
-    let out = errors("a ! b");
-    assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
-    assert_eq!(out[0].span.start, 2);
-    assert_eq!(out[0].span.width, 1);
+fn a_lone_bang_is_the_effect_mark() {
+    assert!(matches!(kinds("a ! b")[..], [_, Kind::Bang, _]));
+    assert!(matches!(
+        kinds("Nat -> Nat!`Log")[..],
+        [_, _, _, Kind::Bang, _]
+    ));
+    assert!(matches!(kinds("a !=b")[..], [_, Kind::NotEqual, _]));
+    assert!(errors("a ! b").is_empty());
 }
 
 /// The `?` that used to mark an optional field is gone from the language, so
@@ -311,4 +315,28 @@ fn names_containing_match_are_still_names() {
     assert!(matches!(&kinds("matches")[..], [Kind::Identifier(name)] if name == "matches"));
     assert!(matches!(&kinds("matchbox")[..], [Kind::Identifier(name)] if name == "matchbox"));
     assert!(matches!(&kinds("rematch")[..], [Kind::Identifier(name)] if name == "rematch"));
+}
+
+/// The three words an effect declaration, a handler and an abort are written
+/// with are reserved: they stop being usable as names, which is what makes one
+/// token of lookahead enough everywhere they appear.
+#[test]
+fn the_effect_keywords_are_reserved() {
+    assert!(matches!(kinds("effect")[..], [Kind::Effect]));
+    assert!(matches!(kinds("handle")[..], [Kind::Handle]));
+    assert!(matches!(kinds("raise")[..], [Kind::Raise]));
+    // The rule that keeps `matches` a name keeps these apart from words that
+    // merely start the same way.
+    assert!(matches!(kinds("effects")[..], [Kind::Identifier(_)]));
+    assert!(matches!(kinds("handler")[..], [Kind::Identifier(_)]));
+    assert!(matches!(kinds("raised")[..], [Kind::Identifier(_)]));
+}
+
+/// `return` is not one of them. It heads a handler arm and is an ordinary name
+/// everywhere else, so the lexer hands it over as the identifier it is and the
+/// one position that reads it recognizes it by spelling — the rule `when` and
+/// `where` already keep.
+#[test]
+fn return_is_an_ordinary_identifier() {
+    assert!(matches!(&kinds("return")[..], [Kind::Identifier(name)] if name == "return"));
 }

@@ -58,17 +58,23 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     // Both namespaces of all three name errors: the namespace is part of the
     // code, so an undefined type and an undefined term are two diagnostics
     // here, and so are the two halves of a loop of bare names.
-    for namespace in [Namespace::Terms, Namespace::Types] {
+    for namespace in [Namespace::Terms, Namespace::Types, Namespace::Effects] {
         for kind in [
             IrError::Undefined { namespace },
             IrError::Duplicate {
                 namespace,
                 previous: span,
             },
-            IrError::Circular { namespace },
         ] {
             all.push(("ir", kind.code(), kind.to_string()));
         }
+    }
+    // A loop of bare names is a term's mistake or a type's; an effect stands
+    // for a set of effects however many aliases it reaches through, so nothing
+    // about one can lead nowhere.
+    for namespace in [Namespace::Terms, Namespace::Types] {
+        let kind = IrError::Circular { namespace };
+        all.push(("ir", kind.code(), kind.to_string()));
     }
     for kind in [
         IrError::DuplicateField,
@@ -97,7 +103,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             first: Sense::Type,
             second: Sense::Cases,
         },
-        IrError::NotARow,
+        IrError::NotARow {
+            sense: Sense::Cases,
+        },
         IrError::RepeatedRowField {
             shape: Shape::Struct,
             field: "x".to_string(),
@@ -113,6 +121,30 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::UnboundPresence {
             name: "c".to_string(),
         },
+        IrError::DuplicateOperation,
+        IrError::NotAnOperation {
+            name: "here".to_string(),
+        },
+        IrError::ImpureOperation,
+        IrError::MixedEffectForm,
+        IrError::OperationOnAlias {
+            effect: "Console".to_string(),
+        },
+        IrError::UnknownOperation {
+            effect: "Log".to_string(),
+            op: "writ".to_string(),
+        },
+        IrError::PartialHandler {
+            effect: "Log".to_string(),
+            missing: vec!["flush".to_string()],
+        },
+        IrError::DuplicateArm {
+            effect: "Log".to_string(),
+            op: "write".to_string(),
+        },
+        IrError::DuplicateReturn { previous: span },
+        IrError::RaiseOutsideArm,
+        IrError::RaiseInFunction,
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -167,6 +199,12 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             allowed: "a or b".to_string(),
             required: "a".to_string(),
         },
+        TypeError::Unhandled {
+            effect: "Log".to_string(),
+        },
+        TypeError::NotAllowed {
+            effect: "Log".to_string(),
+        },
     ] {
         all.push(("types", kind.code(), kind.to_string()));
     }
@@ -191,6 +229,7 @@ const RULES: &[Rule] = &[
     },
     Rule::Prim,
     Rule::Arrow,
+    Rule::Performs,
     Rule::Struct,
     Rule::Sum,
     Rule::Presence {
@@ -271,10 +310,11 @@ fn every_rule_is_named_and_explained_distinctly() {
 /// solver ran, and the goal beside it already shows which shape it ran on.
 #[test]
 fn a_shaped_rule_is_read_in_the_nouns_of_its_shape() {
-    for shape in [Shape::Struct, Shape::Sum] {
+    for shape in [Shape::Struct, Shape::Sum, Shape::Effect] {
         let (theirs, others) = match shape {
             Shape::Struct => ("field", "case"),
             Shape::Sum => ("case", "field"),
+            Shape::Effect => ("effect", "field"),
         };
         for rule in [Rule::Presence { shape }, Rule::Overlap { shape }] {
             let message = rule.to_string();
@@ -462,7 +502,7 @@ fn round_trip(prelude: &str, printed: &str) -> String {
 #[test]
 fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let nat = Rc::new(Ty::plain(Core::Nat));
-    let endo = Rc::new(Ty::plain(Core::Arrow(nat.clone(), nat.clone())));
+    let endo = Rc::new(Ty::plain(Core::pure(nat.clone(), nat.clone())));
 
     // A declared type prints as its name and is an atom whatever it stands
     // for, so the arrow behind this one leaks no parentheses through it. It
@@ -483,7 +523,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         // the right side must not acquire any.
         (
             "",
-            Rc::new(Ty::plain(Core::Arrow(endo.clone(), endo.clone()))),
+            Rc::new(Ty::plain(Core::pure(endo.clone(), endo.clone()))),
             "(Nat -> Nat) -> Nat -> Nat",
         ),
         // The empty struct is unit, and prints as the one spelling this
@@ -509,7 +549,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         ),
         (
             "type Endo = Nat -> Nat\n",
-            Rc::new(Ty::plain(Core::Arrow(named.clone(), named.clone()))),
+            Rc::new(Ty::plain(Core::pure(named.clone(), named.clone()))),
             "Endo -> Endo",
         ),
     ] {
@@ -679,8 +719,15 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
     };
     assert!(repeated.to_string().contains("cases"), "{repeated}");
     assert!(repeated.to_string().contains("``A`"), "{repeated}");
-    let not_a_row = IrError::NotARow;
+    let not_a_row = IrError::NotARow {
+        sense: Sense::Cases,
+    };
     assert!(not_a_row.to_string().contains("sum's cases"), "{not_a_row}");
+    let effects = IrError::NotARow {
+        sense: Sense::Effects,
+    };
+    assert!(effects.to_string().contains("arrow's effects"), "{effects}");
+    assert_eq!(not_a_row.code(), effects.code());
 
     // Including the one a declaration raises about being left open: a `?` on a
     // case and a `?` on a field are the same mistake, and lowering reaches them
@@ -1000,7 +1047,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     for (what, ty) in [
         (
             "an arrow",
-            Rc::new(Ty::plain(Core::Arrow(nat.clone(), nat.clone()))),
+            Rc::new(Ty::plain(Core::pure(nat.clone(), nat.clone()))),
         ),
         ("an application", named.clone()),
         (
@@ -1139,11 +1186,11 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
     // fields, and bracketing here would be noise on the commonest form there
     // is — the type of an unannotated accessor.
     assert_eq!(
-        Ty::plain(Core::Arrow(quantified.clone(), nat.clone())).to_string(),
+        Ty::plain(Core::pure(quantified.clone(), nat.clone())).to_string(),
         "Nat with { x: 'a } -> Nat"
     );
     assert_eq!(
-        Ty::plain(Core::Arrow(nat.clone(), quantified.clone())).to_string(),
+        Ty::plain(Core::pure(nat.clone(), quantified.clone())).to_string(),
         "Nat -> Nat with { x: 'a }"
     );
 
@@ -1553,7 +1600,7 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
         "Nat with { x: Nat }"
     );
     assert_eq!(
-        with_fields(Core::Arrow(nat.clone(), nat.clone()), x()).to_string(),
+        with_fields(Core::pure(nat.clone(), nat.clone()), x()).to_string(),
         "(Nat -> Nat) with { x: Nat }"
     );
     assert_eq!(
@@ -1674,6 +1721,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             symbol,
             bound: nat.clone(),
             level: 1,
+            opened: 0..0,
             promised: Formula::True,
             value: Vec::new(),
             body: Vec::new(),
@@ -1710,6 +1758,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
             symbol,
             bound: nat.clone(),
             level: 2,
+            opened: 0..0,
             promised: Formula::True,
             value: Vec::new(),
             body: Vec::new(),
@@ -1723,6 +1772,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
         symbol,
         bound: nat.clone(),
         level: 2,
+        opened: 0..0,
         promised: Formula::var(0).xor(Formula::var(1)),
         value: Vec::new(),
         body: Vec::new(),
@@ -2152,4 +2202,184 @@ fn a_formula_can_be_quoted_in_its_labels() {
         ui::in_labels(&formula, &[("x".to_string(), Presence::Var(0))]),
         "x != ?1"
     );
+}
+
+/// Every complaint the effect feature added, in the words a reader meets. Kept
+/// beside the codes rather than only among them, because what these say is the
+/// whole of what a reader has to act on — and none of them may say "row",
+/// which names the representation the three shapes share and nothing anybody
+/// wrote.
+#[test]
+fn the_effect_complaints_are_read_in_effects() {
+    for (kind, message) in [
+        (
+            IrError::NotAnOperation {
+                name: "here".to_string(),
+            },
+            "an operation must be a function: write ``here : Nat -> ()`",
+        ),
+        (
+            IrError::ImpureOperation,
+            "an operation's signature must be plain; `!`, `..` and `when` belong in annotations",
+        ),
+        (
+            IrError::MixedEffectForm,
+            "an effect either declares operations or names other effects, not both",
+        ),
+        (
+            IrError::OperationOnAlias {
+                effect: "Console".to_string(),
+            },
+            "an alias names effects and declares no operations, so `Console` has none to perform",
+        ),
+        (
+            IrError::UnknownOperation {
+                effect: "Log".to_string(),
+                op: "writ".to_string(),
+            },
+            "no operation ``writ` on effect `Log`",
+        ),
+        (
+            IrError::PartialHandler {
+                effect: "Log".to_string(),
+                missing: vec!["flush".to_string()],
+            },
+            "handling `Log` needs an arm for ``flush` too",
+        ),
+        (
+            IrError::DuplicateArm {
+                effect: "Log".to_string(),
+                op: "write".to_string(),
+            },
+            "duplicate arm for `Log.`write`",
+        ),
+        (
+            IrError::DuplicateReturn {
+                previous: Span::generated(0, 1),
+            },
+            "duplicate return arm",
+        ),
+        (IrError::RaiseOutsideArm, "raise belongs in a handler arm"),
+        (
+            IrError::RaiseInFunction,
+            "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
+        ),
+        (
+            IrError::OpenDeclaredType {
+                shape: Shape::Effect,
+            },
+            "a declared type must list its effects exactly; `..` and `when` belong in annotations",
+        ),
+    ] {
+        assert_eq!(kind.to_string(), message, "{}", kind.code());
+    }
+
+    for (kind, message) in [
+        (
+            TypeError::Unhandled {
+                effect: "Log".to_string(),
+            },
+            "nothing can handle ``Log` here: a definition's value is computed outside every handler",
+        ),
+        (
+            TypeError::NotAllowed {
+                effect: "Log".to_string(),
+            },
+            "this function performs ``Log`, which its type does not allow",
+        ),
+        (
+            TypeError::ExtraField {
+                shape: Shape::Effect,
+                base: Rc::new(Ty::plain(Core::pure(
+                    Rc::new(Ty::plain(Core::Nat)),
+                    Rc::new(Ty::plain(Core::Nat)),
+                ))),
+                field: "Log".to_string(),
+            },
+            "extra effect ``Log`: the type `Nat -> Nat` lists every effect it allows",
+        ),
+        (
+            TypeError::RepeatedField {
+                shape: Shape::Effect,
+                field: "Log".to_string(),
+            },
+            "`..` covers only the effects a type does not already name, and here it would have to cover ``Log`",
+        ),
+    ] {
+        assert_eq!(kind.to_string(), message, "{}", kind.code());
+    }
+}
+
+/// A missing operation is named in a sentence, and every one of them: an arm
+/// per operation is what the reader has to write, so listing all of them is
+/// the instruction rather than a count of how far off they are.
+#[test]
+fn a_partial_handler_names_every_operation_with_no_arm() {
+    let named = |missing: &[&str]| {
+        IrError::PartialHandler {
+            effect: "Log".to_string(),
+            missing: missing.iter().map(|name| name.to_string()).collect(),
+        }
+        .to_string()
+    };
+    assert_eq!(
+        named(&["flush"]),
+        "handling `Log` needs an arm for ``flush` too"
+    );
+    assert_eq!(
+        named(&["flush", "close"]),
+        "handling `Log` needs an arm for ``flush` and ``close` too"
+    );
+    assert_eq!(
+        named(&["flush", "close", "sync"]),
+        "handling `Log` needs an arm for ``flush`, ``close` and ``sync` too"
+    );
+}
+
+/// The one rule that widens rather than equates reads as the widening it is,
+/// and the constraint it comes from prints its two rows in the effect notation
+/// — an ambient belongs to no type, so there is no arrow around it to hand one
+/// down.
+#[test]
+fn the_performs_constraint_reads_as_a_widening() {
+    let row = |labels: &[&str], rest: Rest| Row {
+        labels: labels
+            .iter()
+            .map(|name| (name.to_string(), RowField::present(Rc::new(Ty::unit()))))
+            .collect(),
+        rest,
+    };
+    let kind = ConstraintKind::Performs {
+        performed: row(&["Log"], Rest::Closed),
+        ambient: row(&["Log", "IO"], Rest::Var(3)),
+        inside: true,
+    };
+    assert_eq!(kind.code(), "performs");
+    assert_eq!(
+        kind.to_string(),
+        "`Log performed where `Log | `IO | ..?3 is allowed"
+    );
+    // The empty row writes the `|` it is spelled with rather than nothing at
+    // all, which would leave the line with a gap in it.
+    let empty = ConstraintKind::Performs {
+        performed: row(&[], Rest::Closed),
+        ambient: row(&[], Rest::Closed),
+        inside: false,
+    };
+    assert_eq!(empty.to_string(), "| performed where | is allowed");
+}
+
+/// The token spellings of the three reserved words and the `!` that introduces
+/// an effect row, so a printed stream re-lexes to the tokens it came from.
+#[test]
+fn the_effect_tokens_print_as_they_were_written() {
+    for (kind, spelled) in [
+        (TokenKind::Effect, "effect"),
+        (TokenKind::Handle, "handle"),
+        (TokenKind::Raise, "raise"),
+        (TokenKind::Bang, "!"),
+        (TokenKind::NotEqual, "!="),
+    ] {
+        assert_eq!(kind.to_string(), spelled);
+    }
 }

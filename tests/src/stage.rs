@@ -1,7 +1,9 @@
 //! Tests for [`ruddy_debug::stage`].
 
+use std::rc::Rc;
+
 use regex::Regex;
-use ruddy::types::Core;
+use ruddy::types::{Core, Rest, Row, Ty};
 use ruddy_debug::{
     stage::{Build, REGISTRY, Spec, panicked, skipped},
     wire::Stage,
@@ -457,4 +459,31 @@ fn the_presence_tab_counts_what_it_rendered() {
         .expect("the presence stage is registered");
     assert_eq!(stage.summary, "1 constraint");
     assert!(stage.micros.is_some());
+}
+
+/// An effect tail prints `..'a` the way a struct's and a sum's do, so the
+/// pattern the tabs declare has to light one up wherever it lands — including
+/// after the `!`, which is a position that did not exist when the pattern was
+/// written.
+#[test]
+fn the_variables_pattern_reaches_an_effect_tail() {
+    let pattern = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "types")
+        .expect("the types tab is registered")
+        .highlight
+        .expect("it declares a pattern");
+    let printed = Ty::plain(Core::Arrow(
+        Rc::new(Ty::plain(Core::Bound(0))),
+        Rc::new(Ty::plain(Core::Bound(0))),
+        Row::of(Rest::Bound(1)),
+    ))
+    .to_string();
+    assert_eq!(printed, "'a -> 'a ! ..'b");
+    let found: Vec<&str> = Regex::new(pattern)
+        .expect("the pattern compiles")
+        .find_iter(&printed)
+        .map(|at| at.as_str())
+        .collect();
+    assert_eq!(found, ["'a", "'a", "'b"]);
 }

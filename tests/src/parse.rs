@@ -1408,3 +1408,248 @@ fn a_rest_must_end_the_struct_pattern() {
     assert_eq!(out.errors[0].span.start, src.len());
     assert_eq!(out.errors[0].span.width, 0);
 }
+
+/// Both forms of an `effect` declaration, printed back as they were written.
+/// Which of the two a declaration is, is not the parser's to say — it records
+/// the cases and lowering reads the `:`s — so a mixed one parses too.
+#[test]
+fn effect_declarations() {
+    assert_eq!(
+        parse_one("effect Log = `write : Nat -> ()"),
+        "effect Log = | `write : Nat -> ()"
+    );
+    assert_eq!(
+        parse_one("effect Log = `write : Nat -> () | `flush : () -> ()"),
+        "effect Log = | `write : Nat -> () | `flush : () -> ()"
+    );
+    // An alias: bare tags, no signatures.
+    assert_eq!(
+        parse_one("effect Console = `Log | `IO"),
+        "effect Console = | `Log | `IO"
+    );
+    // The leading `|` is optional, as it is on a sum.
+    assert_eq!(
+        parse_one("effect Console = | `Log"),
+        "effect Console = | `Log"
+    );
+    // The empty effect declares nothing and is written with the bar alone.
+    assert_eq!(parse_one("effect Nil = |"), "effect Nil = |");
+    // A mix of the two forms parses; refusing it is lowering's.
+    assert_eq!(
+        parse_one("effect Bad = `Log | `w : Nat -> ()"),
+        "effect Bad = | `Log | `w : Nat -> ()"
+    );
+}
+
+/// A `|` between cases promises another one, so nothing after it is reported
+/// at the bar — the rule a sum type keeps. The leading bar promises nothing.
+#[test]
+fn an_effect_case_list_ends_at_a_bar_that_promised_one() {
+    let out = parse(lex("effect E = `a | ", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+}
+
+/// The `!` clause binds to the arrow parsed at its own level, which the
+/// right-associative recursion makes the innermost one. There is no spelling of
+/// `(A -> B) ! E`, so the printer's parentheses are the only thing that says
+/// which arrow a row is on — and the round-trip in [`parse_one`] is what holds
+/// it to that.
+#[test]
+fn an_effect_row_binds_to_the_innermost_arrow() {
+    // Bare: the row sits on the one arrow there is.
+    assert_eq!(
+        parse_one("let f : A -> B ! `Log = g"),
+        "let f : A -> B ! `Log = g"
+    );
+    // Three types, one arrow written twice: the row is on `B -> C`.
+    let inner = parse_stmt("let f : A -> B -> C ! `Log = g");
+    let TypeKind::Arrow { to, effects, .. } = arrow_of(&inner) else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.is_none(), "the outer arrow carries no row");
+    assert!(
+        matches!(
+            &to.tracked,
+            TypeKind::Arrow {
+                effects: Some(_),
+                ..
+            }
+        ),
+        "the inner arrow carries it: {to:#?}"
+    );
+    assert_eq!(
+        parse_one("let f : A -> B -> C ! `Log = g"),
+        "let f : A -> B -> C ! `Log = g"
+    );
+
+    // Parenthesized, the result comes back through an atom and never builds an
+    // arrow at this level, so the row lands on the outer one.
+    let outer = parse_stmt("let f : A -> (B -> C) ! `Log = g");
+    let TypeKind::Arrow { to, effects, .. } = arrow_of(&outer) else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.is_some(), "the outer arrow carries the row");
+    assert!(
+        matches!(&to.tracked, TypeKind::Arrow { effects: None, .. }),
+        "the inner arrow carries none: {to:#?}"
+    );
+    assert_eq!(
+        parse_one("let f : A -> (B -> C) ! `Log = g"),
+        "let f : A -> (B -> C) ! `Log = g"
+    );
+
+    // And a higher-order argument that may perform something.
+    assert_eq!(
+        parse_one("let f : (A -> B ! `Log) -> C = g"),
+        "let f : (A -> B ! `Log) -> C = g"
+    );
+}
+
+/// The row is written in the syntax a sum's cases are: a `|` between effects,
+/// an optional `..` tail, a `when` clause in parentheses, and the `\` of one
+/// written absent. `! |` is the empty row — the same thing a bare arrow means,
+/// written out.
+#[test]
+fn an_effect_row_is_written_as_a_sum_row_is() {
+    for source in [
+        "let f : A -> B ! `Log | `IO = g",
+        "let f : A -> B ! `Log | ..e = g",
+        "let f : A -> B ! ..e = g",
+        "let f : A -> B ! `Log (when a) | `IO (when b) = g",
+        "let f : A -> B ! \\`IO | ..e = g",
+        "let f : A -> B ! | = g",
+        "let f : A -> B ! `Log where a = g",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+}
+
+/// A `!` with no arrow to attach to is reported where it was written rather
+/// than left for whatever the type was being read for to complain about a
+/// token further along.
+#[test]
+fn a_bang_with_no_arrow_is_a_parse_error() {
+    for source in ["let x : Nat ! `Log = 1", "type T = Nat ! `Log"] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source}");
+        let bang = source.find('!').expect("the source writes one");
+        assert_eq!(out.errors[0].span.start, bang, "{source}");
+    }
+}
+
+/// `handle` keeps a `match`'s shape: the leading `|` is optional, zero arms
+/// parse, and each body ends at the next `|` or the `end` of its own accord.
+/// The `return` arm may sit anywhere among them.
+#[test]
+fn handle_expressions() {
+    for source in [
+        "let a = handle e with end",
+        "let a = handle e with | Log.`write s => () end",
+        "let a = handle e with | Log.`write s => () | Log.`flush _ => () end",
+        "let a = handle e with | return x => x end",
+        "let a = handle e with | return x => x | Log.`write s => () end",
+        "let a = handle e with | Log.`write s => () | return x => x end",
+        // The handled expression ends at the `with` however far right it runs.
+        "let a = handle f x y with | Log.`write s => () end",
+        // And a handler is self-delimiting — the `end` closes it — so it may
+        // head an application with no parentheses, exactly as a match does.
+        "let a = handle e with end 1",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+    // The leading bar is optional and printed back on.
+    assert_eq!(
+        parse_one("let a = handle e with Log.`write s => () end"),
+        "let a = handle e with | Log.`write s => () end"
+    );
+}
+
+/// `raise` takes a whole expression, which extends as far right as it can — a
+/// `fn` body's rule — so nothing after it is applied to what it gives back.
+#[test]
+fn raise_expressions() {
+    assert_eq!(parse_one("let a = raise 1"), "let a = raise 1");
+    assert_eq!(parse_one("let a = raise f x"), "let a = raise f x");
+    assert_eq!(
+        parse_one("let a = handle e with | Log.`write s => raise 0 end"),
+        "let a = handle e with | Log.`write s => raise 0 end"
+    );
+}
+
+/// A `.` followed by a tag is an operation reference and a `.` followed by a
+/// name is a projection — one token of lookahead, and the two productions
+/// cannot swallow each other.
+#[test]
+fn an_operation_is_told_from_a_projection_by_the_backtick() {
+    assert_eq!(parse_one("let a = Log.`write"), "let a = Log.`write");
+    assert_eq!(parse_one("let a = base.field"), "let a = base.field");
+    // An operation is a value like any other, so it applies and is applied.
+    assert_eq!(parse_one("let a = Log.`write 1"), "let a = Log.`write 1");
+    assert_eq!(parse_one("let a = f Log.`write"), "let a = f Log.`write");
+    // Only a name may head one: nothing else declares operations.
+    let out = parse(lex("let a = (f x).`op", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+}
+
+/// One statement's parsed tree, for the tests that assert about the shape
+/// rather than about what it prints back as.
+fn parse_stmt(src: &str) -> StmtKind {
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    let [stmt] = &out.stmts[..] else {
+        panic!("{src}: {:#?}", out.stmts);
+    };
+    stmt.tracked.clone()
+}
+
+/// The annotation of a `let`, which every arrow-binding test writes one of.
+fn arrow_of(stmt: &StmtKind) -> &TypeKind {
+    let StmtKind::Let { ty: Some(ty), .. } = stmt else {
+        panic!("expected an annotated let");
+    };
+    &ty.ty.tracked
+}
+
+/// Every position the effect grammar can be given a token it has no reading
+/// for, each reported where it was written.
+#[test]
+fn the_effect_grammar_reports_what_it_cannot_read() {
+    for (source, at) in [
+        // A declaration's name is a name; a `_` is not one, and a type is
+        // nothing a value could be thrown away from.
+        ("effect _ = |", "_"),
+        // An arm head is `` Eff.`op `` — a `.` promises an operation.
+        ("let a = handle e with | Log.write s => () end", "write"),
+        // A binder is a name or `_`, as a `fn` header's argument is.
+        ("let a = handle e with | Log.`write 1 => () end", "1"),
+        // A `\` promises an effect, so anything but a tag after it is
+        // reported — the rule a sum's absent case keeps.
+        ("let f : A -> B ! \\x = g", "x"),
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
+        let start = source.find(at).expect("the source writes it");
+        assert_eq!(out.errors[0].span.start, start, "{source}");
+    }
+
+    // A `|` between effects promises another one, so nothing after it is
+    // reported at the bar — the leading one promises nothing.
+    let out = parse(lex("let f : A -> B ! `Log | = g", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let bar = "let f : A -> B ! `Log ".len();
+    assert_eq!(out.errors[0].span.start, bar);
+}
+
+/// Running out of input where an arm's binder goes is reported at the end of
+/// what there was, the way every other production that needs more reports it.
+#[test]
+fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
+    let source = "let a = handle e with | Log.`write";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert_eq!(out.errors[0].span.start, source.len());
+}

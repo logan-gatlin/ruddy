@@ -53,6 +53,14 @@ pub enum Shape {
     Struct,
     /// `` `A Nat | ..r `` — a value is one of the cases the row says is there.
     Sum,
+    /// `` A -> B ! `Log | ..r `` — calling the arrow may perform every effect
+    /// the row says is there, and no other.
+    ///
+    /// A third reading of the same machinery, not a third machinery: an effect
+    /// row is unified, flattened, generalized and printed by the code the other
+    /// two go through, and the label it carries holds nothing — see
+    /// [`RowField::ty`], which for an effect is unit and is never inspected.
+    Effect,
 }
 
 /// What one parameter of a `type` declaration stands for, without the labels it
@@ -62,14 +70,18 @@ pub enum Shape {
 /// can name the two readings without quoting a set of labels nobody asked
 /// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
 ///
-/// Two of them rather than three, because the rest of a struct *is* a type: a
+/// Three of them rather than four, because the rest of a struct *is* a type: a
 /// `..r` in a struct puts whatever is written for `r` in the type's core, and a
-/// core is a whole type. Only a sum's rest is a reading of its own, for the
-/// reason [`Rest`] gives.
+/// core is a whole type. A sum's rest and an arrow's effects are readings of
+/// their own, for the reason [`Rest`] gives: neither is a position a whole type
+/// could go in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
     Type,
     Cases,
+    /// The effects an arrow may perform: `..e` in `type Runner e = (Nat -> Nat
+    /// ! ..e) -> Nat ! ..e`.
+    Effects,
 }
 
 /// What one parameter of a `type` declaration stands for.
@@ -113,6 +125,14 @@ pub enum ParamKind {
     /// anything else written there would leave a row holding what no row can
     /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
     Cases { lacks: IndexSet<String> },
+    /// Stands for the effects an arrow does not name — and, with them, the
+    /// effects it may therefore not name itself. `e` in
+    /// `type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e`.
+    ///
+    /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
+    /// row's rest is spliced into the row [`Core::Arrow`] carries, so anything
+    /// else written there would leave a row holding what no row can hold.
+    Effects { lacks: IndexSet<String> },
 }
 
 /// One variable a [`Formula`] names: one the solver still owns, or one a
@@ -221,7 +241,18 @@ pub enum Core {
     /// there is one type here and one spelling for it.
     Unit,
     Nat,
-    Arrow(Rc<Ty>, Rc<Ty>),
+    /// `A -> B ! E` — what it takes, what it gives back, and the effects
+    /// calling it may perform.
+    ///
+    /// The row is an *upper bound* and never a demand on the caller: a closed
+    /// one says the function performs no more than those effects. A bare
+    /// `A -> B` is [`Row::closed`] with no labels, which is what "pure" is, and
+    /// what the printer writes as nothing at all.
+    ///
+    /// The third position is [`Shape::Effect`]'s only home, the way
+    /// [`Core::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
+    /// property of every type, so there is nowhere else for the row to live.
+    Arrow(Rc<Ty>, Rc<Ty>, Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
     /// tail saying what is known about the cases not named.
     ///
@@ -440,7 +471,9 @@ impl ParamKind {
     /// of them: `A` in `type Pair A B` sits in no row and forbids nothing.
     pub fn lacks(&self) -> &IndexSet<String> {
         match self {
-            ParamKind::Type { lacks } | ParamKind::Cases { lacks } => lacks,
+            ParamKind::Type { lacks }
+            | ParamKind::Cases { lacks }
+            | ParamKind::Effects { lacks } => lacks,
         }
     }
 
@@ -449,17 +482,19 @@ impl ParamKind {
         match self {
             ParamKind::Type { .. } => Sense::Type,
             ParamKind::Cases { .. } => Sense::Cases,
+            ParamKind::Effects { .. } => Sense::Effects,
         }
     }
 
-    /// The cases an argument written here may not name, or `None` when the
-    /// parameter stands for a type. What the one check that is still about a
-    /// shape asks: a sum's rest is spliced into a row, so only a sum can go
-    /// there.
-    pub fn cases(&self) -> Option<&IndexSet<String>> {
+    /// The labels an argument written here may not name, and the row it would
+    /// be spliced into — or `None` when the parameter stands for a type. What
+    /// the one check that is still about a shape asks: a sum's rest and an
+    /// arrow's effects are both spliced into a row, so only a row can go there.
+    pub fn cases(&self) -> Option<(Shape, &IndexSet<String>)> {
         match self {
             ParamKind::Type { .. } => None,
-            ParamKind::Cases { lacks } => Some(lacks),
+            ParamKind::Cases { lacks } => Some((Shape::Sum, lacks)),
+            ParamKind::Effects { lacks } => Some((Shape::Effect, lacks)),
         }
     }
 }
@@ -529,6 +564,16 @@ impl Assigned {
             Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Undecided))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Undecided),
         }
+    }
+}
+
+impl Core {
+    /// `from -> to`, performing nothing: [`Row::closed`] with no labels, which
+    /// is what a bare `A -> B` means and what the printer writes as nothing at
+    /// all. Every position that builds an arrow with no effects to put on it
+    /// goes through here rather than spelling the empty row again.
+    pub fn pure(from: Rc<Ty>, to: Rc<Ty>) -> Self {
+        Core::Arrow(from, to, Row::closed())
     }
 }
 

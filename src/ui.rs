@@ -254,6 +254,9 @@ impl fmt::Display for Kind {
             Kind::With => f.write_str("with"),
             Kind::Match => f.write_str("match"),
             Kind::Fn => f.write_str("fn"),
+            Kind::Effect => f.write_str("effect"),
+            Kind::Handle => f.write_str("handle"),
+            Kind::Raise => f.write_str("raise"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
             Kind::Arrow => f.write_str("->"),
@@ -262,6 +265,7 @@ impl fmt::Display for Kind {
             Kind::Dot => f.write_str("."),
             Kind::DotDot => f.write_str(".."),
             Kind::NotEqual => f.write_str("!="),
+            Kind::Bang => f.write_str("!"),
             Kind::Backslash => f.write_str("\\"),
             Kind::Pipe => f.write_str("|"),
             // The backtick is written back on: it is how the token was
@@ -460,10 +464,12 @@ impl ir::ErrorKind {
         match self {
             ir::ErrorKind::Undefined { namespace } => match namespace {
                 Namespace::Types => "undefined-type",
+                Namespace::Effects => "undefined-effect",
                 Namespace::Terms | Namespace::Modules => "undefined-term",
             },
             ir::ErrorKind::Duplicate { namespace, .. } => match namespace {
                 Namespace::Types => "duplicate-type",
+                Namespace::Effects => "duplicate-effect",
                 Namespace::Terms | Namespace::Modules => "duplicate-term",
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
@@ -471,9 +477,12 @@ impl ir::ErrorKind {
             // field's is not: the wording quotes the label the way it was
             // written, and that already says which kind of row it sits in.
             ir::ErrorKind::AbsentInClosed { .. } => "absent-in-closed",
+            // An effect never reaches here: nothing about one leads back to
+            // itself through names alone, and a circular alias stands for a
+            // perfectly good set of effects.
             ir::ErrorKind::Circular { namespace } => match namespace {
                 Namespace::Types => "circular-type",
-                Namespace::Terms | Namespace::Modules => "circular-term",
+                Namespace::Terms | Namespace::Effects | Namespace::Modules => "circular-term",
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
@@ -493,7 +502,7 @@ impl ir::ErrorKind {
             // [`ir::ErrorKind::Undefined`] is the other way round, and says so.
             ir::ErrorKind::MixedTail { .. } => "mixed-tail",
             ir::ErrorKind::MixedParameter { .. } => "mixed-parameter",
-            ir::ErrorKind::NotARow => "not-a-row",
+            ir::ErrorKind::NotARow { .. } => "not-a-row",
             ir::ErrorKind::RepeatedRowField { .. } => "repeated-row-field",
             ir::ErrorKind::EndlessFields => "endless-fields",
             // What refuted the binding is not part of the code, only of the
@@ -501,6 +510,17 @@ impl ir::ErrorKind {
             // number only points at where.
             ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
             ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
+            ir::ErrorKind::DuplicateOperation => "duplicate-operation",
+            ir::ErrorKind::NotAnOperation { .. } => "not-an-operation",
+            ir::ErrorKind::ImpureOperation => "impure-operation",
+            ir::ErrorKind::MixedEffectForm => "mixed-effect-form",
+            ir::ErrorKind::OperationOnAlias { .. } => "operation-on-alias",
+            ir::ErrorKind::UnknownOperation { .. } => "unknown-operation",
+            ir::ErrorKind::PartialHandler { .. } => "partial-handler",
+            ir::ErrorKind::DuplicateArm { .. } => "duplicate-arm",
+            ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
+            ir::ErrorKind::RaiseOutsideArm => "raise-outside-arm",
+            ir::ErrorKind::RaiseInFunction => "raise-in-function",
         }
     }
 }
@@ -535,7 +555,7 @@ impl fmt::Display for ir::ErrorKind {
             // about a value rather than about a type.
             ir::ErrorKind::Circular { namespace } => match namespace {
                 Namespace::Types => f.write_str("type defined only as another name"),
-                Namespace::Terms | Namespace::Modules => {
+                Namespace::Terms | Namespace::Effects | Namespace::Modules => {
                     f.write_str("this definition is never given a value of its own")
                 }
             },
@@ -594,8 +614,8 @@ impl fmt::Display for ir::ErrorKind {
                 f,
                 "this stands for {first} in one place and for {second} in another",
             ),
-            ir::ErrorKind::NotARow => {
-                write!(f, "{} goes here, and this is not that", Sense::Cases)
+            ir::ErrorKind::NotARow { sense } => {
+                write!(f, "{sense} goes here, and this is not that")
             }
             // Said as what the argument does rather than as what goes here: a
             // struct's `..` takes any type at all, so there is no reading to
@@ -635,7 +655,68 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::DuplicateBinding { name } => {
                 write!(f, "this binds `{name}` twice")
             }
+            ir::ErrorKind::DuplicateOperation => f.write_str("duplicate operation"),
+            // Said as what to write instead, since the shape of the fix is the
+            // whole of what a reader needs: performing an operation is applying
+            // it, so an operation has to be something that can be applied.
+            ir::ErrorKind::NotAnOperation { name } => write!(
+                f,
+                "an operation must be a function: write `{} : Nat -> ()`",
+                label(Shape::Sum, name),
+            ),
+            ir::ErrorKind::ImpureOperation => f.write_str(
+                "an operation's signature must be plain; `!`, `..` and `when` belong in annotations",
+            ),
+            ir::ErrorKind::MixedEffectForm => f.write_str(
+                "an effect either declares operations or names other effects, not both",
+            ),
+            ir::ErrorKind::OperationOnAlias { effect } => write!(
+                f,
+                "an alias names effects and declares no operations, so `{effect}` has none to perform",
+            ),
+            ir::ErrorKind::UnknownOperation { effect, op } => write!(
+                f,
+                "no operation `{}` on effect `{effect}`",
+                label(Shape::Sum, op),
+            ),
+            // Named rather than counted: the reader has to write an arm for
+            // each of them, and the list is the whole of what they have to do.
+            ir::ErrorKind::PartialHandler { effect, missing } => write!(
+                f,
+                "handling `{effect}` needs an arm for {} too",
+                listed(missing),
+            ),
+            ir::ErrorKind::DuplicateArm { effect, op } => write!(
+                f,
+                "duplicate arm for `{effect}.{}`",
+                label(Shape::Sum, op),
+            ),
+            ir::ErrorKind::DuplicateReturn { .. } => f.write_str("duplicate return arm"),
+            ir::ErrorKind::RaiseOutsideArm => f.write_str("raise belongs in a handler arm"),
+            ir::ErrorKind::RaiseInFunction => f.write_str(
+                "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
+            ),
         }
+    }
+}
+
+/// A list of labels as a sentence reads them: `` `a ``, `` `a and `b ``,
+/// `` `a, `b and `c ``. Every one is named, because every one is an arm the
+/// reader has to write.
+fn listed(names: &[String]) -> String {
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|name| format!("`{}`", label(Shape::Sum, name)))
+        .collect();
+    // Indexed rather than matched for emptiness: a handler that covers every
+    // operation is not partial, so a complaint about one always names at least
+    // the operation that made it.
+    let (last, rest) = quoted
+        .split_last()
+        .expect("a partial handler names an operation with no arm");
+    match rest {
+        [] => last.clone(),
+        rest => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -747,6 +828,10 @@ impl fmt::Display for Shape {
         f.write_str(match self {
             Shape::Struct => "struct",
             Shape::Sum => "sum",
+            // What carries the row rather than what the row is: an effect row
+            // is one of the three things a function's type says, and "row"
+            // names the representation the three shapes share.
+            Shape::Effect => "function",
         })
     }
 }
@@ -764,6 +849,7 @@ impl fmt::Display for Sense {
         f.write_str(match self {
             Sense::Type => "a whole type",
             Sense::Cases => "the rest of a sum's cases",
+            Sense::Effects => "the rest of an arrow's effects",
         })
     }
 }
@@ -773,6 +859,7 @@ fn noun(shape: Shape) -> &'static str {
     match shape {
         Shape::Sum => "case",
         Shape::Struct => "field",
+        Shape::Effect => "effect",
     }
 }
 
@@ -798,7 +885,9 @@ fn about(shape: Shape, name: &str) -> (&'static str, String) {
 pub fn label(shape: Shape, name: &str) -> String {
     match shape {
         Shape::Struct => name.to_string(),
-        Shape::Sum => format!("`{name}"),
+        // An effect wears the backtick a case does, and for the same reason: a
+        // message about `` `Log `` should not ask the reader to look for `Log`.
+        Shape::Sum | Shape::Effect => format!("`{name}"),
     }
 }
 
@@ -807,6 +896,7 @@ impl fmt::Display for Namespace {
         match self {
             Namespace::Terms => f.write_str("term"),
             Namespace::Types => f.write_str("type"),
+            Namespace::Effects => f.write_str("effect"),
             Namespace::Modules => f.write_str("module"),
         }
     }
@@ -975,8 +1065,11 @@ impl fmt::Display for Core {
             // [`Core::Unit`].
             Core::Unit => write_fields(f, &IndexMap::new(), None),
             Core::Nat => f.write_str(Prim::Nat.name()),
-            Core::Arrow(from, to) => write_arrow(f, &**from, &**to),
-            Core::Sum(cases) => write_cases(f, cases),
+            Core::Arrow(from, to, effects) => {
+                let row = effects_of(effects);
+                write_arrow(f, &**from, &**to, row.as_ref().map(shown))
+            }
+            Core::Sum(cases) => write_cases(f, cases, Shape::Sum),
             // A declared type prints as what the user called it rather than as
             // what it stands for, applied to whatever it was given. It is
             // shorter, it is what they wrote, and it is the only way a type
@@ -1026,7 +1119,10 @@ impl fmt::Display for Labels<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.shape {
             Shape::Struct => write_braced(f, self.row),
-            Shape::Sum => write_cases(f, self.row),
+            // One notation for the two, because an effect row is written the
+            // way a sum's cases are — tags, bars and a `..` — minus the payload
+            // an effect never carries.
+            Shape::Sum | Shape::Effect => write_cases(f, self.row, self.shape),
         }
     }
 }
@@ -1075,19 +1171,72 @@ fn write_fields(
 /// thing a sum has that a struct has not is a case carrying unit, which prints
 /// as no payload at all — `` `None `` is how it was written, and `` `None {} ``
 /// is the same type spelled longer.
-fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
-    let cases = row
+fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row, shape: Shape) -> fmt::Result {
+    let marked = row
         .labels
         .iter()
         .filter_map(|(name, field)| match mark(&field.presence) {
             Absence::Absent => None,
-            Absence::There(mark) => Some(Entry::Written {
+            Absence::There(mark) => Some((name, mark, &field.ty)),
+        });
+    let tail = tail_of(shape, &row.rest);
+    let tail = tail.as_ref().map(shown);
+    // The one thing the two readings differ in: an effect carries nothing, so
+    // its label writes no payload and the unit it holds is never inspected.
+    // See R18.
+    match shape {
+        Shape::Effect => {
+            let effects: Vec<Entry<&str, ()>> = marked
+                .map(|(name, mark, _)| Entry::Written {
+                    name: name.as_str(),
+                    mark,
+                    holds: (),
+                })
+                .collect();
+            write_effects(f, &effects, tail)
+        }
+        _ => write_sum(
+            f,
+            marked.map(|(name, mark, ty)| Entry::Written {
                 name,
                 mark,
-                holds: payload(&field.ty),
+                holds: payload(ty),
             }),
-        });
-    write_sum(f, cases, tail_of(Shape::Sum, &row.rest).as_ref().map(shown))
+            tail,
+        ),
+    }
+}
+
+/// What an arrow's effect row prints as, or `None` for the empty closed row —
+/// which prints as nothing at all, so a pure arrow prints bare.
+///
+/// The one question R24's parenthesization turns on, and the one thing that
+/// makes `A -> B` and `A -> B ! |` print the same: both mean "performs
+/// nothing", and there is one spelling for that.
+///
+/// A label settled absent counts for nothing here, on the same grounds as
+/// everywhere else: an effect that is not performed is no part of what the
+/// arrow says. So a row that came to nothing but absences prints as nothing,
+/// exactly as one that named nothing does.
+fn effects_of(row: &Row) -> Option<String> {
+    let named = row.labels.values().any(|field| !absent(field));
+    let tail = tail_of(Shape::Effect, &row.rest);
+    if !named && tail.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = fmt::write(
+        &mut out,
+        format_args!(
+            "{}",
+            Labels {
+                shape: Shape::Effect,
+                row,
+            }
+        ),
+    );
+    Some(out)
 }
 
 /// What is known about the cases a row does not name.
@@ -1350,6 +1499,12 @@ fn tail_of(shape: Shape, rest: &Rest) -> Option<String> {
     match rest {
         Rest::Closed => None,
         Rest::More(row) if row.labels.values().all(absent) => tail_of(shape, &row.rest),
+        // An abandoned effect row says nothing, so it writes nothing: the `?`
+        // on the type beside it already reports the failure, and a `! ..` would
+        // claim the function may still perform something. The other two shapes
+        // write the `..` a reader would have written, because there a tail is
+        // part of what the type says whatever it came to.
+        Rest::Undecided if matches!(shape, Shape::Effect) => None,
         Rest::Undecided => Some(String::new()),
         Rest::More(row) => Some(Labels { shape, row }.to_string()),
         open => Some(open.to_string()),
@@ -1429,6 +1584,7 @@ impl Rule {
             Rule::Overlap { .. } => "overlap",
             Rule::Prim => "prim",
             Rule::Arrow => "arrow",
+            Rule::Performs => "performs",
             Rule::Struct => "struct",
             Rule::Sum => "sum",
             Rule::Presence { .. } => "presence",
@@ -1474,11 +1630,19 @@ impl fmt::Display for Rule {
                 Shape::Sum => f.write_str(
                     "the rest of a sum cannot be a sum naming a case the sum already names",
                 ),
+                // The masking refusal: a handler already discharges these
+                // effects, so an arm re-performing one would name it twice.
+                Shape::Effect => f.write_str(
+                    "the rest of a function's effects cannot name an effect it already performs",
+                ),
             },
             Rule::Prim => f.write_str("the same primitive on both sides"),
-            Rule::Arrow => {
-                f.write_str("two arrows: argument against argument, result against result")
-            }
+            Rule::Arrow => f.write_str(
+                "two arrows: argument against argument, result against result, effects against effects",
+            ),
+            Rule::Performs => f.write_str(
+                "what calling this may perform, opened into what may be performed where it was written",
+            ),
             Rule::Struct => f.write_str(
                 "two types and their fields: shared fields field against field, the rest into whatever the other leaves open",
             ),
@@ -1527,6 +1691,7 @@ impl ConstraintKind {
             ConstraintKind::Equal { .. } => "equal",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
+            ConstraintKind::Performs { .. } => "performs",
         }
     }
 }
@@ -1573,8 +1738,33 @@ impl fmt::Display for ConstraintKind {
             ConstraintKind::Instance { ty, .. } => {
                 write!(f, "{ty} ~ a fresh copy of what this name was bound to")
             }
+            // Read as the widening it is rather than as an equation: what
+            // calling this may perform has to be allowed where it was written,
+            // and the ambient may allow more. The two rows print in the effect
+            // notation, since that is what they are.
+            ConstraintKind::Performs {
+                performed, ambient, ..
+            } => write!(
+                f,
+                "{} performed where {} is allowed",
+                effects_shown(performed),
+                effects_shown(ambient),
+            ),
         }
     }
+}
+
+/// One effect row on its own, in the notation an arrow writes it in: what a
+/// [`ConstraintKind::Performs`] shows, where there is no arrow around the row
+/// to hand it a shape. A row that says nothing prints as the `|` an empty one
+/// is written with rather than as nothing at all, which would leave the line
+/// with a gap in it.
+fn effects_shown(row: &Row) -> String {
+    Labels {
+        shape: Shape::Effect,
+        row,
+    }
+    .to_string()
 }
 
 /// A goal prints as a constraint does, in whichever of the three sorts it is
@@ -1610,6 +1800,8 @@ impl inference::ErrorKind {
             inference::ErrorKind::PresenceImpossible { .. } => "presence-impossible",
             inference::ErrorKind::ClauseImpossible { .. } => "clause-impossible",
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
+            inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
+            inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
         }
     }
 }
@@ -1672,6 +1864,20 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::AnnotationAllows { allowed, required } => write!(
                 f,
                 "the annotation allows `{allowed}`, but the definition requires `{required}`",
+            ),
+            // Said as why there is nobody to answer it rather than as the row
+            // that could not take it: outside every function there is no
+            // signature to widen, and what the reader can change is where the
+            // value is computed.
+            inference::ErrorKind::Unhandled { effect } => write!(
+                f,
+                "nothing can handle `{}` here: a definition's value is computed outside every handler",
+                label(Shape::Effect, effect),
+            ),
+            inference::ErrorKind::NotAllowed { effect } => write!(
+                f,
+                "this function performs `{}`, which its type does not allow",
+                label(Shape::Effect, effect),
             ),
         }
     }
@@ -1743,22 +1949,41 @@ pub fn write_applied<H: Grouped, A: Grouped>(
     Ok(())
 }
 
-/// Render `from -> to`. The arrow is right-associative, so only the left side
-/// can ever need grouping — an arrow there would otherwise re-parse as the outer
-/// arrow's right half.
+/// Render `from -> to ! effects`. The arrow is right-associative, so the left
+/// side needs grouping — an arrow there would otherwise re-parse as the outer
+/// arrow's right half — and so, sometimes, does the result.
 ///
-/// Grouped against the arrow rather than against an atom, so only what could
-/// swallow the arrow is bracketed: an arrow, and a lambda. An application is
-/// left alone, because it stops at the arrow of its own accord and
-/// `Pair A B -> Nat` is how a person would write it — and so is a sum, whose
+/// The left is grouped against the arrow rather than against an atom, so only
+/// what could swallow the arrow is bracketed: an arrow, and a lambda. An
+/// application is left alone, because it stops at the arrow of its own accord
+/// and `Pair A B -> Nat` is how a person would write it — and so is a sum, whose
 /// last case carries an atom and so cannot reach the arrow either.
+///
+/// The result is bracketed exactly when *this* arrow carries a row and the
+/// result is itself an arrow, and in no other case. That is R24, and it follows
+/// from where the `!` binds: a `!` attaches to the innermost arrow parsed at its
+/// own level, so `A -> B -> C ! E` puts `E` on `B -> C` and `A -> (B -> C) ! E`
+/// puts it on the outer one. Bracketing whenever the *result* carries a row —
+/// the reading that looks safer — would move `E` to the wrong arrow on
+/// re-reading.
+///
+/// `effects` is what follows the `!`, already rendered, and `None` is a pure
+/// arrow, which writes no clause at all.
 pub fn write_arrow(
     f: &mut fmt::Formatter<'_>,
     from: &impl Grouped,
     to: &impl Grouped,
+    effects: Option<&dyn fmt::Display>,
 ) -> fmt::Result {
     write_grouped(f, from.prec() < Prec::Sum, from)?;
-    write!(f, " -> {to}")
+    f.write_str(" -> ")?;
+    // An arrow is the one node at this level, in all three printers, so
+    // comparing against it is asking exactly "is the result an arrow".
+    write_grouped(f, effects.is_some() && to.prec() == Prec::Arrow, to)?;
+    match effects {
+        Some(effects) => write!(f, " ! {effects}"),
+        None => Ok(()),
+    }
 }
 
 /// Render a `{ name: value, ... }` literal, shared by every position one can
@@ -1871,6 +2096,62 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
             }
             write!(f, " ..{tail}")
         }
+        None => Ok(()),
+    }
+}
+
+/// Render `` `Log | `IO (when b) | ..tail `` — the effects an arrow may
+/// perform, after the `!` that introduces them.
+///
+/// [`write_sum`] minus two things, and both differences are the syntax's. An
+/// effect carries nothing, so no case writes a payload; and a row that is
+/// nothing but a tail is written `..e` rather than `| ..e`, because the `!`
+/// before it already says a row begins here and a leading bar would be noise.
+/// The empty closed row writes nothing at all, which is what a pure arrow is —
+/// so the caller leaves the whole clause off rather than calling this.
+///
+/// A slice rather than the `impl IntoIterator` its two neighbours take, and a
+/// bare `&str` rather than a label of any shape: this is one function rather
+/// than one per caller, so what a reader is shown is one rendering of an effect
+/// row and not three that happen to agree. A row is a handful of labels, so
+/// gathering one costs nothing worth the alternative.
+pub fn write_effects(
+    f: &mut fmt::Formatter<'_>,
+    effects: &[Entry<&str, ()>],
+    tail: Option<&dyn fmt::Display>,
+) -> fmt::Result {
+    let mut first = true;
+    for effect in effects {
+        if !first {
+            f.write_str(" | ")?;
+        }
+        first = false;
+        match effect {
+            Entry::Written { name, mark, .. } => {
+                write!(f, "`{name}")?;
+                match mark {
+                    // The `?` no syntax reads, kept for the presence a failure
+                    // abandoned — the reason [`Mark::Undecided`] survives.
+                    Some(Mark::Undecided) => f.write_str("?")?,
+                    // Parenthesized for the reason a sum case's is: an effect
+                    // has no colon to end a bare clause.
+                    Some(Mark::When(name_of)) => write!(f, " (when {name_of})")?,
+                    None => {}
+                }
+            }
+            Entry::Absent { name } => write!(f, "\\`{name}")?,
+        }
+    }
+    match tail {
+        Some(tail) => {
+            if !first {
+                f.write_str(" | ")?;
+            }
+            write!(f, "..{tail}")
+        }
+        // The empty row, which a caller only reaches by writing `! |` and
+        // meaning it: the row that allows nothing at all.
+        None if first => f.write_str("|"),
         None => Ok(()),
     }
 }

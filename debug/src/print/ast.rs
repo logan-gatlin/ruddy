@@ -10,15 +10,15 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ClauseKind, ExprKind, StmtKind, SumCase, TypeField, TypeKind,
-        When,
+        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
+        ExprKind, HandlerArm, StmtKind, SumCase, TypeField, TypeKind, When,
     },
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
-    write_project, write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_effects, write_let,
+    write_match, write_project, write_row, write_struct, write_sum, write_tag,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -47,7 +47,12 @@ impl Grouped for Ast<'_, ExprKind> {
             // head an application and be projected from; but it is not an
             // application *argument* by grammar, so an argument position
             // brackets it. Below `Atom` is exactly that split.
-            ExprKind::Match { .. } => Prec::Apply,
+            // Self-delimiting on the right — the `end` closes it — so a
+            // handler groups exactly as a match does.
+            ExprKind::Match { .. } | ExprKind::Handle { .. } => Prec::Apply,
+            // The body runs as far right as it can, so anything appended after
+            // a `raise` would be read as part of what it carries.
+            ExprKind::Raise(_) => Prec::Lambda,
             // A tag carrying something groups as the application it reads as:
             // anything appended to `` `A x `` would be read as applying the
             // case rather than as a second argument to it. Carrying nothing it
@@ -60,7 +65,10 @@ impl Grouped for Ast<'_, ExprKind> {
             ExprKind::Apply { .. } => Prec::Apply,
             // Self-delimiting: each ends at a token of its own, so nothing that
             // follows can be drawn into it.
+            // An operation is written like a projection and closes itself the
+            // same way.
             ExprKind::Project { .. }
+            | ExprKind::Operation { .. }
             | ExprKind::Struct(_)
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
@@ -87,6 +95,23 @@ impl fmt::Display for Ast<'_, StmtKind> {
                     write!(f, " {}", param.tracked)?;
                 }
                 write!(f, " = {}", annotation(body))
+            }
+            // The `|` is written before every case, first included: the
+            // grammar makes the leading one optional, so the printed form
+            // re-parses, and the empty effect is `effect Nil = |` with the one
+            // bar and nothing after it.
+            StmtKind::Effect { name, cases } => {
+                write!(f, "effect {} =", name.tracked)?;
+                if cases.is_empty() {
+                    return f.write_str(" |");
+                }
+                for (op, case) in cases {
+                    write!(f, " | `{}", op.tracked)?;
+                    if let EffectCase::Operation { signature } = case {
+                        write!(f, " : {}", Ast(&signature.tracked))?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -220,6 +245,20 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 None,
                 payload.as_ref().map(|payload| Ast(&payload.tracked)),
             ),
+            // The arms print with a leading `|` apiece, first included, the
+            // way a match's do: the grammar makes it optional there, so the
+            // printed form re-parses, and a handler with no arms writes none.
+            ExprKind::Handle { body, arms } => {
+                write!(f, "handle {} with", Ast(&body.tracked))?;
+                for arm in arms {
+                    write_arm(f, arm)?;
+                }
+                f.write_str(" end")
+            }
+            ExprKind::Raise(value) => write!(f, "raise {}", Ast(&value.tracked)),
+            ExprKind::Operation { effect, op } => {
+                write!(f, "{}.`{}", effect.tracked, op.tracked)
+            }
             ExprKind::Ident { name } => f.write_str(&name.tracked),
             ExprKind::Natural(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
@@ -230,7 +269,15 @@ impl fmt::Display for Ast<'_, ExprKind> {
 impl fmt::Display for Ast<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            TypeKind::Arrow { from, to } => write_arrow(f, &Ast(&from.tracked), &Ast(&to.tracked)),
+            TypeKind::Arrow { from, to, effects } => {
+                let row = effects.as_ref().map(effect_row);
+                write_arrow(
+                    f,
+                    &Ast(&from.tracked),
+                    &Ast(&to.tracked),
+                    row.as_ref().map(|row| row as &dyn fmt::Display),
+                )
+            }
             TypeKind::Struct { fields, tail } => {
                 let fields = fields.iter().map(|(name, field)| match field {
                     TypeField::Written { when, value } => Entry::Written {
@@ -296,6 +343,92 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
         Some(name) => name.tracked.clone(),
         None => "_".to_string(),
     }))
+}
+
+/// Render one handler arm: what it answers, the name it binds, and its body.
+fn write_arm(f: &mut fmt::Formatter<'_>, arm: &HandlerArm) -> fmt::Result {
+    f.write_str(" | ")?;
+    match &arm.head {
+        ArmHead::Operation { effect, op } => write!(f, "{}.`{}", effect.tracked, op.tracked)?,
+        ArmHead::Return { .. } => f.write_str("return")?,
+    }
+    let binder = match &arm.binder.tracked {
+        ArgKind::Name(name) => name.as_str(),
+        ArgKind::Wildcard => "_",
+    };
+    write!(f, " {binder} => {}", Ast(&arm.body.tracked))
+}
+
+/// The `! <effects>` clause an arrow may carry, as it was written — the row
+/// after the `!`, which [`write_arrow`] writes the mark for.
+///
+/// Written as it stands rather than as what it means, which is what keeps the
+/// AST tab honest: `A -> B ! |` wrote a row and `A -> B` wrote none, and both
+/// are the empty closed one.
+fn effect_row(row: &EffectRow) -> Effects {
+    let effects = row
+        .effects
+        .iter()
+        .map(|(name, label)| match label {
+            EffectLabel::Written { when } => Entry::Written {
+                name: name.tracked.clone(),
+                mark: mark(when),
+                holds: (),
+            },
+            EffectLabel::Absent => Entry::Absent {
+                name: name.tracked.clone(),
+            },
+        })
+        .collect();
+    let tail = row.tail.as_ref().map(|tail| {
+        tail.name
+            .as_ref()
+            .map_or_else(String::new, |name| name.tracked.clone())
+    });
+    Effects { effects, tail }
+}
+
+/// One effect row, collected so that it can be handed to [`write_arrow`] as
+/// something that prints itself. The entries have to be owned rather than
+/// borrowed: the row is written *after* the result type, so the iterator would
+/// have to outlive the borrow of the arrow it came from.
+struct Effects {
+    effects: Vec<Entry<String, ()>>,
+    tail: Option<String>,
+}
+
+impl fmt::Display for Effects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let effects: Vec<Entry<&str, ()>> = self
+            .effects
+            .iter()
+            .map(|entry| match entry {
+                Entry::Written { name, mark, .. } => Entry::Written {
+                    name: name.as_str(),
+                    mark: mark.as_ref().map(clone_mark),
+                    holds: (),
+                },
+                Entry::Absent { name } => Entry::Absent {
+                    name: name.as_str(),
+                },
+            })
+            .collect();
+        write_effects(
+            f,
+            &effects,
+            self.tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+        )
+    }
+}
+
+/// One presence mark, copied. [`Mark`] is a compiler type and carries no
+/// `Clone`, so the debugger makes its own — one line, and the alternative is
+/// borrowing a row that has already gone out of scope.
+fn clone_mark(mark: &Mark) -> Mark {
+    match mark {
+        Mark::Undecided => Mark::Undecided,
+        Mark::When(name) => Mark::When(name.clone()),
+    }
 }
 
 /// Render one statement, `let` or `type`, as it was written.

@@ -189,7 +189,22 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
                 walk_locals(body, out);
             }
         }
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        // A handler arm's binder is a lambda argument's twin, so no scheme is
+        // published for one either; only what sits inside is walked.
+        TermKind::Handle { body, handler } => {
+            walk_locals(body, out);
+            for arm in &handler.arms {
+                walk_locals(&arm.body, out);
+            }
+            if let Some(ret) = &handler.ret {
+                walk_locals(&ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => walk_locals(value, out),
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -290,7 +305,9 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
                 names_in(arg, out);
             }
         }
-        Core::Arrow(from, to) => {
+        // An effect row names effects and no declared types, so there is
+        // nothing in one for this to find.
+        Core::Arrow(from, to, _) => {
             names_in(from, out);
             names_in(to, out);
         }

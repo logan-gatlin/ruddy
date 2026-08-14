@@ -304,7 +304,8 @@ pub fn plural(count: usize, noun: &str) -> String {
 ///
 /// A parameter that tails a *struct* stands for a whole type, so it is shown as
 /// one — with the fields it may not name beside it, since that is the whole of
-/// what its `..` still demands. Only a sum's rest is a reading of its own.
+/// what its `..` still demands. A sum's rest and an arrow's effects are
+/// readings of their own, and say which they are.
 ///
 /// The labels are spelled the way their own shape spells them — a field bare, a
 /// case with its backtick — through [`ui::label`], so this row and the
@@ -313,7 +314,8 @@ pub fn stands_for(mint: &Mint, param: &Param) -> String {
     let name = mint.name(param.symbol);
     let lacks = param.kind.lacks();
     let (opener, shape) = match param.kind.cases() {
-        Some(_) => (format!("..{name} (sum)"), Shape::Sum),
+        Some((shape @ Shape::Effect, _)) => (format!("..{name} (effects)"), shape),
+        Some((shape, _)) => (format!("..{name} (sum)"), shape),
         None if lacks.is_empty() => return name.to_string(),
         None => (format!("..{name} (struct)"), Shape::Struct),
     };

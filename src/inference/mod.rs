@@ -75,8 +75,8 @@ use crate::{
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{
-        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar,
+        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Shape, Ty,
+        TyVar,
     },
 };
 use constrain::Constrain;
@@ -317,8 +317,13 @@ pub enum Rule {
     Overlap { shape: Shape },
     /// Two identical primitives.
     Prim,
-    /// Two arrows, taken apart into argument and result.
+    /// Two arrows, taken apart into argument, result and effects.
     Arrow,
+    /// An application, with the callee's row opened into the ambient the call
+    /// was written at — or refused, where the ambient cannot allow one of the
+    /// effects the callee certainly performs. The one rule that widens rather
+    /// than equates; see [`ConstraintKind::Performs`].
+    Performs,
     /// A type carrying fields, taken apart: the fields both sides name against
     /// each other, the fields only one names into what the other side allows
     /// beyond its own, and then the two cores.
@@ -411,6 +416,11 @@ pub enum ConstraintKind {
         /// The level the value was walked at. Everything still unbound at or
         /// above it when the value is solved is the value's to quantify.
         level: u32,
+        /// The variables the annotation on it minted, which R23's closing rule
+        /// may not touch: an effect tail the reader left open is the reader's
+        /// however few times it occurs. Empty for a binding with no annotation,
+        /// which leaves nothing open to protect.
+        opened: Range<TyVar>,
         /// The `where` clause the annotation promised, or [`Formula::True`]
         /// where none was written. What the scheme published for `symbol`
         /// requires of its presences: R10 makes the clause the contract, so a
@@ -426,6 +436,29 @@ pub enum ConstraintKind {
     /// A use of a let-bound name: `ty` is a fresh copy of whatever scheme the
     /// enclosing [`ConstraintKind::Let`] published for `symbol`.
     Instance { symbol: Symbol, ty: Rc<Ty> },
+    /// An application: what calling the function may perform, and what the
+    /// place it is written in allows.
+    ///
+    /// The one rule that *opens* a row, and the whole of what makes an effect
+    /// row an upper bound rather than a demand on the caller. A callee whose
+    /// row is a variable takes whatever the ambient allows; one whose row is
+    /// closed requires the ambient to allow at least its labels, and no more
+    /// than that. See R12.
+    ///
+    /// Solved in emission order, after the [`ConstraintKind::Equal`] that
+    /// determines the callee's row — so an unresolved bare row variable here is
+    /// the variable-tail case, which is the right reading of "the callee
+    /// performs whatever the ambient does".
+    Performs {
+        performed: Row,
+        ambient: Row,
+        /// Whether a `fn` encloses the application. What tells the two readings
+        /// of a failure apart: outside every function the ambient is a
+        /// definition's own, so nothing could ever have handled the effect,
+        /// and inside one it is that function's row, which does not allow it.
+        /// See R11.
+        inside: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +588,19 @@ pub enum ErrorKind {
     /// the reader has to change: both formulas are carried so the complaint can
     /// show what was promised beside what is needed.
     AnnotationAllows { allowed: String, required: String },
+    /// An effect performed where nothing could ever handle it: a definition's
+    /// value is computed outside every handler, so an effect performed there
+    /// has no one to answer it.
+    ///
+    /// [`ErrorKind::NotAllowed`]'s other reading, and the two are split because
+    /// they send the reader to different places: here there is no function to
+    /// widen and the fix is to wrap the value in one, or in a handler.
+    Unhandled { effect: String },
+    /// An effect performed inside a function whose own row does not allow it.
+    ///
+    /// The ordinary refusal, and the reason an effect row is worth having: the
+    /// function says what calling it may do, and this would do more.
+    NotAllowed { effect: String },
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -840,6 +886,24 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         aliases.insert(*symbol, Scheme::new(decl.params.len() as u32, body));
     }
 
+    // And what each operation was declared to be, before any body is walked: a
+    // perform site and a handler arm each want the two sides of one, and both
+    // come straight off the declaration. Lowered here rather than per use, for
+    // the reason the aliases above are: a signature is a plain closed arrow, so
+    // it mentions no variable and lowering one twice would only mint two copies
+    // of nothing.
+    let mut operations = constrain::Operations::new();
+    for (symbol, decl) in &program.effects {
+        let ir::Effect::Operations(declared) = &decl.value else {
+            continue;
+        };
+        for (name, operation) in declared {
+            let from = lower_type(mint, &mut table, &operation.from);
+            let to = lower_type(mint, &mut table, &operation.to);
+            operations.insert((*symbol, name.clone()), (from, to));
+        }
+    }
+
     let mut schemes = IndexMap::new();
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
@@ -945,6 +1009,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 aliases: &aliases,
                 out: Vec::new(),
                 annotated: Vec::new(),
+                operations: &operations,
+                // A definition's value is computed where no handler can reach
+                // it, so it is walked at the empty closed row and outside every
+                // function — which is what makes performing an effect at the
+                // top level an error rather than a silently discarded effect.
+                ambient: constrain::Ambient {
+                    row: Row::closed(),
+                    inside: false,
+                },
+                answer: None,
             };
             // Checked against exactly what the rest of the group sees this
             // definition as. For an annotated one that is the annotation, as it
@@ -1114,7 +1188,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 *scheme = table.published(scheme);
             }
 
-            // Fold-back, first of everything generalization does: a presence
+            // R23's closing rule, before anything is quantified: an effect
+            // variable the solve learned nothing about links nothing, so it is
+            // the empty row rather than a `..'b` the caller gets to choose.
+            table.close_effects(&member.ty, 0, &member.scoped.opened);
+            // Fold-back, next of everything generalization does: a presence
             // the store has already decided is no variable at all, so it is
             // settled here rather than quantified and printed as one.
             table.fold_back(&member.ty);
@@ -1455,8 +1533,10 @@ impl Table {
             // somebody wrote at a use site, and a scheme is opened before it is
             // ever compared — and a variant this cannot tell about belongs in
             // the arm below, whose answer is the safe one.
-            (Core::Arrow(from, to), Core::Arrow(other_from, other_to)) => {
-                self.alike(from, other_from) && self.alike(to, other_to)
+            (Core::Arrow(from, to, effects), Core::Arrow(other_from, other_to, others)) => {
+                self.alike(from, other_from)
+                    && self.alike(to, other_to)
+                    && self.alike_row(effects, others)
             }
             (Core::Sum(cases), Core::Sum(others)) => self.alike_row(cases, others),
             // The name and the arguments, and nothing of the body. Two
@@ -1599,9 +1679,10 @@ impl Table {
         let ty = self.resolve(ty);
         match &ty.core {
             Core::Var(var) => found.push(*var),
-            Core::Arrow(from, to) => {
+            Core::Arrow(from, to, effects) => {
                 self.mentions_ty(from, found);
                 self.mentions_ty(to, found);
+                self.mentions_row(effects, found);
             }
             Core::Sum(cases) => self.mentions_row(cases, found),
             // A declared type is descended into as far as its arguments and no
@@ -1683,10 +1764,11 @@ impl Table {
             self.note_lacks(&field);
         }
         match &ty.core {
-            Core::Arrow(from, to) => {
-                let (from, to) = (from.clone(), to.clone());
+            Core::Arrow(from, to, effects) => {
+                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
                 self.note_lacks(&from);
                 self.note_lacks(&to);
+                self.note_lacks_row(&effects, Shape::Effect);
             }
             Core::Sum(cases) => {
                 let cases = cases.clone();
@@ -1711,7 +1793,7 @@ impl Table {
                     // tails nothing never has.
                     let demand = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
                         Some(kind) if !kind.lacks().is_empty() => {
-                            Some((kind.sense(), kind.lacks().clone()))
+                            Some((kind.cases().map(|(shape, _)| shape), kind.lacks().clone()))
                         }
                         _ => None,
                     };
@@ -1719,14 +1801,18 @@ impl Table {
                         // A struct's `..` is the type's core, so the condition
                         // lands on the argument's own core variable — the one
                         // thing that would still be free to acquire the label.
-                        Some((Sense::Type, labels)) => {
+                        Some((None, labels)) => {
                             if let Core::Var(var) = self.resolve(arg).core {
                                 self.forbidden(var, Shape::Struct, labels);
                             }
                         }
-                        Some((Sense::Cases, labels)) => {
+                        // A sum's rest and an arrow's effects are both spliced
+                        // into a row, so both read the argument for the labels
+                        // it allows and put the condition on what is open past
+                        // them.
+                        Some((Some(shape), labels)) => {
                             let written = self.resolve(arg).cases();
-                            self.forbid(&written, Shape::Sum, &labels);
+                            self.forbid(&written, shape, &labels);
                         }
                         None => {}
                     }
@@ -2040,20 +2126,19 @@ impl Table {
             self.presences_in(&held, found);
         }
         match &ty.core {
-            Core::Arrow(from, to) => {
-                let (from, to) = (from.clone(), to.clone());
+            Core::Arrow(from, to, effects) => {
+                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
                 self.presences_in(&from, found);
                 self.presences_in(&to, found);
+                // An effect's presence is quantified like any other — a
+                // `` `Log (when a) `` on an arrow is a presence the scheme
+                // names — so one missed here would vanish from the scheme
+                // instead of being reported.
+                self.presences_in_row(&effects, found);
             }
             Core::Sum(cases) => {
-                let row = self.canon(cases);
-                for field in row.labels.values() {
-                    if let Presence::Var(var) = self.presence_of(&field.presence) {
-                        found.insert(var);
-                    }
-                    let held = field.ty.clone();
-                    self.presences_in(&held, found);
-                }
+                let cases = cases.clone();
+                self.presences_in_row(&cases, found);
             }
             Core::Named { args, .. } => {
                 for arg in args.clone().iter() {
@@ -2061,6 +2146,19 @@ impl Table {
                 }
             }
             Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+        }
+    }
+
+    /// [`presences_in`](Self::presences_in) about a row: a sum's cases, or an
+    /// arrow's effects. Flattened first, so a presence a tail already spliced
+    /// in is found where it stands.
+    fn presences_in_row(&self, row: &Row, found: &mut IndexSet<TyVar>) {
+        for field in self.canon(row).labels.values() {
+            if let Presence::Var(var) = self.presence_of(&field.presence) {
+                found.insert(var);
+            }
+            let held = field.ty.clone();
+            self.presences_in(&held, found);
         }
     }
 
@@ -2116,10 +2214,15 @@ impl Table {
             self.labels_in(&held, found);
         }
         match &ty.core {
-            Core::Arrow(from, to) => {
-                let (from, to) = (from.clone(), to.clone());
+            Core::Arrow(from, to, effects) => {
+                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
                 self.labels_in(&from, found);
                 self.labels_in(&to, found);
+                for (name, field) in &self.canon(&effects).labels {
+                    found
+                        .entry(name.clone())
+                        .or_insert_with(|| self.presence_of(&field.presence));
+                }
             }
             Core::Sum(cases) => {
                 for (name, field) in &self.canon(cases).labels {
@@ -2204,10 +2307,15 @@ impl Table {
     /// What one variable an annotation left open came back as.
     ///
     /// A written type can leave open only `..`, `..r` and `when`, so a variable
-    /// arriving here is one of three things: the core a struct's `..` lowered
-    /// to, the tail a sum's did, or a presence. Each sort is read in its own
-    /// two spellings of "still nothing but a variable" and "nothing is known",
-    /// which is the whole of the three arms.
+    /// arriving here is one of four things: the core a struct's `..` lowered
+    /// to, the tail a sum's did, the tail an *arrow's effect row* did, or a
+    /// presence. Each sort is read in its own two spellings of "still nothing
+    /// but a variable" and "nothing is known", which is the whole of the three
+    /// arms — an effect tail needs no fourth, being a row like a sum's: one
+    /// with labels is [`Residue::Decided`] and a bare [`Rest::Var`] is
+    /// [`Residue::Open`], which is exactly what `let f : () -> Nat ! ..e = fn
+    /// _ => greet ()` and `let f : Nat -> Nat ! ..e = fn x => x` want said of
+    /// them.
     fn residue(&self, var: TyVar) -> Residue {
         let Slot::Bound(value) = &self.vars[var as usize] else {
             return Residue::Open(var);
@@ -2262,7 +2370,7 @@ impl Table {
         // and [`Assigned::as_ty`] by answering with a type that carries none.
         let labels: IndexMap<String, RowField> = match shape {
             Shape::Struct => self.resolve(&value.as_ty()).fields.clone(),
-            Shape::Sum => self.canon(&value.as_row()).labels,
+            Shape::Sum | Shape::Effect => self.canon(&value.as_row()).labels,
         };
         let named = labels
             .iter()
@@ -2295,7 +2403,7 @@ impl Table {
                     self.forbidden(core, shape, labels);
                 }
             }
-            Shape::Sum => {
+            Shape::Sum | Shape::Effect => {
                 let row = value.as_row();
                 self.forbid(&row, shape, &labels);
             }
@@ -2329,6 +2437,90 @@ impl Table {
         match self.lacks.get(&var) {
             Some((shape, _)) => *shape,
             None => Shape::Struct,
+        }
+    }
+
+    /// Close every effect row variable this type mentions exactly once.
+    ///
+    /// R23. An effect variable the solver learned nothing about links nothing:
+    /// it sits on one arrow and no other, so quantifying it would publish a
+    /// scheme whose caller may choose what the definition performs — which no
+    /// definition means. Closing it to the empty row is what makes
+    /// `fn x => x` read `'a -> 'a` rather than `'a -> 'a ! ..'b`, and one that
+    /// genuinely does link two arrows occurs twice and is quantified.
+    ///
+    /// Only variables inference minted. `opened` is the range an annotation's
+    /// lowering took, which is the range [`narrowed`](Self::narrowed) is asked
+    /// about: a `..e` inside one is the reader's, and closing it would publish
+    /// a scheme narrower than the annotation *and* slip past the too-open check
+    /// — `residue` reports a still-open variable as [`Residue::Open`], so
+    /// nothing would complain. An annotation is the contract.
+    ///
+    /// And only what this scheme would quantify: a variable below `level`
+    /// belongs to a binder further out, which may still put an effect in it.
+    fn close_effects(&mut self, ty: &Rc<Ty>, level: u32, opened: &Range<TyVar>) {
+        // What the annotation's variables have *come to*, not what it minted:
+        // two definitions that name each other are solved monomorphically, so
+        // one member's tail is unified with the other's almost immediately, and
+        // the variable left standing may be either. Followed through
+        // [`residue`](Self::residue), which is the reading
+        // [`narrowed`](Self::narrowed) already takes of the same range.
+        let promised: Vec<TyVar> = opened
+            .clone()
+            .filter_map(|var| match self.residue(var) {
+                Residue::Open(var) => Some(var),
+                Residue::Decided | Residue::Nothing => None,
+            })
+            .collect();
+        let mut counted: IndexMap<TyVar, usize> = IndexMap::new();
+        self.count_effects(ty, &mut counted);
+        for (var, count) in counted {
+            if count != 1 || promised.contains(&var) || self.levels[var as usize] < level {
+                continue;
+            }
+            self.vars[var as usize] = Slot::Bound(Assigned::Row(Rc::new(Row::closed())));
+        }
+    }
+
+    /// How often each still-open effect row variable appears in the effect
+    /// position of an arrow inside `ty`.
+    ///
+    /// Effect positions alone, which is what makes the count well defined: a
+    /// variable's sort is fixed where it was minted, and nothing can unify a
+    /// sum's tail with an arrow's effects, so a variable found here is found
+    /// nowhere but here.
+    fn count_effects(&self, ty: &Rc<Ty>, found: &mut IndexMap<TyVar, usize>) {
+        let ty = self.resolve(ty);
+        for field in ty.fields.values() {
+            let held = field.ty.clone();
+            self.count_effects(&held, found);
+        }
+        match &ty.core {
+            Core::Arrow(from, to, effects) => {
+                let (from, to) = (from.clone(), to.clone());
+                self.count_effects(&from, found);
+                self.count_effects(&to, found);
+                let row = self.canon(effects);
+                if let Rest::Var(var) = row.rest {
+                    *found.entry(var).or_default() += 1;
+                }
+                for field in row.labels.values() {
+                    let held = field.ty.clone();
+                    self.count_effects(&held, found);
+                }
+            }
+            Core::Sum(cases) => {
+                for field in self.canon(cases).labels.values() {
+                    let held = field.ty.clone();
+                    self.count_effects(&held, found);
+                }
+            }
+            Core::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.count_effects(arg, found);
+                }
+            }
+            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
         }
     }
 
@@ -2482,9 +2674,13 @@ impl Table {
                     self.quantify_var(*var, subst, level);
                 }
             }
-            Core::Arrow(from, to) => {
+            Core::Arrow(from, to, effects) => {
                 self.quantify_walk(from, subst, level, presences);
                 self.quantify_walk(to, subst, level, presences);
+                // The effect row is quantified with everything else, and an
+                // effect variable missed here would vanish from the scheme
+                // rather than be reported.
+                self.quantify_row(effects, subst, level, presences);
             }
             Core::Sum(cases) => self.quantify_row(cases, subst, level, presences),
             // An argument left open is the definition's to quantify, the same
@@ -2563,7 +2759,11 @@ impl Table {
                 Some(at) => Core::Bound(*at),
                 None => ty.core.clone(),
             },
-            Core::Arrow(from, to) => Core::Arrow(self.zonk(from, subst), self.zonk(to, subst)),
+            Core::Arrow(from, to, effects) => Core::Arrow(
+                self.zonk(from, subst),
+                self.zonk(to, subst),
+                self.zonk_row(effects, subst),
+            ),
             Core::Sum(cases) => Core::Sum(self.zonk_row(cases, subst)),
             // Rebuilt rather than handed back, because an argument may hold a
             // variable and what leaves here may not. Nothing downstream
@@ -2685,7 +2885,20 @@ impl Table {
                     self.zonk_term(body, subst);
                 }
             }
-            TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+            TermKind::Handle { body, handler } => {
+                self.zonk_term(body, subst);
+                for arm in &mut handler.arms {
+                    self.zonk_term(&mut arm.body, subst);
+                }
+                if let Some(ret) = &mut handler.ret {
+                    self.zonk_term(&mut ret.body, subst);
+                }
+            }
+            TermKind::Raise(value) => self.zonk_term(value, subst),
+            TermKind::Operation { .. }
+            | TermKind::Ident(_)
+            | TermKind::Natural(_)
+            | TermKind::Error => {}
         }
     }
 
@@ -2740,6 +2953,16 @@ impl Table {
             ErrorKind::RepeatedField { shape, field } => ErrorKind::RepeatedField {
                 shape: *shape,
                 field: field.clone(),
+            },
+            // The two effect complaints carry a label rather than a type, for
+            // the reason the presence ones carry prose: what the reader can
+            // change is the signature, and the effect's name is the whole of
+            // what it says.
+            ErrorKind::Unhandled { effect } => ErrorKind::Unhandled {
+                effect: effect.clone(),
+            },
+            ErrorKind::NotAllowed { effect } => ErrorKind::NotAllowed {
+                effect: effect.clone(),
             },
         }
     }
@@ -2887,9 +3110,10 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
         // A parameter is the position it was declared at, which is what
         // unfolding hands an argument to. See [`Core::Bound`].
         TypeKind::Param { index, .. } => Core::Bound(*index),
-        TypeKind::Arrow { from, to } => Core::Arrow(
+        TypeKind::Arrow { from, to, effects } => Core::Arrow(
             lower(mint, table, tails, from),
             lower(mint, table, tails, to),
+            effect_row(table, tails, effects),
         ),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it. A
@@ -3023,6 +3247,38 @@ fn row(
         Some(ir::Row::Param { index, .. }) => Rest::Bound(*index),
     };
     Row { labels, rest }
+}
+
+/// The effects a written arrow says it may perform, as the [`Row`] they denote.
+///
+/// [`row`] about the third shape, and shorter for it: an effect carries
+/// nothing, so every label holds [`Ty::unit`] and no walk ever looks at it. The
+/// tail goes the same four ways a sum's does — no `..` is [`Rest::Closed`],
+/// which is what a pure arrow has; a bare `..` is a variable this definition
+/// may decide; `..e` is that variable shared across one annotation; and `..e`
+/// naming a parameter is the position an argument is handed to.
+///
+/// The variables it mints land in the same range the annotation records, which
+/// is what [`Table::narrowed`] is asked about: an effect tail a reader left open
+/// is the reader's, and R23's closing rule may not touch one.
+fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> Row {
+    let mut labels = IndexMap::new();
+    for (name, label) in &effects.effects {
+        let lowered = match label {
+            ir::EffectLabel::Written { when, .. } => RowField {
+                presence: presence(table, tails, when),
+                ty: Rc::new(Ty::unit()),
+            },
+            // The struct's absent field again: an effect that is definitely
+            // not performed carries nothing worth constraining.
+            ir::EffectLabel::Absent { .. } => RowField {
+                presence: Presence::Absent,
+                ty: Rc::new(Ty::default()),
+            },
+        };
+        labels.insert(name.clone(), lowered);
+    }
+    row(table, tails, labels, &effects.tail)
 }
 
 /// What a written struct's `..` stands for, which is the type its fields sit on.
@@ -3169,9 +3425,11 @@ impl Ty {
             Core::Bound(index) => {
                 return splice(&fields, &fresh[*index as usize].as_ty());
             }
-            Core::Arrow(from, to) => {
-                Core::Arrow(from.open(fresh, presences), to.open(fresh, presences))
-            }
+            Core::Arrow(from, to, effects) => Core::Arrow(
+                from.open(fresh, presences),
+                to.open(fresh, presences),
+                effects.open(fresh, presences),
+            ),
             Core::Sum(cases) => Core::Sum(cases.open(fresh, presences)),
             // A declaration's own body reaches here holding its parameters, so
             // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.

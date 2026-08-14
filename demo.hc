@@ -116,6 +116,40 @@ let unwrap = fn opt => match opt with
   | _ => 0
   end
 
+effect Log = `write : Nat -> ()
+
+effect IO = `print : Nat -> ()
+
+effect Console = `Log | `IO
+
+let greet : () -> Nat ! `Log = fn _ =>
+  let _ = Log.`write 1 in
+  0
+
+let quiet : () -> Nat = fn _ =>
+  handle greet () with
+    | Log.`write s => ()
+    | return x => x
+  end
+
+let loud : () -> Nat ! `Console = fn _ =>
+  handle greet () with
+    | Log.`write s => IO.`print s
+  end
+
+effect Fail = `oops : () -> Nat
+
+let recover : () -> Nat = fn _ =>
+  handle Fail.`oops () with
+    | Fail.`oops _ => raise 0
+  end
+
+let runs = fn g => handle g () with | Log.`write s => () end
+
+type Logger = Nat -> Nat ! `Log
+
+type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e
+
 let bad = @
 
 let malformed = 12abc

@@ -129,7 +129,20 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
                 out.extend(body_tys(body));
             }
         }
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Handle { body, handler } => {
+            out.extend(body_tys(body));
+            for arm in &handler.arms {
+                out.extend(body_tys(&arm.body));
+            }
+            if let Some(ret) = &handler.ret {
+                out.extend(body_tys(&ret.body));
+            }
+        }
+        TermKind::Raise(value) => out.extend(body_tys(value)),
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
     out
 }
@@ -143,7 +156,9 @@ fn body_types(term: &Term) -> Vec<String> {
 fn mentions_a_variable(ty: &Ty) -> bool {
     let core = match &ty.core {
         Core::Var(_) => true,
-        Core::Arrow(from, to) => mentions_a_variable(from) || mentions_a_variable(to),
+        Core::Arrow(from, to, effects) => {
+            mentions_a_variable(from) || mentions_a_variable(to) || row_mentions_a_variable(effects)
+        }
         Core::Sum(cases) => row_mentions_a_variable(cases),
         // A declared type's body is not looked inside, for the reason the
         // compiler's own walks do not: what one stands for was lowered from
@@ -213,10 +228,13 @@ fn no_subterm_keeps_a_solver_variable() {
         body_types(&term_decl(&mint, &out, "a").value),
         [
             "Nat",
-            "('a -> 'a) -> Nat",
-            "Nat -> ('a -> 'a) -> Nat",
+            // The argument's own effect row is no part of `a`'s type, so R23's
+            // closing rule never reaches it and it is named like every other
+            // variable a subterm leaves over.
+            "('a -> 'a ! ..'b) -> Nat",
+            "Nat -> ('a -> 'a ! ..'b) -> Nat",
             "Nat",
-            "'a -> 'a",
+            "'a -> 'a ! ..'b",
             "'a",
         ]
     );
@@ -242,12 +260,18 @@ fn no_subterm_keeps_a_solver_variable() {
 #[test]
 fn quantifiers_are_named_in_first_occurrence_order() {
     let (mint, _, output) = inferred("let apply = fn f x => f x");
-    assert_eq!(scheme(&mint, &output, "apply"), "('a -> 'b) -> 'a -> 'b");
+    // The effect row `apply` links its two arrows through is quantified with
+    // everything else, in the same alphabet; the row on its own outer arrow
+    // occurs once and is closed. See R22 and R23.
+    assert_eq!(
+        scheme(&mint, &output, "apply"),
+        "('a -> 'b ! ..'c) -> 'a -> 'b ! ..'c"
+    );
 
     let (mint, _, output) = inferred("let compose = fn f g x => f (g x)");
     assert_eq!(
         scheme(&mint, &output, "compose"),
-        "('a -> 'b) -> ('c -> 'a) -> 'c -> 'b"
+        "('a -> 'b ! ..'c) -> ('d -> 'a ! ..'c) -> 'd -> 'b ! ..'c"
     );
 }
 
@@ -474,15 +498,22 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
         [
             // Being applied makes `f` a function, which is true and is bound.
             // `?0` is the definition's own variable, minted before the body was
-            // walked so that the body could have named it; `?1` is `f`.
-            "bind  ?2 -> ?3 ~ ?1 => ?1 := ?2 -> ?3",
+            // walked so that the body could have named it; `?1` is `f`, and
+            // `?2` is the row the lambda's own arrow carries.
+            "bind  ?3 -> ?4 ! ..?5 ~ ?1 => ?1 := ?3 -> ?4 ! ..?5",
             // Only the argument asks `f` to be its own parameter.
-            "occurs  ?2 ~ ?2 -> ?3 => this type would have to contain itself",
-            "recover  ?2 ~ ? => ?2 := ?",
+            "occurs  ?3 ~ ?3 -> ?4 ! ..?5 => this type would have to contain itself",
             "recover  ?3 ~ ? => ?3 := ?",
+            "recover  ?4 ~ ? => ?4 := ?",
+            "recover  ?5 ~ ? => ?5 := ?",
+            // The application still opens what calling `f` may perform into
+            // the ambient, and an abandoned row absorbs whatever it meets.
+            "performs  ? ~ ?2 => replaced by the goals below",
+            "  absorb  ? ~ ?2 => no change",
+            "  recover  ?2 ~ ? => ?2 := ?",
             // And the definition is what its body turned out to be, which is
             // the last thing every unannotated definition says.
-            "bind  ?0 ~ ?1 -> ?3 => ?0 := ?1 -> ?3",
+            "bind  ?0 ~ ?1 -> ?4 ! ..?2 => ?0 := ?1 -> ?4 ! ..?2",
         ]
     );
     // No step claims to have bound anything by the rule that failed. The bind
@@ -1549,7 +1580,7 @@ fn closing_a_row_from_both_sides_agrees_with_itself() {
     );
     let taken = steps(&mint, &output, "h");
     assert!(
-        taken.contains(&"  bind  ∅ ~ ?2 => ?2 := ∅".to_string()),
+        taken.contains(&"  bind  ∅ ~ ?4 => ?4 := ∅".to_string()),
         "{taken:#?}"
     );
     assert!(
@@ -1575,20 +1606,21 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
         steps(&mint, &output, "f"),
         [
             // `?0` is the definition itself, minted before its body was walked;
-            // `?1` is `p`. The first projection's demand is a bare variable's
-            // whole value, fields and all.
-            "bind  { x: ?2, ..?3 } ~ ?1 => ?1 := { x: ?2, ..?3 }",
+            // `?1` is `p` and `?2` is the row the lambda's arrow carries. The
+            // first projection's demand is a bare variable's whole value,
+            // fields and all.
+            "bind  { x: ?3, ..?4 } ~ ?1 => ?1 := { x: ?3, ..?4 }",
             // The next two each decide the labels first and let the cores take
             // what is left, since a core variable is what the extras go into.
-            "struct  { y: ?4, ..?5 } ~ { x: ?2, ..?3 } => replaced by the goals below",
-            "  bind  ?5 ~ { x: ?2, ..?8 } => ?5 := { x: ?2, ..?8 }",
-            "  bind  { y: ?4, ..?8 } ~ ?3 => ?3 := { y: ?4, ..?8 }",
-            // The base carries `x` and, behind `?3`, `y`; the goal says so
+            "struct  { y: ?5, ..?6 } ~ { x: ?3, ..?4 } => replaced by the goals below",
+            "  bind  ?6 ~ { x: ?3, ..?9 } => ?6 := { x: ?3, ..?9 }",
+            "  bind  { y: ?5, ..?9 } ~ ?4 => ?4 := { y: ?5, ..?9 }",
+            // The base carries `x` and, behind `?4`, `y`; the goal says so
             // rather than leaving the reader to remember it.
-            "struct  { z: ?6, ..?7 } ~ { x: ?2, y: ?4, ..?8 } => replaced by the goals below",
-            "  bind  ?7 ~ { x: ?2, y: ?4, ..?9 } => ?7 := { x: ?2, y: ?4, ..?9 }",
-            "  bind  { z: ?6, ..?9 } ~ ?8 => ?8 := { z: ?6, ..?9 }",
-            "bind  ?0 ~ ?1 -> { a: ?2, b: ?4, c: ?6 } => ?0 := ?1 -> { a: ?2, b: ?4, c: ?6 }",
+            "struct  { z: ?7, ..?8 } ~ { x: ?3, y: ?5, ..?9 } => replaced by the goals below",
+            "  bind  ?8 ~ { x: ?3, y: ?5, ..?10 } => ?8 := { x: ?3, y: ?5, ..?10 }",
+            "  bind  { z: ?7, ..?10 } ~ ?9 => ?9 := { z: ?7, ..?10 }",
+            "bind  ?0 ~ ?1 -> { a: ?3, b: ?5, c: ?7 } ! ..?2 => ?0 := ?1 -> { a: ?3, b: ?5, c: ?7 } ! ..?2",
         ]
     );
 
@@ -1601,11 +1633,17 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
     assert_eq!(
         steps(&mint, &output, "h"),
         [
-            "bind  { x: Nat, ..?3 } ~ ?2 => ?2 := { x: Nat, ..?3 }",
-            "struct  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => replaced by the goals below",
-            "  occurs  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => this type would have to contain itself",
-            "  recover  ?3 ~ ? => ?3 := ?",
-            "bind  ?1 ~ ?2 -> Nat => ?1 := ?2 -> Nat",
+            "bind  { x: Nat, ..?4 } ~ ?2 => ?2 := { x: Nat, ..?4 }",
+            // `g` performs nothing, so each application opens an empty row
+            // into `h`'s own — which decides nothing about it.
+            "performs  ∅ ~ ?3 => replaced by the goals below",
+            "  bind  ?5 ~ ?3 => ?5 := ?3",
+            "struct  { y: Nat, ..?4 } ~ { x: Nat, ..?4 } => replaced by the goals below",
+            "  occurs  { y: Nat, ..?4 } ~ { x: Nat, ..?4 } => this type would have to contain itself",
+            "  recover  ?4 ~ ? => ?4 := ?",
+            "performs  ∅ ~ ?3 => replaced by the goals below",
+            "  bind  ?6 ~ ?3 => ?6 := ?3",
+            "bind  ?1 ~ ?2 -> Nat ! ..?3 => ?1 := ?2 -> Nat ! ..?3",
         ]
     );
 }
@@ -1653,14 +1691,18 @@ fn no_goal_is_ever_put_back_for_later() {
     assert_eq!(
         steps(&mint, &output, "deep"),
         [
-            "bind  { x: ?2, ..?3 } ~ ?1 => ?1 := { x: ?2, ..?3 }",
-            "bind  { inner: ?4, ..?5 } ~ ?0 => ?0 := { inner: ?4, ..?5 }",
-            "bind  { x: ?2, ..?3 } ~ ?4 => ?4 := { x: ?2, ..?3 }",
-            "struct  { inner: ?4, ..?5 } ~ { inner: { x: Nat } } => replaced by the goals below",
-            "  bind  ?5 ~ {} => ?5 := {}",
-            "  struct  { x: ?2, ..?3 } ~ { x: Nat } => replaced by the goals below",
-            "    bind  ?3 ~ {} => ?3 := {}",
-            "    bind  ?2 ~ Nat => ?2 := Nat",
+            "bind  { x: ?4, ..?5 } ~ ?2 => ?2 := { x: ?4, ..?5 }",
+            "bind  { inner: ?6, ..?7 } ~ ?0 => ?0 := { inner: ?6, ..?7 }",
+            "bind  { x: ?4, ..?5 } ~ ?6 => ?6 := { x: ?4, ..?5 }",
+            "performs  ?3 ~ ?1 => replaced by the goals below",
+            "  bind  ?3 ~ ?1 => ?3 := ?1",
+            "struct  { inner: ?6, ..?7 } ~ { inner: { x: Nat } } => replaced by the goals below",
+            "  bind  ?7 ~ {} => ?7 := {}",
+            "  struct  { x: ?4, ..?5 } ~ { x: Nat } => replaced by the goals below",
+            "    bind  ?5 ~ {} => ?5 := {}",
+            "    bind  ?4 ~ Nat => ?4 := Nat",
+            "performs  ?1 ~ ∅ => replaced by the goals below",
+            "  bind  ?1 ~ ∅ => ?1 := ∅",
             "prim  Nat ~ Nat => no change",
         ]
     );
@@ -2803,6 +2845,11 @@ fn a_presence_against_itself_is_already_the_same_presence() {
             "  same  ?1 ~ ?1 => no change",
             "  same  ?0 ~ ?0 => no change",
             "  prim  Nat ~ Nat => no change",
+            // The recursive call opens what `f` may perform — nothing, since
+            // the annotation carries no `!` — into the ambient the annotation
+            // already closed.
+            "performs  ∅ ~ ∅ => replaced by the goals below",
+            "  bind  ?2 ~ ∅ => ?2 := ∅",
             "prim  Nat ~ Nat => no change",
         ]
     );
@@ -3296,8 +3343,8 @@ fn two_projections_on_one_binder_share_a_core_variable() {
     assert_eq!(
         asked[0..2],
         [
-            "equal: { x: ?2, ..?3 } ~ ?1".to_string(),
-            "equal: { y: ?4, ..?5 } ~ ?1".to_string(),
+            "equal: { x: ?3, ..?4 } ~ ?1".to_string(),
+            "equal: { y: ?5, ..?6 } ~ ?1".to_string(),
         ]
     );
 }
@@ -3342,11 +3389,12 @@ fn variables_are_numbered_in_the_order_they_are_read() {
 #[test]
 fn a_projection_demands_a_core_that_may_not_name_the_field() {
     let (mint, _, output) = inferred("let getx = fn p => p.x");
-    // `?1` is `p`, `?2` the field's type and `?3` the demanded core, which is
-    // the whole of what the base may also have. There is no fourth.
+    // `?1` is `p`, `?2` the row the lambda's arrow carries, `?3` the field's
+    // type and `?4` the demanded core, which is the whole of what the base may
+    // also have. There is no fifth.
     assert_eq!(
         constraints(&mint, &output, "getx"),
-        ["equal: { x: ?2, ..?3 } ~ ?1", "equal: ?0 ~ ?1 -> ?2"]
+        ["equal: { x: ?3, ..?4 } ~ ?1", "equal: ?0 ~ ?1 -> ?3 ! ..?2"]
     );
 
     // The core may not come back naming the field, which is the condition a
@@ -3392,7 +3440,10 @@ fn the_occurs_check_reaches_through_a_core_variable() {
 fn every_projection_complaint_underlines_the_field_it_read() {
     for (src, message) in [
         ("let a = 1.x", "no field `x` on `Nat`"),
-        ("let a = (fn x => x).y", "no field `y` on `'a -> 'a`"),
+        // The lambda's own effect row is no part of `a`'s type, so R23's
+        // closing rule never reaches it and generalization names it as it
+        // names every other leftover.
+        ("let a = (fn x => x).y", "no field `y` on `'a -> 'a ! ..'b`"),
         ("let a = (`A 1).x", "no field `x` on ``A Nat | ..'a`"),
         ("let a = { y: 1 }.x", "no field `x` on `{ y: Nat }`"),
     ] {
@@ -3914,6 +3965,8 @@ fn every_nested_let_publishes_a_scheme() {
         .collect();
     assert_eq!(
         locals,
+        // `id`'s own effect row occurs once in its scheme and is closed, so a
+        // nested binding reads exactly as a definition does.
         [("id", "'a -> 'a".to_string()), ("q", "'a".to_string())]
     );
 
@@ -4028,7 +4081,7 @@ fn a_written_absence_lowers_to_an_absent_presence() {
     let (mint, _, output) = inferred("let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x");
     let symbol = symbol_named(&mint, output.schemes.keys().copied(), "f");
     let body = output.schemes[&symbol].body().clone();
-    let Core::Arrow(from, _) = &body.core else {
+    let Core::Arrow(from, _, _) = &body.core else {
         panic!("expected an arrow, got {body:?}");
     };
     let field = &from.fields["y"];
@@ -4143,8 +4196,8 @@ fn a_match_without_a_default_closes_the_sum() {
 #[test]
 fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
     let (mint, _, output) = inferred(
-        "let handle = fn r => 0\n\
-         let first = fn v => match v with | `Some x => x | rest => handle rest end",
+        "let fallback = fn r => 0\n\
+         let first = fn v => match v with | `Some x => x | rest => fallback rest end",
     );
     // The scrutinee allows `Some` and whatever else; the binder's sum has
     // `Some` absent — not part of what the type says, so it prints as the
@@ -5238,4 +5291,503 @@ fn a_scheme_requires_the_whole_component_it_reaches() {
         "{ x when a: 'a, y when b: 'b, z when c: 'c, ..'d } -> { a: Nat, b: Nat } \
          where a and c or b"
     );
+}
+
+/// Every complaint one source made, as the codes a reporter keys on.
+fn infer_codes(src: &str) -> Vec<&'static str> {
+    let (_, _, output) = infer_src(src);
+    output
+        .errors
+        .iter()
+        .map(|error| error.kind.code())
+        .collect()
+}
+
+/// The three effect declarations every example in the spec is written against.
+const EFFECTS: &str = "effect Log = `write : Nat -> ()\n\
+                       effect IO = `print : Nat -> ()\n";
+
+/// R23's closing rule, over the four schemes the spec names. An effect row
+/// variable the solver learned nothing about sits on one arrow and no other, so
+/// it is the empty row rather than a `..'b` the caller gets to choose; one that
+/// genuinely links two arrows occurs twice and is quantified with everything
+/// else, in the same alphabet.
+#[test]
+fn an_effect_variable_that_links_nothing_is_closed() {
+    let (mint, _, output) = inferred(
+        "let compose = fn f g x => f (g x)\n\
+         let apply = fn f x => f x\n\
+         let id = fn x => x",
+    );
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
+    assert_eq!(
+        scheme(&mint, &output, "apply"),
+        "('a -> 'b ! ..'c) -> 'a -> 'b ! ..'c"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "compose"),
+        "('a -> 'b ! ..'c) -> ('d -> 'a ! ..'c) -> 'd -> 'b ! ..'c"
+    );
+
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ =>\n\
+         let _ = Log.`write 1 in\n\
+         0"
+    ));
+    assert_eq!(scheme(&mint, &output, "greet"), "{} -> Nat ! `Log");
+}
+
+/// A handler discharges what its arms cover, and what its arms themselves
+/// perform lands in the ambient the handler sits at — which is how a handler's
+/// own effects reach the enclosing function's row.
+#[test]
+fn a_handler_discharges_what_its_arms_cover() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let quiet : () -> Nat = fn _ =>\n\
+           handle greet () with | Log.`write s => () | return x => x end\n\
+         let loud : () -> Nat ! `IO = fn _ =>\n\
+           handle greet () with | Log.`write s => IO.`print s end\n\
+         let run = fn g => handle g () with | Log.`write s => () end"
+    ));
+    assert_eq!(scheme(&mint, &output, "quiet"), "{} -> Nat");
+    assert_eq!(scheme(&mint, &output, "loud"), "{} -> Nat ! `IO");
+    // Handling on behalf of a caller: the computation may perform `Log` and
+    // whatever else the caller allows, and what is left over is the handler's
+    // own row.
+    assert_eq!(
+        scheme(&mint, &output, "run"),
+        "({} -> 'a ! `Log | ..'b) -> 'a ! ..'b"
+    );
+}
+
+/// An arm's value *is* the operation's result, so an arm resumes with it — and
+/// `raise` aborts to the handler instead. Both halves of an arm's type come off
+/// the declaration and `Ans` appears in neither, which is why the two read the
+/// same and the difference is worth writing down.
+#[test]
+fn an_arm_resumes_and_raise_aborts() {
+    let (mint, _, output) = inferred(
+        "effect Fail = `oops : () -> Nat\n\
+         let fallback : () -> Nat = fn _ =>\n\
+           handle Fail.`oops () with | Fail.`oops _ => 0 end\n\
+         let recover : () -> Nat = fn _ =>\n\
+           handle Fail.`oops () with | Fail.`oops _ => raise 0 end",
+    );
+    assert_eq!(scheme(&mint, &output, "fallback"), "{} -> Nat");
+    assert_eq!(scheme(&mint, &output, "recover"), "{} -> Nat");
+
+    // Mixing the two paths in one arm needs no rule: `raise`'s fresh type
+    // unifies with the arm's body type wherever it lands.
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let mixed = fn s =>\n\
+           handle Log.`write s with\n\
+             | Log.`write t => match t with | 0 => raise () | _ => () end\n\
+           end"
+    ));
+    assert_eq!(scheme(&mint, &output, "mixed"), "Nat -> {}");
+}
+
+/// A `return` arm binds the handled expression's value and gives the answer, so
+/// it is the one thing that can make the whole expression a different type from
+/// its body. With none, the answer is what the body came to; with no arms at
+/// all, the handler is the identity on it.
+#[test]
+fn the_return_arm_decides_the_answer() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let ret = fn _ => handle 1 with | return x => {{}} end\n\
+         let same = fn _ => handle 1 with end"
+    ));
+    assert_eq!(scheme(&mint, &output, "ret"), "'a -> {}");
+    assert_eq!(scheme(&mint, &output, "same"), "'a -> Nat");
+}
+
+/// An arm's body has to be what the operation gives back, whatever the handler
+/// answers: `` `write : Nat -> () `` makes the arm's body a `()`.
+#[test]
+fn an_arms_body_is_the_operations_result() {
+    let codes = infer_codes(&format!(
+        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | Log.`write s => 1 end"
+    ));
+    assert_eq!(codes, ["type-mismatch"]);
+}
+
+/// R12: applying a function opens its row into the ambient, which is what
+/// makes an effect row an upper bound rather than a demand on the caller. A
+/// closed `` `Log `` goes through wherever `` `Log `` is allowed, and the rest
+/// of what the ambient allows stays the ambient's own.
+#[test]
+fn an_application_opens_the_callees_row() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let both : () -> Nat ! `Log | `IO = fn _ =>\n\
+           let n = greet () in\n\
+           let _ = IO.`print n in\n\
+           n\n\
+         let just : () -> Nat ! `Log = fn _ => greet ()"
+    ));
+    assert_eq!(scheme(&mint, &output, "both"), "{} -> Nat ! `Log | `IO");
+    assert_eq!(scheme(&mint, &output, "just"), "{} -> Nat ! `Log");
+}
+
+/// R13: opening happens at application and nowhere else, so unifying two
+/// arrows compares their rows as rows and an annotation still means what it
+/// says.
+#[test]
+fn an_annotation_is_not_opened() {
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! `Log = fn x => x\n\
+         let h : Nat -> Nat = f"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "extra-field");
+    assert_eq!(
+        error.kind.to_string(),
+        "extra effect ``Log`: the type `Nat -> Nat` lists every effect it allows"
+    );
+}
+
+/// R11's two readings of a failed `Performs`, which send the reader to two
+/// different places: outside every function there is no signature to widen, and
+/// inside one the signature is exactly what to change.
+#[test]
+fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let n = greet ()"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "unhandled-effect");
+    assert_eq!(
+        error.kind.to_string(),
+        "nothing can handle ``Log` here: a definition's value is computed outside every handler"
+    );
+
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let f : () -> Nat = fn _ => greet ()"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "effect-not-allowed");
+    assert_eq!(
+        error.kind.to_string(),
+        "this function performs ``Log`, which its type does not allow"
+    );
+}
+
+/// Masking — re-performing, inside an arm, the effect that arm's own handler
+/// discharges — is refused by the lacks check, which is what a handler's
+/// extended ambient records against the row it was handed.
+#[test]
+fn re_performing_a_discharged_effect_is_refused() {
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let mask = fn _ =>\n\
+           handle Log.`write 1 with | Log.`write s => Log.`write s end"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "repeated-field");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::RepeatedField {
+            shape: Shape::Effect,
+            ..
+        }
+    ));
+}
+
+/// Presence works on an effect label exactly as it does on a sum's case, and
+/// the `where` clause beside it survives into the scheme as written — nothing
+/// in this feature emits a formula about an effect.
+#[test]
+fn presence_written_on_an_effect_survives_into_the_scheme() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where a != b = fn x => x"
+    ));
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b"
+    );
+}
+
+/// An annotation is the contract, so a `..e` the reader wrote is quantified
+/// however few times it occurs — R23's closing rule may not touch one — and the
+/// too-open check still fires in the other direction when the body decides it.
+#[test]
+fn an_annotations_effect_tail_is_the_readers() {
+    let (mint, _, output) = inferred(&format!("{EFFECTS}let f : Nat -> Nat ! ..e = fn x => x"));
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..'a");
+
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let f : () -> Nat ! ..e = fn _ => greet ()"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "annotation-too-open");
+}
+
+/// Two definitions that name each other are solved together and
+/// monomorphically, so an annotated member's effect tail is unified with its
+/// partner's almost immediately — which read one variable at a time is
+/// indistinguishable from a body pinning it down. The range is what tells them
+/// apart, and an effect tail joins the `when`s and `..`s it already covered.
+#[test]
+fn a_mutually_recursive_pair_may_each_leave_effects_open() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let ping : Nat -> Nat ! ..e = fn n => pong n\n\
+         let pong : Nat -> Nat ! ..e = fn n => ping n"
+    ));
+    assert_eq!(scheme(&mint, &output, "ping"), "Nat -> Nat ! ..'a");
+    assert_eq!(scheme(&mint, &output, "pong"), "Nat -> Nat ! ..'a");
+}
+
+/// A declared alias is a name for a set of effects, so a row naming one
+/// unifies with the row that writes them out — there is no alias left by the
+/// time anything is compared.
+#[test]
+fn an_effect_row_unifies_against_a_declared_alias() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}effect Console = `Log | `IO\n\
+         type Both = Nat -> Nat ! `Log | `IO\n\
+         let f : Nat -> Nat ! `Console = fn x => x\n\
+         let g : Both = f"
+    ));
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! `Log | `IO");
+    assert_eq!(scheme(&mint, &output, "g"), "Both");
+}
+
+/// An effect written absent lowers to an absent presence, exactly as a struct's
+/// `\y` and a sum's `` \`B `` do: the `..` beside it may not stand for the
+/// effect, and a label that is not there is no part of what the type says — so
+/// the scheme prints the tail alone.
+#[test]
+fn an_effect_written_absent_lowers_to_an_absent_presence() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e = fn x => x"
+    ));
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..'a");
+    let symbol = symbol_named(&mint, output.schemes.keys().copied(), "f");
+    let body = output.schemes[&symbol].body().clone();
+    let Core::Arrow(_, _, effects) = &body.core else {
+        panic!("expected an arrow, got {body:?}");
+    };
+    let label = &effects.labels["IO"];
+    assert!(matches!(label.presence, Presence::Absent), "{label:?}");
+
+    // And the condition it records is what refuses the tail standing for it.
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e = fn x => x\n\
+         let g : Nat -> Nat ! `IO = f"
+    ));
+    assert!(!output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+/// A presence on an effect label reaches the store like any other, so a
+/// constrained scheme's use-site complaint quotes its formula in the labels the
+/// reader wrote rather than in the presence variables the compiler gave them.
+#[test]
+fn a_use_site_quotes_an_effect_presence_by_its_label() {
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where a != b = fn x => x\n\
+         let g : Nat -> Nat ! `Log | `IO = f"
+    ));
+    let quoted: Vec<String> = output
+        .errors
+        .iter()
+        .filter(|error| error.kind.code() == "presence-required")
+        .map(|error| error.kind.to_string())
+        .collect();
+    assert_eq!(
+        quoted,
+        ["this value needs `Log != IO` among its fields, and it does not have that"],
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// A performed row whose label is not *certainly* there asks nothing of the
+/// ambient: an effect a `when` leaves open is one the function may or may not
+/// perform, and the presence is what decides it rather than the row.
+#[test]
+fn a_performed_effect_that_may_not_be_there_is_not_refused() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) = fn x => x\n\
+         let g : Nat -> Nat = fn n => f n"
+    ));
+    assert_eq!(scheme(&mint, &output, "g"), "Nat -> Nat");
+}
+
+/// Two rows with extras each way continue as one fresh tail, which is what
+/// makes the two sides end as one rather than merely overlapping. The effect
+/// reading reaches it as the other two do.
+#[test]
+fn two_effect_rows_with_extras_both_ways_share_a_fresh_tail() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let p : (Nat -> Nat ! `Log | ..r) -> Nat = fn f => 1\n\
+         let q : (Nat -> Nat ! `IO | ..r) -> Nat = fn f => 1\n\
+         let h = fn v => {{ one: p v, two: q v }}"
+    ));
+    // The argument has to allow both, and the one tail the two now share
+    // links nothing else in the scheme, so R23 closes it.
+    assert_eq!(
+        scheme(&mint, &output, "h"),
+        "(Nat -> Nat ! `Log | `IO) -> { one: Nat, two: Nat }"
+    );
+}
+
+/// A failure abandons the effect row along with everything else the goal would
+/// have decided, and an abandoned presence keeps the `?` no syntax reads —
+/// which is precisely what it is reporting.
+#[test]
+fn an_abandoned_effect_presence_prints_as_a_question() {
+    let (_, _, output) = infer_src(&format!("{EFFECTS}let f : Nat -> Nat ! `Log (when a) = 1"));
+    let quoted: Vec<String> = output
+        .errors
+        .iter()
+        .map(|error| error.kind.to_string())
+        .collect();
+    assert_eq!(
+        quoted,
+        ["type mismatch: expected `Nat -> Nat ! `Log?`, found `Nat`"],
+        "{:#?}",
+        output.errors
+    );
+}
+
+/// The assumption that ends an unfolding is keyed on the whole goal, arguments
+/// included, and the arguments are compared as they stand — so two arrows that
+/// agree on what they take and differ on what they give back are two types, and
+/// the assumption is not taken.
+///
+/// Both declarations hand on an argument of their own rather than the one they
+/// were given, so the goal comes back at a *different* argument once and at the
+/// same one thereafter: the first round is where the two arrows differ.
+#[test]
+fn an_assumption_compares_the_arguments_it_was_pushed_at() {
+    let (mint, _, output) = inferred(
+        "type A a = { v: a, next: A (Nat -> {}) }\n\
+         type B a = { v: a, next: B (Nat -> {}) }\n\
+         let f : A (Nat -> Nat) -> Nat = fn x => 1\n\
+         let g : B (Nat -> Nat) -> Nat = fn x => 1\n\
+         let h = fn v => { one: f v, two: g v }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "h"),
+        "A (Nat -> Nat) -> { one: Nat, two: Nat }"
+    );
+}
+
+/// R23's closing rule is about what *this* scheme would quantify: an effect
+/// variable a binder further out owns is one that binder may still put an
+/// effect in, so a nested `let` leaves it where it stands.
+#[test]
+fn a_nested_let_leaves_an_outer_binders_effects_alone() {
+    // `p`'s own row is minted outside the `let` and pushed below it when the
+    // application ties the two together, so `q` may not close it — and the
+    // definition's scheme is where it is finally quantified.
+    let (mint, _, output) = inferred("let a = fn p => let q = fn z => p z in q");
+    assert_eq!(
+        scheme(&mint, &output, "a"),
+        "('a -> 'b ! ..'c) -> 'a -> 'b ! ..'c"
+    );
+    let locals: Vec<String> = output
+        .locals
+        .values()
+        .map(|scheme| scheme.to_string())
+        .collect();
+    assert_eq!(locals, ["'a -> 'b ! ..'c"]);
+}
+
+/// A `raise` lowering already refused still has a type: its value is walked
+/// like any other term, and there is no handler to check it against.
+#[test]
+fn a_refused_raise_still_walks_its_value() {
+    let (mint, out, output) = infer_src("let a = raise 1");
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["raise-outside-arm"]
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    // Nothing constrains what `raise` gives back, which is the typing it has
+    // in ML — and the value under it is a `Nat` all the same.
+    assert_eq!(scheme(&mint, &output, "a"), "'a");
+    assert_eq!(
+        body_types(&term_decl(&mint, &out, "a").value),
+        ["'a", "Nat"]
+    );
+}
+
+/// R10: an operation is an ordinary value of its declared signature, with the
+/// effect's own label as the row of its outermost arrow, closed. So it may be
+/// passed, partially applied and returned like anything else, and performing
+/// one is applying it.
+#[test]
+fn an_operation_is_a_value_of_its_declared_signature() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let held : Nat -> () ! `Log = Log.`write\n\
+         let done : () -> () ! `Log = fn _ => Log.`write 1"
+    ));
+    assert_eq!(scheme(&mint, &output, "held"), "Nat -> {} ! `Log");
+    assert_eq!(scheme(&mint, &output, "done"), "{} -> {} ! `Log");
+
+    // Referring to one performs nothing: a definition's value is computed
+    // outside every handler, and naming an operation there is fine.
+    let (_, _, output) = infer_src(&format!("{EFFECTS}let held = Log.`write"));
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+/// An arm binds its binder at what the operation takes, so the binder is usable
+/// as exactly that and nothing wider.
+#[test]
+fn an_arm_binds_its_binder_at_what_the_operation_takes() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
+         let h : () -> Nat ! `IO = fn _ =>\n\
+           handle p () with | Log.`write s => IO.`print s end"
+    ));
+    assert_eq!(scheme(&mint, &output, "h"), "{} -> Nat ! `IO");
+
+    // And a binder used at anything else is the mismatch it is.
+    let codes = infer_codes(&format!(
+        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | Log.`write s => s.x end"
+    ));
+    assert_eq!(codes, ["missing-field"]);
+}
+
+/// A `raise` lowering refused for sitting inside a `fn` is still walked, and
+/// answers nothing: a closure can outlive the `handle` it was written in, so
+/// generation clears the arm the same way lowering does rather than leaning on
+/// the check having run.
+#[test]
+fn a_raise_under_a_function_answers_no_arm() {
+    let (mint, out, output) = infer_src(&format!(
+        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | Log.`write s => {{ g: fn _ => raise 0 }} end"
+    ));
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["raise-in-function"]
+    );
+    // The arm's body still has to be what the operation gives back, and a
+    // struct is not — but the `raise` inside it was checked against nothing.
+    assert_eq!(
+        output
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["extra-field"]
+    );
+    assert_eq!(scheme(&mint, &output, "h"), "'a -> Nat");
 }

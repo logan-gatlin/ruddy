@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     rc::Rc,
 };
 
@@ -34,6 +35,20 @@ use super::{
 enum Tail {
     Core(Core),
     Rest(Rest),
+    /// An arrow's effects: what is past them, and the two sides they sit
+    /// beside.
+    ///
+    /// A variant of its own rather than a shape carried beside a [`Rest`],
+    /// because what a complaint about it names is different: a sum's labels are
+    /// the whole of its core, and an arrow's effects are one of three things
+    /// the arrow says. The two sides ride along so that
+    /// [`rebuild`](Rowed::rebuild) can put the arrow back together — they are
+    /// what the goal that failed did *not* decide, so they stand as they were.
+    Effects {
+        from: Rc<Ty>,
+        to: Rc<Ty>,
+        rest: Rest,
+    },
 }
 
 /// A set of labels a goal is about, the type it belongs to, and the tail that
@@ -60,7 +75,12 @@ impl Tail {
     /// are absorbed into, and the whole of what makes a set of labels open.
     fn var(&self) -> Option<TyVar> {
         match self {
-            Tail::Core(Core::Var(var)) | Tail::Rest(Rest::Var(var)) => Some(*var),
+            Tail::Core(Core::Var(var))
+            | Tail::Rest(Rest::Var(var))
+            | Tail::Effects {
+                rest: Rest::Var(var),
+                ..
+            } => Some(*var),
             _ => None,
         }
     }
@@ -70,7 +90,12 @@ impl Tail {
     fn absorbs(&self) -> bool {
         matches!(
             self,
-            Tail::Core(Core::Undecided) | Tail::Rest(Rest::Undecided)
+            Tail::Core(Core::Undecided)
+                | Tail::Rest(Rest::Undecided)
+                | Tail::Effects {
+                    rest: Rest::Undecided,
+                    ..
+                }
         )
     }
 
@@ -88,18 +113,19 @@ impl Tail {
         match self {
             Tail::Core(_) => Shape::Struct,
             Tail::Rest(_) => Shape::Sum,
+            Tail::Effects { .. } => Shape::Effect,
         }
     }
 
     /// This tail carrying `labels`, as the value a variable takes: a whole type
-    /// for a struct's fields, a row for a sum's cases.
+    /// for a struct's fields, a row for a sum's cases or an arrow's effects.
     fn value(&self, labels: IndexMap<String, RowField>) -> Assigned {
         match self {
             Tail::Core(core) => Assigned::Ty(Rc::new(Ty {
                 core: core.clone(),
                 fields: labels,
             })),
-            Tail::Rest(rest) => Assigned::Row(Rc::new(Row {
+            Tail::Rest(rest) | Tail::Effects { rest, .. } => Assigned::Row(Rc::new(Row {
                 labels,
                 rest: rest.clone(),
             })),
@@ -157,6 +183,20 @@ impl<'a> Rowed<'a> {
                     labels,
                     rest: rest.clone(),
                 }),
+                fields: self.ty.fields.clone(),
+            }),
+            // The arrow with its effect row replaced: what the reader wrote,
+            // said as far as the solve has got. The two sides stay as they are,
+            // since the goal that failed was about the effects alone.
+            Tail::Effects { from, to, rest } => Rc::new(Ty {
+                core: Core::Arrow(
+                    from.clone(),
+                    to.clone(),
+                    Row {
+                        labels,
+                        rest: rest.clone(),
+                    },
+                ),
                 fields: self.ty.fields.clone(),
             }),
         }
@@ -225,13 +265,100 @@ impl Solve<'_> {
                     symbol,
                     bound,
                     level,
+                    opened,
                     promised,
                     value,
                     body,
-                } => self.bind_local(*symbol, bound, *level, promised, value, body),
+                } => self.bind_local(*symbol, bound, *level, opened, promised, value, body),
                 ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
+                ConstraintKind::Performs {
+                    performed,
+                    ambient,
+                    inside,
+                } => self.performs(span, performed, ambient, *inside),
             }
         }
+    }
+
+    /// An application: make the place it was written in allow what calling the
+    /// function may perform.
+    ///
+    /// R12's opening rule, and the one rule in the solver that widens rather
+    /// than equates. A callee whose row still ends in a variable takes the
+    /// ambient outright — its tail absorbs the difference — and a closed one is
+    /// opened first, so `` `Log `` performed where `` `Log | `IO `` is allowed
+    /// goes through and the `` `IO `` stays the ambient's own.
+    ///
+    /// Which effects the ambient cannot possibly take is decided here rather
+    /// than left to the row rule below, because the complaint is a different
+    /// complaint: a row that cannot take a label is an extra field, and an
+    /// effect nothing will handle is something the reader fixes by widening a
+    /// signature or writing a handler. Both readings are R11's.
+    fn performs(&mut self, span: Span, performed: &Row, ambient: &Row, inside: bool) {
+        let want = self.table.canon(performed);
+        let have = self.table.canon(ambient);
+        let goal = Goal::Row {
+            expected: Rc::new(want.clone()),
+            actual: Rc::new(have.clone()),
+        };
+        let refused = want.labels.iter().find(|(name, field)| {
+            if !matches!(self.table.presence_of(&field.presence), Presence::Present) {
+                return false;
+            }
+            match have.labels.get(*name) {
+                // Named and settled absent: the ambient says outright that
+                // this effect is not performed here.
+                Some(there) => matches!(self.table.presence_of(&there.presence), Presence::Absent),
+                // Not named at all, and no room past the ones that are.
+                None => matches!(have.rest, Rest::Closed | Rest::Bound(_)),
+            }
+        });
+        if let Some((effect, _)) = refused {
+            let effect = effect.clone();
+            let kind = match inside {
+                true => ErrorKind::NotAllowed { effect },
+                false => ErrorKind::Unhandled { effect },
+            };
+            let abandoned = [Assigned::Row(Rc::new(want.clone()))];
+            self.fail(span, Rule::Performs, goal, Error { span, kind }, &abandoned);
+            return;
+        }
+        // A closed row is opened with a fresh tail, which is what makes the row
+        // an upper bound: the ambient may allow more, and whatever it allows
+        // past the callee's own labels lands there. A row still ending in a
+        // variable is already open and unifies as it stands.
+        let opened = match want.rest {
+            Rest::Closed | Rest::Bound(_) => Row {
+                labels: want.labels.clone(),
+                rest: self.table.fresh_row(),
+            },
+            _ => want.clone(),
+        };
+        self.step(span, Rule::Performs, goal, Effect::Decomposed);
+        self.depth += 1;
+        // The two rows belong to no type the reader wrote — an ambient is the
+        // place a term sits in rather than part of anything — so each is named
+        // as the arrow it would be the effects of, which is what a complaint
+        // about a shared label would quote. Nothing above lets one through:
+        // the labels that could clash were ruled on already.
+        let unit = || Rc::new(Ty::unit());
+        let (left, right) = (
+            Tail::Effects {
+                from: unit(),
+                to: unit(),
+                rest: opened.rest.clone(),
+            },
+            Tail::Effects {
+                from: unit(),
+                to: unit(),
+                rest: have.rest.clone(),
+            },
+        );
+        let (want_ty, have_ty) = (row_ty(&opened), row_ty(&have));
+        let expects = Rowed::cases(&want_ty, &opened.labels, &left);
+        let actuals = Rowed::cases(&have_ty, &have.labels, &right);
+        self.labels(span, expects, actuals);
+        self.depth -= 1;
     }
 
     /// A name bound for the length of a body: solve what its value requires,
@@ -252,17 +379,23 @@ impl Solve<'_> {
     /// The scheme is released when the body ends, the way lowering released the
     /// name. Nothing could reach it afterwards — a symbol is unique — but a
     /// scope that is not closed is a scope that is not a scope.
+    #[allow(clippy::too_many_arguments)]
     fn bind_local(
         &mut self,
         symbol: Symbol,
         bound: &Rc<Ty>,
         level: u32,
+        opened: &Range<TyVar>,
         promised: &Formula,
         value: &[Constraint],
         body: &[Constraint],
     ) {
         self.table.level = level;
         self.run(value);
+        // R23's closing rule, said about a nested binding on the same terms: a
+        // `let` in the middle of a body is generalized exactly as one at the
+        // top of a file is.
+        self.table.close_effects(bound, level, opened);
         // A nested binding's scheme carries what the store requires of the
         // presences it quantifies, exactly as a definition's does — a `let` in
         // the middle of a body is generalized on the same terms as one at the
@@ -575,13 +708,33 @@ impl Solve<'_> {
                 self.step(span, Rule::Prim, goal, Effect::None);
                 true
             }
-            (Core::Arrow(from1, to1), Core::Arrow(from2, to2)) => {
+            // Three goals rather than two, and the third is not opened: an
+            // annotation says what it says, so `let h : Nat -> Nat = f` with
+            // `f : Nat -> Nat ! `Log` is refused. Opening happens where a
+            // function is *applied* and nowhere else. See R13.
+            (Core::Arrow(from1, to1, does1), Core::Arrow(from2, to2, does2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
                 let (from2, to2) = (from2.clone(), to2.clone());
+                let (want, have) = (self.table.canon(does1), self.table.canon(does2));
                 self.step(span, Rule::Arrow, goal, Effect::Decomposed);
                 self.depth += 1;
                 self.unify(span, &from1, &from2);
                 self.unify(span, &to1, &to2);
+                let (left, right) = (
+                    Tail::Effects {
+                        from: from1.clone(),
+                        to: to1.clone(),
+                        rest: want.rest.clone(),
+                    },
+                    Tail::Effects {
+                        from: from2.clone(),
+                        to: to2.clone(),
+                        rest: have.rest,
+                    },
+                );
+                let expects = Rowed::cases(lhs, &want.labels, &left);
+                let actuals = Rowed::cases(rhs, &have.labels, &right);
+                self.labels(span, expects, actuals);
                 self.depth -= 1;
                 true
             }
@@ -757,6 +910,15 @@ impl Solve<'_> {
         match shape {
             Shape::Struct => Tail::Core(Core::Var(self.table.fresh_core())),
             Shape::Sum => Tail::Rest(self.table.fresh_row()),
+            // The two sides only matter to a complaint that names the whole
+            // arrow, and a *fresh* tail is one nothing has yet gone wrong
+            // about: it stands for what the two sides allow beyond the labels
+            // named, which is a row and nothing else.
+            Shape::Effect => Tail::Effects {
+                from: Rc::new(Ty::unit()),
+                to: Rc::new(Ty::unit()),
+                rest: self.table.fresh_row(),
+            },
         }
     }
 
@@ -770,7 +932,13 @@ impl Solve<'_> {
     /// answer with different machinery.
     fn tails(&mut self, span: Span, lhs: &Tail, rhs: &Tail) {
         match (lhs, rhs) {
-            (Tail::Rest(left), Tail::Rest(right)) => self.rests(span, left, right),
+            // Both rows, whichever of the two readings: what is past a set of
+            // labels is a row either way, and which shape it was is the
+            // wording's business rather than the rule's.
+            (
+                Tail::Rest(left) | Tail::Effects { rest: left, .. },
+                Tail::Rest(right) | Tail::Effects { rest: right, .. },
+            ) => self.rests(span, left, right),
             // Two cores, and nothing else can reach here: which shape a set of
             // labels is, is decided by the syntax that wrote it, and the two
             // sides of a goal were matched on it before either arrived. So the
@@ -1370,10 +1538,11 @@ impl Solve<'_> {
                 let var = *var;
                 self.settle(span, var, Assigned::Ty(Rc::new(Ty::default())));
             }
-            Core::Arrow(from, to) => {
-                let (from, to) = (from.clone(), to.clone());
+            Core::Arrow(from, to, effects) => {
+                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
                 self.recover_ty(span, &from);
                 self.recover_ty(span, &to);
+                self.recover_row(span, &effects);
             }
             Core::Sum(cases) => {
                 let cases = cases.clone();
@@ -1466,6 +1635,21 @@ impl Solve<'_> {
 /// to say which sort it is holding: a struct's tail is a whole type and a sum's
 /// is a row, so the same act is a [`Goal::Type`] on one shape and a [`Goal::Row`]
 /// on the other.
+/// An effect row as the arrow it would be the effects of: `{} -> {} ! <row>`.
+///
+/// What [`Rowed`] wants a type for, in the one place there is none to be had. An
+/// ambient is where a term sits rather than part of any type, so a complaint
+/// about one has no written type to name — and naming the row alone would print
+/// it in the struct's braces, which is what [`Display for Row`](Row) falls back
+/// to when nothing hands it a shape.
+fn row_ty(row: &Row) -> Rc<Ty> {
+    Rc::new(Ty::plain(Core::Arrow(
+        Rc::new(Ty::unit()),
+        Rc::new(Ty::unit()),
+        row.clone(),
+    )))
+}
+
 fn goal_of(expected: Assigned, actual: Assigned) -> Goal {
     match (expected, actual) {
         (Assigned::Row(expected), Assigned::Row(actual)) => Goal::Row { expected, actual },

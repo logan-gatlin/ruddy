@@ -528,3 +528,126 @@ fn a_scheme_prints_the_clause_it_requires() {
         assert_eq!(scheme.to_string(), expected, "{source}");
     }
 }
+
+/// R24's four cases, each asserted to re-lower to itself.
+///
+/// The `!` binds to the arrow parsed at its own level, so the printer
+/// parenthesizes an arrow's result exactly when *that* arrow carries a row and
+/// the result is itself an arrow — and in no other case. Bracketing whenever
+/// the result carries one, which looks safer, would move the row to the wrong
+/// arrow on re-reading; the round trip is what says so.
+#[test]
+fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
+    let effects = "effect Log = | `write : Nat -> {}\n";
+    for body in [
+        // A row, and a result that is not an arrow: no parentheses.
+        "Nat -> Nat ! `Log",
+        // No outer row, and the inner arrow carries one: none either.
+        "Nat -> Nat -> Nat ! `Log",
+        // A row, and a result that is an arrow: parentheses, or the row would
+        // read as the inner arrow's.
+        "Nat -> (Nat -> Nat) ! `Log",
+        // Neither carries one: none.
+        "Nat -> Nat -> Nat",
+    ] {
+        let source = format!("{effects}type T = {body}");
+        let (ast, ir) = printed(&source);
+        assert_eq!(ast, source, "{body}");
+        assert_eq!(ir, source, "{body}");
+        // And again off what was printed, which is what makes the parentheses
+        // trustworthy rather than merely plausible.
+        let (_, again) = printed(&ir);
+        assert_eq!(again, ir, "{body}");
+    }
+}
+
+/// A printed *semantic* type re-lowers to the type it was printed from, which
+/// is what a diagnostic quoting one rests on. The two spellings of the empty
+/// row meet here: `A -> B ! |` and `A -> B` are one type, so the scheme prints
+/// bare either way.
+#[test]
+fn a_printed_effect_row_re_lowers_to_itself() {
+    let effects = "effect Log = `write : Nat -> ()\neffect IO = `print : Nat -> ()\n";
+    // A scheme's quantified tail prints `..'a`, which is a letter no reader
+    // could have written and no parser reads back — the rule every other
+    // quantified variable already keeps. So what is re-lowered is the concrete
+    // half, and the open half is only asserted to print as itself.
+    for (annotation, expected) in [
+        ("Nat -> Nat ! `Log", "Nat -> Nat ! `Log"),
+        ("Nat -> Nat ! `Log | `IO", "Nat -> Nat ! `Log | `IO"),
+        ("Nat -> Nat ! ..e", "Nat -> Nat ! ..'a"),
+        ("Nat -> Nat ! `Log | ..e", "Nat -> Nat ! `Log | ..'a"),
+        // Both spellings of pure.
+        ("Nat -> Nat", "Nat -> Nat"),
+        ("Nat -> Nat ! |", "Nat -> Nat"),
+        // The two arrow-binding cases, as a definition's own type.
+        ("Nat -> Nat -> Nat ! `Log", "Nat -> Nat -> Nat ! `Log"),
+        ("Nat -> (Nat -> Nat) ! `Log", "Nat -> (Nat -> Nat) ! `Log"),
+        // A `where` clause on effect presences prints as it was written.
+        (
+            "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b",
+            "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b",
+        ),
+    ] {
+        // Two arguments where the annotation takes two, so that pushing the
+        // written type into the lambda has somewhere to put each of them.
+        let arrows = annotation.matches("->").count();
+        let body = match arrows {
+            1 => "fn x => x".to_string(),
+            _ => "fn x => fn y => y".to_string(),
+        };
+        let source = format!("{effects}let f : {annotation} = {body}");
+        let (_, scheme) = types_of(&source);
+        assert_eq!(scheme, expected, "{annotation}");
+        // What was printed, read back: the scheme of a definition annotated
+        // with it is the same scheme. Only where the printed form is one a
+        // reader could have written, which a quantified tail is not.
+        if !scheme.contains('\'') {
+            let again = format!("{effects}let f : {scheme} = {body}");
+            assert_eq!(types_of(&again).1, expected, "{annotation}");
+        }
+    }
+}
+
+/// An alias does not survive into the semantic type language, so a type
+/// annotated with one prints as the effects it stands for — and that is what
+/// re-lowers.
+#[test]
+fn an_alias_prints_as_the_effects_it_names() {
+    let source = "effect Log = `write : Nat -> ()\n\
+                  effect IO = `print : Nat -> ()\n\
+                  effect Console = `Log | `IO\n\
+                  let f : Nat -> Nat ! `Console = fn x => x";
+    let (written, scheme) = types_of(source);
+    // The IR keeps the row expanded, since expansion is lowering's.
+    assert_eq!(written, "Nat -> Nat ! `Log | `IO");
+    assert_eq!(scheme, "Nat -> Nat ! `Log | `IO");
+}
+
+/// Both trees render an effect declaration, a handler and an operation
+/// reference back as the source they came from — the AST as written, the IR
+/// with its aliases expanded and its binders named through the mint.
+#[test]
+fn both_trees_render_the_effect_forms() {
+    for source in [
+        "effect Log = | `write : Nat -> {}",
+        "effect Log = | `write : Nat -> {} | `flush : {} -> {}",
+        "effect Nil = |",
+        // An effect written absent, and a `when` clause on one: both trees
+        // render the marks a row's labels may wear.
+        "effect Log = | `write : Nat -> {}\nlet f : Nat -> Nat ! \\`Log | ..e = fn x => x",
+        "effect Log = | `write : Nat -> {}\nlet f : Nat -> Nat ! `Log (when a) | ..e = fn x => x",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}");
+        assert_eq!(ir, source, "{source}");
+    }
+
+    let source = "effect Log = | `write : Nat -> {}\n\
+                  let h = fn n => handle Log.`write n with | Log.`write s => {} | return x => x end";
+    let (ast, ir) = printed(source);
+    assert_eq!(ast, source);
+    assert_eq!(ir, source);
+    let (_, again) = printed(&ir);
+    assert_eq!(again, ir);
+}

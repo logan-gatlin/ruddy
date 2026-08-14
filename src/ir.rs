@@ -17,9 +17,57 @@ use crate::{
 pub struct Program {
     pub terms: IndexMap<Symbol, Decl<Term>>,
     pub types: IndexMap<Symbol, Decl<Type>>,
+    /// The effects declared, in the order they were written, each with the
+    /// operations it declares or the effects it stands for.
+    pub effects: IndexMap<Symbol, Decl<Effect>>,
     /// The definitions split into the smallest sets that have to be typed
     /// together, earliest first. See [`Group`] and [`grouping`].
     pub groups: Vec<Group>,
+}
+
+/// What one `effect` declaration says: the operations it declares, or the
+/// effects it stands for.
+///
+/// The two forms of R3 and R4, told apart by whether the cases carry a `:` and
+/// kept apart from there on: an alias declares no operations, so
+/// `` Console.`write `` has nothing to resolve to, and an operation declaration
+/// stands for itself alone.
+#[derive(Debug, Clone)]
+pub enum Effect {
+    /// `` effect Log = `write : Nat -> () `` — the operations, by name, in the
+    /// order they were written. Empty for the empty effect, `effect Nil = |`,
+    /// which declares nothing.
+    Operations(IndexMap<String, Operation>),
+    /// `` effect Console = `Log | `IO `` — the effects this name stands for.
+    ///
+    /// Kept as it was written, though nothing downstream reads an alias: a row
+    /// naming one is expanded to its labels at lowering, so no alias survives
+    /// into the semantic type language and a printed type shows the effects
+    /// rather than the name. See [`Builder::expansions`].
+    Alias(IndexMap<String, Named>),
+}
+
+/// One operation of an effect: the plain closed arrow performing it has.
+///
+/// The two sides rather than one arrow node, because that is what the arm rule
+/// of R16 wants: a handler arm for `` `op : A -> B `` binds its binder at `A`
+/// and has body type `B`, and neither half is ever read as a whole arrow.
+#[derive(Debug, Clone)]
+pub struct Operation {
+    /// Where the operation's name was written, the [`Field`] split every other
+    /// label keeps.
+    pub name_span: Span,
+    pub from: Type,
+    pub to: Type,
+}
+
+/// One effect named by another: the symbol it resolved to, and where it was
+/// written. What an alias's cases are, and what the labels of an effect row
+/// resolve through.
+#[derive(Debug, Clone)]
+pub struct Named {
+    pub name_span: Span,
+    pub symbol: Symbol,
 }
 
 /// A set of definitions that all have to be typed at once, because each of them
@@ -167,6 +215,35 @@ pub enum TermKind {
         scrutinee: Box<Term>,
         arms: Vec<(Pattern, Term)>,
     },
+    /// `handle <expr> with <arms> end` — the effects the arms fully cover,
+    /// discharged.
+    ///
+    /// Which effects those are is settled here, before inference: R15 holds a
+    /// handler to covering every operation of every effect it names, so the set
+    /// is a fact about the written arms rather than something the solver works
+    /// out. See [`Handler`].
+    Handle {
+        body: Box<Term>,
+        handler: Handler,
+    },
+    /// `raise <expr>` — abort to the handler around this arm.
+    ///
+    /// That an arm encloses it, with no `fn` in between, is checked here rather
+    /// than typed: `raise` is bound to one particular handler, so a closure
+    /// carrying one could outlive the `handle` and be called with nothing on
+    /// the stack. See [`ErrorKind::RaiseInFunction`].
+    Raise(Box<Term>),
+    /// `` Log.`write `` — one operation of an effect, as an ordinary value.
+    ///
+    /// The operation's name stays a string for the reason [`Field`]'s keys do:
+    /// it is scoped to the declaration that declares it, and two effects may
+    /// each declare a `` `write ``. What it resolved to is the effect beside
+    /// it, and lowering has already checked that the name is one of that
+    /// effect's.
+    Operation {
+        effect: Tracked<Symbol>,
+        op: TrackedString,
+    },
     Ident(Symbol),
     /// A natural number literal. It carries no symbol: a literal names nothing,
     /// so there is nothing for the mint to hand out.
@@ -174,6 +251,50 @@ pub enum TermKind {
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
+}
+
+/// The arms of one `handle`, and the effects they discharge between them.
+///
+/// `discharges` is what R15's coverage check bought: every effect an arm names
+/// is fully covered, so the set of effects the body may perform beyond its
+/// context is known before a single constraint is generated.
+#[derive(Debug, Clone)]
+pub struct Handler {
+    /// The operation arms, in the order they were written.
+    pub arms: Vec<HandlerArm>,
+    /// The `return` arm, when one was written. At most one, in any position;
+    /// where it was written is not kept, because nothing depends on it.
+    pub ret: Option<ReturnArm>,
+    /// The effects fully covered, in the order the arms first name them.
+    pub discharges: Vec<Tracked<Symbol>>,
+}
+
+/// One operation arm: the operation it answers, the name it binds the payload
+/// to, and the expression it gives back.
+///
+/// The arm's value *is* the operation's result — an arm resumes with it — so
+/// both halves of its type come off the declaration and `Ans` appears in
+/// neither.
+#[derive(Debug, Clone)]
+pub struct HandlerArm {
+    pub effect: Tracked<Symbol>,
+    pub op: TrackedString,
+    /// The binder, as a symbol. A `_` gets a fresh one nothing can name, the
+    /// way a `fn` header's wildcard does.
+    pub binder: Tracked<Symbol>,
+    pub body: Term,
+}
+
+/// The `return` arm: the name it binds the handled expression's value to, and
+/// the answer it gives back.
+#[derive(Debug, Clone)]
+pub struct ReturnArm {
+    /// Where the `return` was written, so a second one can point at the first.
+    pub span: Span,
+    pub binder: Tracked<Symbol>,
+    /// Boxed where an operation arm's is not: those sit in a `Vec`, which is
+    /// already a step away, and there is at most one of these.
+    pub body: Box<Term>,
 }
 
 /// A surface pattern, normalized: every binder a resolved [`Symbol`], puns
@@ -237,6 +358,10 @@ pub enum TypeKind {
     Arrow {
         from: Box<Type>,
         to: Box<Type>,
+        /// The effects calling it may perform, with every alias already
+        /// expanded to the effects it names. Empty and closed for a bare
+        /// `A -> B`, which is pure.
+        effects: EffectRow,
     },
     Ident(Symbol),
     /// A declared type applied to arguments.
@@ -373,6 +498,56 @@ pub enum SumCase {
     Absent { name_span: Span },
 }
 
+/// The effects an arrow may perform, lowered: the effects it names, and what is
+/// known about the ones it does not.
+///
+/// Aliases are gone by the time one of these exists — `` `Console `` lowers to
+/// the labels it stands for — so nothing downstream has an alias to look
+/// through, and a printed type shows the effects rather than the name. See
+/// [`Builder::expansions`].
+///
+/// `written` is `false` for the row a bare `A -> B` has, which is the empty
+/// closed one. Kept so that the debugger's AST and IR tabs can print an arrow
+/// back as it stood: `A -> B ! |` writes a row and `A -> B` writes none, and
+/// both mean this.
+#[derive(Debug, Clone, Default)]
+pub struct EffectRow {
+    pub span: Span,
+    pub written: bool,
+    pub effects: IndexMap<String, EffectLabel>,
+    pub tail: Option<Tail>,
+}
+
+/// One effect a row names: performed — as its `when` clause says, where it
+/// wears one — or definitely not.
+///
+/// [`SumCase`]'s twin minus the payload: an effect carries nothing, so a
+/// lowered label holds only what a complaint about it needs and the symbol the
+/// name resolved to.
+#[derive(Debug, Clone)]
+pub enum EffectLabel {
+    /// `` `Log ``, or `` `Log (when a) ``.
+    Written {
+        name_span: Span,
+        symbol: Symbol,
+        /// Whether this label came out of an alias rather than being written.
+        ///
+        /// `` `Console `` stands for `` `Log `` and `` `IO ``, and neither of
+        /// those names is anywhere on the page — `name_span` is the alias's.
+        /// What reads this is the debugger, which may paint a span in the
+        /// editor as a use of a name only where the name really is.
+        expanded: bool,
+        when: Option<Box<When>>,
+    },
+    /// `` \`Log `` — definitely not performed. `name_span` covers the whole
+    /// `` \`Log ``.
+    Absent {
+        name_span: Span,
+        symbol: Symbol,
+        expanded: bool,
+    },
+}
+
 /// The `..` tail of a struct type: what is said about the fields not named.
 #[derive(Debug, Clone)]
 pub struct Tail {
@@ -430,7 +605,8 @@ pub enum ErrorKind {
         previous: Span,
     },
     DuplicateField,
-    /// A second case of a name in one sum.
+    /// A second case of a name in one sum, one effect row, or one alias — all
+    /// three being a set of labels a name may appear in once.
     DuplicateCase,
     /// An explicitly absent label in a composite with no `..` tail, as in
     /// `{ a: Nat, \y }` or `` `A | \`B ``.
@@ -620,15 +796,19 @@ pub enum ErrorKind {
     /// though it should: a tail holding a name would have to be unfolded by the
     /// walks that flatten rows, and neither does.
     ///
-    /// Only ever about a sum now, which is why it carries nothing: a struct's
-    /// `..` is its core, and a core takes any type at all, so `WithX Nat` is
-    /// well-formed. The name stays because the code is stable and renaming it
-    /// would churn a code and a test file for no gain.
+    /// Never about a struct: a struct's `..` is its core, and a core takes any
+    /// type at all, so `WithX Nat` is well-formed. A sum's rest and an arrow's
+    /// effects are the two that are spliced into a row, so the reading is
+    /// carried to say which of them the reader was asked for. The name stays
+    /// because the code is stable and renaming it would churn a code and a test
+    /// file for no gain.
     ///
     /// The argument absorbs, so this is said once. Left standing it would be
     /// substituted into the tail all the same, and the reader would be told a
     /// second time in words about a row they never wrote.
-    NotARow,
+    NotARow {
+        sense: Sense,
+    },
     /// An argument naming a label the declaration it is handed to already
     /// names: `WithX { x: Nat }` against `type WithX r = { x: Nat, ..r }`, and
     /// `` Or (`A) `` against `` type Or r = `A | ..r ``.
@@ -692,6 +872,93 @@ pub enum ErrorKind {
     DuplicateBinding {
         name: String,
     },
+    /// A second operation of a name in one effect:
+    /// `` effect Log = `write : Nat -> () | `write : () -> () ``.
+    ///
+    /// [`ErrorKind::DuplicateCase`]'s twin, and scoped the same way: an
+    /// operation belongs to its own declaration, so two effects may each
+    /// declare a `` `write `` and two `` `write `` in one may not.
+    DuplicateOperation,
+    /// An operation whose signature is not a function, as in
+    /// `` effect Log = `write : Nat ``.
+    ///
+    /// Performing an operation is applying it, so an operation that is not an
+    /// arrow would be performed by mention — there would be nowhere for the
+    /// perform site to be. Refused rather than read as a nullary operation,
+    /// which is a larger language than this one has.
+    NotAnOperation {
+        /// The operation's name, so the complaint can show what to write
+        /// instead.
+        name: String,
+    },
+    /// An operation's signature that is not plain: an effect row, a `..` tail
+    /// or a `when` anywhere inside it.
+    ///
+    /// All three say something a definition gets to decide, and an operation's
+    /// signature holds for every performance of it — the reason a `type`
+    /// declaration refuses the same three. It is a complaint of its own rather
+    /// than [`ErrorKind::OpenDeclaredType`] because the `!` is refused here and
+    /// nowhere else, and one sentence naming all three is what a reader can act
+    /// on.
+    ImpureOperation,
+    /// An effect declaration whose cases mix the two forms:
+    /// `` effect Bad = `Log | `write : Nat -> () ``.
+    ///
+    /// The `:` is what tells an operation from a name, so a declaration with
+    /// some of each says two things at once and neither of them wholly. Refused
+    /// rather than read one way: which of the two was meant is the writer's to
+    /// say.
+    MixedEffectForm,
+    /// `` Console.`write `` where `Console` is an alias.
+    ///
+    /// An alias is a name for a set of effects and declares nothing of its own,
+    /// so there is no operation here to refer to. The name is carried for the
+    /// wording; the span points at the head.
+    OperationOnAlias {
+        effect: String,
+    },
+    /// An operation an effect does not declare: `` Log.`writ ``.
+    ///
+    /// [`ErrorKind::Undefined`]'s cousin, and not it: an operation is a label
+    /// scoped to its own declaration rather than a name in a namespace, so what
+    /// went wrong names the effect as well as the operation.
+    UnknownOperation {
+        effect: String,
+        op: String,
+    },
+    /// A handler naming an effect it does not fully cover, as in
+    /// `` handle p () with | Log.`write s => () end `` where `Log` also
+    /// declares `` `flush ``.
+    ///
+    /// Which effects a handler discharges has to be known before inference —
+    /// the body is checked at an ambient the discharged effects extend — and a
+    /// half-covered effect leaves that set undecidable. The operations with no
+    /// arm are carried so the complaint can name them.
+    PartialHandler {
+        effect: String,
+        missing: Vec<String>,
+    },
+    /// Two arms for one operation in a handler. The first is the one that
+    /// stands, the way a duplicate anything else is.
+    DuplicateArm {
+        effect: String,
+        op: String,
+    },
+    /// Two `return` arms in one handler. Reported at the second; the first is
+    /// the one that stands.
+    DuplicateReturn {
+        previous: Span,
+    },
+    /// A `raise` with no handler arm enclosing it.
+    RaiseOutsideArm,
+    /// A `raise` written inside a `fn` that sits inside a handler arm.
+    ///
+    /// The rule that keeps the feature sound. A `raise` answers one particular
+    /// handler rather than an effect, so a closure carrying one could be
+    /// returned by the computation, outlive the `handle`, and be called with no
+    /// handler on the stack. The mirror case needs no rule, because the row
+    /// already tracks it.
+    RaiseInFunction,
 }
 
 /// What made a binding's pattern able to fail: the first tag or number found
@@ -745,6 +1012,7 @@ pub struct Output {
 enum Scope {
     Terms,
     Types,
+    Effects,
 }
 
 impl From<Scope> for Namespace {
@@ -752,6 +1020,7 @@ impl From<Scope> for Namespace {
         match scope {
             Scope::Terms => Namespace::Terms,
             Scope::Types => Namespace::Types,
+            Scope::Effects => Namespace::Effects,
         }
     }
 }
@@ -765,6 +1034,22 @@ struct Builder<'a> {
     errors: Vec<Error>,
     terms: Names,
     types: Names,
+    effects: Names,
+    /// What each declared effect stands for: itself, for one that declares
+    /// operations, and the effects it names — transitively — for an alias.
+    ///
+    /// Filled before any type body or annotation is lowered, which is what lets
+    /// an effect row expand an alias wherever it is written, including above the
+    /// declaration it names. See [`Builder::expansions`].
+    expanded: HashMap<Symbol, IndexMap<String, Symbol>>,
+    /// The operations each effect *declares*, in the order it declares them.
+    /// An alias has no entry at all, which is what tells `` Console.`write ``
+    /// from `` Log.`writ ``: one names something that declares no operations,
+    /// and the other an operation the effect does not have.
+    operations: HashMap<Symbol, IndexSet<String>>,
+    /// Which handler arm, if any, lexically encloses the term being lowered.
+    /// What R17's `raise` placement check reads; see [`Answering`].
+    answering: Answering,
     /// How many arguments each declared type takes. Filled before any body is
     /// lowered, so an application can be counted wherever it appears —
     /// including above the declaration it names, which the hoist allows.
@@ -818,12 +1103,35 @@ struct Binding {
 }
 
 /// Where a written type is being lowered from: the body of a `type`
-/// declaration, or an annotation on a definition. Only an annotation may be
-/// open; see [`ErrorKind::OpenDeclaredType`].
+/// declaration, an operation's signature, or an annotation on a definition.
+/// Only an annotation may be open; see [`ErrorKind::OpenDeclaredType`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Place {
     Declaration,
+    /// An operation's signature inside an `effect` declaration. Held closed
+    /// like a declaration's body, and told about it in its own words, because
+    /// the `!` an operation may not carry is refused here and nowhere else.
+    Operation,
     Annotation,
+}
+
+/// Which handler arm a `raise` written here would answer.
+///
+/// R17 in three values. A `raise` answers the innermost arm that lexically
+/// encloses it, so lowering carries the answer down: an arm's body sets
+/// [`Answering::Arm`], a `fn` body puts whatever it had behind it — a closure
+/// can outlive the `handle` it was written in — and everything else passes it
+/// on unchanged. Which is why a `raise` in the handled expression of a nested
+/// `handle` inside an arm is legal: the outer handler is still on the stack
+/// while the inner one runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    /// No handler arm encloses this point at all.
+    Nowhere,
+    /// An arm encloses it, and nothing has come between.
+    Arm,
+    /// An arm encloses it, but a `fn` lies between the two.
+    UnderFn,
 }
 
 /// Where one parameter sits: the declaration that binds it, and its position
@@ -1114,6 +1422,46 @@ impl TypeField {
     }
 }
 
+impl EffectLabel {
+    /// Where the label was written: the name of a performed effect, the whole
+    /// `` \`Log `` of one written absent.
+    pub fn name_span(&self) -> Span {
+        match self {
+            EffectLabel::Written { name_span, .. } | EffectLabel::Absent { name_span, .. } => {
+                *name_span
+            }
+        }
+    }
+
+    /// The effect this label resolved to. Always one: a name that resolved to
+    /// nothing is dropped from the row where it was written, so nothing here
+    /// can be a dangling symbol.
+    pub fn symbol(&self) -> Symbol {
+        match self {
+            EffectLabel::Written { symbol, .. } | EffectLabel::Absent { symbol, .. } => *symbol,
+        }
+    }
+
+    /// Whether an alias put this label here rather than the reader. See
+    /// [`EffectLabel::Written::expanded`].
+    pub fn expanded(&self) -> bool {
+        match self {
+            EffectLabel::Written { expanded, .. } | EffectLabel::Absent { expanded, .. } => {
+                *expanded
+            }
+        }
+    }
+
+    /// The `when` clause the label wears, when it wears one. An absent label
+    /// never does: `` \`Log `` says the effect is not performed outright.
+    pub fn when(&self) -> Option<&When> {
+        match self {
+            EffectLabel::Written { when, .. } => when.as_deref(),
+            EffectLabel::Absent { .. } => None,
+        }
+    }
+}
+
 impl SumCase {
     /// Where the label was written: the [`TypeField::name_span`] of a case.
     pub fn name_span(&self) -> Span {
@@ -1149,6 +1497,10 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         errors: Vec::new(),
         terms: Names::default(),
         types: Names::default(),
+        effects: Names::default(),
+        expanded: HashMap::new(),
+        operations: HashMap::new(),
+        answering: Answering::Nowhere,
         arities: HashMap::new(),
         params: HashMap::new(),
         tails: HashMap::new(),
@@ -1157,19 +1509,22 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     let mut program = Program {
         terms: IndexMap::new(),
         types: IndexMap::new(),
+        effects: IndexMap::new(),
         groups: Vec::new(),
     };
     // Split before lowering rather than lowering in the order written: every
     // type is declared before any term is looked at, so a term can name a type
-    // written anywhere in the program. Both halves keep the order they were
-    // written in, and both are hoisted over themselves, so where a name is
-    // written decides nothing about what can see it.
+    // written anywhere in the program. All three halves keep the order they
+    // were written in, and all three are hoisted over themselves, so where a
+    // name is written decides nothing about what can see it.
     let mut types = Vec::new();
     let mut terms = Vec::new();
+    let mut effects = Vec::new();
     for stmt in stmts {
         match stmt.tracked {
             StmtKind::Type { name, params, body } => types.push((name, params, body)),
             StmtKind::Let { pattern, ty, body } => terms.push((pattern, ty, body)),
+            StmtKind::Effect { name, cases } => effects.push((name, cases)),
         }
     }
     // Every type's name is bound before any type's body is read, so a type can
@@ -1195,6 +1550,43 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         .iter()
         .zip(&bound)
         .filter_map(|(symbol, params)| Some(((*symbol)?, params.len())))
+        .collect();
+    // Effects next, and before any type body: a `type` declaration may name one
+    // in an arrow it writes, and an alias written anywhere has to be expandable
+    // wherever a row mentions it. Their names are bound before any of their own
+    // cases are read, for the reason a type's is — two effects may name each
+    // other, and an operation's signature may name a type declared below it.
+    let named: Vec<_> = effects
+        .iter()
+        .map(|(name, _)| b.declare(Scope::Effects, name))
+        .collect();
+    for (symbol, (name, cases)) in named.into_iter().zip(effects) {
+        let value = b.effect(cases);
+        if let Some(symbol) = symbol {
+            program.effects.insert(
+                symbol,
+                Decl {
+                    name_span: name.span,
+                    annotation: None,
+                    // An effect takes no parameters: it stands for the same
+                    // thing wherever it is written.
+                    params: Vec::new(),
+                    value,
+                },
+            );
+        }
+    }
+    // What each effect name stands for, once every declaration is in: itself,
+    // or — for an alias — the effects it names, through however many aliases it
+    // takes to reach them.
+    b.expanded = expansions(b.mint, &program.effects);
+    b.operations = program
+        .effects
+        .iter()
+        .filter_map(|(symbol, decl)| match &decl.value {
+            Effect::Operations(operations) => Some((*symbol, operations.keys().cloned().collect())),
+            Effect::Alias(_) => None,
+        })
         .collect();
     for ((symbol, (name, _, body)), params) in declared.into_iter().zip(types).zip(bound) {
         // The parameters are in scope for the length of the body and released
@@ -1469,6 +1861,64 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     }
 }
 
+/// What each declared effect stands for, as the concrete effects it names.
+///
+/// An effect that declares operations stands for itself. An alias stands for
+/// the effects its cases name, and for whatever *those* stand for — which makes
+/// this a fixpoint over the alias graph rather than a read of one declaration,
+/// since aliases are hoisted and may name each other.
+///
+/// An alias that leads back to itself contributes nothing on the way round,
+/// which is what keeps this finite: the sets only grow, they are bounded by the
+/// effects in the program, and a loop of pure aliases simply comes to the union
+/// of what its members reach outside itself. There is nothing to refuse — a
+/// circular alias stands for a perfectly good set of effects, unlike a circular
+/// *type*, which stands for nothing at all.
+///
+/// Insertion-ordered, so a row that expands an alias always names its effects
+/// in the same order and a printed type reads the same on every run.
+fn expansions(
+    mint: &Mint,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+) -> HashMap<Symbol, IndexMap<String, Symbol>> {
+    // A declaration with operations is the effect itself, whatever it declares
+    // — including the empty one, which declares nothing and is still an effect
+    // a row may name. An alias starts from nothing and grows below.
+    let mut out: HashMap<Symbol, IndexMap<String, Symbol>> = effects
+        .iter()
+        .map(|(symbol, decl)| {
+            let stands = match &decl.value {
+                Effect::Operations(_) => [(mint.name(*symbol).to_string(), *symbol)]
+                    .into_iter()
+                    .collect(),
+                Effect::Alias(_) => IndexMap::new(),
+            };
+            (*symbol, stands)
+        })
+        .collect();
+    loop {
+        let mut grew = false;
+        for (symbol, decl) in effects {
+            let Effect::Alias(cases) = &decl.value else {
+                continue;
+            };
+            let mut found: IndexMap<String, Symbol> = IndexMap::new();
+            for named in cases.values() {
+                for (name, reached) in out.get(&named.symbol).into_iter().flatten() {
+                    found.insert(name.clone(), *reached);
+                }
+            }
+            let entry = out.get_mut(symbol).expect("every effect was seeded");
+            for (name, reached) in found {
+                grew |= entry.insert(name, reached).is_none();
+            }
+        }
+        if !grew {
+            return out;
+        }
+    }
+}
+
 /// Every declaration that leads back to itself through nothing but core
 /// positions, in the order the loops were found, split by whether the loop adds
 /// fields on the way round.
@@ -1702,7 +2152,22 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
                 erase_circular(body, looping, out);
             }
         }
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Handle { body, handler } => {
+            erase_circular(body, looping, out);
+            for arm in &mut handler.arms {
+                erase_circular(&mut arm.body, looping, out);
+            }
+            if let Some(ret) = &mut handler.ret {
+                erase_circular(&mut ret.body, looping, out);
+            }
+        }
+        TermKind::Raise(value) => erase_circular(value, looping, out),
+        // An operation names an effect rather than a definition, so there is
+        // no value here for a loop to close through.
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -1742,7 +2207,22 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
                 nested(body, out);
             }
         }
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        // A handler arm's binder is a lambda argument's twin, so — as with a
+        // match — only what sits inside is walked.
+        TermKind::Handle { body, handler } => {
+            nested(body, out);
+            for arm in &handler.arms {
+                nested(&arm.body, out);
+            }
+            if let Some(ret) = &handler.ret {
+                nested(&ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => nested(value, out),
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -1796,6 +2276,13 @@ impl Chain<'_> {
             | TermKind::Tag { .. }
             | TermKind::Project { .. }
             | TermKind::Match { .. }
+            // A handler is a shape for the reason a match is: it asks
+            // something of what it handles rather than handing it on. A
+            // `raise` and an operation are shapes outright — neither is a
+            // name that could lead anywhere.
+            | TermKind::Handle { .. }
+            | TermKind::Raise(_)
+            | TermKind::Operation { .. }
             | TermKind::Natural(_)
             | TermKind::Error => Stands::Shape,
         }
@@ -2360,7 +2847,19 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
                 references(body, out);
             }
         }
-        TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Handle { body, handler } => {
+            references(body, out);
+            for arm in &handler.arms {
+                references(&arm.body, out);
+            }
+            if let Some(ret) = &handler.ret {
+                references(&ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => references(value, out),
+        // An operation names an effect, which is no definition and so no node
+        // of the graph a group is read off.
+        TermKind::Operation { .. } | TermKind::Natural(_) | TermKind::Error => {}
     }
 }
 
@@ -2481,10 +2980,20 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
             // the declaration is a write-off and `mixed` says so — but calling
             // it a type would be this pass reporting one thing and displaying
             // another.
-            kinds.push(match read_as.contains(&Sense::Cases) {
-                true => ParamKind::Cases { lacks },
-                false => ParamKind::Type { lacks },
-            });
+            // A parameter read more than one way is shown as the row reading
+            // among them, for the reason below — and a sum's rest wins over an
+            // arrow's effects only because one of the two has to, the
+            // declaration being a write-off either way.
+            kinds.push(
+                match (
+                    read_as.contains(&Sense::Cases),
+                    read_as.contains(&Sense::Effects),
+                ) {
+                    (true, _) => ParamKind::Cases { lacks },
+                    (false, true) => ParamKind::Effects { lacks },
+                    (false, false) => ParamKind::Type { lacks },
+                },
+            );
         }
         out.insert(*symbol, kinds);
     }
@@ -2581,9 +3090,20 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                 out(Fact::Says(*index, ParamKind::Cases { lacks }));
             }
         }
-        TypeKind::Arrow { from, to } => {
+        // The sum's arm a third time, about effects: an arrow's two sides are
+        // type positions, and the effects written beside its tail — absent ones
+        // included — are what that tail may not name.
+        TypeKind::Arrow { from, to, effects } => {
             constrain(from, out);
             constrain(to, out);
+            if let Some(Tail {
+                of: Row::Param { index, .. },
+                ..
+            }) = effects.tail
+            {
+                let lacks = effects.effects.keys().cloned().collect();
+                out(Fact::Says(index, ParamKind::Effects { lacks }));
+            }
         }
         TypeKind::Apply { head, args, .. } => {
             for (at, arg) in args.iter().enumerate() {
@@ -2685,37 +3205,44 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 let head = *head;
                 for (at, arg) in args.iter_mut().enumerate() {
                     let kind = kinds.get(&head).and_then(|kinds| kinds.get(at));
-                    let refused =
-                        match kind {
-                            // A sum's rest is spliced into a row, so only a sum can
-                            // go there — and only one naming none of the cases the
-                            // declaration already names.
-                            Some(ParamKind::Cases { lacks }) => match row_shaped(arg, rows) {
-                                false => Some(ErrorKind::NotARow),
+                    let refused = match kind {
+                        // A sum's rest and an arrow's effects are both
+                        // spliced into a row, so only a row can go there —
+                        // and only one naming none of the labels the
+                        // declaration already names. The two conditions are
+                        // one condition; only the noun a complaint is
+                        // worded in differs.
+                        Some(kind) if kind.cases().is_some() => {
+                            let (shape, lacks) = kind.cases().expect("the arm just asked for one");
+                            match row_shaped(arg, rows) {
+                                false => Some(ErrorKind::NotARow {
+                                    sense: kind.sense(),
+                                }),
                                 true => cases_named(arg).find(|name| lacks.contains(*name)).map(
                                     |field| ErrorKind::RepeatedRowField {
-                                        shape: Shape::Sum,
+                                        shape,
                                         field: field.clone(),
                                     },
                                 ),
-                            },
-                            // A struct's `..` is the type's core, and a core takes
-                            // any type at all — so there is no shape left to check,
-                            // and the only question is the fields the argument would
-                            // bring with it, which reach through a name as much as
-                            // they are written out.
-                            Some(ParamKind::Type { lacks }) if !lacks.is_empty() => {
-                                carried(arg, carries)
-                                    .labels
-                                    .into_iter()
-                                    .find(|name| lacks.contains(name))
-                                    .map(|field| ErrorKind::RepeatedRowField {
-                                        shape: Shape::Struct,
-                                        field,
-                                    })
                             }
-                            _ => None,
-                        };
+                        }
+                        // A struct's `..` is the type's core, and a core takes
+                        // any type at all — so there is no shape left to check,
+                        // and the only question is the fields the argument would
+                        // bring with it, which reach through a name as much as
+                        // they are written out.
+                        Some(ParamKind::Type { lacks }) if !lacks.is_empty() => {
+                            carried(arg, carries)
+                                .labels
+                                .into_iter()
+                                .find(|name| lacks.contains(name))
+                                .map(|field| ErrorKind::RepeatedRowField {
+                                    shape: Shape::Struct,
+                                    field,
+                                })
+                        }
+                        _ => None,
+                    };
                     if let Some(kind) = refused {
                         let span = arg.span;
                         out.push(Error { span, kind });
@@ -2727,7 +3254,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     walk(arg, kinds, carries, rows, out);
                 }
             }
-            TypeKind::Arrow { from, to } => {
+            // The effect row holds no argument to check: an effect is named,
+            // never applied, so there is nothing inside one for a parameter's
+            // conditions to be broken by.
+            TypeKind::Arrow { from, to, .. } => {
                 walk(from, kinds, carries, rows, out);
                 walk(to, kinds, carries, rows, out);
             }
@@ -2839,7 +3369,20 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
                 annotations(body, out);
             }
         }
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Handle { body, handler } => {
+            annotations(body, out);
+            for arm in &mut handler.arms {
+                annotations(&mut arm.body, out);
+            }
+            if let Some(ret) = &mut handler.ret {
+                annotations(&mut ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => annotations(value, out),
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -3147,9 +3690,19 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                     out(*index, under);
                 }
             }
-            TypeKind::Arrow { from, to } => {
+            TypeKind::Arrow { from, to, effects } => {
                 occurrences(from, under, out);
                 occurrences(to, under, out);
+                // The effect tail counts, for the reason a struct's and a
+                // sum's do: what is spliced in there is as much part of what
+                // the declaration stands for as a field is.
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = effects.tail
+                {
+                    out(index, under);
+                }
             }
             TypeKind::Apply { head, args, .. } => {
                 for (at, arg) in args.iter().enumerate() {
@@ -3207,7 +3760,9 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
                 mentioned(arg, out);
             }
         }
-        TypeKind::Arrow { from, to } => {
+        // An effect row names effects and no declared types, so there is
+        // nothing in one to mention.
+        TypeKind::Arrow { from, to, .. } => {
             mentioned(from, out);
             mentioned(to, out);
         }
@@ -3273,7 +3828,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
                 grows(arg, group, report);
             }
         }
-        TypeKind::Arrow { from, to } => {
+        TypeKind::Arrow { from, to, .. } => {
             grows(from, group, report);
             grows(to, group, report);
         }
@@ -3307,7 +3862,11 @@ fn mentions_a_parameter(ty: &Type) -> bool {
     match &ty.tracked {
         TypeKind::Param { .. } => true,
         TypeKind::Apply { args, .. } => args.iter().any(mentions_a_parameter),
-        TypeKind::Arrow { from, to } => mentions_a_parameter(from) || mentions_a_parameter(to),
+        TypeKind::Arrow { from, to, effects } => {
+            tails_a_parameter(&effects.tail)
+                || mentions_a_parameter(from)
+                || mentions_a_parameter(to)
+        }
         TypeKind::Struct { fields, tail } => {
             tails_a_parameter(tail)
                 || fields
@@ -3360,6 +3919,7 @@ impl Builder<'_> {
         match scope {
             Scope::Terms => &mut self.terms,
             Scope::Types => &mut self.types,
+            Scope::Effects => &mut self.effects,
         }
     }
 
@@ -3438,6 +3998,114 @@ impl Builder<'_> {
         }
     }
 
+    /// Lower one `effect` declaration's cases into the operations they declare
+    /// or the effects they name.
+    ///
+    /// Which of the two forms it is, is decided by the `:`s: all of them is an
+    /// operation declaration, none of them an alias, and a mix is refused —
+    /// where the majority is not the point, so a mixed declaration is read as
+    /// whichever form its *first* case is and every case of the other form is
+    /// dropped, leaving one complaint and a declaration that still stands for
+    /// something. The empty declaration, `effect Nil = |`, has no first case
+    /// and declares nothing.
+    fn effect(&mut self, cases: IndexMap<TrackedString, parse::EffectCase>) -> Effect {
+        // The empty declaration takes the operation form: `effect Nil = |` is
+        // an effect a row may name that declares nothing, rather than a name
+        // standing for no effects at all.
+        let aliasing = matches!(cases.values().next(), Some(parse::EffectCase::Alias));
+        let mut mixed = false;
+        let mut operations: IndexMap<String, Operation> = IndexMap::new();
+        let mut names: IndexMap<String, Named> = IndexMap::new();
+        for (name, case) in cases {
+            match (case, aliasing) {
+                (parse::EffectCase::Operation { signature }, false) => {
+                    let lowered = self.operation(&name, *signature);
+                    if operations.contains_key(&name.tracked) {
+                        self.error(name.span, ErrorKind::DuplicateOperation);
+                        continue;
+                    }
+                    operations.insert(name.tracked, lowered);
+                }
+                (parse::EffectCase::Alias, true) => {
+                    let Some(symbol) = self.effects.get(&name.tracked) else {
+                        self.error(
+                            name.span,
+                            ErrorKind::Undefined {
+                                namespace: Namespace::Effects,
+                            },
+                        );
+                        continue;
+                    };
+                    if names.contains_key(&name.tracked) {
+                        self.error(name.span, ErrorKind::DuplicateCase);
+                        continue;
+                    }
+                    names.insert(
+                        name.tracked,
+                        Named {
+                            name_span: name.span,
+                            symbol,
+                        },
+                    );
+                }
+                // A case of the other form. Reported once, at the first of
+                // them, and dropped: the declaration still stands for what its
+                // own form says, so nothing downstream is told a second time.
+                (case, _) => {
+                    if let parse::EffectCase::Operation { signature } = case {
+                        self.ty(*signature, Place::Operation);
+                    }
+                    if !mixed {
+                        mixed = true;
+                        self.error(name.span, ErrorKind::MixedEffectForm);
+                    }
+                }
+            }
+        }
+        match aliasing {
+            true => Effect::Alias(names),
+            false => Effect::Operations(operations),
+        }
+    }
+
+    /// Lower one operation's signature: the plain closed arrow performing it
+    /// has, taken apart into what it takes and what it gives back.
+    ///
+    /// An operation that is not an arrow is refused — a perform site is always
+    /// an application, so there would be nowhere for one to be — and the two
+    /// sides fall back to the error type, which absorbs.
+    fn operation(&mut self, name: &TrackedString, signature: parse::Type) -> Operation {
+        // A signature is a whole written type, so it is a scope of its own for
+        // the reason an annotation is — even though nothing it may write can
+        // reach either table.
+        self.tails.clear();
+        self.whens.clear();
+        let span = signature.span;
+        let lowered = self.ty(signature, Place::Operation);
+        let (from, to) = match lowered.tracked {
+            TypeKind::Arrow { from, to, .. } => (*from, *to),
+            written => {
+                // Only when the signature lowered to something in the first
+                // place: a type that was already refused is the error type, and
+                // saying it is not an arrow would be one mistake told twice.
+                if !matches!(written, TypeKind::Error) {
+                    self.error(
+                        span,
+                        ErrorKind::NotAnOperation {
+                            name: name.tracked.clone(),
+                        },
+                    );
+                }
+                (span.track(TypeKind::Error), span.track(TypeKind::Error))
+            }
+        };
+        Operation {
+            name_span: name.span,
+            from,
+            to,
+        }
+    }
+
     /// What a `..` tail stands for, and the one place a declaration is allowed
     /// to be open.
     ///
@@ -3457,8 +4125,8 @@ impl Builder<'_> {
         shape: Shape,
     ) -> Option<Row> {
         let Some(name) = name else {
-            if place == Place::Declaration {
-                self.error(span, ErrorKind::OpenDeclaredType { shape });
+            if let Some(kind) = openness(place, shape) {
+                self.error(span, kind);
             }
             return Some(Row::Anything);
         };
@@ -3467,8 +4135,8 @@ impl Builder<'_> {
         {
             return Some(Row::Param { symbol, index });
         }
-        if place == Place::Declaration {
-            self.error(span, ErrorKind::OpenDeclaredType { shape });
+        if let Some(kind) = openness(place, shape) {
+            self.error(span, kind);
         }
         // A name is one rest, and one rest stands for one thing. A struct's `..`
         // is the type its fields sit on and a sum's is the cases it does not
@@ -3518,7 +4186,11 @@ impl Builder<'_> {
             // no presence of its own for a formula to relate. Refused where it
             // was written, and dropped — the type beside it stands, exactly as
             // a declaration with a refused `..` keeps everything else it said.
-            Place::Declaration => {
+            // An operation's signature is read as a bare type rather than as
+            // an annotation, so no `where` can reach here written after one —
+            // and one that holds for every performance has no presence of its
+            // own for a formula to relate either way.
+            Place::Declaration | Place::Operation => {
                 self.error(clause.span, ErrorKind::ClauseInDeclaration);
                 None
             }
@@ -3624,9 +4296,9 @@ impl Builder<'_> {
         marks: impl IntoIterator<Item = Span>,
         tail: &Option<Tail>,
     ) -> bool {
-        if place != Place::Declaration {
+        let Some(kind) = openness(place, shape) else {
             return true;
-        }
+        };
         let marks: Vec<Span> = marks.into_iter().collect();
         let open_tail = matches!(
             tail,
@@ -3639,7 +4311,7 @@ impl Builder<'_> {
             return true;
         }
         for span in marks {
-            self.error(span, ErrorKind::OpenDeclaredType { shape });
+            self.error(span, kind.clone());
         }
         false
     }
@@ -3800,7 +4472,16 @@ impl Builder<'_> {
                     };
                     bound.push(span.track(symbol));
                 }
+                // A closure can be returned by the computation and outlive the
+                // `handle` it was written in, so a `raise` inside one answers
+                // nothing that is certain to still be on the stack. See R17.
+                let inner = match self.answering {
+                    Answering::Nowhere => Answering::Nowhere,
+                    Answering::Arm | Answering::UnderFn => Answering::UnderFn,
+                };
+                let outer = std::mem::replace(&mut self.answering, inner);
                 let body = self.term(*body);
+                self.answering = outer;
                 self.terms.release(mark);
                 bound.into_iter().rev().fold(body, |body, arg| {
                     let span = arg.span.merge(body.span);
@@ -3906,7 +4587,201 @@ impl Builder<'_> {
                 }
                 .with_span(span)
             }
+            // An operation is an ordinary value: what it resolves to is the
+            // effect and the label, and the type it gets is the declared
+            // signature with the effect's own label on its outermost arrow.
+            ExprKind::Operation { effect, op } => match self.operation_of(&effect, &op) {
+                Some(symbol) => TermKind::Operation {
+                    effect: effect.span.track(symbol),
+                    op,
+                }
+                .with_span(span),
+                None => TermKind::Error.with_span(span),
+            },
+            ExprKind::Handle { body, arms } => self.handle_term(span, *body, arms),
+            // The check R17 is: a `raise` answers the innermost arm around it,
+            // and a `fn` between the two is a closure that could outlive the
+            // handler. The value is lowered either way, so its own mistakes
+            // are still its own complaints.
+            ExprKind::Raise(value) => {
+                let kind = match self.answering {
+                    Answering::Arm => None,
+                    Answering::UnderFn => Some(ErrorKind::RaiseInFunction),
+                    Answering::Nowhere => Some(ErrorKind::RaiseOutsideArm),
+                };
+                if let Some(kind) = kind {
+                    self.error(span, kind);
+                }
+                TermKind::Raise(Box::new(self.term(*value))).with_span(span)
+            }
         }
+    }
+
+    /// Which effect declares the operation `Eff.`op` names, or `None` when
+    /// nothing does.
+    ///
+    /// Three ways to fail and a complaint apiece: the head names no effect at
+    /// all, the head is an alias — which declares no operations, so there is
+    /// nothing there to perform — or the effect declares no such operation.
+    fn operation_of(&mut self, effect: &TrackedString, op: &TrackedString) -> Option<Symbol> {
+        let Some(symbol) = self.effects.get(&effect.tracked) else {
+            self.error(
+                effect.span,
+                ErrorKind::Undefined {
+                    namespace: Namespace::Effects,
+                },
+            );
+            return None;
+        };
+        match self.operations.get(&symbol) {
+            Some(operations) if operations.contains(&op.tracked) => Some(symbol),
+            Some(_) => {
+                self.error(
+                    op.span,
+                    ErrorKind::UnknownOperation {
+                        effect: effect.tracked.clone(),
+                        op: op.tracked.clone(),
+                    },
+                );
+                None
+            }
+            None => {
+                self.error(
+                    effect.span,
+                    ErrorKind::OperationOnAlias {
+                        effect: effect.tracked.clone(),
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    /// Lower `handle <expr> with <arms> end`.
+    ///
+    /// The handled expression first, then the arms, each with its binder in
+    /// scope for its own body and released after it — the shape a `match`
+    /// keeps. What is decided here rather than typed is R15's coverage: every
+    /// effect an arm names has to have an arm for each of its operations, so
+    /// which effects the handler discharges is known before a constraint is
+    /// generated. And the answer is what R16 hands the body as a larger
+    /// ambient.
+    fn handle_term(&mut self, span: Span, body: Expr, arms: Vec<parse::HandlerArm>) -> Term {
+        let body = self.term(body);
+        // An arm's body runs where the `handle` was written rather than inside
+        // the computation, so a `raise` in one answers the handler around
+        // *that* — which is this one.
+        let outer = std::mem::replace(&mut self.answering, Answering::Arm);
+        let mut lowered: Vec<HandlerArm> = Vec::new();
+        let mut ret: Option<ReturnArm> = None;
+        // Which effects the arms name, and which of their operations have an
+        // arm, in the order the arms first named them.
+        let mut covered: IndexMap<Symbol, (Span, IndexSet<String>)> = IndexMap::new();
+        for arm in arms {
+            match arm.head {
+                parse::ArmHead::Return { span: at } => {
+                    if let Some(first) = &ret {
+                        self.error(
+                            at,
+                            ErrorKind::DuplicateReturn {
+                                previous: first.span,
+                            },
+                        );
+                    }
+                    let (binder, body) = self.arm_body(arm.binder, arm.body);
+                    // The first `return` arm is the one that stands, the way a
+                    // repeated definition is.
+                    if ret.is_none() {
+                        ret = Some(ReturnArm {
+                            span: at,
+                            binder,
+                            body: Box::new(body),
+                        });
+                    }
+                }
+                parse::ArmHead::Operation { effect, op } => {
+                    let symbol = self.operation_of(&effect, &op);
+                    let (binder, body) = self.arm_body(arm.binder, arm.body);
+                    let Some(symbol) = symbol else {
+                        continue;
+                    };
+                    let seen = covered
+                        .entry(symbol)
+                        .or_insert_with(|| (effect.span, IndexSet::new()));
+                    if !seen.1.insert(op.tracked.clone()) {
+                        self.error(
+                            op.span,
+                            ErrorKind::DuplicateArm {
+                                effect: effect.tracked.clone(),
+                                op: op.tracked.clone(),
+                            },
+                        );
+                        continue;
+                    }
+                    lowered.push(HandlerArm {
+                        effect: effect.span.track(symbol),
+                        op,
+                        binder,
+                        body,
+                    });
+                }
+            }
+        }
+        self.answering = outer;
+        // Every effect an arm names must be fully covered: a half-handled
+        // effect leaves it undecidable which effects the body may still
+        // perform, and there is no answer for inference to fall back on.
+        let mut discharges = Vec::new();
+        for (symbol, (at, arms)) in covered {
+            let missing: Vec<String> = self
+                .operations
+                .get(&symbol)
+                .into_iter()
+                .flatten()
+                .filter(|name| !arms.contains(*name))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                discharges.push(at.track(symbol));
+                continue;
+            }
+            self.error(
+                at,
+                ErrorKind::PartialHandler {
+                    effect: self.mint.name(symbol).to_string(),
+                    missing,
+                },
+            );
+        }
+        TermKind::Handle {
+            body: Box::new(body),
+            handler: Handler {
+                arms: lowered,
+                ret,
+                discharges,
+            },
+        }
+        .with_span(span)
+    }
+
+    /// One handler arm's binder and body: the name bound for the length of the
+    /// body and released after it, the way a `fn`'s argument is.
+    fn arm_body(&mut self, binder: parse::Arg, body: Expr) -> (Tracked<Symbol>, Term) {
+        let mark = self.terms.mark();
+        let at = binder.span;
+        let symbol = match binder.tracked {
+            parse::ArgKind::Name(name) => {
+                let symbol = self.mint.local(self.module, Namespace::Terms, &name);
+                self.terms.bind(name, symbol, at);
+                symbol
+            }
+            // A `_` gets a symbol nothing can name, so the payload is still
+            // typed and the body still cannot reach it — a `fn` header's rule.
+            parse::ArgKind::Wildcard => self.fresh("%discard", at).tracked,
+        };
+        let body = self.term(body);
+        self.terms.release(mark);
+        (at.track(symbol), body)
     }
 
     /// Lower a surface type into an IR type, mirroring [`term`](Self::term).
@@ -4086,14 +4961,129 @@ impl Builder<'_> {
                     tail,
                 })
             }
-            parse::TypeKind::Arrow { from, to } => {
+            parse::TypeKind::Arrow { from, to, effects } => {
                 let from = self.ty(*from, place);
                 let to = self.ty(*to, place);
+                let Some(effects) = self.effect_row(span, effects, place) else {
+                    return span.track(TypeKind::Error);
+                };
                 span.track(TypeKind::Arrow {
                     from: Box::new(from),
                     to: Box::new(to),
+                    effects,
                 })
             }
+        }
+    }
+
+    /// Lower the `!` clause on one arrow: resolve every effect it names,
+    /// expand every alias among them, and hold the row to being closed where
+    /// the position demands it.
+    ///
+    /// `None` says the row absorbs and the arrow with it — the same answer a
+    /// refused struct or sum gives, and for the same reason: what the arrow
+    /// would stand for is exactly what could not be worked out.
+    ///
+    /// A bare `A -> B` writes no clause and is the empty closed row, which is
+    /// what pure means. An operation's signature may write none at all: the `!`
+    /// is refused there, once, and the row falls back to the pure one so the
+    /// arrow itself still stands.
+    fn effect_row(
+        &mut self,
+        span: Span,
+        written: Option<parse::EffectRow>,
+        place: Place,
+    ) -> Option<EffectRow> {
+        let Some(written) = written else {
+            return Some(EffectRow {
+                span,
+                ..EffectRow::default()
+            });
+        };
+        if place == Place::Operation {
+            self.error(written.span, ErrorKind::ImpureOperation);
+            return Some(EffectRow {
+                span: written.span,
+                ..EffectRow::default()
+            });
+        }
+        // Every label, expanded: a name declaring operations stands for itself,
+        // and an alias for the effects it reaches. So no alias survives into
+        // what a definition is checked against, and a printed type shows the
+        // effects rather than the name.
+        let mut effects: IndexMap<String, EffectLabel> = IndexMap::new();
+        for (name, label) in written.effects {
+            let Some(symbol) = self.effects.get(&name.tracked) else {
+                self.error(
+                    name.span,
+                    ErrorKind::Undefined {
+                        namespace: Namespace::Effects,
+                    },
+                );
+                continue;
+            };
+            // The clause is lowered once, before the expansion, so that a name
+            // a `where` beside it can use is bound exactly once however many
+            // effects an alias stands for.
+            let when = match &label {
+                parse::EffectLabel::Written { when } => self.when(when.clone()),
+                parse::EffectLabel::Absent => None,
+            };
+            let expanded: Vec<(String, Symbol)> = self
+                .expanded
+                .get(&symbol)
+                .into_iter()
+                .flatten()
+                .map(|(name, symbol)| (name.clone(), *symbol))
+                .collect();
+            for (label_name, label_symbol) in expanded {
+                // Whether the reader wrote *this* effect's name here, or an
+                // alias standing for it among others.
+                let expanded = label_symbol != symbol;
+                let lowered = match &label {
+                    parse::EffectLabel::Written { .. } => EffectLabel::Written {
+                        name_span: name.span,
+                        symbol: label_symbol,
+                        expanded,
+                        when: when.clone(),
+                    },
+                    parse::EffectLabel::Absent => EffectLabel::Absent {
+                        name_span: name.span,
+                        symbol: label_symbol,
+                        expanded,
+                    },
+                };
+                if effects.contains_key(&label_name) {
+                    self.error(name.span, ErrorKind::DuplicateCase);
+                    continue;
+                }
+                effects.insert(label_name, lowered);
+            }
+        }
+        let tail = match self.tail(written.tail, place, Shape::Effect) {
+            Ok(tail) => tail,
+            Err(()) => return None,
+        };
+        // The same two checks a struct and a sum make, in the effect reading:
+        // a position that holds for every definition may leave nothing open,
+        // and a `\` needs a `..` beside it to speak about.
+        let marks = effects
+            .values()
+            .filter_map(|label| Some(label.when()?.span));
+        let closed = self.closed(place, Shape::Effect, marks, &tail);
+        let absences = effects.iter().filter_map(|(name, label)| match label {
+            EffectLabel::Absent { name_span, .. } => Some((name.clone(), *name_span)),
+            EffectLabel::Written { .. } => None,
+        });
+        let tailed = self.tailed(Shape::Effect, absences, &tail);
+        match closed && tailed {
+            true => Some(EffectRow {
+                span: written.span,
+                written: true,
+                effects,
+                tail,
+            }),
+            false => None,
         }
     }
 
@@ -4557,6 +5547,24 @@ fn sense(shape: Shape) -> Sense {
     match shape {
         Shape::Struct => Sense::Type,
         Shape::Sum => Sense::Cases,
+        Shape::Effect => Sense::Effects,
+    }
+}
+
+/// What a row written here is told when it is left open, or `None` where being
+/// open is allowed.
+///
+/// One question in one place, because the answer travels: a `when` and a `..`
+/// each stand for something a definition gets to decide, and the two positions
+/// that hold for every definition — a `type` declaration's body and an
+/// operation's signature — therefore refuse both. They differ only in the words:
+/// an operation's signature refuses the `!` beside them, which a declaration's
+/// body allows, so a reader who wrote one is told about all three at once.
+fn openness(place: Place, shape: Shape) -> Option<ErrorKind> {
+    match place {
+        Place::Annotation => None,
+        Place::Declaration => Some(ErrorKind::OpenDeclaredType { shape }),
+        Place::Operation => Some(ErrorKind::ImpureOperation),
     }
 }
 
