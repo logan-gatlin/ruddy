@@ -123,10 +123,15 @@ impl Constrain<'_> {
                         // the invariant this pass keeps.
                         let from = self.table.vars.len() as TyVar;
                         let bound = lower_type(self.mint, self.table, annotation);
-                        self.annotated.push(Annotated {
-                            span: annotation.span,
-                            opened: from..self.table.vars.len() as TyVar,
-                        });
+                        // A synthetic annotation — a pattern's exact demand —
+                        // is meant to be decided, so it makes no promise for
+                        // the too-open check to hold the value to.
+                        if !super::synthetic(annotation) {
+                            self.annotated.push(Annotated {
+                                span: annotation.span,
+                                opened: from..self.table.vars.len() as TyVar,
+                            });
+                        }
                         bound
                     }
                     None => self.table.fresh_type(),
@@ -345,18 +350,28 @@ impl Constrain<'_> {
     }
 
     /// The type of one position of a match, from the column of sub-patterns
-    /// the arms wrote there — R7's rule, one recursive step per position.
+    /// the arms wrote there — one recursive step per position.
     ///
     /// The demand is the union of what the whole column tests, never any one
     /// arm's view: the tags tested here are the listed cases of one sum row,
     /// each payload typed by the same rule one level down across every arm
-    /// that tests it; a natural test demands `Nat`; a struct pattern demands
-    /// its named fields of the position — the same demand a projection makes,
-    /// with the same lacks note — each field's type from the sub-position; and
-    /// `()` or a bare tag's payload demands unit. The row is closed over its
-    /// listed cases iff no arm is irrefutable at the position — a binder at or
-    /// above it — and otherwise its rest is a fresh row variable that lacks
-    /// the listed names, as a tag literal's tail does.
+    /// that tests it; a natural test demands `Nat`; and the struct and unit
+    /// patterns together make one struct demand, by the column-union rule.
+    /// Each field mentioned anywhere in the column is present iff *every*
+    /// entry of the column is a struct pattern mentioning it — otherwise its
+    /// presence is a fresh variable, which is what lets unification infer an
+    /// optional field — and each field's type comes from its sub-position
+    /// across the arms that mention it. The demand is closed — its core the
+    /// fieldless [`Core::Unit`], so no further fields can attach — iff every
+    /// entry is an exact struct or unit pattern; any `..`, binder or wildcard
+    /// entry leaves it open, a fresh core with the projection's lacks note.
+    /// `()` and `{}` are one pattern — an exact struct naming no fields — so a
+    /// column of them alone demands unit, exactly as it always has.
+    ///
+    /// A sum row is closed over its listed cases iff no arm is irrefutable at
+    /// the position — a binder at or above it — and otherwise its rest is a
+    /// fresh row variable that lacks the listed names, as a tag literal's
+    /// tail does.
     ///
     /// A position tested two ways at once — cases and fields, say — is one
     /// value asked to be two things; the demands are equated against each
@@ -379,29 +394,49 @@ impl Constrain<'_> {
         entries: &[(usize, Col)],
     ) -> Rc<Ty> {
         let mut binds: Vec<(usize, Tracked<Symbol>)> = Vec::new();
-        let mut unit = false;
         let mut naturals = false;
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
+        // Whether any struct or unit pattern tests the position at all, and —
+        // for the closure rule — whether every entry is an exact one. `()`
+        // and `{}` are one pattern, the exact struct naming no fields, so a
+        // unit entry counts as exact; anything that is not a struct or unit
+        // pattern leaves the demand open.
+        let mut structs = false;
+        let mut exact = true;
         for (arm, entry) in entries {
             match entry {
-                Col::Unit => unit = true,
+                Col::Unit => structs = true,
                 Col::Pattern(pattern) => match &pattern.tracked {
-                    ir::PatternKind::Bind(name) => binds.push((*arm, *name)),
+                    ir::PatternKind::Bind(name) => {
+                        binds.push((*arm, *name));
+                        exact = false;
+                    }
                     // A binder minus the binding: it demands nothing of the
                     // position and leaves its row open — the matrix already
                     // counts it among the binds — and there is no name here
                     // for any environment to learn.
-                    ir::PatternKind::Wildcard => {}
-                    ir::PatternKind::Unit => unit = true,
-                    ir::PatternKind::Natural(_) => naturals = true,
+                    ir::PatternKind::Wildcard => exact = false,
+                    ir::PatternKind::Unit => structs = true,
+                    ir::PatternKind::Natural(_) => {
+                        naturals = true;
+                        exact = false;
+                    }
                     ir::PatternKind::Tag { name, payload } => {
                         let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
                         tags.entry(name.tracked.as_str())
                             .or_default()
                             .push((*arm, payload));
+                        exact = false;
                     }
-                    ir::PatternKind::Struct(named) => {
+                    ir::PatternKind::Struct {
+                        fields: named,
+                        rest,
+                    } => {
+                        structs = true;
+                        if rest.is_some() {
+                            exact = false;
+                        }
                         for (name, field) in named {
                             fields
                                 .entry(name.as_str())
@@ -447,23 +482,44 @@ impl Constrain<'_> {
         if naturals {
             demands.push(Rc::new(Ty::plain(Core::Nat)));
         }
-        if !fields.is_empty() {
+        if structs {
+            // The column-union rule for fields. A field is certainly there
+            // only when every entry of the column asks for it; a field some
+            // entries do without gets a fresh presence variable, so whether it
+            // is there is the scrutinee's to decide — the inference behind an
+            // optional field. The demand closes over the named fields exactly
+            // when every entry is exact: its core is then the fieldless unit,
+            // which no further field can attach to. An open demand keeps a
+            // fresh core with the projection's lacks note, asking only for
+            // the named fields' presences.
+            let total = entries.len();
             let mut named = IndexMap::new();
             for (name, subs) in &fields {
                 path.push(ir::Step::Field(name.to_string()));
                 let field = self.position(columns, path, subs);
                 path.pop();
-                named.insert(name.to_string(), RowField::present(field));
+                let presence = match subs.len() == total {
+                    true => Presence::Present,
+                    false => self.table.fresh_presence(),
+                };
+                named.insert(
+                    name.to_string(),
+                    RowField {
+                        presence,
+                        ty: field,
+                    },
+                );
             }
+            let core = match exact {
+                true => Core::Unit,
+                false => Core::Var(self.table.fresh_core()),
+            };
             let ty = Rc::new(Ty {
-                core: Core::Var(self.table.fresh_core()),
+                core,
                 fields: named,
             });
             self.table.note_lacks(&ty);
             demands.push(ty);
-        }
-        if unit {
-            demands.push(Rc::new(Ty::unit()));
         }
         let mut demands = demands.into_iter();
         // A column that only binds demands nothing: the position is a fresh

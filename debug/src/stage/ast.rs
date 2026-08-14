@@ -225,12 +225,8 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
                 None => tag_node,
             }
         }
-        PatternKind::Struct(fields) => Node {
-            label: "Struct".into(),
-            ..node
-        }
-        .children(
-            fields
+        PatternKind::Struct { fields, rest } => {
+            let mut kids: Vec<Node> = fields
                 .iter()
                 .map(|(name, sub)| match sub {
                     Some(sub) => Node::new(
@@ -242,8 +238,19 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
                     .child(pattern_node(ids, sub)),
                     None => Node::new(ids.next(), "Bind", name.tracked.clone()).at(name.span),
                 })
-                .collect::<Vec<_>>(),
-        ),
+                .collect();
+            // The `..` that makes the pattern open is a row of its own, the
+            // way a struct type's tail is shown: it stands for the fields not
+            // named, so it sits beside them rather than folding into one.
+            if let Some(rest) = rest {
+                kids.push(Node::new(ids.next(), "Rest", "..").at(*rest));
+            }
+            Node {
+                label: "Struct".into(),
+                ..node
+            }
+            .children(kids)
+        }
     }
 }
 

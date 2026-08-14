@@ -16,6 +16,7 @@ use ruddy::{
     inference::{self, Constraint, ConstraintKind, Effect, ErrorKind as TypeError, Goal, Rule},
     ir::{self, ErrorKind as IrError},
     parse,
+    patterns::ErrorKind as PatternError,
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
@@ -104,21 +105,27 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::RefutableBinding {
             found: ir::Refuter::Case("Some".to_string()),
         },
-        IrError::UnreachableArm,
-        IrError::MisplacedCatchAll,
-        IrError::UnhandledValues {
-            witness: ir::Witness::Tag {
-                name: "A".to_string(),
-                payload: None,
-            },
-        },
-        IrError::UnhandledNumbers,
-        IrError::MixedMatch,
         IrError::DuplicateBinding {
             name: "x".to_string(),
         },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
+    }
+
+    // The pattern checks, which own the match complaints since they moved
+    // out of lowering and behind inference.
+    for kind in [
+        PatternError::MisplacedCatchAll,
+        PatternError::UnreachableArm,
+        PatternError::UnhandledValues {
+            witness: ir::Witness::Tag {
+                name: "A".to_string(),
+                payload: None,
+            },
+        },
+        PatternError::UnhandledNumbers,
+    ] {
+        all.push(("patterns", kind.code(), kind.to_string()));
     }
 
     for kind in [
@@ -1708,28 +1715,31 @@ fn the_pattern_complaints_say_what_was_written() {
         "this binding has to accept every value, but the number `0` makes it able to fail"
     );
 
-    assert_eq!(IrError::UnreachableArm.code(), "unreachable-arm");
+    assert_eq!(PatternError::UnreachableArm.code(), "unreachable-arm");
     assert_eq!(
-        IrError::UnreachableArm.to_string(),
+        PatternError::UnreachableArm.to_string(),
         "this case is already handled by the arms above it"
     );
 
-    assert_eq!(IrError::MisplacedCatchAll.code(), "misplaced-catch-all");
     assert_eq!(
-        IrError::MisplacedCatchAll.to_string(),
+        PatternError::MisplacedCatchAll.code(),
+        "misplaced-catch-all"
+    );
+    assert_eq!(
+        PatternError::MisplacedCatchAll.to_string(),
         "this arm accepts everything, so the arms after it can never be reached"
     );
 
-    assert_eq!(IrError::UnhandledNumbers.code(), "unhandled-numbers");
+    assert_eq!(PatternError::UnhandledNumbers.code(), "unhandled-numbers");
     assert_eq!(
-        IrError::UnhandledNumbers.to_string(),
+        PatternError::UnhandledNumbers.to_string(),
         "numbers not listed here are not handled; add a final arm that names the rest"
     );
 
     // The unhandled-values complaint renders its witness in source syntax:
     // the hole's own example value, backticks and braces as a reader would
     // write them.
-    let hole = IrError::UnhandledValues {
+    let hole = PatternError::UnhandledValues {
         witness: ir::Witness::Struct(
             [
                 (
@@ -1757,10 +1767,14 @@ fn the_pattern_complaints_say_what_was_written() {
         "some values are not handled — for example `{ a: `A, b: `Y }`; add an arm for them or a final arm naming the rest"
     );
 
-    assert_eq!(IrError::MixedMatch.code(), "mixed-match");
-    assert_eq!(
-        IrError::MixedMatch.to_string(),
-        "this compares against both numbers and cases, and no value can be both"
+    // The mixed match lost its dedicated complaint: the solver's ordinary
+    // mismatch is the only thing left to say about one, so no kind in the
+    // compiler answers to the old code any more.
+    assert!(
+        diagnostics()
+            .iter()
+            .all(|(_, code, _)| *code != "mixed-match"),
+        "the mixed-match code should be gone"
     );
 
     let bound = IrError::DuplicateBinding {
@@ -1840,6 +1854,29 @@ fn a_witness_renders_in_source_syntax() {
         .to_string(),
         "{ a: `A, b: anything other than `X }"
     );
+
+    // R13: a field held present with any value at all prints pun-style —
+    // under exactness the presence is the information, so the field appears
+    // rather than folding away into `{}`.
+    assert_eq!(
+        ir::Witness::Struct([("a".to_string(), ir::Witness::Any)].into_iter().collect())
+            .to_string(),
+        "{ a }"
+    );
+    assert_eq!(
+        ir::Witness::Struct(
+            [
+                ("a".to_string(), ir::Witness::Any),
+                ("b".to_string(), ir::Witness::Natural(1)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .to_string(),
+        "{ a, b: 1 }"
+    );
+    // And the value with no fields at all is still the empty braces.
+    assert_eq!(ir::Witness::Struct(Default::default()).to_string(), "{}");
 }
 
 /// The prose a person meets stays in their words: the compiler's own names

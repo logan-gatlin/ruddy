@@ -8,6 +8,7 @@
 pub mod ast;
 pub mod constraints;
 pub mod ir;
+pub mod patterns;
 pub mod solve;
 pub mod symbols;
 pub mod tokens;
@@ -38,6 +39,7 @@ pub struct Cx<'a> {
     pub stmts: Option<&'a [Stmt]>,
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,
+    pub patterns: Option<&'a ruddy::patterns::Output>,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -55,6 +57,7 @@ pub struct Phases {
     pub parse: u64,
     pub build: u64,
     pub infer: u64,
+    pub patterns: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -106,9 +109,14 @@ pub struct Trace {
 /// `'a`. Everything else a type is made of — `Nat`, `->`, a struct's braces and
 /// field names — is written by the language rather than stood in for.
 ///
-/// Declared once because three tabs render the same type language, and a
+/// The `?` a presence puts on its label — the one in `a?: Nat` — is the
+/// language too, not a stand-in, and the `\B` is what keeps the highlighter
+/// off it: that `?` always follows its label's last character, while a `?`
+/// that begins a variable follows punctuation or space.
+///
+/// Declared once because four tabs render the same type language, and a
 /// pattern that drifted on one of them would go quietly dead there.
-const VARIABLES: &str = r"\?\d*|'[a-z]\d*";
+const VARIABLES: &str = r"\B\?\d*|'[a-z]\d*";
 
 /// Every stage, in tab order. Adding a panel is one line here. A stage that
 /// annotates another owns no tab, so its place in the list does not matter to
@@ -175,6 +183,18 @@ pub const REGISTRY: &[Spec] = &[
         scoped: true,
         annotates: None,
         build: Build::Panel(types::build),
+    },
+    Spec {
+        id: "patterns",
+        title: "Patterns",
+        view: View::Tree,
+        // The solved scrutinee types render in the type language, so the
+        // variables light up the way the Types tab's do — and scope the same
+        // way, since each match's types were zonked with its own definition.
+        highlight: Some(VARIABLES),
+        scoped: true,
+        annotates: None,
+        build: Build::Panel(patterns::build),
     },
     Spec {
         id: "symbols",

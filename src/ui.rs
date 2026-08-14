@@ -47,7 +47,7 @@ use indexmap::IndexMap;
 
 use crate::{
     inference::{self, Constraint, ConstraintKind, Effect, Goal, Rule},
-    ir, parse,
+    ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
     types::{Assigned, Core, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape, Ty},
@@ -293,7 +293,7 @@ impl Grouped for parse::PatternKind {
             | parse::PatternKind::Wildcard
             | parse::PatternKind::Natural(_)
             | parse::PatternKind::Unit
-            | parse::PatternKind::Struct(_) => Prec::Atom,
+            | parse::PatternKind::Struct { .. } => Prec::Atom,
         }
     }
 }
@@ -315,8 +315,8 @@ impl fmt::Display for parse::PatternKind {
                 false,
                 payload.as_deref().map(|payload| &payload.tracked),
             ),
-            parse::PatternKind::Struct(fields) => {
-                if fields.is_empty() {
+            parse::PatternKind::Struct { fields, rest } => {
+                if fields.is_empty() && rest.is_none() {
                     return f.write_str("{}");
                 }
                 f.write_str("{ ")?;
@@ -330,6 +330,15 @@ impl fmt::Display for parse::PatternKind {
                         Some(sub) => write!(f, "{}: {}", name.tracked, sub.tracked)?,
                         None => f.write_str(&name.tracked)?,
                     }
+                }
+                // The `..` that makes the pattern open, last as it was
+                // written: what it stands for has no order among the named
+                // fields to claim.
+                if rest.is_some() {
+                    if !first {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("..")?;
                 }
                 f.write_str(" }")
             }
@@ -366,7 +375,25 @@ impl fmt::Display for ir::Witness {
             ir::Witness::Any => f.write_str("anything"),
             ir::Witness::Natural(value) => write!(f, "{value}"),
             ir::Witness::Tag { name, payload } => write_tag(f, name, false, payload.as_deref()),
-            ir::Witness::Struct(fields) => write_struct(f, fields),
+            // A field held to be present with any value at all prints
+            // pun-style — under exactness the presence *is* the information,
+            // so `{a}` says what `{}` would deny.
+            ir::Witness::Struct(fields) => {
+                if fields.is_empty() {
+                    return f.write_str("{}");
+                }
+                f.write_str("{ ")?;
+                for (at, (name, witness)) in fields.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match witness {
+                        ir::Witness::Any => f.write_str(name)?,
+                        witness => write!(f, "{name}: {witness}")?,
+                    }
+                }
+                f.write_str(" }")
+            }
             ir::Witness::Other(cases) => {
                 f.write_str("anything other than ")?;
                 for (at, case) in cases.iter().enumerate() {
@@ -425,14 +452,6 @@ impl ir::ErrorKind {
             // wording: what went wrong is the binding, and the quoted tag or
             // number only points at where.
             ir::ErrorKind::RefutableBinding { .. } => "binding-can-fail",
-            ir::ErrorKind::UnreachableArm => "unreachable-arm",
-            ir::ErrorKind::MisplacedCatchAll => "misplaced-catch-all",
-            // The witness is not part of the code, only of the wording: what
-            // went wrong is the match, and the example only shows a value it
-            // misses.
-            ir::ErrorKind::UnhandledValues { .. } => "unhandled-values",
-            ir::ErrorKind::UnhandledNumbers => "unhandled-numbers",
-            ir::ErrorKind::MixedMatch => "mixed-match",
             ir::ErrorKind::DuplicateBinding { .. } => "duplicate-binding",
         }
     }
@@ -556,28 +575,66 @@ impl fmt::Display for ir::ErrorKind {
                     "this binding has to accept every value, but the number `{value}` makes it able to fail",
                 ),
             },
-            ir::ErrorKind::UnreachableArm => {
-                f.write_str("this case is already handled by the arms above it")
-            }
-            ir::ErrorKind::MisplacedCatchAll => f.write_str(
-                "this arm accepts everything, so the arms after it can never be reached",
-            ),
-            // The example is the complaint: a value no arm accepts, written in
-            // source syntax so the reader can see what to add an arm for.
-            ir::ErrorKind::UnhandledValues { witness } => write!(
-                f,
-                "some values are not handled — for example `{witness}`; add an arm for them or a final arm naming the rest",
-            ),
-            ir::ErrorKind::UnhandledNumbers => f.write_str(
-                "numbers not listed here are not handled; add a final arm that names the rest",
-            ),
-            ir::ErrorKind::MixedMatch => f.write_str(
-                "this compares against both numbers and cases, and no value can be both",
-            ),
             ir::ErrorKind::DuplicateBinding { name } => {
                 write!(f, "this binds `{name}` twice")
             }
         }
+    }
+}
+
+impl patterns::ErrorKind {
+    /// A stable, greppable name for this kind of error — the codes the same
+    /// checks had when they ran at lowering, so a reporter keyed on one keeps
+    /// working across the move.
+    pub fn code(&self) -> &'static str {
+        match self {
+            patterns::ErrorKind::MisplacedCatchAll => "misplaced-catch-all",
+            patterns::ErrorKind::UnreachableArm => "unreachable-arm",
+            // The witness is not part of the code, only of the wording: what
+            // went wrong is the match, and the example only shows a value it
+            // misses.
+            patterns::ErrorKind::UnhandledValues { .. } => "unhandled-values",
+            patterns::ErrorKind::UnhandledNumbers => "unhandled-numbers",
+        }
+    }
+}
+
+/// What the pattern checks found, in a phrase — the wordings the same checks
+/// had when they ran at lowering, unchanged by the move.
+impl fmt::Display for patterns::ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            patterns::ErrorKind::MisplacedCatchAll => f.write_str(
+                "this arm accepts everything, so the arms after it can never be reached",
+            ),
+            patterns::ErrorKind::UnreachableArm => {
+                f.write_str("this case is already handled by the arms above it")
+            }
+            // The example is the complaint: a value no arm accepts, written in
+            // source syntax so the reader can see what to add an arm for.
+            patterns::ErrorKind::UnhandledValues { witness } => write!(
+                f,
+                "some values are not handled — for example `{witness}`; add an arm for them or a final arm naming the rest",
+            ),
+            patterns::ErrorKind::UnhandledNumbers => f.write_str(
+                "numbers not listed here are not handled; add a final arm that names the rest",
+            ),
+        }
+    }
+}
+
+/// One arm's verdict, as the word the Patterns tab prints beside it. Plain
+/// English on purpose: "starved" says the arm sits after one that accepts
+/// everything, and "skipped" that the checks stood aside because the typing
+/// already failed.
+impl fmt::Display for patterns::Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            patterns::Verdict::Reachable => "reachable",
+            patterns::Verdict::Unreachable => "unreachable",
+            patterns::Verdict::Starved => "starved",
+            patterns::Verdict::Skipped => "skipped",
+        })
     }
 }
 

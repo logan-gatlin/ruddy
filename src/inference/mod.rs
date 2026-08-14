@@ -772,6 +772,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // else's.
             let told = errors.len();
             if let Some(annotation) = &decl.annotation
+                // A synthetic annotation — a pattern's exact demand — is meant
+                // to be decided, so there is no promise here to hold anyone to.
+                && !synthetic(annotation)
                 && from == to
                 && member.scoped.opened.clone().any(|var| table.narrowed(var))
             {
@@ -2036,9 +2039,37 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             }
             Core::Sum(row(table, tails, labels, tail))
         }
+        // A hole the solver fills: a fresh variable, so whatever the position
+        // meets decides it. The pattern desugar's field types are these — the
+        // pattern says which fields are there, not what they hold — and the
+        // variable is what lets a projection of the field and the demand share
+        // one answer. See [`ir::TypeKind::Any`](crate::ir::TypeKind).
+        TypeKind::Any => Core::Var(table.fresh_core()),
         TypeKind::Error => Core::Undecided,
     };
     Rc::new(Ty::plain(core))
+}
+
+/// Whether an annotation is the compiler's own demand rather than the reader's
+/// promise: whether it holds a hole, which nothing a reader writes can.
+///
+/// What it exempts is the too-open check. A written `..` or `?` is a promise —
+/// the definition works whatever the open part turns out to be — and a
+/// definition that decides it has broken the promise. A hole is the opposite:
+/// it is *there to be decided*, so holding the annotation to the promise would
+/// report every exact pattern binding as a broken contract nobody wrote.
+pub(crate) fn synthetic(ty: &Type) -> bool {
+    match &ty.tracked {
+        TypeKind::Any => true,
+        // The desugar writes a hole only as a field's type, directly under
+        // the struct that is the demand — see [`ir::TypeKind::Any`] — so the
+        // walk needs no further reach: everything else a written type can be
+        // is a written type.
+        TypeKind::Struct { fields, .. } => fields
+            .values()
+            .any(|field| field.value().is_some_and(synthetic)),
+        _ => false,
+    }
 }
 
 /// Whether one label is there, as the written `?` says it: a mark means the

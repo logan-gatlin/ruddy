@@ -1182,3 +1182,67 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         assert_eq!(error.span.width, 1, "{src:?}");
     }
 }
+
+/// R1: a struct pattern may end with `..` — with fields before it, bare, and
+/// with a trailing comma before it — and the printed form re-parses, `..`
+/// last as written. The marker lands on the tree with the `..`'s own span.
+#[test]
+fn a_struct_pattern_may_end_with_a_rest() {
+    assert_eq!(
+        parse_one("let f = fn v => match v with | { a, .. } => a end"),
+        "let f = fn v => match v with | { a, .. } => a end"
+    );
+    assert_eq!(
+        parse_one("let f = fn v => match v with | { .. } => 1 end"),
+        "let f = fn v => match v with | { .. } => 1 end"
+    );
+    // On a `let`, in both forms, and beside a renamed field.
+    assert_eq!(parse_one("let {x, ..} = p"), "let { x, .. } = p");
+    assert_eq!(
+        parse_one("let a = let {x: y, ..} = p in y"),
+        "let a = let { x: y, .. } = p in y"
+    );
+
+    let src = "let { a, .. } = p";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let StmtKind::Let { pattern, .. } = &out.stmts[0].tracked else {
+        panic!("a let");
+    };
+    let ruddy::parse::PatternKind::Struct { fields, rest } = &pattern.tracked else {
+        panic!("a struct pattern");
+    };
+    assert_eq!(fields.len(), 1);
+    let rest = rest.expect("the rest marker survives");
+    assert_eq!(rest.start, src.find("..").expect("the dots"));
+    assert_eq!(rest.width, 2);
+}
+
+/// R1's refusals: `..` is only legal as the final element of a struct
+/// pattern. Anything after it — a comma, a second field, the name a future
+/// named-rest might want — is the parser's usual unexpected-token complaint,
+/// at the token after the `..`; input running out is reported at the end.
+#[test]
+fn a_rest_must_end_the_struct_pattern() {
+    for (src, from) in [
+        ("let {.., a} = p", ", a} = p"),
+        ("let {a, .., b} = p", ", b} = p"),
+        ("let {a, ..r} = p", "r} = p"),
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?} kept: {:#?}", out.stmts);
+        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{src:?}");
+        let at = src.len() - from.len();
+        assert_eq!(out.errors[0].span.start, at, "{src:?}: {:#?}", out.errors);
+    }
+
+    // `{..` at the end of input: the complaint points at the zero-width
+    // position where the brace would have gone.
+    let src = "let {..";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert_eq!(out.errors[0].span.start, src.len());
+    assert_eq!(out.errors[0].span.width, 0);
+}

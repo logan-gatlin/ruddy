@@ -151,7 +151,14 @@ pub enum PatternKind {
     /// name puns, binding the field to its own name, so the value is `None`;
     /// `name: <pattern>` matches the field against the sub-pattern. `{}` is
     /// allowed and binds nothing.
-    Struct(IndexMap<TrackedString, Option<Pattern>>),
+    Struct {
+        fields: IndexMap<TrackedString, Option<Pattern>>,
+        /// The `..` ending the field list, when the pattern was written open.
+        /// Without it the pattern is exact — it matches only values with
+        /// exactly the fields it names; with it, values with at least them.
+        /// The span is the `..`'s own, for the debugger to point at.
+        rest: Option<Span>,
+    },
     /// `` `Name [<pattern>] `` — one case of a sum. The payload pattern is
     /// taken greedily, exactly as [`Parser::tag_expr`] takes a payload, so
     /// `` `A `B x `` is `` `A `` carrying `` (`B x) ``. Written bare, the case
@@ -839,16 +846,29 @@ impl Parser {
         }
     }
 
-    /// `{ <field>, <field>: <pattern>, ... }` with an optional trailing comma —
-    /// the struct expression's shape, with a bare name allowed to pun.
+    /// `{ <field>, <field>: <pattern>, ..., [..] }` with an optional trailing
+    /// comma among the fields — the struct expression's shape, with a bare name
+    /// allowed to pun, and a `..` allowed to end the list. The `..` makes the
+    /// pattern open — at-least matching — and comes last, the way a struct
+    /// type's tail does: the fields it stands for have no order among the
+    /// named ones to claim. Only `}` may follow it; a name after it — the
+    /// named rest a future spec may want — is the unexpected token it looks
+    /// like, reported where it was written.
     fn struct_pattern(&mut self) -> Option<Pattern> {
         let open = self.eat(&Kind::LeftBrace).expect("the caller peeked `{`");
         let mut fields = IndexMap::new();
+        let mut rest = None;
 
         while !matches!(
             self.peek().map(|t| &t.tracked),
             Some(Kind::RightBrace) | None
         ) {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                rest = Some(dots.span);
+                // Nothing but the brace may follow: the `eat` below reports
+                // whatever else was written, at the token itself.
+                break;
+            }
             // A `_` here is a field named nothing — or, with no colon after
             // it, a pun of nothing: a pun binds a field to its own name, and
             // `_` is not a name. Which of the two decides the wording, and
@@ -878,7 +898,7 @@ impl Parser {
 
         let close = self.eat(&Kind::RightBrace)?;
         let span = open.span.merge(close.span);
-        Some(span.track(PatternKind::Struct(fields)))
+        Some(span.track(PatternKind::Struct { fields, rest }))
     }
 
     /// `( <pattern> )` — grouping only, discarded exactly as

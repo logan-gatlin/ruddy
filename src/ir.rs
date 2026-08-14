@@ -159,8 +159,10 @@ pub enum TermKind {
     /// The matrix of arms carries the whole meaning: first-match, top to
     /// bottom. Nothing here says how a machine would dispatch them — typing is
     /// defined on the written match, and compiling it to a decision tree is a
-    /// post-typing phase for a future evaluator. See [`Builder::match_term`]
-    /// for the checks lowering runs on the matrix.
+    /// post-typing phase for a future evaluator. Every written arm is here:
+    /// which arms a value can reach, and whether any value goes unhandled, are
+    /// questions about solved types, asked by [`patterns`](crate::patterns)
+    /// after inference rather than here.
     Match {
         scrutinee: Box<Term>,
         arms: Vec<(Pattern, Term)>,
@@ -193,7 +195,15 @@ pub enum PatternKind {
     Wildcard,
     /// Field name → sub-pattern. Puns are expanded here: surface `{x}`
     /// arrives as field "x" → Bind(x's symbol).
-    Struct(IndexMap<String, Field<Pattern>>),
+    Struct {
+        fields: IndexMap<String, Field<Pattern>>,
+        /// The `..` the pattern was written with, when it was written open.
+        /// Without it the pattern is exact — it matches only values with
+        /// exactly the fields it names — which is what the column rule in
+        /// inference and the typed checks in [`patterns`](crate::patterns)
+        /// both read off this marker.
+        rest: Option<Span>,
+    },
     /// Payload `None` means "written bare": constrains the payload to
     /// unit, binding nothing — the same convention TermKind::Tag keeps.
     Tag {
@@ -261,6 +271,19 @@ pub enum TypeKind {
         index: u32,
     },
     Prim(Prim),
+    /// A type position left entirely to the solver: lowers to a fresh
+    /// variable, so whatever meets it decides it.
+    ///
+    /// No source syntax writes one — there is no inferred-type hole in the
+    /// language — so every one in a program is the compiler's own. The one
+    /// producer is the pattern desugar: an exact struct pattern on a `let`
+    /// demands *exactly* its named fields of the value, and the demand is an
+    /// annotation whose field types are these, since the pattern says which
+    /// fields are there and nothing about what they hold. An annotation
+    /// holding one is the compiler's demand rather than the reader's promise,
+    /// which is what exempts it from the too-open check — see
+    /// [`inference::synthetic`](crate::inference).
+    Any,
     Error,
 }
 
@@ -594,39 +617,6 @@ pub enum ErrorKind {
     RefutableBinding {
         found: Refuter,
     },
-    /// An arm no value can reach: everything it could match is matched by an
-    /// arm above it — a second bare `` `A `` after `` `A x ``, a duplicate
-    /// literal, and the like. Reported at the unreachable arm; its body is
-    /// lowered for its own complaints and then dropped, the way a duplicate
-    /// definition's is.
-    UnreachableArm,
-    /// An arm that accepts everything — a bare name, `()`, a struct pattern
-    /// with nothing refutable inside — written anywhere but last. The arms
-    /// after it can never be reached, so the mistake is the placement, and it
-    /// is reported at the arm that accepts everything rather than at each arm
-    /// it starves.
-    MisplacedCatchAll,
-    /// A match that leaves values unhandled — `` match e with `A => 1 end ``
-    /// written where the row stays open, or two arms whose columns are each
-    /// covered while the combination is not. Reported at the match, with a
-    /// concrete example of a value no arm accepts, so the reader is shown what
-    /// to add an arm for rather than told an analysis failed. See [`Matrix`]
-    /// for the check.
-    UnhandledValues {
-        witness: Witness,
-    },
-    /// A match on numbers with no final arm accepting the rest —
-    /// `match n with 0 => a end`. A sum's cases can be listed in full; the
-    /// naturals cannot, so a match testing them has to end in an arm that
-    /// takes whatever number was not listed. [`ErrorKind::UnhandledValues`]
-    /// with the friendlier wording numbers deserve, kept apart because the
-    /// witness — some number — is not worth quoting.
-    UnhandledNumbers,
-    /// One match testing both numbers and tags at the same level —
-    /// `match e with 0 => a | `A x => b end`. No value is both, so the match
-    /// is refused here, with a complaint about what was written, rather than
-    /// surfacing later as a unification failure about types nobody wrote.
-    MixedMatch,
     /// One pattern binding the same name twice — `{x, x}`, `{a: x, b: x}`, or
     /// across any nesting in one pattern. Reported at the repeat; the first
     /// binding is the one the body sees. Distinct patterns — two different
@@ -649,7 +639,7 @@ pub enum Refuter {
 
 /// A concrete example of a value a match leaves unhandled, in the shape of the
 /// value rather than in words, so the complaint can write it in source syntax.
-/// See [`ErrorKind::UnhandledValues`] and [`Matrix::unhandled`].
+/// See [`patterns::ErrorKind::UnhandledValues`](crate::patterns::ErrorKind).
 #[derive(Debug, Clone)]
 pub enum Witness {
     /// Any value at all: a position the arms never test, so no example is
@@ -663,9 +653,10 @@ pub enum Witness {
         name: String,
         payload: Option<Box<Witness>>,
     },
-    /// A value carrying these fields. Only the fields that matter are named:
-    /// a field any value serves for is left out, the way a struct pattern
-    /// leaves out the fields it does not constrain.
+    /// A value carrying these fields. A field held to be *present* is named
+    /// even when any value serves for what it holds — under exactness the
+    /// presence is the information, and such a field prints pun-style, as
+    /// `{a}` — while a field the example does not need is left out.
     Struct(IndexMap<String, Witness>),
     /// A value that is none of the listed cases — what an open position's
     /// "anything else" is written as.
@@ -899,12 +890,17 @@ enum Calm {
     /// by a fresh definition nothing can name — so it is still typechecked;
     /// see [`Builder::destructure_stmt`] and R5/R6 of the wildcard spec.
     Wildcard(Span),
-    /// Binds nothing, and constrains the value to unit.
+    /// Binds nothing, and constrains the value to unit. What `()` reads as,
+    /// and `{}` too: the two are one pattern — exactly no fields.
     Unit(Span),
-    /// Reaches into fields, each with a pattern that cannot fail.
+    /// Reaches into fields, each with a pattern that cannot fail. Exact
+    /// without the `..` — the value has these fields and no others, a demand
+    /// [`Builder::destructure`] writes as an annotation — and open with it,
+    /// asking only for the fields it names.
     Struct {
         span: Span,
         fields: Vec<(TrackedString, Calm)>,
+        rest: Option<Span>,
     },
 }
 
@@ -928,11 +924,12 @@ pub(crate) enum Step {
 /// and the numbers always infinite.
 ///
 /// Syntactic throughout: built from the normalized patterns and consulting no
-/// types. One implementation serves the three questions asked of a matrix —
-/// unhandled values with a witness ([`Matrix::unhandled`]), per-arm
-/// reachability ([`Matrix::reachable`]), and whether earlier arms fully handle
-/// a case at a position ([`Matrix::handled`], which is what refines a binder's
-/// view in inference).
+/// types. What inference reads: whether a position's row stays open
+/// ([`Matrix::open`]) and whether earlier arms fully handle a case at a
+/// position ([`Matrix::handled`], which is what refines a binder's view). The
+/// typed exhaustiveness and reachability checks moved to
+/// [`patterns`](crate::patterns), which reads the solved types this analysis
+/// shaped — one implementation of the closure rule, read from two ends.
 pub(crate) struct Matrix {
     /// The tags and numbers tested at each position, over every arm.
     tests: HashMap<Vec<Step>, Tests>,
@@ -943,8 +940,9 @@ pub(crate) struct Matrix {
     binds: Vec<Vec<Step>>,
 }
 
-/// The tests one position has seen, over every arm. Both kinds are collected
-/// so a position testing both can be refused; see [`Matrix::mixed`].
+/// The tests one position has seen, over every arm. Both kinds are collected —
+/// a mixed position types as the mismatch it is, and the universes here have
+/// to hold whatever was written.
 #[derive(Debug, Default)]
 struct Tests {
     tags: IndexSet<String>,
@@ -1487,6 +1485,7 @@ impl Follow<'_> {
             | TypeKind::Sum { .. }
             | TypeKind::Arrow { .. }
             | TypeKind::Prim(_)
+            | TypeKind::Any
             | TypeKind::Error => Stands::Shape,
             TypeKind::Param { index, .. } => Stands::Param {
                 index: *index,
@@ -1730,7 +1729,9 @@ fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
         PatternKind::Tag { name, .. } => Some((name.span, Refuter::Case(name.tracked.clone()))),
         PatternKind::Natural(value) => Some((pattern.span, Refuter::Number(*value))),
-        PatternKind::Struct(fields) => fields.values().find_map(|field| refuter(&field.value)),
+        PatternKind::Struct { fields, .. } => {
+            fields.values().find_map(|field| refuter(&field.value))
+        }
     }
 }
 
@@ -1743,7 +1744,12 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
         PatternKind::Bind(name) => Some(Calm::Bind(*name)),
         PatternKind::Wildcard => Some(Calm::Wildcard(pattern.span)),
         PatternKind::Unit => Some(Calm::Unit(pattern.span)),
-        PatternKind::Struct(fields) => {
+        // `{}` and `()` are one pattern — exactly no fields — so the exact
+        // empty struct reads as the unit it is and the two lower alike.
+        PatternKind::Struct { fields, rest: None } if fields.is_empty() => {
+            Some(Calm::Unit(pattern.span))
+        }
+        PatternKind::Struct { fields, rest } => {
             let mut lowered = Vec::with_capacity(fields.len());
             for (name, field) in fields {
                 lowered.push((field.name_span.track(name.clone()), calm(&field.value)?));
@@ -1751,6 +1757,7 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
             Some(Calm::Struct {
                 span: pattern.span,
                 fields: lowered,
+                rest: *rest,
             })
         }
         PatternKind::Tag { .. } | PatternKind::Natural(_) => None,
@@ -1769,7 +1776,7 @@ fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
                 pattern_binders(payload, out);
             }
         }
-        PatternKind::Struct(fields) => {
+        PatternKind::Struct { fields, .. } => {
             for field in fields.values() {
                 pattern_binders(&field.value, out);
             }
@@ -1798,6 +1805,31 @@ fn bound_to_errors(names: Vec<Tracked<Symbol>>, body: Term) -> Term {
     inner
 }
 
+/// The demand an exact struct pattern makes of the value a `let` binds it to,
+/// written as an annotation: exactly the named fields — the list closed, each
+/// field present — with a hole where each field's type goes, since the pattern
+/// says which fields are there and nothing about what they hold. Spanned at
+/// the pattern, so the solver's ordinary mismatch points at what was written.
+///
+/// An annotation because that is the channel a binding's demand already
+/// travels: the unit pattern's `()` goes the same way, and inference needs no
+/// new rule to enforce this one. The holes are what mark it as the compiler's
+/// own — see [`TypeKind::Any`].
+fn exact_demand(span: Span, fields: &[(TrackedString, Calm)]) -> Type {
+    let fields = fields
+        .iter()
+        .map(|(name, _)| {
+            let field = TypeField::Written {
+                name_span: name.span,
+                optional: false,
+                value: name.span.track(TypeKind::Any),
+            };
+            (name.tracked.clone(), field)
+        })
+        .collect();
+    span.track(TypeKind::Struct { fields, tail: None })
+}
+
 /// A normalized pattern as the matrix walk matches it: everything that only
 /// binds is the one wildcard, a bare tag carries a wildcard payload, and `{}`
 /// — which reaches into nothing — is a wildcard too.
@@ -1809,8 +1841,8 @@ fn mat(pattern: &Pattern) -> Mat {
             name: name.tracked.clone(),
             payload: Box::new(payload.as_deref().map(mat).unwrap_or(Mat::Wild)),
         },
-        PatternKind::Struct(fields) if fields.is_empty() => Mat::Wild,
-        PatternKind::Struct(fields) => Mat::Struct(
+        PatternKind::Struct { fields, .. } if fields.is_empty() => Mat::Wild,
+        PatternKind::Struct { fields, .. } => Mat::Struct(
             fields
                 .iter()
                 .map(|(name, field)| (name.clone(), mat(&field.value)))
@@ -1869,7 +1901,7 @@ impl Matrix {
                     path.pop();
                 }
             }
-            PatternKind::Struct(fields) => {
+            PatternKind::Struct { fields, .. } => {
                 for (name, field) in fields {
                     path.push(Step::Field(name.clone()));
                     self.collect(&field.value, path);
@@ -1877,33 +1909,6 @@ impl Matrix {
                 }
             }
         }
-    }
-
-    /// Whether any one position is tested against both numbers and cases. No
-    /// value is both, so such a match is refused at lowering with its own
-    /// complaint rather than surfacing as a unification failure. See
-    /// [`ErrorKind::MixedMatch`].
-    pub(crate) fn mixed(&self) -> bool {
-        self.tests
-            .values()
-            .any(|tests| !tests.tags.is_empty() && !tests.naturals.is_empty())
-    }
-
-    /// A value no arm accepts, when one exists: the wildcard's usefulness
-    /// against the whole matrix, which is the exhaustiveness question. The
-    /// witness comes back in the shape of the value, for the complaint to
-    /// write in source syntax.
-    pub(crate) fn unhandled(&self, arms: &[&Pattern]) -> Option<Witness> {
-        let rows: Vec<Vec<Mat>> = arms.iter().map(|pattern| vec![mat(pattern)]).collect();
-        let mut witness = self.useful(&rows, &[Vec::new()], &[Mat::Wild])?;
-        Some(witness.remove(0))
-    }
-
-    /// Whether some value reaches this arm past the ones above it: the arm's
-    /// own usefulness against the matrix of earlier arms.
-    pub(crate) fn reachable(&self, earlier: &[&Pattern], arm: &Pattern) -> bool {
-        let rows: Vec<Vec<Mat>> = earlier.iter().map(|pattern| vec![mat(pattern)]).collect();
-        self.useful(&rows, &[Vec::new()], &[mat(arm)]).is_some()
     }
 
     /// Whether the earlier arms alone leave no unhandled value carrying this
@@ -1925,23 +1930,21 @@ impl Matrix {
                 },
             };
         }
-        self.useful(&rows, &[Vec::new()], &[forced]).is_none()
+        !self.useful(&rows, &[Vec::new()], &[forced])
     }
 
-    /// Maranget's usefulness, with a witness: a value that matches `q` and no
-    /// row of `rows`, or `None` when every such value is covered. `cols` names
-    /// the position each column stands for, which is where the universes come
-    /// from; the three are always the same width.
+    /// Maranget's usefulness: whether some value matches `q` and no row of
+    /// `rows`. `cols` names the position each column stands for, which is
+    /// where the universes come from; the three are always the same width.
     ///
-    /// The witness the wildcard question gets back is built from the listed
-    /// tests, so it is concrete wherever the tests are — a listed tag, the
-    /// smallest number not listed — and "anything else" exactly where an open
-    /// row's rest is what goes unhandled.
-    fn useful(&self, rows: &[Vec<Mat>], cols: &[Vec<Step>], q: &[Mat]) -> Option<Vec<Witness>> {
+    /// No witness comes back any more: the checks that show a reader an
+    /// example are typed and live in [`patterns`](crate::patterns), and the
+    /// refinement this serves asks only whether anything escapes.
+    fn useful(&self, rows: &[Vec<Mat>], cols: &[Vec<Step>], q: &[Mat]) -> bool {
         // No columns left: every value matching q matches every row, so q is
         // useful exactly when no row is left to cover it.
         let Some((pos, later)) = cols.split_first() else {
-            return rows.is_empty().then(Vec::new);
+            return rows.is_empty();
         };
         // A column with a struct pattern in it is widened first: one column
         // per field any of its structs names, plus the position itself for the
@@ -1991,23 +1994,7 @@ impl Matrix {
             let wide_rows: Vec<Vec<Mat>> =
                 rows.iter().map(|row| widen(&row[0], &row[1..])).collect();
             let wide_q = widen(&q[0], &q[1..]);
-            let mut witness = self.useful(&wide_rows, &wide_cols, &wide_q)?;
-            // Fold the widened columns back into one witness: the fields that
-            // matter in braces, or the core's own answer when none of them do.
-            let after = witness.split_off(1 + named.len());
-            let mut parts = witness.into_iter();
-            let core = parts.next().expect("the widening put the core first");
-            let fields: IndexMap<String, Witness> = named
-                .iter()
-                .map(|name| (*name).clone())
-                .zip(parts)
-                .filter(|(_, witness)| !matches!(witness, Witness::Any))
-                .collect();
-            let folded = match fields.is_empty() {
-                true => core,
-                false => Witness::Struct(fields),
-            };
-            return Some(std::iter::once(folded).chain(after).collect());
+            return self.useful(&wide_rows, &wide_cols, &wide_q);
         }
         match &q[0] {
             // q tests a tag: only the rows that could take the same values
@@ -2018,77 +2005,40 @@ impl Matrix {
                 let q: Vec<Mat> = std::iter::once((**payload).clone())
                     .chain(q[1..].iter().cloned())
                     .collect();
-                let mut witness = self.useful(&rows, &cols, &q)?;
-                let payload = witness.remove(0);
-                Some(
-                    std::iter::once(tag_witness(name.clone(), payload))
-                        .chain(witness)
-                        .collect(),
-                )
+                self.useful(&rows, &cols, &q)
             }
-            // q tests a number: the rows that test another are dropped, and
-            // a number carries nothing, so the column is simply consumed.
-            Mat::Natural(value) => {
-                let rows = specialize_natural(rows, *value);
-                let mut witness = self.useful(&rows, later, &q[1..])?;
-                witness.insert(0, Witness::Natural(*value));
-                Some(witness)
-            }
-            // q accepts everything here, so it is useful if any value of the
-            // position's universe escapes the rows: each listed case in turn,
-            // each listed number and then some other number — the numbers
-            // never run out — and "anything else" when the position is open.
-            // A struct cannot reach this arm — the widening above took every
-            // column holding one — so a cell here is a wildcard exactly when
-            // it is not a test.
-            Mat::Wild | Mat::Struct(_) => {
+            // q accepts everything here — [`handled`](Self::handled)'s forced
+            // rows are tags and structs down to a wildcard, so no natural
+            // ever arrives at the head of one, and the widening above took
+            // every column holding a struct — so it is useful if any value of
+            // the position's universe escapes the rows: each listed case in
+            // turn, each listed number and then some other number — the
+            // numbers never run out — and "anything else" when the position
+            // is open.
+            _ => {
                 let empty = Tests::default();
                 let tests = self.tests.get(pos).unwrap_or(&empty);
                 if !tests.tags.is_empty() {
-                    for name in &tests.tags {
+                    tests.tags.iter().any(|name| {
                         let rows = specialize_tag(rows, name);
                         let cols = payload_cols(pos, name, later);
                         let q: Vec<Mat> = std::iter::once(Mat::Wild)
                             .chain(q[1..].iter().cloned())
                             .collect();
-                        if let Some(mut witness) = self.useful(&rows, &cols, &q) {
-                            let payload = witness.remove(0);
-                            return Some(
-                                std::iter::once(tag_witness(name.clone(), payload))
-                                    .chain(witness)
-                                    .collect(),
-                            );
-                        }
-                    }
-                    if self.open(pos) {
-                        let rows = defaults(rows);
-                        let mut witness = self.useful(&rows, later, &q[1..])?;
-                        witness.insert(0, Witness::Other(tests.tags.iter().cloned().collect()));
-                        return Some(witness);
-                    }
-                    None
+                        self.useful(&rows, &cols, &q)
+                    }) || (self.open(pos) && self.useful(&defaults(rows), later, &q[1..]))
                 } else if !tests.naturals.is_empty() {
-                    for value in &tests.naturals {
-                        let rows = specialize_natural(rows, *value);
-                        if let Some(mut witness) = self.useful(&rows, later, &q[1..]) {
-                            witness.insert(0, Witness::Natural(*value));
-                            return Some(witness);
-                        }
-                    }
-                    let unlisted = (0..)
-                        .find(|value| !tests.naturals.contains(value))
-                        .expect("a finite set of naturals leaves one out");
-                    let rows = defaults(rows);
-                    let mut witness = self.useful(&rows, later, &q[1..])?;
-                    witness.insert(0, Witness::Natural(unlisted));
-                    Some(witness)
+                    // The numbers never run out, so the escape past the listed
+                    // ones needs no openness question.
+                    tests
+                        .naturals
+                        .iter()
+                        .any(|value| self.useful(&specialize_natural(rows, *value), later, &q[1..]))
+                        || self.useful(&defaults(rows), later, &q[1..])
                 } else {
                     // Nothing tests the position at all, so every cell in the
                     // column is a wildcard and any value serves.
-                    let rows = defaults(rows);
-                    let mut witness = self.useful(&rows, later, &q[1..])?;
-                    witness.insert(0, Witness::Any);
-                    Some(witness)
+                    self.useful(&defaults(rows), later, &q[1..])
                 }
             }
         }
@@ -2159,16 +2109,6 @@ fn payload_cols(pos: &[Step], name: &str, later: &[Vec<Step>]) -> Vec<Vec<Step>>
         .collect()
 }
 
-/// A tag's witness, with a payload any value serves for folded away — the
-/// bare spelling, which is how a case carrying nothing is written.
-fn tag_witness(name: String, payload: Witness) -> Witness {
-    let payload = match payload {
-        Witness::Any => None,
-        payload => Some(Box::new(payload)),
-    };
-    Witness::Tag { name, payload }
-}
-
 /// Every name a surface pattern binds, in the order the lowering walk meets
 /// them — repeats included, so the declare pass and [`Builder::pattern`] agree
 /// position for position. See [`Binders::Declared`].
@@ -2185,7 +2125,7 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 pattern_names(payload, out);
             }
         }
-        parse::PatternKind::Struct(fields) => {
+        parse::PatternKind::Struct { fields, .. } => {
             for (name, sub) in fields {
                 match sub {
                     Some(sub) => pattern_names(sub, out),
@@ -2607,7 +2547,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                 }
             }
         }
-        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {}
+        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Any | TypeKind::Error => {}
     }
 }
 
@@ -2718,7 +2658,11 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     }
                 }
             }
-            TypeKind::Ident(_) | TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+            TypeKind::Ident(_)
+            | TypeKind::Param { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Any
+            | TypeKind::Error => {}
         }
     }
 
@@ -2955,9 +2899,11 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
             }
             out
         }
-        TypeKind::Sum { .. } | TypeKind::Arrow { .. } | TypeKind::Prim(_) | TypeKind::Error => {
-            Carried::default()
-        }
+        TypeKind::Sum { .. }
+        | TypeKind::Arrow { .. }
+        | TypeKind::Prim(_)
+        | TypeKind::Any
+        | TypeKind::Error => Carried::default(),
     }
 }
 
@@ -3121,7 +3067,7 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                     under.pop();
                 }
             }
-            TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => {}
+            TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Any | TypeKind::Error => {}
         }
     }
 
@@ -3188,7 +3134,7 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
                 }
             }
         }
-        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Any | TypeKind::Error => {}
     }
 }
 
@@ -3254,7 +3200,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
                 }
             }
         }
-        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Error => {}
+        TypeKind::Param { .. } | TypeKind::Prim(_) | TypeKind::Any | TypeKind::Error => {}
     }
 }
 
@@ -3283,7 +3229,7 @@ fn mentions_a_parameter(ty: &Type) -> bool {
                     .values()
                     .any(|case| case.payload().is_some_and(mentions_a_parameter))
         }
-        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Error => false,
+        TypeKind::Ident(_) | TypeKind::Prim(_) | TypeKind::Any | TypeKind::Error => false,
     }
 }
 
@@ -4116,7 +4062,10 @@ impl Builder<'_> {
                     payload.map(|payload| Box::new(self.pattern(*payload, seen, binders, dropped)));
                 span.track(PatternKind::Tag { name, payload })
             }
-            parse::PatternKind::Struct(entries) => {
+            parse::PatternKind::Struct {
+                fields: entries,
+                rest,
+            } => {
                 let mut named: Vec<(String, bool)> = Vec::new();
                 let mut fields: IndexMap<String, Field<Pattern>> = IndexMap::new();
                 for (name, sub) in entries {
@@ -4159,7 +4108,7 @@ impl Builder<'_> {
                         false => pattern_binders(&sub, dropped),
                     }
                 }
-                span.track(PatternKind::Struct(fields))
+                span.track(PatternKind::Struct { fields, rest })
             }
         }
     }
@@ -4234,27 +4183,54 @@ impl Builder<'_> {
                     .with_span(at)
                 }
             },
-            Calm::Struct { span, fields } => {
-                let held = self.fresh("%struct", span);
-                let mut inner = inner;
-                for (name, sub) in fields.into_iter().rev() {
-                    let base = TermKind::Ident(held.tracked).with_span(name.span);
-                    let field = TermKind::Project {
-                        base: Box::new(base),
-                        field: name.clone(),
+            // Without the `..` the pattern is exact, and the demand — the
+            // value has exactly the named fields — is an annotation of the
+            // pattern's own making; see [`exact_demand`]. A written annotation
+            // is the contract on the whole value, so it goes on a binding of
+            // its own and the demand on a second, the way a unit pattern's
+            // does. With the `..` the pattern asks only for the fields it
+            // names, which is the demand the projections already make.
+            Calm::Struct { span, fields, rest } => match (annotation, rest) {
+                (Some(annotation), None) => {
+                    let held = self.fresh("%value", span);
+                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let calm = Calm::Struct { span, fields, rest };
+                    let constrained = self.destructure(calm, again, None, inner);
+                    let at = span.merge(constrained.span);
+                    TermKind::Let {
+                        name: held,
+                        annotation: Some(annotation),
+                        value: Box::new(value),
+                        body: Box::new(constrained),
                     }
-                    .with_span(name.span);
-                    inner = self.destructure(sub, field, None, inner);
+                    .with_span(at)
                 }
-                let at = span.merge(inner.span);
-                TermKind::Let {
-                    name: held,
-                    annotation,
-                    value: Box::new(value),
-                    body: Box::new(inner),
+                (annotation, rest) => {
+                    let annotation = match rest {
+                        None => Some(exact_demand(span, &fields)),
+                        Some(_) => annotation,
+                    };
+                    let held = self.fresh("%struct", span);
+                    let mut inner = inner;
+                    for (name, sub) in fields.into_iter().rev() {
+                        let base = TermKind::Ident(held.tracked).with_span(name.span);
+                        let field = TermKind::Project {
+                            base: Box::new(base),
+                            field: name.clone(),
+                        }
+                        .with_span(name.span);
+                        inner = self.destructure(sub, field, None, inner);
+                    }
+                    let at = span.merge(inner.span);
+                    TermKind::Let {
+                        name: held,
+                        annotation,
+                        value: Box::new(value),
+                        body: Box::new(inner),
+                    }
+                    .with_span(at)
                 }
-                .with_span(at)
-            }
+            },
         }
     }
 
@@ -4329,52 +4305,68 @@ impl Builder<'_> {
                     );
                 }
             },
-            Calm::Struct { span, fields } => {
-                let held = self.fresh("%struct", span);
-                out.insert(
-                    held.tracked,
-                    Decl {
-                        name_span: span,
-                        annotation,
-                        params: Vec::new(),
-                        value,
-                    },
-                );
-                for (name, sub) in fields {
-                    let base = TermKind::Ident(held.tracked).with_span(name.span);
-                    let field = TermKind::Project {
-                        base: Box::new(base),
-                        field: name.clone(),
-                    }
-                    .with_span(name.span);
-                    self.destructure_stmt(sub, None, field, out);
+            // The expression form's split, said about definitions: a written
+            // annotation holds the whole value on a binding of its own, and
+            // the exact pattern's demand — see [`exact_demand`] — rides on the
+            // `%struct` the projections read from.
+            Calm::Struct { span, fields, rest } => match (annotation, rest) {
+                (Some(annotation), None) => {
+                    let held = self.fresh("%value", span);
+                    out.insert(
+                        held.tracked,
+                        Decl {
+                            name_span: span,
+                            annotation: Some(annotation),
+                            params: Vec::new(),
+                            value,
+                        },
+                    );
+                    let again = TermKind::Ident(held.tracked).with_span(span);
+                    let calm = Calm::Struct { span, fields, rest };
+                    self.destructure_stmt(calm, None, again, out);
                 }
-            }
+                (annotation, rest) => {
+                    let annotation = match rest {
+                        None => Some(exact_demand(span, &fields)),
+                        Some(_) => annotation,
+                    };
+                    let held = self.fresh("%struct", span);
+                    out.insert(
+                        held.tracked,
+                        Decl {
+                            name_span: span,
+                            annotation,
+                            params: Vec::new(),
+                            value,
+                        },
+                    );
+                    for (name, sub) in fields {
+                        let base = TermKind::Ident(held.tracked).with_span(name.span);
+                        let field = TermKind::Project {
+                            base: Box::new(base),
+                            field: name.clone(),
+                        }
+                        .with_span(name.span);
+                        self.destructure_stmt(sub, None, field, out);
+                    }
+                }
+            },
         }
     }
 
     /// Lower `match <expr> with <arms> end`: the scrutinee, then each arm's
     /// pattern and body — the pattern's names in scope for its own body and
     /// released after it — into the one [`TermKind::Match`] node, arms in
-    /// written order. Nothing about how a machine would dispatch them is
-    /// decided here; what is decided is what the matrix itself can be wrong
-    /// about:
-    ///
-    /// - an arm that accepts everything belongs last, and one written anywhere
-    ///   else is reported at itself — the placement is the mistake — with the
-    ///   arms it starves dropped, bodies already lowered for their own
-    ///   complaints (R11);
-    /// - a position tested against both numbers and cases is refused whole
-    ///   (R9);
-    /// - an arm no value can reach is reported at itself and dropped (R10);
-    /// - a match that leaves values unhandled is reported at the match, with
-    ///   a concrete example — worded about numbers when the example is one
-    ///   (R8, R9).
+    /// written order. Every written arm is lowered and kept, so every one is
+    /// typechecked: which arms a value can reach, where a catch-all belongs,
+    /// and whether anything goes unhandled are questions about solved types,
+    /// asked by [`patterns`](crate::patterns) once inference has answered
+    /// them. What stays here is the pattern's own to get wrong — a name bound
+    /// twice — reported by the pattern walk itself.
     fn match_term(&mut self, span: Span, scrutinee: Expr, arms: Vec<parse::Arm>) -> Term {
         let scrutinee = self.term(scrutinee);
-        let mut rows: Vec<(Pattern, Term, Span)> = Vec::new();
+        let mut lowered: Vec<(Pattern, Term)> = Vec::new();
         for arm in arms {
-            let at = arm.pattern.span.merge(arm.body.span);
             let mark = self.terms.mark();
             let mut seen = Vec::new();
             let mut dropped = Vec::new();
@@ -4382,65 +4374,11 @@ impl Builder<'_> {
             let body = self.term(arm.body);
             self.terms.release(mark);
             let body = bound_to_errors(dropped, body);
-            rows.push((pattern, body, at));
-        }
-        // An arm that accepts everything starves every arm after it, so each
-        // one written anywhere but last is reported — at itself, since the
-        // placement is the mistake, and once, rather than once per arm it
-        // starves — and the arms past the first stand no chance and are
-        // dropped.
-        for (at, row) in rows.iter().enumerate() {
-            if at + 1 < rows.len() && refuter(&row.0).is_none() {
-                self.error(row.2, ErrorKind::MisplacedCatchAll);
-            }
-        }
-        if let Some(catch) = rows.iter().position(|row| refuter(&row.0).is_none()) {
-            rows.truncate(catch + 1);
-        }
-        // One position compares one kind of thing: numbers and cases answer
-        // to different types, and no value is both, so the mix is refused
-        // here as the written mistake it is rather than surfacing as a
-        // unification failure. The whole match absorbs: which arms mean what
-        // is exactly what could not be worked out.
-        let matrix = Matrix::new(rows.iter().map(|row| &row.0));
-        if matrix.mixed() {
-            self.error(span, ErrorKind::MixedMatch);
-            return TermKind::Error.with_span(span);
-        }
-        // An arm nothing can reach is dropped after being reported, the way a
-        // duplicate definition is: the matrix inference reads should hold the
-        // arms that mean something. Each arm is asked against the arms kept
-        // so far — a dropped arm covered nothing its predecessors did not, so
-        // dropping it moves no later answer.
-        let mut arms: Vec<(Pattern, Term)> = Vec::new();
-        for (pattern, body, at) in rows {
-            let earlier: Vec<&Pattern> = arms.iter().map(|(pattern, _)| pattern).collect();
-            match matrix.reachable(&earlier, &pattern) {
-                true => arms.push((pattern, body)),
-                false => self.error(at, ErrorKind::UnreachableArm),
-            }
-        }
-        // Unhandled values, with a witness. The empty match is exempt by
-        // construction rather than by exception: it constrains the scrutinee
-        // to the empty sum, which has no values to leave unhandled. The
-        // universes are re-read from the arms as they finally stand, since
-        // those are the arms inference will close the rows over.
-        if !arms.is_empty() {
-            let matrix = Matrix::new(arms.iter().map(|(pattern, _)| pattern));
-            let kept: Vec<&Pattern> = arms.iter().map(|(pattern, _)| pattern).collect();
-            if let Some(witness) = matrix.unhandled(&kept) {
-                let kind = match witness {
-                    // The friendlier wording about numbers: some number went
-                    // unhandled, and no one number is worth quoting.
-                    Witness::Natural(_) => ErrorKind::UnhandledNumbers,
-                    witness => ErrorKind::UnhandledValues { witness },
-                };
-                self.error(span, kind);
-            }
+            lowered.push((pattern, body));
         }
         TermKind::Match {
             scrutinee: Box::new(scrutinee),
-            arms,
+            arms: lowered,
         }
         .with_span(span)
     }

@@ -165,7 +165,7 @@ impl Grouped for Show<'_, PatternKind> {
             | PatternKind::Wildcard
             | PatternKind::Natural(_)
             | PatternKind::Unit
-            | PatternKind::Struct(_) => Prec::Atom,
+            | PatternKind::Struct { .. } => Prec::Atom,
         }
     }
 }
@@ -189,7 +189,23 @@ impl fmt::Display for Show<'_, PatternKind> {
                 false,
                 payload.as_deref().map(|payload| self.show(payload)),
             ),
-            PatternKind::Struct(fields) => write_struct(f, self.pairs(fields)),
+            // Through `write_row` rather than `write_struct`, because a
+            // pattern's field list can end in the `..` that makes it open —
+            // rendered as a tail with nothing after it, exactly as it was
+            // written.
+            PatternKind::Struct { fields, rest } => {
+                let fields = self.pairs(fields).map(|(name, sub)| Entry::Written {
+                    name,
+                    optional: false,
+                    holds: sub,
+                });
+                let rest = rest.as_ref().map(|_| "");
+                write_row(
+                    f,
+                    fields,
+                    rest.as_ref().map(|tail| tail as &dyn fmt::Display),
+                )
+            }
         }
     }
 }
@@ -204,6 +220,7 @@ impl Grouped for Show<'_, TypeKind> {
             | TypeKind::Ident(_)
             | TypeKind::Param { .. }
             | TypeKind::Prim(_)
+            | TypeKind::Any
             | TypeKind::Error => Prec::Atom,
         }
     }
@@ -271,6 +288,9 @@ impl fmt::Display for Show<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
             TypeKind::Error => f.write_str("<error>"),
+            // The hole a pattern's demand leaves for the solver, spelled the
+            // way the type printer spells a type with nothing to report.
+            TypeKind::Any => f.write_str("?"),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             // A parameter prints as the name it was declared with, which is
             // what makes this printer's output match the parse tree's.

@@ -4134,7 +4134,7 @@ fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
     );
     assert_eq!(
         scheme(&mint, &output, "pick"),
-        "`Cons { head: `Some Nat | `None, tail: 'a, ..'b } | `Nil -> Nat"
+        "`Cons { head: `Some Nat | `None, tail: 'a } | `Nil -> Nat"
     );
     // The bare `` `None `` and `` `Nil `` both carry unit: supplying a
     // payload to one is the ordinary mismatch.
@@ -4172,7 +4172,7 @@ fn columns_type_as_unions_across_arms() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a: `A, b: `X | `Y, c: 'a, ..'b } -> Nat"
+        "{ a: `A, b: `X | `Y, c: 'a } -> Nat"
     );
 }
 
@@ -4237,12 +4237,13 @@ fn an_error_in_an_arm_body_is_reported_once() {
 }
 
 /// A natural match with no default still types — the scrutinee and the arms
-/// are numbers — even though lowering already complained that the numbers not
-/// listed are unhandled; one mistake, one complaint, and no echo from here.
+/// are numbers. That the numbers not listed go unhandled is the `patterns`
+/// phase's to say, after this has run; neither lowering nor inference
+/// complains, so every arm reaches here and is typed.
 #[test]
 fn a_natural_match_without_a_default_still_types() {
     let (mint, out, output) = infer_src("let f = fn n => match n with | 0 => 1 end");
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat");
 }
@@ -4273,7 +4274,7 @@ fn a_catch_all_keeps_struct_payload_rows_open() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`P (`A { x: `X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
+        "`P (`A { x?: `X | ..'a, ..'b } | ..'c) | ..'d -> Nat"
     );
 }
 
@@ -4308,10 +4309,7 @@ fn a_column_closes_over_every_listed_case() {
         "let f = fn e => match e with \
          | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: `A | `B, b: Nat } -> Nat");
 
     // Mirror ordering: the riding row lands past a different tag and the
     // column still closes over both.
@@ -4319,10 +4317,7 @@ fn a_column_closes_over_every_listed_case() {
         "let f = fn e => match e with \
          | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 end",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ a: `A | `B, b: Nat, ..'a } -> Nat"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: `A | `B, b: Nat } -> Nat");
 
     // Nested in a tag's payload: the outer sum closes over the one tag, the
     // payload's column over both of its own.
@@ -4332,7 +4327,7 @@ fn a_column_closes_over_every_listed_case() {
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`T { a: `A | `B, b: Nat, ..'a } -> Nat"
+        "`T { a: `A | `B, b: Nat } -> Nat"
     );
 
     // The same three shapes with a trailing catch-all still build clean.
@@ -4427,16 +4422,10 @@ fn a_discarded_value_is_still_typechecked() {
 #[test]
 fn a_wildcard_struct_leaf_still_demands_its_field() {
     let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
-    assert_eq!(
-        scheme(&mint, &output, "use_y"),
-        "{ x: 'a, y: 'b, ..'c } -> 'b"
-    );
+    assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
     let (mint, _, output) = inferred("let use_y = fn p => match p with {x: _, y} => y end");
-    assert_eq!(
-        scheme(&mint, &output, "use_y"),
-        "{ x: 'a, y: 'b, ..'c } -> 'b"
-    );
+    assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 }
 
 /// R8: in a match, `_` types exactly as a named, unused catch-all does — the
@@ -4467,4 +4456,159 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     let (mint, _, output) =
         inferred("let has = fn opt => match opt with | `Some _ => 1 | `None => 0 end");
     assert_eq!(scheme(&mint, &output, "has"), "`Some 'a | `None -> Nat");
+}
+
+/// The motivating program of the exactness spec: exact arms over every
+/// presence combination of two fields. The column rule gives each field a
+/// fresh presence variable — `{}` mentions neither — and closes the row, so
+/// unification infers two optional fields and generalization prints them as
+/// the `?` they stayed.
+#[test]
+fn the_motivating_program_infers_optional_fields() {
+    let (mint, _, output) = inferred(
+        "let p = fn a => match a with \
+         | {a, b} => () | {a} => {} | {b} => {} | {} => {} end",
+    );
+    assert_eq!(scheme(&mint, &output, "p"), "{ a?: 'a, b?: 'b } -> {}");
+}
+
+/// R5's closed half: a single exact arm mentions every field in every entry,
+/// so each is present and the row closes — the demanded struct is exactly the
+/// named fields, and a use site with one more is refused.
+#[test]
+fn an_exact_column_closes_the_row() {
+    let (mint, _, output) = inferred("let f = fn v => match v with {a, b} => a end");
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, b: 'b } -> 'a");
+
+    let (_, _, output) = infer_src(
+        "let f = fn v => match v with {a, b} => a end\n\
+         let bad = f { a: 1, b: 2, c: 3 }",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(
+        output.errors[0].kind,
+        ErrorKind::ExtraField { .. }
+    ));
+}
+
+/// R5's open half: a `..` entry — or a binder or wildcard anywhere in the
+/// column — keeps the demand open, so a value with more fields still fits.
+#[test]
+fn a_rest_or_binder_entry_opens_the_row() {
+    let (mint, _, output) = inferred(
+        "let f = fn v => match v with {a, ..} => a end\n\
+         let ok = f { a: 1, b: 2 }",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, ..'b } -> 'a");
+    assert_eq!(scheme(&mint, &output, "ok"), "Nat");
+
+    let (mint, _, output) = inferred(
+        "let g = fn v => match v with | {a} => a | w => 0 end\n\
+         let ok = g { a: 1, b: 2 }",
+    );
+    // The binder opens the row and un-pins the presence: `a` may be there.
+    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat, ..'a } -> Nat");
+}
+
+/// The spec's open example: `x` is presence-variable — `{}` does not mention
+/// it — the row stays open, and `x`'s type unifies with `Nat` through the
+/// second arm's `0`.
+#[test]
+fn the_open_example_types_through_both_arms() {
+    let (mint, _, output) = inferred("let f = fn v => match v with | {x, ..} => x | {} => 0 end");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x?: Nat, ..'a } -> Nat");
+}
+
+/// R2 on a `let`, the breaking change: an exact pattern demands exactly its
+/// named fields of the value, so a field the value has and the pattern does
+/// not is the solver's ordinary complaint — and the `..` restores the old
+/// at-least reading.
+#[test]
+fn an_exact_let_pattern_is_exact() {
+    let (_, _, output) = infer_src("let q = {x: 1, y: 2}  let {x} = q");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    match &output.errors[0].kind {
+        ErrorKind::ExtraField { shape, field, .. } => {
+            assert_eq!(*shape, Shape::Struct);
+            assert_eq!(field, "y");
+        }
+        other => panic!("expected an extra field, got {other:#?}"),
+    }
+
+    let (mint, _, output) = inferred("let {x, ..} = {x: 1, y: 2}");
+    assert_eq!(scheme(&mint, &output, "x"), "Nat");
+
+    // The expression form makes the same two demands.
+    let (_, _, output) = infer_src("let a = let {x} = {x: 1, y: 2} in x");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    let (mint, _, output) = inferred("let a = let {x, ..} = {x: 1, y: 2} in x");
+    assert_eq!(scheme(&mint, &output, "a"), "Nat");
+}
+
+/// R3: `()` and `{}` are one pattern — exactly no fields — in a match column
+/// as on a `let`, so the two spellings demand the same thing and mix freely.
+#[test]
+fn unit_and_empty_braces_demand_the_same() {
+    let (mint, _, output) = inferred("let f = fn v => match v with {} => 1 end");
+    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
+
+    let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0 end");
+    assert_eq!(scheme(&mint, &output, "g"), "{ a?: Nat } -> Nat");
+
+    let (_, _, output) = infer_src("let {} = 5");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+    let (_, _, output) = infer_src("let () = 5");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// R8: a match testing numbers and cases at one position is typed like any
+/// other — the two demands cannot be one type, and the solver's ordinary
+/// mismatch is the only complaint anything makes about it.
+#[test]
+fn a_mixed_match_is_one_ordinary_mismatch() {
+    let (_, out, output) = infer_src("let f = fn e => match e with | 0 => 1 | `A x => 2 end");
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
+}
+
+/// R4's last sentence: field types still unify across the arms that mention
+/// the field, presence variables or not — one field, one type.
+#[test]
+fn field_types_unify_across_arms() {
+    let (mint, _, output) =
+        inferred("let f = fn v => match v with | {a} => a | {a, b} => b | {} => 2 end");
+    // `a` is typed by arm one's use as the result, `b` by arm two's, and the
+    // result `Nat` reaches both through the bodies.
+    assert_eq!(scheme(&mint, &output, "f"), "{ a?: Nat, b?: Nat } -> Nat");
+
+    // Disagreeing across arms is the mismatch it sounds like.
+    let (_, _, output) = infer_src(
+        "let wants : Nat -> Nat = fn n => n\n\
+         let f = fn v => match v with | {a} => wants a | {a, b} => wants (a {}) end",
+    );
+    assert!(!output.errors.is_empty());
+}
+
+/// The refinement past two different numbers under one tag: neither alone
+/// covers the payload — the numbers never run out — so the catch-all's view
+/// keeps the case present, and the whole thing types clean.
+#[test]
+fn a_case_tested_by_numbers_stays_present_for_the_catch_all() {
+    let (mint, _, output) = inferred(
+        "let keep = fn r => 0\n\
+         let f = fn e => match e with | `A 1 => 1 | `A 2 => 2 | r => keep r end",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "`A Nat | ..'a -> Nat");
+}
+
+/// A `{}` payload is the exact unit test it reads as, and the refinement
+/// counts it as covering the whole payload: the catch-all's view drops the
+/// case, exactly as a binder payload would.
+#[test]
+fn an_empty_struct_payload_covers_its_case() {
+    let (mint, _, output) = inferred("let f = fn e => match e with | `A {} => 1 | r => 2 end");
+    assert_eq!(scheme(&mint, &output, "f"), "`A | ..'a -> Nat");
 }

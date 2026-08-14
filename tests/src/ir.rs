@@ -2676,26 +2676,37 @@ fn an_identifier_let_lowers_unchanged() {
 }
 
 /// R6's statement half: `let {x, y} = e` is a fresh definition holding `e`,
-/// then one definition per field, in written order — N+1 definitions.
+/// then one definition per field, in written order — N+1 definitions. The
+/// temporary wears the exact pattern's demand as an annotation: exactly the
+/// named fields, each field's type a hole for the solver.
 #[test]
 fn a_struct_let_statement_makes_a_definition_per_field() {
     assert_eq!(
         lowered("let {x, y} = { x: 1, y: 2 }"),
-        "let %struct = { x: 1, y: 2 }\nlet x = %struct.x\nlet y = %struct.y"
+        "let %struct : { x: ?, y: ? } = { x: 1, y: 2 }\nlet x = %struct.x\nlet y = %struct.y"
     );
-    // Renaming and annotation: the annotation rides on the temporary, and the
-    // renamed field projects as the name it binds.
+    // Renaming and annotation: the written annotation is the contract on the
+    // whole value, so it holds the value on a binding of its own, and the
+    // exact demand rides on the temporary the projections read.
     assert_eq!(
         lowered("let {x: a} : { x: Nat } = { x: 1 }"),
-        "let %struct : { x: Nat } = { x: 1 }\nlet a = %struct.x"
+        "let %value : { x: Nat } = { x: 1 }\nlet %struct : { x: ? } = %value\nlet a = %struct.x"
     );
-    // `let {} = e` just binds the temporary.
-    assert_eq!(lowered("let {} = { x: 1 }"), "let %struct = { x: 1 }");
-    // Nesting chains through intermediate temporaries, still in field order.
+    // `let {} = e` is the unit pattern by another spelling: exactly no
+    // fields.
+    assert_eq!(lowered("let {} = {}"), "let %unit : {} = {}");
+    // With the `..` there is no demand beyond the projections': the pattern
+    // is open, and the temporary is bare.
+    assert_eq!(
+        lowered("let {x, ..} = { x: 1, y: 2 }"),
+        "let %struct = { x: 1, y: 2 }\nlet x = %struct.x"
+    );
+    // Nesting chains through intermediate temporaries, still in field order,
+    // each exact level with a demand of its own.
     assert_eq!(
         lowered("let {pos: {x, y}, tag: t} = p  let p = { pos: { x: 1, y: 2 }, tag: 3 }"),
-        "let %struct = p\n\
-         let %struct = %struct.pos\n\
+        "let %struct : { pos: ?, tag: ? } = p\n\
+         let %struct : { x: ?, y: ? } = %struct.pos\n\
          let x = %struct.x\n\
          let y = %struct.y\n\
          let t = %struct.tag\n\
@@ -2709,14 +2720,28 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
 fn a_struct_let_expression_chains_through_a_temporary() {
     assert_eq!(
         lowered("let d = fn e => let {x, y: a} = e in x"),
-        "let d = fn e => let %struct = e in let x = %struct.x in let a = %struct.y in x"
+        "let d = fn e => let %struct : { x: ?, y: ? } = e in \
+         let x = %struct.x in let a = %struct.y in x"
+    );
+    // Open, the pattern demands only what the projections do, so the
+    // temporary is bare.
+    assert_eq!(
+        lowered("let d = fn e => let {x, ..} = e in x"),
+        "let d = fn e => let %struct = e in let x = %struct.x in x"
+    );
+    // A written annotation holds the whole value on a binding of its own, and
+    // the exact demand rides on the temporary the projections read.
+    assert_eq!(
+        lowered("let a = let {x} : { x: Nat } = { x: 1 } in x"),
+        "let a = let %value : { x: Nat } = { x: 1 } in \
+         let %struct : { x: ? } = %value in let x = %struct.x in x"
     );
     // The spec's own nested example.
     assert_eq!(
         lowered("let dist = fn p => let {pos: {x, y}} = p in add x y  let add = fn a b => a"),
         "let dist = fn p => \
-         let %struct = p in \
-         let %struct = %struct.pos in \
+         let %struct : { pos: ? } = p in \
+         let %struct : { x: ?, y: ? } = %struct.pos in \
          let x = %struct.x in let y = %struct.y in add x y\n\
          let add = fn a => fn b => a"
     );
@@ -2828,11 +2853,13 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
 fn a_wildcard_struct_leaf_keeps_the_projection() {
     assert_eq!(
         lowered("let {x: _, y} = { x: 1, y: 2 }"),
-        "let %struct = { x: 1, y: 2 }\nlet %discard = %struct.x\nlet y = %struct.y"
+        "let %struct : { x: ?, y: ? } = { x: 1, y: 2 }\n\
+         let %discard = %struct.x\nlet y = %struct.y"
     );
     assert_eq!(
         lowered("let use_y = fn p => let {x: _, y} = p in y"),
-        "let use_y = fn p => let %struct = p in let %discard = %struct.x in let y = %struct.y in y"
+        "let use_y = fn p => let %struct : { x: ?, y: ? } = p in \
+         let %discard = %struct.x in let y = %struct.y in y"
     );
 }
 
@@ -2909,34 +2936,20 @@ fn a_wildcard_does_not_make_a_refutable_binding_calm() {
     assert!(errors[0].starts_with("binding-can-fail@"), "{errors:#?}");
 }
 
-/// R8: a bare `_` arm is a catch-all, so the placement rules hold — anywhere
-/// but last is the existing misplaced-catch-all complaint, at the `_` arm,
-/// including a second `_` arm after a first.
+/// A `_` arm anywhere is lowered and kept: where a catch-all belongs is the
+/// `patterns` phase's question, asked after inference so the starved arms are
+/// still typechecked. Lowering says nothing and drops nothing.
 #[test]
-fn a_wildcard_arm_is_a_catch_all_and_must_be_last() {
-    let src = "let f = fn n => match n with _ => 1 | 0 => 2 end";
-    let (_, errors) = lowered_with_errors(src);
-    assert_eq!(errors.len(), 1, "{errors:#?}");
+fn a_wildcard_arm_lowers_wherever_it_was_written() {
     assert_eq!(
-        errors[0],
-        format!(
-            "misplaced-catch-all@{}",
-            src.find("_ => 1").expect("the arm")
-        )
+        lowered("let f = fn n => match n with _ => 1 | 0 => 2 end"),
+        "let f = fn n => match n with | _ => 1 | 0 => 2 end"
     );
-
-    let src = "let f = fn e => match e with _ => 1 | _ => 2 end";
-    let (_, errors) = lowered_with_errors(src);
-    assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
-        errors[0],
-        format!(
-            "misplaced-catch-all@{}",
-            src.find("_ => 1").expect("the first arm")
-        )
+        lowered("let f = fn e => match e with _ => 1 | _ => 2 end"),
+        "let f = fn e => match e with | _ => 1 | _ => 2 end"
     );
-
-    // Last, it is what a named catch-all is: exhaustive, and clean.
+    // Last, it is what a named catch-all is: an ordinary final arm.
     assert_eq!(
         lowered("let f = fn n => match n with 0 => 1 | _ => 2 end"),
         "let f = fn n => match n with | 0 => 1 | _ => 2 end"
@@ -3013,7 +3026,7 @@ fn nested_arms_stay_written() {
         else {
             panic!("a Cons arm");
         };
-        let PatternKind::Struct(fields) = &payload.tracked else {
+        let PatternKind::Struct { fields, .. } = &payload.tracked else {
             panic!("a struct payload");
         };
         let PatternKind::Bind(name) = &fields["tail"].value.tracked else {
@@ -3135,147 +3148,40 @@ fn a_refutable_let_is_refused_and_its_names_still_bind() {
     );
 }
 
-/// An arm nothing can reach is an error at that arm: a second bare tag after
-/// one binding a payload, a duplicate literal, and an arm shadowed through
-/// nesting. The unreachable body is lowered for its own complaints and then
-/// dropped.
+/// Every arm is lowered, kept, and printed back — an arm nothing can reach, a
+/// catch-all anywhere, a match with no final arm, a mixed match. The checks
+/// that used to prune or refuse these moved behind inference, into the
+/// `patterns` phase, so lowering's whole job is to keep the matrix as
+/// written; the only complaint left below is the one that never moved, a name
+/// inside an arm's body that resolves to nothing.
 #[test]
-fn an_unreachable_arm_is_reported_at_itself() {
-    let (printed, errors) =
-        lowered_with_errors("let f = fn e => match e with | `A x => 1 | `A y => 2 end");
-    assert_eq!(errors, ["unreachable-arm@43"], "{errors:#?}");
-    assert_eq!(printed, "let f = fn e => match e with | `A x => 1 end");
-
-    let (_, errors) =
-        lowered_with_errors("let f = fn n => match n with | 0 => 1 | 0 => 2 | k => 3 end");
-    assert_eq!(errors, ["unreachable-arm@40"], "{errors:#?}");
-
-    // Shadowed through nesting: everything the second arm's sub-patterns
-    // accept, the first arm's already did.
-    let (_, errors) =
-        lowered_with_errors("let f = fn e => match e with | `A { x } => 1 | `A { x: y } => 2 end");
-    assert_eq!(errors, ["unreachable-arm@47"], "{errors:#?}");
-
-    // A name inside a dropped body is still resolved before the body goes.
+fn every_arm_is_lowered_and_kept() {
+    // A shadowed arm survives with its body.
+    assert_eq!(
+        lowered("let f = fn e => match e with | `A x => 1 | `A y => 2 end"),
+        "let f = fn e => match e with | `A x => 1 | `A y => 2 end"
+    );
+    // A misplaced catch-all starves nothing here: the arms after it stay.
+    assert_eq!(
+        lowered("let f = fn e => match e with | r => 1 | `A x => 2 end"),
+        "let f = fn e => match e with | r => 1 | `A x => 2 end"
+    );
+    // A natural match with no final arm keeps its shape and raises nothing.
+    assert_eq!(
+        lowered("let f = fn n => match n with | 0 => 1 end"),
+        "let f = fn n => match n with | 0 => 1 end"
+    );
+    // A mixed match is not lowering's to refuse any more: the solver's
+    // ordinary mismatch is the only complaint such a program gets.
+    assert_eq!(
+        lowered("let f = fn e => match e with | 0 => 1 | `A x => 2 | k => 3 end"),
+        "let f = fn e => match e with | 0 => 1 | `A x => 2 | k => 3 end"
+    );
+    // A name inside a kept arm's body still resolves — or fails to, which is
+    // still lowering's own complaint.
     let (_, errors) =
         lowered_with_errors("let f = fn e => match e with | `A x => 1 | `A y => oops end");
-    assert_eq!(
-        errors,
-        ["unreachable-arm@43", "undefined-term@51"],
-        "{errors:#?}"
-    );
-}
-
-/// An arm that accepts everything belongs last; anywhere else it is reported —
-/// at itself — and the starved arms are dropped.
-#[test]
-fn a_misplaced_catch_all_is_reported_at_itself() {
-    let (printed, errors) =
-        lowered_with_errors("let f = fn e => match e with | r => 1 | `A x => 2 end");
-    assert_eq!(errors, ["misplaced-catch-all@31"], "{errors:#?}");
-    assert_eq!(printed, "let f = fn e => match e with | r => 1 end");
-
-    // Every irrefutable arm that is not last is one, each reported.
-    let (_, errors) =
-        lowered_with_errors("let f = fn e => match e with | a => 1 | b => 2 | c => 3 end");
-    assert_eq!(
-        errors,
-        ["misplaced-catch-all@31", "misplaced-catch-all@40"],
-        "{errors:#?}"
-    );
-}
-
-/// A match on numbers has to end in an arm that names the rest; the match is
-/// still lowered as written, so the shape survives for the debugger. The
-/// wording is the numbers' own — no witness is quoted, because no one number
-/// is the point.
-#[test]
-fn natural_arms_need_a_final_catch_all() {
-    let (printed, errors) = lowered_with_errors("let f = fn n => match n with | 0 => 1 end");
-    assert_eq!(errors, ["unhandled-numbers@16"], "{errors:#?}");
-    assert_eq!(printed, "let f = fn n => match n with | 0 => 1 end");
-
-    // A refutable last arm is not the rest either.
-    let (_, errors) = lowered_with_errors("let f = fn n => match n with | 0 => 1 | 1 => 2 end");
-    assert_eq!(errors, ["unhandled-numbers@16"], "{errors:#?}");
-}
-
-/// A number pattern nested inside a tag or a struct leaves values unhandled
-/// too — reported at the match with the witness written out, since the
-/// example is no longer a bare number — and a final catch-all handles the
-/// numbers wherever the column sits.
-#[test]
-fn a_nested_natural_column_leaves_values_unhandled() {
-    let (printed, errors) = lowered_with_errors("let f = fn e => match e with | `A 0 => 1 end");
-    assert_eq!(errors, ["unhandled-values@16"], "{errors:#?}");
-    assert_eq!(
-        witnessed("let f = fn e => match e with | `A 0 => 1 end"),
-        ["`A 1"]
-    );
-    // Lowering stays total: the match keeps its shape.
-    assert_eq!(printed, "let f = fn e => match e with | `A 0 => 1 end");
-
-    let (_, errors) = lowered_with_errors("let f = fn e => match e with | { n: 0 } => 1 end");
-    assert_eq!(errors, ["unhandled-values@16"], "{errors:#?}");
-    assert_eq!(
-        witnessed("let f = fn e => match e with | { n: 0 } => 1 end"),
-        ["{ n: 1 }"]
-    );
-
-    let (_, errors) = lowered_with_errors("let f = fn e => match e with | `A 0 => 1 | q => 2 end");
-    assert!(errors.is_empty(), "{errors:#?}");
-}
-
-/// The example values the unhandled-values complaints carry, rendered. One
-/// vector per program, so a match with several holes shows its first.
-fn witnessed(src: &str) -> Vec<String> {
-    let (_, out) = build_src(src);
-    out.errors
-        .iter()
-        .filter_map(|error| match &error.kind {
-            ErrorKind::UnhandledValues { .. } => Some(error.kind.to_string()),
-            _ => None,
-        })
-        .map(|message| {
-            let (_, rest) = message
-                .split_once("for example `")
-                .expect("the complaint quotes its example");
-            let (example, _) = rest.rsplit_once("`;").expect("the quote closes");
-            example.to_string()
-        })
-        .collect()
-}
-
-/// The hole — every column covered, the combination not. Rows cannot express
-/// the dependency between two positions, so the matrix check has to catch
-/// it, and its witness is the combination itself. Adding a final arm naming
-/// the rest makes it clean.
-#[test]
-fn a_column_covered_hole_is_caught_with_a_witness() {
-    let src = "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `B, b: `Y } => 2 end";
-    let (_, errors) = lowered_with_errors(src);
-    assert_eq!(errors, ["unhandled-values@16"], "{errors:#?}");
-    assert_eq!(witnessed(src), ["{ a: `A, b: `Y }"]);
-
-    lowered(
-        "let f = fn e => match e with \
-         | { a: `A, b: `X } => 1 | { a: `B, b: `Y } => 2 | w => 3 end",
-    );
-}
-
-/// A partially handled tag with no catch-all: a closed payload is the whole
-/// story and clean; an open one — a later arm's binder under the same field —
-/// leaves the rest of the payload's cases unhandled, worded as "anything
-/// other than" what was listed.
-#[test]
-fn an_open_position_is_worded_as_anything_other_than() {
-    lowered("let f = fn e => match e with | `A `X => 1 end");
-    lowered("let f = fn e => match e with | `A `X => 1 | `B => 2 end");
-
-    let src = "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `B, b: w } => 2 end";
-    let (_, errors) = lowered_with_errors(src);
-    assert_eq!(errors, ["unhandled-values@16"], "{errors:#?}");
-    assert_eq!(witnessed(src), ["{ a: `A, b: anything other than `X }"]);
+    assert_eq!(errors, ["undefined-term@51"], "{errors:#?}");
 }
 
 /// The column unions that broke revision 1 lower clean: positions are typed
@@ -3295,19 +3201,31 @@ fn overlapping_arms_are_clean() {
     lowered("let f = fn e => match e with | `A `X x => 1 | `A w => 2 | r => 3 end");
 }
 
-/// Numbers and cases at one position are refused as the written mistake, not
-/// as a unification failure; the match erases and nothing echoes it.
+/// The `..` survives normalization: exactness is read off the rest marker by
+/// inference and the pattern checks, so the marker has to arrive — and the
+/// printed pattern has to show it, so the IR tab reads as the source did.
 #[test]
-fn mixed_natural_and_tag_arms_are_refused() {
-    let (printed, errors) =
-        lowered_with_errors("let f = fn e => match e with | 0 => 1 | `A x => 2 | k => 3 end");
-    assert_eq!(errors, ["mixed-match@16"], "{errors:#?}");
-    assert_eq!(printed, "let f = fn e => <error>");
-
-    // At a nested position too: the payloads of one tag are one position.
-    let (_, errors) =
-        lowered_with_errors("let f = fn e => match e with | `A 0 => 1 | `A `X => 2 | r => 3 end");
-    assert_eq!(errors, ["mixed-match@16"], "{errors:#?}");
+fn a_rest_marker_survives_normalization() {
+    assert_eq!(
+        lowered("let f = fn v => match v with {x, ..} => x | {} => 0 end"),
+        "let f = fn v => match v with | { x: x, .. } => x | {} => 0 end"
+    );
+    assert_eq!(
+        lowered("let f = fn v => match v with {..} => 1 end"),
+        "let f = fn v => match v with | { .. } => 1 end"
+    );
+    let (mint, out) = built("let f = fn v => match v with {x, ..} => x end");
+    let TermKind::Fn { body, .. } = term_value(&mint, &out, "f") else {
+        panic!("f is a function");
+    };
+    let TermKind::Match { arms, .. } = &body.kind else {
+        panic!("the body is a match");
+    };
+    let PatternKind::Struct { fields, rest } = &arms[0].0.tracked else {
+        panic!("a struct pattern");
+    };
+    assert!(rest.is_some());
+    assert_eq!(fields.keys().collect::<Vec<_>>(), ["x"]);
 }
 
 /// One pattern binding one name twice is reported at the repeat, in any
@@ -3379,7 +3297,7 @@ fn pattern_let_corners() {
     assert_eq!(errors, ["duplicate-binding@8"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let %struct = { x: 1 }\nlet x = %struct.x\nlet x = <error>"
+        "let %struct : { x: ? } = { x: 1 }\nlet x = %struct.x\nlet x = <error>"
     );
 
     // A refutable statement pattern with a number: the complaint quotes it.
