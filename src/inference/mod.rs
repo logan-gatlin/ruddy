@@ -392,6 +392,11 @@ pub enum ConstraintKind {
         /// The level the value was walked at. Everything still unbound at or
         /// above it when the value is solved is the value's to quantify.
         level: u32,
+        /// The `where` clause the annotation promised, or [`Formula::True`]
+        /// where none was written. What the scheme published for `symbol`
+        /// requires of its presences: R10 makes the clause the contract, so a
+        /// use of the name sees it rather than whatever the value worked out.
+        promised: Formula,
         /// What the value requires, including that it match the annotation when
         /// one was written. Solved first, at `level`.
         value: Vec<Constraint>,
@@ -620,6 +625,13 @@ struct Annotated {
     /// The variables it minted, which are the ones it left for the value to
     /// decide. See [`Table::narrowed`].
     opened: Range<TyVar>,
+    /// The `where` clause it promised, or [`Formula::True`] where none was
+    /// written. The clause the value under it is held to, exactly as a
+    /// definition's own is. See [`Scoped::promised`].
+    promised: Formula,
+    /// The labels its `when`s named, so a complaint about the clause quotes it
+    /// in the nouns the reader wrote. See [`Scoped::names`].
+    names: Vec<(String, Presence)>,
 }
 
 /// One member of a binding group once it has been walked and solved, waiting
@@ -984,6 +996,13 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // Silent once something has already flipped the store, and once
             // this definition has already failed some other way — both for the
             // reason the check above is.
+            //
+            // The body's stretch starts one batch past where the definition's
+            // does when a clause was written, because the clause went into the
+            // store as the first batch of that stretch — see the lowering
+            // above. Skipping it is what keeps the "the definition requires …"
+            // half of the message about the body alone.
+            let clause = usize::from(!member.scoped.promised.is_true());
             if let Some(annotation) = &decl.annotation
                 && annotation.clause.is_some()
                 && from == to
@@ -991,7 +1010,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 && let Some((allowed, required)) = table.disagreement(
                     &member.scoped.promised,
                     &member.scoped.names,
-                    member.scoped.batches..member.batches,
+                    member.scoped.batches + clause..member.batches,
                 )
             {
                 errors.push(Error {
@@ -1011,6 +1030,25 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     errors.push(Error {
                         span: annotated.span,
                         kind: ErrorKind::AnnotationTooOpen,
+                    });
+                }
+                // And its clause is a promise about a smaller scope on the same
+                // terms. Read against the whole definition's stretch of the
+                // store, which needs no narrower bookkeeping: a batch that says
+                // nothing about the clause's variables projects away to `true`,
+                // and the clause's own batch inside the range only strengthens a
+                // premise the value already keeps.
+                if from == to
+                    && !table.unsat
+                    && let Some((allowed, required)) = table.disagreement(
+                        &annotated.promised,
+                        &annotated.names,
+                        member.scoped.batches..member.batches,
+                    )
+                {
+                    errors.push(Error {
+                        span: annotated.span,
+                        kind: ErrorKind::AnnotationAllows { allowed, required },
                     });
                 }
             }
@@ -1835,6 +1873,18 @@ impl Table {
     /// annotation because that is the line the reader changes — the body is
     /// doing what it says.
     ///
+    /// The body's side is every batch in `batches`, whatever its origin: a body
+    /// acquires a presence requirement as readily by *using* another
+    /// constrained definition — an [`Origin::Instance`] batch — as by matching
+    /// on its own argument, and a clause that does not cover the one covers
+    /// nothing.
+    ///
+    /// Which is why the caller starts the range past the definition's own
+    /// clause batch: that batch is the promise, not the body, and leaving it in
+    /// would let the message say the definition requires what the annotation
+    /// asked for. It changes no verdict — the premise of the entailment already
+    /// carries it — only who the second half of the complaint is about.
+    ///
     /// The body's side is projected onto the clause's own variables first:
     /// a match inside the definition may relate presences the annotation never
     /// mentions, and those are its own business.
@@ -1848,7 +1898,6 @@ impl Table {
         let needed = Formula::all(
             self.store.batches[batches]
                 .iter()
-                .filter(|batch| matches!(batch.origin, Origin::Coverage(_)))
                 .map(|batch| self.resolved(&batch.formula)),
         );
         let mut atoms = Vec::new();
@@ -2253,9 +2302,11 @@ impl Table {
     /// which is what makes the leftmost variable print as `'a`.
     ///
     /// Presence variables are numbered after everything else, in a second
-    /// walk. A presence prints as the `?` on its field rather than as a
-    /// letter, so numbering one in line would leave a visible gap: the scheme
-    /// of `{ x?: Nat } -> 'a` should not call its one letter `'b`.
+    /// walk, because they have an alphabet of their own: a presence prints as
+    /// the bare `a` its `when` clause names it, a type as `'a`, and the two
+    /// pools are independent. Numbering them in line would leave a visible gap
+    /// in each — the scheme of `{ x when a: Nat } -> 'a` should call neither
+    /// of its letters `b`.
     fn quantify(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32) {
         self.quantify_walk(ty, subst, level, false);
         self.quantify_walk(ty, subst, level, true);
@@ -2568,14 +2619,14 @@ fn quantify_formula(formula: &Formula, subst: &Subst) -> Formula {
 /// itself; the mint is here only to spell it, never to decide anything.
 ///
 /// The table is here for the parts of an annotation that stand for something
-/// the definition gets to decide: a `..` tail, a `..r` tail, and a `?` field
+/// the definition gets to decide: a `..` tail, a `..r` tail, and a `when` field
 /// each lower to a fresh variable, minted at the level the annotation is
 /// lowered at so that what stays unconstrained is quantified with the
 /// definition. One call is one annotation, which is the whole scope of a
 /// tail's name: every `..r` in it shares one variable, and no other
 /// annotation's `r` can reach it.
 ///
-/// A `type` declaration's body reaches none of that. A `?` and a bare `..` are
+/// A `type` declaration's body reaches none of that. A `when` and a bare `..` are
 /// refused there outright, and the one tail it may have names a row parameter,
 /// which lowers to a [`Core::Bound`] — a leaf whose value comes from the use
 /// site, not a variable this table has to solve. So a declaration still lowers
@@ -2759,7 +2810,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
 /// Whether an annotation is the compiler's own demand rather than the reader's
 /// promise: whether it holds a hole, which nothing a reader writes can.
 ///
-/// What it exempts is the too-open check. A written `..` or `?` is a promise —
+/// What it exempts is the too-open check. A written `..` or `when` is a promise —
 /// the definition works whatever the open part turns out to be — and a
 /// definition that decides it has broken the promise. A hole is the opposite:
 /// it is *there to be decided*, so holding the annotation to the promise would

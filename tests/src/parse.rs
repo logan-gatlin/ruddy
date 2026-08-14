@@ -250,7 +250,7 @@ fn a_clause_may_not_name_the_discard() {
 }
 
 /// `\name` is accepted wherever a field may be written — first, middle, last,
-/// beside ordinary and `?` fields, before either kind of tail — and prints
+/// beside ordinary and `when` fields, before either kind of tail — and prints
 /// back as written. The parser judges nothing: a closed struct with a `\` in
 /// it parses too, and refusing it is lowering's rule.
 #[test]
@@ -683,7 +683,7 @@ fn sum_types() {
     );
     // One case is a sum like any other.
     assert_eq!(parse_one("type Just = `It Nat"), "type Just = `It Nat");
-    // And a case may be marked `?`, which no tail can say for it.
+    // And a case may be marked with a `when`, which no tail can say for it.
     assert_eq!(
         parse_one("let x : `A (when a) Nat | `B = y"),
         "let x : `A (when a) Nat | `B = y"
@@ -765,8 +765,8 @@ fn a_sum_case_may_be_written_absent() {
     );
 }
 
-/// An absent label is bare: `\y` takes no `:` type and no `?`, `` \`B `` no
-/// payload and no `?`, a `\` needs a name after it, and a `\` begins no
+/// An absent label is bare: `\y` takes no `:` type and no `when`, `` \`B `` no
+/// payload and no `when`, a `\` needs a name after it, and a `\` begins no
 /// expression at all. Each is the ordinary unexpected-token report, at the
 /// token that has no place — and the statement is dropped, as for any other
 /// malformed one.

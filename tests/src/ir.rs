@@ -884,7 +884,7 @@ fn a_head_that_cannot_be_applied_is_still_lowered() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 
-    // A `?` field or a bare `..` inside a head is refused where it stands, for
+    // A `when` field or a bare `..` inside a head is refused where it stands, for
     // the same reason.
     let (_, out) = build_src("type A = { x: Nat, .. } Nat");
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
@@ -1495,7 +1495,7 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
 
 /// A `..` naming a parameter is the one way a declared type may be left open,
 /// because what it stands for is supplied at every use rather than decided
-/// here. A bare `..` and a `?` are still refused, and so is a name that binds
+/// here. A bare `..` and a `when` are still refused, and so is a name that binds
 /// nothing.
 #[test]
 fn a_declaration_is_open_only_through_a_parameter() {
@@ -2494,8 +2494,8 @@ fn an_absent_label_needs_a_tail() {
     );
     assert_eq!(out.errors[0].span.width, 3);
 
-    // Every absence in the row is its own report, the way every `?` in an
-    // open declared type is: each is a mark the reader can act on.
+    // Every absence in the row is its own report, the way every `when` in a
+    // declared type is: each is a mark the reader can act on.
     let (_, out) = build_src("let x : { \\y, \\z } = 1");
     assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
 

@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{Assigned, Core, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
+    types::{Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
 };
 
 use super::{
@@ -225,9 +225,10 @@ impl Solve<'_> {
                     symbol,
                     bound,
                     level,
+                    promised,
                     value,
                     body,
-                } => self.bind_local(*symbol, bound, *level, value, body),
+                } => self.bind_local(*symbol, bound, *level, promised, value, body),
                 ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
             }
         }
@@ -256,6 +257,7 @@ impl Solve<'_> {
         symbol: Symbol,
         bound: &Rc<Ty>,
         level: u32,
+        promised: &Formula,
         value: &[Constraint],
         body: &[Constraint],
     ) {
@@ -264,8 +266,16 @@ impl Solve<'_> {
         // A nested binding's scheme carries what the store requires of the
         // presences it quantifies, exactly as a definition's does — a `let` in
         // the middle of a body is generalized on the same terms as one at the
-        // top of a file.
-        let required = self.table.required(bound);
+        // top of a file. Which includes R10: an annotated binding publishes its
+        // annotation's clause and not what its value worked out, since the
+        // clause is the contract and the value has been held to it. Silent once
+        // something has flipped the store — the cascade rule, and what
+        // [`Table::required`](super::Table) does for the unannotated case.
+        let required = if !promised.is_true() && !self.table.unsat {
+            self.table.resolved(promised)
+        } else {
+            self.table.required(bound)
+        };
         let (scheme, _) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());

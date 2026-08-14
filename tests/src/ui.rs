@@ -1671,6 +1671,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
             symbol,
             bound: nat.clone(),
             level: 1,
+            promised: Formula::True,
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -1692,7 +1693,8 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
 /// two lists rather than a pair of types, so it prints as the header of the
 /// tree its children make; a use of the name it bound cannot spell the name at
 /// all, there being no mint here to spell one with, so it says what it is
-/// instead.
+/// instead. An annotation's clause follows the header, because that is what the
+/// scheme the `let` publishes requires of its presences.
 #[test]
 fn the_scoping_constraints_read_as_what_they_do() {
     let nat = Rc::new(Ty::plain(Core::Nat));
@@ -1705,6 +1707,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
             symbol,
             bound: nat.clone(),
             level: 2,
+            promised: Formula::True,
             value: Vec::new(),
             body: Vec::new(),
         },
@@ -1712,6 +1715,19 @@ fn the_scoping_constraints_read_as_what_they_do() {
     assert_eq!(bound.kind.code(), "let");
     assert_eq!(bound.to_string(), "Nat generalized at level 2");
     assert_eq!(bound.to_string(), bound.kind.to_string());
+
+    let promised = ConstraintKind::Let {
+        symbol,
+        bound: nat.clone(),
+        level: 2,
+        promised: Formula::var(0).xor(Formula::var(1)),
+        value: Vec::new(),
+        body: Vec::new(),
+    };
+    assert_eq!(
+        promised.to_string(),
+        "Nat generalized at level 2 where ?0 != ?1"
+    );
 
     let use_site = ConstraintKind::Instance {
         symbol,

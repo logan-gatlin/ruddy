@@ -1549,8 +1549,22 @@ impl fmt::Display for ConstraintKind {
             // level everything the value still leaves open is quantified at. The
             // two lists are rows of their own — see the debugger's Constraints
             // tab, which is where a constraint that has children is read.
-            ConstraintKind::Let { bound, level, .. } => {
-                write!(f, "{bound} generalized at level {level}")
+            //
+            // The clause an annotation promised follows, when one was written:
+            // it is what the scheme this `let` publishes requires of its
+            // presences, so a reader following the tab is shown the contract
+            // beside the type it is a contract about.
+            ConstraintKind::Let {
+                bound,
+                level,
+                promised,
+                ..
+            } => {
+                write!(f, "{bound} generalized at level {level}")?;
+                if promised.is_true() {
+                    return Ok(());
+                }
+                write!(f, " where {promised}")
             }
             // The name is not spelled: a symbol needs the mint to name it, and
             // nothing here has one. The type is what a reader is following

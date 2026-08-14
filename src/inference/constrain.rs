@@ -187,7 +187,7 @@ impl Constrain<'_> {
                 // is the contract, so the value is checked against it and the
                 // recursive uses the annotation exists for are checked against
                 // it too; without one it is a variable the value decides.
-                let bound = match annotation {
+                let (bound, promised) = match annotation {
                     Some(annotation) => {
                         // The variables it minted are counted off, so that an
                         // annotation the value went on to decide can be
@@ -202,8 +202,11 @@ impl Constrain<'_> {
                         // use of this name sees, and what the value under it is
                         // held to. See R10.
                         if !formula.is_true() {
-                            let origin = Origin::Annotation(Named { labels: names });
-                            self.table.require(annotation.ty.span, origin, formula);
+                            let origin = Origin::Annotation(Named {
+                                labels: names.clone(),
+                            });
+                            self.table
+                                .require(annotation.ty.span, origin, formula.clone());
                         }
                         // A synthetic annotation — a pattern's exact demand —
                         // is meant to be decided, so it makes no promise for
@@ -212,11 +215,13 @@ impl Constrain<'_> {
                             self.annotated.push(Annotated {
                                 span: annotation.ty.span,
                                 opened: from..self.table.vars.len() as TyVar,
+                                promised: formula.clone(),
+                                names,
                             });
                         }
-                        bound
+                        (bound, formula)
                     }
-                    None => self.table.fresh_type(),
+                    None => (self.table.fresh_type(), Formula::True),
                 };
                 // Monomorphically, the same rule a binding group follows: a use
                 // of the name inside its own value is the one type being
@@ -244,6 +249,7 @@ impl Constrain<'_> {
                         symbol: name.tracked,
                         bound,
                         level,
+                        promised,
                         value: required,
                         body: rest,
                     },

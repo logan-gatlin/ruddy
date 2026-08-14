@@ -619,8 +619,8 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
          let a = f { y: 1 }\n\
          let b = f { x: 5, y: 1 }",
     );
-    // The presence variable is quantified too, but it prints as the `?` on
-    // its field rather than as a letter — the tail is still `'a`.
+    // The presence variable is quantified too, but it prints in its own
+    // alphabet as the `when a` on its field — the tail is still `'a`.
     assert_eq!(
         scheme(&mint, &output, "f"),
         "{ x when a: Nat, y: Nat, ..'a } -> Nat"
@@ -642,7 +642,7 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
 }
 
 /// An annotation is the contract, and a contract the definition rewrites is
-/// not one. Every `..` and every `?` in a written type says the definition
+/// not one. Every `..` and every `when` in a written type says the definition
 /// works for more than one thing; where the body settles one of them, the
 /// annotation the reader is shown promises something nobody checked — so the
 /// annotation is refused rather than quietly replaced by what was solved.
@@ -654,8 +654,8 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
 #[test]
 fn an_annotation_may_not_be_narrowed_by_its_definition() {
     // The body projects `x`, and a projection needs the field to be there —
-    // so the `?` cannot stay. Reported at the annotation, which is the line
-    // that has to change.
+    // so the `when a` cannot stay. Reported at the annotation, which is the
+    // line that has to change.
     let src = "let f : { x when a: Nat, .. } -> Nat = fn p => p.x";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
@@ -687,7 +687,7 @@ fn an_annotation_may_not_be_narrowed_by_its_definition() {
     assert_eq!(error.kind.code(), "annotation-too-open");
 
     // A value binding is a definition too, and a concrete value decides every
-    // `?` and every `..` above it — so an open annotation on one is a
+    // `when` and every `..` above it — so an open annotation on one is a
     // contradiction in terms rather than a niche mistake. The wording has to
     // read as well here as it does over a function, since there is no body to
     // blame and nothing else to write.
@@ -2488,7 +2488,7 @@ fn checking_pushes_a_sum_into_a_tag() {
 
 /// A case that may or may not be allowed is the dual of a field that may or
 /// may not be there, and it is not something a tail can say: a tail allows
-/// every other case, and a `?` allows exactly one more.
+/// every other case, and a `when` allows exactly one more.
 #[test]
 fn a_case_may_be_marked_optional() {
     let (mint, _, out) = inferred("let m : `A (when a) Nat | `B = `B");
@@ -2550,9 +2550,9 @@ fn a_sum_tail_may_not_come_back_naming_its_own_case() {
 ///
 /// Getting a row to hold a settled `absent` takes three uses of one parameter:
 /// one to give it the optional field, one to close it — which settles the
-/// field away — and one that then asks for the field back. A `?` field is the
-/// only thing that can be settled either way, so it is the only thing that can
-/// disagree with a constant on the other side.
+/// field away — and one that then asks for the field back. A `when` field is
+/// the only thing that can be settled either way, so it is the only thing that
+/// can disagree with a constant on the other side.
 #[test]
 fn a_settled_presence_is_reported_as_the_field_it_is_about() {
     // The annotation demands the field; the row it is given no longer has it.
@@ -2602,7 +2602,7 @@ fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
          let f = fn r => { a: optional r, b: closed r, c: closed r }",
     );
 
-    // And an open row asking for it back settles its own `?` the same way,
+    // And an open row asking for it back settles its own `when` the same way,
     // without going near the field's type: an absent field's type slot means
     // nothing, and constraining it would refuse rows that agree.
     inferred(
@@ -2677,8 +2677,8 @@ fn an_undecided_field_meeting_a_tail_that_lacks_it_settles_absent() {
 #[test]
 fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
     // `nope` is a name lowering complained about, so its type says nothing and
-    // the application abandons the whole type the annotation wrote — the `?`
-    // and the core its `..` lowered to. The recursive call then puts that type
+    // the application abandons the whole type the annotation wrote — the
+    // `when` and the core its `..` lowered to. The recursive call then puts that type
     // against a struct with a field it does not name, and the abandoned core
     // takes the whole of it. One mistake, and inference adds nothing to it.
     let (mint, out, output) =
@@ -2737,7 +2737,7 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
 #[test]
 fn a_presence_against_itself_is_already_the_same_presence() {
     // A recursive call is monomorphic, so the parameter's row meets itself:
-    // one `?` on both sides, and one tail on both sides.
+    // one `when` on both sides, and one tail on both sides.
     let (mint, _, output) = inferred("let f : { x when a: Nat, .. } -> Nat = fn p => f p");
     assert_eq!(
         scheme(&mint, &output, "f"),
@@ -2761,7 +2761,7 @@ fn a_presence_against_itself_is_already_the_same_presence() {
 /// pair that already agrees.
 #[test]
 fn two_presences_that_already_agree_need_no_rule_of_their_own() {
-    // `closed` settles the `?` away, and then `both` puts the row against
+    // `closed` settles the `when` away, and then `both` puts the row against
     // itself through a tail it shares — so the field settled absent is named on
     // both sides of one goal, absent on both.
     let (mint, _, output) = inferred(
@@ -2829,7 +2829,7 @@ fn a_demand_on_the_actual_side_still_names_the_type_with_no_fields() {
 
 /// An assumption is compared to the goal in front of it argument by argument,
 /// and an argument still holding a variable is compared as that variable: two
-/// `?` fields unified with each other are one question, so the goal that comes
+/// `when` fields unified with each other are one question, so the goal that comes
 /// back round is the goal already on the stack.
 #[test]
 fn an_assumption_matches_through_a_variable_the_two_sides_share() {
@@ -2949,7 +2949,7 @@ fn two_rows_sharing_a_tail_and_naming_the_same_fields_agree() {
 /// two declarations at a different argument is a different question, and the
 /// comparison that decides so has to look at whatever an argument can be: a
 /// row with other labels, a row with more of them, a row of the other shape, an
-/// arrow whose halves differ, and a `?` nothing has decided yet.
+/// arrow whose halves differ, and a presence nothing has decided yet.
 ///
 /// Each of these programs reaches `Tree ? ~ Tree2 ?` twice with the two
 /// arguments apart, so the second question is asked rather than answered by
@@ -2987,7 +2987,7 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
 
     // And a presence still open, which is the one part of an argument that can
     // be a variable while the goal is being asked. The definition is left
-    // unannotated so that unifying the two `?`s is not the annotation being
+    // unannotated so that unifying the two presences is not the annotation being
     // narrowed.
     let (mint, _, output) = inferred(
         "type Tree x = { v: x, k: Bush }\n\
@@ -3260,7 +3260,7 @@ fn variables_are_numbered_in_the_order_they_are_read() {
     let (mint, _, output) = inferred("let getx = fn p => p.x");
     assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
 
-    // Presences keep their second pass, so a `?` never takes a letter another
+    // Presences keep their second pass, so a `when` never takes a letter another
     // variable would have had: `f`'s one letter is its core, and `g`'s are the
     // field's type and then the core it sits on.
     let (mint, _, output) = inferred(
@@ -3818,7 +3818,7 @@ fn an_annotated_nested_let_is_checked_against_its_annotation() {
 }
 
 /// A nested annotation is held to the same promise a definition's is: what it
-/// left open with a `..` or a `?` the value may not decide. Reported once, at
+/// left open with a `..` or a `when` the value may not decide. Reported once, at
 /// the annotation, and held back when the binding already complained.
 #[test]
 fn a_nested_annotation_may_not_be_narrowed_by_its_value() {
@@ -4474,7 +4474,7 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
 /// presence combination of two fields. The column rule gives each field a
 /// fresh presence variable — `{}` mentions neither — and closes the row, so
 /// unification infers two optional fields and generalization prints them as
-/// the `?` they stayed.
+/// the `when`s they stayed.
 #[test]
 fn the_motivating_program_infers_optional_fields() {
     let (mint, _, output) = inferred(
@@ -4792,6 +4792,111 @@ fn an_annotation_is_the_contract_for_its_presences() {
         error.kind.to_string(),
         "the annotation allows `a or b`, but the definition requires `a != b`"
     );
+}
+
+/// A body acquires a presence requirement as readily by *using* another
+/// constrained definition as by matching on its own argument, and the clause
+/// has to cover that too. Reading only the definition's own matches would
+/// accept the annotation, publish its weaker clause, and let through a use the
+/// clause admits but the body cannot serve — which is the whole of what R10 is
+/// for.
+#[test]
+fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let f : { x when a: Nat, y when b: Nat } -> {} where a or b = fn v => p v\n\
+               let bad = f { x: 1, y: 2 }";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "annotation-allows-more");
+    assert_eq!(
+        error.kind.to_string(),
+        "the annotation allows `a or b`, but the definition requires `a != b`"
+    );
+    // At the annotation, which is the line to rewrite — not at the use, which
+    // is doing what the clause said it could.
+    assert_eq!(error.span.start, 65);
+
+    // And a clause that does cover what the use requires is accepted, and is
+    // what the definition publishes.
+    let (mint, _, output) = inferred(
+        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+         let f : { x when a: Nat, y when b: Nat } -> {} where a != b = fn v => p v",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ x when a: Nat, y when b: Nat } -> {} where a != b"
+    );
+}
+
+/// An annotation on a nested `let` is the same promise about a smaller scope:
+/// the value is held to the clause, and the scheme the binding publishes is the
+/// clause rather than what the value worked out.
+#[test]
+fn a_nested_annotation_is_the_contract_for_its_presences() {
+    let src = "let k =\n\
+               \x20 let g : { x when a: Nat, y when b: Nat } -> {} where a or b = fn v =>\n\
+               \x20   match v with | {x} => {} | {y} => {} end in\n\
+               \x20 g { x: 1, y: 2 }";
+    let (_, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "annotation-allows-more");
+    assert_eq!(
+        error.kind.to_string(),
+        "the annotation allows `a or b`, but the definition requires `a != b`"
+    );
+    // The use satisfies `a or b`, so it is not what is wrong here.
+    assert_eq!(error.span.start, 18);
+
+    // A clause the value keeps is accepted, and it — not the `a or b` the open
+    // arms needed — is what the body of the `let` sees. So a use that violates
+    // it is refused where it is written.
+    let src = "let k =\n\
+               \x20 let g : { x when a: Nat, y when b: Nat, ..'c } -> {} where a != b = fn v =>\n\
+               \x20   match v with | {x, ..} => {} | {y, ..} => {} end in\n\
+               \x20 g { x: 1, y: 2 }";
+    let (mint, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    let locals: Vec<(&str, String)> = output
+        .locals
+        .iter()
+        .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
+        .collect();
+    assert_eq!(
+        locals,
+        [(
+            "g",
+            "{ x when a: Nat, y when b: Nat, ..'a } -> {} where a != b".to_string()
+        )]
+    );
+}
+
+/// The cascade rule reaches a nested annotation's clause exactly as it reaches
+/// a definition's own: once something has left the store with no model, the
+/// clause is neither checked nor published, because everything downstream of
+/// one contradiction is the same mistake said again.
+#[test]
+fn a_flipped_store_silences_a_nested_clause() {
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let bad = p {}\n\
+               let k = let g : { x when a: Nat } -> {} where a = fn v => {} in g";
+    let (mint, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "presence-required");
+    let locals: Vec<(&str, String)> = output
+        .locals
+        .iter()
+        .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
+        .collect();
+    assert_eq!(locals, [("g", "{ x when a: Nat } -> {}".to_string())]);
 }
 
 /// A column that tests anything but presence keeps today's behaviour end to
