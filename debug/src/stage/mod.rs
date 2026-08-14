@@ -109,9 +109,14 @@ pub struct Trace {
 /// `'a`. Everything else a type is made of — `Nat`, `->`, a struct's braces and
 /// field names — is written by the language rather than stood in for.
 ///
-/// Declared once because three tabs render the same type language, and a
+/// The `?` a presence puts on its label — the one in `a?: Nat` — is the
+/// language too, not a stand-in, and the `\B` is what keeps the highlighter
+/// off it: that `?` always follows its label's last character, while a `?`
+/// that begins a variable follows punctuation or space.
+///
+/// Declared once because four tabs render the same type language, and a
 /// pattern that drifted on one of them would go quietly dead there.
-const VARIABLES: &str = r"\?\d*|'[a-z]\d*";
+const VARIABLES: &str = r"\B\?\d*|'[a-z]\d*";
 
 /// Every stage, in tab order. Adding a panel is one line here. A stage that
 /// annotates another owns no tab, so its place in the list does not matter to

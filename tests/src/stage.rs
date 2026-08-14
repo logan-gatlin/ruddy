@@ -1,5 +1,6 @@
 //! Tests for [`ruddy_debug::stage`].
 
+use regex::Regex;
 use ruddy::types::Core;
 use ruddy_debug::{
     stage::{Build, REGISTRY, Spec, panicked, skipped},
@@ -19,7 +20,7 @@ use ruddy_debug::{
 fn the_type_tabs_declare_how_a_variable_is_spelled() {
     // Every tab that renders the type language agrees on the notation, since
     // it is one language and one printer.
-    let declared: Vec<Option<&str>> = ["constraints", "solve", "types"]
+    let declared: Vec<Option<&str>> = ["constraints", "solve", "types", "patterns"]
         .iter()
         .map(|id| {
             REGISTRY
@@ -34,7 +35,7 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
         declared.iter().all(|one| *one == Some(pattern)),
         "{declared:?}"
     );
-    assert_eq!(pattern, r"\?\d*|'[a-z]\d*");
+    assert_eq!(pattern, r"\B\?\d*|'[a-z]\d*");
 
     // `\?\d*`: a `?`, then digits — of which a bare `?` is the empty case.
     for (ty, tail) in [(Core::Var(4), "4"), (Core::Undecided, "")] {
@@ -55,6 +56,40 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
         );
         assert!(chars.all(|c| c.is_ascii_digit()), "{printed}");
     }
+}
+
+/// The spelling test above pins what the pattern says; this one pins what it
+/// matches. The `?` a presence writes on its label — the one in `a?: Nat` — is
+/// spelled like a variable's sigil, so the pattern has to decline it by
+/// position: a match may not begin right against a label's last character.
+/// The check runs on this side's engine while the page matches in the
+/// browser's, which is tolerable because the pattern stays inside the syntax
+/// the two share.
+#[test]
+fn a_presence_mark_is_not_lit_as_a_variable() {
+    let pattern = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "types")
+        .expect("the types tab is registered")
+        .highlight
+        .expect("the types tab declares a pattern");
+    let pattern = Regex::new(pattern).expect("the pattern compiles");
+
+    // The optional fields' `?`s sit against their labels and stay dark; the
+    // quantified type beside them still lights.
+    let matches: Vec<&str> = pattern
+        .find_iter("{ a?: Nat, b?: 'b }")
+        .map(|found| found.as_str())
+        .collect();
+    assert_eq!(matches, vec!["'b"]);
+
+    // Each variable spelling begins after space or punctuation, and still
+    // matches whole: a solver's `?4`, an undecided `?`, a quantified `'a2`.
+    let matches: Vec<&str> = pattern
+        .find_iter("{ x: ?4 } -> ? -> 'a2")
+        .map(|found| found.as_str())
+        .collect();
+    assert_eq!(matches, vec!["?4", "?", "'a2"]);
 }
 
 /// The notation is shared, but how far one spelling reaches is not. A `?4` is
