@@ -68,6 +68,15 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
 
+/// The note a repeated `where let` name points back with, printed against the
+/// span of the declaration that stands.
+///
+/// [`FIRST_DEFINITION`]'s counterpart for a `where` clause, and separate from it
+/// because nothing in a clause is defined: a declaration says a name will stand
+/// for something, and what it stands for is the type beside it. See
+/// [`ir::ErrorKind::DuplicateVariable`].
+pub const FIRST_DECLARATION: &str = "first declared here";
+
 /// The note a complaint about a `where let` variable points back with, printed
 /// against the span of the name in the `where let` that declared it.
 ///

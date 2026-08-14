@@ -132,6 +132,13 @@ pub struct Node {
     /// the symbol's other rows; the editor does not paint them, because there
     /// is nothing at that span the user wrote the name at.
     pub owner: Option<u32>,
+    /// A group id for rows that name the same thing but have no `Symbol` to be
+    /// grouped by — a `where let` variable and its uses, which are scoped to
+    /// one annotation and reach no name table. The page paints every row of the
+    /// focused row's group the way it paints a symbol's, and paints no editor
+    /// range for them, since the group is the stage's own reading rather than
+    /// something the name table can be asked about.
+    pub link: Option<u32>,
     /// Rendered red: an error node, or a check this stage runs that failed.
     pub error: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -255,6 +262,11 @@ impl Node {
 
     pub fn owner(mut self, index: u32) -> Self {
         self.owner = Some(index);
+        self
+    }
+
+    pub fn link(mut self, group: u32) -> Self {
+        self.link = Some(group);
         self
     }
 

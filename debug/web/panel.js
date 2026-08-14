@@ -196,12 +196,16 @@ function createPane(root, app, index) {
 
   function mark(row) {
     const start = row.dataset.start;
+    // A step row carries no `data-link`, so an absent one reads the same as an
+    // empty one: this row is in no group.
+    const link = row.dataset.link ?? "";
     return {
       origin: `pane${index}`,
       stage: stage?.id,
       node: Number(row.dataset.node),
       span: start === "" ? null : [Number(start), Number(row.dataset.end)],
       symbol: row.dataset.symbol === "" ? null : Number(row.dataset.symbol),
+      link: link === "" ? null : Number(link),
     };
   }
 
@@ -507,6 +511,10 @@ function createPane(root, app, index) {
     const { selection, hover } = app.state;
     const focus = selection ?? hover;
     const symbol = focus?.symbol ?? null;
+    // A row that names something no symbol table holds — a `where let` variable
+    // and its uses — carries a group id instead, and lights its group the same
+    // way a symbol lights its own rows.
+    const link = focus?.link ?? null;
 
     // A caret in the editor selects the deepest row covering it; a click in
     // another panel selects the row that came from the same source text.
@@ -536,6 +544,7 @@ function createPane(root, app, index) {
       // `owner` costs a node is the editor painting its span, not its place in
       // the group.
       if (symbol != null && symbolOf(row.node) === symbol) symbolised.add(row.el);
+      if (link != null && row.node.link === link) symbolised.add(row.el);
     }
 
     for (const el of marked) if (!wanted.has(el)) el.classList.remove("sel");
@@ -722,6 +731,7 @@ function rowHtml(row, columns, app, badges, pattern) {
     `<div class="${classes.join(" ")}" data-key="${row.key}" data-node="${node.id}" ` +
     `data-kids="${kids ? 1 : 0}" data-start="${node.span ? node.span[0] : ""}" ` +
     `data-end="${node.span ? node.span[1] : ""}" data-symbol="${symbolOf(node) ?? ""}" ` +
+    `data-link="${node.link ?? ""}" ` +
     `style="padding-left:${8 + depth * INDENT}px">` +
     `<span class="twisty${kids ? "" : " leaf"}">${twisty}</span>` +
     `<span class="label">${esc(node.label)}</span>` +

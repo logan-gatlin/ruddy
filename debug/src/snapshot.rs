@@ -305,9 +305,11 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
     // already worked out.
     let elsewhere = match &error.kind {
         ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous }
-        | ir::ErrorKind::DuplicateVariable { previous, .. } => {
-            Some((*previous, ui::FIRST_DEFINITION))
+        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
+        // A `where let` declares rather than defines, so its repeat points back
+        // with the note about a declaration. See [`ui::FIRST_DECLARATION`].
+        ir::ErrorKind::DuplicateVariable { previous, .. } => {
+            Some((*previous, ui::FIRST_DECLARATION))
         }
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,

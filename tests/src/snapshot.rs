@@ -452,6 +452,27 @@ fn a_duplicate_carries_the_definition_it_repeats() {
         .expect("the repeat is reported");
     assert_eq!(duplicate.related.len(), 1);
     assert_eq!(duplicate.related[0].span, Some([4, 5]));
+    assert_eq!(duplicate.related[0].message, "first defined here");
+}
+
+/// A name declared twice in one `where` clause points back the same way, and
+/// says declared rather than defined: a clause says what a name will stand for,
+/// and the type beside it is what defines anything.
+#[test]
+fn a_duplicate_variable_points_back_at_the_declaration_that_stands() {
+    let source = "let worse : a -> a where let a; let a = fn x => x\n";
+    let snapshot = snapshot(source);
+    let duplicate = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "duplicate-variable")
+        .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
+    let first = source.find("let a").expect("the first declaration") + 4;
+    let second = source.rfind("let a").expect("the repeat") + 4;
+    assert_eq!(duplicate.span, Some([second, second + 1]));
+    assert_eq!(duplicate.related.len(), 1);
+    assert_eq!(duplicate.related[0].span, Some([first, first + 1]));
+    assert_eq!(duplicate.related[0].message, "first declared here");
 }
 
 /// A name given two rests of different shapes is the same kind of complaint:

@@ -9,7 +9,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Core, Presence, Rest, Shape, Ty, TyVar},
+    types::{Core, Presence, Rest, Sense, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -4104,6 +4104,97 @@ fn a_local_leaves_every_sort_of_outer_variable_alone() {
             .collect();
         assert_eq!(locals, [("q", printed.to_string())], "{src}");
     }
+}
+
+/// And whatever it leaves free, a published scheme still keeps its presences in
+/// the low positions and everything else above them, which is the one thing a
+/// `Scheme` promises about its numbering. A local that quantifies a type of its
+/// own and leaves a presence free is the case that has to make room: the free
+/// presence goes beside the scheme's own, and the scheme's own type moves up.
+#[test]
+fn a_published_scheme_keeps_its_presences_below_its_types() {
+    let (mint, _, output) = inferred(
+        "let outer = fn r =>\n\
+         \x20 let inner = fn s => r in\n\
+         \x20 match r with\n\
+         \x20   | {x} => inner\n\
+         \x20   | {} => inner\n\
+         \x20 end",
+    );
+    let symbol = symbol_named(&mint, output.locals.keys().copied(), "inner");
+    let scheme = &output.locals[&symbol];
+    // `b` is the argument `inner` quantifies of its own; `a` is the presence
+    // the enclosing lambda's record left free, and `c` what that field holds.
+    assert_eq!(scheme.to_string(), "b -> { x when a: c } where let a, b, c");
+    assert_eq!(scheme.presences(), 1);
+    assert_eq!(scheme.count(), 3);
+    for (at, sense) in positions(scheme.body()) {
+        match at < scheme.presences() {
+            true => assert_eq!(sense, Sense::Presence, "position {at} of {scheme}"),
+            false => assert_ne!(sense, Sense::Presence, "position {at} of {scheme}"),
+        }
+    }
+
+    // Every place a position can be written is moved the same way, whether or
+    // not this local had any moving to do: a sum's tail and a declared type's
+    // argument are positions like the core of an arrow.
+    for (src, printed) in [
+        (
+            "let k = let g : (`A Nat | ..r) -> Nat where let r = fn v => 1 in g",
+            "`A Nat | ..a -> Nat where let a",
+        ),
+        (
+            "type Box A = { it: A }\n\
+             let k = let f : Box b -> b where let b = fn x => x.it in f",
+            "Box a -> a where let a",
+        ),
+    ] {
+        let (mint, _, output) = inferred(src);
+        let locals: Vec<(&str, String)> = output
+            .locals
+            .iter()
+            .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
+            .collect();
+        assert_eq!(locals.len(), 1, "{src}");
+        assert_eq!(locals[0].1, printed, "{src}");
+    }
+}
+
+/// Which sort each position a scheme's body uses is used at, for the check
+/// above: a presence slot, or a type or row slot.
+fn positions(ty: &Ty) -> Vec<(u32, Sense)> {
+    let mut found = Vec::new();
+    for field in ty.fields.values() {
+        if let Presence::Bound(at) = field.presence {
+            found.push((at, Sense::Presence));
+        }
+        found.extend(positions(&field.ty));
+    }
+    match &ty.core {
+        Core::Bound(at) => found.push((*at, Sense::Type)),
+        Core::Arrow(from, to) => {
+            found.extend(positions(from));
+            found.extend(positions(to));
+        }
+        Core::Sum(cases) => {
+            for field in cases.labels.values() {
+                if let Presence::Bound(at) = field.presence {
+                    found.push((at, Sense::Presence));
+                }
+                found.extend(positions(&field.ty));
+            }
+            if let Rest::Bound(at) = cases.rest {
+                found.push((at, Sense::Cases));
+            }
+        }
+        Core::Named { args, .. } => {
+            for arg in args.iter() {
+                found.extend(positions(arg));
+            }
+        }
+        Core::Unit | Core::Nat | Core::Var(_) | Core::Rigid { .. } | Core::Undecided => {}
+    }
+    found
 }
 
 /// The row entry an explicitly absent label lowers to: `Presence::Absent`,

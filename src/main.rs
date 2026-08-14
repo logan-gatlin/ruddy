@@ -94,13 +94,16 @@ fn main() -> ExitCode {
 /// a repeat repeats was first written, or where the `..` a tail clashes with
 /// was first used. Every kind that carries such a span is listed, and a
 /// reporter that renders one and not the others tells the reader half of what
-/// the compiler knows — see [`ui::FIRST_DEFINITION`] and [`ui::FIRST_USE`].
+/// the compiler knows — see [`ui::FIRST_DEFINITION`], [`ui::FIRST_DECLARATION`]
+/// and [`ui::FIRST_USE`].
 fn elsewhere(kind: &ir::ErrorKind) -> Option<(Span, &'static str)> {
     match kind {
         ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous }
-        | ir::ErrorKind::DuplicateVariable { previous, .. } => {
-            Some((*previous, ui::FIRST_DEFINITION))
+        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
+        // A `where let` says what a name will stand for rather than defining
+        // anything, so the note it points back with says so.
+        ir::ErrorKind::DuplicateVariable { previous, .. } => {
+            Some((*previous, ui::FIRST_DECLARATION))
         }
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,

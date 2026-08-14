@@ -2460,8 +2460,9 @@ impl Table {
     }
 
     /// A local binding's scheme as it is published: everything it left free
-    /// numbered on past its own quantifiers, so that a reader is shown letters
-    /// rather than the solver's `?3`.
+    /// numbered on past its own quantifiers of the same sort, so that a reader
+    /// is shown letters rather than the solver's `?3` and the scheme still says
+    /// truthfully which of its positions are presences.
     ///
     /// Only for [`Output::locals`], and only once the solve that could still
     /// bind those variables is over. The scheme the solver instantiates is the
@@ -2471,9 +2472,14 @@ impl Table {
     fn published(&self, scheme: &Scheme) -> Scheme {
         let mut subst = Subst::default();
         self.quantify(scheme.body(), &mut subst, 0);
-        // Its own quantifiers already occupy the first positions of the space,
-        // so what was free numbers on from the end of them — every sort at
-        // once, since there is one numbering.
+        // Each sort numbers on from the end of the scheme's own quantifiers of
+        // that sort, rather than past all of them at once: the low positions
+        // are the presences and the rest are types and rows, and a scheme that
+        // said otherwise about itself would be lying to everything that reads
+        // [`Scheme::presences`]. So a free presence lands directly above the
+        // scheme's own presences, and the scheme's own types and rows move up
+        // to make room — which is what `shift` below is for.
+        let free = subst.presences.len() as u32;
         let base = scheme.count();
         let shifted = Subst {
             types: subst
@@ -2484,18 +2490,17 @@ impl Table {
             presences: subst
                 .presences
                 .into_iter()
-                .map(|(var, at)| (var, base + at))
+                .map(|(var, at)| (var, scheme.presences() + at))
                 .collect(),
             // A scheme's body holds no rigid: generalization numbered every
             // one into a [`Core::Bound`] before it published anything, so
             // there is nothing here left to shift.
             rigids: HashMap::new(),
         };
-        let presences = scheme.presences() + shifted.presences.len() as u32;
         Scheme::constrained(
             base + shifted.next(),
-            presences,
-            self.zonk(scheme.body(), &shifted),
+            scheme.presences() + free,
+            self.zonk(&shift(scheme.body(), free), &shifted),
             quantify_formula(scheme.formula(), &shifted),
         )
     }
@@ -2872,6 +2877,66 @@ fn quantify_formula(formula: &Formula, subst: &Subst) -> Formula {
         Some(at) => Formula::bound(*at),
         None => Formula::var(var),
     })
+}
+
+/// One scheme body with every type and row position it quantifies moved up by
+/// `by`, to make room below them for that many more presences.
+///
+/// Only [`Table::published`] needs this, and only because a scheme's presences
+/// are promised the low positions of its index space: numbering what a local
+/// left free means fitting free presences in beside the scheme's own, and
+/// everything above the presences has to move for them. A presence position is
+/// below the ones that move and is left exactly where it is, which is why
+/// neither [`Presence::Bound`] nor the formula's [`Atom::Bound`] appears here.
+///
+/// Unconditional over [`Core::Bound`] and [`Rest::Bound`]: every one of those is
+/// a type or a row position by construction, since a presence is only ever
+/// written as a [`Presence::Bound`].
+fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
+    let fields = shift_labels(&ty.fields, by);
+    let core = match &ty.core {
+        Core::Bound(at) => Core::Bound(at + by),
+        Core::Arrow(from, to) => Core::Arrow(shift(from, by), shift(to, by)),
+        Core::Sum(cases) => Core::Sum(shift_row(cases, by)),
+        Core::Named { symbol, name, args } => Core::Named {
+            symbol: *symbol,
+            name: name.clone(),
+            args: args.iter().map(|arg| shift(arg, by)).collect(),
+        },
+        // A variable is one an enclosing binder still owns, and a rigid is
+        // numbered by the zonk that follows this: neither is a position in the
+        // space being made room in.
+        Core::Unit | Core::Nat | Core::Var(_) | Core::Rigid { .. } | Core::Undecided => {
+            ty.core.clone()
+        }
+    };
+    Rc::new(Ty { core, fields })
+}
+
+/// [`shift`] over a sum's cases: the labels, and the tail when that is a
+/// position rather than a variable, a rigid or a decided end.
+fn shift_row(row: &Row, by: u32) -> Row {
+    let labels = shift_labels(&row.labels, by);
+    let rest = match &row.rest {
+        Rest::Bound(at) => Rest::Bound(at + by),
+        rest => rest.clone(),
+    };
+    Row { labels, rest }
+}
+
+/// [`shift`] over a label map. A label's presence is below the split and stays
+/// where it is; what the label holds is a type like any other.
+fn shift_labels(labels: &IndexMap<String, RowField>, by: u32) -> IndexMap<String, RowField> {
+    labels
+        .iter()
+        .map(|(name, field)| {
+            let field = RowField {
+                presence: field.presence.clone(),
+                ty: shift(&field.ty, by),
+            };
+            (name.clone(), field)
+        })
+        .collect()
 }
 
 /// The semantic type a written type denotes. A declared type stays the name it

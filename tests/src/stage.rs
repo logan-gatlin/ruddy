@@ -550,6 +550,39 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
     );
 }
 
+/// A use of a declared variable in the type is grouped with the `where let`
+/// statement that declared it, the way a declaration parameter is grouped with
+/// its header — by a link the page paints, since a variable scoped to one
+/// annotation reaches no symbol table. Two variables are two groups.
+#[test]
+fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
+    let tree = tab(
+        "ir",
+        "let f : { x: c, ..b } -> Nat where let b, c = fn p => 0",
+    );
+    let rows = flatten(&tree);
+    let link = |label: &str, text: &str| {
+        rows.iter()
+            .find(|node| node.label == label && node.text.starts_with(text))
+            .unwrap_or_else(|| panic!("`{label}` `{text}` is a row: {rows:#?}"))
+            .link
+    };
+    let b = link("Variable b", "b");
+    let c = link("Variable c", "c");
+    assert_eq!(link("Rest", "..b"), b);
+    assert_eq!(link("Var", "c"), c);
+    // Both are a group at all, and they are not the same group: two names that
+    // stand for two things may not light each other.
+    assert!(b.is_some() && c.is_some(), "{rows:#?}");
+    assert_ne!(b, c);
+
+    // A declaration declares no such variables, so nothing in one is grouped
+    // this way: its parameters are symbols and light up as those.
+    let tree = tab("ir", "type Pair a = { fst: a, snd: a }");
+    let rows = flatten(&tree);
+    assert!(rows.iter().all(|node| node.link.is_none()), "{rows:#?}");
+}
+
 /// The Types tab shows the published schemes in the spelling the CLI reports,
 /// `where let` clause and all — so the tab and the compiler's own answer cannot
 /// drift — and the Solve tab shows a rigid in a goal as the name it was

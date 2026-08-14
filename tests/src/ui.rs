@@ -632,12 +632,18 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
 /// The notes are held in [`ui`] rather than in either reporter, because both
 /// print them: the CLI as a second indented line, the strip as a second
 /// highlight on the same diagnostic. One for the complaints about a name
-/// defined twice, one for the name used two ways, and one for the `where let`
-/// a body broke its promise about — the second place is a definition in the
-/// first, a use in the second and a declaration in the third.
+/// defined twice, one for the name declared twice in one `where` clause, one
+/// for the name used two ways, and one for the `where let` a body broke its
+/// promise about — the second place is a definition in the first, a declaration
+/// in the second and the fourth, and a use in the third.
 #[test]
 fn the_notes_pointing_elsewhere_are_worded_once() {
-    let notes = [ui::FIRST_DEFINITION, ui::FIRST_USE, ui::DECLARED_HERE];
+    let notes = [
+        ui::FIRST_DEFINITION,
+        ui::FIRST_DECLARATION,
+        ui::FIRST_USE,
+        ui::DECLARED_HERE,
+    ];
     for note in notes {
         assert!(!note.is_empty());
         assert!(!note.ends_with('.'));
@@ -648,6 +654,13 @@ fn the_notes_pointing_elsewhere_are_worded_once() {
     }
     let distinct: HashSet<&str> = notes.into_iter().collect();
     assert_eq!(distinct.len(), notes.len());
+
+    // And each says which of the three it is. Nothing in a `where` clause is
+    // defined, so a repeat there may not borrow the definition's wording.
+    assert_eq!(ui::FIRST_DEFINITION, "first defined here");
+    assert_eq!(ui::FIRST_DECLARATION, "first declared here");
+    assert_eq!(ui::FIRST_USE, "first used here");
+    assert_eq!(ui::DECLARED_HERE, "declared here");
 }
 
 /// Which kind of row a complaint is about decides the noun and the spelling,

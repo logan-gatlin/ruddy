@@ -34,7 +34,17 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
 
     // Types first, then terms — the order `Program`'s own printer uses.
     for (symbol, decl) in &program.types {
-        let node = decl_node(&mut ids, cx, mint, "type", *symbol, decl, type_node);
+        // A declaration body declares no variables, so nothing in it links to
+        // one: its own parameters are symbols, and cross-highlight as those.
+        let node = decl_node(
+            &mut ids,
+            cx,
+            mint,
+            "type",
+            *symbol,
+            decl,
+            |ids, cx, mint, ty| type_node(ids, cx, mint, ty, &[]),
+        );
         trace.decls.push(node.id);
         nodes.push(node);
     }
@@ -357,18 +367,22 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
 /// A variable's row says the sort lowering read it as, which is the whole of
 /// what the panel adds over the AST's: the name is written bare and what it
 /// stands for follows from where the type uses it, exactly as a declaration
-/// parameter's does. The rows carry the declaring name's span, so clicking a
-/// `..r` in the type lights the `let r` that declared it — the same
-/// cross-highlighting a declaration's header already gets.
+/// parameter's does. The rows carry the declaring name's span, and the
+/// variable's own id as their [`Node::link`], which every use of that name in
+/// the type carries too — so clicking a `..r` in the type lights the `let r`
+/// that declared it, the same cross-highlighting a declaration's header gets
+/// from its symbols.
 fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation) -> Node {
-    let mut node = type_node(ids, cx, mint, &annotation.ty);
+    let scope = annotation.variables.as_slice();
+    let mut node = type_node(ids, cx, mint, &annotation.ty, scope);
     for variable in &annotation.variables {
         let row = Node::new(
             ids.next(),
             format!("Variable {}", variable.name),
             stands_for_variable(variable),
         )
-        .at(variable.span);
+        .at(variable.span)
+        .link(variable.id);
         node = node.child(row);
     }
     match &annotation.clause {
@@ -433,7 +447,30 @@ fn when_text(when: &Option<Box<When>>) -> String {
     }
 }
 
-fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
+/// The declaration this name was written against, when the name is one of the
+/// variables in scope. A use and its declaration share the variable's id, which
+/// is unique across the program, so two annotations that each write `a` group
+/// separately.
+fn link_of(scope: &[Variable], name: &str) -> Option<u32> {
+    scope
+        .iter()
+        .find(|variable| variable.name == name)
+        .map(|variable| variable.id)
+}
+
+/// `node` grouped with the row that declared the name it uses, when there is
+/// one — [`with_symbol`]'s counterpart for a name no symbol table holds.
+fn linked(node: Node, link: Option<u32>) -> Node {
+    match link {
+        Some(id) => node.link(id),
+        None => node,
+    }
+}
+
+/// One written type. `scope` is the variables the annotation around it declared
+/// — empty inside a declaration body, which declares none — and is what a use in
+/// the type is grouped against.
+fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable]) -> Node {
     let node = Node::new(ids.next(), "", print::ir::ty(&ty.tracked, mint).to_string()).at(ty.span);
     match &ty.tracked {
         TypeKind::Error => Node {
@@ -449,13 +486,16 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             ..node
         },
         // A use of a `where let` variable. The name is scoped to its own
-        // annotation and resolves to no symbol, so the row carries the span it
-        // was written at and the sort lowering read it as — which is what the
-        // `Where` rows beside it cross-highlight against by name.
-        TypeKind::Var(_) => Node {
-            label: "Var".into(),
-            ..node
-        },
+        // annotation and resolves to no symbol, so instead of a symbol the row
+        // carries the declared variable's id as its link, which is what groups
+        // it with the `Variable` row that declared it.
+        TypeKind::Var(name) => linked(
+            Node {
+                label: "Var".into(),
+                ..node
+            },
+            link_of(scope, name),
+        ),
         TypeKind::Ident(symbol) => with_symbol(
             Node {
                 label: "Ident".into(),
@@ -494,7 +534,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             .child(head)
             .children(
                 args.iter()
-                    .map(|arg| type_node(ids, cx, mint, arg))
+                    .map(|arg| type_node(ids, cx, mint, arg, scope))
                     .collect::<Vec<_>>(),
             )
         }
@@ -522,7 +562,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                         let node =
                             Node::new(ids.next(), format!("`{name}{mark}"), text).at(*name_span);
                         match payload {
-                            Some(payload) => node.child(type_node(ids, cx, mint, payload)),
+                            Some(payload) => node.child(type_node(ids, cx, mint, payload, scope)),
                             None => node,
                         }
                     }
@@ -534,7 +574,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                 })
                 .collect();
             if let Some(tail) = tail {
-                kids.push(rest_node(ids, mint, tail));
+                kids.push(rest_node(ids, mint, tail, scope));
             }
             Node {
                 label: "Sum".into(),
@@ -546,8 +586,8 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             label: "Arrow".into(),
             ..node
         }
-        .child(type_node(ids, cx, mint, from))
-        .child(type_node(ids, cx, mint, to)),
+        .child(type_node(ids, cx, mint, from, scope))
+        .child(type_node(ids, cx, mint, to, scope)),
         TypeKind::Struct { fields, tail } => {
             let mut kids: Vec<Node> = fields
                 .iter()
@@ -564,7 +604,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
                             print::ir::ty(&value.tracked, mint).to_string(),
                         )
                         .at(*name_span)
-                        .child(type_node(ids, cx, mint, value))
+                        .child(type_node(ids, cx, mint, value, scope))
                     }
                     // An absent field is a leaf: there is no type under it,
                     // and the span covers the whole `\name`.
@@ -576,7 +616,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             // The tail is a row of its own: it stands for the labels not
             // named, so it is shown beside them rather than folded into one.
             if let Some(tail) = tail {
-                kids.push(rest_node(ids, mint, tail));
+                kids.push(rest_node(ids, mint, tail, scope));
             }
             Node {
                 label: "Struct".into(),
@@ -590,11 +630,18 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
 /// The `..` tail of either shape of row, as the row of its own it is shown as.
 /// A row parameter prints as the name it was declared with, for the reason a
 /// type parameter does.
-fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail) -> Node {
-    let name = match &tail.of {
-        Row::Anything => String::new(),
-        Row::Named(name) => name.clone(),
-        Row::Param { symbol, .. } => mint.name(*symbol).to_string(),
+///
+/// A named tail is a use of a declared variable, so it is grouped with the
+/// declaration the same way a bare name in a type position is; a bare `..`
+/// names nothing and a parameter is a symbol, and neither needs the group.
+fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail, scope: &[Variable]) -> Node {
+    let (name, link) = match &tail.of {
+        Row::Anything => (String::new(), None),
+        Row::Named(name) => (name.clone(), link_of(scope, name)),
+        Row::Param { symbol, .. } => (mint.name(*symbol).to_string(), None),
     };
-    Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span)
+    linked(
+        Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span),
+        link,
+    )
 }
