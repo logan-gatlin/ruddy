@@ -94,13 +94,33 @@ fn the_motivating_program_is_exhaustive() {
     assert_eq!(verdicts(report), [Verdict::Reachable; 4]);
 }
 
-/// Presences are independent: with `{a, b}` and `{}` over an otherwise
-/// unconstrained scrutinee, the subsets holding exactly one of the fields go
-/// unhandled, and the witness names one pun-style — the presence is the
-/// information.
+/// A qualifying column no longer leaves a hole: `{a, b}` and `{}` between them
+/// say the two presences agree, that goes into the store as the column's
+/// coverage, and every value the store allows is one of the two arms.
+///
+/// This is R6 and R11 together, and it is the whole of what the feature buys —
+/// before the store existed, presences were independent and the subsets holding
+/// exactly one field went unhandled.
 #[test]
-fn independent_presences_leave_a_hole() {
+fn a_qualifying_column_is_exhaustive_by_its_constraint() {
     let src = "let p = fn a => match a with | {a, b} => 1 | {} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = sole_report(&checks);
+    assert!(matches!(&report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+}
+
+/// The coverage the arms promise can be contradicted by what the scrutinee
+/// turns out to be, and then it is the match that is wrong: a literal pinning
+/// both fields present leaves the store with no model, the coverage batch is
+/// the one that flipped it, and the witness is read off a model of what the
+/// store allowed before it.
+#[test]
+fn a_scrutinee_that_contradicts_the_coverage_is_unhandled() {
+    let src = "let bad = match {x: 1, y: 2} with {x} => {} | {y} => {} end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
@@ -112,7 +132,7 @@ fn independent_presences_leave_a_hole() {
         )],
         "{checks:#?}"
     );
-    assert_eq!(witness_of(&checks), "{ a }");
+    assert_eq!(witness_of(&checks), "{ x, y }");
     let report = sole_report(&checks);
     assert!(matches!(
         &report.coverage,
@@ -685,4 +705,259 @@ fn a_closed_nested_rest_offers_no_escape() {
         verdicts(report),
         [Verdict::Reachable, Verdict::Reachable, Verdict::Unreachable]
     );
+}
+
+/// Reachability for a converted column is a SAT query: an arm the store
+/// forbids is dead, and one it allows is not.
+///
+/// The `let` above the match forces `x` present, `a != b` then forces `y`
+/// absent, and no value of the resulting type is a `{y}` — which is a verdict
+/// no walk over the written matrix alone could reach.
+#[test]
+fn the_store_decides_reachability_for_a_converted_column() {
+    let src = "let h = fn v =>\n\
+               \x20 let {x, ..} = v in\n\
+               \x20 match v with | {x} => {} | {y} => {} end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let report = sole_report(&checks);
+    assert_eq!(
+        verdicts(report),
+        [Verdict::Reachable, Verdict::Unreachable],
+        "{checks:#?}"
+    );
+    assert_eq!(errors(&checks).len(), 1, "{checks:#?}");
+    assert_eq!(
+        checks.errors[0].kind.code(),
+        ErrorKind::UnreachableArm.code()
+    );
+}
+
+/// The cascade rule, in the phase that has to obey it: once a batch has left
+/// the store without a model, a later match's coverage cannot be reasoned
+/// from — every arm of it would read dead — so the checks stand aside.
+#[test]
+fn a_match_after_the_flip_stands_aside() {
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let bad = p {}\n\
+               let q = fn v => match v with | {u, w} => 1 | {} => 2 end";
+    let (_, inferred, checks) = checked(src);
+    assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+    // The flip is the use site's, so nothing the patterns phase says is about
+    // it — and the match written after it reports nothing at all.
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let last = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(last.coverage, Coverage::Skipped));
+    assert_eq!(verdicts(last), [Verdict::Skipped; 2]);
+}
+
+/// The catch-all placement rule stays syntactic: an arm irrefutable on its face
+/// owns the complaint whatever the store makes of the column it sits in.
+#[test]
+fn the_catch_all_rule_ignores_the_store() {
+    let src = "let f = fn v => match v with | x => 1 | {a} => 2 end";
+    let (_, _, checks) = checked(src);
+    assert_eq!(
+        checks
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["misplaced-catch-all"]
+    );
+}
+
+/// The witness reads each of the scrutinee's labels off the model: a presence
+/// the solve settled says so outright, and one still a variable is whatever the
+/// model made of it.
+#[test]
+fn a_witness_reads_every_kind_of_presence() {
+    // Two matches over one value, saying opposite things: the second batch is
+    // the one that flips, and the model of what the first allowed and the
+    // second's arms do not names one field.
+    let src = "let f = fn v => { a: match v with | {x} => 1 | {y} => 2 end,\n\
+               \x20                b: match v with | {x, y} => 1 | {} => 2 end }";
+    let (_, _, checks) = checked(src);
+    assert_eq!(witness_of(&checks), "{ y }");
+
+    // A scrutinee with neither field settles both absent, and the witness is
+    // the value that has neither.
+    let (_, _, checks) = checked("let bad = match {} with | {x} => 1 | {y} => 2 end");
+    assert_eq!(witness_of(&checks), "{}");
+}
+
+/// A tested field the solved type does not name is provably absent — the type
+/// closed over its own fields elsewhere — and still gets a column of its own,
+/// with the one-value universe absence is. The arm demanding it is then the
+/// unreachable arm the checks report.
+#[test]
+fn a_field_the_type_never_named_is_still_a_column() {
+    let src = "let f : {} -> Nat = fn v => match v with | {a, ..} => 1 | {} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Unreachable, Verdict::Reachable]);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.find("{a, ..}").expect("the arm")
+        )]
+    );
+}
+
+/// R11 over a column inference did *not* convert: the walk still reads the
+/// store. The `let` above the match makes `x != y` of the scrutinee, so the
+/// value with both fields is no value at all, and the three arms below cover
+/// everything left — even though the natural test in the first of them keeps
+/// the column out of the conversion.
+#[test]
+fn a_non_qualifying_column_reads_the_store_for_exhaustiveness() {
+    let src = "let g = fn v =>\n\
+               \x20 let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20 match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+}
+
+/// The same store, the same unconverted column, and the other question: an arm
+/// demanding both fields at once demands what `x != y` forbids, so no value
+/// reaches it. Nothing about the arms above it says so — it is the store alone.
+#[test]
+fn a_non_qualifying_column_reads_the_store_for_reachability() {
+    let src = "let g = fn v =>\n\
+               \x20 let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20 match v with\n\
+               \x20 | {x: 1} => 1 | {x: n, y} => 2 | {x: n} => 3 | {y} => 4 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.find("{x: n, y}").expect("the arm the store forbids")
+        )],
+        "{checks:#?}"
+    );
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(
+        verdicts(report),
+        [
+            Verdict::Reachable,
+            Verdict::Unreachable,
+            Verdict::Reachable,
+            Verdict::Reachable
+        ]
+    );
+}
+
+/// The same program one binding further in. A nested `let` is generalized on
+/// the same terms as a definition, and the presences of its type are numbered
+/// by the enclosing definition's substitution — so the walk has to be promised
+/// what the store says about *those* too, not only about the presences the
+/// top-level scheme quantified. Read the store's word about them and the
+/// nested match is exhaustive exactly as it is at the top level.
+#[test]
+fn a_nested_binding_reads_the_store_for_exhaustiveness() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20   match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+}
+
+/// And the reachability half of R11 through a nested binding: the arm the
+/// store forbids is unreachable wherever the binding that constrains it sits.
+#[test]
+fn a_nested_binding_reads_the_store_for_reachability() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20   match v with\n\
+               \x20   | {x: 1} => 1 | {x: n, y} => 2 | {x: n} => 3 | {y} => 4 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.find("{x: n, y}").expect("the arm the store forbids")
+        )],
+        "{checks:#?}"
+    );
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(
+        verdicts(report),
+        [
+            Verdict::Reachable,
+            Verdict::Unreachable,
+            Verdict::Reachable,
+            Verdict::Reachable
+        ]
+    );
+}
+
+/// A written clause on a nested binding is the store's word about that
+/// binding's presences too, and a witness has to be a value the clause admits:
+/// `c != d` says nothing has both `p` and `q`, so the hole the walk reports is
+/// the value with neither rather than the one with both.
+#[test]
+fn a_nested_written_clause_shapes_the_witness() {
+    let src = "let solo = fn v =>\n\
+               \x20 let inner : {p when c: Nat, q when d: Nat} -> Nat where c != d =\n\
+               \x20   fn w => match w with | {p: 1} => 0 | {q} => 0 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unhandled-values@{}",
+            src.find("match").expect("the match")
+        )],
+        "{checks:#?}"
+    );
+    assert_eq!(witness_of(&checks), "{ p: 0 }");
+}
+
+/// A store with nothing in it says nothing, and the walk over an unconverted
+/// column reads exactly as it always did: R6 leaves such a column's own
+/// coverage where it was, and this path only ever reads the store.
+#[test]
+fn a_non_qualifying_column_with_no_constraints_reads_as_before() {
+    let src = "let m = fn v => match v with | {x: 1} => 1 | {y} => 2 end";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(inferred.store.batches.is_empty(), "{:#?}", inferred.store);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unhandled-values@{}",
+            src.find("match").expect("the match")
+        )],
+        "{checks:#?}"
+    );
+    assert_eq!(witness_of(&checks), "{ x: 1, y }");
 }

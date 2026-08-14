@@ -5,11 +5,26 @@
 //! reads the solved types the column rule shaped, so the checks are *typed*: a
 //! field the scrutinee's type proves present needs no absent case, one it
 //! proves absent makes arms requiring it unreachable, and one whose presence
-//! is still a variable — or a quantified `?` — must have both its cases
+//! is still a variable — or one a scheme quantified — must have both its cases
 //! covered, independently per field. The catch-all placement rule alone stays
 //! syntactic: the dedicated wording is reserved for arms that are irrefutable
 //! on their face, and an exact arm the type happens to make total is reported
 //! as the unreachable arm it leaves behind instead.
+//!
+//! For a match whose column inference converted to a formula, both questions
+//! are asked of the constraint store instead. An arm is reachable exactly when
+//! some assignment the store allows satisfies what that arm covers and none of
+//! what the arms above it cover; and every value the store allows is one some
+//! arm accepts, so such a match is exhaustive unless conjoining its own
+//! coverage is what left the store without a model — which is the match being
+//! wrong, and is reported here with a witness read off a model. Those columns
+//! test nothing but which labels are there, so the two ways of asking agree
+//! wherever both can be asked; a column that tests a number or a case is not
+//! one of them and keeps the walk below. The walk is not left reasoning as if
+//! presences were independent, though: a field whose presence is still open
+//! only has the halves the definition's own clause allows it, given the halves
+//! the columns above it were entered on, so `a != b` rules out the value with
+//! both fields wherever the question is asked.
 //!
 //! One rule of ownership per match, in order: a misplaced catch-all owns its
 //! own arm — the arms it starves are not additionally flagged — then an arm no
@@ -28,11 +43,11 @@ use std::rc::Rc;
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
-    inference::{self, unfold},
+    inference::{self, Coverage as Covers, Origin, Store, sat, unfold},
     ir::{Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
     tracking::Span,
-    types::{Core, Presence, Rest, Row, Scheme, Ty},
+    types::{Atom, Core, Formula, Presence, Rest, Row, Scheme, Ty},
 };
 
 /// What the phase found, over the whole program: one report per match, in the
@@ -182,6 +197,21 @@ enum Mode {
     Exhaustiveness,
 }
 
+/// What a usefulness walk carries down its recursion: which question it is
+/// answering, and what the path to this point has assumed about the presences
+/// it passed through.
+///
+/// The assumptions are the other half of R11. A presence column's two halves
+/// are not independent of the ones above it — the constraints may say `a != b`,
+/// and then the value that has both is no value at all — so entering a half
+/// records its literal, and every column below is asked *given* that. Every
+/// walk starts assuming nothing.
+#[derive(Clone)]
+struct Walk {
+    mode: Mode,
+    assumed: Formula,
+}
+
 /// The walk's context: the aliases, for looking through a declared name to
 /// the shape the checks need, and the solver's complaints, for the one part
 /// of the cascade rule the solved types cannot carry — a scrutinee the solver
@@ -190,20 +220,67 @@ enum Mode {
 struct Check<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
     errors: &'a [inference::Error],
+    /// What the program requires of its presences, as the finished solve reads
+    /// it. The whole of R11: for a column whose coverage was converted to a
+    /// formula, reachability and exhaustiveness are questions about this rather
+    /// than about the matrix — and, that column being nothing but structs and
+    /// binders, everything it could be asked *is* presence.
+    store: &'a Store,
+    /// Which batch, if any, left the store without a model. Everything after it
+    /// is suppressed: with no model at all, every arm reads unreachable and
+    /// every match reads unhandled, which is one mistake said in as many places
+    /// as the program has matches.
+    flipped: Option<usize>,
+    /// What the definition being walked may assume about its presences: the
+    /// store's word about every presence its terms can name, nested bindings
+    /// included. See [`inference::Output::promises`].
+    ///
+    /// The store itself is in the wrong alphabet to ask. Its batches are
+    /// written about solver variables, and closing the definition numbered the
+    /// types the walk reads — a presence still open in one of them is the
+    /// *position* it was closed to, not the variable it was. The promise is
+    /// that same content, renamed by the substitution that closed those types,
+    /// so it is the reading of the store a column can be asked about. It keeps
+    /// the cascade rule with it: a definition generalized once something had
+    /// flipped the store promises nothing at all.
+    promise: Formula,
+}
+
+/// What the store has to say about one match: which batch is its coverage, and
+/// the arms and labels that batch carried.
+struct Constrained<'a> {
+    at: usize,
+    coverage: &'a Covers,
 }
 
 /// Run the checks over every match in the program. `inferred` is read for its
 /// aliases — the solved types themselves were written into the terms.
 pub fn check(program: &Program, inferred: &inference::Output) -> Output {
-    let check = Check {
-        aliases: &inferred.aliases,
-        errors: &inferred.errors,
-    };
+    let flipped = inferred
+        .store
+        .batches
+        .iter()
+        .position(|batch| batch.flipped);
     let mut out = Output {
         reports: Vec::new(),
         errors: Vec::new(),
     };
-    for decl in program.terms.values() {
+    // One definition at a time, because the presences its types name are its
+    // own: the promise inference published for it is what the store came to
+    // about them, and it is the only reading of the store the walk inside it
+    // can use.
+    for (symbol, decl) in &program.terms {
+        let check = Check {
+            aliases: &inferred.aliases,
+            errors: &inferred.errors,
+            store: &inferred.store,
+            flipped,
+            promise: inferred
+                .promises
+                .get(symbol)
+                .cloned()
+                .unwrap_or(Formula::True),
+        };
         walk(&check, &decl.value, &mut out);
     }
     // In the order the reader would meet them, whatever order the walk found
@@ -339,6 +416,16 @@ fn wild_row(row: &[Cell]) -> Vec<Cell> {
     row[1..].to_vec()
 }
 
+impl Walk {
+    /// A walk about to begin: the question it answers, and nothing assumed yet.
+    fn start(mode: Mode) -> Self {
+        Walk {
+            mode,
+            assumed: Formula::True,
+        }
+    }
+}
+
 impl Check<'_> {
     /// A type as the checks read it: the shape behind a declared name. The
     /// types are zonked, so this needs no table — only the aliases.
@@ -415,7 +502,9 @@ impl Check<'_> {
         // The misplaced catch-all, first in the order of ownership: one error
         // at the first arm that accepts everything and is not last. The arms
         // it starves are its to explain, so they are not additionally
-        // flagged, however unreachable they are.
+        // flagged, however unreachable they are. Syntactic, and staying so:
+        // the dedicated wording is reserved for arms irrefutable on their face,
+        // whatever the store makes of them.
         let misplaced = arms[..arms.len() - 1]
             .iter()
             .position(|(pattern, _)| catch_all(pattern));
@@ -426,9 +515,38 @@ impl Check<'_> {
             });
         }
 
+        // A column whose coverage inference converted to a formula is decided
+        // by the store; anything else keeps the matrix walk it always had.
+        let constrained = self.constrained(span);
+        // The cascade rule: a match whose coverage comes after the batch that
+        // flipped the store cannot be reasoned about from a store with no
+        // model, so it stands aside rather than reporting every arm dead.
+        if let Some(found) = &constrained
+            && self.flipped.is_some_and(|first| first < found.at)
+        {
+            out.reports.push(Report {
+                span,
+                scrutinee: ty,
+                scrutinee_span: scrutinee.span,
+                arms: arms
+                    .iter()
+                    .zip(&spans)
+                    .map(|((pattern, _), at)| Arm {
+                        span: *at,
+                        pattern: pattern.clone(),
+                        verdict: Verdict::Skipped,
+                    })
+                    .collect(),
+                coverage: Coverage::Skipped,
+            });
+            return;
+        }
+
         // A verdict per arm, and the unreachable complaints. Reachability is
         // typed: the arm's own usefulness against the arms above it, over the
-        // universes the solved scrutinee type draws.
+        // universes the solved scrutinee type draws — or, where the store
+        // decides the column, whether any assignment the store allows reaches
+        // the arm past the ones above it.
         let cols = [Col::Whole(ty.clone())];
         let mut reported = Vec::with_capacity(arms.len());
         for (at, (pattern, _)) in arms.iter().enumerate() {
@@ -438,11 +556,28 @@ impl Check<'_> {
                 Some(here) if at == here => Verdict::Reachable,
                 Some(here) if at > here => Verdict::Starved,
                 _ => {
-                    let rows: Vec<Vec<Cell>> =
-                        cells[..at].iter().map(|cell| vec![cell.clone()]).collect();
-                    match self.useful(&rows, &cols, &[cells[at].clone()], Mode::Reachability) {
-                        Some(_) => Verdict::Reachable,
+                    let reachable = match &constrained {
+                        // The flipping batch's own match is the one being
+                        // reported unhandled below; with the store already
+                        // without a model, every arm of it would read dead,
+                        // and the arms are not what went wrong.
+                        Some(found) if self.flipped == Some(found.at) => true,
+                        Some(found) => self.reaches(&found.coverage.arms, at),
                         None => {
+                            let rows: Vec<Vec<Cell>> =
+                                cells[..at].iter().map(|cell| vec![cell.clone()]).collect();
+                            self.useful(
+                                &rows,
+                                &cols,
+                                &[cells[at].clone()],
+                                &Walk::start(Mode::Reachability),
+                            )
+                            .is_some()
+                        }
+                    };
+                    match reachable {
+                        true => Verdict::Reachable,
+                        false => {
                             out.errors.push(Error {
                                 span: spans[at],
                                 kind: ErrorKind::UnreachableArm,
@@ -462,20 +597,48 @@ impl Check<'_> {
         // Exhaustiveness, last: a value of the solved type no arm accepts,
         // with the example written out — worded about numbers when the
         // example is one, since no one number is worth quoting.
-        let rows: Vec<Vec<Cell>> = cells.iter().map(|cell| vec![cell.clone()]).collect();
-        let coverage = match self.useful(&rows, &cols, &[Cell::Wild], Mode::Exhaustiveness) {
-            Some(mut wits) => {
-                let witness = wits.remove(0).unwrap_or(Witness::Any);
-                let kind = match &witness {
-                    Witness::Natural(_) => ErrorKind::UnhandledNumbers,
-                    _ => ErrorKind::UnhandledValues {
-                        witness: witness.clone(),
-                    },
-                };
-                out.errors.push(Error { span, kind });
-                Coverage::Unhandled(witness)
+        let coverage = match &constrained {
+            // A converted column's arms are in the store as what they cover, so
+            // every value the store allows is one some arm accepts — unless
+            // conjoining that very batch is what left the store without a
+            // model, which is the coverage failing and is reported here, at the
+            // match, with a witness read off a model of what the store allowed
+            // before it and the arms do not.
+            Some(found) => match self.flipped == Some(found.at) {
+                false => Coverage::Exhaustive,
+                true => {
+                    let witness = self.witness(found);
+                    out.errors.push(Error {
+                        span,
+                        kind: ErrorKind::UnhandledValues {
+                            witness: witness.clone(),
+                        },
+                    });
+                    Coverage::Unhandled(witness)
+                }
+            },
+            None => {
+                let rows: Vec<Vec<Cell>> = cells.iter().map(|cell| vec![cell.clone()]).collect();
+                match self.useful(
+                    &rows,
+                    &cols,
+                    &[Cell::Wild],
+                    &Walk::start(Mode::Exhaustiveness),
+                ) {
+                    Some(mut wits) => {
+                        let witness = wits.remove(0).unwrap_or(Witness::Any);
+                        let kind = match &witness {
+                            Witness::Natural(_) => ErrorKind::UnhandledNumbers,
+                            _ => ErrorKind::UnhandledValues {
+                                witness: witness.clone(),
+                            },
+                        };
+                        out.errors.push(Error { span, kind });
+                        Coverage::Unhandled(witness)
+                    }
+                    None => Coverage::Exhaustive,
+                }
             }
-            None => Coverage::Exhaustive,
         };
 
         out.reports.push(Report {
@@ -485,6 +648,109 @@ impl Check<'_> {
             arms: reported,
             coverage,
         });
+    }
+
+    /// The store's coverage batch for the match at `span`, when inference
+    /// converted that match's column.
+    ///
+    /// Matched by span, which is the batch's own: one match writes one coverage
+    /// batch, and the span is where the batch says it came from.
+    fn constrained(&self, span: Span) -> Option<Constrained<'_>> {
+        self.store
+            .batches
+            .iter()
+            .enumerate()
+            .find_map(|(at, batch)| match &batch.origin {
+                Origin::Coverage(coverage) if batch.span == span => {
+                    Some(Constrained { at, coverage })
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether any value the store allows reaches arm `at` — that is, satisfies
+    /// what that arm covers and none of what the arms above it cover.
+    ///
+    /// Maranget's usefulness, said propositionally. The two agree wherever both
+    /// can be asked; where only this one can, it is because the column tests
+    /// nothing but which labels are there, and that is what the store is about.
+    fn reaches(&self, arms: &[Formula], at: usize) -> bool {
+        let earlier = Formula::any(arms[..at].iter().cloned());
+        let reach = arms[at].clone().and(earlier.not());
+        sat::satisfiable(&self.known().and(reach))
+    }
+
+    /// The walk with one more presence literal assumed, or `None` when what the
+    /// definition promises leaves no room for it: a half no assignment can
+    /// reach is not walked, exactly as a half the solved presence rules out is
+    /// not.
+    ///
+    /// The other half of R11, and the half the matrix cannot answer for itself:
+    /// two of a column's presences may be two the store related to each other,
+    /// and then whether this half exists at all is a question for the
+    /// constraints rather than for the patterns. A column carrying no literal —
+    /// a presence settled either way, or one a failure abandoned — is walked
+    /// unconditionally, which is what it always was.
+    fn assuming(&self, walk: &Walk, literal: Option<Formula>) -> Option<Walk> {
+        let Some(literal) = literal else {
+            return Some(walk.clone());
+        };
+        let assumed = walk.assumed.clone().and(literal);
+        let allowed = sat::satisfiable(&self.promise.clone().and(assumed.clone()));
+        allowed.then_some(Walk {
+            mode: walk.mode,
+            assumed,
+        })
+    }
+
+    /// Everything the store says while it still says anything: the batches up
+    /// to the one that flipped it, or all of them when none did.
+    ///
+    /// The cascade rule, said where the queries are made. A store with no model
+    /// entails everything, so asking it about an arm would answer "unreachable"
+    /// for every arm of every match in the program — one contradiction reported
+    /// as many times as the file has arms. The last consistent state is the one
+    /// that has anything to say.
+    fn known(&self) -> Formula {
+        let upto = self.flipped.unwrap_or(self.store.batches.len());
+        Formula::all(
+            self.store.batches[..upto]
+                .iter()
+                .map(|batch| batch.formula.clone()),
+        )
+    }
+
+    /// A value the arms of a flipped coverage batch leave unhandled, read off a
+    /// model of what the store allowed before the batch and the arms do not.
+    ///
+    /// Such a model always exists: the store had one until this batch was
+    /// conjoined, and it has none after, so something the store allows is
+    /// outside what the arms cover. The value is written as the labels the
+    /// model puts there — a field present with any value at all, which prints
+    /// pun-style, because under this reading the presence *is* the information.
+    fn witness(&self, found: &Constrained) -> Witness {
+        let before = Formula::all(
+            self.store.batches[..found.at]
+                .iter()
+                .map(|batch| batch.formula.clone()),
+        );
+        let covered = Formula::any(found.coverage.arms.iter().cloned());
+        let model = sat::model(&before.and(covered.not()))
+            .expect("the store had a model before the batch that flipped it");
+        let there = |presence: &Presence| match presence {
+            Presence::Present => true,
+            Presence::Var(var) => *model.get(&Atom::Var(*var)).unwrap_or(&false),
+            _ => false,
+        };
+        Witness::Struct(
+            found
+                .coverage
+                .fields
+                .iter()
+                .filter(|(_, presence)| there(presence))
+                .map(|(name, _)| (name.clone(), Witness::Any))
+                .collect(),
+        )
     }
 
     /// Whether one arm's tests all land on positions the solved type has an
@@ -562,15 +828,15 @@ impl Check<'_> {
         rows: &[Vec<Cell>],
         cols: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         let Some((col, later)) = cols.split_first() else {
             return rows.is_empty().then(Vec::new);
         };
         match col {
-            Col::Whole(ty) => self.whole(rows, ty, later, q, mode),
-            Col::Field { presence, ty } => self.field(rows, presence, ty, later, q, mode),
-            Col::Rest { open } => self.rest(rows, *open, later, q, mode),
+            Col::Whole(ty) => self.whole(rows, ty, later, q, walk),
+            Col::Field { presence, ty } => self.field(rows, presence, ty, later, q, walk),
+            Col::Rest { open } => self.rest(rows, *open, later, q, walk),
         }
     }
 
@@ -584,16 +850,16 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         let ty = self.shape(ty);
         let structs = std::iter::once(&q[0])
             .chain(rows.iter().map(|row| &row[0]))
             .any(|cell| matches!(cell, Cell::Struct { .. }));
         if structs {
-            return self.widened(rows, &ty, later, q, mode);
+            return self.widened(rows, &ty, later, q, walk);
         }
-        self.core(rows, &ty, later, q, mode)
+        self.core(rows, &ty, later, q, walk)
     }
 
     /// The widening step: the fields the solved type names become one
@@ -611,7 +877,7 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         let mut named: Vec<(String, Presence, Rc<Ty>)> = ty
             .fields
@@ -693,7 +959,7 @@ impl Check<'_> {
         let mut wide_q = widen(&q[0]);
         wide_q.extend(q[1..].iter().cloned());
 
-        let mut wits = self.useful(&wide_rows, &wide_cols, &wide_q, mode)?;
+        let mut wits = self.useful(&wide_rows, &wide_cols, &wide_q, walk)?;
         let after = wits.split_off(named.len() + 2);
         // The rest entry has nothing to print: its empty half witnesses as
         // `None`, and its nonempty half is only walked judging reachability,
@@ -714,10 +980,11 @@ impl Check<'_> {
 
     /// One field's presence: a little universe of at most two values — there,
     /// with whatever the field holds, and not there — filtered by what the
-    /// solved presence allows. This is where the typed rules live: a field
+    /// solved presence allows and by what the constraints allow given the
+    /// halves already entered. This is where the typed rules live: a field
     /// proved present has no absent case to cover, a field proved absent
-    /// starves every cell demanding it, and a variable — or a quantified `?` —
-    /// keeps both.
+    /// starves every cell demanding it, and one still open keeps both halves —
+    /// minus whatever the definition's clause has ruled out.
     fn field(
         &self,
         rows: &[Vec<Cell>],
@@ -725,8 +992,17 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
+        // What this column is called in the clause the definition promised. The
+        // types the walk reads are closed, so a presence still open in one is a
+        // position that clause may speak of; one settled either way, or one a
+        // failure abandoned, is nothing it has an opinion about, and the
+        // presence rules alone decide that column's halves.
+        let literal = match presence {
+            Presence::Bound(index) => Some(Formula::bound(*index)),
+            _ => None,
+        };
         // The present half of the universe: the rows demanding absence drop,
         // and the question moves into what the field holds — whose column
         // takes this one's place, so its witness is the field's own.
@@ -734,6 +1010,7 @@ impl Check<'_> {
             if !may_be_present(presence) {
                 return None;
             }
+            let walk = &self.assuming(walk, literal.clone())?;
             let rows: Vec<Vec<Cell>> = rows
                 .iter()
                 .filter_map(|row| {
@@ -752,7 +1029,7 @@ impl Check<'_> {
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
             sub_q.extend(q[1..].iter().cloned());
-            self.useful(&rows, &cols, &sub_q, mode)
+            self.useful(&rows, &cols, &sub_q, walk)
         };
         // The absent half: the rows demanding the field drop, and the field
         // contributes nothing further to the value.
@@ -760,12 +1037,13 @@ impl Check<'_> {
             if !may_be_absent(presence) {
                 return None;
             }
+            let walk = &self.assuming(walk, literal.clone().map(Formula::not))?;
             let rows: Vec<Vec<Cell>> = rows
                 .iter()
                 .filter(|row| matches!(&row[0], Cell::Absent | Cell::Wild))
                 .map(|row| wild_row(row))
                 .collect();
-            let wits = self.useful(&rows, later, &q[1..], mode)?;
+            let wits = self.useful(&rows, later, &q[1..], walk)?;
             Some(std::iter::once(None).chain(wits).collect())
         };
         match &q[0] {
@@ -792,7 +1070,7 @@ impl Check<'_> {
         open: bool,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         // The empty half: a value with no extra fields, which the exact and
         // the indifferent rows both accept. Nothing extra means nothing to
@@ -803,7 +1081,7 @@ impl Check<'_> {
                 .filter(|row| matches!(&row[0], Cell::Absent | Cell::Wild))
                 .map(|row| wild_row(row))
                 .collect();
-            let wits = self.useful(&rows, later, &q[1..], mode)?;
+            let wits = self.useful(&rows, later, &q[1..], walk)?;
             Some(std::iter::once(None).chain(wits).collect())
         };
         // The nonempty half: some field beyond the named ones, which only the
@@ -818,13 +1096,13 @@ impl Check<'_> {
                 .filter(|row| matches!(&row[0], Cell::Wild))
                 .map(|row| wild_row(row))
                 .collect();
-            let wits = self.useful(&rows, later, &q[1..], mode)?;
+            let wits = self.useful(&rows, later, &q[1..], walk)?;
             Some(std::iter::once(Some(Witness::Any)).chain(wits).collect())
         };
         match &q[0] {
             Cell::Absent => empty(),
             // A wildcard — the widening put nothing else here.
-            _ => match mode {
+            _ => match walk.mode {
                 Mode::Reachability => empty().or_else(nonempty),
                 Mode::Exhaustiveness => empty(),
             },
@@ -840,18 +1118,18 @@ impl Check<'_> {
         ty: &Rc<Ty>,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         match &ty.core {
-            Core::Nat => self.naturals(rows, later, q, mode),
-            Core::Sum(row) => self.cases(rows, &flat(row), later, q, mode),
+            Core::Nat => self.naturals(rows, later, q, walk),
+            Core::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
             // flattened every struct — so every cell here is a wildcard, the
             // column is consumed, and any value serves.
             _ => {
                 let rows: Vec<Vec<Cell>> = rows.iter().map(|row| wild_row(row)).collect();
-                let wits = self.useful(&rows, later, &q[1..], mode)?;
+                let wits = self.useful(&rows, later, &q[1..], walk)?;
                 Some(std::iter::once(Some(Witness::Any)).chain(wits).collect())
             }
         }
@@ -865,7 +1143,7 @@ impl Check<'_> {
         rows: &[Vec<Cell>],
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         let narrow = |value: u128| -> Vec<Vec<Cell>> {
             rows.iter()
@@ -878,7 +1156,7 @@ impl Check<'_> {
         };
         match &q[0] {
             Cell::Natural(value) => {
-                let wits = self.useful(&narrow(*value), later, &q[1..], mode)?;
+                let wits = self.useful(&narrow(*value), later, &q[1..], walk)?;
                 Some(
                     std::iter::once(Some(Witness::Natural(*value)))
                         .chain(wits)
@@ -896,7 +1174,7 @@ impl Check<'_> {
                     })
                     .collect();
                 for value in &listed {
-                    if let Some(wits) = self.useful(&narrow(*value), later, &q[1..], mode) {
+                    if let Some(wits) = self.useful(&narrow(*value), later, &q[1..], walk) {
                         return Some(
                             std::iter::once(Some(Witness::Natural(*value)))
                                 .chain(wits)
@@ -912,7 +1190,7 @@ impl Check<'_> {
                     .filter(|row| matches!(&row[0], Cell::Wild))
                     .map(|row| wild_row(row))
                     .collect();
-                let wits = self.useful(&rows, later, &q[1..], mode)?;
+                let wits = self.useful(&rows, later, &q[1..], walk)?;
                 Some(
                     std::iter::once(Some(Witness::Natural(unlisted)))
                         .chain(wits)
@@ -931,7 +1209,7 @@ impl Check<'_> {
         row: &Row,
         later: &[Col],
         q: &[Cell],
-        mode: Mode,
+        walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         let narrow = |name: &str| -> Vec<Vec<Cell>> {
             rows.iter()
@@ -952,7 +1230,7 @@ impl Check<'_> {
             cols.extend(later.iter().cloned());
             let mut sub_q = vec![sub.clone()];
             sub_q.extend(q[1..].iter().cloned());
-            let mut wits = self.useful(&narrow(name), &cols, &sub_q, mode)?;
+            let mut wits = self.useful(&narrow(name), &cols, &sub_q, walk)?;
             let payload = wits.remove(0).unwrap_or(Witness::Any);
             Some(
                 std::iter::once(Some(tag_witness(name, payload)))
@@ -993,7 +1271,7 @@ impl Check<'_> {
                         .filter(|row| matches!(&row[0], Cell::Wild))
                         .map(|row| wild_row(row))
                         .collect();
-                    let wits = self.useful(&rows, later, &q[1..], mode)?;
+                    let wits = self.useful(&rows, later, &q[1..], walk)?;
                     let listed: Vec<String> =
                         universe.iter().map(|(name, _)| (*name).clone()).collect();
                     // "Anything other than" needs something to be other than;

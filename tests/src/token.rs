@@ -11,6 +11,16 @@ fn kinds(src: &str) -> Vec<Kind> {
     out.tokens.into_iter().map(|token| token.tracked).collect()
 }
 
+/// The tokens of a source that also has lex errors, for the one thing that
+/// wants both halves of what the lexer made of a line.
+fn tokens_of(src: &str) -> Vec<Kind> {
+    lex(src, FileID::GENERATED)
+        .tokens
+        .into_iter()
+        .map(|token| token.tracked)
+        .collect()
+}
+
 fn errors(src: &str) -> Vec<Error> {
     lex(src, FileID::GENERATED).errors
 }
@@ -103,16 +113,39 @@ fn lexes_the_two_dots_apart() {
     assert_eq!(dots.span.width, 2);
 }
 
+/// `!=` is one token, the way `->` is: a lone `!` begins nothing, so the only
+/// thing it can be is the head of this.
 #[test]
-fn lexes_the_optional_marker() {
+fn lexes_the_comparison() {
     assert!(matches!(
-        kinds("a?: A")[..],
-        [
-            Kind::Identifier(_),
-            Kind::Question,
-            Kind::Colon,
-            Kind::Identifier(_)
-        ]
+        kinds("a != b")[..],
+        [Kind::Identifier(_), Kind::NotEqual, Kind::Identifier(_)]
+    ));
+}
+
+/// A lone `!` is reported at the `!` itself, for the reason a lone `-` is.
+#[test]
+fn a_lone_bang_is_unrecognized() {
+    let out = errors("a ! b");
+    assert_eq!(out.len(), 1, "errors: {out:#?}");
+    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].span.start, 2);
+    assert_eq!(out[0].span.width, 1);
+}
+
+/// The `?` that used to mark an optional field is gone from the language, so
+/// the character begins no token at all and is reported where it was written.
+#[test]
+fn the_question_mark_is_no_longer_a_token() {
+    let out = errors("a?: A");
+    assert_eq!(out.len(), 1, "errors: {out:#?}");
+    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].span.start, 1);
+    assert_eq!(out[0].span.width, 1);
+    // And nothing in the stream stands for it: the rest lexes as it always did.
+    assert!(matches!(
+        tokens_of("a?: A")[..],
+        [Kind::Identifier(_), Kind::Colon, Kind::Identifier(_)]
     ));
 }
 
@@ -169,7 +202,7 @@ fn a_backtick_that_begins_no_name_is_unrecognized() {
     // rule the malformed natural below already keeps. A span narrower than the
     // lexeme points at a character the reader cannot act on and leaves the rest
     // of the mistake unmarked.
-    for (src, width) in [("`", 1), ("` ", 1), ("`?", 1), ("`1", 2), ("`1abc", 5)] {
+    for (src, width) in [("`", 1), ("` ", 1), ("`|", 1), ("`1", 2), ("`1abc", 5)] {
         let out = errors(src);
         assert_eq!(out.len(), 1, "{src}: {out:#?}");
         assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");

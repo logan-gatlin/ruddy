@@ -43,10 +43,10 @@ fn both_trees_render_a_struct_the_same_way() {
         "let n = { p: { q: 3 } }",
         "let v : { a: Nat } = { a: 1 }",
         "let f = fn r => { wrapped: r.x }",
-        // Open rows and optional fields: the `..` tail, named or not, and the
-        // `?` marker are one rendering rule too.
+        // Open rows and named presences: the `..` tail, named or not, and the
+        // `when` clause are one rendering rule too.
         "let g : { a: Nat, ..r } -> Nat = fn p => p.a",
-        "let h : { a?: Nat, .. } -> Nat = fn p => p.a",
+        "let h : { a when a: Nat, .. } -> Nat = fn p => p.a",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -138,7 +138,7 @@ fn types_of(source: &str) -> (String, String) {
         .expect("the source declares one term");
     let annotation = decl.annotation.as_ref().expect("it is annotated");
     (
-        print::ir::ty(&annotation.tracked, &mint).to_string(),
+        print::ir::ty(&annotation.ty.tracked, &mint).to_string(),
         inferred.schemes[symbol].to_string(),
     )
 }
@@ -205,9 +205,9 @@ fn a_row_reads_as_written_and_as_quantified() {
             "{ x: Nat, ..'a } -> { x: Nat, ..'a }",
         ),
         (
-            "let h : { x?: Nat, y: Nat } -> Nat = fn r => r.y",
-            "{ x?: Nat, y: Nat } -> Nat",
-            "{ x?: Nat, y: Nat } -> Nat",
+            "let h : { x when a: Nat, y: Nat } -> Nat = fn r => r.y",
+            "{ x when a: Nat, y: Nat } -> Nat",
+            "{ x when a: Nat, y: Nat } -> Nat",
         ),
     ] {
         let (as_written, as_inferred) = types_of(source);
@@ -261,9 +261,9 @@ fn both_trees_render_a_sum_the_same_way() {
         "let n = `None",
         "let f = fn x => `Wrap x",
         "let p = fn f => `Some (f 1)",
-        // A case marked `?`, and a tail: the two ways a sum is left open, both
-        // of which only an annotation may write.
-        "let o : `A? Nat | `B = `B",
+        // A case whose presence a `when` names, and a tail: the two ways a sum
+        // is left open, both of which only an annotation may write.
+        "let o : `A (when a) Nat | `B = `B",
         "let t : `A Nat | .. = `A 1",
         "let r : `A Nat | ..s = `A 1",
         // The two forms that write no case, and so print the leading bar the
@@ -473,4 +473,58 @@ fn both_trees_render_a_pattern_rest() {
     let (ast, ir) = printed("let g = fn v => match v with | { .. } => 1 end");
     assert_eq!(ast, "let g = fn v => match v with | { .. } => 1 end");
     assert_eq!(ir, "let g = fn v => match v with | { .. } => 1 end");
+}
+
+/// A `where` clause is part of a written ascription, so both trees render it —
+/// and both render it back to the source it was parsed from, parentheses and
+/// all.
+#[test]
+fn both_trees_render_a_where_clause_the_same_way() {
+    for source in [
+        "let f : { x when a: Nat } where a = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where a != b = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where a = b = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where not (a and b) = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where a or b = { x: 1 }",
+        // The anonymous presence is spelled back as the `_` it was written as.
+        "let f : { x when _: Nat } = { x: 1 }",
+        // And a sum's clause takes the parentheses the grammar needs.
+        "let f : `A (when a) Nat | `B (when b) = `B",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, ir, "{source}");
+        assert_eq!(ast, source, "{source}");
+    }
+}
+
+/// The clause a definition ends up with is what its scheme prints, and it
+/// follows the whole type — omitted entirely when the definition requires
+/// nothing, which is what makes an ordinary program read exactly as before.
+#[test]
+fn a_scheme_prints_the_clause_it_requires() {
+    for (source, expected) in [
+        (
+            "let p = fn a => match a with | {x} => {} | {y} => {} end",
+            "{ x when a: 'a, y when b: 'b } -> {} where a != b",
+        ),
+        ("let id = fn x => x", "'a -> 'a"),
+    ] {
+        let mut files = FileManager::new();
+        let file = files.register_new_file("<test>".to_string(), source.to_string());
+        let lexed = token::lex(source, file);
+        let parsed = parse::parse(lexed.tokens);
+        let bundle =
+            Bundle::new("test", Version::new(0, 1, 0)).expect("the test bundle name is valid");
+        let mut mint = Mint::new(bundle);
+        let mut built = ir::build(&mut mint, parsed.stmts);
+        assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
+        let output = inference::infer(&mint, &mut built.program);
+        assert!(output.errors.is_empty(), "{source}: {:#?}", output.errors);
+        let scheme = output
+            .schemes
+            .values()
+            .next()
+            .expect("the source declares one term");
+        assert_eq!(scheme.to_string(), expected, "{source}");
+    }
 }

@@ -19,8 +19,9 @@ pub enum StmtKind {
         /// pattern is a tree of its own, and inlining one here would grow
         /// every statement to the size of the largest thing a binding can be.
         pattern: Box<Pattern>,
-        /// The written type, when the definition was ascribed one.
-        ty: Option<Type>,
+        /// The written type, when the definition was ascribed one, with the
+        /// `where` clause that may follow it.
+        ty: Option<Annotation>,
         body: Tracked<Expr>,
     },
     Type {
@@ -34,7 +35,11 @@ pub enum StmtKind {
         /// follows from where the body uses it, which is a question for
         /// lowering.
         params: Vec<TrackedString>,
-        body: Type,
+        /// The body, read as an annotation is: a declaration may write neither
+        /// a `when` nor a `where`, and refusing them is lowering's — see
+        /// [`ir::ErrorKind::OpenDeclaredType`](crate::ir::ErrorKind), which
+        /// already refuses the `..` beside them for the same reason.
+        body: Annotation,
     },
 }
 
@@ -68,7 +73,7 @@ pub enum ExprKind {
         /// the largest thing either can carry, so inlining it here would make
         /// every expression in the tree the size of the one construct that has
         /// one.
-        ty: Option<Box<Type>>,
+        ty: Option<Box<Annotation>>,
         value: Box<Expr>,
         body: Box<Expr>,
     },
@@ -217,41 +222,105 @@ pub enum TypeKind {
     Unit,
 }
 
-/// One field of a struct type: its type and the `?` it may wear, or the `\`
-/// that says the label is not there at all.
+/// One field of a struct type: its type and the `when` clause it may wear, or
+/// the `\` that says the label is not there at all.
 #[derive(Debug, Clone)]
 pub enum TypeField {
-    /// `name[?]: T` — a field that is there, or (`?`) may be, with this type
-    /// when it is.
-    Written { optional: bool, value: Type },
+    /// `name [when a]: T` — a field that is there, or — with a `when` — one
+    /// whose being there is the named presence variable's to say, with this
+    /// type when it is.
+    Written {
+        when: Option<Box<When>>,
+        value: Type,
+    },
     /// `\name` — the label is definitely absent: the `..` beside it may not
-    /// stand for it. No type and no `?`, so this variant carries nothing; the
+    /// stand for it. No type and no `when`, so this variant carries nothing; the
     /// map key's span covers the whole `\name`, which is what a diagnostic
     /// about the entry underlines.
     Absent,
 }
 
-/// One case of a sum type: what it carries and the `?` it may wear, or the `\`
-/// that says the case is not there at all.
+/// One case of a sum type: what it carries and the `when` clause it may wear,
+/// or the `\` that says the case is not there at all.
 ///
-/// The `?` is not what a `..` tail says. `` `A? Nat | `B `` allows `A` and
-/// nothing else beyond `B`; `` `B | ..r `` allows anything at all beyond `B`.
-/// Neither can be written as the other, which is why both are here.
+/// A `when` is not what a `..` tail says. `` `A (when a) Nat | `B `` allows `A`
+/// or not and nothing else beyond `B`; `` `B | ..r `` allows anything at all
+/// beyond `B`. Neither can be written as the other, which is why both are here.
 ///
 /// `payload` is `None` for a case written bare. That means unit — the same
 /// thing `()` means — but it is recorded as the nothing it was written as, so
 /// that printing the tree gives back the source it was parsed from.
 #[derive(Debug, Clone)]
 pub enum SumCase {
-    /// `` `Name[?] [T] `` — a case a value may be, carrying this when it is.
+    /// `` `Name [(when a)] [T] `` — a case a value may be, carrying this when
+    /// it is.
     Written {
-        optional: bool,
+        when: Option<Box<When>>,
         payload: Option<Type>,
     },
-    /// `` \`Name `` — the case is definitely absent. No payload and no `?`,
+    /// `` \`Name `` — the case is definitely absent. No payload and no `when`,
     /// exactly as [`TypeField::Absent`]: the map key's span covers the whole
     /// `` \`Name ``.
     Absent,
+}
+
+/// The `when` clause on one label of a written type: the name it binds a
+/// presence variable to.
+///
+/// Named rather than anonymous, which is the whole of what retired the old `?`.
+/// A presence a `where` clause has to be able to talk about needs a name, the
+/// way a type variable needs `'a`, and `?` gave every one of them the same
+/// nothing. `when _` is what the `?` used to be: a presence this definition
+/// decides and no formula may name.
+///
+/// The span covers the whole clause — the `when` and the name after it — which
+/// is what a complaint about the label's openness underlines.
+///
+/// Boxed where a label holds one, for the reason [`ExprKind::Let`] boxes its
+/// ascription: a clause is the rarest thing a label can carry and among the
+/// largest, so inlining one would grow every field of every written type to the
+/// size of the few that have one.
+#[derive(Debug, Clone)]
+pub struct When {
+    pub span: Span,
+    /// The name, or `None` for the anonymous `when _`.
+    pub name: Option<TrackedString>,
+}
+
+/// A `where` clause's formula, as written.
+///
+/// The surface grammar, loosest to tightest: `=` and `!=`, non-associative, at
+/// the top; then `or`, then `and`, then unary `not`, then parentheses and
+/// names. Nothing here is resolved — a name is the string it was written as,
+/// and whether the type binds it is [`ir`](crate::ir)'s to say.
+pub type Clause = Tracked<ClauseKind>;
+
+#[derive(Debug, Clone)]
+pub enum ClauseKind {
+    /// A presence variable, by the name a `when` in the same annotation bound
+    /// it to.
+    Name(String),
+    Not(Box<Clause>),
+    And(Box<Clause>, Box<Clause>),
+    Or(Box<Clause>, Box<Clause>),
+    /// `a = b` — both there or neither.
+    Equal(Box<Clause>, Box<Clause>),
+    /// `a != b` — exactly one of them there.
+    NotEqual(Box<Clause>, Box<Clause>),
+}
+
+/// A written type and the `where` clause that may follow it: what a definition
+/// is ascribed.
+///
+/// A wrapper rather than a node of [`TypeKind`], because a `where` is not a
+/// type: it ends one, once, at the outside. Nesting one would let a field's
+/// type carry a clause naming presences from another part of the annotation,
+/// which is a larger language than R3 describes.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub ty: Type,
+    /// The `where` clause, when one was written.
+    pub clause: Option<Clause>,
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -312,6 +381,17 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+}
+
+impl Annotation {
+    /// Where the whole annotation was written: the type, and the `where` clause
+    /// after it when there is one.
+    pub fn span(&self) -> Span {
+        match &self.clause {
+            Some(clause) => self.ty.span.merge(clause.span),
+            None => self.ty.span,
+        }
+    }
 }
 
 pub fn parse(toks: Vec<Token>) -> Output {
@@ -474,7 +554,7 @@ impl Parser {
         let kw = self.advance().expect("the caller peeked `let`");
         let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
-            Some(_) => Some(self.type_expr()?),
+            Some(_) => Some(self.annotation(true)?),
             None => None,
         };
         self.eat(&Kind::Equal)?;
@@ -512,8 +592,10 @@ impl Parser {
             return self.wildcard(Place::Type);
         }
         self.eat(&Kind::Equal)?;
-        let body = self.type_expr()?;
-        let span = kw.span.merge(body.span);
+        // Nothing follows a declaration's body, so a second comparison in a
+        // `where` written there is a chain however it is spelled.
+        let body = self.annotation(false)?;
+        let span = kw.span.merge(body.span());
         Some(span.track(StmtKind::Type { name, params, body }))
     }
 
@@ -727,7 +809,7 @@ impl Parser {
         let kw = self.advance().expect("the caller peeked `let`");
         let pattern = self.pattern()?;
         let ty = match self.eat_if(&Kind::Colon) {
-            Some(_) => Some(Box::new(self.type_expr()?)),
+            Some(_) => Some(Box::new(self.annotation(true)?)),
             None => None,
         };
         self.eat(&Kind::Equal)?;
@@ -938,6 +1020,197 @@ impl Parser {
         Some(args)
     }
 
+    /// Whether the token at `at` is the contextual keyword `word`.
+    ///
+    /// `when`, `where`, `or`, `and` and `not` are ordinary identifiers
+    /// everywhere but the few type positions that read them, so they are
+    /// recognized by spelling here rather than reserved by the lexer. That is
+    /// what keeps a term or a label called `when` writable: only the positions
+    /// below ask, and one token of lookahead is all any of them needs.
+    fn keyword_at(&self, at: usize, word: &str) -> bool {
+        matches!(
+            self.toks.get(at).map(|tok| &tok.tracked),
+            Some(Kind::Identifier(name)) if name == word
+        )
+    }
+
+    /// Whether the next token is the contextual keyword `word`.
+    fn at_keyword(&self, word: &str) -> bool {
+        self.keyword_at(self.pos, word)
+    }
+
+    /// Consume the next token if it is the contextual keyword `word`.
+    fn eat_keyword(&mut self, word: &str) -> Option<Token> {
+        match self.at_keyword(word) {
+            true => self.advance(),
+            false => None,
+        }
+    }
+
+    /// `<type> [where <clause>]` — what a definition is ascribed, and what a
+    /// `type` declaration's body is read as.
+    ///
+    /// The clause is read here and nowhere deeper: a `where` ends a whole
+    /// written type, once, so the names it may use are exactly the ones the
+    /// `when`s of that type bound. Which of them it actually names is
+    /// [`ir`](crate::ir)'s to check.
+    fn annotation(&mut self, defined: bool) -> Option<Annotation> {
+        let ty = self.type_expr()?;
+        let clause = match self.eat_keyword("where") {
+            Some(_) => Some(self.clause(defined)?),
+            None => None,
+        };
+        Some(Annotation { ty, clause })
+    }
+
+    /// `<or> [('='|'!=') <or>]` — the loosest level of a `where` clause, and
+    /// the one that does not associate: `a = b = c` is refused rather than
+    /// read one way or the other, since neither reading is what a person
+    /// writing it meant.
+    fn clause(&mut self, defined: bool) -> Option<Clause> {
+        let left = self.clause_or()?;
+        let equal = match self.peek().map(|tok| &tok.tracked) {
+            Some(Kind::Equal) => true,
+            Some(Kind::NotEqual) => false,
+            _ => return Some(left),
+        };
+        // A definition's own `=` follows its annotation, so an `=` here is
+        // either the clause's comparison or the one that introduces the value —
+        // and what tells them apart is that the clause's is followed by the
+        // definition's. Read speculatively and put back: `where a = b = v`
+        // compares, and `where a = v` is the clause `a` and then the value.
+        //
+        // `!=` needs none of this: nothing but a clause can hold one, so it is
+        // always the comparison.
+        let mark = (self.pos, self.errors.len());
+        self.advance();
+        if defined && equal {
+            let read = self
+                .clause_or()
+                .filter(|_| matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Equal)));
+            let Some(right) = read else {
+                self.pos = mark.0;
+                self.errors.truncate(mark.1);
+                return Some(left);
+            };
+            let span = left.span.merge(right.span);
+            return Some(span.track(ClauseKind::Equal(Box::new(left), Box::new(right))));
+        }
+        let right = self.clause_or()?;
+        let span = left.span.merge(right.span);
+        let kind = match equal {
+            true => ClauseKind::Equal(Box::new(left), Box::new(right)),
+            false => ClauseKind::NotEqual(Box::new(left), Box::new(right)),
+        };
+        // Non-associative: a second comparison after the first has no reading,
+        // so it is reported where it was written rather than folded in.
+        //
+        // With one exception, and it is not the grammar bending. A definition's
+        // own `=` follows its annotation, so in `let p: T where a != b = v` the
+        // `=` after the clause is the one that introduces the value — the
+        // clause has already ended, and there is nothing here to refuse. `!=`
+        // is never that, so a chain written with one is still reported wherever
+        // it appears.
+        let chained = match defined {
+            true => matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::NotEqual)),
+            false => matches!(
+                self.peek().map(|tok| &tok.tracked),
+                Some(Kind::Equal | Kind::NotEqual)
+            ),
+        };
+        if chained {
+            return self.unexpected();
+        }
+        Some(span.track(kind))
+    }
+
+    /// `<and> (or <and>)*`, left-associative.
+    fn clause_or(&mut self) -> Option<Clause> {
+        let mut left = self.clause_and()?;
+        while self.eat_keyword("or").is_some() {
+            let right = self.clause_and()?;
+            let span = left.span.merge(right.span);
+            left = span.track(ClauseKind::Or(Box::new(left), Box::new(right)));
+        }
+        Some(left)
+    }
+
+    /// `<not> (and <not>)*`, left-associative.
+    fn clause_and(&mut self) -> Option<Clause> {
+        let mut left = self.clause_not()?;
+        while self.eat_keyword("and").is_some() {
+            let right = self.clause_not()?;
+            let span = left.span.merge(right.span);
+            left = span.track(ClauseKind::And(Box::new(left), Box::new(right)));
+        }
+        Some(left)
+    }
+
+    /// `not <not>`, or an atom. Unary and stacking, so `not not a` reads.
+    fn clause_not(&mut self) -> Option<Clause> {
+        let Some(kw) = self.eat_keyword("not") else {
+            return self.clause_atom();
+        };
+        let inner = self.clause_not()?;
+        let span = kw.span.merge(inner.span);
+        Some(span.track(ClauseKind::Not(Box::new(inner))))
+    }
+
+    /// `( <clause> )` or a name. A `_` here is the wildcard's own complaint:
+    /// `when _` mints a presence no formula may name, so there is nothing for
+    /// a clause to be saying about it.
+    fn clause_atom(&mut self) -> Option<Clause> {
+        if let Some(open) = self.eat_if(&Kind::LeftParen) {
+            // Inside parentheses nothing follows the clause but the `)`, so a
+            // chain written there is a chain however the annotation ends.
+            let inner = self.clause(false)?;
+            let close = self.eat(&Kind::RightParen)?;
+            return Some(open.span.merge(close.span).track(inner.tracked));
+        }
+        if self.at_wildcard() {
+            return self.wildcard(Place::Type);
+        }
+        let name = self.ident()?;
+        Some(name.span.track(ClauseKind::Name(name.tracked)))
+    }
+
+    /// The `when` clause a label may wear, when one is written there.
+    ///
+    /// `parens` says whether the clause is bracketed, which is the one thing
+    /// the two positions differ in: a struct field writes it bare between the
+    /// label and the colon, and a sum case has no colon to end it, so it takes
+    /// parentheses. Both bind a name, and both allow `_`.
+    fn when(&mut self, parens: bool) -> Option<When> {
+        let open = match parens {
+            true => Some(self.eat(&Kind::LeftParen).expect("the caller peeked `(`")),
+            false => None,
+        };
+        let kw = self.eat_keyword("when").expect("the caller peeked `when`");
+        let mut span = match &open {
+            Some(open) => open.span.merge(kw.span),
+            None => kw.span,
+        };
+        // `when _` is the anonymous presence: this definition decides it, and
+        // no formula may name it.
+        let name = match self.at_wildcard() {
+            true => {
+                let discard = self.advance().expect("just peeked `_`");
+                span = span.merge(discard.span);
+                None
+            }
+            false => {
+                let name = self.ident()?;
+                span = span.merge(name.span);
+                Some(name)
+            }
+        };
+        if parens {
+            let close = self.eat(&Kind::RightParen)?;
+            span = span.merge(close.span);
+        }
+        Some(When { span, name })
+    }
+
     /// `<sum> [-> <type>]` — the arrow is right-associative, so
     /// `A -> B -> C` is `A -> (B -> C)`, and everything else binds tighter, so
     /// `Pair Nat Nat -> Nat` is `(Pair Nat Nat) -> Nat` and
@@ -1007,7 +1280,7 @@ impl Parser {
             if let Some(slash) = self.eat_if(&Kind::Backslash) {
                 // A `\` promises a case, so anything but a tag after it is
                 // reported — the case keeps its backtick, spelled the same
-                // way present or absent. No payload and no `?` either;
+                // way present or absent. No payload and no `when` either;
                 // whatever follows but a `|` is somebody else's token to
                 // refuse, exactly as it is after a written case's payload.
                 let Some(name) = self.tag() else {
@@ -1035,7 +1308,18 @@ impl Parser {
                     break;
                 };
                 span = span.merge(name.span);
-                let optional = self.eat_if(&Kind::Question).is_some();
+                // A case has no colon to end a bare `when`, so the clause takes
+                // parentheses — and two tokens of lookahead tell one from a
+                // parenthesized payload, since only the clause has `when`
+                // inside it.
+                let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
+                    true => {
+                        let when = self.when(true)?;
+                        span = span.merge(when.span);
+                        Some(Box::new(when))
+                    }
+                    false => None,
+                };
                 // What a case carries is one atom, which is the same rule
                 // [`tag_expr`](Self::tag_expr) keeps for a term: a tag carries
                 // one thing, and anything with a space in it takes parentheses.
@@ -1050,7 +1334,7 @@ impl Parser {
                     }
                     false => None,
                 };
-                cases.insert(name, SumCase::Written { optional, payload });
+                cases.insert(name, SumCase::Written { when, payload });
             }
 
             match self.eat_if(&Kind::Pipe) {
@@ -1096,6 +1380,14 @@ impl Parser {
     /// hole — and reading it here is what points the complaint at the `_`
     /// rather than at whatever follows the type.
     fn at_type_atom(&self) -> bool {
+        // `where` ends a written type rather than continuing it. It is an
+        // ordinary identifier everywhere else — the one position that reads it
+        // is this one, which is what "contextual" means here — so a type
+        // application stops in front of one instead of taking it as another
+        // argument.
+        if self.at_keyword("where") {
+            return false;
+        }
         matches!(
             self.peek(),
             Some(tok) if matches!(
@@ -1103,6 +1395,12 @@ impl Parser {
                 Kind::Identifier(_) | Kind::LeftBrace | Kind::LeftParen | Kind::Underscore
             )
         )
+    }
+
+    /// Whether the next token opens a parenthesis — the first half of the two
+    /// tokens a sum case's `when` clause is told apart by.
+    fn at_left_paren(&self) -> bool {
+        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::LeftParen))
     }
 
     /// A name, a struct, a parenthesized type, or `()`. Application is
@@ -1130,10 +1428,11 @@ impl Parser {
         }
     }
 
-    /// `{ <field>[?]: <type> | \<field>, ..., [..[<name>]] }` with an optional
-    /// trailing comma among the fields. The `?` marks a field that may or may
-    /// not be there; `\name` one that definitely is not, which takes no type
-    /// and no `?` — whatever follows it but a comma or the brace is the
+    /// `{ <field> [when <a>]: <type> | \<field>, ..., [..[<name>]] }` with an
+    /// optional trailing comma among the fields. A `when` names the presence
+    /// variable that says whether the field is there; `\name` says it definitely
+    /// is not, which takes no type and no `when` — whatever follows it but a
+    /// comma or the brace is the
     /// unexpected token it looks like, since nothing here reads one. The `..`
     /// tail, when present, comes last — the fields it stands for have no order
     /// among the named ones to claim — and takes no comma after it.
@@ -1166,10 +1465,16 @@ impl Parser {
                 fields.insert(key, TypeField::Absent);
             } else {
                 let name = self.ident()?;
-                let optional = self.eat_if(&Kind::Question).is_some();
+                // One token of lookahead is the whole disambiguation: after a
+                // field's name, a `when` can only be the clause, because
+                // `{when: Nat}` has already spent its `when` on the name.
+                let when = match self.at_keyword("when") {
+                    true => Some(Box::new(self.when(false)?)),
+                    false => None,
+                };
                 self.eat(&Kind::Colon)?;
                 let value = self.type_expr()?;
-                fields.insert(name, TypeField::Written { optional, value });
+                fields.insert(name, TypeField::Written { when, value });
             }
 
             // A comma separates fields; its absence ends the field list.

@@ -46,6 +46,7 @@ fn every_stage_reports_on_the_demo() {
             "constraints",
             "solve",
             "types",
+            "presence",
             "patterns",
             "symbols",
             "types-ir"
@@ -77,6 +78,7 @@ fn every_stage_reports_on_the_demo() {
             "Constraints",
             "Solve",
             "Types",
+            "Presence",
             "Patterns",
             "Symbols"
         ]
@@ -288,13 +290,13 @@ fn the_surface_prerequisites_reach_every_stage() {
     assert_eq!(labelled("tokens", "Dot"), ["."]);
 }
 
-/// The row forms — an optional field, and a named tail — checked through
+/// The row forms — a `when`-named presence, and a named tail — checked through
 /// every panel that renders them: the tokens they lex to, the field and tail
 /// rows of both trees, the constraint the projection becomes, and the scheme
 /// the definition ends with.
 #[test]
 fn rows_reach_every_stage() {
-    let source = "let f : { x?: Nat, y: Nat, ..r } -> Nat = fn p => p.y\n";
+    let source = "let f : { x when a: Nat, y: Nat, ..r } -> Nat = fn p => p.y\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -318,12 +320,20 @@ fn rows_reach_every_stage() {
     };
 
     assert_eq!(labelled("tokens", "DotDot"), [".."]);
-    assert_eq!(labelled("tokens", "Question"), ["?"]);
+    // `when` lexes as the ordinary identifier it is — contextual, not
+    // reserved — which is what keeps a term or a label of that name writable.
+    assert_eq!(
+        labelled("tokens", "Identifier"),
+        [
+            "f", "x", "when", "a", "Nat", "y", "Nat", "r", "Nat", "p", "p", "y"
+        ]
+    );
 
     for id in ["ast", "ir"] {
-        // The optional field is a row of the struct's like any other, wearing
-        // its `?` in the label; the tail is a row of its own.
-        assert_eq!(labelled(id, "x?:"), ["Nat"], "{id}");
+        // The field whose presence a `when` names is a row of the struct's like
+        // any other, wearing the clause in its label; the tail is a row of its
+        // own.
+        assert_eq!(labelled(id, "x when a:"), ["Nat"], "{id}");
         assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
     }
 
@@ -342,13 +352,14 @@ fn rows_reach_every_stage() {
     );
 
     // The scheme spells the quantified tail with its letter and keeps the
-    // field optional — nothing in the body decided `x` either way.
+    // field's presence a variable — nothing in the body decided `x` either way
+    // — printed as the `when` clause naming it in the presence alphabet.
     let types: Vec<&str> = stage("types")
         .nodes
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(types, ["{ x?: Nat, y: Nat, ..'a } -> Nat"]);
+    assert_eq!(types, ["{ x when a: Nat, y: Nat, ..'a } -> Nat"]);
 }
 
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps
@@ -780,13 +791,13 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
         )
     );
 
-    let narrowed = snapshot("let f : { x?: Nat, .. } -> Nat = fn p => p.x\n");
+    let narrowed = snapshot("let f : { x when a: Nat, .. } -> Nat = fn p => p.x\n");
     let [diagnostic] = narrowed.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", narrowed.diagnostics);
     };
     assert_eq!(diagnostic.code, "annotation-too-open");
     // Spanned at the annotation, which is the text the reader has to change.
-    assert_eq!(diagnostic.span, Some([8, 30]));
+    assert_eq!(diagnostic.span, Some([8, 36]));
 
     let flat = snapshot("let n = 1\nlet bad = n.x\n");
     let [diagnostic] = flat.diagnostics.as_slice() else {
@@ -1065,7 +1076,9 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     };
     assert_eq!(
         ids(true),
-        ["tokens", "ast", "ir", "types", "patterns", "symbols"]
+        [
+            "tokens", "ast", "ir", "types", "presence", "patterns", "symbols"
+        ]
     );
     assert_eq!(ids(false), ["constraints", "solve", "types-ir"]);
 }

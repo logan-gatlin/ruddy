@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{Assigned, Core, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
+    types::{Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
 };
 
 use super::{
@@ -225,9 +225,10 @@ impl Solve<'_> {
                     symbol,
                     bound,
                     level,
+                    promised,
                     value,
                     body,
-                } => self.bind_local(*symbol, bound, *level, value, body),
+                } => self.bind_local(*symbol, bound, *level, promised, value, body),
                 ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
             }
         }
@@ -256,12 +257,26 @@ impl Solve<'_> {
         symbol: Symbol,
         bound: &Rc<Ty>,
         level: u32,
+        promised: &Formula,
         value: &[Constraint],
         body: &[Constraint],
     ) {
         self.table.level = level;
         self.run(value);
-        let (scheme, _) = self.table.generalize(bound, level);
+        // A nested binding's scheme carries what the store requires of the
+        // presences it quantifies, exactly as a definition's does — a `let` in
+        // the middle of a body is generalized on the same terms as one at the
+        // top of a file. Which includes R10: an annotated binding publishes its
+        // annotation's clause and not what its value worked out, since the
+        // clause is the contract and the value has been held to it. Silent once
+        // something has flipped the store — the cascade rule, and what
+        // [`Table::required`](super::Table) does for the unannotated case.
+        let required = if !promised.is_true() && !self.table.unsat {
+            self.table.resolved(promised)
+        } else {
+            self.table.required(bound)
+        };
+        let (scheme, _) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
         self.schemes.insert(symbol, scheme);
@@ -281,7 +296,7 @@ impl Solve<'_> {
         // At the level of the use site, which is where the table is: a copy is
         // as new as the place it was made, whatever the scheme was generalized
         // at.
-        let copy = self.table.instantiate(&scheme);
+        let copy = self.table.instantiate(span, &scheme);
         self.unify(span, &copy, ty);
     }
 
@@ -828,7 +843,7 @@ impl Solve<'_> {
 
     /// A set of labels as it reads at this moment: every presence fixed at what
     /// it has been decided to be — still open becomes undecided, which prints as
-    /// the `?` the user would have written and which nothing downstream will
+    /// the mark the user would have written and which nothing downstream will
     /// rewrite — and the whole put back into the type the labels belong to.
     ///
     /// Already flattened by the time it arrives: [`Solve::labels`] is handed a

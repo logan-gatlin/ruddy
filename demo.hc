@@ -48,7 +48,18 @@ let dot = getx { x: 3, y: 4 }
 
 let open : { small: Nat, ..extra } -> Nat = fn s => s.small
 
-let opt : { label?: Nat, value: Nat, .. } -> Nat = fn r => r.value
+let opt : { label when a: Nat, value: Nat, .. } -> Nat = fn r => r.value
+
+let either = fn v => match v with
+  | {x} => {}
+  | {y} => {}
+end
+
+let both : { x when a: Nat, y when b: Nat } -> {} where a = b = fn v =>
+  match v with
+    | {x, y} => {}
+    | {} => {}
+  end
 
 type Option T = `Some T | `None
 

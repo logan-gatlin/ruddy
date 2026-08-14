@@ -8,10 +8,13 @@ use crate::{
     ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::{Span, Tracked},
-    types::{Core, Presence, Rest, Row, RowField, Scheme, Ty, TyVar},
+    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty, TyVar},
 };
 
-use super::{Annotated, Binding, Constraint, ConstraintKind, Table, lower_type, same_field_set};
+use super::{
+    Annotated, Binding, Constraint, ConstraintKind, Coverage, Named, Origin, Table,
+    lower_annotation, same_field_set,
+};
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
 pub struct Constrain<'a> {
@@ -57,6 +60,77 @@ struct Columns<'a> {
     matrix: ir::Matrix,
     patterns: Vec<&'a ir::Pattern>,
     at: Span,
+}
+
+/// What one column contributes to the covered set: the conjunction of presence
+/// literals each arm demands at this position and everywhere below it, by arm.
+///
+/// `None` when the column does not qualify — see R6. Which is not the same as
+/// an empty map: a column of nothing but binders qualifies and contributes
+/// nothing, which is the formula that is always true and the reason such a
+/// column leaves the match exhaustive.
+///
+/// Only the arms that reach the position are keyed. An arm that never gets here
+/// — a field it did not mention — says nothing about it, and the enclosing
+/// disjunct is where its own literals already are.
+type Cover = Option<IndexMap<usize, Formula>>;
+
+/// The covered set of one qualifying column: one disjunct per arm that reaches
+/// it, as R6 defines them.
+///
+/// An exact column's universe is the closed field set — every label anything in
+/// the column mentions — so an arm that does *not* mention one of them is
+/// saying it is not there, and the literal is negated. An open column claims
+/// nothing about what it did not mention, so only the positives go in. Either
+/// way a nested qualifying sub-pattern's literals join the same conjunction:
+/// `{x: {a}}` covers "an `x`, no `y`, and an `a` inside the `x`", which is one
+/// disjunct rather than two constraints.
+///
+/// A binder or a wildcard covers the position outright, which is the empty
+/// conjunction — and a disjunction with that in it is [`Formula::True`], so a
+/// column with one emits nothing, exactly as R6 says.
+fn covered(
+    entries: &[(usize, Col)],
+    named: &IndexMap<String, RowField>,
+    nested: &IndexMap<String, IndexMap<usize, Formula>>,
+    exact: bool,
+) -> IndexMap<usize, Formula> {
+    let mut out = IndexMap::new();
+    for (arm, entry) in entries {
+        let mentioned: Vec<&str> = match entry {
+            // A bare tag's payload demands unit, which is the exact struct
+            // naming no fields — the same reading `()` gets.
+            Col::Unit => Vec::new(),
+            Col::Pattern(pattern) => match &pattern.tracked {
+                ir::PatternKind::Unit => Vec::new(),
+                ir::PatternKind::Struct { fields, .. } => {
+                    fields.keys().map(String::as_str).collect()
+                }
+                // A binder or a wildcard: nothing is demanded here, so the
+                // conjunction is empty and the arm covers whatever reaches it.
+                _ => {
+                    out.insert(*arm, Formula::True);
+                    continue;
+                }
+            },
+        };
+        let here = named.iter().filter_map(|(name, field)| {
+            let literal = field.presence.formula();
+            match (mentioned.contains(&name.as_str()), exact) {
+                (true, _) => Some(literal),
+                (false, true) => Some(literal.not()),
+                (false, false) => None,
+            }
+        });
+        // Indexed rather than looked up: a column only reaches here having
+        // qualified, and qualifying is every sub-position answering, so every
+        // field mentioned anywhere in it has an entry.
+        let below = mentioned
+            .iter()
+            .filter_map(|name| nested[*name].get(arm).cloned());
+        out.insert(*arm, Formula::all(here.chain(below)));
+    }
+    out
 }
 
 impl Constrain<'_> {
@@ -113,7 +187,7 @@ impl Constrain<'_> {
                 // is the contract, so the value is checked against it and the
                 // recursive uses the annotation exists for are checked against
                 // it too; without one it is a variable the value decides.
-                let bound = match annotation {
+                let (bound, promised) = match annotation {
                     Some(annotation) => {
                         // The variables it minted are counted off, so that an
                         // annotation the value went on to decide can be
@@ -122,19 +196,32 @@ impl Constrain<'_> {
                         // about what any of them has been solved to, which is
                         // the invariant this pass keeps.
                         let from = self.table.vars.len() as TyVar;
-                        let bound = lower_type(self.mint, self.table, annotation);
+                        let (bound, formula, names) =
+                            lower_annotation(self.mint, self.table, annotation);
+                        // The clause is the contract, said in the store: what a
+                        // use of this name sees, and what the value under it is
+                        // held to. See R10.
+                        if !formula.is_true() {
+                            let origin = Origin::Annotation(Named {
+                                labels: names.clone(),
+                            });
+                            self.table
+                                .require(annotation.ty.span, origin, formula.clone());
+                        }
                         // A synthetic annotation — a pattern's exact demand —
                         // is meant to be decided, so it makes no promise for
                         // the too-open check to hold the value to.
-                        if !super::synthetic(annotation) {
+                        if !super::synthetic(&annotation.ty) {
                             self.annotated.push(Annotated {
-                                span: annotation.span,
+                                span: annotation.ty.span,
                                 opened: from..self.table.vars.len() as TyVar,
+                                promised: formula.clone(),
+                                names,
                             });
                         }
-                        bound
+                        (bound, formula)
                     }
-                    None => self.table.fresh_type(),
+                    None => (self.table.fresh_type(), Formula::True),
                 };
                 // Monomorphically, the same rule a binding group follows: a use
                 // of the name inside its own value is the one type being
@@ -162,6 +249,7 @@ impl Constrain<'_> {
                         symbol: name.tracked,
                         bound,
                         level,
+                        promised,
                         value: required,
                         body: rest,
                     },
@@ -171,8 +259,18 @@ impl Constrain<'_> {
                 body.ty.clone()
             }
             TermKind::Apply { func, arg } => {
+                let opened = self.table.store.batches.len();
                 self.infer_term(func);
+                let at = func.span;
                 self.infer_term(arg);
+                // A constrained scheme opened by the function is a demand on
+                // the argument: what the function requires among its fields is
+                // required of the value written here, so that is where a
+                // violation belongs. Only the batches still carrying the
+                // function's own span move — the ones an inner application
+                // already aimed at its own argument are already where they
+                // belong.
+                self.table.aim(opened, at, arg.span);
                 let applied = func.ty.clone();
                 // Through a name, so that something annotated `Endo` is
                 // applied as the arrow it stands for. The arrow the arm then
@@ -332,7 +430,30 @@ impl Constrain<'_> {
                             .enumerate()
                             .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
                             .collect();
-                        self.position(&columns, &mut Vec::new(), &root)
+                        let (demand, cover) = self.position(&columns, &mut Vec::new(), &root);
+                        // The column-to-constraint conversion, R6: what the
+                        // arms between them cover, as a formula over the
+                        // presences the demand just minted. Emitted for the
+                        // whole match rather than per position — a nested
+                        // column's literals are already inside the enclosing
+                        // arm's disjunct.
+                        if let Some(cover) = cover {
+                            let arms: Vec<Formula> = (0..arms.len())
+                                .map(|arm| cover.get(&arm).cloned().unwrap_or(Formula::True))
+                                .collect();
+                            let fields = demand
+                                .fields
+                                .iter()
+                                .map(|(name, field)| (name.clone(), field.presence.clone()))
+                                .collect();
+                            let formula = Formula::any(arms.clone());
+                            self.table.require(
+                                span,
+                                Origin::Coverage(Coverage { arms, fields }),
+                                formula,
+                            );
+                        }
+                        demand
                     }
                 };
                 let actual = scrutinee.ty.clone();
@@ -392,11 +513,18 @@ impl Constrain<'_> {
         columns: &Columns,
         path: &mut Vec<ir::Step>,
         entries: &[(usize, Col)],
-    ) -> Rc<Ty> {
+    ) -> (Rc<Ty>, Cover) {
         let mut binds: Vec<(usize, Tracked<Symbol>)> = Vec::new();
         let mut naturals = false;
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
+        // Whether the column qualifies for coverage-to-constraint conversion:
+        // every entry a struct, unit, binder or wildcard, and the struct
+        // entries not a mix of exact and `..`-open. A tag or a natural test is
+        // a gap that is not propositional over finitely many presences, so a
+        // column with one keeps today's behaviour end to end.
+        let mut qualifies = true;
+        let mut exacts = false;
         // Whether any struct or unit pattern tests the position at all, and —
         // for the closure rule — whether every entry is an exact one. `()`
         // and `{}` are one pattern, the exact struct naming no fields, so a
@@ -406,7 +534,10 @@ impl Constrain<'_> {
         let mut exact = true;
         for (arm, entry) in entries {
             match entry {
-                Col::Unit => structs = true,
+                Col::Unit => {
+                    structs = true;
+                    exacts = true;
+                }
                 Col::Pattern(pattern) => match &pattern.tracked {
                     ir::PatternKind::Bind(name) => {
                         binds.push((*arm, *name));
@@ -417,10 +548,14 @@ impl Constrain<'_> {
                     // counts it among the binds — and there is no name here
                     // for any environment to learn.
                     ir::PatternKind::Wildcard => exact = false,
-                    ir::PatternKind::Unit => structs = true,
+                    ir::PatternKind::Unit => {
+                        structs = true;
+                        exacts = true;
+                    }
                     ir::PatternKind::Natural(_) => {
                         naturals = true;
                         exact = false;
+                        qualifies = false;
                     }
                     ir::PatternKind::Tag { name, payload } => {
                         let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
@@ -428,14 +563,16 @@ impl Constrain<'_> {
                             .or_default()
                             .push((*arm, payload));
                         exact = false;
+                        qualifies = false;
                     }
                     ir::PatternKind::Struct {
                         fields: named,
                         rest,
                     } => {
                         structs = true;
-                        if rest.is_some() {
-                            exact = false;
+                        match rest.is_some() {
+                            true => exact = false,
+                            false => exacts = true,
                         }
                         for (name, field) in named {
                             fields
@@ -447,12 +584,29 @@ impl Constrain<'_> {
                 },
             }
         }
+        // An exact entry says the value has exactly these fields, which is a
+        // claim about the *rest* — the fields nobody named — as much as about
+        // the ones it names. That is only propositional over finitely many
+        // presences where the whole column is exact and the demand closes over
+        // its own field set; beside anything that leaves the row open — another
+        // arm's `..`, a binder, a wildcard — the claim reaches fields no
+        // formula has a variable for. So a column with an exact entry qualifies
+        // only when every entry is one, and a column with none qualifies
+        // whatever else is in it.
+        if exacts && !exact {
+            qualifies = false;
+        }
         // Whether an arm is irrefutable here — a binder at or above, or a
         // catch-all arm — which is what decides whether the row closes. Read
         // off the matrix rather than tracked down the recursion, so this and
         // the lowering checks answer from one place.
         let open = columns.matrix.open(path);
         let mut demands: Vec<Rc<Ty>> = Vec::new();
+        // The demand's own fields, and what each sub-column covers per arm:
+        // the two halves the covered set is built from, kept out here because
+        // a column with no struct entry has neither and still has to answer.
+        let mut named: IndexMap<String, RowField> = IndexMap::new();
+        let mut nested: IndexMap<String, IndexMap<usize, Formula>> = IndexMap::new();
         // The listed cases, kept beside their row's rest for the binder views
         // below: a view is the same labels re-read, not a second demand.
         let mut listed: Option<(IndexMap<String, RowField>, Rest)> = None;
@@ -460,7 +614,9 @@ impl Constrain<'_> {
             let mut labels = IndexMap::new();
             for (name, payloads) in &tags {
                 path.push(ir::Step::Payload(name.to_string()));
-                let payload = self.position(columns, path, payloads);
+                // A tag already disqualified this column, so the sub-column's
+                // own coverage has nobody to contribute to.
+                let (payload, _) = self.position(columns, path, payloads);
                 path.pop();
                 labels.insert(name.to_string(), RowField::present(payload));
             }
@@ -493,11 +649,19 @@ impl Constrain<'_> {
             // fresh core with the projection's lacks note, asking only for
             // the named fields' presences.
             let total = entries.len();
-            let mut named = IndexMap::new();
             for (name, subs) in &fields {
                 path.push(ir::Step::Field(name.to_string()));
-                let field = self.position(columns, path, subs);
+                let (field, sub) = self.position(columns, path, subs);
                 path.pop();
+                // Every tested sub-position has to qualify too: a column whose
+                // fields hide a natural test hides a gap that is not
+                // propositional, however plain the fields above it look.
+                match sub {
+                    Some(sub) => {
+                        nested.insert(name.to_string(), sub);
+                    }
+                    None => qualifies = false,
+                }
                 let presence = match subs.len() == total {
                     true => Presence::Present,
                     false => self.table.fresh_presence(),
@@ -516,7 +680,7 @@ impl Constrain<'_> {
             };
             let ty = Rc::new(Ty {
                 core,
-                fields: named,
+                fields: named.clone(),
             });
             self.table.note_lacks(&ty);
             demands.push(ty);
@@ -528,6 +692,10 @@ impl Constrain<'_> {
         for also in demands {
             self.checks(columns.at, &also, &ty);
         }
+        let cover = match qualifies {
+            false => None,
+            true => Some(covered(entries, &named, &nested, exact)),
+        };
         for (arm, binder) in binds {
             let view = match &listed {
                 // The refinement: every case the arms above this one fully
@@ -559,7 +727,7 @@ impl Constrain<'_> {
             };
             self.env.insert(binder.tracked, Binding::Mono(view));
         }
-        ty
+        (ty, cover)
     }
 
     /// Check `term` against a type the context already knows. Checking pushes
@@ -570,7 +738,7 @@ impl Constrain<'_> {
     ///
     /// `expected` is always a written type: it starts at an annotation and
     /// only ever loses an arrow or a field on the way down. The variables a
-    /// written type can mention — a tail, a `?` field — arrive fresh from
+    /// written type can mention — a tail, a `when` field — arrive fresh from
     /// [`lower_type`] and unbound, so checking matches on what was literally
     /// written and, like the rest of generation, never has to ask the table
     /// anything.
@@ -663,7 +831,7 @@ impl Constrain<'_> {
         // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
             Binding::Mono(ty) => ty,
-            Binding::Poly(scheme) => self.table.instantiate(&scheme),
+            Binding::Poly(scheme) => self.table.instantiate(span, &scheme),
             // The scheme is not written yet, so the walk says what this use is
             // rather than what it has: a fresh copy of whatever the enclosing
             // [`ConstraintKind::Let`] publishes. Which keeps the invariant this

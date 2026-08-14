@@ -4,8 +4,8 @@
 //! the rendered source can never drift apart: they are the same printer.
 
 use ruddy::parse::{
-    ArgKind, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField,
-    TypeKind,
+    Annotation, ArgKind, Clause, ClauseKind, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind,
+    SumCase, Type, TypeField, TypeKind, When,
 };
 
 use crate::{
@@ -51,7 +51,7 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             // goes on the type's own node rather than on a wrapper around it: a
             // wrapper would carry the same text and the same span one row up.
             if let Some(ty) = ty {
-                let mut ascribed = type_node(ids, ty);
+                let mut ascribed = annotation_node(ids, ty);
                 ascribed.label = format!("Ascribed {}", ascribed.label);
                 let_node = let_node.child(ascribed);
             }
@@ -69,7 +69,7 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
                 type_node_ = type_node_
                     .child(Node::new(ids.next(), "Param", param.tracked.clone()).at(param.span));
             }
-            type_node_.child(type_node(ids, body))
+            type_node_.child(annotation_node(ids, body))
         }
     }
 }
@@ -112,7 +112,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             }
             .child(pattern_node(ids, pattern));
             if let Some(ty) = ty {
-                let mut ascribed = type_node(ids, ty);
+                let mut ascribed = annotation_node(ids, ty);
                 ascribed.label = format!("Ascribed {}", ascribed.label);
                 let_node = let_node.child(ascribed);
             }
@@ -254,6 +254,61 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
     }
 }
 
+/// The `when` clause a label wears, as the row's label shows it: nothing when
+/// the label is simply there, and the clause as written otherwise.
+fn when_text(when: &Option<Box<When>>) -> String {
+    match when {
+        None => String::new(),
+        Some(when) => match &when.name {
+            Some(name) => format!(" when {}", name.tracked),
+            None => " when _".to_string(),
+        },
+    }
+}
+
+/// One written ascription: the type, and — when one was written — the `where`
+/// clause beside it, as a row of its own.
+///
+/// The clause is a sibling of the type rather than a child, because that is
+/// what it is: it constrains the presences the type's `when`s bound, and
+/// burying it under the type would say it was part of one.
+fn annotation_node(ids: &mut Ids, annotation: &Annotation) -> Node {
+    let node = type_node(ids, &annotation.ty);
+    match &annotation.clause {
+        Some(clause) => {
+            let row = Node::new(ids.next(), "Where", clause_text(clause)).at(clause.span);
+            node.child(row.children(clause_kids(ids, clause)))
+        }
+        None => node,
+    }
+}
+
+/// One clause as the source it was written from — through the shared printer,
+/// so the row and the type's own text cannot spell one clause two ways.
+fn clause_text(clause: &Clause) -> String {
+    print::ast::clause(&clause.tracked).to_string()
+}
+
+/// The parts of a clause, each a row of its own, so a reader can cross-
+/// highlight the name a formula uses against the `when` that bound it.
+fn clause_kids(ids: &mut Ids, clause: &Clause) -> Vec<Node> {
+    let parts: Vec<&Clause> = match &clause.tracked {
+        ClauseKind::Name(_) => Vec::new(),
+        ClauseKind::Not(inner) => vec![inner],
+        ClauseKind::And(left, right)
+        | ClauseKind::Or(left, right)
+        | ClauseKind::Equal(left, right)
+        | ClauseKind::NotEqual(left, right) => vec![left, right],
+    };
+    parts
+        .into_iter()
+        .map(|part| {
+            let row = Node::new(ids.next(), "", clause_text(part)).at(part.span);
+            row.children(clause_kids(ids, part))
+        })
+        .collect()
+}
+
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
@@ -261,8 +316,8 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             let mut kids: Vec<Node> = fields
                 .iter()
                 .map(|(name, field)| match field {
-                    TypeField::Written { optional, value } => {
-                        let mark = if *optional { "?" } else { "" };
+                    TypeField::Written { when, value } => {
+                        let mark = when_text(when);
                         Node::new(
                             ids.next(),
                             format!("{}{mark}:", name.tracked),
@@ -297,8 +352,8 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             let mut kids: Vec<Node> = cases
                 .iter()
                 .map(|(name, case)| match case {
-                    SumCase::Written { optional, payload } => {
-                        let mark = if *optional { "?" } else { "" };
+                    SumCase::Written { when, payload } => {
+                        let mark = when_text(when);
                         let text = payload
                             .as_ref()
                             .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());

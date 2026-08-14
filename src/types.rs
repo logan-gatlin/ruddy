@@ -115,10 +115,73 @@ pub enum ParamKind {
     Cases { lacks: IndexSet<String> },
 }
 
+/// One variable a [`Formula`] names: one the solver still owns, or one a
+/// [`Scheme`] quantified.
+///
+/// The same two readings [`Presence::Var`] and [`Presence::Bound`] have, and
+/// for the same reason — a formula is a statement about presences, so it names
+/// them the way a type does. One value rather than two variants of [`Formula`]
+/// so that walking, evaluating and printing a formula each ask about an atom
+/// once instead of once per reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Atom {
+    Var(TyVar),
+    Bound(u32),
+}
+
+/// A propositional formula over presence variables: what a type says about
+/// *which combinations* of its labels may be there, over and above what each
+/// label says on its own.
+///
+/// `{x when a: 'a, y when b: 'b} -> {}` says each of `x` and `y` may or may not
+/// be there and nothing about the two together; the same type `where a != b`
+/// says exactly one of them is. No unconstrained type says that, which is the
+/// whole reason this exists — see the `presence-sat` spec's motivation.
+///
+/// A tree rather than a normal form, because it is written as one: the surface
+/// `where` grammar has `=`, `!=`, `or`, `and` and `not`, and an annotation that
+/// re-parses as itself has to keep them. [`Formula::canonical`] is where a
+/// normal form is taken, once, at generalization.
+///
+/// The constructors below simplify as they build — `and` with [`Formula::True`]
+/// is the other side — so the common case of a formula that says nothing is the
+/// value `True` rather than a tree of trues to be recognized later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Formula {
+    /// The constraint that says nothing. A scheme carrying this prints with no
+    /// `where` clause at all.
+    True,
+    /// The constraint nothing satisfies. Never written; what conjoining two
+    /// batches that contradict each other comes to.
+    False,
+    Atom(Atom),
+    Not(Rc<Formula>),
+    And(Rc<Formula>, Rc<Formula>),
+    Or(Rc<Formula>, Rc<Formula>),
+    /// `a = b` — both there or neither.
+    Iff(Rc<Formula>, Rc<Formula>),
+    /// `a != b` — exactly one of them there.
+    Xor(Rc<Formula>, Rc<Formula>),
+}
+
+/// A type closed over the variables it binds, and what it requires of the
+/// presences among them.
+///
+/// Two numberings rather than one, because the two print in two alphabets: a
+/// type or a row variable is `'a`, and a presence is the bare `a` of a `when`
+/// clause. Sharing one index space would leave a visible gap — the scheme of
+/// `{x when a: Nat} -> 'a` should not call its one type variable `'b` — so
+/// [`Core::Bound`] and [`Rest::Bound`] index `count` while [`Presence::Bound`]
+/// and [`Atom::Bound`] index `presences`.
 #[derive(Debug, Clone)]
 pub struct Scheme {
     count: u32,
+    presences: u32,
     body: Rc<Ty>,
+    /// What has to hold of the presences this scheme quantifies. A constrained
+    /// scheme in the HM(X) sense: instantiating one conjoins this, with fresh
+    /// variables substituted for the bound ones, into the constraint store.
+    formula: Formula,
 }
 
 /// A type: what it is, and the struct fields it carries.
@@ -208,7 +271,7 @@ pub enum Core {
     ///
     /// The arguments are the exception to that, and the one thing about this
     /// variant a walk may not skip. A body holds no solver variable — lowering
-    /// refuses a `..` or a `?` in a declaration for exactly that reason — but
+    /// refuses a `..` or a `when` in a declaration for exactly that reason — but
     /// `args` is written at the use site and holds whatever that site had. So
     /// every walk stops at the body and descends into the arguments: see
     /// [`Table::occurs`](crate::inference), which does both in one pass.
@@ -334,7 +397,7 @@ pub struct RowField {
 /// A type of its own, so that "there", "not there" and "still being decided"
 /// are the only three answers a field can have and nothing has to say in prose
 /// that no other type may be written here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Presence {
     Present,
     /// The label is definitely not there. Written as `\name` in a struct type
@@ -343,9 +406,11 @@ pub enum Presence {
     /// a closed one that lacks the label.
     Absent,
     Var(TyVar),
-    /// A presence a scheme quantified, which prints as the `?` on its label.
+    /// A presence a scheme quantified, which prints as the `when` clause on its
+    /// label: `{x when a: Nat}`, and `` `A (when a) Nat ``.
     Bound(u32),
-    /// A failure abandoned the question, or a reporter froze it.
+    /// A failure abandoned the question, or a reporter froze it. The one
+    /// presence that still prints as a `?`, and no syntax reads one back.
     #[default]
     Undecided,
 }
@@ -441,20 +506,6 @@ impl Assigned {
                 _ => ty.cases(),
             },
             Assigned::Presence(_) => Row::closed(),
-        }
-    }
-
-    /// This value read as a presence: a presence outright, or the variable a
-    /// scheme's fresh one arrives as. Anything else is undecided, for the
-    /// reason [`as_ty`](Self::as_ty) gives.
-    pub fn as_presence(&self) -> Presence {
-        match self {
-            Assigned::Presence(presence) => presence.clone(),
-            Assigned::Ty(ty) => match (&ty.core, ty.fields.is_empty()) {
-                (Core::Var(var), true) => Presence::Var(*var),
-                _ => Presence::Undecided,
-            },
-            Assigned::Row(_) => Presence::Undecided,
         }
     }
 
@@ -560,27 +611,230 @@ impl RowField {
 }
 
 impl Scheme {
-    /// Close `body` over the variables it binds. Every [`Core::Bound`],
-    /// [`Rest::Bound`] and [`Presence::Bound`] in `body` must be an index below
-    /// `count`; opening one trusts that.
+    /// Close `body` over the type and row variables it binds, requiring nothing
+    /// of its presences. Every [`Core::Bound`] and [`Rest::Bound`] in `body`
+    /// must be an index below `count`; opening one trusts that.
     ///
     /// Two things are closed this way and the difference is only in who
     /// supplies the values: a definition's scheme binds what generalization
     /// quantified, and instantiation hands each one a fresh variable; a
     /// declaration's binds its parameters, and unfolding hands each one the
     /// argument written at the use site. See [`Core::Bound`].
+    ///
+    /// A declaration's scheme is always one of these: a declaration's body
+    /// holds no presence variable — lowering refuses a `when` there for the
+    /// reason it refuses a `..` — so there is nothing for it to quantify or to
+    /// require.
     pub fn new(count: u32, body: Rc<Ty>) -> Self {
-        Self { count, body }
+        Self {
+            count,
+            presences: 0,
+            body,
+            formula: Formula::True,
+        }
     }
 
-    /// How many variables the scheme quantifies. Zero means the type is
-    /// monomorphic and instantiation returns the body unchanged.
+    /// [`new`](Self::new) with the presences a definition's generalization
+    /// quantified, and what it requires of them.
+    pub fn constrained(count: u32, presences: u32, body: Rc<Ty>, formula: Formula) -> Self {
+        Self {
+            count,
+            presences,
+            body,
+            formula,
+        }
+    }
+
+    /// How many type and row variables the scheme quantifies. Zero means the
+    /// type is monomorphic in those and instantiation copies nothing.
     pub fn count(&self) -> u32 {
         self.count
     }
 
+    /// How many presence variables the scheme quantifies — its own alphabet,
+    /// for the reason [`Scheme`] gives.
+    pub fn presences(&self) -> u32 {
+        self.presences
+    }
+
     pub fn body(&self) -> &Rc<Ty> {
         &self.body
+    }
+
+    /// What has to hold of the presences this scheme quantifies.
+    pub fn formula(&self) -> &Formula {
+        &self.formula
+    }
+}
+
+impl Formula {
+    /// The formula naming one solver variable.
+    pub fn var(var: TyVar) -> Self {
+        Formula::Atom(Atom::Var(var))
+    }
+
+    /// The formula naming one variable a scheme quantified.
+    pub fn bound(index: u32) -> Self {
+        Formula::Atom(Atom::Bound(index))
+    }
+
+    /// Whether this formula says nothing, and so writes no `where` clause.
+    pub fn is_true(&self) -> bool {
+        matches!(self, Formula::True)
+    }
+
+    /// The negation, with the two constants and a double negative folded away.
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(self) -> Self {
+        match self {
+            Formula::True => Formula::False,
+            Formula::False => Formula::True,
+            Formula::Not(inner) => (*inner).clone(),
+            other => Formula::Not(Rc::new(other)),
+        }
+    }
+
+    /// Both, with the constants folded away — which is what makes "says
+    /// nothing" the value [`Formula::True`] rather than a tree of them.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Formula::False, _) | (_, Formula::False) => Formula::False,
+            (Formula::True, kept) | (kept, Formula::True) => kept,
+            (left, right) => Formula::And(Rc::new(left), Rc::new(right)),
+        }
+    }
+
+    /// Either, folded the same way.
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Formula::True, _) | (_, Formula::True) => Formula::True,
+            (Formula::False, kept) | (kept, Formula::False) => kept,
+            (left, right) => Formula::Or(Rc::new(left), Rc::new(right)),
+        }
+    }
+
+    /// Both or neither: what `a = b` says.
+    pub fn iff(self, other: Self) -> Self {
+        Formula::Iff(Rc::new(self), Rc::new(other))
+    }
+
+    /// Exactly one: what `a != b` says.
+    pub fn xor(self, other: Self) -> Self {
+        Formula::Xor(Rc::new(self), Rc::new(other))
+    }
+
+    /// Every one of them, left to right.
+    pub fn all(parts: impl IntoIterator<Item = Self>) -> Self {
+        parts.into_iter().fold(Formula::True, Formula::and)
+    }
+
+    /// Any one of them, left to right.
+    pub fn any(parts: impl IntoIterator<Item = Self>) -> Self {
+        parts.into_iter().fold(Formula::False, Formula::or)
+    }
+
+    /// Every atom this formula names, in the order it first names them.
+    /// First-appearance order is what decides the printed alphabet, so it is
+    /// what the walk preserves.
+    pub fn atoms(&self, out: &mut Vec<Atom>) {
+        match self {
+            Formula::True | Formula::False => {}
+            Formula::Atom(atom) => {
+                if !out.contains(atom) {
+                    out.push(*atom);
+                }
+            }
+            Formula::Not(inner) => inner.atoms(out),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                left.atoms(out);
+                right.atoms(out);
+            }
+        }
+    }
+
+    /// Whether this formula holds when each atom is read by `assign`.
+    pub fn eval(&self, assign: &dyn Fn(Atom) -> bool) -> bool {
+        match self {
+            Formula::True => true,
+            Formula::False => false,
+            Formula::Atom(atom) => assign(*atom),
+            Formula::Not(inner) => !inner.eval(assign),
+            Formula::And(left, right) => left.eval(assign) && right.eval(assign),
+            Formula::Or(left, right) => left.eval(assign) || right.eval(assign),
+            Formula::Iff(left, right) => left.eval(assign) == right.eval(assign),
+            Formula::Xor(left, right) => left.eval(assign) != right.eval(assign),
+        }
+    }
+
+    /// One formula with each atom replaced by what `of` makes of it, rebuilt
+    /// through the constructors so the constants fold on the way out.
+    ///
+    /// The one walk every substitution over a formula goes through — opening a
+    /// scheme's, reading one through what the solve decided, and quantifying
+    /// one into a scheme — so there is one place for a connective to be handled
+    /// and no way for three copies to disagree about `Iff`.
+    pub fn substitute(&self, of: &dyn Fn(Atom) -> Formula) -> Self {
+        match self {
+            Formula::True => Formula::True,
+            Formula::False => Formula::False,
+            Formula::Atom(atom) => of(*atom),
+            Formula::Not(inner) => inner.substitute(of).not(),
+            Formula::And(left, right) => left.substitute(of).and(right.substitute(of)),
+            Formula::Or(left, right) => left.substitute(of).or(right.substitute(of)),
+            Formula::Iff(left, right) => left.substitute(of).iff(right.substitute(of)),
+            Formula::Xor(left, right) => left.substitute(of).xor(right.substitute(of)),
+        }
+    }
+
+    /// [`substitute`](Self::substitute) over the *solver's* variables alone: a
+    /// variable a scheme quantified is left where it stands.
+    ///
+    /// What both readers of a store want. Following a variable to what the
+    /// solve decided it is, and numbering one into the scheme being
+    /// generalized, are the same walk over the same half of the atoms — and
+    /// neither has anything to say about a quantified one, since a store is
+    /// written about variables that exist.
+    pub fn rename(&self, of: &dyn Fn(TyVar) -> Formula) -> Self {
+        self.substitute(&|atom| match atom {
+            Atom::Var(var) => of(var),
+            Atom::Bound(index) => Formula::bound(index),
+        })
+    }
+
+    /// Replace each variable a scheme bound with what instantiation minted for
+    /// it — the formula half of [`Ty::open`], and the whole of what
+    /// "instantiating a constrained scheme conjoins its formula with fresh
+    /// variables substituted for bound ones" means.
+    ///
+    /// A presence that has already been decided folds to a constant: a label
+    /// certainly there satisfies every literal about it, and one certainly not
+    /// there satisfies none. A presence nothing knows anything about claims
+    /// nothing, which is [`Formula::True`] — the same answer the undecided type
+    /// gives every question.
+    pub fn open(&self, presences: &[Presence]) -> Self {
+        self.substitute(&|atom| match atom {
+            Atom::Var(var) => Formula::var(var),
+            Atom::Bound(index) => presences[index as usize].formula(),
+        })
+    }
+}
+
+impl Presence {
+    /// This presence read as a formula: what a literal about the label says.
+    pub fn formula(&self) -> Formula {
+        match self {
+            Presence::Present => Formula::True,
+            Presence::Absent => Formula::False,
+            Presence::Var(var) => Formula::var(*var),
+            Presence::Bound(index) => Formula::bound(*index),
+            // A failure abandoned the question, so there is nothing here to
+            // require — and requiring anything would be the first complaint
+            // said again in a second place.
+            Presence::Undecided => Formula::True,
+        }
     }
 }
 
