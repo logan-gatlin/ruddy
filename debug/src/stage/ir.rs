@@ -8,10 +8,10 @@ use ruddy::{
     inference,
     ir::{
         Annotation, Clause, ClauseKind, Decl, Pattern, PatternKind, Row, SumCase, Tail, Term,
-        TermKind, Type, TypeField, TypeKind, When,
+        TermKind, Type, TypeField, TypeKind, Variable, When,
     },
     symbol::{Mint, Symbol},
-    types::Core,
+    types::{Core, Sense},
 };
 
 use crate::{
@@ -346,14 +346,31 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
     }
 }
 
-/// One lowered ascription: the type, and — when one was written — the `where`
-/// clause beside it, as a row of its own.
+/// One lowered ascription: the type, the variables its `where let` declared,
+/// and — when one was written — the formula beside them.
 ///
-/// A sibling of the type rather than a child, exactly as the AST panel shows
-/// it: a clause constrains the presences the type's `when`s bound, and burying
-/// it under the type would say it was part of one.
+/// All three are siblings of the type rather than children, exactly as the AST
+/// panel shows them: a clause declares what the type uses and constrains the
+/// presences its `when`s wear, and burying it under the type would say it was
+/// part of one.
+///
+/// A variable's row says the sort lowering read it as, which is the whole of
+/// what the panel adds over the AST's: the name is written bare and what it
+/// stands for follows from where the type uses it, exactly as a declaration
+/// parameter's does. The rows carry the declaring name's span, so clicking a
+/// `..r` in the type lights the `let r` that declared it — the same
+/// cross-highlighting a declaration's header already gets.
 fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation) -> Node {
-    let node = type_node(ids, cx, mint, &annotation.ty);
+    let mut node = type_node(ids, cx, mint, &annotation.ty);
+    for variable in &annotation.variables {
+        let row = Node::new(
+            ids.next(),
+            format!("Variable {}", variable.name),
+            stands_for_variable(variable),
+        )
+        .at(variable.span);
+        node = node.child(row);
+    }
     match &annotation.clause {
         Some(clause) => {
             let row = Node::new(ids.next(), "Where", clause_text(mint, clause)).at(clause.span);
@@ -361,6 +378,22 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
         }
         None => node,
     }
+}
+
+/// What one declared variable turned out to stand for: the way its uses spell
+/// it, and the reading behind that spelling.
+///
+/// The [`stands_for`] of a `where let` name, and the reading comes off the
+/// compiler's own `Display for Sense` for the reason that one's labels come off
+/// `ui::label`: a row here and a complaint about the same variable should not
+/// be able to call it two different things.
+fn stands_for_variable(variable: &Variable) -> String {
+    let written = match variable.sense {
+        Sense::Type => variable.name.clone(),
+        Sense::Cases => format!("..{}", variable.name),
+        Sense::Presence => format!("when {}", variable.name),
+    };
+    format!("{written} ({})", variable.sense)
 }
 
 /// One clause as the source it was lowered from — through the shared printer,
@@ -408,11 +441,19 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type) -> Node {
             ..node
         }
         .error(),
-        // The hole a pattern's exact demand leaves for the solver: nothing
-        // was written, so there is nothing to cross-highlight, and it is not
-        // the error its rendering superficially resembles.
-        TypeKind::Any => Node {
-            label: "Any".into(),
+        // A position left for inference to decide, written `_` by the reader
+        // or by the pattern desugar's exact demand: it binds nothing and names
+        // nothing, so there is nothing to cross-highlight.
+        TypeKind::Hole => Node {
+            label: "Hole".into(),
+            ..node
+        },
+        // A use of a `where let` variable. The name is scoped to its own
+        // annotation and resolves to no symbol, so the row carries the span it
+        // was written at and the sort lowering read it as — which is what the
+        // `Where` rows beside it cross-highlight against by name.
+        TypeKind::Var(_) => Node {
+            label: "Var".into(),
             ..node
         },
         TypeKind::Ident(symbol) => with_symbol(

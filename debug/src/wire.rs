@@ -54,8 +54,8 @@ pub struct Stage {
     pub highlight: Option<&'static str>,
     /// Whether a match of `highlight` names the same thing only within the row
     /// it appears in. Also the stage's to say: a `?4` is one variable of one
-    /// program-wide table, but a scheme's `'a` is numbered from scratch per
-    /// scheme, so two rows spelling `'a` are two unrelated variables.
+    /// program-wide table, but a scheme's letters are numbered from scratch
+    /// per scheme, so two rows spelling `a` are two unrelated variables.
     pub scoped: bool,
     pub status: Status,
     /// Shown next to the tab title, e.g. `3 types · 5 terms`.

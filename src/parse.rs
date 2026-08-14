@@ -219,6 +219,15 @@ pub enum TypeKind {
     Ident {
         name: TrackedString,
     },
+    /// `_` — a type position left for inference to decide.
+    ///
+    /// The one thing a `where let` variable is not: a hole binds nothing, may
+    /// not be referred to, and needs no declaration, so writing one is saying
+    /// "infer this" rather than promising anything about it. That is what buys
+    /// back the brevity a declared variable costs — see
+    /// [`ir::ErrorKind::HoleInDeclaration`](crate::ir::ErrorKind), which is
+    /// where the one position that still refuses a hole says so.
+    Hole,
     Unit,
 }
 
@@ -269,7 +278,7 @@ pub enum SumCase {
 ///
 /// Named rather than anonymous, which is the whole of what retired the old `?`.
 /// A presence a `where` clause has to be able to talk about needs a name, the
-/// way a type variable needs `'a`, and `?` gave every one of them the same
+/// way a type variable needs a name, and `?` gave every one of them the same
 /// nothing. `when _` is what the `?` used to be: a presence this definition
 /// decides and no formula may name.
 ///
@@ -309,18 +318,49 @@ pub enum ClauseKind {
     NotEqual(Box<Clause>, Box<Clause>),
 }
 
+/// One statement of a `where` clause. Statements are separated by `;`, may
+/// appear in any order and may be interleaved; several declaration statements
+/// accumulate their names, and several constraint statements are conjoined in
+/// written order.
+pub type ClauseStmt = Tracked<ClauseStmtKind>;
+
+#[derive(Debug, Clone)]
+pub enum ClauseStmtKind {
+    /// `let a, b` — the variables this annotation declares. A declaration
+    /// statement never contains an `=`, which is what makes
+    /// `let id : a -> a where let a = fn x => x` need no speculation to read.
+    Let(Vec<TrackedString>),
+    /// The boolean expression grammar the `where` clause has always had.
+    Constraint(Clause),
+}
+
+/// The `where` clause of an annotation: a `;`-separated list of statements.
+///
+/// A wrapper rather than a bare `Vec`, so that the whole clause has a span of
+/// its own — the one an annotation merges into itself, and the one a complaint
+/// about the clause as a whole points at. Each statement keeps a span too,
+/// which is what lets a declaration statement written in a `type` declaration
+/// be refused where it stands rather than by a complaint about everything
+/// beside it.
+#[derive(Debug, Clone)]
+pub struct Where {
+    pub span: Span,
+    pub stmts: Vec<ClauseStmt>,
+}
+
 /// A written type and the `where` clause that may follow it: what a definition
 /// is ascribed.
 ///
 /// A wrapper rather than a node of [`TypeKind`], because a `where` is not a
 /// type: it ends one, once, at the outside. Nesting one would let a field's
-/// type carry a clause naming presences from another part of the annotation,
-/// which is a larger language than R3 describes.
+/// type carry a clause naming presences from another part of the annotation —
+/// and would be a higher-rank language than this one, since a `where let`
+/// variable is quantified at the annotation's outermost level and nowhere else.
 #[derive(Debug, Clone)]
 pub struct Annotation {
     pub ty: Type,
     /// The `where` clause, when one was written.
-    pub clause: Option<Clause>,
+    pub clause: Option<Where>,
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
@@ -366,8 +406,14 @@ pub enum Place {
     Pun,
     /// A projection: `x._`.
     Projection,
-    /// A type expression, a `type` declaration's name, or one of its
-    /// parameters.
+    /// A `type` declaration's name, one of its parameters, or a name inside a
+    /// `where` clause's formula.
+    ///
+    /// Not a type expression any more: `_` there is
+    /// [`TypeKind::Hole`], the position left for inference to decide. What is
+    /// left are the three places a `_` still names nothing — a declaration
+    /// binds names rather than types, and a formula is written about presences
+    /// a `when` gave names to.
     Type,
 }
 
@@ -1057,10 +1103,65 @@ impl Parser {
     fn annotation(&mut self, defined: bool) -> Option<Annotation> {
         let ty = self.type_expr()?;
         let clause = match self.eat_keyword("where") {
-            Some(_) => Some(self.clause(defined)?),
+            Some(kw) => Some(self.where_clause(kw.span, defined)?),
             None => None,
         };
         Some(Annotation { ty, clause })
+    }
+
+    /// `<statement> (';' <statement>)*` — the whole of a `where` clause.
+    ///
+    /// A trailing `;` is a parse error rather than a courtesy, which is what
+    /// every other separator in the language already is: the `;` promises
+    /// another statement, and whatever follows it is reported where it was
+    /// written.
+    fn where_clause(&mut self, kw: Span, defined: bool) -> Option<Where> {
+        let mut stmts = Vec::new();
+        let mut span = kw;
+        loop {
+            let stmt = self.clause_stmt(defined)?;
+            span = span.merge(stmt.span);
+            stmts.push(stmt);
+            if self.eat_if(&Kind::Semicolon).is_none() {
+                break;
+            }
+        }
+        Some(Where { span, stmts })
+    }
+
+    /// One statement of a `where` clause: `let <name> (, <name>)*`, or the
+    /// boolean expression grammar.
+    ///
+    /// The speculative read that tells a comparison's `=` from the definition's
+    /// own applies to the last statement alone, since only the last can be
+    /// followed by the definition's `=`. Which statement is the last is decided
+    /// by reading one without the speculation and looking for the `;` that would
+    /// promise another: a statement followed by one was never a candidate, and
+    /// what was read is what was meant. Anything else is put back — cursor and
+    /// complaints alike — and read again the way an annotation's last statement
+    /// has always been read.
+    fn clause_stmt(&mut self, defined: bool) -> Option<ClauseStmt> {
+        if let Some(kw) = self.eat_if(&Kind::Let) {
+            let mut names = vec![self.ident()?];
+            while self.eat_if(&Kind::Comma).is_some() {
+                names.push(self.ident()?);
+            }
+            let last = names.last().expect("a declaration statement names one");
+            let span = kw.span.merge(last.span);
+            return Some(span.track(ClauseStmtKind::Let(names)));
+        }
+        if defined {
+            let mark = (self.pos, self.errors.len());
+            if let Some(clause) = self.clause(false)
+                && matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Semicolon))
+            {
+                return Some(clause.span.track(ClauseStmtKind::Constraint(clause)));
+            }
+            self.pos = mark.0;
+            self.errors.truncate(mark.1);
+        }
+        let clause = self.clause(defined)?;
+        Some(clause.span.track(ClauseStmtKind::Constraint(clause)))
     }
 
     /// `<or> [('='|'!=') <or>]` — the loosest level of a `where` clause, and
@@ -1375,10 +1476,9 @@ impl Parser {
 
     /// Whether the next token can begin an atomic type — the type-level
     /// counterpart of [`at_expr_atom`](Self::at_expr_atom), and what decides
-    /// where an application stops. `_` is one for the reason it is an
-    /// expression atom: no type can be made of it — there is no inferred-type
-    /// hole — and reading it here is what points the complaint at the `_`
-    /// rather than at whatever follows the type.
+    /// where an application stops. `_` is one because it *is* a type now: the
+    /// hole, which a type application may be given as an argument like any
+    /// other atom.
     fn at_type_atom(&self) -> bool {
         // `where` ends a written type rather than continuing it. It is an
         // ordinary identifier everywhere else — the one position that reads it
@@ -1419,9 +1519,15 @@ impl Parser {
                 self.advance();
                 Some(span.track(TypeKind::Ident { name }))
             }
-            // There is no inferred-type hole: `_` in a type is refused, with
-            // the wildcard's complaint worded for the position.
-            Kind::Underscore => self.wildcard(Place::Type),
+            // `_` in a type is the hole: a position left for inference to
+            // decide, which binds nothing and can be written as often as one
+            // likes. The two positions where it is still not a type — a
+            // declaration's name and its parameters — say so before reaching
+            // here.
+            Kind::Underscore => {
+                self.advance();
+                Some(span.track(TypeKind::Hole))
+            }
             // As in [`atom`](Self::atom): a type position with no type in it is
             // reported, so `let x : = ()` cannot pass for `let x : () = ()`.
             _ => self.unexpected(),

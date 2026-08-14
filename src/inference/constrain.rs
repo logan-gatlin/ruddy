@@ -8,7 +8,7 @@ use crate::{
     ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::{Span, Tracked},
-    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty, TyVar},
+    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty},
 };
 
 use super::{
@@ -187,47 +187,41 @@ impl Constrain<'_> {
                 // is the contract, so the value is checked against it and the
                 // recursive uses the annotation exists for are checked against
                 // it too; without one it is a variable the value decides.
-                let (bound, promised) = match annotation {
+                let (bound, promised, rigids) = match annotation {
                     Some(annotation) => {
-                        // The variables it minted are counted off, so that an
-                        // annotation the value went on to decide can be
-                        // refused. See [`Annotated`]. Counting is not
-                        // inspecting: how many variables exist says nothing
-                        // about what any of them has been solved to, which is
-                        // the invariant this pass keeps.
-                        let from = self.table.vars.len() as TyVar;
-                        let (bound, formula, names) =
-                            lower_annotation(self.mint, self.table, annotation);
+                        let lowered = lower_annotation(self.mint, self.table, annotation);
                         // The clause is the contract, said in the store: what a
                         // use of this name sees, and what the value under it is
-                        // held to. See R10.
-                        if !formula.is_true() {
+                        // held to.
+                        if !lowered.formula.is_true() {
                             let origin = Origin::Annotation(Named {
-                                labels: names.clone(),
+                                labels: lowered.names.clone(),
                             });
                             self.table
-                                .require(annotation.ty.span, origin, formula.clone());
+                                .require(annotation.ty.span, origin, lowered.formula.clone());
                         }
-                        // A synthetic annotation — a pattern's exact demand —
-                        // is meant to be decided, so it makes no promise for
-                        // the too-open check to hold the value to.
-                        if !super::synthetic(&annotation.ty) {
-                            self.annotated.push(Annotated {
-                                span: annotation.ty.span,
-                                opened: from..self.table.vars.len() as TyVar,
-                                promised: formula.clone(),
-                                names,
-                            });
-                        }
-                        (bound, formula)
+                        self.annotated.push(Annotated {
+                            span: annotation.ty.span,
+                            promised: lowered.formula.clone(),
+                            names: lowered.names,
+                        });
+                        // A recursive use inside the value is a copy of what the
+                        // annotation declared, sharing what it left to
+                        // inference: the same rule a top-level annotated
+                        // definition follows, about a smaller scope.
+                        self.env.insert(name.tracked, Binding::Poly(lowered.scheme));
+                        (lowered.ty, lowered.formula, lowered.rigids)
                     }
-                    None => (self.table.fresh_type(), Formula::True),
+                    None => {
+                        // Monomorphically, the same rule a binding group
+                        // follows: a use of the name inside its own value is
+                        // the one type being decided rather than a copy of a
+                        // scheme that does not exist yet.
+                        let bound = self.table.fresh_type();
+                        self.env.insert(name.tracked, Binding::Mono(bound.clone()));
+                        (bound, Formula::True, Vec::new())
+                    }
                 };
-                // Monomorphically, the same rule a binding group follows: a use
-                // of the name inside its own value is the one type being
-                // decided rather than a copy of a scheme that does not exist
-                // yet.
-                self.env.insert(name.tracked, Binding::Mono(bound.clone()));
                 let outer = std::mem::take(&mut self.out);
                 self.check_term(value, &bound);
                 let required = std::mem::replace(&mut self.out, outer);
@@ -250,6 +244,7 @@ impl Constrain<'_> {
                         bound,
                         level,
                         promised,
+                        rigids,
                         value: required,
                         body: rest,
                     },

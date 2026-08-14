@@ -113,6 +113,37 @@ fn lexes_the_two_dots_apart() {
     assert_eq!(dots.span.width, 2);
 }
 
+/// `;` separates the statements of a `where` clause and nothing else, so it is
+/// one character and one token — never the head of something longer, which is
+/// what makes two of them two tokens rather than one the lexer has to tell
+/// apart from a `;` beside a `;`.
+#[test]
+fn lexes_the_statement_separator() {
+    assert!(matches!(kinds(";")[..], [Kind::Semicolon]));
+    assert!(matches!(
+        kinds(";;")[..],
+        [Kind::Semicolon, Kind::Semicolon]
+    ));
+    assert!(matches!(
+        kinds("where let a; a = b")[..],
+        [
+            Kind::Identifier(_),
+            Kind::Let,
+            Kind::Identifier(_),
+            Kind::Semicolon,
+            Kind::Identifier(_),
+            Kind::Equal,
+            Kind::Identifier(_),
+        ]
+    ));
+
+    let out = lex("a ; b", FileID::GENERATED);
+    let semi = &out.tokens[1];
+    assert!(matches!(semi.tracked, Kind::Semicolon));
+    assert_eq!(semi.span.start, 2);
+    assert_eq!(semi.span.width, 1);
+}
+
 /// `!=` is one token, the way `->` is: a lone `!` begins nothing, so the only
 /// thing it can be is the head of this.
 #[test]

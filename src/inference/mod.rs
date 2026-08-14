@@ -109,7 +109,7 @@ pub struct Output {
     /// Numbered on its own. A local's scheme may leave an enclosing binder's
     /// variables free, and those are spelled here as letters past its own
     /// quantifiers rather than as the `?3` the solver knew them by — see
-    /// [`Table::published`] — so two rows of this map spelling `'a` are two
+    /// [`Table::published`] — so two rows of this map spelling `a` are two
     /// unrelated variables, exactly as two schemes are.
     pub locals: IndexMap<Symbol, Scheme>,
     /// What generation asked of each definition, in the order it asked, and
@@ -416,6 +416,10 @@ pub enum ConstraintKind {
         /// requires of its presences: R10 makes the clause the contract, so a
         /// use of the name sees it rather than whatever the value worked out.
         promised: Formula,
+        /// The `where let` variables the annotation declared, which are the
+        /// ones the scheme this publishes may quantify. Empty where none was
+        /// written. See [`ErrorKind::RigidEscapes`].
+        rigids: Vec<u32>,
         /// What the value requires, including that it match the annotation when
         /// one was written. Solved first, at `level`.
         value: Vec<Constraint>,
@@ -491,16 +495,46 @@ pub enum ErrorKind {
         base: Rc<Ty>,
         field: String,
     },
-    /// An annotation left something open with `..` or `when` that the definition
-    /// then decided. The type the definition was checked against is not the
-    /// type it has, so the contract the annotation looked like — works for any
-    /// rest, works whether or not the field is there — was never checked and
-    /// does not hold.
+    /// A body deciding what one of its annotation's `where let` variables is.
     ///
-    /// No payload: the complaint is about the written type, which the span
-    /// already points at, and the type it should have said instead is the
-    /// scheme printed beside it.
-    AnnotationTooOpen,
+    /// `a` stands for whatever the caller picks, so a body that makes it a
+    /// `Nat` — or makes it the *other* variable the annotation declared — has
+    /// not written the function its signature promises. Refused at the
+    /// expression that decided it rather than at the annotation, which is the
+    /// whole point of skolemizing: the reader is sent to the line they can
+    /// change instead of being told that a type several lines up is somehow
+    /// wrong.
+    ///
+    /// `found` is what the expression turned out to be, `name` is the variable
+    /// it was supposed to be, and `declared` is where that variable was
+    /// declared — the second place a reporter points at, the way
+    /// [`ir::ErrorKind::Duplicate`](crate::ir::ErrorKind) carries one.
+    RigidBroken {
+        found: Rc<Ty>,
+        name: Rc<str>,
+        declared: Span,
+    },
+    /// A label demanded of a `where let` variable: a projection, a match arm, a
+    /// struct literal's field set.
+    ///
+    /// What replaces the lacks bookkeeping for a rigid. An ordinary open row
+    /// can be told which labels it may not stand for and then given the rest; a
+    /// rigid can never be given anything at all, so every label demanded of one
+    /// is refused outright, wherever the demand was written.
+    RigidField {
+        shape: Shape,
+        field: String,
+        name: Rc<str>,
+        declared: Span,
+    },
+    /// A `where let` variable reaching a type outside the annotation that
+    /// declared it.
+    ///
+    /// A rigid stands for whatever the caller of *that* annotation picks, so it
+    /// means nothing anywhere else: a scheme quantifying one would be promising
+    /// its own callers something only somebody else's caller decides. Reported
+    /// at the declaring name, which is the line that has to change.
+    RigidEscapes { name: Rc<str> },
     /// A `..` was decided to stand for a label the row it tails already names.
     /// `{ x: Nat, ..r }` says "an `x`, plus whatever else `r` is", so `r`
     /// standing for anything that certainly has an `x` of its own would name
@@ -614,25 +648,6 @@ enum Side {
     Actual,
 }
 
-/// What a variable an annotation left open came back as, once the group it was
-/// in is solved. See [`Table::residue`].
-#[derive(Debug, Clone, Copy)]
-enum Residue {
-    /// Still a variable of its own sort with nothing attached, and which one:
-    /// the annotation kept its promise about this slot, whatever the variable
-    /// ended up being called. Named rather than a bare yes, because two slots
-    /// that came back as one variable are the case a bare yes cannot see.
-    Open(TyVar),
-    /// The undecided value of its own sort: abandoned by a failure rather than
-    /// solved by the definition. Something already went wrong and pointed it
-    /// here, and a complaint about the annotation would be that failure said
-    /// again in words about the wrong line.
-    Nothing,
-    /// Something the reader could have written instead. The annotation said
-    /// this slot was open and the definition closed it.
-    Decided,
-}
-
 /// One member of a binding group as it goes into scope, before anything in the
 /// group has been walked.
 ///
@@ -645,10 +660,11 @@ struct Scoped {
     /// lowered annotation, or a variable standing for whatever the body turns
     /// out to be.
     bound: Rc<Ty>,
-    /// The variables the annotation minted, which are the ones it left for the
-    /// definition to decide. Empty for a definition with no annotation. See
-    /// [`Table::narrowed`].
-    opened: Range<TyVar>,
+    /// The `where let` variables its annotation declared, which are the ones
+    /// its scheme is entitled to quantify. Empty for a definition with no
+    /// annotation, which is entitled to none. See
+    /// [`ErrorKind::RigidEscapes`].
+    rigids: Vec<u32>,
     /// What the annotation's `where` clause promised, over the presence
     /// variables the annotation minted. [`Formula::True`] for a definition with
     /// no clause, which promises nothing.
@@ -663,16 +679,14 @@ struct Scoped {
 /// is in is solved.
 ///
 /// The one thing about a nested binding that the constraint language has no
-/// room for, and rightly so: whether an annotation promised more than the value
-/// kept is a question about a *written type*, asked once the solve is over, and
-/// the solver has never seen a written anything. [`Scoped::opened`] is the same
-/// pair about a definition's own annotation, checked in the same place.
+/// room for, and rightly so: whether an annotation's clause allows more than
+/// the value under it needs is a question about a *written type*, asked once
+/// the solve is over, and the solver has never seen a written anything.
+/// [`Scoped::promised`] is the same pair about a definition's own annotation,
+/// checked in the same place.
 struct Annotated {
     /// The annotation's span, which is the line the reader has to change.
     span: Span,
-    /// The variables it minted, which are the ones it left for the value to
-    /// decide. See [`Table::narrowed`].
-    opened: Range<TyVar>,
     /// The `where` clause it promised, or [`Formula::True`] where none was
     /// written. The clause the value under it is held to, exactly as a
     /// definition's own is. See [`Scoped::promised`].
@@ -778,6 +792,18 @@ struct Table {
     /// use-site and annotation checks, and — through
     /// [`Output::store`] — in the patterns phase. Never by unification.
     store: Store,
+    /// Where each `where let` variable in the program was declared, by the id
+    /// its annotation gave it.
+    ///
+    /// A [`Core::Rigid`] carries its spelling but not its span — a type is
+    /// printed with no table beside it, and a span is not something a reader
+    /// reads — so the second place a rigid complaint points at is looked up
+    /// here. Program-global, exactly as the ids are.
+    rigids: HashMap<u32, Span>,
+    /// The rigids already reported as escaping. One mistake said once: a
+    /// variable that reaches two schemes it does not belong to is still one
+    /// annotation to rewrite. See [`ErrorKind::RigidEscapes`].
+    escaped: HashSet<u32>,
     /// Whether some batch has already flipped the store unsatisfiable. The
     /// cascade rule: that batch owns the single resulting error, and every
     /// later SAT-dependent complaint — a use-site violation, an annotation
@@ -786,17 +812,33 @@ struct Table {
     unsat: bool,
 }
 
-/// Which quantified position each variable was given, in the two alphabets a
-/// scheme has: `'a` for a type or a row, and the bare `a` of a `when` clause
-/// for a presence.
+/// Which quantified position each thing a scheme closes over was given, in the
+/// one index space a scheme has.
 ///
-/// Two maps rather than one, for the reason [`Scheme`] gives: one numbering
-/// would leave a visible gap in whichever alphabet came second. A variable's
-/// sort is fixed where it was minted, so no variable is ever in both.
+/// Three maps rather than one because three different things are being
+/// numbered — a solver variable standing for a type or a row, a solver variable
+/// standing for a presence, and a rigid, which is no variable at all and is
+/// keyed by its own id — and no key of one is ever a key of another. The
+/// numbers they hand out come from one pool: the presences take `0..presences`
+/// and everything else the rest, which is what [`Scheme`] promises.
 #[derive(Debug, Default, Clone)]
 struct Subst {
     types: HashMap<TyVar, u32>,
     presences: HashMap<TyVar, u32>,
+    /// The `where let` variables an annotated definition's own scheme
+    /// re-quantifies: rigid while the body was checked, and an ordinary
+    /// quantified position once it has been. See [`ErrorKind::RigidEscapes`]
+    /// for the one that may not be.
+    rigids: HashMap<u32, u32>,
+}
+
+impl Subst {
+    /// The next position for something that is not a presence. The presences
+    /// are numbered first and in full, so what is left is one running count
+    /// over the two maps that share the high end of the space.
+    fn next(&self) -> u32 {
+        (self.presences.len() + self.types.len() + self.rigids.len()) as u32
+    }
 }
 
 /// Assign a type to every term in the program, in place, and return the
@@ -854,17 +896,25 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         .map(|group| group.members.clone())
         .collect();
     for members in groups {
-        // Every member is in scope, monomorphically, before any of them is
-        // walked. That is the whole of what makes recursion typable: a use of a
-        // group member inside the group is the one type the group is deciding,
-        // rather than a copy of a scheme that does not exist yet. A use of a
-        // definition in an earlier group is a [`Binding::Poly`] and instantiates
-        // as it always has, which is what keeps let-polymorphism.
+        // Every member is in scope before any of them is walked. That is the
+        // whole of what makes recursion typable: a use of a group member inside
+        // the group is either the one type the group is deciding or a copy of
+        // what its annotation already promised, rather than a copy of a scheme
+        // that does not exist yet. A use of a definition in an earlier group is
+        // a [`Binding::Poly`] and instantiates as it always has, which is what
+        // keeps let-polymorphism.
         //
         // A member with an annotation is bound to *it* rather than to a fresh
         // variable. A variable would never be tied to what was written, so the
         // recursive uses the annotation exists for would be checked against
         // nothing at all.
+        //
+        // And it is bound to the annotation's *scheme* rather than to the type
+        // itself, so that a recursive use instantiates what the annotation
+        // declared and shares what it left to inference. That is R29, and it is
+        // what makes polymorphic recursion over a declared variable type: the
+        // body sees a fresh copy of `r` at every mention, while the holes stay
+        // the one thing the group is deciding.
         let scoped: Vec<Scoped> = members
             .iter()
             .map(|symbol| {
@@ -873,45 +923,51 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // along the way — is what the definition means to everyone
                 // downstream.
                 //
-                // Which is only honest while the body cannot decide the parts
-                // of it the annotation left open. Nothing stops it: a `..`, a
-                // `..r` and a `when` each lower to an ordinary variable, and a
-                // variable is something the solve is free to bind. So the
-                // variables this lowering mints are counted off here and
-                // checked once the group is solved — see [`Table::narrowed`].
-                // The alternative is to make them unbindable, and that is a
-                // larger language than this one has: a variable that refuses to
-                // be bound needs a rule saying what happens when something
-                // tries, and the answer has to travel all the way back to the
-                // annotation anyway. Checking says the same thing, at the one
-                // place that knows which variables came from where.
-                let from = table.vars.len() as TyVar;
-                let annotated = program.terms[symbol].annotation.as_ref().map(|annotation| {
-                    let (ty, formula, names) = lower_annotation(mint, &mut table, annotation);
-                    // The clause goes into the store as its own batch, so that
-                    // it is what a use of this name sees and what the body is
-                    // held to. See R10.
-                    if !formula.is_true() {
+                // Which is honest because the variables it declared are rigid
+                // while the body is checked. A `where let` name is a promise
+                // about every caller, so nothing the body does may decide it —
+                // and a body that tries is refused at the expression that
+                // tried, which is the line the reader can change. What is left
+                // open with a `..`, a `when _` or a `_` is the opposite: those
+                // are holes, and a body deciding one is exactly what a hole is
+                // for.
+                let lowered = program.terms[symbol].annotation.as_ref().map(|annotation| {
+                    let lowered = lower_annotation(mint, &mut table, annotation);
+                    // The clause goes into the store as its own batch, so
+                    // that it is what a use of this name sees and what the
+                    // body is held to.
+                    if !lowered.formula.is_true() {
                         let origin = Origin::Annotation(Named {
-                            labels: names.clone(),
+                            labels: lowered.names.clone(),
                         });
-                        table.require(annotation.ty.span, origin, formula.clone());
+                        table.require(annotation.ty.span, origin, lowered.formula.clone());
                     }
-                    (ty, formula, names)
+                    lowered
                 });
-                let opened = from..table.vars.len() as TyVar;
-                let promised = annotated
+                let promised = lowered
                     .as_ref()
-                    .map_or(Formula::True, |(_, formula, _)| formula.clone());
-                let names = annotated
+                    .map_or(Formula::True, |lowered| lowered.formula.clone());
+                let names = lowered
                     .as_ref()
-                    .map_or_else(Vec::new, |(_, _, names)| names.clone());
-                let bound = annotated.map_or_else(|| table.fresh_type(), |(ty, _, _)| ty);
-                env.insert(*symbol, Binding::Mono(bound.clone()));
+                    .map_or_else(Vec::new, |lowered| lowered.names.clone());
+                let rigids = lowered
+                    .as_ref()
+                    .map_or_else(Vec::new, |lowered| lowered.rigids.clone());
+                let bound = match &lowered {
+                    Some(lowered) => {
+                        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+                        lowered.ty.clone()
+                    }
+                    None => {
+                        let bound = table.fresh_type();
+                        env.insert(*symbol, Binding::Mono(bound.clone()));
+                        bound
+                    }
+                };
                 Scoped {
                     symbol: *symbol,
                     bound,
-                    opened,
+                    rigids,
                     promised,
                     names,
                 }
@@ -1018,35 +1074,17 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             let (from, to) = (bounds[at], bounds[at + 1]);
             let decl = &mut program.terms[&symbol];
 
-            // One complaint per definition, not per variable: an annotation
-            // that is too open is one thing to rewrite however many of its
-            // `..`s and `when`s the body pinned down, and the reader is being sent
-            // to the same line either way. Held back when *this* definition
-            // already said something, because everything a failure abandons it
-            // also decides — pointing it at the undecided type is a binding like
-            // any other — and a second complaint about the fallout of the first
-            // is one mistake said twice. Its own range and nobody else's: a
-            // definition that shares a group with a broken one is not the one
-            // with something to rewrite.
-            //
             // Said here, past every member's solve, rather than beside the
             // list it is about, so that it lands after all of them: a member's
             // own range was fixed while the group was being solved, and a
             // complaint written into the middle of it would move everybody
             // else's.
             let told = errors.len();
-            if let Some(annotation) = &decl.annotation
-                // A synthetic annotation — a pattern's exact demand — is meant
-                // to be decided, so there is no promise here to hold anyone to.
-                && !synthetic(&annotation.ty)
-                && from == to
-                && table.narrowed(member.scoped.opened.clone())
-            {
-                errors.push(Error {
-                    span: annotation.ty.span,
-                    kind: ErrorKind::AnnotationTooOpen,
-                });
-            }
+            // A `where let` variable stands for whatever *this* annotation's
+            // caller picks, so it means nothing in anybody else's type. A
+            // scheme that would quantify one it did not declare is refused at
+            // the declaration, which is the line the reader has to change.
+            table.escapes(&member.ty, &member.scoped.rigids, &mut errors);
             // An annotation's `where` clause is the contract, so the body may
             // not need more of its presences than the clause allows: a use of
             // the name sees the clause and nothing of the body, and one that
@@ -1082,13 +1120,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // complaint about the fallout of a failure is one mistake said
             // twice.
             for annotated in &member.annotated {
-                if from == to && table.narrowed(annotated.opened.clone()) {
-                    errors.push(Error {
-                        span: annotated.span,
-                        kind: ErrorKind::AnnotationTooOpen,
-                    });
-                }
-                // And its clause is a promise about a smaller scope on the same
+                // Its clause is a promise about a smaller scope on the same
                 // terms. Read against the same stretch, which needs no narrower
                 // bookkeeping: a batch that says nothing about the clause's
                 // variables projects away to `true`, so everything outside the
@@ -1395,6 +1427,15 @@ impl Table {
         }
     }
 
+    /// Where the `where let` name behind one rigid was written: the second
+    /// place a rigid complaint points at.
+    ///
+    /// Indexed rather than looked up: every rigid in a type was minted by
+    /// [`lower_annotation`], which records the span as it mints.
+    fn declared(&self, id: u32) -> Span {
+        self.rigids[&id]
+    }
+
     /// Follow a presence variable to what it stands for.
     fn presence_of(&self, presence: &Presence) -> Presence {
         let mut presence = presence.clone();
@@ -1454,7 +1495,10 @@ impl Table {
             // reaches here holding one — an argument was lowered from what
             // somebody wrote at a use site, and a scheme is opened before it is
             // ever compared — and a variant this cannot tell about belongs in
-            // the arm below, whose answer is the safe one.
+            // the arm below, whose answer is the safe one. A rigid goes the
+            // same way: an argument written at a declaration comes from a use
+            // site, and the one caller of this is looking for a goal about two
+            // declared names it is already in the middle of.
             (Core::Arrow(from, to), Core::Arrow(other_from, other_to)) => {
                 self.alike(from, other_from) && self.alike(to, other_to)
             }
@@ -1618,7 +1662,7 @@ impl Table {
                     self.mentions_ty(arg, found);
                 }
             }
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit | Core::Nat | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided => {}
         }
         self.mentions_labels(&ty.fields, found);
     }
@@ -1728,12 +1772,20 @@ impl Table {
                             let written = self.resolve(arg).cases();
                             self.forbid(&written, Shape::Sum, &labels);
                         }
-                        None => {}
+                        // A declaration binds no presence — lowering refuses a
+                        // `when` in one — so a parameter is never read the
+                        // third way, and a [`ParamKind`] cannot answer with it.
+                        Some((Sense::Presence, _)) | None => {}
                     }
                     self.note_lacks(arg);
                 }
             }
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Var(_)
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
         }
     }
 
@@ -2002,7 +2054,7 @@ impl Table {
     ///
     /// What this buys is the whole of the `h` example: a `let` pattern forces
     /// `x` present, the match's `a != b` then forces `y` absent, and the
-    /// definition generalizes to `{x: 'a} -> {}` with no variables and no
+    /// definition generalizes to `{x: a} -> {}` with no variables and no
     /// `where` clause left over.
     fn fold_back(&mut self, ty: &Rc<Ty>) {
         let known = self.known();
@@ -2060,7 +2112,12 @@ impl Table {
                     self.presences_in(arg, found);
                 }
             }
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Var(_)
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
         }
     }
 
@@ -2078,12 +2135,12 @@ impl Table {
         // that is what a scheme records. See [`Assigned::as_row`]. A presence
         // is minted in its own alphabet, for the reason [`Scheme`] gives.
         let fresh: Vec<Assigned> = (0..scheme.count())
-            .map(|_| Assigned::Ty(self.fresh_type()))
+            .map(|at| match at < scheme.presences() {
+                true => Assigned::Presence(self.fresh_presence()),
+                false => Assigned::Ty(self.fresh_type()),
+            })
             .collect();
-        let presences: Vec<Presence> = (0..scheme.presences())
-            .map(|_| self.fresh_presence())
-            .collect();
-        let ty = scheme.body().open(&fresh, &presences);
+        let ty = scheme.body().open(&fresh);
         // A scheme's body says which of its rows a quantified tail is the tail
         // of, but the condition that follows from that is not part of the
         // body: it lived beside the variables the scheme closed over, and this
@@ -2092,7 +2149,7 @@ impl Table {
         // And so is what it requires of its presences. Per instance, never per
         // scheme: two uses of one definition with different field sets are both
         // legal exactly when each instance's formula is separately satisfiable.
-        let formula = scheme.formula().open(&presences);
+        let formula = scheme.formula().open(&fresh);
         if !formula.is_true() {
             let mut labels = IndexMap::new();
             self.labels_in(&ty, &mut labels);
@@ -2135,7 +2192,12 @@ impl Table {
                     self.labels_in(arg, found);
                 }
             }
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Var(_)
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
         }
     }
 
@@ -2165,75 +2227,67 @@ impl Table {
         unfolded
     }
 
-    /// Whether the variables an annotation left open came back narrower than it
-    /// promised — either because the definition decided one of them, or because
-    /// it made two of them into one.
+    /// Every `where let` variable a type still mentions that the scheme being
+    /// generalized into may not quantify, reported at the declaration.
     ///
-    /// Asked of the whole range at once rather than a variable at a time, and
-    /// that is the point. Openness is not a property a variable has by itself:
-    /// a `when` that came back as somebody else's still-open presence is a
-    /// `when` the reader's type keeps, because the scheme quantifies whatever
-    /// is left free and prints it under the name the annotation gave it. Two
-    /// `when`s that came back as the *same* still-open presence are one `when`,
-    /// however open it is, and the type the reader wrote is not the type the
-    /// definition has. Only a range can tell those apart.
+    /// A walk rather than a level or a rank discipline on variables, and that
+    /// is enough here because the language has one annotation scope per
+    /// binding: a rigid belongs to exactly one annotation, `owned` is the list
+    /// that annotation declared, and anything else in the type came from
+    /// somewhere it cannot mean anything.
     ///
-    /// Which is what a binding group turns on. Two definitions that name each
-    /// other are solved together and monomorphically, so an annotated member's
-    /// presences are unified with the variables standing in for its partner's
-    /// almost immediately — and read one at a time that is indistinguishable
-    /// from a body pinning them down, so every mutually recursive annotated
-    /// definition was told to rewrite a type it had in fact kept.
-    ///
-    /// See [`Table::residue`] for what one variable coming back is.
-    fn narrowed(&self, opened: Range<TyVar>) -> bool {
-        let mut open: Vec<TyVar> = Vec::new();
-        for var in opened {
-            match self.residue(var) {
-                Residue::Decided => return true,
-                Residue::Nothing => {}
-                Residue::Open(var) => match open.contains(&var) {
-                    true => return true,
-                    false => open.push(var),
-                },
+    /// Said once per variable across the whole program. A rigid that reaches
+    /// two schemes it does not belong to is still one annotation to rewrite,
+    /// and a reader sent to the same line twice learns nothing the second time.
+    fn escapes(&mut self, ty: &Rc<Ty>, owned: &[u32], errors: &mut Vec<Error>) {
+        let mut found = IndexMap::new();
+        self.rigids_in(ty, &mut found);
+        for (id, name) in found {
+            if owned.contains(&id) || !self.escaped.insert(id) {
+                continue;
             }
+            let span = self.rigids[&id];
+            errors.push(Error {
+                span,
+                kind: ErrorKind::RigidEscapes { name },
+            });
         }
-        false
     }
 
-    /// What one variable an annotation left open came back as.
-    ///
-    /// A written type can leave open only `..`, `..r` and `when`, so a variable
-    /// arriving here is one of three things: the core a struct's `..` lowered
-    /// to, the tail a sum's did, or a presence. Each sort is read in its own
-    /// two spellings of "still nothing but a variable" and "nothing is known",
-    /// which is the whole of the three arms.
-    fn residue(&self, var: TyVar) -> Residue {
-        let Slot::Bound(value) = &self.vars[var as usize] else {
-            return Residue::Open(var);
-        };
-        match value {
-            Assigned::Presence(presence) => match self.presence_of(presence) {
-                Presence::Undecided => Residue::Nothing,
-                Presence::Var(var) => Residue::Open(var),
-                _ => Residue::Decided,
-            },
-            Assigned::Row(row) => match self.canon(row) {
-                flat if !flat.labels.is_empty() => Residue::Decided,
-                flat => match flat.rest {
-                    Rest::Undecided => Residue::Nothing,
-                    Rest::Var(var) => Residue::Open(var),
-                    _ => Residue::Decided,
-                },
-            },
-            Assigned::Ty(ty) => match self.resolve(ty) {
-                ty if !ty.fields.is_empty() => Residue::Decided,
-                ty => match ty.core {
-                    Core::Undecided => Residue::Nothing,
-                    Core::Var(var) => Residue::Open(var),
-                    _ => Residue::Decided,
-                },
-            },
+    /// Every rigid a type mentions, by id, with the spelling it prints as, in
+    /// the order the type mentions them. A leaf wherever it appears, so this is
+    /// the ordinary walk with one arm that collects.
+    fn rigids_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<u32, Rc<str>>) {
+        let ty = self.resolve(ty);
+        for field in ty.fields.values() {
+            let held = field.ty.clone();
+            self.rigids_in(&held, found);
+        }
+        match &ty.core {
+            Core::Rigid { id, name } => {
+                found.entry(*id).or_insert_with(|| name.clone());
+            }
+            Core::Arrow(from, to) => {
+                let (from, to) = (from.clone(), to.clone());
+                self.rigids_in(&from, found);
+                self.rigids_in(&to, found);
+            }
+            Core::Sum(cases) => {
+                let row = self.canon(cases);
+                for field in row.labels.values() {
+                    let held = field.ty.clone();
+                    self.rigids_in(&held, found);
+                }
+                if let Rest::Rigid { id, name } = &row.rest {
+                    found.entry(*id).or_insert_with(|| name.clone());
+                }
+            }
+            Core::Named { args, .. } => {
+                for arg in args.clone().iter() {
+                    self.rigids_in(arg, found);
+                }
+            }
+            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
         }
     }
 
@@ -2349,12 +2403,7 @@ impl Table {
         let body = self.zonk(ty, &subst);
         let formula = quantify_formula(&formula, &subst);
         (
-            Scheme::constrained(
-                subst.types.len() as u32,
-                subst.presences.len() as u32,
-                body,
-                formula,
-            ),
+            Scheme::constrained(subst.next(), subst.presences.len() as u32, body, formula),
             subst,
         )
     }
@@ -2422,43 +2471,49 @@ impl Table {
     fn published(&self, scheme: &Scheme) -> Scheme {
         let mut subst = Subst::default();
         self.quantify(scheme.body(), &mut subst, 0);
-        // Its own quantifiers already occupy the first positions of each
-        // alphabet, so what was free numbers on from there — in its own
-        // alphabet, since the two do not share a numbering.
+        // Its own quantifiers already occupy the first positions of the space,
+        // so what was free numbers on from the end of them — every sort at
+        // once, since there is one numbering.
+        let base = scheme.count();
         let shifted = Subst {
             types: subst
                 .types
                 .into_iter()
-                .map(|(var, at)| (var, scheme.count() + at))
+                .map(|(var, at)| (var, base + at))
                 .collect(),
             presences: subst
                 .presences
                 .into_iter()
-                .map(|(var, at)| (var, scheme.presences() + at))
+                .map(|(var, at)| (var, base + at))
                 .collect(),
+            // A scheme's body holds no rigid: generalization numbered every
+            // one into a [`Core::Bound`] before it published anything, so
+            // there is nothing here left to shift.
+            rigids: HashMap::new(),
         };
-        let count = scheme.count() + shifted.types.len() as u32;
         let presences = scheme.presences() + shifted.presences.len() as u32;
         Scheme::constrained(
-            count,
+            base + shifted.next(),
             presences,
             self.zonk(scheme.body(), &shifted),
             quantify_formula(scheme.formula(), &shifted),
         )
     }
 
-    /// Number the generalizable variables of `ty` in first-occurrence order —
-    /// which is what makes the leftmost variable print as `'a`.
+    /// Number everything `ty` quantifies, in first-occurrence order within each
+    /// of the two passes — which is what makes the leftmost variable of each
+    /// print as the earlier letter.
     ///
-    /// Presence variables are numbered after everything else, in a second
-    /// walk, because they have an alphabet of their own: a presence prints as
-    /// the bare `a` its `when` clause names it, a type as `'a`, and the two
-    /// pools are independent. Numbering them in line would leave a visible gap
-    /// in each — the scheme of `{ x when a: Nat } -> 'a` should call neither
-    /// of its letters `b`.
+    /// The presences go first and in full, because they take the low positions
+    /// of the one index space a scheme has: what a `where let` lists is every
+    /// letter in index order, and a numbering that interleaved the two sorts
+    /// would still be correct but would put the letters in an order nobody
+    /// reading the type left to right could predict. Whichever pass runs, a
+    /// variable can only be numbered by one of them — a variable's sort is
+    /// fixed where it was minted — so the two can never number one twice.
     fn quantify(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32) {
-        self.quantify_walk(ty, subst, level, false);
         self.quantify_walk(ty, subst, level, true);
+        self.quantify_walk(ty, subst, level, false);
     }
 
     /// One numbering pass over one type: over everything but the presence
@@ -2470,7 +2525,7 @@ impl Table {
     /// Fields first because the core is what the `..` prints, and a tail is read
     /// last. The rule used to be the other way round, when a core was one thing
     /// a type had and its tail was another; now the core *is* the tail, so
-    /// numbering it first would call the rightmost thing on the line `'a`. No
+    /// numbering it first would call the rightmost thing on the line `a`. No
     /// special case for it either way — it is descended into exactly where it
     /// sits.
     fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32, presences: bool) {
@@ -2482,13 +2537,26 @@ impl Table {
                     self.quantify_var(*var, subst, level);
                 }
             }
+            // A rigid is quantified rather than left standing: the annotation
+            // that declared it is exactly the scheme being built, so what was
+            // a promise about every caller while the body was checked becomes
+            // the quantifier that says so. No level to consult — a rigid was
+            // never minted, so there is no binder further out for it to belong
+            // to. One that belongs to a *different* annotation is numbered here
+            // too and reported separately: see [`Table::escapes`].
+            Core::Rigid { id, .. } => {
+                if !presences {
+                    let next = subst.next();
+                    subst.rigids.entry(*id).or_insert(next);
+                }
+            }
             Core::Arrow(from, to) => {
                 self.quantify_walk(from, subst, level, presences);
                 self.quantify_walk(to, subst, level, presences);
             }
             Core::Sum(cases) => self.quantify_row(cases, subst, level, presences),
             // An argument left open is the definition's to quantify, the same
-            // as one written anywhere else: `WithX ..'a -> Nat` names its tail
+            // as one written anywhere else: `WithX ..a -> Nat` names its tail
             // because this descends.
             Core::Named { args, .. } => {
                 for arg in args.iter() {
@@ -2504,8 +2572,18 @@ impl Table {
     fn quantify_row(&self, row: &Row, subst: &mut Subst, level: u32, presences: bool) {
         let row = self.canon(row);
         self.quantify_labels(&row.labels, subst, level, presences);
-        if !presences && let Rest::Var(var) = row.rest {
-            self.quantify_var(var, subst, level);
+        if presences {
+            return;
+        }
+        match row.rest {
+            Rest::Var(var) => self.quantify_var(var, subst, level),
+            // The struct core's rule about a sum's tail; see
+            // [`quantify_walk`](Self::quantify_walk).
+            Rest::Rigid { id, .. } => {
+                let next = subst.next();
+                subst.rigids.entry(id).or_insert(next);
+            }
+            Rest::Closed | Rest::Bound(_) | Rest::Undecided | Rest::More(_) => {}
         }
     }
 
@@ -2532,12 +2610,12 @@ impl Table {
         if self.levels[var as usize] < level {
             return;
         }
-        let next = subst.types.len() as u32;
+        let next = subst.next();
         subst.types.entry(var).or_insert(next);
     }
 
-    /// [`quantify_var`](Self::quantify_var) in the other alphabet: a presence
-    /// is numbered `a`, `b`, … among presences alone.
+    /// [`quantify_var`](Self::quantify_var) at the low end of the space, which
+    /// the presences have to themselves. See [`Scheme`].
     fn quantify_presence(&self, var: TyVar, subst: &mut Subst, level: u32) {
         if self.levels[var as usize] < level {
             return;
@@ -2563,6 +2641,17 @@ impl Table {
                 Some(at) => Core::Bound(*at),
                 None => ty.core.clone(),
             },
+            // The rigid the annotation checked its body against, becoming the
+            // quantifier the scheme publishes. See
+            // [`quantify_walk`](Self::quantify_walk).
+            //
+            // Indexed rather than looked up, unlike the variable above: a
+            // variable may belong to a binder further out and be left standing,
+            // and a rigid belongs to nobody further out. Every caller quantifies
+            // the very type it then zonks, and quantifying numbers every rigid
+            // it walks whatever the level, so a rigid reaching here has a
+            // position.
+            Core::Rigid { id, .. } => Core::Bound(subst.rigids[id]),
             Core::Arrow(from, to) => Core::Arrow(self.zonk(from, subst), self.zonk(to, subst)),
             Core::Sum(cases) => Core::Sum(self.zonk_row(cases, subst)),
             // Rebuilt rather than handed back, because an argument may hold a
@@ -2602,6 +2691,9 @@ impl Table {
                 Some(at) => Rest::Bound(*at),
                 None => Rest::Var(var),
             },
+            // Indexed for the reason a struct's core is; see
+            // [`zonk`](Self::zonk).
+            Rest::Rigid { id, .. } => Rest::Bound(subst.rigids[&id]),
             decided => decided,
         };
         Row { labels, rest }
@@ -2701,7 +2793,7 @@ impl Table {
     /// finished substitution. Left alone, such a variable would reach the
     /// reader as `?7`, which names the solver's bookkeeping rather than
     /// anything they wrote, and would spell as `?7` a type the scheme beside
-    /// it spells `'a`.
+    /// it spells `a`.
     fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
             ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
@@ -2719,7 +2811,29 @@ impl Table {
                 base: self.close(base, subst),
                 field: field.clone(),
             },
-            ErrorKind::AnnotationTooOpen => ErrorKind::AnnotationTooOpen,
+            ErrorKind::RigidBroken {
+                found,
+                name,
+                declared,
+            } => ErrorKind::RigidBroken {
+                found: self.close(found, subst),
+                name: name.clone(),
+                declared: *declared,
+            },
+            // The label and the variable are both spellings, and the span is a
+            // place: nothing here is a type for a later substitution to improve.
+            ErrorKind::RigidField {
+                shape,
+                field,
+                name,
+                declared,
+            } => ErrorKind::RigidField {
+                shape: *shape,
+                field: field.clone(),
+                name: name.clone(),
+                declared: *declared,
+            },
+            ErrorKind::RigidEscapes { name } => ErrorKind::RigidEscapes { name: name.clone() },
             // The presence complaints carry prose rather than types:
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here
@@ -2795,46 +2909,181 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
     lowered
 }
 
-/// Every `..r` an annotation has written so far, by name, in the two sorts a
-/// named tail can be: the core a struct's `..` stands for, and the rest a sum's
-/// does. Two maps rather than one because the two are two sorts of value —
-/// lowering has already refused a name used at both, so no name is ever in both.
-/// See [`ir::ErrorKind::MixedTail`](crate::ir::ErrorKind::MixedTail).
+/// What one annotation's `where let` declared, ready for the type beside it to
+/// be lowered against.
+///
+/// One map per sort a variable can have, because the three are three sorts of
+/// value — lowering has already refused a name used at two, so no name is ever
+/// in more than one. A declared type or row variable is a rigid, minted before
+/// the type is walked because a use may come first; a declared presence is an
+/// ordinary solver variable, exactly as `when a` has always minted one, for the
+/// reason the spec's assumption gives: presences remain governed by the SAT
+/// store rather than skolemized.
+///
+/// Empty for a `type` declaration's body, which declares nothing and whose
+/// tails are its parameters.
 #[derive(Default)]
 struct Tails {
     cores: HashMap<String, Core>,
     rows: HashMap<String, Rest>,
-    /// Every `when a` the annotation has written so far, by name. The same
-    /// scope and the same rule: two labels wearing one name share one presence
-    /// variable, which is how a type says two fields are there together, and
-    /// what the `where` clause beside them resolves against.
+    /// The presences, by the names their `when`s wear. Two labels wearing one
+    /// name share one variable, which is how a type says two fields are there
+    /// together, and what the `where` clause beside them resolves against.
     presences: HashMap<String, Presence>,
 }
 
-/// The semantic type and formula a written annotation denotes: [`lower_type`]
-/// with the `where` clause the type's `when`s bind the names of.
+/// Everything one lowered annotation says: the type its body is checked
+/// against, the scheme a use of its own name inside that body instantiates, and
+/// what it promised about its presences.
+struct Lowered {
+    /// The skolemized type. Its `where let` variables are rigids and its holes
+    /// are ordinary solver variables, which is the whole of the difference
+    /// between what the annotation promises and what it leaves to inference.
+    ty: Rc<Ty>,
+    /// [`Lowered::ty`] with its rigids quantified and nothing else — what a
+    /// recursive use of the name is a copy of.
+    ///
+    /// Quantifying the rigids is what makes polymorphic recursion over a
+    /// declared variable typable: each mention gets its own fresh copy of `r`,
+    /// so `depth n.kids` handing a closed record where the annotation wrote an
+    /// open one is no conflict. Leaving the holes alone is what keeps the rest
+    /// monomorphic: they are the one thing the group is deciding, and a copy of
+    /// one would decide nothing.
+    scheme: Scheme,
+    /// What the `where` clause requires, over the presence variables the
+    /// annotation minted.
+    formula: Formula,
+    /// The presence names it bound and what each lowered to — what a complaint
+    /// about the clause quotes it in, since the reader wrote `a` and never saw
+    /// the variable.
+    names: Vec<(String, Presence)>,
+    /// The ids of the type and row variables it declared, which are the ones
+    /// its own scheme may quantify. See [`Table::escapes`].
+    rigids: Vec<u32>,
+}
+
+/// The semantic type a written annotation denotes, with everything else the
+/// annotation settles.
 ///
-/// The clause is read after the type, whatever order a reader's eye takes them
-/// in, because there is nothing to resolve a name against until the labels that
-/// bind it are lowered.
-fn lower_annotation(
-    mint: &Mint,
-    table: &mut Table,
-    annotation: &Annotation,
-) -> (Rc<Ty>, Formula, Vec<(String, Presence)>) {
+/// The declarations first, because a use may be written before the statement
+/// that declares it and every one of them has to resolve. Then the type. Then
+/// the clause, whatever order a reader's eye takes the two in, because there is
+/// nothing to resolve a formula's names against until the labels that wear them
+/// are lowered.
+fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> Lowered {
     let mut tails = Tails::default();
-    let lowered = lower(mint, table, &mut tails, &annotation.ty);
-    table.note_lacks(&lowered);
+    let mut at: HashMap<u32, u32> = HashMap::new();
+    let mut rigids = Vec::new();
+    for variable in &annotation.variables {
+        table.rigids.insert(variable.id, variable.span);
+        let name: Rc<str> = variable.name.as_str().into();
+        match variable.sense {
+            Sense::Type => {
+                at.insert(variable.id, at.len() as u32);
+                rigids.push(variable.id);
+                let core = Core::Rigid {
+                    id: variable.id,
+                    name,
+                };
+                tails.cores.insert(variable.name.clone(), core);
+            }
+            Sense::Cases => {
+                at.insert(variable.id, at.len() as u32);
+                rigids.push(variable.id);
+                let rest = Rest::Rigid {
+                    id: variable.id,
+                    name,
+                };
+                tails.rows.insert(variable.name.clone(), rest);
+            }
+            // A presence is a solver variable like any other `when`'s: the
+            // clause beside it and the SAT store are what govern it, and
+            // nothing here is skolemized.
+            Sense::Presence => {
+                let presence = table.fresh_presence();
+                tails.presences.insert(variable.name.clone(), presence);
+            }
+        }
+    }
+    let ty = lower(mint, table, &mut tails, &annotation.ty);
+    // A tail stands for the fields its row did not write out, and this is where
+    // that is first true of a written one: `{ x: Nat, ..h }` says the hole `h`
+    // has no `x`. A rigid needs none of it — nothing can ever be bound to one,
+    // so every label demanded of one is refused outright instead. See
+    // [`Table::lacks`] and [`ErrorKind::RigidField`].
+    table.note_lacks(&ty);
     let formula = match &annotation.clause {
         Some(clause) => clause_formula(&tails, clause),
         None => Formula::True,
     };
+    let scheme = Scheme::new(at.len() as u32, close_rigids(&ty, &at));
     // In one fixed order, because they come out of a hash map and the order it
     // hands them over is nobody's: a complaint about the clause names its
     // presences the same way on every run, which alphabetical is enough for.
     let mut names: Vec<(String, Presence)> = tails.presences.into_iter().collect();
     names.sort_by(|(one, _), (other, _)| one.cmp(other));
-    (lowered, formula, names)
+    Lowered {
+        ty,
+        scheme,
+        formula,
+        names,
+        rigids,
+    }
+}
+
+/// A skolemized annotation with its rigids quantified: what a recursive use of
+/// the annotated name is a copy of. See [`Lowered::scheme`].
+///
+/// A structural walk with no resolving in it, because there is nothing yet to
+/// resolve: the type was lowered a moment ago and no constraint has been solved
+/// against it — which is also why no tail here has been spliced to more cases.
+/// The map is indexed rather than looked up for the same reason: it holds every
+/// variable this annotation declared, and a rigid in the type came from this
+/// annotation or from nowhere.
+fn close_rigids(ty: &Rc<Ty>, at: &HashMap<u32, u32>) -> Rc<Ty> {
+    let fields = ty
+        .fields
+        .iter()
+        .map(|(name, field)| {
+            let field = RowField {
+                presence: field.presence.clone(),
+                ty: close_rigids(&field.ty, at),
+            };
+            (name.clone(), field)
+        })
+        .collect();
+    let core = match &ty.core {
+        Core::Rigid { id, .. } => Core::Bound(at[id]),
+        Core::Arrow(from, to) => Core::Arrow(close_rigids(from, at), close_rigids(to, at)),
+        Core::Sum(cases) => Core::Sum(close_rigids_row(cases, at)),
+        Core::Named { symbol, name, args } => Core::Named {
+            symbol: *symbol,
+            name: name.clone(),
+            args: args.iter().map(|arg| close_rigids(arg, at)).collect(),
+        },
+        Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => ty.core.clone(),
+    };
+    Rc::new(Ty { core, fields })
+}
+
+/// [`close_rigids`] over a sum's cases: its payloads, and the rest it ends with.
+fn close_rigids_row(row: &Row, at: &HashMap<u32, u32>) -> Row {
+    let labels = row
+        .labels
+        .iter()
+        .map(|(name, field)| {
+            let field = RowField {
+                presence: field.presence.clone(),
+                ty: close_rigids(&field.ty, at),
+            };
+            (name.clone(), field)
+        })
+        .collect();
+    let rest = match &row.rest {
+        Rest::Rigid { id, .. } => Rest::Bound(at[id]),
+        rest => rest.clone(),
+    };
+    Row { labels, rest }
 }
 
 /// One lowered `where` clause as the formula it denotes, over the presence
@@ -2949,54 +3198,39 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             Core::Sum(row(table, tails, labels, tail))
         }
         // A hole the solver fills: a fresh variable, so whatever the position
-        // meets decides it. The pattern desugar's field types are these — the
-        // pattern says which fields are there, not what they hold — and the
-        // variable is what lets a projection of the field and the demand share
-        // one answer. See [`ir::TypeKind::Any`](crate::ir::TypeKind).
-        TypeKind::Any => Core::Var(table.fresh_core()),
+        // meets decides it. `_` written by a reader and the field types of the
+        // pattern desugar's exact demand are the same thing — a position left
+        // to be decided, whoever left it — and the variable is what lets a
+        // projection of a field and the demand for it share one answer.
+        TypeKind::Hole => Core::Var(table.fresh_core()),
+        // A `where let` variable in a type position: the rigid its declaration
+        // minted, shared by every mention of the name in this one annotation.
+        //
+        // Indexed rather than looked up: lowering refused a name nothing
+        // declared, and a name read at another sort absorbed into
+        // [`TypeKind::Error`] rather than reaching here.
+        TypeKind::Var(name) => tails.cores[name].clone(),
         TypeKind::Error => Core::Undecided,
     };
     Rc::new(Ty::plain(core))
 }
 
-/// Whether an annotation is the compiler's own demand rather than the reader's
-/// promise: whether it holds a hole, which nothing a reader writes can.
-///
-/// What it exempts is the too-open check. A written `..` or `when` is a promise —
-/// the definition works whatever the open part turns out to be — and a
-/// definition that decides it has broken the promise. A hole is the opposite:
-/// it is *there to be decided*, so holding the annotation to the promise would
-/// report every exact pattern binding as a broken contract nobody wrote.
-pub(crate) fn synthetic(ty: &Type) -> bool {
-    match &ty.tracked {
-        TypeKind::Any => true,
-        // The desugar writes a hole only as a field's type, directly under
-        // the struct that is the demand — see [`ir::TypeKind::Any`] — so the
-        // walk needs no further reach: everything else a written type can be
-        // is a written type.
-        TypeKind::Struct { fields, .. } => fields
-            .values()
-            .any(|field| field.value().is_some_and(synthetic)),
-        _ => false,
-    }
-}
-
 /// Whether one label is there, as its `when` clause says it: no clause means it
-/// is simply there, a named one is the variable everything of that name in this
-/// annotation shares, and `when _` is a variable of its own that nothing can
-/// name.
-fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) -> Presence {
+/// is simply there, a named one is the variable the annotation's own
+/// declaration minted for that name, and `when _` is a variable of its own that
+/// nothing can name.
+///
+/// Indexed rather than looked up: a named `when` is a *use*, so lowering has
+/// already refused a name nothing declared and erased one read at another sort,
+/// and [`lower_annotation`] minted a variable for every name that survived.
+fn presence(table: &mut Table, tails: &Tails, when: &Option<Box<ir::When>>) -> Presence {
     let Some(when) = when else {
         return Presence::Present;
     };
     let Some(name) = &when.name else {
         return table.fresh_presence();
     };
-    tails
-        .presences
-        .entry(name.clone())
-        .or_insert_with(|| table.fresh_presence())
-        .clone()
+    tails.presences[name].clone()
 }
 
 /// The cases of a written sum and what its `..` stands for, assembled into the
@@ -3012,11 +3246,9 @@ fn row(
     let rest = match tail.as_ref().map(|tail| &tail.of) {
         None => Rest::Closed,
         Some(ir::Row::Anything) => table.fresh_row(),
-        Some(ir::Row::Named(name)) => tails
-            .rows
-            .entry(name.clone())
-            .or_insert_with(|| table.fresh_row())
-            .clone(),
+        // The rigid its declaration minted, shared by every `..r` in this one
+        // annotation. Indexed for the reason [`presence`] is.
+        Some(ir::Row::Named(name)) => tails.rows[name].clone(),
         // A row parameter is its position, the same as a type one: what it
         // stands for is spliced in where this sits, by the flattening
         // [`Table::canon`] already does for a tail bound to a row.
@@ -3038,11 +3270,7 @@ fn core_tail(table: &mut Table, tails: &mut Tails, tail: &Option<Tail>) -> Core 
     match tail.as_ref().map(|tail| &tail.of) {
         None => Core::Unit,
         Some(ir::Row::Anything) => Core::Var(table.fresh_core()),
-        Some(ir::Row::Named(name)) => tails
-            .cores
-            .entry(name.clone())
-            .or_insert_with(|| Core::Var(table.fresh_core()))
-            .clone(),
+        Some(ir::Row::Named(name)) => tails.cores[name].clone(),
         Some(ir::Row::Param { index, .. }) => Core::Bound(*index),
     }
 }
@@ -3107,7 +3335,7 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
         // stands for and says nothing about the fields written outside it.
         // A declaration binds no presence — lowering refuses a `when` in one —
         // so there is no presence list for unfolding to supply.
-        ty = splice(&ty.fields, &scheme.body().open(&fresh, &[]));
+        ty = splice(&ty.fields, &scheme.body().open(&fresh));
     }
     ty
 }
@@ -3158,8 +3386,8 @@ impl Ty {
     /// the argument written at the use site. Which sort a position needs is
     /// decided here rather than by the caller, because the position is what
     /// knows: see [`Assigned::as_row`].
-    pub fn open(&self, fresh: &[Assigned], presences: &[Presence]) -> Rc<Ty> {
-        let fields = open_labels(&self.fields, fresh, presences);
+    pub fn open(&self, fresh: &[Assigned]) -> Rc<Ty> {
+        let fields = open_labels(&self.fields, fresh);
         let core = match &self.core {
             // Not a leaf: what the variable stands for may carry fields, and
             // the fields written outside it are kept over them. This is what a
@@ -3169,18 +3397,21 @@ impl Ty {
             Core::Bound(index) => {
                 return splice(&fields, &fresh[*index as usize].as_ty());
             }
-            Core::Arrow(from, to) => {
-                Core::Arrow(from.open(fresh, presences), to.open(fresh, presences))
-            }
-            Core::Sum(cases) => Core::Sum(cases.open(fresh, presences)),
+            Core::Arrow(from, to) => Core::Arrow(from.open(fresh), to.open(fresh)),
+            Core::Sum(cases) => Core::Sum(cases.open(fresh)),
             // A declaration's own body reaches here holding its parameters, so
             // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.
             Core::Named { symbol, name, args } => Core::Named {
                 symbol: *symbol,
                 name: name.clone(),
-                args: args.iter().map(|arg| arg.open(fresh, presences)).collect(),
+                args: args.iter().map(|arg| arg.open(fresh)).collect(),
             },
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Undecided => self.core.clone(),
+            // A rigid is a leaf and is never opened: what a scheme quantified is
+            // a [`Core::Bound`], and a rigid is what an annotation's own
+            // variable stands for while its body is being checked.
+            Core::Unit | Core::Nat | Core::Var(_) | Core::Rigid { .. } | Core::Undecided => {
+                self.core.clone()
+            }
         };
         Rc::new(Ty { core, fields })
     }
@@ -3191,8 +3422,8 @@ impl Row {
     /// stands for the cases whatever is handed to it allows, which is how an
     /// argument written as a whole type is read for the row it carries. See
     /// [`Assigned::as_row`].
-    fn open(&self, fresh: &[Assigned], presences: &[Presence]) -> Row {
-        let labels = open_labels(&self.labels, fresh, presences);
+    fn open(&self, fresh: &[Assigned]) -> Row {
+        let labels = open_labels(&self.labels, fresh);
         let rest = match &self.rest {
             Rest::Bound(index) => Rest::More(Rc::new(fresh[*index as usize].as_row())),
             rest => rest.clone(),
@@ -3207,14 +3438,13 @@ impl Row {
 fn open_labels(
     labels: &IndexMap<String, RowField>,
     fresh: &[Assigned],
-    presences: &[Presence],
 ) -> IndexMap<String, RowField> {
     labels
         .iter()
         .map(|(name, field)| {
             let field = RowField {
-                presence: field.presence.open(presences),
-                ty: field.ty.open(fresh, presences),
+                presence: field.presence.open(fresh),
+                ty: field.ty.open(fresh),
             };
             (name.clone(), field)
         })
@@ -3222,12 +3452,12 @@ fn open_labels(
 }
 
 impl Presence {
-    /// [`Ty::open`] over one presence, in the presence alphabet: a scheme
-    /// numbers its `when` names apart from its `'a`s, so a bound presence
-    /// indexes its own list.
-    fn open(&self, presences: &[Presence]) -> Presence {
+    /// [`Ty::open`] over one presence. One index space, so a bound presence
+    /// indexes the same list a bound type does — its position is simply one of
+    /// the low ones the scheme reserved for presences. See [`Scheme`].
+    fn open(&self, fresh: &[Assigned]) -> Presence {
         match self {
-            Presence::Bound(index) => presences[*index as usize].clone(),
+            Presence::Bound(index) => fresh[*index as usize].presence(),
             decided => decided.clone(),
         }
     }

@@ -154,14 +154,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         );
     }
     if let Some(inferred) = &inferred {
-        diagnostics.extend(inferred.errors.iter().map(|error| {
-            raw(
-                "types",
-                error.kind.code(),
-                error.kind.to_string(),
-                Some(error.span),
-            )
-        }));
+        diagnostics.extend(inferred.errors.iter().map(inference_diagnostic));
     }
     if let Some(checked) = &checked {
         diagnostics.extend(checked.errors.iter().map(|error| {
@@ -312,7 +305,10 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
     // already worked out.
     let elsewhere = match &error.kind {
         ir::ErrorKind::Duplicate { previous, .. }
-        | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
+        | ir::ErrorKind::DuplicateParameter { previous }
+        | ir::ErrorKind::DuplicateVariable { previous, .. } => {
+            Some((*previous, ui::FIRST_DEFINITION))
+        }
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,
     };
@@ -320,6 +316,32 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
         diagnostic.related.push(Related {
             span: range(previous),
             message: note.to_string(),
+        });
+    }
+    diagnostic
+}
+
+/// Inference's errors, two of which have a second place to point at: the
+/// `where let` that declared the variable a body broke its promise about. The
+/// same pairing [`ir_diagnostic`] makes one phase earlier, and shown the same
+/// way — one diagnostic with two highlights, because a broken promise is only
+/// legible next to the promise.
+fn inference_diagnostic(error: &inference::Error) -> Diagnostic {
+    let mut diagnostic = raw(
+        "types",
+        error.kind.code(),
+        error.kind.to_string(),
+        Some(error.span),
+    );
+    let declared = match &error.kind {
+        inference::ErrorKind::RigidBroken { declared, .. }
+        | inference::ErrorKind::RigidField { declared, .. } => Some(*declared),
+        _ => None,
+    };
+    if let Some(declared) = declared {
+        diagnostic.related.push(Related {
+            span: range(declared),
+            message: ui::DECLARED_HERE.to_string(),
         });
     }
     diagnostic
