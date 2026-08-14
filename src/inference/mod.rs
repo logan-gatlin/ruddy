@@ -2331,8 +2331,8 @@ impl Table {
     /// type's, so a presence only a nested binding's type mentions is spoken
     /// for; and nothing is projected away, because the walk asks only whether
     /// an assignment exists — a variable left free answers that as well as a
-    /// quantified one, and eliminating it would cost the Shannon expansion for
-    /// nothing.
+    /// quantified one, and eliminating it would cost a walk of the projection
+    /// for nothing.
     ///
     /// Silent once something has already flipped the store, for the reason
     /// [`required`](Self::required) is.
