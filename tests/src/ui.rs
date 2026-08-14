@@ -160,6 +160,9 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         TypeError::PresenceImpossible {
             formula: "x and y".to_string(),
         },
+        TypeError::ClauseImpossible {
+            formula: "a and not a".to_string(),
+        },
         TypeError::AnnotationAllows {
             allowed: "a or b".to_string(),
             required: "a".to_string(),

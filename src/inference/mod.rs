@@ -126,6 +126,25 @@ pub struct Output {
     /// What the program requires of its presence variables, in the order it
     /// required it. See [`Store`].
     pub store: Store,
+    /// What [`patterns`](crate::patterns) may assume while it walks each
+    /// top-level definition: the store's word about *every* presence variable
+    /// that definition's zonked terms can name, in the [`Core::Bound`]
+    /// numbering those terms were closed into.
+    ///
+    /// Not the scheme's `where` clause, which is a strictly smaller thing. A
+    /// scheme quantifies only the presences its own type mentions (R8, R12),
+    /// but a nested `let` is generalized on its own terms and its presences
+    /// still reach the enclosing definition's body — numbered by the same
+    /// substitution, and so nameable by the types the walk reads. Promising
+    /// only the scheme's clause would leave every such presence unconstrained
+    /// and walk both halves of a column the store had already related: the
+    /// independence R11 exists to remove.
+    ///
+    /// Keyed by the top-level symbol, in source order. Empty — [`Formula::True`]
+    /// — for a definition generalized once something had flipped the store: a
+    /// store with no model entails everything, and asking it would call every
+    /// arm of every match unreachable.
+    pub promises: IndexMap<Symbol, Formula>,
     pub errors: Vec<Error>,
 }
 
@@ -512,7 +531,21 @@ pub enum ErrorKind {
     /// [`ErrorKind::PresenceRequired`]'s twin at the other end: there the
     /// contradiction is between a scheme and a use, here between an annotation
     /// and the body it is written over.
+    ///
+    /// Only when the clause has a model of its own and something earlier took
+    /// it away. A clause with no model at all is
+    /// [`ErrorKind::ClauseImpossible`] instead: blaming the definition for it
+    /// would be blaming a body that may do nothing with the type whatever.
     PresenceImpossible { formula: String },
+    /// An annotation whose `where` clause nothing can satisfy on its own
+    /// terms — `where a and not a`, which forbids every value at once.
+    ///
+    /// [`ErrorKind::PresenceImpossible`]'s other half, split from it because
+    /// the two blame different things. There the clause is fine and the
+    /// definition is what leaves it without a model; here nothing outside the
+    /// clause is involved, and a complaint that mentioned the definition would
+    /// be asserting something untrue of it.
+    ClauseImpossible { formula: String },
     /// An annotation whose `where` clause allows more than the definition
     /// under it does — `where a or b` over a body that needs `a`.
     ///
@@ -799,6 +832,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut schemes = IndexMap::new();
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
+    let mut promises = IndexMap::new();
     let mut steps = Vec::new();
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
@@ -1083,6 +1117,11 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // into the body, so a term's type and its definition's scheme spell
             // the same variable the same way.
             table.zonk_term(&mut decl.value, &mut subst);
+            // With every presence the body can name now numbered, the store's
+            // word about all of them, for the patterns walk to assume. The
+            // scheme's own clause is deliberately not this: see
+            // [`Output::promises`].
+            promises.insert(symbol, table.promised(&subst));
             // And the same for what it complained about, which is why this
             // waits until the group is solved rather than running where the
             // error was reported: a variable in a payload may have been solved
@@ -1112,6 +1151,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         .collect();
     schemes.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
     constraints.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
+    promises.sort_by(|one, _, other, _| position[one].cmp(&position[other]));
 
     // Constraints are solved in the order the walk emitted them, which is not
     // quite the order anyone reads a file in — a body's demands come before
@@ -1135,6 +1175,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         constraints,
         steps,
         store,
+        promises,
         errors,
     }
 }
@@ -1160,9 +1201,21 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
     let kind = match &batch.origin {
         Origin::Coverage(_) => return,
         Origin::Instance(named) | Origin::Annotation(named) => {
+            // Which of the two annotation complaints it is: a clause with no
+            // model of its own is wrong by itself, and the body under it —
+            // which may do nothing with the type at all — has no part in it.
+            // Asked of the formula as written rather than of
+            // [`Table::resolved`], which is the whole distinction: resolving
+            // substitutes what the solve decided, so a clause the definition
+            // ruled out and one that rules itself out would come back the
+            // same, and every clause would blame the clause. An annotation
+            // check is one of the three places R8 lets the solver run, so
+            // this widens nothing.
+            let alone = sat::satisfiable(&batch.formula);
             let formula = crate::ui::in_labels(&batch.formula, &named.labels);
             match &batch.origin {
-                Origin::Annotation(_) => ErrorKind::PresenceImpossible { formula },
+                Origin::Annotation(_) if alone => ErrorKind::PresenceImpossible { formula },
+                Origin::Annotation(_) => ErrorKind::ClauseImpossible { formula },
                 _ => ErrorKind::PresenceRequired { formula },
             }
         }
@@ -2261,6 +2314,39 @@ impl Table {
         sat::project(&self.component(&atoms), &atoms)
     }
 
+    /// What the store says about every presence variable `subst` numbered, in
+    /// that numbering: the formula [`patterns`](crate::patterns) walks a
+    /// definition under. See [`Output::promises`].
+    ///
+    /// Beside [`required`](Self::required) rather than in it, and deliberately
+    /// unlike it in two ways. The atoms are the substitution's rather than the
+    /// type's, so a presence only a nested binding's type mentions is spoken
+    /// for; and nothing is projected away, because the walk asks only whether
+    /// an assignment exists — a variable left free answers that as well as a
+    /// quantified one, and eliminating it would cost the Shannon expansion for
+    /// nothing.
+    ///
+    /// Silent once something has already flipped the store, for the reason
+    /// [`required`](Self::required) is.
+    fn promised(&self, subst: &Subst) -> Formula {
+        if self.unsat {
+            return Formula::True;
+        }
+        // By the number each was given, so that what the walk is handed does
+        // not depend on how a hash map happened to order itself.
+        let mut numbered: Vec<(TyVar, u32)> = subst
+            .presences
+            .iter()
+            .map(|(var, at)| (*var, *at))
+            .collect();
+        numbered.sort_by_key(|(_, at)| *at);
+        let atoms: Vec<Atom> = numbered
+            .into_iter()
+            .map(|(var, _)| Atom::Var(var))
+            .collect();
+        quantify_formula(&self.component(&atoms), subst)
+    }
+
     /// A local binding's scheme as it is published: everything it left free
     /// numbered on past its own quantifiers, so that a reader is shown letters
     /// rather than the solver's `?3`.
@@ -2571,7 +2657,7 @@ impl Table {
                 field: field.clone(),
             },
             ErrorKind::AnnotationTooOpen => ErrorKind::AnnotationTooOpen,
-            // The three presence complaints carry prose rather than types:
+            // The presence complaints carry prose rather than types:
             // their formulas were already worded, at the moment the variables
             // in them still had labels to be named by. There is nothing here
             // for a later substitution to improve.
@@ -2579,6 +2665,9 @@ impl Table {
                 formula: formula.clone(),
             },
             ErrorKind::PresenceImpossible { formula } => ErrorKind::PresenceImpossible {
+                formula: formula.clone(),
+            },
+            ErrorKind::ClauseImpossible { formula } => ErrorKind::ClauseImpossible {
                 formula: formula.clone(),
             },
             ErrorKind::AnnotationAllows { allowed, required } => ErrorKind::AnnotationAllows {

@@ -5033,6 +5033,33 @@ fn an_annotation_its_definition_rules_out_is_refused() {
     assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
 }
 
+/// A clause that contradicts itself is the clause's own fault, whatever the
+/// body under it does — and this body does nothing with the type at all. So
+/// the complaint blames only the clause: a different kind from the one that
+/// blames the definition, and it is the only error the program gets.
+#[test]
+fn an_annotation_that_rules_itself_out_is_refused() {
+    let src = "let f : { x when a: Nat } -> {} where a and not a = fn v => {}";
+    let (mint, _, output) = infer_src(src);
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "clause-impossible");
+    // At the annotation, which is the line the reader has to change.
+    assert_eq!(
+        error.span.start,
+        src.find("{ x when a").expect("the annotation")
+    );
+    assert_eq!(
+        error.kind.to_string(),
+        "nothing can satisfy `a and not a`: this clause rules out every value at once"
+    );
+    // And nothing is published from it: a scheme carrying a clause with no
+    // model would say the same wrong thing again at every use of the name.
+    assert!(output.schemes.values().all(|s| s.formula().is_true()));
+    assert_eq!(scheme(&mint, &output, "f"), "{ x when a: Nat } -> {}");
+}
+
 /// A use-site complaint quotes its formula in whatever labels the instantiated
 /// type names, wherever in it they are: under an arrow, inside a sum, and
 /// through a declared type's arguments.

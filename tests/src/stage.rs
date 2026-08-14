@@ -289,7 +289,8 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
 
 /// The Presence tab: one section per batch of the store, in program order,
 /// each with what it came from, the formula it contributed and the running
-/// verdict — and then what every definition's scheme ended up requiring.
+/// verdict — and then what every definition's scheme ended up requiring, beside
+/// what the patterns phase walks that definition under.
 #[test]
 fn the_presence_tab_renders_the_store_and_the_clauses() {
     use ruddy_debug::{
@@ -321,6 +322,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
     assert_eq!(labels, ["match-coverage", "let p"], "{nodes:#?}");
     assert_eq!(nodes[1].text, "where a != b");
+    assert_eq!(nodes[1].children[0].label, "patterns assume");
     let rows: Vec<(&str, &str)> = nodes[0]
         .children
         .iter()
@@ -373,12 +375,40 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         "{nodes:#?}"
     );
 
+    // What the patterns phase assumes is the other half of the definition's
+    // row, and it is not the scheme's clause: a definition whose presences all
+    // live in a nested binding publishes no clause at all and is still walked
+    // under everything the store says about them.
+    let nodes = tab("let outer = fn z =>\n  \
+           let g = fn v =>\n    \
+             let w = match v with | {x} => 0 | {y} => 0 end in\n    \
+             match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end in\n  \
+           0");
+    let outer = nodes
+        .iter()
+        .find(|node| node.label == "let outer")
+        .expect("the definition's row");
+    assert_eq!(outer.text, "unconstrained");
+    let assumed = outer
+        .children
+        .iter()
+        .find(|child| child.label == "patterns assume")
+        .expect("the promise row");
+    assert_eq!(assumed.text, "a and not b or not a and b", "{nodes:#?}");
+
     // A program that constrains nothing still says so, per definition: the
-    // ordinary case is a tab full of "unconstrained" rather than an empty one.
+    // ordinary case is a tab full of "unconstrained" rather than an empty one,
+    // promise row included.
     let nodes = tab("let id = fn x => x");
     assert_eq!(nodes.len(), 1, "{nodes:#?}");
     assert_eq!(nodes[0].label, "let id");
     assert_eq!(nodes[0].text, "unconstrained");
+    let rows: Vec<(&str, &str)> = nodes[0]
+        .children
+        .iter()
+        .map(|child| (child.label.as_str(), child.text.as_str()))
+        .collect();
+    assert_eq!(rows, [("patterns assume", "unconstrained")], "{nodes:#?}");
 }
 
 /// A program that never reaches inference leaves the tab with nothing to

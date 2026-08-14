@@ -1608,6 +1608,7 @@ impl inference::ErrorKind {
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
             inference::ErrorKind::PresenceRequired { .. } => "presence-required",
             inference::ErrorKind::PresenceImpossible { .. } => "presence-impossible",
+            inference::ErrorKind::ClauseImpossible { .. } => "clause-impossible",
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
         }
     }
@@ -1660,6 +1661,13 @@ impl fmt::Display for inference::ErrorKind {
             inference::ErrorKind::PresenceImpossible { formula } => write!(
                 f,
                 "nothing can satisfy `{formula}`: what this definition does with the type has already ruled it out",
+            ),
+            // The same shape of sentence with the definition left out of it,
+            // because a clause that contradicts itself does so over any body
+            // at all — including one that never touches the type.
+            inference::ErrorKind::ClauseImpossible { formula } => write!(
+                f,
+                "nothing can satisfy `{formula}`: this clause rules out every value at once",
             ),
             inference::ErrorKind::AnnotationAllows { allowed, required } => write!(
                 f,

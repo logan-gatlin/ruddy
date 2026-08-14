@@ -9,9 +9,11 @@
 //! follows.
 //!
 //! Under the batches, what each definition's scheme came to require of the
-//! presences it quantifies — the `where` clause a reader sees on the type. The
-//! ordinary program is the one with no section at all, which is what R13 asks
-//! the tab to look like.
+//! presences it quantifies — the `where` clause a reader sees on the type —
+//! and beside it what the patterns phase walks that definition under, which is
+//! the same store read over every presence the body can name rather than only
+//! the ones the type does. The ordinary program is the one with no section at
+//! all, which is what R13 asks the tab to look like.
 //!
 //! Every row carries its origin's span, so clicking one lights the match, the
 //! use site or the annotation it came from, exactly as the other stages do.
@@ -127,6 +129,16 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             Some(decl) => row.at(decl.name_span),
             None => row,
         };
+        // Beside the clause, what the patterns phase walks the definition
+        // under. The two differ whenever a nested binding has presences of its
+        // own: the scheme quantifies only what its own type mentions, and a
+        // reader who saw only that could not explain a reachability verdict
+        // that turned on a nested `let`'s constraint.
+        let promise = match output.promises.get(symbol) {
+            Some(promise) if !promise.is_true() => promise.to_string(),
+            _ => "unconstrained".to_string(),
+        };
+        let row = row.child(Node::new(ids.next(), "patterns assume", promise));
         nodes.push(with_symbol(row, cx, mint, *symbol));
     }
 

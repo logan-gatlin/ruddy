@@ -861,6 +861,86 @@ fn a_non_qualifying_column_reads_the_store_for_reachability() {
     );
 }
 
+/// The same program one binding further in. A nested `let` is generalized on
+/// the same terms as a definition, and the presences of its type are numbered
+/// by the enclosing definition's substitution — so the walk has to be promised
+/// what the store says about *those* too, not only about the presences the
+/// top-level scheme quantified. Read the store's word about them and the
+/// nested match is exhaustive exactly as it is at the top level.
+#[test]
+fn a_nested_binding_reads_the_store_for_exhaustiveness() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20   match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+}
+
+/// And the reachability half of R11 through a nested binding: the arm the
+/// store forbids is unreachable wherever the binding that constrains it sits.
+#[test]
+fn a_nested_binding_reads_the_store_for_reachability() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {x} => 0 | {y} => 0 end in\n\
+               \x20   match v with\n\
+               \x20   | {x: 1} => 1 | {x: n, y} => 2 | {x: n} => 3 | {y} => 4 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unreachable-arm@{}",
+            src.find("{x: n, y}").expect("the arm the store forbids")
+        )],
+        "{checks:#?}"
+    );
+    let report = checks.reports.last().expect("two matches were checked");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(
+        verdicts(report),
+        [
+            Verdict::Reachable,
+            Verdict::Unreachable,
+            Verdict::Reachable,
+            Verdict::Reachable
+        ]
+    );
+}
+
+/// A written clause on a nested binding is the store's word about that
+/// binding's presences too, and a witness has to be a value the clause admits:
+/// `c != d` says nothing has both `p` and `q`, so the hole the walk reports is
+/// the value with neither rather than the one with both.
+#[test]
+fn a_nested_written_clause_shapes_the_witness() {
+    let src = "let solo = fn v =>\n\
+               \x20 let inner : {p when c: Nat, q when d: Nat} -> Nat where c != d =\n\
+               \x20   fn w => match w with | {p: 1} => 0 | {q} => 0 end in\n\
+               \x20 0";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(
+        errors(&checks),
+        [format!(
+            "unhandled-values@{}",
+            src.find("match").expect("the match")
+        )],
+        "{checks:#?}"
+    );
+    assert_eq!(witness_of(&checks), "{ p: 0 }");
+}
+
 /// A store with nothing in it says nothing, and the walk over an unconverted
 /// column reads exactly as it always did: R6 leaves such a column's own
 /// coverage where it was, and this path only ever reads the store.

@@ -231,18 +231,18 @@ struct Check<'a> {
     /// every match reads unhandled, which is one mistake said in as many places
     /// as the program has matches.
     flipped: Option<usize>,
-    /// What the definition being walked promises about the presences it
-    /// quantified: its scheme's `where` clause, which is what the store came to
-    /// about exactly those presences.
+    /// What the definition being walked may assume about its presences: the
+    /// store's word about every presence its terms can name, nested bindings
+    /// included. See [`inference::Output::promises`].
     ///
     /// The store itself is in the wrong alphabet to ask. Its batches are
-    /// written about solver variables, and generalization closed the types the
-    /// walk reads — a presence still open in one of them is the *position* the
-    /// scheme bound it to, not the variable it was. The clause is that same
-    /// content, renamed by the substitution that closed the types, so it is the
-    /// reading of the store a column can be asked about. It keeps the cascade
-    /// rule with it: a definition generalized once something had flipped the
-    /// store promises nothing at all.
+    /// written about solver variables, and closing the definition numbered the
+    /// types the walk reads — a presence still open in one of them is the
+    /// *position* it was closed to, not the variable it was. The promise is
+    /// that same content, renamed by the substitution that closed those types,
+    /// so it is the reading of the store a column can be asked about. It keeps
+    /// the cascade rule with it: a definition generalized once something had
+    /// flipped the store promises nothing at all.
     promise: Formula,
 }
 
@@ -266,8 +266,9 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
         errors: Vec::new(),
     };
     // One definition at a time, because the presences its types name are its
-    // own: the clause its scheme published is what the store came to about
-    // them, and it is the only reading of the store the walk inside it can use.
+    // own: the promise inference published for it is what the store came to
+    // about them, and it is the only reading of the store the walk inside it
+    // can use.
     for (symbol, decl) in &program.terms {
         let check = Check {
             aliases: &inferred.aliases,
@@ -275,9 +276,9 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
             store: &inferred.store,
             flipped,
             promise: inferred
-                .schemes
+                .promises
                 .get(symbol)
-                .map(|scheme| scheme.formula().clone())
+                .cloned()
                 .unwrap_or(Formula::True),
         };
         walk(&check, &decl.value, &mut out);
