@@ -4830,6 +4830,42 @@ fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
     );
 }
 
+/// A binding group is monomorphic, so a presence a fellow member's match
+/// constrains is the *same variable* in the annotated member's type: R10 reads
+/// the group's bodies and not the annotated one's alone. It reads the same
+/// either way round — a clause is no less broken for having been written above
+/// the match that breaks it than below it.
+#[test]
+fn a_clause_covers_what_its_whole_group_needs() {
+    let annotated = "let f : { x when a: Nat, y when b: Nat } -> {} where a or b = fn v => g v";
+    let matching = "let g = fn v => match v with | {x} => {} | {y} => f v end";
+    for src in [
+        format!("{annotated}\n{matching}"),
+        format!("{matching}\n{annotated}"),
+    ] {
+        let (_, _, output) = infer_src(&src);
+        let complaint = output
+            .errors
+            .iter()
+            .find(|error| error.kind.code() == "annotation-allows-more")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a complaint about the clause: {:#?}",
+                    output.errors
+                )
+            });
+        // In the names the reader wrote, which are the annotation's — and stay
+        // its own however the group's variables were unified.
+        assert_eq!(
+            complaint.kind.to_string(),
+            "the annotation allows `a or b`, but the definition requires `a != b`"
+        );
+        // At the annotation, wherever in the group it was written.
+        let at = src.find("{ x when").expect("the annotation");
+        assert_eq!(complaint.span.start, at);
+    }
+}
+
 /// An annotation on a nested `let` is the same promise about a smaller scope:
 /// the value is held to the clause, and the scheme the binding publishes is the
 /// clause rather than what the value worked out.

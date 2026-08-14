@@ -44,8 +44,16 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     // the walk goes for the same reason inference rebuilds it: what a batch
     // says is only interesting beside everything said before it.
     let mut accumulated = Formula::True;
+    // Which batch flipped the store, once one has: the verdict stays
+    // unsatisfiable for every batch after it, and a row that named the batch it
+    // is printed beside would blame each of them in turn for the one thing only
+    // the first of them did.
+    let mut flipped: Option<usize> = None;
     for (at, batch) in output.store.batches.iter().enumerate() {
         accumulated = accumulated.and(batch.formula.clone());
+        if batch.flipped {
+            flipped = Some(at);
+        }
         let mut node =
             Node::new(ids.next(), batch.origin.code(), batch.formula.to_string()).at(batch.span);
         if batch.flipped {
@@ -76,7 +84,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             None => Node::new(
                 ids.next(),
                 "verdict",
-                format!("unsatisfiable — flipped by batch {at}"),
+                match flipped {
+                    Some(flipped) => format!("unsatisfiable — flipped by batch {flipped}"),
+                    // Only reachable from a store that never marked a flip,
+                    // which inference does not build; a row saying what it can
+                    // see beats one asserting a batch number it cannot.
+                    None => "unsatisfiable".to_string(),
+                },
             )
             .error(),
         };

@@ -126,6 +126,32 @@ fn projection_eliminates_what_it_does_not_keep() {
     assert_eq!(sat::project(&Formula::any([]), &[]), Formula::False);
 }
 
+/// A formula too wide to enumerate is answered rather than enumerated: the
+/// truth table is `2^atoms` rows indexed by a `u32`, so a formula naming enough
+/// of them would take an age and then overflow the index it was counting on.
+#[test]
+fn a_projection_too_wide_to_enumerate_is_answered_anyway() {
+    // Wide enough that the row index would not fit, let alone be reached.
+    let wide = Formula::all((0..34).map(var));
+    let named = atoms(&wide);
+
+    // Nothing to eliminate, so nothing is lost but the minimization: what the
+    // formula said about its atoms is exactly what comes back.
+    assert_eq!(sat::project(&wide, &named), wide);
+
+    // With something to eliminate there is no such shortcut, and the answer
+    // errs the way that costs a missed complaint rather than an invented one.
+    assert!(sat::project(&wide, &[Atom::Var(0)]).is_true());
+
+    // The width is the formula's own, not the caller's: keeping atoms it never
+    // names widens nothing, so a small formula is still projected properly.
+    let keep: Vec<Atom> = (0..34).map(Atom::Var).collect();
+    assert_eq!(
+        sat::project(&var(0).and(var(1)), &keep).to_string(),
+        "?0 and ?1"
+    );
+}
+
 /// The constant formulas fold as they are built, so "says nothing" is the
 /// value rather than a tree of trues for something later to recognize.
 #[test]

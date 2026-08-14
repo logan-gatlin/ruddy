@@ -368,6 +368,27 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         "{nodes:#?}"
     );
 
+    // The store never recovers, so every batch past the flip renders an
+    // unsatisfiable verdict too — and each of them names the batch that did the
+    // flipping rather than itself, which would blame each in turn for the one
+    // thing only the first of them did.
+    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+         let bad = p {}\n\
+         let q = fn a => match a with | {x} => {} | {y} => {} end");
+    let unsatisfiable: Vec<&str> = nodes
+        .iter()
+        .filter_map(|node| node.children.iter().find(|child| child.label == "verdict"))
+        .map(|verdict| verdict.text.as_str())
+        .filter(|text| text.starts_with("unsatisfiable"))
+        .collect();
+    assert!(unsatisfiable.len() > 1, "{nodes:#?}");
+    assert!(
+        unsatisfiable
+            .iter()
+            .all(|text| *text == "unsatisfiable — flipped by batch 1"),
+        "{unsatisfiable:#?}"
+    );
+
     // An annotation's own clause is a batch of its own.
     let nodes = tab("let f : { x when a: Nat } where a = { x: 1 }");
     assert!(

@@ -638,10 +638,6 @@ struct Scoped {
     /// what a complaint about the clause quotes it in, since the reader wrote
     /// `a` and never saw the variable.
     names: Vec<(String, Presence)>,
-    /// Where this definition's batches begin in the store. What the R10 check
-    /// reads: the conjuncts the *body* contributed, as against the clause the
-    /// annotation promised.
-    batches: usize,
 }
 
 /// One annotation written on a nested `let`, kept aside while the definition it
@@ -671,10 +667,6 @@ struct Annotated {
 /// for the group to end so that it can be generalized.
 struct Solved {
     scoped: Scoped,
-    /// Where this definition's batches end in the store. Its own stretch and
-    /// nobody else's: a definition sharing a group with another is not the one
-    /// whose annotation the other's matches have to agree with.
-    batches: usize,
     /// The type this definition publishes: its annotation, which is the
     /// contract, or what its body turned out to be.
     ty: Rc<Ty>,
@@ -875,7 +867,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // annotation anyway. Checking says the same thing, at the one
                 // place that knows which variables came from where.
                 let from = table.vars.len() as TyVar;
-                let batches = table.store.batches.len();
                 let annotated = program.terms[symbol].annotation.as_ref().map(|annotation| {
                     let (ty, formula, names) = lower_annotation(mint, &mut table, annotation);
                     // The clause goes into the store as its own batch, so that
@@ -904,7 +895,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     opened,
                     promised,
                     names,
-                    batches,
                 }
             })
             .collect();
@@ -914,6 +904,19 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // unification does not care what order it is asked in, and keeps a
         // [`Step`] able to name the definition it came from.
         let mut solved: Vec<Solved> = Vec::with_capacity(scoped.len());
+        // Where the group's clauses end and its bodies begin. Every member's
+        // annotation is lowered before any member's body is walked, so the
+        // store falls into two stretches, and the R10 check below wants the
+        // second one — a clause is the promise being checked rather than any
+        // part of what the group needs. Which member's body a batch is in does
+        // not matter to that check and must not: a group is monomorphic, so a
+        // presence one member's match constrains is the same variable in
+        // another's type, and a clause that ignored what a fellow member did to
+        // it would be a contract the group cannot keep. The batches that say
+        // nothing about a clause's own presences project away to `true`, so
+        // members with nothing to do with each other cost nothing but the walk.
+        let bodies = table.store.batches.len();
+
         for scoped in scoped {
             let decl = &mut program.terms[&scoped.symbol];
             let mut constrain = Constrain {
@@ -963,7 +966,6 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             report_flip(&mut table, &mut errors);
 
             solved.push(Solved {
-                batches: table.store.batches.len(),
                 scoped,
                 ty,
                 generated,
@@ -972,6 +974,9 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 locals: published,
             });
         }
+
+        // And where they end, now that every member has been walked.
+        let bodies = bodies..table.store.batches.len();
 
         // Where each member's complaints end, which is where the next one's
         // begin — and, for the last, where the group left the list.
@@ -1031,12 +1036,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // this definition has already failed some other way — both for the
             // reason the check above is.
             //
-            // The body's stretch starts one batch past where the definition's
-            // does when a clause was written, because the clause went into the
-            // store as the first batch of that stretch — see the lowering
-            // above. Skipping it is what keeps the "the definition requires …"
-            // half of the message about the body alone.
-            let clause = usize::from(!member.scoped.promised.is_true());
+            // Read against the group's bodies and no clause of anyone's: a
+            // clause is a promise rather than a requirement, and leaving one in
+            // the range would let the message say the definition requires what
+            // an annotation asked for. See `bodies` above.
             if let Some(annotation) = &decl.annotation
                 && annotation.clause.is_some()
                 && from == to
@@ -1044,7 +1047,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 && let Some((allowed, required)) = table.disagreement(
                     &member.scoped.promised,
                     &member.scoped.names,
-                    member.scoped.batches + clause..member.batches,
+                    bodies.clone(),
                 )
             {
                 errors.push(Error {
@@ -1067,18 +1070,14 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     });
                 }
                 // And its clause is a promise about a smaller scope on the same
-                // terms. Read against the whole definition's stretch of the
-                // store, which needs no narrower bookkeeping: a batch that says
-                // nothing about the clause's variables projects away to `true`,
-                // and the clause's own batch inside the range only strengthens a
-                // premise the value already keeps.
+                // terms. Read against the same stretch, which needs no narrower
+                // bookkeeping: a batch that says nothing about the clause's
+                // variables projects away to `true`, so everything outside the
+                // nested value costs nothing but the walk over it.
                 if from == to
                     && !table.unsat
-                    && let Some((allowed, required)) = table.disagreement(
-                        &annotated.promised,
-                        &annotated.names,
-                        member.scoped.batches..member.batches,
-                    )
+                    && let Some((allowed, required)) =
+                        table.disagreement(&annotated.promised, &annotated.names, bodies.clone())
                 {
                     errors.push(Error {
                         span: annotated.span,
@@ -1932,11 +1931,12 @@ impl Table {
     /// on its own argument, and a clause that does not cover the one covers
     /// nothing.
     ///
-    /// Which is why the caller starts the range past the definition's own
-    /// clause batch: that batch is the promise, not the body, and leaving it in
-    /// would let the message say the definition requires what the annotation
-    /// asked for. It changes no verdict — the premise of the entailment already
-    /// carries it — only who the second half of the complaint is about.
+    /// Which is why the caller hands over the batches the bodies of the group
+    /// put in the store and no clause of anyone's. A clause is the promise
+    /// rather than the body, and leaving one in would let the message say the
+    /// definition requires what an annotation asked for. It changes no verdict —
+    /// the premise of the entailment already carries this definition's own
+    /// clause — only who the second half of the complaint is about.
     ///
     /// The body's side is projected onto the clause's own variables first:
     /// a match inside the definition may relate presences the annotation never
@@ -1959,9 +1959,17 @@ impl Table {
         if sat::entails(&allowed, &needed) {
             return None;
         }
+        // Both halves are quoted in the names the reader wrote, which means
+        // looking each one up by the presence it decides — as the solve now has
+        // it, not as the annotation minted it. A variable unified with another
+        // is spelled by whichever of the two the store kept, and a lookup that
+        // asked for the other would find nothing and print the number.
+        let named = self.settled_names(&Named {
+            labels: names.to_vec(),
+        });
         Some((
-            crate::ui::in_labels(&sat::project(&allowed, &atoms), names),
-            crate::ui::in_labels(&needed, names),
+            crate::ui::in_labels(&sat::project(&allowed, &atoms), &named.labels),
+            crate::ui::in_labels(&needed, &named.labels),
         ))
     }
 

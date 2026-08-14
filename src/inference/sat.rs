@@ -28,6 +28,22 @@ use varisat::{ExtendFormula, Lit, Solver, Var};
 
 use crate::types::{Atom, Formula};
 
+/// The widest projection [`project`] enumerates.
+///
+/// Shannon expansion costs one evaluation per row of a `2^(kept + dropped)`
+/// truth table, and the minimization that reads the table off is worse than
+/// that in the kept side alone. The spec takes the trade on the understanding
+/// that these formulas are tiny — a store names only the presences some match,
+/// use or clause related, and one definition relates few of them — and this is
+/// the width at which the understanding stops holding.
+///
+/// It is a correctness bound and not only a budget. A row index is a `u32`, so
+/// a formula naming 32 atoms shifts past the end of one: a panic where that is
+/// checked and, where it is not, a table enumerated over a single row and a
+/// formula that is not the one asked about. Answering wide is the alternative
+/// to answering wrong.
+const WIDTH: usize = 20;
+
 /// One Tseitin encoding in progress: the solver being filled, and which
 /// variable each atom was given.
 struct Encoding {
@@ -102,6 +118,8 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
 /// recognized first because those are what a reader wrote and what R12 asks to
 /// see. Deterministic throughout: the atom order fixes the literal order inside
 /// a product, and the products are sorted by it.
+///
+/// Bounded by [`WIDTH`], past which it answers without enumerating.
 pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
     let mut named = Vec::new();
     formula.atoms(&mut named);
@@ -115,6 +133,18 @@ pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
         .copied()
         .filter(|atom| !keep.contains(atom))
         .collect();
+    // Past [`WIDTH`] the table is not enumerated at all, and what comes back
+    // instead errs the one way it may: `true` says less about the kept atoms
+    // than the truth does, so a caller loses a complaint it might have made and
+    // never invents one. A projection with nothing to eliminate is already its
+    // own answer, so a wide formula that only wanted canonicalizing keeps
+    // everything it said and loses the minimization alone.
+    if kept.len() + dropped.len() > WIDTH {
+        return match dropped.is_empty() {
+            true => formula.clone(),
+            false => Formula::True,
+        };
+    }
     let minterms = table(formula, &kept, &dropped);
     rebuild(&kept, &minterms)
 }
