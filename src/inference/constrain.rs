@@ -76,7 +76,11 @@ pub struct Constrain<'a> {
 /// Named because two readers want it — generation, for an operation reference
 /// and a handler arm — and because the pair of pairs reads as nothing at all
 /// written out at each of them.
-pub type Operations = HashMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>;
+///
+/// Insertion-ordered, because a third reader publishes it: [`Output::operations`](crate::inference::Output::operations)
+/// hands the same table on to [`lir`](crate::lir), and a map whose order came
+/// out of a hash would print differently from one run to the next.
+pub type Operations = IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>;
 
 /// Where a term sits, as far as effects are concerned: what may be performed
 /// there, and whether a `fn` encloses it.

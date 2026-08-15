@@ -16,7 +16,7 @@ use std::{
 };
 
 use ruddy::{
-    inference, ir, parse, patterns,
+    inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
@@ -174,6 +174,22 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         diagnostic.id = i as u32;
     }
 
+    // Lowering to LIR runs on an accepted program and nothing else, which is
+    // the rule `main.rs` follows too — so it is gated on the whole diagnostic
+    // list rather than on any one phase having produced a value. Its tab
+    // reports `Skipped` the moment the reader types something wrong.
+    let lowered = match (&built, &inferred, &checked, diagnostics.is_empty()) {
+        (Some(built), Some(inferred), Some(_), true) => {
+            let started = Instant::now();
+            let out = guard("lir", &mut panicked, || {
+                lir::lower(&mint, &built.program, inferred)
+            });
+            micros.lir = started.elapsed().as_micros() as u64;
+            out
+        }
+        _ => None,
+    };
+
     let symbols = stage::symbols::index(&mint);
     let cx = Cx {
         source,
@@ -182,6 +198,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         program: built.as_ref().map(|built| &built.program),
         inference: inferred.as_ref(),
         patterns: checked.as_ref(),
+        lir: lowered.as_ref(),
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,

@@ -1,5 +1,6 @@
 pub mod inference;
 pub mod ir;
+pub mod lir;
 pub mod parse;
 pub mod patterns;
 pub mod symbol;
