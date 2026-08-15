@@ -627,6 +627,153 @@ fn the_type_tabs_show_the_new_spelling() {
     );
 }
 
+/// The LIR tab: one root per global and per function wearing the header line
+/// the listing writes, a row per instruction under it labelled by its opcode,
+/// and a dispatch's blocks behind the answer that selects each. Every row shows
+/// the representation of what it assigns, since that is the whole of what LIR
+/// keeps of a type.
+#[test]
+fn the_lir_tab_renders_the_listing_as_a_tree() {
+    let nodes = tab(
+        "lir",
+        "let f = fn a => match a with | `A n => n | b => 0 end",
+    );
+    let roots: Vec<(&str, &str)> = nodes
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert_eq!(
+        roots,
+        [
+            ("global", "global f:"),
+            ("fn", "fn f(%0: sum):"),
+            ("fn", "fn f#1(%4: sum):"),
+        ],
+        "{nodes:#?}"
+    );
+
+    // The dispatch owns its cases, and each case owns the block it selects.
+    let switch = &nodes[1].children[0];
+    assert_eq!(switch.label, "switch_tag");
+    assert_eq!(switch.text, "%3: nat = switch_tag %0:");
+    let cases: Vec<&str> = switch
+        .children
+        .iter()
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(cases, ["`A =>", "else =>"], "{switch:#?}");
+    let inside: Vec<(&str, &str)> = switch.children[0]
+        .children
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert_eq!(
+        inside,
+        [("payload", "%1: nat = payload %0"), ("yield", "yield %1")]
+    );
+
+    // A row the source wrote points back at it, so the tab and the editor
+    // cross-highlight; a curried wrapper is nobody's source and says so.
+    assert!(nodes[1].span.is_some(), "{:#?}", nodes[1]);
+    assert!(nodes[2].generated, "{:#?}", nodes[2]);
+    assert!(nodes[2].span.is_none(), "{:#?}", nodes[2]);
+}
+
+/// Evidence is plumbing rather than prose: the record of a handler's operations
+/// and the bundle a call builds for an effect-polymorphic callee are rows the
+/// reader never wrote, so they are marked generated and point at no source. The
+/// `catch` beside them is the `handle` the reader did write, and still does.
+#[test]
+fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
+    let nodes = tab(
+        "lir",
+        "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let logger : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let use = fn w => handle piped logger 1 with | Log.`write s => {} end\n",
+    );
+    let rows = flatten(&nodes);
+    let row = |text: &str| {
+        rows.iter()
+            .find(|node| node.text.contains(text))
+            .unwrap_or_else(|| panic!("`{text}` is a row of:\n{rows:#?}"))
+    };
+
+    // The handler's record of operation closures, and the bundle the call to
+    // `piped` builds out of it.
+    for text in ["= struct { write: %", "= struct { Log: %"] {
+        let node = row(text);
+        assert!(node.generated, "{node:#?}");
+        assert!(node.span.is_none(), "{node:#?}");
+    }
+
+    // The `handle` itself is the reader's, and so is the perform inside the
+    // function the evidence reaches.
+    let caught = row("= catch %");
+    assert!(!caught.generated, "{caught:#?}");
+    assert!(caught.span.is_some(), "{caught:#?}");
+}
+
+/// A temp is one temp everywhere it appears, so the tab lights every occurrence
+/// of `%17` in the whole listing rather than only the ones in a row's own
+/// function. That is the pattern it declares, and it is deliberately not the
+/// type tabs' — a temp is a value, not a question the solver has yet to answer.
+#[test]
+fn the_lir_tab_lights_a_temp_wherever_it_appears() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "lir")
+        .expect("the lir stage is registered");
+    let pattern = spec.highlight.expect("the lir tab declares a pattern");
+    assert_eq!(pattern, r"%\d+");
+    assert!(!spec.scoped);
+
+    let found: Vec<&str> = Regex::new(pattern)
+        .expect("the pattern compiles")
+        .find_iter("%3: nat = call add, %17, %2")
+        .map(|at| at.as_str())
+        .collect();
+    assert_eq!(found, ["%3", "%17", "%2"]);
+}
+
+/// Lowering runs on a program every earlier phase accepted, so the tab reports
+/// `Skipped` the moment anything upstream complains — rather than rendering
+/// half a listing of a program that does not type.
+#[test]
+fn the_lir_tab_skips_a_program_with_errors() {
+    use ruddy_debug::{
+        snapshot::compile,
+        wire::{BundleSpec, CompileRequest, Status},
+    };
+
+    let stage = |source: &str| {
+        compile(
+            &CompileRequest {
+                source: source.to_string(),
+                revision: 0,
+                bundle: BundleSpec::default(),
+            },
+            0,
+        )
+        .stages
+        .into_iter()
+        .find(|stage| stage.id == "lir")
+        .expect("the lir stage is registered")
+    };
+
+    let ok = stage("let f = fn a => a\n");
+    assert_eq!(ok.status, Status::Ok);
+    assert_eq!(ok.summary, "1 global · 2 functions");
+
+    // A type error, which is one the earlier phases all survive: the program is
+    // built and inferred, and lowering still stands aside.
+    let bad = stage("let f : Nat = fn a => a\n");
+    assert_eq!(bad.status, Status::Skipped);
+    assert_eq!(bad.summary, "lowering to LIR did not run");
+    assert!(bad.nodes.is_empty());
+    assert!(bad.micros.is_none());
+}
+
 /// The rows of one stage over one source, for the tests above.
 fn tab(id: &'static str, source: &str) -> Vec<ruddy_debug::wire::Node> {
     use ruddy_debug::{

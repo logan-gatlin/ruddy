@@ -8,6 +8,7 @@
 pub mod ast;
 pub mod constraints;
 pub mod ir;
+pub mod lir;
 pub mod patterns;
 pub mod presence;
 pub mod solve;
@@ -41,6 +42,9 @@ pub struct Cx<'a> {
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,
     pub patterns: Option<&'a ruddy::patterns::Output>,
+    /// `None` whenever an earlier phase reported anything: LIR runs on accepted
+    /// programs alone, which is what lets it be infallible.
+    pub lir: Option<&'a ruddy::lir::Output>,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -59,6 +63,7 @@ pub struct Phases {
     pub build: u64,
     pub infer: u64,
     pub patterns: u64,
+    pub lir: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -126,6 +131,13 @@ pub struct Trace {
 /// Declared once because four tabs render the same type language, and a
 /// pattern that drifted on one of them would go quietly dead there.
 const VARIABLES: &str = r"\B\?\d*";
+
+/// How the LIR listing spells a temp: a `%` and its number. Its own constant
+/// rather than [`VARIABLES`] because it is a different notation about a
+/// different thing — a temp is a value the instruction stream assigns, not a
+/// question the solver has yet to answer — and the two would only be one
+/// pattern by coincidence.
+const TEMPS: &str = r"%\d+";
 
 /// Every stage, in tab order. Adding a panel is one line here. A stage that
 /// annotates another owns no tab, so its place in the list does not matter to
@@ -220,6 +232,19 @@ pub const REGISTRY: &[Spec] = &[
         scoped: true,
         annotates: None,
         build: Build::Panel(patterns::build),
+    },
+    Spec {
+        id: "lir",
+        title: "LIR",
+        view: View::Tree,
+        // A listing is read by following one temp: where it was assigned, and
+        // everywhere it is used afterwards. Unscoped, unlike the type tabs'
+        // variables: temps are numbered by one program-wide counter, so `%17` in
+        // two functions really is one temp — a captured value carried in.
+        highlight: Some(TEMPS),
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(lir::build),
     },
     Spec {
         id: "symbols",

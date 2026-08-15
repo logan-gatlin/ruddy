@@ -96,6 +96,17 @@ pub struct Output {
     /// the same `open`. A declaration taking no parameters is a scheme binding
     /// nothing, and opening one returns its body unchanged.
     pub aliases: IndexMap<Symbol, Scheme>,
+    /// The two sides of every declared operation, keyed by the effect that
+    /// declares it and the operation's own name, in declaration order.
+    ///
+    /// A plain closed arrow, lowered once before any body is walked, because a
+    /// signature mentions no variable. Published for the reason
+    /// [`Output::aliases`] is: a later phase reads it and has no table to lower
+    /// a written type with. [`lir`](crate::lir) is that phase — a handler arm's
+    /// binder is the operation's argument, and how a value of it is held is
+    /// nowhere else to be found, since the binder has no term of its own to
+    /// carry a solved type.
+    pub operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
     /// The scheme each top-level term was inferred, or checked, to have.
     pub schemes: IndexMap<Symbol, Scheme>,
     /// The scheme each nested `let` was inferred, in the order the lets were
@@ -1297,6 +1308,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
 
     Output {
         aliases,
+        operations,
         schemes,
         locals,
         constraints,

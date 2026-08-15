@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use ruddy::{
-    inference, ir, parse, patterns,
+    inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::{FileManager, Span},
@@ -49,6 +49,11 @@ fn main() -> ExitCode {
         + inferred.errors.len()
         + checked.errors.len();
     if errors == 0 {
+        // LIR runs only here, on a program every earlier phase accepted — which
+        // is what lets it be infallible. Nothing of it is printed: the driver
+        // prints diagnostics, and lowering has none. Read the listing in the
+        // debugger's LIR tab.
+        let _lowered = lir::lower(&mint, &built.program, &inferred);
         println!("built successfully with no errors");
         return ExitCode::SUCCESS;
     }

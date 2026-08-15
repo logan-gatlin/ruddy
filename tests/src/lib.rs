@@ -12,6 +12,7 @@
 mod docs;
 mod inference;
 mod ir;
+mod lir;
 mod parse;
 mod patterns;
 mod print;

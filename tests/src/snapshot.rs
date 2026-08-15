@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ruddy_debug::{
     snapshot::{compile, guard, install_hook},
     stage::REGISTRY,
-    wire::{BundleSpec, CompileRequest, Node, Snapshot, Stage, View},
+    wire::{BundleSpec, CompileRequest, Node, Snapshot, Stage, Status, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -48,6 +48,7 @@ fn every_stage_reports_on_the_demo() {
             "types",
             "presence",
             "patterns",
+            "lir",
             "symbols",
             "types-ir"
         ]
@@ -55,6 +56,15 @@ fn every_stage_reports_on_the_demo() {
     assert_eq!(snapshot.revision, 3);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
+        // The demo ends in three deliberate mistakes, and LIR runs on accepted
+        // programs alone — so its tab is the one that reports `Skipped` here,
+        // with a summary saying so and no rows behind it.
+        if stage.id == "lir" {
+            assert_eq!(stage.status, Status::Skipped);
+            assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
+            assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
+            continue;
+        }
         assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
         // The pane bar prints this beside the tab strip, so a stage that
         // counted nothing leaves a blank there rather than a count.
@@ -80,6 +90,7 @@ fn every_stage_reports_on_the_demo() {
             "Types",
             "Presence",
             "Patterns",
+            "LIR",
             "Symbols"
         ]
     );
@@ -1106,6 +1117,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
 /// round to zero silently lost its chip.
 #[test]
 fn only_the_stages_that_own_a_phase_report_a_time() {
+    let clean = snapshot("let f = fn a => a\n");
     let snapshot = snapshot(DEMO);
     let ids = |timed: bool| -> Vec<&str> {
         snapshot
@@ -1121,7 +1133,21 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "tokens", "ast", "ir", "types", "presence", "patterns", "symbols"
         ]
     );
-    assert_eq!(ids(false), ["constraints", "solve", "types-ir"]);
+    // LIR owns a phase too, and reports nothing here for the other reason a
+    // stage can: the demo has errors in it, so lowering never ran and there is
+    // no duration to report rather than no phase to have one.
+    assert_eq!(ids(false), ["constraints", "solve", "lir", "types-ir"]);
+
+    // On a program with nothing wrong with it, it reports one like everybody
+    // else — which is what makes the line above about the demo rather than
+    // about the registry.
+    let lir = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "lir")
+        .expect("the lir stage is registered");
+    assert_eq!(lir.status, Status::Ok);
+    assert!(lir.micros.is_some());
 }
 
 /// A tab's raw view dumps what that tab owns, and no more.
