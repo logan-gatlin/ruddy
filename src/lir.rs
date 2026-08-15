@@ -771,19 +771,29 @@ impl Lower<'_> {
     /// The type a value's evidence was built against, which is not always the
     /// type the use site gives it.
     ///
-    /// Naming a definition whose value is a nest of `fn`s hands over wrappers
-    /// built once, from the row that definition was written with — so however
-    /// the use instantiates the row, what arrives is still the shape the
-    /// wrappers take. Everything else was built where it was written, and there
-    /// its own solved type is the whole story.
+    /// A definition whose value is a nest of `fn`s hands over wrappers built
+    /// once, from the rows that definition was written with — so however the use
+    /// instantiates them, what arrives is still the shape the wrappers take.
+    /// That covers naming the definition and applying it short of its arity
+    /// alike: both come to a wrapper closure, the second with the arguments so
+    /// far captured, so the type it stands for is the definition's own walked
+    /// down one arrow per argument given. A full application is a value like any
+    /// other, and everything else was built where it was written, so there its
+    /// own solved type is the whole story.
     fn built(&self, term: &Term) -> Rc<Ty> {
-        match &term.kind {
-            TermKind::Ident(symbol) => match self.known.get(symbol) {
-                Some(known) => known.ty.clone(),
-                None => term.ty.clone(),
-            },
-            _ => term.ty.clone(),
+        let (head, applies) = spine(term);
+        if let TermKind::Ident(symbol) = &head.kind
+            && let Some(known) = self.known.get(symbol)
+            && applies.len() < known.levels.len()
+        {
+            let mut ty = known.ty.clone();
+            for _ in 0..applies.len() {
+                let (_, to, _) = self.arrow(&ty);
+                ty = to;
+            }
+            return ty;
         }
+        term.ty.clone()
     }
 
     /// Whether a value whose evidence was built for `have` can be called where
@@ -1002,15 +1012,24 @@ impl Lower<'_> {
         }
     }
 
-    /// The evidence one call site has to hand a callee whose arrow performs
-    /// `row`: what is in scope for each definitely performed effect, and a
-    /// bundle for the variable part.
-    fn evidence_args(&mut self, row: &Row, body: &mut Body) -> Vec<Temp> {
+    /// The evidence one call site has to hand a callee: what is in scope for
+    /// each definitely performed effect, and a bundle for the variable part.
+    ///
+    /// Two rows decide it. The callee's parameter list was built from the row it
+    /// was *declared* with, so that row says which records go across and whether
+    /// there is a tail parameter at all. What goes *in* the tail is the row at
+    /// this *use*: a row variable is only the caller's own where the use says so,
+    /// since a variable's index is its place in its own scheme and two unrelated
+    /// schemes both quantify a first one. Where the use has no variable part to
+    /// share, [`RestKey::Open`] stands for it and never forwards, so the bundle
+    /// is built here out of what the scope can handle.
+    fn evidence_args(&mut self, declared: &Row, used: &Row, body: &mut Body) -> Vec<Temp> {
         let mut args = Vec::new();
-        for name in shape(row).names {
+        for name in shape(declared).names {
             args.push(self.evidence_of(&name));
         }
-        if let Some(key) = tail_key(row) {
+        if tail_key(declared).is_some() {
+            let key = tail_key(used).unwrap_or(RestKey::Open);
             args.push(self.bundle(key, body));
         }
         args
@@ -1454,7 +1473,7 @@ impl Lower<'_> {
         if let TermKind::Ident(symbol) = &head.kind
             && let Some(known) = self.known.get(symbol).cloned()
         {
-            return self.call_known(&known, &applies, body);
+            return self.call_known(&known, &head.ty, &applies, body);
         }
         let mut callee = self.term(head, body);
         let mut carrying = head.ty.clone();
@@ -1479,7 +1498,9 @@ impl Lower<'_> {
         body: &mut Body,
     ) -> Temp {
         let (from, _, row) = self.arrow(callee_ty);
-        let mut args = self.evidence_args(&row, body);
+        // An indirect callee is called as whatever it is here, so the row it was
+        // compiled with and the row at this use are the one row.
+        let mut args = self.evidence_args(&row, &row, body);
         let have = self.built(written);
         args.push(self.fitted(&from, &have, arg, body));
         let rep = self.rep(&node.ty);
@@ -1539,7 +1560,17 @@ impl Lower<'_> {
     }
 
     /// Applying a definition whose arity is known.
-    fn call_known(&mut self, known: &Known, applies: &[(&Term, &Term)], body: &mut Body) -> Temp {
+    ///
+    /// `used` is the type the head has *here*, which is the definition's type
+    /// however this use instantiated it. The call takes its parameter shape from
+    /// the definition and its tail bundles from `used`, per [`Self::evidence_args`].
+    fn call_known(
+        &mut self,
+        known: &Known,
+        used: &Rc<Ty>,
+        applies: &[(&Term, &Term)],
+        body: &mut Body,
+    ) -> Temp {
         let arity = known.levels.len();
         let taken = applies.len().min(arity);
         let mut args: Vec<Temp> = Vec::new();
@@ -1550,10 +1581,13 @@ impl Lower<'_> {
         // evidence around them is this pass's own, and goes in afterwards.
         let span = applies[0].0.span;
         let mut full: Vec<Temp> = Vec::new();
+        let mut here = used.clone();
         for ((level, (_, written)), arg) in known.levels.iter().zip(applies).zip(&args) {
-            full.extend(self.evidence_args(&level.row, body));
+            let (_, rest, row) = self.arrow(&here);
+            full.extend(self.evidence_args(&level.row, &row, body));
             let have = self.built(written);
             full.push(self.fitted(&level.from, &have, *arg, body));
+            here = rest;
         }
 
         let mut value = match taken == arity {

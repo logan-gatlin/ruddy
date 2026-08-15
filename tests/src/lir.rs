@@ -957,6 +957,71 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
     );
 }
 
+/// Applying a known definition short of its arity hands over a wrapper, and a
+/// wrapper takes the evidence the *definition* was compiled with — not the
+/// evidence the use site's own type asks for.
+///
+/// `two 1` reads as `Nat -> Nat ! `Log`, one record and no bundle; the wrapper
+/// it becomes takes a record and a bundle both, because that is the row `two`
+/// was written with. So the partial application is fitted like any other
+/// mismatch: an adapter that takes what `takes` passes and rebuilds the bundle
+/// the wrapper expects.
+#[test]
+fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let two : Nat -> Nat -> Nat ! `Log | ..s where let s =\n\
+           fn a => fn b => let z = Log.`write a in b\n\
+         let takes : (Nat -> Nat ! `Log) -> Nat ! `Log = fn f => f 1\n\
+         let go = fn w => handle takes (two 1) with | Log.`write s => {} end";
+    // The wrapper the partial application becomes takes a record and a bundle.
+    assert!(
+        section(source, "fn two#2")
+            .starts_with("fn two#2(%8: nat, %9: struct, %10: struct, %11: nat):"),
+        "{}",
+        listing(source)
+    );
+    // `takes` passes one record and the argument, so the adapter's parameters
+    // after its capture are exactly those two.
+    assert_eq!(
+        section(source, "fn go#3"),
+        "fn go#3(%30: fn, %31: struct, %32: nat):\n\
+         \x20 %33: struct = struct { Log: %31 }\n\
+         \x20 %34: nat = call %30, %31, %33, %32\n\
+         \x20 ret %34"
+    );
+    let go = section(source, "fn go(");
+    assert!(go.contains("%29: fn = closure two#2, [%28]"), "{go}");
+    assert!(go.contains("%35: fn = closure go#3, [%29]"), "{go}");
+    assert!(go.contains("%36: nat = call takes, %27, %35"), "{go}");
+}
+
+/// A *full* application is a value like any other: the wrappers are behind it,
+/// not in front, so what it stands for is the type it came to and nothing is
+/// fitted. `pick 1 2` is already the function `takes` was declared to take, and
+/// it goes straight across with no adapter between them.
+#[test]
+fn a_full_application_stands_for_what_it_came_to() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let noisy : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let pick : Nat -> Nat -> (Nat -> Nat ! `Log) = fn a => fn b => noisy\n\
+         let takes : (Nat -> Nat ! `Log) -> Nat ! `Log = fn f => f 1\n\
+         let go = fn w => handle takes (pick 1 2) with | Log.`write s => {} end";
+    assert_eq!(
+        section(source, "fn go("),
+        "fn go(%25: any):\n\
+         \x20 %26: any = new_tag\n\
+         \x20 %29: fn = closure go#2, []\n\
+         \x20 %30: struct = struct { write: %29 }\n\
+         \x20 %35: nat = catch %26:\n\
+         \x20   %31: nat = const 1\n\
+         \x20   %32: nat = const 2\n\
+         \x20   %33: fn = call pick, %31, %32\n\
+         \x20   %34: nat = call takes, %30, %33\n\
+         \x20   yield %34\n\
+         \x20 ret %35"
+    );
+}
+
 /// A bundle is built out of every effect the scope can handle, and each is in
 /// it once however many frames between here and the handler carry it.
 #[test]
@@ -1002,6 +1067,47 @@ fn a_bundle_with_no_identity_is_never_forwarded() {
          \x20 %23: struct = struct {}\n\
          \x20 %24: nat = call piped, %22, %23, %16\n\
          \x20 ret %24"
+    );
+}
+
+/// Whether a bundle may be forwarded is read off the row at the *use*, not the
+/// row the callee was declared with.
+///
+/// A row variable's index is its place in the scheme that quantified it, so two
+/// unrelated definitions both quantify a first one and their indices compare
+/// equal. `caller` quantifies a rest of its own and calls `piped`, which
+/// quantifies one too — but at that use `piped`'s rest stands for the `Log` the
+/// handler on the same line discharges, so the bundle has to be built there out
+/// of the handler's record. `twice` calls `piped` at its own rest, and that one
+/// really is forwarded.
+#[test]
+fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let noisy : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let caller : (Nat -> Nat ! ..r) -> Nat -> Nat ! ..r where let r =\n\
+           fn k => fn n => handle piped noisy n with | Log.`write s => {} end\n\
+         let twice : (Nat -> Nat ! ..f) -> Nat -> Nat ! ..f where let f =\n\
+           fn g => fn n => piped g n";
+    assert_eq!(
+        section(source, "fn caller("),
+        "fn caller(%19: fn, %20: struct, %21: nat):\n\
+         \x20 %22: any = new_tag\n\
+         \x20 %25: fn = closure caller#3, []\n\
+         \x20 %26: struct = struct { write: %25 }\n\
+         \x20 %36: nat = catch %22:\n\
+         \x20   %27: fn = global noisy\n\
+         \x20   %33: fn = closure caller#4, [%27]\n\
+         \x20   %34: struct = struct { Log: %26 }\n\
+         \x20   %35: nat = call piped, %33, %34, %21\n\
+         \x20   yield %35\n\
+         \x20 ret %36"
+    );
+    assert_eq!(
+        section(source, "fn twice("),
+        "fn twice(%44: fn, %45: struct, %46: nat):\n\
+         \x20 %47: nat = call piped, %44, %45, %46\n\
+         \x20 ret %47"
     );
 }
 
