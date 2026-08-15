@@ -10,8 +10,8 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ClauseKind, ExprKind, StmtKind, SumCase, TypeField, TypeKind,
-        When,
+        Annotation, Arg, ArgKind, ClauseKind, ClauseStmtKind, ExprKind, StmtKind, SumCase,
+        TypeField, TypeKind, When, Where,
     },
     tracking::Tracked,
 };
@@ -31,7 +31,9 @@ impl Grouped for Ast<'_, TypeKind> {
             TypeKind::Arrow { .. } => Prec::Arrow,
             TypeKind::Sum { .. } => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
-            TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Unit => Prec::Atom,
+            TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Hole | TypeKind::Unit => {
+                Prec::Atom
+            }
         }
     }
 }
@@ -107,8 +109,52 @@ impl fmt::Display for Written<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", Ast(&self.0.ty.tracked))?;
         match &self.0.clause {
-            Some(clause) => write!(f, " where {}", Ast(&clause.tracked)),
+            Some(clause) => write!(f, " where {}", Ast(clause)),
             None => Ok(()),
+        }
+    }
+}
+
+/// A whole `where` clause: its statements, separated by the `;`s the reader
+/// wrote. Written here rather than by whoever shows one, so the clause on an
+/// annotation's line and the clause on a row of its own cannot come out spelled
+/// differently.
+pub fn where_clause(clause: &Where) -> impl fmt::Display + '_ {
+    Ast(clause)
+}
+
+impl fmt::Display for Ast<'_, Where> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (at, stmt) in self.0.stmts.iter().enumerate() {
+            if at > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{}", Ast(&stmt.tracked))?;
+        }
+        Ok(())
+    }
+}
+
+/// One statement of a `where` clause, as it was written: a `let` and the names
+/// it declares, or the formula.
+pub fn clause_stmt(kind: &ClauseStmtKind) -> impl fmt::Display + '_ {
+    Ast(kind)
+}
+
+impl fmt::Display for Ast<'_, ClauseStmtKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ClauseStmtKind::Let(names) => {
+                f.write_str("let ")?;
+                for (at, name) in names.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&name.tracked)?;
+                }
+                Ok(())
+            }
+            ClauseStmtKind::Constraint(clause) => write!(f, "{}", Ast(&clause.tracked)),
         }
     }
 }
@@ -281,6 +327,8 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 args.iter().map(|arg| Ast(&arg.tracked)),
             ),
             TypeKind::Ident { name } => f.write_str(&name.tracked),
+            // The hole as written: `_`, a position left for inference.
+            TypeKind::Hole => f.write_str("_"),
             TypeKind::Unit => f.write_str("()"),
         }
     }

@@ -511,7 +511,7 @@ fn an_abandoned_presence_skips_the_checks() {
 /// being "anything other than" nothing.
 #[test]
 fn an_open_sum_with_no_cases_witnesses_as_anything() {
-    let src = "let f : { a: Nat, b: (\\`X | ..r), .. } -> Nat = \
+    let src = "let f : { a: Nat, b: (\\`X | ..r), .. } -> Nat where let r = \
                fn v => match v with | {a: 0, ..} => 1 end";
     let (out, _, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -602,7 +602,7 @@ fn arms_above_a_misplaced_catch_all_keep_their_verdicts() {
 #[test]
 fn an_empty_match_over_a_real_sum_is_skipped() {
     let (_, inferred, checks) =
-        checked("let f = fn v => let w : (`A Nat | ..r) = v in match v with end");
+        checked("let f = fn v => let w : (`A Nat | ..) = v in match v with end");
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     let report = sole_report(&checks);
@@ -924,7 +924,7 @@ fn a_nested_binding_reads_the_store_for_reachability() {
 #[test]
 fn a_nested_written_clause_shapes_the_witness() {
     let src = "let solo = fn v =>\n\
-               \x20 let inner : {p when c: Nat, q when d: Nat} -> Nat where c != d =\n\
+               \x20 let inner : {p when c: Nat, q when d: Nat} -> Nat where let c, d; c != d =\n\
                \x20   fn w => match w with | {p: 1} => 0 | {q} => 0 end in\n\
                \x20 0";
     let (out, inferred, checks) = checked(src);

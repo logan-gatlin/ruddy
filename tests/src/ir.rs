@@ -3,8 +3,8 @@
 use indexmap::IndexMap;
 use ruddy::{
     ir::{
-        ClauseKind, ErrorKind, Field, Output, PatternKind, SumCase, Term, TermKind, TypeField,
-        TypeKind, build,
+        Annotation, ClauseKind, ErrorKind, Field, Output, PatternKind, SumCase, Term, TermKind,
+        TypeField, TypeKind, build,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -52,6 +52,15 @@ fn built(src: &str) -> (Mint, Output) {
     let (mint, out) = build_src(src);
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     (mint, out)
+}
+
+/// The lowered annotation of a top-level definition, which is where the
+/// variables a `where let` declared and the sorts lowering read them at live.
+fn annotation_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Annotation {
+    out.program.terms[&term_symbol(mint, out, name)]
+        .annotation
+        .as_ref()
+        .expect("the definition is annotated")
 }
 
 /// Find a top-level term by the name it was defined under. Nothing outside
@@ -691,7 +700,7 @@ fn duplicate_type_fields_are_rejected() {
 
     // Annotations go the same way, and the `when` clause only they may carry
     // rides through the re-keying with the field it was written on.
-    let src = "let f : { a when a: Nat, a: Nat } -> Nat = fn p => p.a";
+    let src = "let f : { a when a: Nat, a: Nat } -> Nat where let a = fn p => p.a";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
@@ -761,7 +770,7 @@ fn a_declared_type_must_be_closed() {
     assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
 
     // An annotation is where openness belongs, and it passes through whole.
-    let (_, out) = build_src("let f : { x when a: Nat, ..r } -> Nat = fn p => p.x");
+    let (_, out) = build_src("let f : { x when a: Nat, ..r } -> Nat where let a, r = fn p => p.x");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -1771,7 +1780,7 @@ fn a_sum_makes_a_type_recursive_rather_than_circular() {
 /// anywhere telling the reader why.
 #[test]
 fn one_tail_name_is_one_shape_of_rest() {
-    let src = "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat = fn a => fn b => 1";
+    let src = "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat where let r = fn a => fn b => 1";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
@@ -1786,22 +1795,23 @@ fn one_tail_name_is_one_shape_of_rest() {
         "{:#?}",
         out.errors
     );
-    // At the second `..r`, which is the one the writer has to choose about —
-    // and pointing back at the first, which is the other half of what went
+    // At the second use's *name*, which is the one thing the writer can change
+    // — and pointing back at the first, which is the other half of what went
     // wrong and is somewhere else on the page.
     assert_eq!(
         out.errors[0].span.start,
-        src.rfind("..r").expect("the tail")
+        src.rfind("..r").expect("the tail") + 2
     );
     let ErrorKind::MixedTail { previous, .. } = out.errors[0].kind else {
         panic!("the clash was just matched");
     };
-    assert_eq!(previous.start, src.find("..r").expect("the first tail"));
+    assert_eq!(previous.start, src.find("..r").expect("the first tail") + 2);
 
     // Either order: the row that absorbs is the second one written, whichever
     // shape that is.
-    let (_, out) =
-        build_src("let f : (`A Nat | ..r) -> { x: Nat, ..r } -> Nat = fn a => fn b => 1");
+    let (_, out) = build_src(
+        "let f : (`A Nat | ..r) -> { x: Nat, ..r } -> Nat where let r = fn a => fn b => 1",
+    );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
         matches!(
@@ -1817,16 +1827,18 @@ fn one_tail_name_is_one_shape_of_rest() {
     );
 
     // Two tails of one shape are what naming one is *for*, and stay one rest.
-    let (_, out) = build_src("let f : { x: Nat, ..r } -> { ..r } -> Nat = fn a => fn b => 1");
+    let (_, out) =
+        build_src("let f : { x: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let (_, out) = build_src("let f : (`A Nat | ..r) -> (| ..r) -> Nat = fn a => fn b => 1");
+    let (_, out) =
+        build_src("let f : (`A Nat | ..r) -> (| ..r) -> Nat where let r = fn a => fn b => 1");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     // And the scope is one written type, so two annotations may each use `r`
     // for a rest of their own.
     let (_, out) = build_src(
-        "let f : { x: Nat, ..r } -> Nat = fn a => 1\n\
-         let g : (`A Nat | ..r) -> Nat = fn b => 2",
+        "let f : { x: Nat, ..r } -> Nat where let r = fn a => 1\n\
+         let g : (`A Nat | ..r) -> Nat where let r = fn b => 2",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }
@@ -1897,24 +1909,33 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
     );
 }
 
-/// A `..` naming a declared type is not a rest — a rest is a parameter or
-/// nothing — so in an annotation it is read as a name of its own, the way any
-/// other unbound tail name is. The declaration it happens to share a spelling
-/// with has nothing to do with it.
+/// A `..` names a rest, and a rest is a declaration's parameter or a `where
+/// let` variable and nothing else. A declared *type* of the same spelling has
+/// nothing to do with it: a tail is a use, and a name nothing declared as a
+/// variable stands for nothing at all.
 #[test]
-fn a_tail_naming_a_declared_type_is_still_just_a_name() {
-    let (_, out) = build_src("type T = Nat  let f : { x: Nat, ..T } -> Nat = fn r => r.x");
-    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
-
-    // And it is one rest like any other, so giving it two shapes still clashes.
-    let (_, out) = build_src(
-        "type T = Nat  let f : { x: Nat, ..T } -> (`A Nat | ..T) -> Nat = fn a => fn b => 1",
-    );
+fn a_tail_naming_a_declared_type_is_not_a_rest() {
+    let src = "type T = Nat  let f : { x: Nat, ..T } -> Nat = fn r => r.x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(
-        matches!(out.errors[0].kind, ErrorKind::MixedTail { .. }),
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::Undefined {
+                namespace: Namespace::Types
+            }
+        ),
         "{:#?}",
         out.errors
     );
+    assert_eq!(out.errors[0].span.start, src.rfind('T').expect("the tail"));
+
+    // Declared as a variable, it is a rest like any other — and the
+    // declaration it shares a spelling with is shadowed for the extent of the
+    // annotation, exactly as a `type Nat` shadows the built-in.
+    let (_, out) =
+        build_src("type T = Nat  let f : { x: Nat, ..T } -> Nat where let T = fn r => r.x");
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
 /// An argument written where a row parameter goes has to be a row of that
@@ -2619,8 +2640,8 @@ fn displays_absent_labels_as_written() {
         "type NoErr r = `Ok Nat | \\`Err | ..r"
     );
     assert_eq!(
-        display_program("let f : { \\y, ..r } -> { ..r } = fn a => a"),
-        "let f : { \\y, ..r } -> { ..r } = fn a => a"
+        display_program("let f : { \\y, ..r } -> { ..r } where let r = fn a => a"),
+        "let f : { \\y, ..r } -> { ..r } where let r = fn a => a"
     );
 }
 
@@ -2678,14 +2699,14 @@ fn an_identifier_let_lowers_unchanged() {
 fn a_struct_let_statement_makes_a_definition_per_field() {
     assert_eq!(
         lowered("let {x, y} = { x: 1, y: 2 }"),
-        "let %struct : { x: ?, y: ? } = { x: 1, y: 2 }\nlet x = %struct.x\nlet y = %struct.y"
+        "let %struct : { x: _, y: _ } = { x: 1, y: 2 }\nlet x = %struct.x\nlet y = %struct.y"
     );
     // Renaming and annotation: the written annotation is the contract on the
     // whole value, so it holds the value on a binding of its own, and the
     // exact demand rides on the temporary the projections read.
     assert_eq!(
         lowered("let {x: a} : { x: Nat } = { x: 1 }"),
-        "let %value : { x: Nat } = { x: 1 }\nlet %struct : { x: ? } = %value\nlet a = %struct.x"
+        "let %value : { x: Nat } = { x: 1 }\nlet %struct : { x: _ } = %value\nlet a = %struct.x"
     );
     // `let {} = e` is the unit pattern by another spelling: exactly no
     // fields.
@@ -2700,8 +2721,8 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
     // each exact level with a demand of its own.
     assert_eq!(
         lowered("let {pos: {x, y}, tag: t} = p  let p = { pos: { x: 1, y: 2 }, tag: 3 }"),
-        "let %struct : { pos: ?, tag: ? } = p\n\
-         let %struct : { x: ?, y: ? } = %struct.pos\n\
+        "let %struct : { pos: _, tag: _ } = p\n\
+         let %struct : { x: _, y: _ } = %struct.pos\n\
          let x = %struct.x\n\
          let y = %struct.y\n\
          let t = %struct.tag\n\
@@ -2715,7 +2736,7 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
 fn a_struct_let_expression_chains_through_a_temporary() {
     assert_eq!(
         lowered("let d = fn e => let {x, y: a} = e in x"),
-        "let d = fn e => let %struct : { x: ?, y: ? } = e in \
+        "let d = fn e => let %struct : { x: _, y: _ } = e in \
          let x = %struct.x in let a = %struct.y in x"
     );
     // Open, the pattern demands only what the projections do, so the
@@ -2729,14 +2750,14 @@ fn a_struct_let_expression_chains_through_a_temporary() {
     assert_eq!(
         lowered("let a = let {x} : { x: Nat } = { x: 1 } in x"),
         "let a = let %value : { x: Nat } = { x: 1 } in \
-         let %struct : { x: ? } = %value in let x = %struct.x in x"
+         let %struct : { x: _ } = %value in let x = %struct.x in x"
     );
     // The spec's own nested example.
     assert_eq!(
         lowered("let dist = fn p => let {pos: {x, y}} = p in add x y  let add = fn a b => a"),
         "let dist = fn p => \
-         let %struct : { pos: ? } = p in \
-         let %struct : { x: ?, y: ? } = %struct.pos in \
+         let %struct : { pos: _ } = p in \
+         let %struct : { x: _, y: _ } = %struct.pos in \
          let x = %struct.x in let y = %struct.y in add x y\n\
          let add = fn a => fn b => a"
     );
@@ -2848,12 +2869,12 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
 fn a_wildcard_struct_leaf_keeps_the_projection() {
     assert_eq!(
         lowered("let {x: _, y} = { x: 1, y: 2 }"),
-        "let %struct : { x: ?, y: ? } = { x: 1, y: 2 }\n\
+        "let %struct : { x: _, y: _ } = { x: 1, y: 2 }\n\
          let %discard = %struct.x\nlet y = %struct.y"
     );
     assert_eq!(
         lowered("let use_y = fn p => let {x: _, y} = p in y"),
-        "let use_y = fn p => let %struct : { x: ?, y: ? } = p in \
+        "let use_y = fn p => let %struct : { x: _, y: _ } = p in \
          let %discard = %struct.x in let y = %struct.y in y"
     );
 }
@@ -3292,7 +3313,7 @@ fn pattern_let_corners() {
     assert_eq!(errors, ["duplicate-binding@8"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let %struct : { x: ? } = { x: 1 }\nlet x = %struct.x\nlet x = <error>"
+        "let %struct : { x: _ } = { x: 1 }\nlet x = %struct.x\nlet x = <error>"
     );
 
     // A refutable statement pattern with a number: the complaint quotes it.
@@ -3318,7 +3339,8 @@ fn pattern_let_corners() {
 /// would be a different one.
 #[test]
 fn an_annotation_keeps_its_clause() {
-    let (mint, out) = built("let f : { x when a: Nat, y when b: Nat } where a != b = { x: 1 }");
+    let (mint, out) =
+        built("let f : { x when a: Nat, y when b: Nat } where let a, b; a != b = { x: 1 }");
     let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
         .annotation
         .as_ref()
@@ -3380,7 +3402,7 @@ fn the_anonymous_presence_binds_no_name() {
 /// written and the clause absorbs whole.
 #[test]
 fn a_clause_may_not_name_what_the_type_does_not_bind() {
-    let src = "let f : { x when a: Nat } where c = { x: 1 }";
+    let src = "let f : { x when a: Nat } where let a; c = { x: 1 }";
     let (mint, out) = build_src(src);
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);
@@ -3403,15 +3425,33 @@ fn a_clause_may_not_name_what_the_type_does_not_bind() {
     // unbound presences reports both — and the clause still absorbs whole,
     // through every connective one can be written with.
     for (src, count) in [
-        ("let f : { x when a: Nat } where c or d = { x: 1 }", 2),
-        ("let f : { x when a: Nat } where c and d = { x: 1 }", 2),
-        ("let f : { x when a: Nat } where c = d = { x: 1 }", 2),
-        ("let f : { x when a: Nat } where c != d = { x: 1 }", 2),
-        ("let f : { x when a: Nat } where not c = { x: 1 }", 1),
-        ("let f : { x when a: Nat } where a or c = { x: 1 }", 1),
-        ("let f : { x when a: Nat } where a and c = { x: 1 }", 1),
-        ("let f : { x when a: Nat } where a = c = { x: 1 }", 1),
-        ("let f : { x when a: Nat } where a != c = { x: 1 }", 1),
+        (
+            "let f : { x when a: Nat } where let a; c or d = { x: 1 }",
+            2,
+        ),
+        (
+            "let f : { x when a: Nat } where let a; c and d = { x: 1 }",
+            2,
+        ),
+        ("let f : { x when a: Nat } where let a; c = d = { x: 1 }", 2),
+        (
+            "let f : { x when a: Nat } where let a; c != d = { x: 1 }",
+            2,
+        ),
+        ("let f : { x when a: Nat } where let a; not c = { x: 1 }", 1),
+        (
+            "let f : { x when a: Nat } where let a; a or c = { x: 1 }",
+            1,
+        ),
+        (
+            "let f : { x when a: Nat } where let a; a and c = { x: 1 }",
+            1,
+        ),
+        ("let f : { x when a: Nat } where let a; a = c = { x: 1 }", 1),
+        (
+            "let f : { x when a: Nat } where let a; a != c = { x: 1 }",
+            1,
+        ),
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), count, "{src}: {:#?}", out.errors);
@@ -3446,4 +3486,400 @@ fn a_declaration_may_not_carry_a_clause() {
             .collect::<Vec<_>>(),
         ["open-declared-type"]
     );
+}
+
+/// A bare name in a type resolves in one order and no other: a declaration's
+/// parameter, a `where let` variable, a declared type, a primitive. The first
+/// two never share a scope — a declaration has no `where let` — so what the
+/// order really decides is that a declared variable shadows a declared type and
+/// the built-in alike, for the extent of its own annotation.
+#[test]
+fn a_bare_name_resolves_in_one_order() {
+    // A declared type, which is what a bare name has always been.
+    let (mint, out) = built("type T = Nat  let f : T -> Nat = fn x => 0");
+    let annotation = annotation_of(&mint, &out, "f");
+    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+        panic!("expected an arrow");
+    };
+    assert!(matches!(from.tracked, TypeKind::Ident(_)));
+
+    // The same spelling declared as a variable shadows it, exactly as a user's
+    // `type Nat` shadows the built-in.
+    let (mint, out) = built("type T = Nat  let f : T -> T where let T = fn x => x");
+    let annotation = annotation_of(&mint, &out, "f");
+    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+        panic!("expected an arrow");
+    };
+    assert!(matches!(&from.tracked, TypeKind::Var(name) if name == "T"));
+
+    // And the built-in goes the same way.
+    let (mint, out) = built("let f : Nat -> Nat where let Nat = fn x => x");
+    let annotation = annotation_of(&mint, &out, "f");
+    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+        panic!("expected an arrow");
+    };
+    assert!(matches!(&from.tracked, TypeKind::Var(name) if name == "Nat"));
+
+    // A declaration's parameter still comes first, and a declaration declares
+    // no variables for it to be shadowed by.
+    let (mint, out) = built("type Box a = { it: a }");
+    let symbol = type_symbol(&mint, &out, "Box");
+    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.tracked else {
+        panic!("expected a struct");
+    };
+    let TypeField::Written { value, .. } = &fields["it"] else {
+        panic!("expected a written field");
+    };
+    assert!(matches!(value.tracked, TypeKind::Param { .. }));
+}
+
+/// A name in a type position, in a `..`, or in a `when` is a *use*: it has to
+/// have been declared, and a name nothing declared stands for nothing at all.
+#[test]
+fn an_undeclared_name_is_undefined_wherever_it_is_used() {
+    for (src, at) in [
+        // A type position, twice — one report per use.
+        ("let bad : a -> a = fn x => x", 2),
+        // A struct's tail, a sum's tail, and a `when`.
+        ("let bad : { x: Nat, ..r } -> Nat = fn p => p.x", 1),
+        ("let bad : (`A Nat | ..r) -> Nat = fn p => 0", 1),
+        ("let bad : { x when a: Nat } -> Nat = fn p => 0", 1),
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), at, "{src}: {:#?}", out.errors);
+        for error in &out.errors {
+            assert!(
+                matches!(
+                    error.kind,
+                    ErrorKind::Undefined {
+                        namespace: Namespace::Types
+                    }
+                ),
+                "{src}: {:#?}",
+                out.errors
+            );
+        }
+    }
+
+    // At the name rather than at the `..` or the `when` in front of it: the
+    // name is the whole of what the reader can change.
+    let src = "let bad : { x: Nat, ..r } -> Nat = fn p => p.x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors[0].span.start, src.find("..r").expect("tail") + 2);
+    let src = "let bad : { x when a: Nat } -> Nat = fn p => 0";
+    let (_, out) = build_src(src);
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("when a").expect("clause") + 5
+    );
+}
+
+/// What a declared variable stands for is read off its uses, the way a
+/// declaration parameter's kind is: a type position or a struct's `..r` makes a
+/// whole type, a sum's `..r` the rest of its cases, a `when` a presence. The
+/// lowered annotation carries the answers, so inference re-derives none of it.
+#[test]
+fn a_declared_variable_takes_its_sort_from_its_uses() {
+    for (src, sense) in [
+        ("let f : a -> a where let a = fn x => x", Sense::Type),
+        (
+            "let f : { x: Nat, ..a } -> Nat where let a = fn p => p.x",
+            Sense::Type,
+        ),
+        (
+            "let f : (`A Nat | ..a) -> Nat where let a = fn p => 0",
+            Sense::Cases,
+        ),
+        (
+            "let f : { x when a: Nat } -> Nat where let a = fn p => 0",
+            Sense::Presence,
+        ),
+    ] {
+        let (mint, out) = built(src);
+        let annotation = annotation_of(&mint, &out, "f");
+        let [variable] = annotation.variables.as_slice() else {
+            panic!("{src}: expected one variable: {:#?}", annotation.variables);
+        };
+        assert_eq!(variable.name, "a", "{src}");
+        assert_eq!(variable.sense, sense, "{src}");
+        assert_eq!(variable.span.start, src.rfind("let a").expect("it") + 4);
+    }
+
+    // Several of them, in the order they were declared, each with the sort its
+    // own uses gave it — and each with an id nothing else in the program has.
+    let src = "let f : { x when a: c, ..b } -> c where let a, b, c = fn p => p.x";
+    let (mint, out) = built(src);
+    let annotation = annotation_of(&mint, &out, "f");
+    let senses: Vec<(&str, Sense)> = annotation
+        .variables
+        .iter()
+        .map(|variable| (variable.name.as_str(), variable.sense))
+        .collect();
+    assert_eq!(
+        senses,
+        [
+            ("a", Sense::Presence),
+            ("b", Sense::Type),
+            ("c", Sense::Type)
+        ]
+    );
+    let ids: Vec<u32> = annotation.variables.iter().map(|v| v.id).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(
+        ids.iter()
+            .all(|id| ids.iter().filter(|o| *o == id).count() == 1)
+    );
+
+    // And two annotations that each write `a` declare two variables, however
+    // alike they look.
+    let (mint, out) = built(
+        "let f : a -> a where let a = fn x => x\n\
+         let g : a -> a where let a = fn x => x",
+    );
+    let one = annotation_of(&mint, &out, "f").variables[0].id;
+    let other = annotation_of(&mint, &out, "g").variables[0].id;
+    assert_ne!(one, other);
+}
+
+/// One variable stands for one thing, and there are three things it could be.
+/// A use that disagrees with the first one is refused where it was written,
+/// naming both readings and pointing back at the use that decided it.
+#[test]
+fn a_declared_variable_used_at_two_sorts_is_refused() {
+    for (src, first, second) in [
+        (
+            "let f : { x: Nat, ..a } -> (`A Nat | ..a) -> Nat where let a = fn p => fn q => 0",
+            Sense::Type,
+            Sense::Cases,
+        ),
+        (
+            "let f : (`A Nat | ..a) -> { x: Nat, ..a } -> Nat where let a = fn p => fn q => 0",
+            Sense::Cases,
+            Sense::Type,
+        ),
+        (
+            "let f : { x when a: Nat } -> a where let a = fn r => r",
+            Sense::Presence,
+            Sense::Type,
+        ),
+        (
+            "let f : a -> { x when a: Nat } where let a = fn r => r",
+            Sense::Type,
+            Sense::Presence,
+        ),
+        (
+            "let f : (`A Nat | ..a) -> { x when a: Nat } where let a = fn r => r",
+            Sense::Cases,
+            Sense::Presence,
+        ),
+        (
+            "let f : { x when a: Nat } -> (`A Nat | ..a) where let a = fn r => r",
+            Sense::Presence,
+            Sense::Cases,
+        ),
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::MixedTail {
+                    first: one,
+                    second: two,
+                    ..
+                } if one == first && two == second
+            ),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+
+    // A name in a formula is a presence use, since a formula is written about
+    // presences and nothing else.
+    let src = "let f : a -> a where let a; a = fn x => x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(
+        matches!(
+            out.errors[0].kind,
+            ErrorKind::MixedTail {
+                first: Sense::Type,
+                second: Sense::Presence,
+                ..
+            }
+        ),
+        "{:#?}",
+        out.errors
+    );
+}
+
+/// One `where` clause declares each name once. A repeat declares nothing — the
+/// first is the one that stands — and is reported against it, however the two
+/// statements were spelled.
+#[test]
+fn a_where_clause_declares_each_name_once() {
+    for src in [
+        "let f : a -> a where let a; let a = fn x => x",
+        "let f : a -> a where let a, a = fn x => x",
+    ] {
+        let (mint, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
+        let ErrorKind::DuplicateVariable { name, previous } = &out.errors[0].kind else {
+            panic!("{src}: {:#?}", out.errors);
+        };
+        assert_eq!(name, "a");
+        assert_eq!(
+            out.errors[0].span.start,
+            src.rfind('a').expect("the repeat")
+        );
+        assert_eq!(previous.start, src.find("let a").expect("the first") + 4);
+        // One variable, and it is the first one's.
+        let annotation = annotation_of(&mint, &out, "f");
+        assert_eq!(annotation.variables.len(), 1, "{src}");
+    }
+}
+
+/// A declared name nothing uses has no sort to be read off it, so there is
+/// nothing for it to be. Reported at the name, in the order they were written.
+#[test]
+fn a_declared_variable_has_to_be_used() {
+    let src = "let f : Nat -> Nat where let a = fn x => x";
+    let (mint, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let ErrorKind::UnusedVariable { name } = &out.errors[0].kind else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(name, "a");
+    assert_eq!(out.errors[0].span.start, src.rfind('a').expect("the name"));
+    // Nothing survives into the annotation for inference to mint.
+    assert!(annotation_of(&mint, &out, "f").variables.is_empty());
+
+    // In declaration order, one report each.
+    let (_, out) = build_src("let f : Nat -> Nat where let a, b = fn x => x");
+    let names: Vec<&str> = out
+        .errors
+        .iter()
+        .map(|error| match &error.kind {
+            ErrorKind::UnusedVariable { name } => name.as_str(),
+            other => panic!("{other:#?}"),
+        })
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+/// A formula is written about presences, and a presence is what a `when` puts
+/// on a label — so a name no `when` wears is a name the formula has nothing to
+/// say about, whether or not anything declared it.
+#[test]
+fn a_formula_names_only_what_a_when_wears() {
+    for src in [
+        // Declared, and never worn by a label.
+        "let f : { x when a: Nat } -> Nat where let a, b; a = b = fn p => 0",
+        // Not declared at all, which the reader fixes the same way.
+        "let f : { x when a: Nat } -> Nat where let a; a = b = fn p => 0",
+    ] {
+        let (_, out) = build_src(src);
+        let complaints: Vec<&ErrorKind> = out
+            .errors
+            .iter()
+            .map(|error| &error.kind)
+            .filter(|kind| matches!(kind, ErrorKind::UnboundPresence { name } if name == "b"))
+            .collect();
+        assert_eq!(complaints.len(), 1, "{src}: {:#?}", out.errors);
+    }
+}
+
+/// A declaration's variables are its parameters, so there is nothing in one's
+/// `where` for a `let` to declare — and nothing for a formula to relate either.
+/// Both are reported at the statement's own span, so a clause with several bad
+/// statements reports each, and the type beside them stands.
+#[test]
+fn a_declaration_may_declare_nothing_in_its_where() {
+    let src = "type Bad r = { x: Nat, ..r } where let r";
+    let (mint, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::VariableInDeclaration));
+    assert_eq!(error.span.start, src.rfind("let r").expect("the statement"));
+    // The type beside it stands, exactly as a declaration with a refused `..`
+    // keeps everything else it said.
+    let symbol = type_symbol(&mint, &out, "Bad");
+    assert!(matches!(
+        out.program.types[&symbol].value.tracked,
+        TypeKind::Struct { .. }
+    ));
+
+    // One report per statement, whichever kind each is.
+    let src = "type Bad = { x when a: Nat } where let r; a; let s";
+    let (_, out) = build_src(src);
+    let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
+    assert_eq!(
+        codes,
+        [
+            "open-declared-type",
+            "variable-in-declaration",
+            "declared-where-clause",
+            "variable-in-declaration"
+        ]
+    );
+}
+
+/// Several constraint statements are conjoined in written order: `where a; b`
+/// says what `where a and b` says, so the definition is held to both.
+#[test]
+fn several_constraint_statements_are_conjoined() {
+    let (mint, out) =
+        built("let f : { x when a: Nat, y when b: Nat } -> Nat where let a, b; a; b = fn p => 0");
+    let annotation = annotation_of(&mint, &out, "f");
+    let clause = annotation.clause.as_ref().expect("the clause");
+    assert_eq!(
+        print::ir::clause(&clause.tracked, &mint).to_string(),
+        "a and b"
+    );
+}
+
+/// A `where let` variable stands for one type outright, the way a declaration's
+/// parameter does, so there is nothing there to give arguments to — and the
+/// name still counts as used, since a second complaint about it would be the
+/// first one said again.
+#[test]
+fn a_declared_variable_may_not_be_applied() {
+    let src = "let f : a Nat -> Nat where let a = fn x => 0";
+    let (_, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::ParameterApplied));
+    assert_eq!(error.span.start, src.find('a').expect("the head"));
+}
+
+/// A declaration says the same thing wherever it is used, so there is nothing
+/// in one for a `_` to leave open. Refused where it stands, and the type
+/// absorbs — the treatment an open row written there already gets.
+#[test]
+fn a_declaration_may_not_hold_a_hole() {
+    let src = "type Bad = { x: _ }";
+    let (mint, out) = build_src(src);
+    let [error] = out.errors.as_slice() else {
+        panic!("expected one error: {:#?}", out.errors);
+    };
+    assert!(matches!(error.kind, ErrorKind::HoleInDeclaration));
+    assert_eq!(error.span.start, src.find('_').expect("the hole"));
+    let symbol = type_symbol(&mint, &out, "Bad");
+    let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.tracked else {
+        panic!("expected a struct");
+    };
+    let TypeField::Written { value, .. } = &fields["x"] else {
+        panic!("expected a written field");
+    };
+    assert!(matches!(value.tracked, TypeKind::Error));
+
+    // An annotation is where a hole belongs, and it lowers to one.
+    let (mint, out) = built("let k : _ -> Nat = fn x => 0");
+    let annotation = annotation_of(&mint, &out, "k");
+    let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
+        panic!("expected an arrow");
+    };
+    assert!(matches!(from.tracked, TypeKind::Hole));
 }

@@ -68,6 +68,25 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
 
+/// The note a repeated `where let` name points back with, printed against the
+/// span of the declaration that stands.
+///
+/// [`FIRST_DEFINITION`]'s counterpart for a `where` clause, and separate from it
+/// because nothing in a clause is defined: a declaration says a name will stand
+/// for something, and what it stands for is the type beside it. See
+/// [`ir::ErrorKind::DuplicateVariable`].
+pub const FIRST_DECLARATION: &str = "first declared here";
+
+/// The note a complaint about a `where let` variable points back with, printed
+/// against the span of the name in the `where let` that declared it.
+///
+/// [`FIRST_USE`]'s counterpart for the complaints inference raises about a
+/// rigid: what went wrong is on the line the reader is being shown, and what
+/// was promised is somewhere else on the page. See
+/// [`inference::ErrorKind::RigidBroken`] and
+/// [`inference::ErrorKind::RigidField`].
+pub const DECLARED_HERE: &str = "declared here";
+
 /// A node a printer has to parenthesize by precedence. Implemented by every
 /// wrapper that prints as surface syntax, and by [`Ty`], which prints as one
 /// directly.
@@ -259,6 +278,7 @@ impl fmt::Display for Kind {
             Kind::Arrow => f.write_str("->"),
             Kind::Colon => f.write_str(":"),
             Kind::Comma => f.write_str(","),
+            Kind::Semicolon => f.write_str(";"),
             Kind::Dot => f.write_str("."),
             Kind::DotDot => f.write_str(".."),
             Kind::NotEqual => f.write_str("!="),
@@ -477,10 +497,15 @@ impl ir::ErrorKind {
             },
             ir::ErrorKind::OpenDeclaredType { .. } => "open-declared-type",
             ir::ErrorKind::ClauseInDeclaration => "declared-where-clause",
+            ir::ErrorKind::VariableInDeclaration => "variable-in-declaration",
+            ir::ErrorKind::HoleInDeclaration => "hole-in-declaration",
             // The name is not part of the code, only of the wording: what went
-            // wrong is that the clause names something the type does not bind,
-            // and which name it was is the span's to show.
+            // wrong is that the clause names something no label wears, and
+            // which name it was is the span's to show. The two below say the
+            // same about theirs.
             ir::ErrorKind::UnboundPresence { .. } => "unbound-presence",
+            ir::ErrorKind::DuplicateVariable { .. } => "duplicate-variable",
+            ir::ErrorKind::UnusedVariable { .. } => "unused-variable",
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
@@ -552,9 +577,35 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::ClauseInDeclaration => f.write_str(
                 "a declared type says the same thing wherever it is used, so there is nothing here for a `where` clause to decide; it belongs in an annotation",
             ),
+            // The same refusal about a `let` statement rather than a
+            // comparison, and said as what a declaration's variables already
+            // are: writing one in the header is the fix, and naming it is
+            // shorter than describing it.
+            ir::ErrorKind::VariableInDeclaration => f.write_str(
+                "a declared type's variables are its parameters, so there is nothing here for a `let` to declare; write `type T a = ...`",
+            ),
+            // And the same about a `_`, which leaves open the one thing a
+            // declaration has no way to leave open.
+            ir::ErrorKind::HoleInDeclaration => f.write_str(
+                "a declared type says the same thing wherever it is used, so there is nothing here for `_` to leave open",
+            ),
+            // Said as what the type would have to do rather than as what the
+            // clause failed to find: a formula is about presences, a presence
+            // is what a `when` puts on a label, and putting the name on one is
+            // the fix whether it was declared or not.
             ir::ErrorKind::UnboundPresence { name } => write!(
                 f,
-                "this clause names `{name}`, but nothing in the type beside it binds that name with a `when`",
+                "this clause names `{name}`, but no `when` in the type beside it gives it a label",
+            ),
+            ir::ErrorKind::DuplicateVariable { name, .. } => {
+                write!(f, "`{name}` is declared twice in one `where` clause")
+            }
+            // Said as what the declaration did rather than as what is missing:
+            // there is a name on the page doing nothing, and which of the two
+            // halves the reader meant to change is theirs to say.
+            ir::ErrorKind::UnusedVariable { name } => write!(
+                f,
+                "this declares `{name}`, but nothing in the type beside it uses that name",
             ),
             // Counted in words, and said as what the type takes rather than as
             // what the reader failed to supply — the count is the fact, and
@@ -580,15 +631,16 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::GrowingRecursion => f.write_str(
                 "types that lead back to each other may hand on the names they take, but not types built out of them, which get bigger every time round",
             ),
-            // Said as the two readings rather than as "kind", which names a
-            // thing this language does not otherwise have and the reader has
-            // never been shown.
-            // One sentence for the two, because it is one thing gone wrong:
-            // a name that has to be one rest was given two. Which name it is,
-            // the span already says.
+            // Said as the readings rather than as "kind", which names a thing
+            // this language does not otherwise have and the reader has never
+            // been shown. One sentence for the two, because it is one thing
+            // gone wrong: a name that has to stand for one thing was given two.
+            // Which name it is, the span already says; where the other reading
+            // was is a second place, and pointing at one is layout — see
+            // [`FIRST_USE`].
             ir::ErrorKind::MixedTail { first, second, .. } => write!(
                 f,
-                "this stands for {first} in one place and for {second} in another",
+                "this is used as {second} here and as {first} before it, and a name can only stand for one of them",
             ),
             ir::ErrorKind::MixedParameter { first, second } => write!(
                 f,
@@ -764,6 +816,10 @@ impl fmt::Display for Sense {
         f.write_str(match self {
             Sense::Type => "a whole type",
             Sense::Cases => "the rest of a sum's cases",
+            // What a `when` puts on a label, said as the reader's own word for
+            // it rather than as "a presence variable": they wrote `when a`, and
+            // the variable behind it is the compiler's business.
+            Sense::Presence => "a presence",
         })
     }
 }
@@ -856,7 +912,10 @@ impl Grouped for Ty {
             (true, core) => core.prec(),
             // Braces close it, however many fields are inside and whatever the
             // `..` after them says.
-            (false, Core::Unit | Core::Var(_) | Core::Bound(_) | Core::Undecided) => Prec::Atom,
+            (
+                false,
+                Core::Unit | Core::Var(_) | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided,
+            ) => Prec::Atom,
             (false, _) => Prec::With,
         }
     }
@@ -886,6 +945,7 @@ impl Grouped for Core {
             | Core::Named { .. }
             | Core::Var(_)
             | Core::Bound(_)
+            | Core::Rigid { .. }
             | Core::Undecided => Prec::Atom,
         }
     }
@@ -893,7 +953,8 @@ impl Grouped for Core {
 
 /// Types print in the surface type grammar, so a printed type reads the same
 /// as one the user could have written. The two forms with no surface spelling
-/// print as what they mean: a quantified variable as `'a`, and an unsolved or
+/// print as what they mean: a quantified variable as the bare letter its
+/// `where let` declares it as, and an unsolved or
 /// undecided type as `?` — inference's way of saying it has nothing to report.
 ///
 /// Three forms, and which one a type takes is decided by its two halves rather
@@ -911,7 +972,7 @@ impl Grouped for Core {
 ///
 /// The `..` spelling is [`tail_of`]'s table read off the core rather than off a
 /// tail, and that is the whole of what keeps a printed type re-lowerable to the
-/// type it was printed from: `'b with { x: 'a }` is not something the parser
+/// type it was printed from: `b with { x: a }` is not something the parser
 /// could read back, and `{ x: 'a, ..'b }` is.
 ///
 /// The grouping comes from [`write_arrow`] and the braces from [`write_row`]
@@ -924,7 +985,7 @@ impl Grouped for Core {
 /// whoever knows what it stands for, and the two readers know different
 /// things: the IR tab is showing a type as it was written, so it spells a
 /// named tail `..r`, while a scheme is showing what the definition was
-/// inferred to be, so it spells the same tail `..'a`. `tests/src/print.rs`
+/// inferred to be, so it spells the same tail `..a`. `tests/src/print.rs`
 /// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -959,7 +1020,11 @@ fn core_tail(core: &Core) -> Option<Option<String>> {
     match core {
         Core::Unit => Some(None),
         Core::Var(var) => Some(Some(format!("?{var}"))),
-        Core::Bound(index) => Some(Some(Core::Bound(*index).to_string())),
+        Core::Bound(index) => Some(Some(name_at(*index))),
+        // A struct's rest declared by a `where let` prints as the name it was
+        // declared with, which is what the reader wrote and what re-lowers to
+        // the same rest.
+        Core::Rigid { name, .. } => Some(Some(name.to_string())),
         Core::Undecided => Some(Some(String::new())),
         Core::Nat | Core::Arrow(..) | Core::Sum(_) | Core::Named { .. } => None,
     }
@@ -988,7 +1053,10 @@ impl fmt::Display for Core {
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
             Core::Var(var) => write!(f, "?{var}"),
-            Core::Bound(index) => letter(f, *index),
+            Core::Bound(index) => f.write_str(&name_at(*index)),
+            // A rigid prints as the name its `where let` gave it: the reader
+            // wrote it, and it is what tells two of them apart in one message.
+            Core::Rigid { name, .. } => f.write_str(name),
             Core::Undecided => f.write_str("?"),
         }
     }
@@ -1101,7 +1169,8 @@ impl fmt::Display for Rest {
         match self {
             Rest::Closed => f.write_str("∅"),
             Rest::Var(var) => write!(f, "?{var}"),
-            Rest::Bound(index) => letter(f, *index),
+            Rest::Bound(index) => f.write_str(&name_at(*index)),
+            Rest::Rigid { name, .. } => f.write_str(name),
             Rest::Undecided => f.write_str("?"),
             // A tail already decided to be more labels prints as those labels,
             // so `..{ y: Nat }` says what the row has come to be without
@@ -1122,7 +1191,7 @@ impl fmt::Display for Presence {
             Presence::Present => f.write_str("present"),
             Presence::Absent => f.write_str("absent"),
             Presence::Var(var) => write!(f, "?{var}"),
-            Presence::Bound(index) => presence_letter(f, *index),
+            Presence::Bound(index) => f.write_str(&name_at(*index)),
             Presence::Undecided => f.write_str("?"),
         }
     }
@@ -1135,7 +1204,7 @@ impl fmt::Display for Atom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Atom::Var(var) => write!(f, "?{var}"),
-            Atom::Bound(index) => presence_letter(f, *index),
+            Atom::Bound(index) => f.write_str(&name_at(*index)),
         }
     }
 }
@@ -1153,22 +1222,15 @@ impl fmt::Display for Assigned {
     }
 }
 
-/// A quantified variable, by its position: `'a` through `'z`, and then `'a1`
-/// once the letters run out. Types and rows share this alphabet; presences have
-/// [`presence_letter`] instead.
-fn letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
-    write!(f, "'{}", name_at(index))
-}
-
-/// A quantified presence, by its position: `a` through `z`, then `a1`. The same
-/// letters and no quote, which is the whole of what tells the two alphabets
-/// apart — and they are separate pools, so a type's `'a` and a presence's `a`
-/// in one scheme are unrelated by construction rather than by luck.
-fn presence_letter(f: &mut fmt::Formatter<'_>, index: u32) -> fmt::Result {
-    f.write_str(&name_at(index))
-}
-
-/// The `a`, `b`, … `a1` sequence both alphabets are built from.
+/// A quantified variable, by its position: `a` through `z`, and then `a1` once
+/// the letters run out.
+///
+/// One alphabet and no prefix. Every sort a scheme quantifies prints through
+/// here — a type bare, a struct's rest after a `..`, a sum's the same, a
+/// presence after a `when` — because that is how each of them is *written*, and
+/// a printed scheme is meant to read back as source. The position a letter sits
+/// in says which sort it is, and a scheme's one index space is what keeps two
+/// of them from ever colliding.
 fn name_at(index: u32) -> String {
     let letter = (b'a' + (index % 26) as u8) as char;
     match index / 26 {
@@ -1324,7 +1386,7 @@ impl fmt::Display for Formula {
 }
 
 /// What follows a row's `..`, or `None` when the row allows nothing more and no
-/// `..` is written at all: a quantified `'a`, a solver variable's `?3`, the
+/// `..` is written at all: a quantified `a`, a solver variable's `?3`, the
 /// labels a tail has been decided to be, or the empty string where the rest is
 /// undecided and there is nothing to report.
 ///
@@ -1391,21 +1453,42 @@ fn payload(ty: &Ty) -> Option<&Ty> {
     }
 }
 
-/// A scheme prints as its body and what it requires of its presences: the
-/// quantifier is implied by the `'a`s and the `when` names that appear, the way
-/// ML type printers have always done it.
+/// A scheme prints as its body, the `where let` that declares what it
+/// quantifies, and what it requires of its presences.
 ///
-/// The `where` clause follows the whole type, and is left off entirely when the
-/// formula says nothing — which is every scheme in a program with no qualifying
-/// match and no written clause, so R13's "behaves exactly as before" is what
-/// falls out of the ordinary case.
+/// The quantifier is written out rather than implied by the letters that
+/// appear, and that is the whole point: what comes out is source. `let id =
+/// fn x => x` reports `a -> a where let a`, and pasting that back as
+/// `let id : a -> a where let a` re-lowers to the type it was printed from — a
+/// round trip an implied quantifier could not have, since a bare `a` in an
+/// annotation is a name that has to have been declared.
+///
+/// Every letter in index order, whichever sort it is: the presences first,
+/// because that is where a scheme's index space puts them. A scheme quantifying
+/// nothing and requiring nothing prints no `where` at all, which is every
+/// scheme in a monomorphic program.
 impl fmt::Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.body().fmt(f)?;
+        let quantified = self.count() > 0;
+        if !quantified && self.formula().is_true() {
+            return Ok(());
+        }
+        f.write_str(" where")?;
+        if quantified {
+            let names: Vec<String> = (0..self.count()).map(name_at).collect();
+            write!(f, " let {}", names.join(", "))?;
+        }
         if self.formula().is_true() {
             return Ok(());
         }
-        write!(f, " where {}", self.formula())
+        // The `;` that separates the statements of a clause, which is what the
+        // two are: a declaration statement and a constraint statement, in the
+        // order the grammar reads them back.
+        if quantified {
+            f.write_str(";")?;
+        }
+        write!(f, " {}", self.formula())
     }
 }
 
@@ -1604,7 +1687,13 @@ impl inference::ErrorKind {
             // kind of row is reading the shape the complaint carries.
             inference::ErrorKind::MissingField { .. } => "missing-field",
             inference::ErrorKind::ExtraField { .. } => "extra-field",
-            inference::ErrorKind::AnnotationTooOpen => "annotation-too-open",
+            // The variable's name is not part of these codes, only of their
+            // wording, for the reason a row error's shape is not part of its:
+            // what went wrong is that a promise was broken, and which promise
+            // it was is the span's — and the note's — to show.
+            inference::ErrorKind::RigidBroken { .. } => "rigid-broken",
+            inference::ErrorKind::RigidField { .. } => "rigid-field",
+            inference::ErrorKind::RigidEscapes { .. } => "rigid-escapes",
             inference::ErrorKind::RepeatedField { .. } => "repeated-field",
             inference::ErrorKind::PresenceRequired { .. } => "presence-required",
             inference::ErrorKind::PresenceImpossible { .. } => "presence-impossible",
@@ -1635,11 +1724,30 @@ impl fmt::Display for inference::ErrorKind {
                     "extra {noun} `{field}`: the type `{base}` lists every {noun} it allows",
                 )
             }
-            // Said as what the reader can change — the type they wrote — and
-            // not as the variable the solve bound, which is a thing the
-            // annotation stood for rather than anything on the page.
-            inference::ErrorKind::AnnotationTooOpen => f.write_str(
-                "this type promises a `..` or a `when` that the definition does not leave open: write the type it actually has"
+            // Said as what the expression turned out to be, beside what the
+            // annotation promised it would be. Not as two types that failed to
+            // agree: one of them is a name standing in for a choice the reader
+            // handed to their caller, and "expected `a`, found `Nat`" says
+            // nothing about why `a` cannot simply be `Nat`.
+            inference::ErrorKind::RigidBroken { found, name, .. } => write!(
+                f,
+                "this is `{found}`, but `{name}` stands for whatever type the caller picks",
+            ),
+            inference::ErrorKind::RigidField {
+                shape, field, name, ..
+            } => {
+                let (noun, field) = about(*shape, field);
+                write!(
+                    f,
+                    "this reads a {noun} `{field}`, but `{name}` stands for whatever type the caller picks, so it may not have one",
+                )
+            }
+            // Said at the declaration, because that is the line that has to
+            // change: the type the variable leaked into is somewhere the reader
+            // never wrote it down.
+            inference::ErrorKind::RigidEscapes { name } => write!(
+                f,
+                "`{name}` stands for whatever the caller picks, so it can't be part of a type outside the annotation that declared it",
             ),
             // Said as what `..` means rather than as the two rows that
             // disagreed: neither of those is a type the reader wrote, and the

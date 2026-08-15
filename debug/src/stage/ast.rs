@@ -4,8 +4,8 @@
 //! the rendered source can never drift apart: they are the same printer.
 
 use ruddy::parse::{
-    Annotation, ArgKind, Clause, ClauseKind, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind,
-    SumCase, Type, TypeField, TypeKind, When,
+    Annotation, ArgKind, Clause, ClauseKind, ClauseStmtKind, Expr, ExprKind, Pattern, PatternKind,
+    Stmt, StmtKind, SumCase, Type, TypeField, TypeKind, When,
 };
 
 use crate::{
@@ -267,20 +267,49 @@ fn when_text(when: &Option<Box<When>>) -> String {
 }
 
 /// One written ascription: the type, and — when one was written — the `where`
-/// clause beside it, as a row of its own.
+/// clause beside it, as a row of its own with one child per statement.
 ///
 /// The clause is a sibling of the type rather than a child, because that is
-/// what it is: it constrains the presences the type's `when`s bound, and
-/// burying it under the type would say it was part of one.
+/// what it is: it declares the variables the type uses and constrains the
+/// presences its `when`s wear, and burying it under the type would say it was
+/// part of one. Each statement gets a row so the `;`s a reader wrote are the
+/// rows they see, and a `let` statement's names each get one under that, so a
+/// use in the type cross-highlights against the declaration it resolves to.
 fn annotation_node(ids: &mut Ids, annotation: &Annotation) -> Node {
     let node = type_node(ids, &annotation.ty);
-    match &annotation.clause {
-        Some(clause) => {
-            let row = Node::new(ids.next(), "Where", clause_text(clause)).at(clause.span);
-            node.child(row.children(clause_kids(ids, clause)))
-        }
-        None => node,
-    }
+    let Some(clause) = &annotation.clause else {
+        return node;
+    };
+    let stmts: Vec<Node> = clause
+        .stmts
+        .iter()
+        .map(|stmt| {
+            let text = print::ast::clause_stmt(&stmt.tracked).to_string();
+            let row = Node::new(ids.next(), "", text).at(stmt.span);
+            match &stmt.tracked {
+                ClauseStmtKind::Let(names) => Node {
+                    label: "Let".into(),
+                    ..row
+                }
+                .children(
+                    names
+                        .iter()
+                        .map(|name| {
+                            Node::new(ids.next(), "Variable", name.tracked.clone()).at(name.span)
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                ClauseStmtKind::Constraint(clause) => Node {
+                    label: "Constraint".into(),
+                    ..row
+                }
+                .children(clause_kids(ids, clause)),
+            }
+        })
+        .collect();
+    let text = print::ast::where_clause(clause).to_string();
+    let row = Node::new(ids.next(), "Where", text).at(clause.span);
+    node.child(row.children(stmts))
 }
 
 /// One clause as the source it was written from — through the shared printer,
@@ -403,6 +432,13 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             ..node
         }
         .at(name.span),
+        // A leaf like a pattern's wildcard, and for the same reason: it binds
+        // nothing and can never be referred to, so there is nothing to
+        // cross-highlight.
+        TypeKind::Hole => Node {
+            label: "Hole".into(),
+            ..node
+        },
         TypeKind::Unit => Node {
             label: "Unit".into(),
             ..node
