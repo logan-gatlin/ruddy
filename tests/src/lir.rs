@@ -1103,6 +1103,148 @@ fn a_definition_returned_from_a_function_arrives_callable() {
     );
 }
 
+/// An effect-polymorphic value called through an *unannotated* binding is
+/// called at the shape it holds, not at the shape this use instantiates it to.
+///
+/// `h` names the very value `app`'s global holds — a closure of `app#1`, which
+/// takes one bundle and one argument — while the use reads `h` at a row naming
+/// `A` and `B` outright. The call goes by what the value holds: one bundle
+/// built at the site, keyed by effect name, and `both` adapted from its two
+/// records down to the bundle `app` hands it — exactly the call `direct`
+/// makes without the binding in the way.
+#[test]
+fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
+    let source = "effect A = `a : Nat -> ()\n\
+         effect B = `b : Nat -> ()\n\
+         let both : Nat -> Nat ! `A | `B = fn n => let x = A.`a n in let y = B.`b n in n\n\
+         let app = fn g => g 1\n\
+         let direct = fn w => handle handle app both\n\
+           with | A.`a s => {} end with | B.`b s => {} end\n\
+         let bound = fn w => handle handle (let h = app in h both)\n\
+           with | A.`a s => {} end with | B.`b s => {} end";
+    // The lifted `app` and its wrapper take a bundle and the argument: two
+    // parameters, which is what every call of the value has to supply.
+    assert!(
+        section(source, "fn app#1").starts_with("fn app#1(%16: struct, %17: fn):"),
+        "{}",
+        listing(source)
+    );
+    // `direct` calls `app` directly: one bundle, one adapted argument.
+    let direct = section(source, "fn direct(");
+    assert!(
+        direct.contains("%32: struct = struct { B: %25, A: %30 }"),
+        "{direct}"
+    );
+    assert!(
+        direct.contains("%39: fn = closure direct#4, [%31]"),
+        "{direct}"
+    );
+    assert!(direct.contains("%40: nat = call app, %32, %39"), "{direct}");
+    // `bound` calls the same value through `h`, and the call has the same
+    // shape: the bundle keyed by effect name, the adapter over `global both`,
+    // and two arguments handed to the temp the global read produced.
+    let bound = section(source, "fn bound(");
+    assert!(bound.contains("%57: fn = global app"), "{bound}");
+    assert!(bound.contains("%58: fn = global both"), "{bound}");
+    assert!(
+        bound.contains("%59: struct = struct { B: %51, A: %56 }"),
+        "{bound}"
+    );
+    assert!(
+        bound.contains("%66: fn = closure bound#4, [%58]"),
+        "{bound}"
+    );
+    assert!(bound.contains("%67: nat = call %57, %59, %66"), "{bound}");
+    // The two adapters repack the same two records into the same bundle.
+    assert_eq!(
+        section(source, "fn bound#4"),
+        "fn bound#4(%60: fn, %61: struct, %62: nat):\n\
+         \x20 %63: struct = project %61, \"A\"\n\
+         \x20 %64: struct = project %61, \"B\"\n\
+         \x20 %65: nat = call %60, %63, %64, %62\n\
+         \x20 ret %65"
+    );
+}
+
+/// A lambda parameter applied at two different instantiations in one body is
+/// called both times at the shape the parameter holds — the declared type it
+/// arrived at — so both calls pass exactly as many arguments as the lifted
+/// function has parameters, and the argument whose own shape differs gets an
+/// adapter.
+#[test]
+fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let noisy : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let pure = fn n => n\n\
+         let go = fn w => handle (let h = fn g => g 1 in { a: h noisy, b: h pure })\n\
+           with | Log.`write s => {} end";
+    // The lifted `h` takes a bundle and its argument: two parameters.
+    assert_eq!(
+        section(source, "fn go#3"),
+        "fn go#3(%18: struct, %19: fn):\n\
+         \x20 %20: nat = const 1\n\
+         \x20 %21: any = call %19, %18, %20\n\
+         \x20 ret %21"
+    );
+    // Both calls of the closure pass two arguments — a bundle and the adapted
+    // function — although one use reads `h` at `Log` and the other reads it
+    // pure.
+    let go = section(source, "fn go(");
+    assert!(go.contains("%31: nat = call %22, %24, %30"), "{go}");
+    assert!(go.contains("%39: nat = call %22, %33, %38"), "{go}");
+    assert!(go.contains("%24: struct = struct { Log: %17 }"), "{go}");
+    assert!(go.contains("%30: fn = closure go#4, [%23]"), "{go}");
+    assert!(go.contains("%38: fn = closure go#5, [%32]"), "{go}");
+    // `noisy`'s adapter reads its record back out of the bundle; `pure`'s
+    // drops the bundle it has no use for.
+    assert_eq!(
+        section(source, "fn go#4"),
+        "fn go#4(%25: fn, %26: struct, %27: nat):\n\
+         \x20 %28: struct = project %26, \"Log\"\n\
+         \x20 %29: nat = call %25, %28, %27\n\
+         \x20 ret %29"
+    );
+    assert_eq!(
+        section(source, "fn go#5"),
+        "fn go#5(%34: fn, %35: struct, %36: nat):\n\
+         \x20 %37: nat = call %34, %36\n\
+         \x20 ret %37"
+    );
+}
+
+/// An effect-polymorphic value returned from a call is called at the shape it
+/// holds: what `pick {}` gives back is shaped by `pick`'s own last arrow, so
+/// the call of the result builds the bundle keyed by effect name — not a raw
+/// per-effect record — and adapts the argument, exactly as if `app` had been
+/// named on the spot.
+#[test]
+fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
+    let source = "effect A = `a : Nat -> ()\n\
+         effect B = `b : Nat -> ()\n\
+         let both : Nat -> Nat ! `A | `B = fn n => let x = A.`a n in let y = B.`b n in n\n\
+         let app = fn g => g 1\n\
+         let pick = fn u => app\n\
+         let late = fn w => handle handle (pick {}) both\n\
+           with | A.`a s => {} end with | B.`b s => {} end";
+    let late = section(source, "fn late(");
+    assert!(late.contains("%37: fn = call pick, %36"), "{late}");
+    assert!(late.contains("%38: fn = global both"), "{late}");
+    assert!(
+        late.contains("%39: struct = struct { B: %30, A: %35 }"),
+        "{late}"
+    );
+    assert!(late.contains("%46: fn = closure late#4, [%38]"), "{late}");
+    assert!(late.contains("%47: nat = call %37, %39, %46"), "{late}");
+    assert_eq!(
+        section(source, "fn late#4"),
+        "fn late#4(%40: fn, %41: struct, %42: nat):\n\
+         \x20 %43: struct = project %41, \"A\"\n\
+         \x20 %44: struct = project %41, \"B\"\n\
+         \x20 %45: nat = call %40, %43, %44, %42\n\
+         \x20 ret %45"
+    );
+}
+
 /// A bundle is built out of every effect the scope can handle, and each is in
 /// it once however many frames between here and the handler carry it.
 #[test]
@@ -1304,4 +1446,21 @@ fn forced(source: &str) -> lir::Output {
     let mut built = ir::build(&mut mint, parsed.stmts);
     let inferred = inference::infer(&mint, &mut built.program);
     lir::lower(&mint, &built.program, &inferred)
+}
+
+/// An indirect call whose callee gives back a function hands the result on at
+/// the shape the callee's own next level declares — here the two agree, so the
+/// second call takes the first's temp as it stands, with nothing between.
+#[test]
+fn a_function_an_indirect_call_returns_is_called_in_turn() {
+    assert_eq!(
+        section("let main = (fn a => fn b => a) 1 2", "global main"),
+        "global main:\n\
+         \x20 %4: fn = closure main#2, []\n\
+         \x20 %5: nat = const 1\n\
+         \x20 %6: fn = call %4, %5\n\
+         \x20 %7: nat = const 2\n\
+         \x20 %8: nat = call %6, %7\n\
+         \x20 ret %8"
+    );
 }

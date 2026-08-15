@@ -407,6 +407,14 @@ struct Lower<'a> {
     /// representation of what it captures, and the only place that is written
     /// down is here.
     reps: Vec<Rep>,
+    /// The type whose shape each function-valued temp holds — the type it was
+    /// produced or fitted at — indexed by the temp. A call reads the callee's
+    /// evidence parameters off this, not off the type the use site instantiates
+    /// the value at: the two disagree exactly where a polymorphic value reaches
+    /// the call through a binding, a parameter or a return. `None` where no
+    /// producer recorded one, in which case production and use are the same
+    /// place and the use's type is the type held.
+    held: Vec<Option<Rc<Ty>>>,
     /// Reserved before anything is emitted, because a definition may call itself
     /// or its neighbour: a slot exists from the moment its name does, and is
     /// filled when its body is built.
@@ -432,6 +440,7 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         inference,
         temps: 0,
         reps: Vec::new(),
+        held: Vec::new(),
         functions: Vec::new(),
         labels: Vec::new(),
         known: IndexMap::new(),
@@ -696,7 +705,16 @@ impl Lower<'_> {
         let temp = self.temps;
         self.temps += 1;
         self.reps.push(rep);
+        self.held.push(None);
         temp
+    }
+
+    /// Record the type whose shape a temp holds. Only a function value has a
+    /// shape a caller must match, so nothing else is worth writing down.
+    fn hold(&mut self, temp: Temp, ty: &Rc<Ty>) {
+        if self.rep(ty) == Rep::Fn {
+            self.held[temp as usize] = Some(ty.clone());
+        }
     }
 
     /// Emit one value-producing instruction and hand back the temp it assigns.
@@ -856,6 +874,7 @@ impl Lower<'_> {
             self.evidence_params(&level.row, &mut params);
             let rep = self.rep(&level.from);
             let temp = self.fresh(rep);
+            self.hold(temp, &level.from);
             self.top().locals.insert(*arg, temp);
             params.push(Param { temp, rep });
         }
@@ -1033,6 +1052,7 @@ impl Lower<'_> {
     /// nobody wrote, so all of it is generated.
     fn fitted(&mut self, want: &Rc<Ty>, have: &Rc<Ty>, temp: Temp, body: &mut Body) -> Temp {
         if self.fits(want, have) {
+            self.hold(temp, want);
             return temp;
         }
         let (want_from, want_to, want_row) = self.arrow(want);
@@ -1138,12 +1158,14 @@ impl Lower<'_> {
                 span: Span::default(),
             },
         );
-        self.emit(
+        let adapted = self.emit(
             body,
             Span::default(),
             Rep::Fn,
             Op::Closure { func: id, captures },
-        )
+        );
+        self.hold(adapted, want);
+        adapted
     }
 
     /// The record of one effect's operations, as this scope has it — captured
@@ -1230,7 +1252,11 @@ impl Lower<'_> {
                 Some(known) => known,
                 None => {
                     let rep = self.reps[carried as usize];
+                    let shape = self.held[carried as usize].clone();
                     let inner = self.fresh(rep);
+                    // A capture is the same value under a new name, so it holds
+                    // the very shape the value it stands for does.
+                    self.held[inner as usize] = shape;
                     let frame = &mut self.frames[at];
                     frame.caught.insert(carried, inner);
                     frame.captures.push(Capture {
@@ -1364,6 +1390,7 @@ impl Lower<'_> {
         self.evidence_params(&row, &mut params);
         let rep = self.rep(&from);
         let temp = self.fresh(rep);
+        self.hold(temp, &from);
         self.top().locals.insert(arg, temp);
         params.push(Param { temp, rep });
 
@@ -1387,7 +1414,11 @@ impl Lower<'_> {
                 span: term.span,
             },
         );
-        self.emit(body, term.span, Rep::Fn, Op::Closure { func: id, captures })
+        let closure = self.emit(body, term.span, Rep::Fn, Op::Closure { func: id, captures });
+        // The closure holds the shape of the very type the `fn` was compiled
+        // against, wherever a binding or a return carries it from here.
+        self.hold(closure, &term.ty);
+        closure
     }
 
     /// An operation used as a value: a wrapper that takes the effect's evidence
@@ -1481,6 +1512,13 @@ impl Lower<'_> {
 
     /// One indirect call: the evidence the callee's own arrow asks for, then the
     /// one visible argument, fitted to what that arrow declares of it.
+    ///
+    /// The arrow asked is the one the callee value *holds*, not the one this
+    /// use instantiates it at: a value reaching the call through a binding, a
+    /// parameter or a return was compiled against its own row, and calling it
+    /// takes exactly the parameters that row came to. The row at this use still
+    /// says what goes in the tail bundle, and the result is fitted back to what
+    /// this node stands for, so the temp handed on holds its own term's shape.
     #[allow(clippy::too_many_arguments)]
     fn indirect(
         &mut self,
@@ -1491,13 +1529,18 @@ impl Lower<'_> {
         node: &Term,
         body: &mut Body,
     ) -> Temp {
-        let (from, _, row) = self.arrow(callee_ty);
-        // An indirect callee is called as whatever it is here, so the row it was
-        // compiled with and the row at this use are the one row.
-        let mut args = self.evidence_args(&row, &row, body);
+        let shape = match &self.held[callee as usize] {
+            Some(ty) => ty.clone(),
+            // No producer recorded a shape, so production and use are the same
+            // place and the type at this use is the type the value holds.
+            None => callee_ty.clone(),
+        };
+        let (from, to, declared) = self.arrow(&shape);
+        let (_, _, used) = self.arrow(callee_ty);
+        let mut args = self.evidence_args(&declared, &used, body);
         args.push(self.fitted(&from, &written.ty, arg, body));
         let rep = self.rep(&node.ty);
-        self.emit(
+        let value = self.emit(
             body,
             node.span,
             rep,
@@ -1505,7 +1548,15 @@ impl Lower<'_> {
                 callee: Callee::Indirect(callee),
                 args,
             },
-        )
+        );
+        // What comes back is shaped by the callee's own next level. Where that
+        // level pins a function shape down, fit it to what this node stands
+        // for; where it does not — an `any` nothing decided — the value is
+        // taken as this use reads it, which is all there is to go on.
+        match self.rep(&to) == Rep::Fn {
+            true => self.fitted(&node.ty, &to, value, body),
+            false => value,
+        }
     }
 
     /// Performing an operation: read the implementation the handler passed down
@@ -1586,7 +1637,7 @@ impl Lower<'_> {
             true => {
                 let node = applies[arity - 1].0;
                 let rep = self.rep(&node.ty);
-                self.emit(
+                let temp = self.emit(
                     body,
                     node.span,
                     rep,
@@ -1594,7 +1645,14 @@ impl Lower<'_> {
                         callee: Callee::Direct(known.lifted),
                         args: full,
                     },
-                )
+                );
+                // What a full application gives back is shaped by the
+                // definition's own last arrow, not by what this use
+                // instantiated it to — and it carries that shape wherever a
+                // binding or a further application takes it.
+                let to = known.levels[arity - 1].to.clone();
+                self.hold(temp, &to);
+                temp
             }
             // Short of a full application, the arguments so far become the
             // captures of the wrapper that takes the next one. What that
