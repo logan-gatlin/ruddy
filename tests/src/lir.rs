@@ -896,6 +896,29 @@ fn evidence_of_the_same_shape_is_handed_straight_over() {
     );
 }
 
+/// Fitting compares two evidence shapes, and a type that does not pin its
+/// value down to a function has none to compare — so neither side is walked
+/// into and nothing is repacked.
+///
+/// `idv` names `id` without applying it, so the call goes through a value
+/// rather than a known chain, and what `id` gives back is the very variable
+/// its scheme quantified. The value crosses as it stands; the call that
+/// eventually reaches it passes the evidence the row at *that* call asks for,
+/// which is `go`'s own bundle.
+#[test]
+fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
+    let source = "let id = fn x => x\nlet idv = id\nlet go = fn f => (idv f) 1";
+    assert_eq!(
+        section(source, "fn go("),
+        "fn go(%5: struct, %6: fn):\n\
+         \x20 %7: fn = global idv\n\
+         \x20 %8: fn = call %7, %6\n\
+         \x20 %9: nat = const 1\n\
+         \x20 %10: any = call %8, %5, %9\n\
+         \x20 ret %10"
+    );
+}
+
 /// A row that names `Log` and carries a variable part beside it is two pieces
 /// of evidence, and a position declaring only `Log` passes one. The adapter
 /// packs what it was given into the bundle the value expects, keyed by the
@@ -938,6 +961,11 @@ fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
 /// part. The function-typed argument crosses the same boundary the other way
 /// round — it arrives shaped for the bundle alone, and `both` calls it with a
 /// record and a bundle — so a second adapter stands between the two of them.
+///
+/// That second adapter is handed both pieces and has to give back one: the
+/// record `both` passes for `Log` is laid over the bundle it passes for the
+/// rest, so what the value reads through its tail is everything the adapter
+/// was given rather than the named part alone.
 #[test]
 fn an_adapter_forwards_the_bundle_it_was_handed() {
     let source = "effect Log = `write : Nat -> ()\n\
@@ -955,16 +983,17 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
         section(source, "fn fwd#3"),
         "fn fwd#3(%27: fn, %28: struct, %29: fn):\n\
          \x20 %30: struct = project %28, \"Log\"\n\
-         \x20 %37: fn = closure fwd#2, [%29]\n\
-         \x20 %38: nat = call %27, %30, %28, %37\n\
-         \x20 ret %38"
+         \x20 %38: fn = closure fwd#2, [%29]\n\
+         \x20 %39: nat = call %27, %30, %28, %38\n\
+         \x20 ret %39"
     );
     assert_eq!(
         section(source, "fn fwd#2"),
         "fn fwd#2(%31: fn, %32: struct, %33: struct, %34: nat):\n\
          \x20 %35: struct = struct { Log: %32 }\n\
-         \x20 %36: nat = call %31, %35, %34\n\
-         \x20 ret %36"
+         \x20 %36: struct = merge %33, %35\n\
+         \x20 %37: nat = call %31, %36, %34\n\
+         \x20 ret %37"
     );
 }
 
@@ -1478,8 +1507,13 @@ fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
 /// A row whose variable part is a label's own presence rather than a rest has
 /// no identity to share: the bundle standing for it is nobody else's, so a call
 /// out of it builds its own rather than forwarding the one in hand.
+///
+/// Building its own still means handing over everything the scope holds, and
+/// what this scope holds is that very bundle — `maybe` names no effect
+/// outright, so there is nothing to lay over it and nothing to copy it into.
+/// The evidence goes across; the identity does not.
 #[test]
-fn a_bundle_with_no_identity_is_never_forwarded() {
+fn a_bundle_with_no_identity_hands_over_what_it_holds() {
     let source = "effect Log = `write : Nat -> ()\n\
          let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
          let idn = fn n => n\n\
@@ -1489,9 +1523,8 @@ fn a_bundle_with_no_identity_is_never_forwarded() {
         "fn maybe(%15: struct, %16: nat):\n\
          \x20 %17: fn = global idn\n\
          \x20 %22: fn = closure maybe#2, [%17]\n\
-         \x20 %23: struct = struct {}\n\
-         \x20 %24: nat = call piped, %22, %23, %16\n\
-         \x20 ret %24"
+         \x20 %23: nat = call piped, %22, %15, %16\n\
+         \x20 ret %23"
     );
 }
 
@@ -1502,9 +1535,10 @@ fn a_bundle_with_no_identity_is_never_forwarded() {
 /// unrelated definitions both quantify a first one and their indices compare
 /// equal. `caller` quantifies a rest of its own and calls `piped`, which
 /// quantifies one too — but at that use `piped`'s rest stands for the `Log` the
-/// handler on the same line discharges, so the bundle has to be built there out
-/// of the handler's record. `twice` calls `piped` at its own rest, and that one
-/// really is forwarded.
+/// handler on the same line discharges, so the bundle has to be built there:
+/// the handler's record laid over the bundle `caller` was handed, since the
+/// callee may reach for either. `twice` calls `piped` at its own rest, and that
+/// one really is forwarded — nothing is built for it at all.
 #[test]
 fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
     let source = "effect Log = `write : Nat -> ()\n\
@@ -1520,19 +1554,20 @@ fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
          \x20 %22: any = new_tag\n\
          \x20 %25: fn = closure caller#3, []\n\
          \x20 %26: struct = struct { write: %25 }\n\
-         \x20 %36: nat = catch %22:\n\
+         \x20 %37: nat = catch %22:\n\
          \x20   %27: fn = global noisy\n\
          \x20   %33: fn = closure caller#4, [%27]\n\
          \x20   %34: struct = struct { Log: %26 }\n\
-         \x20   %35: nat = call piped, %33, %34, %21\n\
-         \x20   yield %35\n\
-         \x20 ret %36"
+         \x20   %35: struct = merge %20, %34\n\
+         \x20   %36: nat = call piped, %33, %35, %21\n\
+         \x20   yield %36\n\
+         \x20 ret %37"
     );
     assert_eq!(
         section(source, "fn twice("),
-        "fn twice(%44: fn, %45: struct, %46: nat):\n\
-         \x20 %47: nat = call piped, %44, %45, %46\n\
-         \x20 ret %47"
+        "fn twice(%45: fn, %46: struct, %47: nat):\n\
+         \x20 %48: nat = call piped, %45, %46, %47\n\
+         \x20 ret %48"
     );
 }
 

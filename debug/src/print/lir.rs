@@ -82,6 +82,7 @@ pub fn opcode(op: &Op) -> &'static str {
     match op {
         Op::Const(_) => "const",
         Op::Struct(_) => "struct",
+        Op::Merge(_) => "merge",
         Op::Project { .. } => "project",
         Op::Tag { .. } => "tag",
         Op::Payload(_) => "payload",
@@ -208,6 +209,10 @@ fn operation(output: &Output, op: &Op) -> String {
                 .map(|(name, temp)| format!("{name}: %{temp}"))
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
+        }
+        Op::Merge(records) => {
+            let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();
+            format!("merge {}", laid.join(", "))
         }
         Op::Project { base, field } => format!("project %{base}, {field:?}"),
         Op::Tag {

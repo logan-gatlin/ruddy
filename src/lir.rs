@@ -118,6 +118,13 @@ pub enum Op {
     Const(u128),
     /// A struct literal. Empty is the unit value.
     Struct(IndexMap<String, Temp>),
+    /// One record carrying every field of each of these, laid over one another
+    /// in order: a later one wins wherever two of them name the same field.
+    ///
+    /// Evidence plumbing alone, and the only way to build a record out of one
+    /// whose fields are not known here — which is what a tail bundle is. Never
+    /// fewer than two operands: laying one record over nothing is that record.
+    Merge(Vec<Temp>),
     /// Read one field of a struct.
     Project { base: Temp, field: String },
     /// One case of a sum. A bare case carries no payload temp.
@@ -334,6 +341,18 @@ struct Body {
     end: Option<Terminator>,
 }
 
+/// One application: the node the whole application comes to, and the argument
+/// written under it.
+///
+/// The node is kept rather than just its type because two things are read off
+/// it — what the application comes to, which is its own solved type, and where
+/// the call was written, which is its span.
+#[derive(Debug, Clone, Copy)]
+struct Apply<'a> {
+    node: &'a Term,
+    arg: &'a Term,
+}
+
 /// One pattern, with everything that only binds flattened to the wildcard it
 /// matches as. [`Cell::Present`] and [`Cell::Absent`] arise from widening a
 /// struct column and are written by no pattern.
@@ -360,23 +379,40 @@ enum Cell {
 
 /// One column of the decision matrix: a whole value at a temp, one field's
 /// presence, or whatever fields a value carries beyond the ones its type names.
+///
+/// Each carries its own payload rather than naming fields inline, so that the
+/// dispatch in [`Lower::tree`] hands one whole column to whatever decides it
+/// and nothing below has to be told what a column is a second time.
 #[derive(Debug, Clone)]
 enum Col {
-    Value {
-        temp: Temp,
-        ty: Rc<Ty>,
-    },
-    Field {
-        base: Temp,
-        name: String,
-        presence: Presence,
-        ty: Rc<Ty>,
-    },
-    Rest {
-        base: Temp,
-        names: Vec<String>,
-        open: bool,
-    },
+    Value(Value),
+    Field(Field),
+    Beyond(Beyond),
+}
+
+/// A whole value, at the temp holding it.
+#[derive(Debug, Clone)]
+struct Value {
+    temp: Temp,
+    ty: Rc<Ty>,
+}
+
+/// One field of a struct: whether it is there, and what it holds when it is.
+#[derive(Debug, Clone)]
+struct Field {
+    base: Temp,
+    name: String,
+    presence: Presence,
+    ty: Rc<Ty>,
+}
+
+/// Whatever a struct carries past the fields its type names. `open` is whether
+/// there can be any.
+#[derive(Debug, Clone)]
+struct Beyond {
+    base: Temp,
+    names: Vec<String>,
+    open: bool,
 }
 
 /// One row of the decision matrix: what the arm tests at each live column, which
@@ -386,6 +422,19 @@ struct Line {
     cells: Vec<Cell>,
     arm: usize,
     binds: Vec<(Symbol, Temp)>,
+}
+
+/// The decision matrix under one column: the columns still to test and the rows
+/// still live. Every row has one cell per column, in the same order, and cell
+/// zero is the column being decided right now.
+///
+/// The two halves travel together everywhere — narrowing the rows and advancing
+/// the columns are the same step of one algorithm — so they are one value, and
+/// what the algorithm does to them is the methods on it.
+#[derive(Debug, Clone)]
+struct Matrix {
+    cols: Vec<Col>,
+    lines: Vec<Line>,
 }
 
 /// What every leaf of one match's tree needs: the arms to emit, the
@@ -551,14 +600,13 @@ fn nest(term: &Term) -> (Vec<(&Term, Symbol)>, &Term) {
     (fns, cur)
 }
 
-/// An application spine, innermost first: the ultimate callee, and every `Apply`
-/// node over it. Each node is kept whole rather than just its argument, because
-/// what one application comes to is that node's own solved type.
-fn spine(term: &Term) -> (&Term, Vec<(&Term, &Term)>) {
+/// An application spine, innermost first: the ultimate callee, and every
+/// [`Apply`] over it.
+fn spine(term: &Term) -> (&Term, Vec<Apply<'_>>) {
     let mut applies = Vec::new();
     let mut cur = term;
     while let TermKind::Apply { func, arg } = &cur.kind {
-        applies.push((cur, &**arg));
+        applies.push(Apply { node: cur, arg });
         cur = func;
     }
     applies.reverse();
@@ -614,6 +662,122 @@ impl RestKey {
     /// no reason to think they have the same one.
     fn forwards(self, other: RestKey) -> bool {
         !matches!(self, RestKey::Open) && self == other
+    }
+}
+
+impl Line {
+    /// This row with the decided column's cell dropped, and whatever that cell
+    /// bound bound to the temp the column stood at.
+    fn consumed(mut self, temp: Temp) -> Line {
+        if let Cell::Wild(Some(symbol)) = &self.cells[0] {
+            self.binds.push((*symbol, temp));
+        }
+        self.cells.remove(0);
+        self
+    }
+
+    /// The same, where nothing at the column could have bound anything.
+    fn dropped(mut self) -> Line {
+        self.cells.remove(0);
+        self
+    }
+}
+
+/// Reading the matrix borrows it and narrowing it consumes it, which is the
+/// difference between a branch that is one of several — every arm of a switch
+/// narrows the same matrix — and a walk that goes on down.
+impl Matrix {
+    /// Take the column being decided off the front, leaving the matrix under
+    /// it, or `None` where every column has been decided and a row has won.
+    ///
+    /// The rows keep their first cell: it belongs to the column just taken, and
+    /// what becomes of it is that column's to say.
+    fn split(&mut self) -> Option<Col> {
+        match self.cols.is_empty() {
+            true => None,
+            false => Some(self.cols.remove(0)),
+        }
+    }
+
+    /// Whether no row tests the column being decided — in which case reading
+    /// the value at it would be an instruction with no reader.
+    fn untested(&self) -> bool {
+        self.lines.iter().all(|line| !tests(&line.cells[0]))
+    }
+
+    /// The rows this keeps, under the same columns.
+    fn kept(&self, keep: impl Fn(&Line) -> bool) -> Matrix {
+        Matrix {
+            cols: self.cols.clone(),
+            lines: self
+                .lines
+                .iter()
+                .filter(|line| keep(line))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The decided column dropped from every row: it has nothing further to say
+    /// about the value.
+    fn dropped(self) -> Matrix {
+        Matrix {
+            cols: self.cols,
+            lines: self.lines.into_iter().map(Line::dropped).collect(),
+        }
+    }
+
+    /// The same, with whatever the column bound bound to the temp it stood at.
+    fn consumed(self, temp: Temp) -> Matrix {
+        Matrix {
+            cols: self.cols,
+            lines: self
+                .lines
+                .into_iter()
+                .map(|line| line.consumed(temp))
+                .collect(),
+        }
+    }
+
+    /// Columns put in front of the ones still to test, which is what reading a
+    /// value out of another one comes to. The rows already carry the cells they
+    /// line up with — a widening put them there, or the column being decided
+    /// left its own behind.
+    fn under(mut self, mut cols: Vec<Col>) -> Matrix {
+        cols.append(&mut self.cols);
+        Matrix {
+            cols,
+            lines: self.lines,
+        }
+    }
+
+    /// The rows that survive the field being there, with the presence cell
+    /// replaced by what the arm asks of the field's value.
+    fn present(&self) -> Matrix {
+        Matrix {
+            cols: self.cols.clone(),
+            lines: self
+                .lines
+                .iter()
+                .filter_map(|line| {
+                    let mut line = line.clone();
+                    line.cells[0] = match &line.cells[0] {
+                        Cell::Present(sub) => (**sub).clone(),
+                        Cell::Absent => return None,
+                        // The widening puts nothing else here.
+                        _ => Cell::Wild(None),
+                    };
+                    Some(line)
+                })
+                .collect(),
+        }
+    }
+
+    /// The rows that survive the field being missing, with the column dropped:
+    /// a field that is not there contributes nothing further to the value.
+    fn absent(&self) -> Matrix {
+        self.kept(|line| matches!(&line.cells[0], Cell::Absent | Cell::Wild(_)))
+            .dropped()
     }
 }
 
@@ -839,8 +1003,19 @@ impl Lower<'_> {
     /// Whether a value whose evidence was built for `have` can be called where
     /// `want` was declared: the same evidence, in the same order, at every level
     /// a call walks down.
+    ///
+    /// A side neither type pins down to a function is a side with no shape to
+    /// compare — a quantified variable, a rigid, or a type nothing decided —
+    /// and there is nothing to build an adapter out of either. Both sides are
+    /// asked, not just the declaration: a value reaches a call through a
+    /// position its own type left open as often as a declaration does, and the
+    /// walk down the levels reaches such a position even where the two types
+    /// started out as arrows. Where a side is open, lowering passes the value
+    /// through as it stands, which is the same assumption the whole pass makes
+    /// of every polymorphic position: what a scheme quantified is carried, not
+    /// repacked.
     fn fits(&self, want: &Rc<Ty>, have: &Rc<Ty>) -> bool {
-        if self.rep(want) != Rep::Fn {
+        if self.rep(want) != Rep::Fn || self.rep(have) != Rep::Fn {
             return true;
         }
         let (_, want_to, want_row) = self.arrow(want);
@@ -1149,15 +1324,31 @@ impl Lower<'_> {
             args.push(record);
         }
         if have_shape.tail {
-            // A declaration naming no effect of its own passes the whole
-            // variable part as the one bundle it was given, and what the value
-            // calls its tail is that same bundle. Otherwise the variable part
-            // the value stands for is what the declaration named, keyed by
-            // effect name.
-            let alone = records.is_empty();
-            let bundle = match carried.filter(|_| alone) {
-                Some(bundle) => bundle,
-                None => self.emit(
+            // What the value calls its tail stands for everything the
+            // declaration handed over that the value does not name outright —
+            // which is the records the declaration passed positionally, keyed
+            // by effect name, and whatever its own bundle stood for. So all
+            // three cases are the same one: lay the records over the bundle.
+            // Either piece alone goes across as it is, and a bundle carrying a
+            // name the value also takes positionally is a key nothing reads
+            // rather than a mistake.
+            let bundle = match (carried, records.is_empty()) {
+                (Some(bundle), true) => bundle,
+                (Some(bundle), false) => {
+                    let named = self.emit(
+                        &mut lifted,
+                        Span::default(),
+                        Rep::Struct,
+                        Op::Struct(records),
+                    );
+                    self.emit(
+                        &mut lifted,
+                        Span::default(),
+                        Rep::Struct,
+                        Op::Merge(vec![bundle, named]),
+                    )
+                }
+                (None, _) => self.emit(
                     &mut lifted,
                     Span::default(),
                     Rep::Struct,
@@ -1229,7 +1420,15 @@ impl Lower<'_> {
 
     /// The bundle standing in for a row's variable part: the caller's own, when
     /// caller and callee share the very same variable part, and otherwise a
-    /// fresh record of everything the scope can handle.
+    /// fresh record of everything the scope can hand over.
+    ///
+    /// What the scope can hand over is two things, not one. The effects it names
+    /// outright are a record built here. The effects it holds only inside a
+    /// bundle of its own — because its own row has a variable part, and what
+    /// that part stands for is known by name to nobody — cannot be named at all,
+    /// so every such bundle is laid underneath. A bundle that shares no identity
+    /// with the callee's variable part still carries evidence the callee may
+    /// reach for, and a key the callee never reads costs nothing.
     ///
     /// A record built here is evidence plumbing rather than anything the reader
     /// wrote, so it carries no span and the debugger marks it generated.
@@ -1251,7 +1450,19 @@ impl Lower<'_> {
         }
         // Outermost first, so the record reads in the order the handlers were
         // written; the innermost frame that has a name still wins, since that is
-        // what `evidence_of` answers with.
+        // what `evidence_of` answers with. The bundles go in the same order and
+        // for the same reason, and under the record: a name the scope has
+        // outright is the one to hand over where a bundle holds it too.
+        let held: Vec<(usize, Temp)> = self
+            .frames
+            .iter()
+            .enumerate()
+            .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
+            .collect();
+        let mut layers: Vec<Temp> = held
+            .into_iter()
+            .map(|(at, temp)| self.thread(at, temp))
+            .collect();
         let mut names: Vec<String> = Vec::new();
         for frame in &self.frames {
             for name in frame.evidence.keys() {
@@ -1260,14 +1471,23 @@ impl Lower<'_> {
                 }
             }
         }
-        let entries: IndexMap<String, Temp> = names
-            .into_iter()
-            .map(|name| {
-                let temp = self.evidence_of(&name);
-                (name, temp)
-            })
-            .collect();
-        self.emit(body, Span::default(), Rep::Struct, Op::Struct(entries))
+        // The record is worth building for its own sake, or to lay over the
+        // bundles — but not to lay nothing over them.
+        if layers.is_empty() || !names.is_empty() {
+            let entries: IndexMap<String, Temp> = names
+                .into_iter()
+                .map(|name| {
+                    let temp = self.evidence_of(&name);
+                    (name, temp)
+                })
+                .collect();
+            let record = self.emit(body, Span::default(), Rep::Struct, Op::Struct(entries));
+            layers.push(record);
+        }
+        match layers.as_slice() {
+            [only] => *only,
+            _ => self.emit(body, Span::default(), Rep::Struct, Op::Merge(layers)),
+        }
     }
 
     /// The handler identity a `raise` here unwinds to, captured in if the arm it
@@ -1576,18 +1796,32 @@ impl Lower<'_> {
         {
             return self.call_known(&known, &head.ty, &applies, body);
         }
-        let mut callee = self.term(head, body);
-        let mut carrying = head.ty.clone();
-        for (node, written) in &applies {
-            let arg = self.term(written, body);
-            callee = self.indirect(&carrying, callee, written, arg, node, body);
-            carrying = node.ty.clone();
-        }
-        callee
+        let callee = self.term(head, body);
+        self.spun(callee, &head.ty, &applies, body)
     }
 
-    /// One indirect call: the evidence the callee's own arrow asks for, then the
-    /// one visible argument, fitted to what that arrow declares of it.
+    /// Whatever is left of a spine once the head has taken all it can: one
+    /// indirect call per argument, with what each application comes to becoming
+    /// the type the next is made at.
+    ///
+    /// All three shapes end here. An ordinary application takes the whole
+    /// spine, performing an operation takes everything past the payload, and a
+    /// known chain takes everything past its arity — over-applying a definition
+    /// is calling what its last level gave back, which is a value like any
+    /// other.
+    fn spun(&mut self, head: Temp, ty: &Rc<Ty>, applies: &[Apply], body: &mut Body) -> Temp {
+        let mut value = head;
+        let mut carrying = ty.clone();
+        for apply in applies {
+            value = self.indirect(&carrying, value, *apply, body);
+            carrying = apply.node.ty.clone();
+        }
+        value
+    }
+
+    /// One indirect call: the argument, the evidence the callee's own arrow asks
+    /// for, and then the call — the argument fitted to what that arrow declares
+    /// of it.
     ///
     /// The arrow asked is the one the callee value *holds*, not the one this
     /// use instantiates it at: a value reaching the call through a binding, a
@@ -1595,16 +1829,16 @@ impl Lower<'_> {
     /// takes exactly the parameters that row came to. The row at this use still
     /// says what goes in the tail bundle, and the result is fitted back to what
     /// this node stands for, so the temp handed on holds its own term's shape.
-    #[allow(clippy::too_many_arguments)]
     fn indirect(
         &mut self,
         callee_ty: &Rc<Ty>,
         callee: Temp,
-        written: &Term,
-        arg: Temp,
-        node: &Term,
+        apply: Apply,
         body: &mut Body,
     ) -> Temp {
+        // The argument is lowered first, ahead of any evidence: the reader
+        // wrote it, and everything else here is this pass's own plumbing.
+        let arg = self.term(apply.arg, body);
         let shape = match &self.held[callee as usize] {
             Some(ty) => ty.clone(),
             // No producer recorded a shape, so production and use are the same
@@ -1614,11 +1848,11 @@ impl Lower<'_> {
         let (from, to, declared) = self.arrow(&shape);
         let (_, _, used) = self.arrow(callee_ty);
         let mut args = self.evidence_args(&declared, &used, body);
-        args.push(self.fitted(&from, &written.ty, arg, body));
-        let rep = self.rep(&node.ty);
+        args.push(self.fitted(&from, &apply.arg.ty, arg, body));
+        let rep = self.rep(&apply.node.ty);
         let value = self.emit(
             body,
-            node.span,
+            apply.node.span,
             rep,
             Op::Call {
                 callee: Callee::Indirect(callee),
@@ -1630,7 +1864,7 @@ impl Lower<'_> {
         // for; where it does not — an `any` nothing decided — the value is
         // taken as this use reads it, which is all there is to go on.
         match self.rep(&to) == Rep::Fn {
-            true => self.fitted(&node.ty, &to, value, body),
+            true => self.fitted(&apply.node.ty, &to, value, body),
             false => value,
         }
     }
@@ -1642,7 +1876,7 @@ impl Lower<'_> {
         head: &Term,
         effect: crate::tracking::Tracked<Symbol>,
         op: &str,
-        applies: &[(&Term, &Term)],
+        applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
         let name = self.mint.name(effect.tracked).to_string();
@@ -1656,27 +1890,21 @@ impl Lower<'_> {
                 field: op.to_string(),
             },
         );
-        let (first, written) = applies[0];
-        let arg = self.term(written, body);
-        let rep = self.rep(&first.ty);
+        let first = applies[0];
+        let arg = self.term(first.arg, body);
+        let rep = self.rep(&first.node.ty);
         // The implementation the record holds is an ordinary closure of the
         // operation's declared arrow, so no evidence goes with the call.
-        let mut value = self.emit(
+        let value = self.emit(
             body,
-            first.span,
+            first.node.span,
             rep,
             Op::Call {
                 callee: Callee::Indirect(held),
                 args: vec![arg],
             },
         );
-        let mut carrying = first.ty.clone();
-        for (node, written) in &applies[1..] {
-            let arg = self.term(written, body);
-            value = self.indirect(&carrying, value, written, arg, node, body);
-            carrying = node.ty.clone();
-        }
-        value
+        self.spun(value, &first.node.ty, &applies[1..], body)
     }
 
     /// Applying a definition whose arity is known.
@@ -1688,30 +1916,30 @@ impl Lower<'_> {
         &mut self,
         known: &Known,
         used: &Rc<Ty>,
-        applies: &[(&Term, &Term)],
+        applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
         let arity = known.levels.len();
         let taken = applies.len().min(arity);
         let mut args: Vec<Temp> = Vec::new();
-        for (_, written) in &applies[..taken] {
-            args.push(self.term(written, body));
+        for apply in &applies[..taken] {
+            args.push(self.term(apply.arg, body));
         }
         // The visible arguments are evaluated where they were written; the
         // evidence around them is this pass's own, and goes in afterwards.
-        let span = applies[0].0.span;
+        let span = applies[0].node.span;
         let mut full: Vec<Temp> = Vec::new();
         let mut here = used.clone();
-        for ((level, (_, written)), arg) in known.levels.iter().zip(applies).zip(&args) {
+        for ((level, apply), arg) in known.levels.iter().zip(applies).zip(&args) {
             let (_, rest, row) = self.arrow(&here);
             full.extend(self.evidence_args(&level.row, &row, body));
-            full.push(self.fitted(&level.from, &written.ty, *arg, body));
+            full.push(self.fitted(&level.from, &apply.arg.ty, *arg, body));
             here = rest;
         }
 
-        let mut value = match taken == arity {
+        let value = match taken == arity {
             true => {
-                let node = applies[arity - 1].0;
+                let node = applies[arity - 1].node;
                 let rep = self.rep(&node.ty);
                 let temp = self.emit(
                     body,
@@ -1736,7 +1964,7 @@ impl Lower<'_> {
             // arrow per argument given, so the closure is fitted to what this
             // use asked for before it goes anywhere.
             false => {
-                let node = applies[taken - 1].0;
+                let node = applies[taken - 1].node;
                 let rep = self.rep(&node.ty);
                 let temp = self.emit(
                     body,
@@ -1751,13 +1979,7 @@ impl Lower<'_> {
                 self.fitted(&node.ty, &have, temp, body)
             }
         };
-        let mut carrying = applies[taken - 1].0.ty.clone();
-        for (node, written) in &applies[taken..] {
-            let arg = self.term(written, body);
-            value = self.indirect(&carrying, value, written, arg, node, body);
-            carrying = node.ty.clone();
-        }
-        value
+        self.spun(value, &applies[taken - 1].node.ty, &applies[taken..], body)
     }
 
     /// `handle body with arms end`, inline in the function around it: a fresh
@@ -1900,43 +2122,39 @@ impl Lower<'_> {
             ty: term.ty.clone(),
             span: term.span,
         };
-        let cols = vec![Col::Value {
-            temp,
-            ty: scrutinee.ty.clone(),
-        }];
-        let lines = arms
-            .iter()
-            .enumerate()
-            .map(|(at, (pattern, _))| Line {
-                cells: vec![cell(pattern)],
-                arm: at,
-                binds: Vec::new(),
-            })
-            .collect();
-        self.tree(&cols, lines, &tree, body)
+        let matrix = Matrix {
+            cols: vec![Col::Value(Value {
+                temp,
+                ty: scrutinee.ty.clone(),
+            })],
+            lines: arms
+                .iter()
+                .enumerate()
+                .map(|(at, (pattern, _))| Line {
+                    cells: vec![cell(pattern)],
+                    arm: at,
+                    binds: Vec::new(),
+                })
+                .collect(),
+        };
+        self.tree(matrix, &tree, body)
     }
 
     /// The decision tree itself: test the first column that anything tests, and
     /// recur on what each answer leaves.
-    fn tree(&mut self, cols: &[Col], lines: Vec<Line>, tree: &Tree, body: &mut Body) -> Temp {
-        let Some((col, later)) = cols.split_first() else {
-            let line = lines
+    fn tree(&mut self, mut matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        let Some(col) = matrix.split() else {
+            let line = matrix
+                .lines
                 .into_iter()
                 .next()
                 .expect("the pattern checks proved the match exhaustive");
             return self.leaf(line, tree, body);
         };
         match col {
-            Col::Value { temp, ty } => self.column(*temp, ty, later, lines, tree, body),
-            Col::Field {
-                base,
-                name,
-                presence,
-                ty,
-            } => self.presence(*base, name, presence, ty, later, lines, tree, body),
-            Col::Rest { base, names, open } => {
-                self.remainder(*base, names, *open, later, lines, tree, body)
-            }
+            Col::Value(col) => self.column(&col, matrix, tree, body),
+            Col::Field(col) => self.presence(&col, matrix, tree, body),
+            Col::Beyond(col) => self.remainder(&col, matrix, tree, body),
         }
     }
 
@@ -1962,86 +2180,54 @@ impl Lower<'_> {
     /// first — one presence column per field the type names, the core, and then
     /// whatever fields lie beyond — so everything below only ever sees a flat
     /// cell.
-    #[allow(clippy::too_many_arguments)]
-    fn column(
-        &mut self,
-        temp: Temp,
-        ty: &Rc<Ty>,
-        later: &[Col],
-        lines: Vec<Line>,
-        tree: &Tree,
-        body: &mut Body,
-    ) -> Temp {
-        let ty = unfold(&self.inference.aliases, ty);
-        if lines
+    fn column(&mut self, col: &Value, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        let ty = unfold(&self.inference.aliases, &col.ty);
+        if matrix
+            .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Struct { .. }))
         {
-            return self.widen(temp, &ty, later, lines, tree, body);
+            return self.widen(col.temp, &ty, matrix, tree, body);
         }
-        let numbers = lines
+        let numbers = matrix
+            .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Nat(_)));
-        let tags = lines
+        let tags = matrix
+            .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
         match &ty.core {
-            Core::Nat if numbers => self.switch_nat(temp, later, lines, tree, body),
+            Core::Nat if numbers => self.switch_nat(col.temp, matrix, tree, body),
             Core::Sum(row) if tags => {
                 let row = flat(row);
-                self.switch_tag(temp, &row, later, lines, tree, body)
+                self.switch_tag(col.temp, &row, matrix, tree, body)
             }
             // Nothing here to test: a unit, an arrow, a variable, or a position
             // every arm accepts whole. The column is consumed and whatever binds
             // at it binds the value itself.
-            _ => {
-                let lines = lines
-                    .into_iter()
-                    .map(|line| Self::consumed(line, temp))
-                    .collect();
-                self.tree(later, lines, tree, body)
-            }
+            _ => self.tree(matrix.consumed(col.temp), tree, body),
         }
-    }
-
-    /// One row with its first cell dropped, and whatever that cell bound bound
-    /// to the temp the column stood at.
-    fn consumed(mut line: Line, temp: Temp) -> Line {
-        if let Cell::Wild(Some(symbol)) = &line.cells[0] {
-            line.binds.push((*symbol, temp));
-        }
-        line.cells.remove(0);
-        line
     }
 
     /// A natural position: one case per number written, and the rest.
-    fn switch_nat(
-        &mut self,
-        temp: Temp,
-        later: &[Col],
-        lines: Vec<Line>,
-        tree: &Tree,
-        body: &mut Body,
-    ) -> Temp {
+    fn switch_nat(&mut self, temp: Temp, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
         let mut listed: Vec<u128> = Vec::new();
-        for line in &lines {
+        for line in &matrix.lines {
             if let Cell::Nat(value) = &line.cells[0]
                 && !listed.contains(value)
             {
                 listed.push(*value);
             }
         }
-        let narrow = |value: Option<u128>| -> Vec<Line> {
-            lines
-                .iter()
-                .filter(|line| match (&line.cells[0], value) {
+        let narrow = |value: Option<u128>| -> Matrix {
+            matrix
+                .kept(|line| match (&line.cells[0], value) {
                     (Cell::Nat(written), Some(value)) => *written == value,
                     (Cell::Wild(_), _) => true,
                     _ => false,
                 })
-                .cloned()
-                .map(|line| Self::consumed(line, temp))
-                .collect()
+                .consumed(temp)
         };
         let cases: Vec<NatCase> = listed
             .iter()
@@ -2049,12 +2235,12 @@ impl Lower<'_> {
                 let kept = narrow(Some(*value));
                 NatCase {
                     value: *value,
-                    block: self.child(tree.span, |low, inner| low.tree(later, kept, tree, inner)),
+                    block: self.child(tree.span, |low, inner| low.tree(kept, tree, inner)),
                 }
             })
             .collect();
         let kept = narrow(None);
-        let fallback = self.child(tree.span, |low, inner| low.tree(later, kept, tree, inner));
+        let fallback = self.child(tree.span, |low, inner| low.tree(kept, tree, inner));
         self.emit(
             body,
             tree.span,
@@ -2070,18 +2256,16 @@ impl Lower<'_> {
     /// A sum position: one case per tag written, each reading the payload out
     /// once where anything below it tests one, and a fallback only where some
     /// arm accepts a case the listed ones do not.
-    #[allow(clippy::too_many_arguments)]
     fn switch_tag(
         &mut self,
         temp: Temp,
         row: &Row,
-        later: &[Col],
-        lines: Vec<Line>,
+        matrix: Matrix,
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
         let mut listed: Vec<String> = Vec::new();
-        for line in &lines {
+        for line in &matrix.lines {
             if let Cell::Tag { name, .. } = &line.cells[0]
                 && !listed.contains(name)
             {
@@ -2096,25 +2280,31 @@ impl Lower<'_> {
                     .get(name)
                     .map(|case| case.ty.clone())
                     .unwrap_or_default();
-                let kept: Vec<Line> = lines
-                    .iter()
-                    .filter_map(|line| {
-                        let mut line = line.clone();
-                        let payload = match &line.cells[0] {
-                            Cell::Tag { name: tag, payload } if tag == name => (**payload).clone(),
-                            Cell::Wild(bound) => {
-                                if let Some(symbol) = bound {
-                                    line.binds.push((*symbol, temp));
+                let kept = Matrix {
+                    cols: matrix.cols.clone(),
+                    lines: matrix
+                        .lines
+                        .iter()
+                        .filter_map(|line| {
+                            let mut line = line.clone();
+                            let payload = match &line.cells[0] {
+                                Cell::Tag { name: tag, payload } if tag == name => {
+                                    (**payload).clone()
                                 }
-                                Cell::Wild(None)
-                            }
-                            _ => return None,
-                        };
-                        line.cells[0] = payload;
-                        Some(line)
-                    })
-                    .collect();
-                let reads = kept.iter().any(|line| tests(&line.cells[0]));
+                                Cell::Wild(bound) => {
+                                    if let Some(symbol) = bound {
+                                        line.binds.push((*symbol, temp));
+                                    }
+                                    Cell::Wild(None)
+                                }
+                                _ => return None,
+                            };
+                            line.cells[0] = payload;
+                            Some(line)
+                        })
+                        .collect(),
+                };
+                let reads = !kept.untested();
                 let block = self.child(tree.span, |low, inner| match reads {
                     true => {
                         // What shape the payload holds is the scrutinee's
@@ -2129,23 +2319,13 @@ impl Lower<'_> {
                         let read = low.emit(inner, tree.span, rep, Op::Payload(temp));
                         low.contain(read, &have);
                         let held = low.fitted(&payload_ty, &have, read, inner);
-                        let mut cols = vec![Col::Value {
+                        let cols = vec![Col::Value(Value {
                             temp: held,
                             ty: payload_ty.clone(),
-                        }];
-                        cols.extend(later.iter().cloned());
-                        low.tree(&cols, kept, tree, inner)
+                        })];
+                        low.tree(kept.under(cols), tree, inner)
                     }
-                    false => {
-                        let kept = kept
-                            .into_iter()
-                            .map(|mut line| {
-                                line.cells.remove(0);
-                                line
-                            })
-                            .collect();
-                        low.tree(later, kept, tree, inner)
-                    }
+                    false => low.tree(kept.dropped(), tree, inner),
                 });
                 TagCase {
                     name: name.clone(),
@@ -2159,18 +2339,13 @@ impl Lower<'_> {
                 .labels
                 .iter()
                 .any(|(name, case)| possible(&case.presence) && !listed.contains(name));
-        let wilds: Vec<Line> = lines
-            .iter()
-            .filter(|line| matches!(line.cells[0], Cell::Wild(_)))
-            .cloned()
-            .map(|line| Self::consumed(line, temp))
-            .collect();
-        let fallback = match uncovered && !wilds.is_empty() {
-            true => {
-                Some(Box::new(self.child(tree.span, |low, inner| {
-                    low.tree(later, wilds, tree, inner)
-                })))
-            }
+        let wilds = matrix
+            .kept(|line| matches!(line.cells[0], Cell::Wild(_)))
+            .consumed(temp);
+        let fallback = match uncovered && !wilds.lines.is_empty() {
+            true => Some(Box::new(
+                self.child(tree.span, |low, inner| low.tree(wilds, tree, inner)),
+            )),
             false => None,
         };
         self.emit(
@@ -2191,8 +2366,7 @@ impl Lower<'_> {
         &mut self,
         temp: Temp,
         ty: &Rc<Ty>,
-        later: &[Col],
-        lines: Vec<Line>,
+        matrix: Matrix,
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
@@ -2204,7 +2378,7 @@ impl Lower<'_> {
         // A field an arm names that the type does not is provably absent — the
         // pattern checks let it through over the fieldless unit alone — and
         // still needs a column, with the one-value universe absence is.
-        for line in &lines {
+        for line in &matrix.lines {
             if let Cell::Struct { fields, .. } = &line.cells[0] {
                 for (name, _) in fields {
                     if !named.iter().any(|(known, _, _)| known == name) {
@@ -2243,87 +2417,64 @@ impl Lower<'_> {
         };
         let mut cols: Vec<Col> = named
             .iter()
-            .map(|(name, presence, ty)| Col::Field {
-                base: temp,
-                name: name.clone(),
-                presence: presence.clone(),
-                ty: ty.clone(),
+            .map(|(name, presence, ty)| {
+                Col::Field(Field {
+                    base: temp,
+                    name: name.clone(),
+                    presence: presence.clone(),
+                    ty: ty.clone(),
+                })
             })
             .collect();
-        cols.push(Col::Value {
+        cols.push(Col::Value(Value {
             temp,
             ty: Rc::new(Ty::plain(ty.core.clone())),
-        });
-        cols.push(Col::Rest {
+        }));
+        cols.push(Col::Beyond(Beyond {
             base: temp,
             names: named.iter().map(|(name, _, _)| name.clone()).collect(),
             open: !matches!(ty.core, Core::Unit),
-        });
-        cols.extend(later.iter().cloned());
-        let lines = lines
-            .into_iter()
-            .map(|line| {
-                let mut cells = widen(&line.cells[0]);
-                cells.extend(line.cells[1..].iter().cloned());
-                Line { cells, ..line }
-            })
-            .collect();
-        self.tree(&cols, lines, tree, body)
+        }));
+        let widened = Matrix {
+            cols: matrix.cols,
+            lines: matrix
+                .lines
+                .into_iter()
+                .map(|line| {
+                    let mut cells = widen(&line.cells[0]);
+                    cells.extend(line.cells[1..].iter().cloned());
+                    Line { cells, ..line }
+                })
+                .collect(),
+        };
+        self.tree(widened.under(cols), tree, body)
     }
 
     /// One field's presence. A field the type proves present is read straight
     /// out; one it proves absent tests nothing and starves the arms demanding
     /// it; one still open is the `switch_presence` the optional fields exist
     /// for.
-    #[allow(clippy::too_many_arguments)]
-    fn presence(
-        &mut self,
-        base: Temp,
-        name: &str,
-        presence: &Presence,
-        ty: &Rc<Ty>,
-        later: &[Col],
-        lines: Vec<Line>,
-        tree: &Tree,
-        body: &mut Body,
-    ) -> Temp {
+    fn presence(&mut self, col: &Field, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
         // Nothing anywhere in the column asks about this field, so neither the
         // presence nor the value is worth reading.
-        if lines.iter().all(|line| !tests(&line.cells[0])) {
-            let lines = lines
-                .into_iter()
-                .map(|mut line| {
-                    line.cells.remove(0);
-                    line
-                })
-                .collect();
-            return self.tree(later, lines, tree, body);
+        if matrix.untested() {
+            return self.tree(matrix.dropped(), tree, body);
         }
-        match presence {
-            Presence::Present => {
-                let kept = Self::present(&lines);
-                self.field(base, name, ty, later, kept, tree, body)
-            }
-            Presence::Absent => {
-                let lines = Self::absent(&lines);
-                self.tree(later, lines, tree, body)
-            }
+        match col.presence {
+            Presence::Present => self.field(col, matrix.present(), tree, body),
+            Presence::Absent => self.tree(matrix.absent(), tree, body),
             _ => {
-                let kept = Self::present(&lines);
-                let present = self.child(tree.span, |low, inner| {
-                    low.field(base, name, ty, later, kept, tree, inner)
-                });
-                let missing = Self::absent(&lines);
-                let absent = self.child(tree.span, |low, inner| {
-                    low.tree(later, missing, tree, inner)
-                });
+                let kept = matrix.present();
+                let present = self.child(tree.span, |low, inner| low.field(col, kept, tree, inner));
+                let missing = matrix.absent();
+                let absent = self.child(tree.span, |low, inner| low.tree(missing, tree, inner));
                 self.emit(
                     body,
                     tree.span,
                     tree.rep,
                     Op::SwitchPresence {
-                        on: base,
-                        field: name.to_string(),
+                        on: col.base,
+                        field: col.name.clone(),
                         present: Box::new(present),
                         absent: Box::new(absent),
                     },
@@ -2332,124 +2483,52 @@ impl Lower<'_> {
         }
     }
 
-    /// The rows that survive the field being there, with the presence cell
-    /// replaced by what the arm asks of the field's value.
-    fn present(lines: &[Line]) -> Vec<Line> {
-        lines
-            .iter()
-            .filter_map(|line| {
-                let mut line = line.clone();
-                line.cells[0] = match &line.cells[0] {
-                    Cell::Present(sub) => (**sub).clone(),
-                    Cell::Absent => return None,
-                    // The widening puts nothing else here.
-                    _ => Cell::Wild(None),
-                };
-                Some(line)
-            })
-            .collect()
-    }
-
-    /// The rows that survive the field being missing, with the column dropped:
-    /// a field that is not there contributes nothing further to the value.
-    fn absent(lines: &[Line]) -> Vec<Line> {
-        lines
-            .iter()
-            .filter(|line| matches!(&line.cells[0], Cell::Absent | Cell::Wild(_)))
-            .cloned()
-            .map(|mut line| {
-                line.cells.remove(0);
-                line
-            })
-            .collect()
-    }
-
     /// Read one field out and go on into what the arms ask of it.
-    #[allow(clippy::too_many_arguments)]
-    fn field(
-        &mut self,
-        base: Temp,
-        name: &str,
-        ty: &Rc<Ty>,
-        later: &[Col],
-        lines: Vec<Line>,
-        tree: &Tree,
-        body: &mut Body,
-    ) -> Temp {
-        if lines.iter().all(|line| !tests(&line.cells[0])) {
-            let lines = lines
-                .into_iter()
-                .map(|mut line| {
-                    line.cells.remove(0);
-                    line
-                })
-                .collect();
-            return self.tree(later, lines, tree, body);
+    fn field(&mut self, col: &Field, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        if matrix.untested() {
+            return self.tree(matrix.dropped(), tree, body);
         }
-        let rep = self.rep(ty);
+        let rep = self.rep(&col.ty);
         let temp = self.emit(
             body,
             tree.span,
             rep,
             Op::Project {
-                base,
-                field: name.to_string(),
+                base: col.base,
+                field: col.name.clone(),
             },
         );
-        let mut cols = vec![Col::Value {
+        let read = vec![Col::Value(Value {
             temp,
-            ty: ty.clone(),
-        }];
-        cols.extend(later.iter().cloned());
-        self.tree(&cols, lines, tree, body)
+            ty: col.ty.clone(),
+        })];
+        self.tree(matrix.under(read), tree, body)
     }
 
     /// Whatever fields a value carries beyond the ones its type names. Only a
     /// pattern written exact asks about them, and only an open type can have
     /// any, so the test exists exactly where both are true.
-    #[allow(clippy::too_many_arguments)]
-    fn remainder(
-        &mut self,
-        base: Temp,
-        names: &[String],
-        open: bool,
-        later: &[Col],
-        lines: Vec<Line>,
-        tree: &Tree,
-        body: &mut Body,
-    ) -> Temp {
-        let exacting = lines
+    fn remainder(&mut self, col: &Beyond, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        let exacting = matrix
+            .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Absent));
-        let dropped = |lines: Vec<Line>| -> Vec<Line> {
-            lines
-                .into_iter()
-                .map(|mut line| {
-                    line.cells.remove(0);
-                    line
-                })
-                .collect()
-        };
-        if !exacting || !open {
-            let lines = dropped(lines);
-            return self.tree(later, lines, tree, body);
+        if !exacting || !col.open {
+            return self.tree(matrix.dropped(), tree, body);
         }
-        let none = dropped(lines.clone());
-        let some = dropped(
-            lines
-                .into_iter()
-                .filter(|line| matches!(line.cells[0], Cell::Wild(_)))
-                .collect(),
-        );
-        let none = self.child(tree.span, |low, inner| low.tree(later, none, tree, inner));
-        let some = self.child(tree.span, |low, inner| low.tree(later, some, tree, inner));
+        let some = matrix
+            .kept(|line| matches!(line.cells[0], Cell::Wild(_)))
+            .dropped();
+        let none = matrix.dropped();
+        let none = self.child(tree.span, |low, inner| low.tree(none, tree, inner));
+        let some = self.child(tree.span, |low, inner| low.tree(some, tree, inner));
         self.emit(
             body,
             tree.span,
             tree.rep,
             Op::SwitchRest {
-                on: base,
-                fields: names.to_vec(),
+                on: col.base,
+                fields: col.names.clone(),
                 none: Box::new(none),
                 some: Box::new(some),
             },
