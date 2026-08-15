@@ -768,32 +768,15 @@ impl Lower<'_> {
         (from.clone(), to.clone(), flat(row))
     }
 
-    /// The type a value's evidence was built against, which is not always the
-    /// type the use site gives it.
-    ///
-    /// A definition whose value is a nest of `fn`s hands over wrappers built
-    /// once, from the rows that definition was written with — so however the use
-    /// instantiates them, what arrives is still the shape the wrappers take.
-    /// That covers naming the definition and applying it short of its arity
-    /// alike: both come to a wrapper closure, the second with the arguments so
-    /// far captured, so the type it stands for is the definition's own walked
-    /// down one arrow per argument given. A full application is a value like any
-    /// other, and everything else was built where it was written, so there its
-    /// own solved type is the whole story.
-    fn built(&self, term: &Term) -> Rc<Ty> {
-        let (head, applies) = spine(term);
-        if let TermKind::Ident(symbol) = &head.kind
-            && let Some(known) = self.known.get(symbol)
-            && applies.len() < known.levels.len()
-        {
-            let mut ty = known.ty.clone();
-            for _ in 0..applies.len() {
-                let (_, to, _) = self.arrow(&ty);
-                ty = to;
-            }
-            return ty;
+    /// The type reached by walking `steps` arrows down from `ty`, which is what
+    /// a value applied that many times short of its arity stands for.
+    fn walked(&self, ty: &Rc<Ty>, steps: usize) -> Rc<Ty> {
+        let mut ty = ty.clone();
+        for _ in 0..steps {
+            let (_, to, _) = self.arrow(&ty);
+            ty = to;
         }
-        term.ty.clone()
+        ty
     }
 
     /// Whether a value whose evidence was built for `have` can be called where
@@ -1324,17 +1307,28 @@ impl Lower<'_> {
                 self.top().locals.insert(name.tracked, temp);
                 self.term(rest, body)
             }
+            // A definition is compiled once, against the row it was written
+            // with, so what a `global` read hands back is that shape however
+            // the use instantiated it. Fitting it here — where the value is
+            // produced rather than wherever it is eventually passed — is what
+            // makes every temp hold a value shaped by its own term's type, so
+            // that a value travelling through a binding or a return arrives
+            // callable.
             TermKind::Ident(symbol) => match self.local(*symbol) {
                 Some(temp) => temp,
-                None => self.emit(
-                    body,
-                    span,
-                    rep,
-                    Op::Global {
-                        symbol: *symbol,
-                        name: self.mint.name(*symbol).to_string(),
-                    },
-                ),
+                None => {
+                    let temp = self.emit(
+                        body,
+                        span,
+                        rep,
+                        Op::Global {
+                            symbol: *symbol,
+                            name: self.mint.name(*symbol).to_string(),
+                        },
+                    );
+                    let have = self.program.terms[symbol].value.ty.clone();
+                    self.fitted(&term.ty, &have, temp, body)
+                }
             },
             TermKind::Fn { arg, body: inner } => self.lambda(term, arg.tracked, inner, body),
             TermKind::Apply { .. } => self.apply(term, body),
@@ -1501,8 +1495,7 @@ impl Lower<'_> {
         // An indirect callee is called as whatever it is here, so the row it was
         // compiled with and the row at this use are the one row.
         let mut args = self.evidence_args(&row, &row, body);
-        let have = self.built(written);
-        args.push(self.fitted(&from, &have, arg, body));
+        args.push(self.fitted(&from, &written.ty, arg, body));
         let rep = self.rep(&node.ty);
         self.emit(
             body,
@@ -1585,8 +1578,7 @@ impl Lower<'_> {
         for ((level, (_, written)), arg) in known.levels.iter().zip(applies).zip(&args) {
             let (_, rest, row) = self.arrow(&here);
             full.extend(self.evidence_args(&level.row, &row, body));
-            let have = self.built(written);
-            full.push(self.fitted(&level.from, &have, *arg, body));
+            full.push(self.fitted(&level.from, &written.ty, *arg, body));
             here = rest;
         }
 
@@ -1605,10 +1597,14 @@ impl Lower<'_> {
                 )
             }
             // Short of a full application, the arguments so far become the
-            // captures of the wrapper that takes the next one.
+            // captures of the wrapper that takes the next one. What that
+            // wrapper takes is the definition's own shape walked down one
+            // arrow per argument given, so the closure is fitted to what this
+            // use asked for before it goes anywhere.
             false => {
-                let rep = self.rep(&applies[taken - 1].0.ty);
-                self.emit(
+                let node = applies[taken - 1].0;
+                let rep = self.rep(&node.ty);
+                let temp = self.emit(
                     body,
                     span,
                     rep,
@@ -1616,7 +1612,9 @@ impl Lower<'_> {
                         func: known.wrappers[taken],
                         captures: full,
                     },
-                )
+                );
+                let have = self.walked(&known.ty, taken);
+                self.fitted(&node.ty, &have, temp, body)
             }
         };
         let mut carrying = applies[taken - 1].0.ty.clone();

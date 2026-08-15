@@ -941,19 +941,20 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
     let source = "effect Log = `write : Nat -> ()\n\
          let hof2 : ((Nat -> Nat ! ..r) -> Nat ! ..r) -> Nat ! ..r where let r =\n\
            fn k => k (fn m => m)\n\
-         let both = fn g => let z = Log.`write 1 in g 2\n\
-         let fwd = fn w => handle hof2 both with | Log.`write s => {} end";
+         let both : (Nat -> Nat ! `Log | ..s) -> Nat ! `Log | ..s where let s =\n\
+           fn g => let z = Log.`write 1 in g 2\n\
+         let fwd : {} -> Nat ! `Log | ..t where let t = fn w => hof2 both";
     assert!(
         section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn):"),
         "{}",
         listing(source)
     );
     assert_eq!(
-        section(source, "fn fwd#3"),
-        "fn fwd#3(%31: fn, %32: struct, %33: fn):\n\
-         \x20 %34: struct = project %32, \"Log\"\n\
-         \x20 %35: any = call %31, %34, %32, %33\n\
-         \x20 ret %35"
+        section(source, "fn fwd#2"),
+        "fn fwd#2(%27: fn, %28: struct, %29: fn):\n\
+         \x20 %30: struct = project %28, \"Log\"\n\
+         \x20 %31: nat = call %27, %30, %28, %29\n\
+         \x20 ret %31"
     );
 }
 
@@ -1019,6 +1020,86 @@ fn a_full_application_stands_for_what_it_came_to() {
          \x20   %34: nat = call takes, %30, %33\n\
          \x20   yield %34\n\
          \x20 ret %35"
+    );
+}
+
+/// A definition is fitted where its value is *read*, not where it happens to be
+/// passed, so a binding between the read and the call changes nothing: the temp
+/// `h` names already holds the shape `h`'s own type promises, and handing it to
+/// `run` is handing over a function `run` can call.
+#[test]
+fn a_definition_read_through_a_binding_arrives_callable() {
+    let source = "effect A = `a : Nat -> ()\n\
+         effect B = `b : Nat -> ()\n\
+         let poly : Nat -> Nat ! ..e where let e = fn n => n\n\
+         let run : (Nat -> Nat ! `A | `B) -> Nat ! `A | `B = fn f => f 1\n\
+         let go = fn w => handle handle\n\
+           (let h : Nat -> Nat ! `A | `B = poly in run h)\n\
+           with | A.`a s => {} end with | B.`b s => {} end";
+    // `poly` was compiled with one tail bundle before its argument, and `run`
+    // calls what it is given with two records before it — so the adapter packs
+    // the two into the bundle, keyed by effect name.
+    assert!(
+        section(source, "fn poly(").starts_with("fn poly(%0: struct, %1: nat):"),
+        "{}",
+        listing(source)
+    );
+    assert_eq!(
+        section(source, "fn go#4"),
+        "fn go#4(%28: fn, %29: struct, %30: struct, %31: nat):\n\
+         \x20 %32: struct = struct { A: %29, B: %30 }\n\
+         \x20 %33: nat = call %28, %32, %31\n\
+         \x20 ret %33"
+    );
+    // The adapter is built where the global is read, and it is the adapter that
+    // travels through the binding into the call.
+    let go = section(source, "fn go(");
+    assert!(go.contains("%27: fn = global poly"), "{go}");
+    assert!(go.contains("%34: fn = closure go#4, [%27]"), "{go}");
+    assert!(go.contains("%35: nat = call run, %26, %21, %34"), "{go}");
+    // Which is what makes the indirect call inside `run` reach a function of as
+    // many parameters as it passes arguments.
+    assert_eq!(
+        section(source, "fn run("),
+        "fn run(%6: struct, %7: struct, %8: fn):\n\
+         \x20 %9: nat = const 1\n\
+         \x20 %10: nat = call %8, %6, %7, %9\n\
+         \x20 ret %10"
+    );
+}
+
+/// The same, with a function return in place of the binding: `get` hands back
+/// what `poly` stands for at `get`'s own declared type, so the fitting happens
+/// inside `get` and the caller has nothing left to do.
+#[test]
+fn a_definition_returned_from_a_function_arrives_callable() {
+    let source = "effect A = `a : Nat -> ()\n\
+         effect B = `b : Nat -> ()\n\
+         let poly : Nat -> Nat ! ..e where let e = fn n => n\n\
+         let get : {} -> (Nat -> Nat ! `A | `B) = fn u => poly\n\
+         let run : (Nat -> Nat ! `A | `B) -> Nat ! `A | `B = fn f => f 1\n\
+         let go = fn w => handle handle run (get {})\n\
+           with | A.`a s => {} end with | B.`b s => {} end";
+    assert_eq!(
+        section(source, "fn get("),
+        "fn get(%6: unit):\n\
+         \x20 %7: fn = global poly\n\
+         \x20 %14: fn = closure get#2, [%7]\n\
+         \x20 ret %14"
+    );
+    assert_eq!(
+        section(source, "fn get#2"),
+        "fn get#2(%8: fn, %9: struct, %10: struct, %11: nat):\n\
+         \x20 %12: struct = struct { A: %9, B: %10 }\n\
+         \x20 %13: nat = call %8, %12, %11\n\
+         \x20 ret %13"
+    );
+    assert_eq!(
+        section(source, "fn run("),
+        "fn run(%18: struct, %19: struct, %20: fn):\n\
+         \x20 %21: nat = const 1\n\
+         \x20 %22: nat = call %20, %18, %19, %21\n\
+         \x20 ret %22"
     );
 }
 
