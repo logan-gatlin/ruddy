@@ -581,7 +581,10 @@ fn a_printed_effect_row_re_lowers_to_itself() {
         ("Nat -> Nat ! `Log | `IO", "Nat -> Nat ! `Log | `IO"),
         // The scheme spells its quantifiers positionally, so a declared `e`
         // comes back as the letter its position earns.
-        ("Nat -> Nat ! ..e where let e", "Nat -> Nat ! ..a where let a"),
+        (
+            "Nat -> Nat ! ..e where let e",
+            "Nat -> Nat ! ..a where let a",
+        ),
         (
             "Nat -> Nat ! `Log | ..e where let e",
             "Nat -> Nat ! `Log | ..a where let a",

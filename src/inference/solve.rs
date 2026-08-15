@@ -10,7 +10,9 @@ use indexmap::IndexMap;
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
+    types::{
+        Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar,
+    },
 };
 
 use super::{

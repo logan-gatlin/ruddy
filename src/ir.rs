@@ -5320,8 +5320,7 @@ impl Builder<'_> {
             parse::TypeKind::Arrow { from, to, effects } => {
                 let from = self.ty(*from, place);
                 let to = self.ty(*to, place);
-                let Some(effects) = self.effect_row(span, effects.map(|row| *row), place)
-                else {
+                let Some(effects) = self.effect_row(span, effects.map(|row| *row), place) else {
                     return span.track(TypeKind::Error);
                 };
                 span.track(TypeKind::Arrow {

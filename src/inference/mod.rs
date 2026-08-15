@@ -75,8 +75,8 @@ use crate::{
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{
-        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape,
-        Ty, TyVar,
+        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
+        Shape, Ty, TyVar,
     },
 };
 use constrain::Constrain;
@@ -3108,11 +3108,9 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
     let fields = shift_labels(&ty.fields, by);
     let core = match &ty.core {
         Core::Bound(at) => Core::Bound(at + by),
-        Core::Arrow(from, to, effects) => Core::Arrow(
-            shift(from, by),
-            shift(to, by),
-            shift_row(effects, by),
-        ),
+        Core::Arrow(from, to, effects) => {
+            Core::Arrow(shift(from, by), shift(to, by), shift_row(effects, by))
+        }
         Core::Sum(cases) => Core::Sum(shift_row(cases, by)),
         Core::Named { symbol, name, args } => Core::Named {
             symbol: *symbol,

@@ -5783,6 +5783,40 @@ fn an_annotations_effect_tail_is_the_readers() {
     assert_eq!(error.kind.code(), "rigid-field");
 }
 
+/// A handler may run under a declared tail: what it discharges is its own,
+/// and what is left over lands in the rigid ambient without deciding it — the
+/// `Rest::More` chain a handler extends the ambient with flattens through a
+/// rigid exactly as it does through a variable.
+#[test]
+fn a_handler_runs_under_a_declared_tail() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+         let f : () -> Nat ! ..e where let e = fn _ =>\n\
+         \x20 handle greet () with | Log.`write s => () | return x => x end"
+    ));
+    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat ! ..a where let a");
+}
+
+/// A body that closes a declared effect tail outright — aliasing a pure
+/// definition under an annotation whose row is the caller's — breaks the
+/// promise with no label to point at, so the complaint is about the tails and
+/// quotes no arrow nobody wrote.
+#[test]
+fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let g = fn x => x\n\
+         let f : Nat -> Nat ! ..e where let e = g"
+    ));
+    let [error] = output.errors.as_slice() else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "rigid-broken");
+    assert_eq!(
+        error.kind.to_string(),
+        "this decides what it may perform, but `e` stands for whatever effects the caller allows"
+    );
+}
+
 /// Two definitions that name each other are solved together and
 /// monomorphically, so an annotated member's effect tail is unified with its
 /// partner's almost immediately — which read one variable at a time is
@@ -5794,8 +5828,14 @@ fn a_mutually_recursive_pair_may_each_leave_effects_open() {
         "{EFFECTS}let ping : Nat -> Nat ! ..e where let e = fn n => pong n\n\
          let pong : Nat -> Nat ! ..e where let e = fn n => ping n"
     ));
-    assert_eq!(scheme(&mint, &output, "ping"), "Nat -> Nat ! ..a where let a");
-    assert_eq!(scheme(&mint, &output, "pong"), "Nat -> Nat ! ..a where let a");
+    assert_eq!(
+        scheme(&mint, &output, "ping"),
+        "Nat -> Nat ! ..a where let a"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "pong"),
+        "Nat -> Nat ! ..a where let a"
+    );
 }
 
 /// A declared alias is a name for a set of effects, so a row naming one
@@ -5971,10 +6011,7 @@ fn a_refused_raise_still_walks_its_value() {
     // Nothing constrains what `raise` gives back, which is the typing it has
     // in ML — and the value under it is a `Nat` all the same.
     assert_eq!(scheme(&mint, &output, "a"), "a where let a");
-    assert_eq!(
-        body_types(&term_decl(&mint, &out, "a").value),
-        ["a", "Nat"]
-    );
+    assert_eq!(body_types(&term_decl(&mint, &out, "a").value), ["a", "Nat"]);
 }
 
 /// R10: an operation is an ordinary value of its declared signature, with the

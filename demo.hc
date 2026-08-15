@@ -165,6 +165,8 @@ let recover : () -> Nat = fn _ =>
 
 let runs = fn g => handle g () with | Log.`write s => () end
 
+let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g n => g n
+
 type Logger = Nat -> Nat ! `Log
 
 type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e
