@@ -935,7 +935,9 @@ fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
 /// bundle, and the value wants a record of its own *and* a bundle beside it.
 /// The adapter reads the record out of the bundle by the effect's name and
 /// forwards the bundle as it stands — it is already the whole of the variable
-/// part.
+/// part. The function-typed argument crosses the same boundary the other way
+/// round — it arrives shaped for the bundle alone, and `both` calls it with a
+/// record and a bundle — so a second adapter stands between the two of them.
 #[test]
 fn an_adapter_forwards_the_bundle_it_was_handed() {
     let source = "effect Log = `write : Nat -> ()\n\
@@ -950,11 +952,19 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
         listing(source)
     );
     assert_eq!(
-        section(source, "fn fwd#2"),
-        "fn fwd#2(%27: fn, %28: struct, %29: fn):\n\
+        section(source, "fn fwd#3"),
+        "fn fwd#3(%27: fn, %28: struct, %29: fn):\n\
          \x20 %30: struct = project %28, \"Log\"\n\
-         \x20 %31: nat = call %27, %30, %28, %29\n\
-         \x20 ret %31"
+         \x20 %37: fn = closure fwd#2, [%29]\n\
+         \x20 %38: nat = call %27, %30, %28, %37\n\
+         \x20 ret %38"
+    );
+    assert_eq!(
+        section(source, "fn fwd#2"),
+        "fn fwd#2(%31: fn, %32: struct, %33: struct, %34: nat):\n\
+         \x20 %35: struct = struct { Log: %32 }\n\
+         \x20 %36: nat = call %31, %35, %34\n\
+         \x20 ret %36"
     );
 }
 
@@ -1242,6 +1252,198 @@ fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
          \x20 %44: struct = project %41, \"B\"\n\
          \x20 %45: nat = call %40, %43, %44, %42\n\
          \x20 ret %45"
+    );
+}
+
+/// A function value stored in a struct field keeps its shape across the
+/// container: the field was stored at the type the *definition* built the
+/// struct with, so the projection reads it at that type — one tail bundle
+/// before the argument — however the use instantiates the container. The
+/// adapters stand at the projection, and the function-typed argument crossing
+/// into the stored value goes through one of its own, unpacking the bundle
+/// back into the records `both` was compiled to take.
+#[test]
+fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         effect Fail = `oops : Nat -> ()\n\
+         let s = { f: fn g => fn n => g n }\n\
+         let both : Nat -> Nat ! `Log | `Fail = fn n =>\n\
+           let a = Log.`write n in let b = Fail.`oops n in n\n\
+         let go = fn w => handle handle s.f both 1\n\
+           with | Log.`write x => {} end with | Fail.`oops y => {} end";
+    // The function lifted out of the field takes a bundle and its argument,
+    // and calls its own argument with that same bundle: two parameters after
+    // the capture, two arguments — never the use site's positional records.
+    assert_eq!(
+        section(source, "fn s#1"),
+        "fn s#1(%3: fn, %1: struct, %2: any):\n\
+         \x20 %4: any = call %3, %1, %2\n\
+         \x20 ret %4"
+    );
+    // The projection is fitted where it is read, and every call downstream
+    // passes exactly as many arguments as its callee has parameters.
+    let go = section(source, "fn go(");
+    assert!(go.contains("%31: struct = global s"), "{go}");
+    assert!(go.contains("%32: fn = project %31, \"f\""), "{go}");
+    assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
+    assert!(go.contains("%52: fn = call %50, %51"), "{go}");
+    assert!(go.contains("%54: nat = call %52, %30, %25, %53"), "{go}");
+    // `both` goes in through an adapter that unpacks the bundle back into the
+    // two records it takes.
+    assert_eq!(
+        section(source, "fn go#4"),
+        "fn go#4(%35: fn, %36: struct, %37: any):\n\
+         \x20 %38: struct = project %36, \"Log\"\n\
+         \x20 %39: struct = project %36, \"Fail\"\n\
+         \x20 %40: nat = call %35, %38, %39, %37\n\
+         \x20 ret %40"
+    );
+    // And the use site's two records are packed into the one bundle the
+    // stored function's next level takes.
+    assert_eq!(
+        section(source, "fn go#5"),
+        "fn go#5(%43: fn, %44: struct, %45: struct, %46: nat):\n\
+         \x20 %47: struct = struct { Log: %44, Fail: %45 }\n\
+         \x20 %48: any = call %43, %47, %46\n\
+         \x20 ret %48"
+    );
+}
+
+/// The same value carried as a sum payload behaves identically: the payload
+/// read takes the case's shape from the type the tag was *built* at, and the
+/// match binder holds a value fitted from that shape to the use's own.
+#[test]
+fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         effect Fail = `oops : Nat -> ()\n\
+         let wrap = `F (fn g => fn n => g n)\n\
+         let both : Nat -> Nat ! `Log | `Fail = fn n =>\n\
+           let a = Log.`write n in let b = Fail.`oops n in n\n\
+         let go = fn w => handle handle\n\
+           (match wrap with | `F h => h both 1 | _ => 0 end)\n\
+           with | Log.`write x => {} end with | Fail.`oops y => {} end";
+    let go = section(source, "fn go(");
+    assert!(go.contains("%32: fn = payload %31"), "{go}");
+    assert!(go.contains("%50: fn = closure go#6, [%32]"), "{go}");
+    assert!(go.contains("%54: nat = call %52, %30, %25, %53"), "{go}");
+    // The same unpacking adapter stands in front of `both` as in the struct
+    // spelling: the payload's shape survived the container.
+    assert_eq!(
+        section(source, "fn go#4"),
+        "fn go#4(%35: fn, %36: struct, %37: any):\n\
+         \x20 %38: struct = project %36, \"Log\"\n\
+         \x20 %39: struct = project %36, \"Fail\"\n\
+         \x20 %40: nat = call %35, %38, %39, %37\n\
+         \x20 ret %40"
+    );
+}
+
+/// A match whose arms yield function values fits each one, at its own leaf,
+/// from the shape it holds to what the whole match stands for — so the switch
+/// temp can be called at the match's own type, and the caller's positional
+/// records land on adapters that pack them into the bundle each arm's value
+/// actually takes.
+#[test]
+fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
+    let source = "effect A = `a : Nat -> ()\n\
+         effect B = `b : Nat -> ()\n\
+         let both : Nat -> Nat ! `A | `B = fn n => let x = A.`a n in let y = B.`b n in n\n\
+         let app = fn g => g 1\n\
+         let pick = fn u => app\n\
+         let go = fn c => handle handle\n\
+           ((match c with | `L => pick {} | _ => pick {} end) both)\n\
+           with | A.`a s => {} end with | B.`b s => {} end";
+    // Each leaf wraps its own `pick {}` — which holds `app`'s bundle shape —
+    // in an adapter of its own, and the one call after the switch passes the
+    // two records and the argument the match's own type promises.
+    let go = section(source, "fn go(");
+    assert!(go.contains("%51: fn = closure go#5, [%37]"), "{go}");
+    assert!(go.contains("%67: fn = closure go#7, [%53]"), "{go}");
+    assert!(go.contains("%70: nat = call %68, %35, %30, %69"), "{go}");
+    assert_eq!(
+        section(source, "fn go#5"),
+        "fn go#5(%38: fn, %39: struct, %40: struct, %41: fn):\n\
+         \x20 %42: struct = struct { A: %39, B: %40 }\n\
+         \x20 %49: fn = closure go#4, [%41]\n\
+         \x20 %50: any = call %38, %42, %49\n\
+         \x20 ret %50"
+    );
+}
+
+/// A value already shaped as the container's type declares goes in and comes
+/// out untouched: the store fits trivially, the read fits trivially, and the
+/// listing carries not one instruction beyond the ones the source wrote.
+#[test]
+fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let s : { f: Nat -> Nat ! `Log } = { f: fn n => let z = Log.`write n in n }\n\
+         let go = fn w => handle s.f 1 with | Log.`write x => {} end";
+    assert_eq!(
+        section(source, "global s"),
+        "global s:\n\
+         \x20 %4: fn = closure s#1, []\n\
+         \x20 %5: struct = struct { f: %4 }\n\
+         \x20 ret %5"
+    );
+    assert_eq!(
+        section(source, "fn go("),
+        "fn go(%6: any):\n\
+         \x20 %7: any = new_tag\n\
+         \x20 %10: fn = closure go#2, []\n\
+         \x20 %11: struct = struct { write: %10 }\n\
+         \x20 %16: nat = catch %7:\n\
+         \x20   %12: struct = global s\n\
+         \x20   %13: fn = project %12, \"f\"\n\
+         \x20   %14: nat = const 1\n\
+         \x20   %15: nat = call %13, %11, %14\n\
+         \x20   yield %15\n\
+         \x20 ret %16"
+    );
+}
+
+/// Tagging a value whose type nothing pinned down: the case's own word is
+/// anything at all, which says nothing about a shape, so the payload goes in
+/// exactly as it stands — no fitting, no extra instruction.
+#[test]
+fn a_payload_no_type_pinned_down_goes_in_as_it_stands() {
+    assert_eq!(
+        section("let f = fn v => `F v", "fn f("),
+        "fn f(%0: any):\n\
+         \x20 %1: sum = tag `F, %0\n\
+         \x20 ret %1"
+    );
+}
+
+/// A case the production type never listed — here `G`, which only the use's
+/// instantiation of `w`'s open row can carry — has no authoritative payload
+/// type to read, so the payload is taken at the use's own word.
+#[test]
+fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
+    assert_eq!(
+        section(
+            "let w = `F 1\nlet f = fn v => match w with | `F x => x | `G 0 => 7 | _ => 0 end",
+            "fn f("
+        ),
+        "fn f(%2: any):\n\
+         \x20 %3: sum = global w\n\
+         \x20 %10: nat = switch_tag %3:\n\
+         \x20   `F =>\n\
+         \x20     %4: nat = payload %3\n\
+         \x20     yield %4\n\
+         \x20   `G =>\n\
+         \x20     %5: nat = payload %3\n\
+         \x20     %8: nat = switch_nat %5:\n\
+         \x20       0 =>\n\
+         \x20         %6: nat = const 7\n\
+         \x20         yield %6\n\
+         \x20       else =>\n\
+         \x20         %7: nat = const 0\n\
+         \x20         yield %7\n\
+         \x20     yield %8\n\
+         \x20   else =>\n\
+         \x20     %9: nat = const 0\n\
+         \x20     yield %9\n\
+         \x20 ret %10"
     );
 }
 

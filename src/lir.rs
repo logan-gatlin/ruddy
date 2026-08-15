@@ -389,10 +389,13 @@ struct Line {
 }
 
 /// What every leaf of one match's tree needs: the arms to emit, the
-/// representation their value has, and where the match was written.
+/// representation their value has, what the whole match stands for — which is
+/// what every arm's value is fitted to on the way out — and where the match
+/// was written.
 struct Tree<'a> {
     arms: &'a [(Pattern, Term)],
     rep: Rep,
+    ty: Rc<Ty>,
     span: Span,
 }
 
@@ -411,9 +414,12 @@ struct Lower<'a> {
     /// produced or fitted at — indexed by the temp. A call reads the callee's
     /// evidence parameters off this, not off the type the use site instantiates
     /// the value at: the two disagree exactly where a polymorphic value reaches
-    /// the call through a binding, a parameter or a return. `None` where no
-    /// producer recorded one, in which case production and use are the same
-    /// place and the use's type is the type held.
+    /// the call through a binding, a parameter or a return. A struct or sum
+    /// temp records the type it was built at for the same reason: the
+    /// functions inside it are shaped by that type's members, and a read has
+    /// to know which type that was. `None` where no producer recorded one, in
+    /// which case production and use are the same place and the use's type is
+    /// the type held.
     held: Vec<Option<Rc<Ty>>>,
     /// Reserved before anything is emitted, because a definition may call itself
     /// or its neighbour: a slot exists from the moment its name does, and is
@@ -709,12 +715,31 @@ impl Lower<'_> {
         temp
     }
 
-    /// Record the type whose shape a temp holds. Only a function value has a
-    /// shape a caller must match, so nothing else is worth writing down.
+    /// Record the type whose shape a temp holds. A function value is the one
+    /// thing a caller must match; containers are [`Lower::contain`]'s to note.
     fn hold(&mut self, temp: Temp, ty: &Rc<Ty>) {
         if self.rep(ty) == Rep::Fn {
             self.held[temp as usize] = Some(ty.clone());
         }
+    }
+
+    /// Record the type a container was built at. A struct or sum may carry
+    /// function values, each stored at the shape the container's own type
+    /// gives its member — so a read out of the container has to know that
+    /// type, not whatever type a use instantiates the container to.
+    fn contain(&mut self, temp: Temp, ty: &Rc<Ty>) {
+        if matches!(self.rep(ty), Rep::Struct | Rep::Sum) {
+            self.held[temp as usize] = Some(ty.clone());
+        }
+    }
+
+    /// The type whose shape a temp's value actually holds: what its producer
+    /// recorded, or the type the value is being read at where none did — in
+    /// which case production and use are the same place and the two agree.
+    fn holding(&self, temp: Temp, ty: &Rc<Ty>) -> Rc<Ty> {
+        self.held[temp as usize]
+            .clone()
+            .unwrap_or_else(|| ty.clone())
     }
 
     /// Emit one value-producing instruction and hand back the temp it assigns.
@@ -795,6 +820,20 @@ impl Lower<'_> {
             ty = to;
         }
         ty
+    }
+
+    /// What a container's type says one of its members holds: one field of a
+    /// struct, or the payload of one sum case. `None` where the type does not
+    /// name the member — a use may dispatch on a case the production type
+    /// never listed — or does not pin its shape down, in which case the use
+    /// site's own reading is all there is to go on.
+    fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
+        let ty = unfold(&self.inference.aliases, ty);
+        let member = match &ty.core {
+            Core::Sum(row) => flat(row).labels.get(name).map(|case| case.ty.clone()),
+            _ => ty.fields.get(name).map(|field| field.ty.clone()),
+        };
+        member.filter(|member| self.rep(member) != Rep::Any)
     }
 
     /// Whether a value whose evidence was built for `have` can be called where
@@ -1056,7 +1095,7 @@ impl Lower<'_> {
             return temp;
         }
         let (want_from, want_to, want_row) = self.arrow(want);
-        let (_, have_to, have_row) = self.arrow(have);
+        let (have_from, have_to, have_row) = self.arrow(have);
         let want_shape = shape(&want_row);
         let have_shape = shape(&have_row);
 
@@ -1127,7 +1166,11 @@ impl Lower<'_> {
             };
             args.push(bundle);
         }
-        args.push(arg);
+        // The visible argument arrives shaped as the declaration passes it,
+        // and the value takes its own level's argument at its own shape — a
+        // function crossing between the two is a value changing hands like
+        // any other, and is fitted the same way.
+        args.push(self.fitted(&have_from, &want_from, arg, &mut lifted));
         let called = self.emit(
             &mut lifted,
             Span::default(),
@@ -1288,29 +1331,57 @@ impl Lower<'_> {
         let rep = self.rep(&term.ty);
         match &term.kind {
             TermKind::Natural(value) => self.emit(body, span, rep, Op::Const(*value)),
+            // A container honestly contains values shaped by its own type:
+            // each member is fitted from the shape it holds to the shape the
+            // container's type gives it going in, and the container records
+            // that type so a read coming out can trust it.
             TermKind::Struct(fields) => {
                 let mut entries = IndexMap::new();
                 for (name, field) in fields {
                     let temp = self.term(&field.value, body);
+                    let want = self
+                        .member_of(&term.ty, name)
+                        .unwrap_or_else(|| field.value.ty.clone());
+                    let have = self.holding(temp, &field.value.ty);
+                    let temp = self.fitted(&want, &have, temp, body);
                     entries.insert(name.clone(), temp);
                 }
-                self.emit(body, span, rep, Op::Struct(entries))
+                let temp = self.emit(body, span, rep, Op::Struct(entries));
+                self.contain(temp, &term.ty);
+                temp
             }
+            // The field's shape is the base container's to declare: the type
+            // the container was built at says what the stored value holds,
+            // however this use instantiates the container, and the read is
+            // fitted from that to what this projection stands for.
             TermKind::Project { base, field } => {
                 let temp = self.term(base, body);
-                self.emit(
+                let authority = self.holding(temp, &base.ty);
+                let have = self
+                    .member_of(&authority, &field.tracked)
+                    .unwrap_or_else(|| term.ty.clone());
+                let read = self.emit(
                     body,
                     span,
-                    rep,
+                    self.rep(&have),
                     Op::Project {
                         base: temp,
                         field: field.tracked.clone(),
                     },
-                )
+                );
+                self.contain(read, &have);
+                self.fitted(&term.ty, &have, read, body)
             }
             TermKind::Tag { name, payload } => {
-                let payload = payload.as_ref().map(|term| self.term(term, body));
-                self.emit(
+                let payload = payload.as_ref().map(|written| {
+                    let temp = self.term(written, body);
+                    let want = self
+                        .member_of(&term.ty, &name.tracked)
+                        .unwrap_or_else(|| written.ty.clone());
+                    let have = self.holding(temp, &written.ty);
+                    self.fitted(&want, &have, temp, body)
+                });
+                let temp = self.emit(
                     body,
                     span,
                     rep,
@@ -1318,7 +1389,9 @@ impl Lower<'_> {
                         name: name.tracked.clone(),
                         payload,
                     },
-                )
+                );
+                self.contain(temp, &term.ty);
+                temp
             }
             // A binding is a name for a temp and nothing else: the value is
             // lowered where it was written, the name maps to it, and the
@@ -1339,7 +1412,9 @@ impl Lower<'_> {
             // produced rather than wherever it is eventually passed — is what
             // makes every temp hold a value shaped by its own term's type, so
             // that a value travelling through a binding or a return arrives
-            // callable.
+            // callable. A container is not refitted — its contents were built
+            // at the definition's type — so the read records that type for
+            // whatever is later projected out.
             TermKind::Ident(symbol) => match self.local(*symbol) {
                 Some(temp) => temp,
                 None => {
@@ -1353,6 +1428,7 @@ impl Lower<'_> {
                         },
                     );
                     let have = self.program.terms[symbol].value.ty.clone();
+                    self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }
             },
@@ -1821,6 +1897,7 @@ impl Lower<'_> {
         let tree = Tree {
             arms,
             rep,
+            ty: term.ty.clone(),
             span: term.span,
         };
         let cols = vec![Col::Value {
@@ -1872,7 +1949,13 @@ impl Lower<'_> {
         for (symbol, temp) in &line.binds {
             self.top().locals.insert(*symbol, *temp);
         }
-        self.term(&tree.arms[line.arm].1, body)
+        // Every leaf yields to the one temp the whole match stands at, so a
+        // function value is fitted from the shape it holds to the match's own
+        // type — which is the shape everything downstream reads the temp at.
+        let arm = &tree.arms[line.arm].1;
+        let value = self.term(arm, body);
+        let have = self.holding(value, &arm.ty);
+        self.fitted(&tree.ty, &have, value, body)
     }
 
     /// One whole position. A column any arm reaches into fields at is widened
@@ -2034,8 +2117,18 @@ impl Lower<'_> {
                 let reads = kept.iter().any(|line| tests(&line.cells[0]));
                 let block = self.child(tree.span, |low, inner| match reads {
                     true => {
-                        let rep = low.rep(&payload_ty);
-                        let held = low.emit(inner, tree.span, rep, Op::Payload(temp));
+                        // What shape the payload holds is the scrutinee's
+                        // container type to declare, where one was recorded —
+                        // the case was stored at that type's word, not at
+                        // whatever this use instantiates the sum to.
+                        let have = low.held[temp as usize]
+                            .clone()
+                            .and_then(|authority| low.member_of(&authority, name))
+                            .unwrap_or_else(|| payload_ty.clone());
+                        let rep = low.rep(&have);
+                        let read = low.emit(inner, tree.span, rep, Op::Payload(temp));
+                        low.contain(read, &have);
+                        let held = low.fitted(&payload_ty, &have, read, inner);
                         let mut cols = vec![Col::Value {
                             temp: held,
                             ty: payload_ty.clone(),
