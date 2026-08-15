@@ -106,9 +106,17 @@ pub struct Trace {
 }
 
 /// How the type printer spells the things that are *not* concrete types: a
-/// solver variable as `?4`, an undecided type as `?`, and a quantified one as
-/// `'a`. Everything else a type is made of — `Nat`, `->`, a struct's braces and
-/// field names — is written by the language rather than stood in for.
+/// solver variable as `?4`, and an undecided type as `?`. Everything else a
+/// type is made of — `Nat`, `->`, a struct's braces and field names — is
+/// written by the language rather than stood in for.
+///
+/// A variable a scheme quantifies is deliberately not here. It prints as a
+/// bare letter now, the way a `where let` declares it, and a bare letter is
+/// exactly what an ordinary name looks like: a pattern matching one would light
+/// up every field called `a` on the page. What tells a reader which letters a
+/// scheme quantifies is the `where let` clause printed beside the type, which
+/// is a better answer than a highlight anyway — it is the source they could
+/// paste back.
 ///
 /// The `?` an abandoned presence puts on its label — the one in `a?: Nat` — is
 /// the language too, not a stand-in, and the `\B` is what keeps the highlighter
@@ -117,7 +125,7 @@ pub struct Trace {
 ///
 /// Declared once because four tabs render the same type language, and a
 /// pattern that drifted on one of them would go quietly dead there.
-const VARIABLES: &str = r"\B\?\d*|'[a-z]\d*";
+const VARIABLES: &str = r"\B\?\d*";
 
 /// Every stage, in tab order. Adding a panel is one line here. A stage that
 /// annotates another owns no tab, so its place in the list does not matter to
@@ -175,11 +183,12 @@ pub const REGISTRY: &[Spec] = &[
         id: "types",
         title: "Types",
         view: View::Tree,
-        // Schemes are mostly concrete, so the `'a`s are what the eye is
-        // looking for — but only inside one scheme. Generalization numbers
-        // each definition's quantifiers from `'a` again, so `id`'s `'a` and
-        // `k`'s `'a` are two unrelated variables that happen to be spelled
-        // the same, and lighting one from the other would say otherwise.
+        // A scheme's own letters are not lit — they are spelled exactly as
+        // names are, and the `where let` beside the type is what declares
+        // them — so what is left to follow is the solver's own variables, and
+        // only inside one scheme. Generalization numbers each definition's
+        // quantifiers from scratch, so two rows spelling `?3` in the *types*
+        // tab are two unrelated variables that happen to look alike.
         highlight: Some(VARIABLES),
         scoped: true,
         annotates: None,
@@ -298,7 +307,8 @@ pub fn plural(count: usize, noun: &str) -> String {
 /// one — the labels an argument written there may not name.
 ///
 /// Both tabs show a parameter and neither can show one usefully without this:
-/// the meaning column spells every parameter `'a` alike, and which of them tails
+/// the meaning column spells every parameter as a bare letter alike, and which
+/// of them tails
 /// something, what kind, and what may not be in it, is nowhere else on the page.
 /// Written once so the two cannot spell it differently.
 ///

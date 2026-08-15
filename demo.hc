@@ -46,20 +46,21 @@ let getx = fn p => p.x
 
 let dot = getx { x: 3, y: 4 }
 
-let open : { small: Nat, ..extra } -> Nat = fn s => s.small
+let open : { small: Nat, ..extra } -> Nat where let extra = fn s => s.small
 
-let opt : { label when a: Nat, value: Nat, .. } -> Nat = fn r => r.value
+let opt : { label when a: Nat, value: Nat, .. } -> Nat where let a = fn r => r.value
 
 let either = fn v => match v with
   | {x} => {}
   | {y} => {}
 end
 
-let both : { x when a: Nat, y when b: Nat } -> {} where a = b = fn v =>
-  match v with
-    | {x, y} => {}
-    | {} => {}
-  end
+let both : { x when a: c, y when b: d } -> {} where let a, b; a = b; let c, d
+  = fn v =>
+    match v with
+      | {x, y} => {}
+      | {} => {}
+    end
 
 type Option T = `Some T | `None
 
@@ -76,6 +77,24 @@ let leaf : Tree Nat = `Leaf
 type Fallible r = `Err Nat | ..r
 
 let handled : Fallible (`Ok Nat) -> Nat = fn t => 0
+
+let identical : a -> a where let a = fn x => x
+
+let firstly : { x: a, .. } -> a where let a = fn p => p.x
+
+let widened : (`Err Nat | ..r) -> Nat where let r = fn t => 0
+
+let anonymous : { .. } -> Nat = fn s => 0
+
+let unnamed : { flag when _: Nat, .. } -> Nat = fn s => 0
+
+let holed : _ -> Nat = fn x => 0
+
+let narrowed : Nat -> Nat = fn x => x
+
+type Nest = { kids: Nest }
+
+let depth : { kids: Nest, ..r } -> Nat where let r = fn n => depth n.kids
 
 let repeat = fn x => repeat x
 

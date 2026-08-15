@@ -296,7 +296,7 @@ fn the_surface_prerequisites_reach_every_stage() {
 /// the definition ends with.
 #[test]
 fn rows_reach_every_stage() {
-    let source = "let f : { x when a: Nat, y: Nat, ..r } -> Nat = fn p => p.y\n";
+    let source = "let f : { x when a: Nat, y: Nat, ..r } -> Nat where let a, r = fn p => p.y\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -325,7 +325,7 @@ fn rows_reach_every_stage() {
     assert_eq!(
         labelled("tokens", "Identifier"),
         [
-            "f", "x", "when", "a", "Nat", "y", "Nat", "r", "Nat", "p", "p", "y"
+            "f", "x", "when", "a", "Nat", "y", "Nat", "r", "Nat", "where", "a", "r", "p", "p", "y"
         ]
     );
 
@@ -359,7 +359,10 @@ fn rows_reach_every_stage() {
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(types, ["{ x when a: Nat, y: Nat, ..'a } -> Nat"]);
+    assert_eq!(
+        types,
+        ["{ x when a: Nat, y: Nat, ..b } -> Nat where let a, b"]
+    );
 }
 
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps
@@ -449,6 +452,27 @@ fn a_duplicate_carries_the_definition_it_repeats() {
         .expect("the repeat is reported");
     assert_eq!(duplicate.related.len(), 1);
     assert_eq!(duplicate.related[0].span, Some([4, 5]));
+    assert_eq!(duplicate.related[0].message, "first defined here");
+}
+
+/// A name declared twice in one `where` clause points back the same way, and
+/// says declared rather than defined: a clause says what a name will stand for,
+/// and the type beside it is what defines anything.
+#[test]
+fn a_duplicate_variable_points_back_at_the_declaration_that_stands() {
+    let source = "let worse : a -> a where let a; let a = fn x => x\n";
+    let snapshot = snapshot(source);
+    let duplicate = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "duplicate-variable")
+        .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
+    let first = source.find("let a").expect("the first declaration") + 4;
+    let second = source.rfind("let a").expect("the repeat") + 4;
+    assert_eq!(duplicate.span, Some([second, second + 1]));
+    assert_eq!(duplicate.related.len(), 1);
+    assert_eq!(duplicate.related[0].span, Some([first, first + 1]));
+    assert_eq!(duplicate.related[0].message, "first declared here");
 }
 
 /// A name given two rests of different shapes is the same kind of complaint:
@@ -456,16 +480,19 @@ fn a_duplicate_carries_the_definition_it_repeats() {
 /// highlights that one too rather than leaving the reader to find it.
 #[test]
 fn a_mixed_tail_carries_the_use_it_clashes_with() {
-    let source = "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat = fn a => fn b => 1\n";
+    let source =
+        "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat where let r = fn a => fn b => 1\n";
     let snapshot = snapshot(source);
     let mixed = snapshot
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.code == "mixed-tail")
         .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
-    let first = source.find("..r").expect("the first tail");
+    // At the name rather than at the `..` in front of it: the name is the one
+    // thing the reader can change, and is what the second use points back to.
+    let first = source.find("..r").expect("the first tail") + 2;
     assert_eq!(mixed.related.len(), 1);
-    assert_eq!(mixed.related[0].span, Some([first, first + 3]));
+    assert_eq!(mixed.related[0].span, Some([first, first + 1]));
     // Worded as a use rather than as a definition: nothing here was defined
     // twice.
     assert_eq!(mixed.related[0].message, "first used here");
@@ -499,7 +526,7 @@ fn inferred_types_reach_the_panels() {
         .into_iter()
         .find(|node| node.label == "let id")
         .expect("the definition has a row");
-    assert_eq!(scheme.text, "'a -> 'a");
+    assert_eq!(scheme.text, "a -> a where let a");
 
     let badges = stage("types-ir");
     assert_eq!(badges.annotates, Some("ir"));
@@ -512,7 +539,7 @@ fn inferred_types_reach_the_panels() {
     }
     // The declaration row wears the scheme.
     let texts: Vec<_> = badges.nodes.iter().map(|node| node.text.as_str()).collect();
-    assert!(texts.contains(&"'a -> 'a"), "{texts:?}");
+    assert!(texts.contains(&"a -> a"), "{texts:?}");
 }
 
 /// Every row the IR stage renders a term on wears the type inference gave it.
@@ -752,7 +779,13 @@ fn a_type_error_is_a_diagnostic() {
 /// compiler ever sees.
 #[test]
 fn a_row_error_reaches_the_strip_and_the_solve_tab() {
-    let repeated = snapshot("let h : { x: { y: Nat, ..r } } -> { ..r } = fn p => { y: {} }\n");
+    // Through a call, since a declared rest is rigid inside the body that
+    // promised it: what the lacks condition rules on is the *fresh* rest a use
+    // of the published scheme gets.
+    let repeated = snapshot(
+        "let h : { ..r } -> { x: { y: Nat, ..r } } -> Nat where let r = fn a => fn b => 1\n\
+         let z = h { y: {} } { x: { y: 1 } }\n",
+    );
     let [diagnostic] = repeated.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", repeated.diagnostics);
     };
@@ -791,13 +824,21 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
         )
     );
 
-    let narrowed = snapshot("let f : { x when a: Nat, .. } -> Nat = fn p => p.x\n");
-    let [diagnostic] = narrowed.diagnostics.as_slice() else {
-        panic!("expected one error: {:#?}", narrowed.diagnostics);
+    // A body deciding what its annotation declared reaches the strip too, and
+    // carries the declaration as a second highlight — the promise it broke.
+    let source = "let bad : a -> Nat where let a = fn p => p.x\n";
+    let broken = snapshot(source);
+    let [diagnostic] = broken.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", broken.diagnostics);
     };
-    assert_eq!(diagnostic.code, "annotation-too-open");
-    // Spanned at the annotation, which is the text the reader has to change.
-    assert_eq!(diagnostic.span, Some([8, 36]));
+    assert_eq!(diagnostic.code, "rigid-field");
+    // Spanned at the projection, which is the expression that broke it.
+    let read = source.rfind('x').expect("the field");
+    assert_eq!(diagnostic.span, Some([read, read + 1]));
+    let declared = source.rfind("let a").expect("the declaration") + 4;
+    assert_eq!(diagnostic.related.len(), 1);
+    assert_eq!(diagnostic.related[0].span, Some([declared, declared + 1]));
+    assert_eq!(diagnostic.related[0].message, "declared here");
 
     let flat = snapshot("let n = 1\nlet bad = n.x\n");
     let [diagnostic] = flat.diagnostics.as_slice() else {
@@ -1158,14 +1199,14 @@ fn the_types_tab_maps_each_letter_back_to_its_parameter() {
         .iter()
         .find(|node| node.label == "type Pair")
         .expect("a row for the declaration");
-    assert_eq!(pair.text, "{ first: 'a, second: 'b }");
+    assert_eq!(pair.text, "{ first: a, second: b } where let a, b");
 
     let letters: Vec<(&str, &str)> = pair
         .children
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
+    assert_eq!(letters, vec![("a", "A"), ("b", "B")]);
 }
 
 /// The IR tab shows a `type` declaration's binders, as the AST tab and the
@@ -1286,10 +1327,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(
-        letters,
-        vec![("'a", "A"), ("'b", "..r (struct) without it")]
-    );
+    assert_eq!(letters, vec![("a", "A"), ("b", "..r (struct) without it")]);
 
     // A struct's `..` beside no fields at all forbids nothing, and there is
     // nothing else about it to show: the rest of a struct *is* a whole type, so
@@ -1393,7 +1431,7 @@ fn sums_reach_every_stage() {
         .into_iter()
         .find(|node| node.label == "type Fallible")
         .expect("a row for the declaration");
-    assert_eq!(fallible.text, "`Err Nat | ..'a");
+    assert_eq!(fallible.text, "`Err Nat | ..a where let a");
     assert_eq!(fallible.children[0].text, "..r (sum) without `Err");
 
     // And the definition's scheme is the declared type, applied to the row the
@@ -1430,7 +1468,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
         .map(|node| node.text.clone())
         .find(|text| text.contains(".."))
         .expect("the scheme prints an open end");
-    assert_eq!(scheme, "{ x: 'a, ..'b } -> 'a");
+    assert_eq!(scheme, "{ x: a, ..b } -> a where let a, b");
 
     // And the IR tab's inline badges, which the types stage paints on: the
     // binder `p` wears the base's own type.
@@ -1442,7 +1480,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
     assert!(
         nodes(badges)
             .iter()
-            .any(|node| node.text == "{ x: 'a, ..'b }"),
+            .any(|node| node.text == "{ x: a, ..b }"),
         "{:#?}",
         nodes(badges)
     );

@@ -1,10 +1,14 @@
 //! Tests for [`ruddy_debug::print`].
 
+use std::rc::Rc;
+
+use indexmap::IndexMap;
 use ruddy::{
     inference, ir, parse,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
+    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty},
 };
 use ruddy_debug::print;
 
@@ -45,8 +49,8 @@ fn both_trees_render_a_struct_the_same_way() {
         "let f = fn r => { wrapped: r.x }",
         // Open rows and named presences: the `..` tail, named or not, and the
         // `when` clause are one rendering rule too.
-        "let g : { a: Nat, ..r } -> Nat = fn p => p.a",
-        "let h : { a when a: Nat, .. } -> Nat = fn p => p.a",
+        "let g : { a: Nat, ..r } -> Nat where let r = fn p => p.a",
+        "let h : { a when a: Nat, .. } -> Nat where let a = fn p => p.a",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -138,7 +142,7 @@ fn types_of(source: &str) -> (String, String) {
         .expect("the source declares one term");
     let annotation = decl.annotation.as_ref().expect("it is annotated");
     (
-        print::ir::ty(&annotation.ty.tracked, &mint).to_string(),
+        print::ir::annotation(annotation, &mint).to_string(),
         inferred.schemes[symbol].to_string(),
     )
 }
@@ -197,17 +201,17 @@ fn a_row_reads_as_written_and_as_quantified() {
         (
             "let f : { x: Nat, .. } -> Nat = fn p => p.x",
             "{ x: Nat, .. } -> Nat",
-            "{ x: Nat, ..'a } -> Nat",
+            "{ x: Nat, ..a } -> Nat where let a",
         ),
         (
-            "let g : { x: Nat, ..r } -> { x: Nat, ..r } = fn p => p",
-            "{ x: Nat, ..r } -> { x: Nat, ..r }",
-            "{ x: Nat, ..'a } -> { x: Nat, ..'a }",
+            "let g : { x: Nat, ..r } -> { x: Nat, ..r } where let r = fn p => p",
+            "{ x: Nat, ..r } -> { x: Nat, ..r } where let r",
+            "{ x: Nat, ..a } -> { x: Nat, ..a } where let a",
         ),
         (
-            "let h : { x when a: Nat, y: Nat } -> Nat = fn r => r.y",
-            "{ x when a: Nat, y: Nat } -> Nat",
-            "{ x when a: Nat, y: Nat } -> Nat",
+            "let h : { x when a: Nat, y: Nat } -> Nat where let a = fn r => r.y",
+            "{ x when a: Nat, y: Nat } -> Nat where let a",
+            "{ x when a: Nat, y: Nat } -> Nat where let a",
         ),
     ] {
         let (as_written, as_inferred) = types_of(source);
@@ -263,9 +267,9 @@ fn both_trees_render_a_sum_the_same_way() {
         "let p = fn f => `Some (f 1)",
         // A case whose presence a `when` names, and a tail: the two ways a sum
         // is left open, both of which only an annotation may write.
-        "let o : `A (when a) Nat | `B = `B",
+        "let o : `A (when a) Nat | `B where let a = `B",
         "let t : `A Nat | .. = `A 1",
-        "let r : `A Nat | ..s = `A 1",
+        "let r : `A Nat | ..s where let s = `A 1",
         // The two forms that write no case, and so print the leading bar the
         // rest of them do not.
         "type Void = |",
@@ -433,7 +437,7 @@ fn a_wildcard_pattern_round_trips() {
     assert_eq!(ast, source);
     assert_eq!(
         ir,
-        "let f = fn p => let %struct : { x: ?, y: ? } = p in \
+        "let f = fn p => let %struct : { x: _, y: _ } = p in \
          let %discard = %struct.x in let y = %struct.y in y"
     );
 }
@@ -481,15 +485,15 @@ fn both_trees_render_a_pattern_rest() {
 #[test]
 fn both_trees_render_a_where_clause_the_same_way() {
     for source in [
-        "let f : { x when a: Nat } where a = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where a != b = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where a = b = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where not (a and b) = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where a or b = { x: 1 }",
+        "let f : { x when a: Nat } where let a; a = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where let a, b; a != b = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where let a, b; a = b = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where let a, b; not (a and b) = { x: 1 }",
+        "let f : { x when a: Nat, y when b: Nat } where let a, b; a or b = { x: 1 }",
         // The anonymous presence is spelled back as the `_` it was written as.
         "let f : { x when _: Nat } = { x: 1 }",
         // And a sum's clause takes the parentheses the grammar needs.
-        "let f : `A (when a) Nat | `B (when b) = `B",
+        "let f : `A (when a) Nat | `B (when b) where let a, b = `B",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -505,9 +509,9 @@ fn a_scheme_prints_the_clause_it_requires() {
     for (source, expected) in [
         (
             "let p = fn a => match a with | {x} => {} | {y} => {} end",
-            "{ x when a: 'a, y when b: 'b } -> {} where a != b",
+            "{ x when a: c, y when b: d } -> {} where let a, b, c, d; a != b",
         ),
-        ("let id = fn x => x", "'a -> 'a"),
+        ("let id = fn x => x", "a -> a where let a"),
     ] {
         let mut files = FileManager::new();
         let file = files.register_new_file("<test>".to_string(), source.to_string());
@@ -650,4 +654,165 @@ fn both_trees_render_the_effect_forms() {
     assert_eq!(ir, source);
     let (_, again) = printed(&ir);
     assert_eq!(again, ir);
+}
+
+/// Every variable a scheme quantifies prints as the bare letter a `where let`
+/// declares it as — no prefix, whichever of the three sorts it is — and the
+/// clause beside the type is what says which letters those are.
+#[test]
+fn a_scheme_declares_the_letters_it_quantifies() {
+    // A type, a struct's rest, a sum's rest and a presence, each in its own
+    // position and each spelled the way the surface grammar writes it.
+    let cases: IndexMap<String, RowField> = [(
+        "A".to_string(),
+        RowField {
+            presence: Presence::Bound(0),
+            ty: Rc::new(Ty::plain(Core::Bound(1))),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let body = Rc::new(Ty::plain(Core::pure(
+        Rc::new(Ty {
+            core: Core::Bound(2),
+            fields: [(
+                "x".to_string(),
+                RowField::present(Rc::new(Ty::plain(Core::Bound(1)))),
+            )]
+            .into_iter()
+            .collect(),
+        }),
+        Rc::new(Ty::plain(Core::Sum(Row {
+            labels: cases,
+            rest: Rest::Bound(3),
+        }))),
+    )));
+    let scheme = Scheme::constrained(4, 1, body, Formula::True);
+    assert_eq!(
+        scheme.to_string(),
+        "{ x: b, ..c } -> `A (when a) b | ..d where let a, b, c, d"
+    );
+
+    // A formula follows the declarations, separated by the `;` the grammar
+    // reads the two statements apart with.
+    let both = Scheme::constrained(
+        2,
+        2,
+        Rc::new(Ty {
+            core: Core::Unit,
+            fields: [
+                (
+                    "x".to_string(),
+                    RowField {
+                        presence: Presence::Bound(0),
+                        ty: Rc::new(Ty::plain(Core::Nat)),
+                    },
+                ),
+                (
+                    "y".to_string(),
+                    RowField {
+                        presence: Presence::Bound(1),
+                        ty: Rc::new(Ty::plain(Core::Nat)),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }),
+        Formula::bound(0).xor(Formula::bound(1)),
+    );
+    assert_eq!(
+        both.to_string(),
+        "{ x when a: Nat, y when b: Nat } where let a, b; a != b"
+    );
+
+    // A scheme requiring something of a presence it does not itself quantify
+    // writes the clause and no `let`: there are no letters to declare, and the
+    // formula is still what the scheme requires.
+    let free = Scheme::constrained(0, 0, Rc::new(Ty::plain(Core::Nat)), Formula::var(3));
+    assert_eq!(free.to_string(), "Nat where ?3");
+
+    // A scheme quantifying nothing and requiring nothing writes no `where` at
+    // all, which is every scheme in a monomorphic program.
+    let plain = Scheme::new(0, Rc::new(Ty::plain(Core::Nat)));
+    assert_eq!(plain.to_string(), "Nat");
+
+    // A rigid prints as the name its `where let` gave it, in either sort.
+    let rigid = Rc::new(Ty {
+        core: Core::Rigid {
+            id: 0,
+            name: "r".into(),
+        },
+        fields: [(
+            "x".to_string(),
+            RowField::present(Rc::new(Ty::plain(Core::Rigid {
+                id: 1,
+                name: "a".into(),
+            }))),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    assert_eq!(rigid.to_string(), "{ x: a, ..r }");
+
+    // And a solver variable is unchanged: `?3` for a type or a rest, `?3` in a
+    // `when` for a presence, a bare `?` for the undecided.
+    let solver = Rc::new(Ty {
+        core: Core::Var(3),
+        fields: [(
+            "x".to_string(),
+            RowField {
+                presence: Presence::Var(4),
+                ty: Rc::new(Ty::default()),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    });
+    assert_eq!(solver.to_string(), "{ x when ?4: ?, ..?3 }");
+}
+
+/// A printed scheme is valid source. `let id = fn x => x` reports
+/// `a -> a where let a`, and pasting that back as an annotation re-lowers to
+/// the type it was printed from — which an implied quantifier could not do,
+/// since a bare `a` in an annotation is a name that has to have been declared.
+#[test]
+fn a_printed_scheme_reads_back_as_source() {
+    for source in [
+        "let id = fn x => x",
+        "let getx = fn p => p.x",
+        "let wrap = fn x => `Some x",
+        "let both = fn a => match a with | {x} => {} | {y} => {} end",
+    ] {
+        let printed = printed_scheme(source);
+        // Pasted back as an annotation over the very same body, which is what
+        // "valid source" has to mean: it parses, it lowers, and what it
+        // publishes is what it was printed from.
+        let value = source.split_once(" = ").expect("a definition").1;
+        let again = format!("let pasted : {printed} = {value}");
+        assert_eq!(printed_scheme(&again), printed, "{again}");
+    }
+}
+
+/// The scheme of the last definition in `source`, as it prints.
+fn printed_scheme(source: &str) -> String {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let lexed = token::lex(source, file);
+    assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+
+    let bundle = Bundle::new("test", Version::new(0, 1, 0)).expect("the test bundle name is valid");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
+    let inferred = inference::infer(&mint, &mut built.program);
+    assert!(
+        inferred.errors.is_empty(),
+        "{source}: {:#?}",
+        inferred.errors
+    );
+    let (symbol, _) = built.program.terms.last().expect("a definition");
+    inferred.schemes[symbol].to_string()
 }

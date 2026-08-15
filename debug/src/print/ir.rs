@@ -264,7 +264,8 @@ impl Grouped for Show<'_, TypeKind> {
             | TypeKind::Ident(_)
             | TypeKind::Param { .. }
             | TypeKind::Prim(_)
-            | TypeKind::Any
+            | TypeKind::Var(_)
+            | TypeKind::Hole
             | TypeKind::Error => Prec::Atom,
         }
     }
@@ -298,7 +299,7 @@ impl fmt::Display for Show<'_, TermKind> {
             } => write_let(
                 f,
                 &self.mint.name(name.tracked),
-                annotation.as_ref().map(|ty| self.show(ty)),
+                annotation.as_deref().map(|ty| self.show(ty)),
                 &self.show(&**value),
                 &self.show(&**body),
             ),
@@ -374,9 +375,12 @@ impl fmt::Display for Show<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.node {
             TypeKind::Error => f.write_str("<error>"),
-            // The hole a pattern's demand leaves for the solver, spelled the
-            // way the type printer spells a type with nothing to report.
-            TypeKind::Any => f.write_str("?"),
+            // The hole, as written: `_`, whether the reader left it or the
+            // pattern desugar did.
+            TypeKind::Hole => f.write_str("_"),
+            // A `where let` variable, as the name it was declared with — which
+            // is what the reader wrote and what re-parses to the same use.
+            TypeKind::Var(name) => f.write_str(name),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             // A parameter prints as the name it was declared with, which is
             // what makes this printer's output match the parse tree's.
@@ -446,13 +450,39 @@ impl fmt::Display for Show<'_, TypeKind> {
     }
 }
 
-/// An annotation prints as the type it ascribes and the clause after it, which
-/// is what a reader wrote and what re-parses back to it.
+/// An annotation prints as the type it ascribes and the `where` clause after
+/// it, which is what a reader wrote and what re-parses back to it.
+///
+/// The clause is two statements at most, however many the reader wrote: the
+/// declarations are gathered into one `let`, in the order they were declared,
+/// and the constraints into the one formula lowering conjoined them to. What
+/// comes out re-lowers to the same annotation, which is the round trip that
+/// matters here — a `;` the reader put between two comparisons is not a fact
+/// the IR keeps, any more than the parentheses around one are.
 impl fmt::Display for Show<'_, Annotation> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.show(&self.node.ty))?;
+        let declared = !self.node.variables.is_empty();
+        if !declared && self.node.clause.is_none() {
+            return Ok(());
+        }
+        f.write_str(" where")?;
+        if declared {
+            let names: Vec<&str> = self
+                .node
+                .variables
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect();
+            write!(f, " let {}", names.join(", "))?;
+        }
         match &self.node.clause {
-            Some(clause) => write!(f, " where {}", self.show(clause)),
+            Some(clause) => {
+                if declared {
+                    f.write_str(";")?;
+                }
+                write!(f, " {}", self.show(clause))
+            }
             None => Ok(()),
         }
     }
@@ -619,6 +649,13 @@ pub fn program<'a>(program: &'a Program, mint: &'a Mint) -> impl fmt::Display + 
 /// program cannot disagree about how the same node reads.
 pub fn term<'a>(kind: &'a TermKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
+}
+
+/// Render one lowered ascription: the type, the variables its `where let`
+/// declared, and the formula beside them. The [`ty`] counterpart for the whole
+/// of what a definition was ascribed.
+pub fn annotation<'a>(node: &'a Annotation, mint: &'a Mint) -> impl fmt::Display + 'a {
+    Show { node, mint }
 }
 
 /// Render one type, the [`term`] counterpart.

@@ -2,8 +2,10 @@
 
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use ruddy::types::{
-    Assigned, Atom, Core, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty,
+    Assigned, Atom, Core, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
+    Shape, Ty,
 };
 
 #[test]
@@ -249,12 +251,20 @@ fn opening_a_formula_substitutes_what_was_minted() {
     let formula = Formula::bound(0).xor(Formula::bound(1));
     assert_eq!(
         formula
-            .open(&[Presence::Var(7), Presence::Var(8)])
+            .open(&[
+                Assigned::Presence(Presence::Var(7)),
+                Assigned::Presence(Presence::Var(8)),
+            ])
             .to_string(),
         "?7 != ?8"
     );
     // A variable the scheme did not quantify is left standing.
-    assert_eq!(Formula::var(3).open(&[Presence::Present]).to_string(), "?3");
+    assert_eq!(
+        Formula::var(3)
+            .open(&[Assigned::Presence(Presence::Present)])
+            .to_string(),
+        "?3"
+    );
     // Each presence reads as the literal it is.
     for (presence, printed) in [
         (Presence::Present, "always"),
@@ -322,4 +332,92 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
     assert_eq!(effects.sense(), Sense::Effects);
     assert_eq!(effects.lacks(), &lacks);
     assert_eq!(effects.cases(), Some((Shape::Effect, &lacks)));
+}
+
+/// A scheme has one index space, not two. The presences take the low
+/// positions, `0..presences`, and everything else the rest, `presences..count`
+/// — which is what lets a bare [`Ty`] be printed with no scheme beside it to
+/// ask which alphabet a letter came out of.
+#[test]
+fn a_scheme_numbers_every_sort_in_one_space() {
+    // A declaration's scheme quantifies its parameters and requires nothing, so
+    // it has no presences and its count is the whole of it.
+    let body = Rc::new(Ty::plain(Core::Bound(1)));
+    let declaration = Scheme::new(2, body.clone());
+    assert_eq!(declaration.count(), 2);
+    assert_eq!(declaration.presences(), 0);
+    assert!(declaration.formula().is_true());
+
+    // A definition's may quantify both, and `count` is the total rather than
+    // the types alone.
+    let fields: IndexMap<String, RowField> = [(
+        "x".to_string(),
+        RowField {
+            presence: Presence::Bound(0),
+            ty: Rc::new(Ty::plain(Core::Bound(1))),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let body = Rc::new(Ty {
+        core: Core::Bound(2),
+        fields,
+    });
+    let scheme = Scheme::constrained(3, 1, body, Formula::bound(0));
+    assert_eq!(scheme.count(), 3);
+    assert_eq!(scheme.presences(), 1);
+
+    // Opening it hands every position its value out of one list: the low one is
+    // a presence, and the rest are types.
+    let fresh = [
+        Assigned::Presence(Presence::Var(7)),
+        Assigned::Ty(Rc::new(Ty::plain(Core::Nat))),
+        Assigned::Ty(Rc::new(Ty::unit())),
+    ];
+    let opened = scheme.body().open(&fresh);
+    assert_eq!(opened.to_string(), "{ x when ?7: Nat }");
+    assert_eq!(scheme.formula().open(&fresh).to_string(), "?7");
+}
+
+/// Every position of a scheme is opened at the sort the scheme reserved it for,
+/// so a value of another sort never reaches one. Rather than a rule for what
+/// cannot happen there is a value that says nothing, which absorbs the way
+/// every other unanswerable value does.
+#[test]
+fn a_value_of_the_wrong_sort_opens_to_nothing() {
+    assert_eq!(
+        Assigned::Ty(Rc::new(Ty::plain(Core::Nat))).presence(),
+        Presence::Undecided
+    );
+    assert_eq!(
+        Assigned::Row(Rc::new(Row::closed())).presence(),
+        Presence::Undecided
+    );
+    assert_eq!(
+        Assigned::Presence(Presence::Present).presence(),
+        Presence::Present
+    );
+}
+
+/// A rigid is a leaf: it is not opened, because nothing supplies a value for
+/// one. What a scheme quantified is a [`Core::Bound`], and a rigid is what an
+/// annotation's own variable stands for while its body is being checked.
+#[test]
+fn a_rigid_is_a_leaf_that_opening_leaves_alone() {
+    let rigid = Rc::new(Ty::plain(Core::Rigid {
+        id: 4,
+        name: "r".into(),
+    }));
+    let opened = rigid.open(&[Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))]);
+    assert!(matches!(opened.core, Core::Rigid { id: 4, .. }));
+
+    // A sum's rest goes the same way, and prints as its name either side of
+    // the substitution.
+    let cases = Rc::new(Ty::plain(Core::Sum(Row::of(Rest::Rigid {
+        id: 5,
+        name: "s".into(),
+    }))));
+    assert_eq!(cases.to_string(), "| ..s");
+    let opened = cases.open(&[Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))]);
+    assert_eq!(opened.to_string(), "| ..s");
 }

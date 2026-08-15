@@ -34,6 +34,10 @@ pub enum Kind {
     Arrow,
     Colon,
     Comma,
+    /// `;`, separating the statements of a `where` clause. Nothing else in the
+    /// language writes one — a definition ends where the next `let` or `type`
+    /// begins — so this is the whole of what it is for.
+    Semicolon,
     Dot,
     /// `..`, the tail of a struct type: the fields not named, absent when the
     /// struct is written closed. Distinct from two [`Dot`](Kind::Dot)s the way
@@ -147,6 +151,10 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             }
             ',' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Comma));
+                chars.next();
+            }
+            ';' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Semicolon));
                 chars.next();
             }
             '.' => {

@@ -2,7 +2,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::Range,
     rc::Rc,
 };
 
@@ -85,6 +84,17 @@ impl Tail {
         }
     }
 
+    /// The `where let` variable this tail is, if it is one: its spelling and
+    /// its id. What a label demanded of it is refused by name.
+    fn rigid(&self) -> Option<(Rc<str>, u32)> {
+        match self {
+            Tail::Core(Core::Rigid { id, name }) | Tail::Rest(Rest::Rigid { id, name }) => {
+                Some((name.clone(), *id))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this tail absorbs whatever it is put against: a failure abandoned
     /// the question, so nothing it decides is worth deciding again.
     fn absorbs(&self) -> bool {
@@ -103,8 +113,16 @@ impl Tail {
     /// name is absent. Neither open nor abandoned is the whole of it: `Nat`
     /// carries the fields written beside it and no others, exactly as a closed
     /// row of cases allows the cases it names and no others.
+    ///
+    /// A rigid is not one, and that is the whole of what it costs the shared
+    /// label rule. It allows whatever its annotation's caller picks, so two
+    /// sides that name the same labels have not agreed merely by having no
+    /// extras between them — the tails still have to meet, and two rigids that
+    /// are not the same variable are two promises that cannot both be kept.
+    /// Nothing can be *pushed into* one either, which is what
+    /// [`Solve::absorb`] rules on separately.
     fn closed(&self) -> bool {
-        self.var().is_none() && !self.absorbs()
+        self.var().is_none() && !self.absorbs() && self.rigid().is_none()
     }
 
     /// Which of the two sets of labels this is a tail of, which is the reading
@@ -203,6 +221,21 @@ impl<'a> Rowed<'a> {
     }
 }
 
+/// Everything a [`ConstraintKind::Let`] says besides the name it binds: what
+/// the name stands for while its value is walked, the level that value was
+/// walked at, what its annotation promised, and the two constraint lists.
+///
+/// One value rather than seven arguments, because it is one thing: a nested
+/// binding's whole scoping, read off the constraint that recorded it.
+struct Scoping<'a> {
+    bound: &'a Rc<Ty>,
+    level: u32,
+    promised: &'a Formula,
+    rigids: &'a [u32],
+    value: &'a [Constraint],
+    body: &'a [Constraint],
+}
+
 /// Pass two: the solver, which sees constraints and never terms.
 pub struct Solve<'a> {
     pub table: &'a mut Table,
@@ -265,11 +298,21 @@ impl Solve<'_> {
                     symbol,
                     bound,
                     level,
-                    opened,
                     promised,
+                    rigids,
                     value,
                     body,
-                } => self.bind_local(*symbol, bound, *level, opened, promised, value, body),
+                } => self.bind_local(
+                    *symbol,
+                    &Scoping {
+                        bound,
+                        level: *level,
+                        promised,
+                        rigids,
+                        value,
+                        body,
+                    },
+                ),
                 ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
                 ConstraintKind::Performs {
                     performed,
@@ -379,23 +422,21 @@ impl Solve<'_> {
     /// The scheme is released when the body ends, the way lowering released the
     /// name. Nothing could reach it afterwards — a symbol is unique — but a
     /// scope that is not closed is a scope that is not a scope.
-    #[allow(clippy::too_many_arguments)]
-    fn bind_local(
-        &mut self,
-        symbol: Symbol,
-        bound: &Rc<Ty>,
-        level: u32,
-        opened: &Range<TyVar>,
-        promised: &Formula,
-        value: &[Constraint],
-        body: &[Constraint],
-    ) {
+    fn bind_local(&mut self, symbol: Symbol, scoping: &Scoping<'_>) {
+        let &Scoping {
+            bound,
+            level,
+            promised,
+            rigids,
+            value,
+            body,
+        } = scoping;
         self.table.level = level;
         self.run(value);
         // R23's closing rule, said about a nested binding on the same terms: a
         // `let` in the middle of a body is generalized exactly as one at the
         // top of a file is.
-        self.table.close_effects(bound, level, opened);
+        self.table.close_effects(bound, level);
         // A nested binding's scheme carries what the store requires of the
         // presences it quantifies, exactly as a definition's does — a `let` in
         // the middle of a body is generalized on the same terms as one at the
@@ -409,6 +450,10 @@ impl Solve<'_> {
         } else {
             self.table.required(bound)
         };
+        // A `where let` variable this binding did not declare means nothing in
+        // the scheme it is about to publish, exactly as it means nothing in a
+        // definition's. See [`Table::escapes`](super::Table).
+        self.table.escapes(bound, rigids, self.errors);
         let (scheme, _) = self.table.generalize(bound, level, required);
         self.table.level = level - 1;
         self.locals.insert(symbol, scheme.clone());
@@ -448,7 +493,7 @@ impl Solve<'_> {
     /// 1. [`Core::Undecided`] on either side absorbs, as it always has.
     /// 2. A *bare* variable — a [`Core::Var`] carrying no labels — takes the
     ///    whole type it is against, fields and all, which is what keeps
-    ///    `fn x => x` inferring `'a -> 'a`. Before unfolding, so that one
+    ///    `fn x => x` inferring `a -> a`. Before unfolding, so that one
     ///    against a declared type takes the type by the name it was written as:
     ///    a definition then reads as its annotation said, and the solver has one
     ///    less thing to unfold later.
@@ -604,6 +649,28 @@ impl Solve<'_> {
             (Core::Var(a), Core::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
+            }
+            // A `where let` variable is equal to itself and to nothing else.
+            // Two rigids with one id are the same variable however differently
+            // the two sides were reached; two with different ids are two
+            // promises about two independent choices the caller makes, and one
+            // is no more the other than `Nat` is.
+            (Core::Rigid { id: a, .. }, Core::Rigid { id: b, .. }) if a == b => {
+                self.step(span, Rule::Same, goal, Effect::None);
+                true
+            }
+            // Meeting anything else is the promise broken — except an unbound
+            // variable, which takes the rigid as it would take any other type
+            // and is left to the binding rules below. A declared name is not
+            // looked through first: what the reader wrote is the name, and
+            // unfolding it would quote them a shape they never put on the page.
+            (Core::Rigid { name, id }, other) if !matches!(other, Core::Var(_)) => {
+                let (name, id) = (name.clone(), *id);
+                self.rigid_broken(span, goal, name, id, rhs)
+            }
+            (other, Core::Rigid { name, id }) if !matches!(other, Core::Var(_)) => {
+                let (name, id) = (name.clone(), *id);
+                self.rigid_broken(span, goal, name, id, lhs)
             }
             // One declaration applied to nothing is only ever equal to itself,
             // so this saves an unfolding rather than deciding anything. Two
@@ -780,6 +847,39 @@ impl Solve<'_> {
     /// Named as the two whole types rather than as their cores: a `Nat` against
     /// `{ x: Nat }` is a mismatch of what the reader wrote, and the cores alone
     /// would quote them a unit they never mentioned.
+    /// A `where let` variable met something it cannot be: report it, abandon
+    /// what the goal was about, and say the labels beside them are not worth
+    /// deciding.
+    ///
+    /// [`mismatch`](Self::mismatch) about the one thing that is not a mismatch
+    /// of two written types. The reader is not shown two types that failed to
+    /// agree — one of them is a name standing in for a choice they handed to
+    /// their caller — so the complaint names what the expression turned out to
+    /// be and what it had promised to be, and points back at the declaration
+    /// that promised it.
+    ///
+    /// Recorded as [`Rule::Mismatch`], which is what it is: no rule applied.
+    fn rigid_broken(
+        &mut self,
+        span: Span,
+        goal: Goal,
+        name: Rc<str>,
+        id: u32,
+        found: &Rc<Ty>,
+    ) -> bool {
+        let error = Error {
+            span,
+            kind: ErrorKind::RigidBroken {
+                found: found.clone(),
+                name,
+                declared: self.table.declared(id),
+            },
+        };
+        let abandoned = [Assigned::Ty(found.clone())];
+        self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+        false
+    }
+
     fn mismatch(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         let error = Error {
             span,
@@ -995,6 +1095,22 @@ impl Solve<'_> {
             (Rest::Var(a), Rest::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
+            // The core rule's arms about a sum's rest, and the same rule: a
+            // declared rest is equal to itself, takes an unbound variable as
+            // any row would, and breaks its promise against anything else.
+            (Rest::Rigid { id: a, .. }, Rest::Rigid { id: b, .. }) if a == b => {
+                self.step(span, Rule::Same, goal, Effect::None)
+            }
+            (Rest::Rigid { name, id }, other) if !matches!(other, Rest::Var(_)) => {
+                let (name, id) = (name.clone(), *id);
+                let found = Rc::new(Ty::plain(Core::Sum((*have).clone())));
+                self.rigid_broken(span, goal, name, id, &found);
+            }
+            (other, Rest::Rigid { name, id }) if !matches!(other, Rest::Var(_)) => {
+                let (name, id) = (name.clone(), *id);
+                let found = Rc::new(Ty::plain(Core::Sum((*want).clone())));
+                self.rigid_broken(span, goal, name, id, &found);
+            }
             (Rest::Var(var), _) => {
                 let var = *var;
                 self.assign(span, goal, var, Assigned::Row(have));
@@ -1191,7 +1307,12 @@ impl Solve<'_> {
     ) {
         let shape = base.shape();
         let tail = base.tail;
-        if !tail.closed() {
+        let rigid = tail.rigid();
+        // A rigid takes nothing: it is not closed — it allows whatever its
+        // caller picks — but there is no variable to put the extras in either,
+        // so the labels are ruled on one at a time below, exactly as they are
+        // against a row that allows nothing more.
+        if rigid.is_none() && !tail.closed() {
             let value = rest.value(extras);
             let (expected, actual) = match side {
                 Side::Expected => (tail.bare(), value.clone()),
@@ -1214,6 +1335,34 @@ impl Solve<'_> {
 
         for (name, field) in &extras {
             let presence = self.table.presence_of(&field.presence);
+            // A label certainly there, demanded of a `where let` variable. The
+            // variable stands for whatever the caller picks, so it may not have
+            // one — and unlike a closed row, which at least lists what it does
+            // allow, there is nothing here to show the reader but the promise
+            // they made. This is what replaces the lacks bookkeeping for a
+            // rigid: nothing can ever be bound to one, so a demand on one is
+            // refused outright rather than recorded for later.
+            //
+            // A label still being decided is not a demand and is not refused:
+            // it settles absent below, the one answer the promise leaves open.
+            if let (Presence::Present, Some((rigid, id))) = (&presence, &rigid) {
+                let error = Error {
+                    span,
+                    kind: ErrorKind::RigidField {
+                        shape,
+                        field: name.clone(),
+                        name: rigid.clone(),
+                        declared: self.table.declared(*id),
+                    },
+                };
+                let goal = Goal::Presence {
+                    expected: Presence::Absent,
+                    actual: presence.clone(),
+                };
+                let abandoned = [Assigned::Ty(field.ty.clone())];
+                self.fail(span, Rule::Mismatch, goal, error, &abandoned);
+                continue;
+            }
             match (&presence, side) {
                 (Presence::Absent, _) => {}
                 // A label certainly there, against a closed tail on the
@@ -1489,7 +1638,7 @@ impl Solve<'_> {
     /// The cores and nothing else. What the two types hold besides them — a
     /// label's type, an arrow's halves — was not decided by the goal that
     /// failed, and a complaint already made names one of these two types: a
-    /// reader is better served by ``no field `y` on `'a -> 'a` `` than by the
+    /// reader is better served by ``no field `y` on `a -> a` `` than by the
     /// same sentence about `? -> ?`.
     fn abandon(&mut self, span: Span, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
         for core in [&lhs.core, &rhs.core] {
@@ -1556,7 +1705,7 @@ impl Solve<'_> {
                     self.recover_ty(span, arg);
                 }
             }
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit | Core::Nat | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided => {}
         }
         let fields = ty.fields.clone();
         self.recover_labels(span, &fields);

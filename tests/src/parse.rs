@@ -235,6 +235,76 @@ fn a_comparison_does_not_chain() {
     );
 }
 
+/// A `where` clause is a `;`-separated list of statements, and a declaration
+/// statement is the keyword `let` and one or more comma-separated names.
+/// Statements may appear in any order and may be interleaved, and several
+/// declaration statements accumulate their names.
+#[test]
+fn a_where_clause_is_a_statement_list() {
+    for src in [
+        // One declaration statement, which is the whole clause.
+        "let id : a -> a where let a = fn x => x",
+        // Several names in one, and several statements.
+        "let h : a -> b where let a, b = fn x => x",
+        "let h : a -> b where let a; let b = fn x => x",
+        // Interleaved with the constraints, in any order.
+        "let f : { x when a: A, y when b: B } where let a, b; a = b = z",
+        "let f : { x when a: A, y when b: B } where a = b; let a, b = z",
+        "let f : { x when a: A, y when b: B } where let a; a = b; let b = z",
+        // A constraint-only clause is what the language already had, and reads
+        // as one statement.
+        "let f : { x when a: A } where a = z",
+        // Three statements, and the last one still tells its `=` from the
+        // definition's.
+        "let f : { x when a: A, y when b: B } where let a; let b; a = b = z",
+        // And a declaration's body reads one too, for lowering to refuse.
+        "type T = { x: A } where let r",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// A `;` promises another statement, so a trailing one is the unexpected token
+/// it looks like — the treatment every other separator in the language gets.
+#[test]
+fn a_trailing_separator_is_unexpected() {
+    for src in [
+        "type T = { x when a: A } where a;",
+        "type T = { x when a: A } where let a;",
+        "let f : { x when a: A } where a; = z",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        let [error] = out.errors.as_slice() else {
+            panic!("{src:?}: expected one error: {:#?}", out.errors);
+        };
+        assert_eq!(error.kind, ErrorKind::Unexpected, "{src}");
+    }
+}
+
+/// `_` in a type is the hole — a position left for inference — so it parses
+/// wherever a type does, as often as one likes, and prints back as itself.
+#[test]
+fn a_type_hole_parses_as_a_type() {
+    for src in [
+        "let k : _ -> Nat = fn x => 0",
+        "let k : _ -> _ = fn x => x",
+        "let k : { x: _, y: _ } -> Nat = fn p => 0",
+        "let k : `Some _ | `None = nothing",
+        "let k : List _ = nil",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+
+    // And it is the node it says it is, rather than a name spelled `_`.
+    let out = parse(lex("let k : _ = 1", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let StmtKind::Let { ty, .. } = &out.stmts[0].tracked else {
+        panic!("expected a definition");
+    };
+    let ty = ty.as_ref().expect("it is annotated");
+    assert!(matches!(ty.ty.tracked, TypeKind::Hole), "{:#?}", ty.ty);
+}
+
 /// `_` names nothing, so a formula cannot be about it: `when _` mints a
 /// presence no clause may mention, and the `_` written in one gets the
 /// wildcard's own complaint worded for the type position it sits in.
@@ -1316,13 +1386,13 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         ("let a = match x with {_} => 0 end", Place::Pun),
         // A projection.
         ("let p = x._", Place::Projection),
-        // A `type` declaration's name and parameters, and a type expression —
-        // there is no inferred-type hole.
+        // A `type` declaration's name and its parameters, which are names
+        // rather than types — a `_` in a type is the hole, and reads.
         ("type _ = Nat", Place::Type),
         ("type T _ = Nat", Place::Type),
-        ("let f : _ -> Nat = fn x => x", Place::Type),
-        ("let f : List _ = nil", Place::Type),
-        ("let f : `Some _ | `None = nothing", Place::Type),
+        // And a name in a `where` clause's formula, which is written about a
+        // presence a `when` gave a name to.
+        ("let f : { x when a: Nat } where _ = { x: 1 }", Place::Type),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");

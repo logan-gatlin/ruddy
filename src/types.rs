@@ -70,11 +70,15 @@ pub enum Shape {
 /// can name the two readings without quoting a set of labels nobody asked
 /// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
 ///
-/// Three of them rather than four, because the rest of a struct *is* a type: a
-/// `..r` in a struct puts whatever is written for `r` in the type's core, and a
-/// core is a whole type. A sum's rest and an arrow's effects are readings of
-/// their own, for the reason [`Rest`] gives: neither is a position a whole type
-/// could go in.
+/// Four of them rather than two, because a `where let` variable can be two
+/// things a declaration's parameter never can: the presence a `when` names, and
+/// nothing here — the rest of a struct *is* a type, since `..r` in a struct
+/// puts whatever is written for `r` in the type's core. A sum's rest and an
+/// arrow's effects are readings of their own, for the reason [`Rest`] gives:
+/// neither is a position a whole type could go in.
+///
+/// [`ParamKind`] answers with the first three alone: a declaration binds no
+/// presence, so nothing there can ever be read the fourth way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
     Type,
@@ -82,6 +86,9 @@ pub enum Sense {
     /// The effects an arrow may perform: `..e` in `type Runner e = (Nat -> Nat
     /// ! ..e) -> Nat ! ..e`.
     Effects,
+    /// Whether one label is there — what a `when a` names and what a `where`
+    /// clause's formula is written about.
+    Presence,
 }
 
 /// What one parameter of a `type` declaration stands for.
@@ -187,12 +194,12 @@ pub enum Formula {
 /// A type closed over the variables it binds, and what it requires of the
 /// presences among them.
 ///
-/// Two numberings rather than one, because the two print in two alphabets: a
-/// type or a row variable is `'a`, and a presence is the bare `a` of a `when`
-/// clause. Sharing one index space would leave a visible gap — the scheme of
-/// `{x when a: Nat} -> 'a` should not call its one type variable `'b` — so
-/// [`Core::Bound`] and [`Rest::Bound`] index `count` while [`Presence::Bound`]
-/// and [`Atom::Bound`] index `presences`.
+/// One numbering, not two. Every variable a scheme quantifies prints as a bare
+/// letter — a type as `a`, a struct's rest as `..a`, a presence as `when a` —
+/// so two alphabets would be two things spelled the same way with nothing to
+/// tell them apart. The presences take the low positions, `0..presences`, and
+/// the types and rows the rest, `presences..count`, which is what lets a bare
+/// [`Ty`] be printed with no scheme beside it to ask.
 #[derive(Debug, Clone)]
 pub struct Scheme {
     count: u32,
@@ -289,6 +296,29 @@ pub enum Core {
     /// opens to a `Nat` carrying an `x` and `WithX { y: Nat }` to a struct
     /// carrying both — one substitution, and the one the compiler already had.
     Bound(u32),
+    /// A variable an annotation's `where let` declared, while the body under
+    /// that annotation is being checked.
+    ///
+    /// Rigid: equal only to a rigid with the same `id`, and never bound to
+    /// anything. That is the whole of what makes an annotation a promise rather
+    /// than a suggestion — a body that decides what `a` is meets this and is
+    /// refused at the expression that decided it, instead of being told
+    /// afterwards that the annotation as a whole was too open.
+    ///
+    /// `id` is unique per declaration occurrence across the whole program, so
+    /// two annotations that each write `a` never collide however alike they
+    /// look. `name` is the spelling, carried for the reason [`Core::Named`]
+    /// carries one: [`Display`](std::fmt::Display) is handed a bare type with no
+    /// table to ask.
+    ///
+    /// A leaf, unlike [`Core::Bound`]. Nothing supplies a value for it — the
+    /// scheme the annotation publishes re-quantifies it into a [`Core::Bound`]
+    /// at generalization — so the fields written beside one are the whole of
+    /// what a type carrying it says.
+    Rigid {
+        id: u32,
+        name: Rc<str>,
+    },
     /// A declared type, held as the name it was written as rather than as what
     /// it stands for, applied to whatever it was given.
     ///
@@ -396,6 +426,12 @@ pub enum Rest {
     /// A tail a scheme quantified, or one a declaration takes as a sum's rest.
     /// A leaf: what it stands for is supplied from outside.
     Bound(u32),
+    /// A rest an annotation's `where let` declared: [`Core::Rigid`] about a
+    /// sum's cases, and rigid for the same reason and on the same terms.
+    Rigid {
+        id: u32,
+        name: Rc<str>,
+    },
     /// A failure abandoned the question, or a reporter froze it. Absorbs, the
     /// way [`Core::Undecided`] does.
     Undecided,
@@ -541,6 +577,20 @@ impl Assigned {
                 _ => ty.cases(),
             },
             Assigned::Presence(_) => Row::closed(),
+        }
+    }
+
+    /// This value read as whether one label is there.
+    ///
+    /// [`as_ty`](Self::as_ty)'s twin at the third sort, and the one a scheme's
+    /// low positions are opened at. A type or a row arriving here would be a
+    /// scheme numbering a presence above its own `presences`, which nothing
+    /// builds — so, rather than a rule for it, there is a presence that says
+    /// nothing and absorbs the way every other unanswerable value does.
+    pub fn presence(&self) -> Presence {
+        match self {
+            Assigned::Presence(presence) => presence.clone(),
+            Assigned::Ty(_) | Assigned::Row(_) => Presence::Undecided,
         }
     }
 
@@ -690,14 +740,15 @@ impl Scheme {
         }
     }
 
-    /// How many type and row variables the scheme quantifies. Zero means the
-    /// type is monomorphic in those and instantiation copies nothing.
+    /// How many variables the scheme quantifies, of every sort together. Zero
+    /// means the type is monomorphic and instantiation copies nothing.
     pub fn count(&self) -> u32 {
         self.count
     }
 
-    /// How many presence variables the scheme quantifies — its own alphabet,
-    /// for the reason [`Scheme`] gives.
+    /// How many of them are presences, which is where the type and row
+    /// variables start: the low positions are the presences, for the reason
+    /// [`Scheme`] gives.
     pub fn presences(&self) -> u32 {
         self.presences
     }
@@ -859,10 +910,10 @@ impl Formula {
     /// there satisfies none. A presence nothing knows anything about claims
     /// nothing, which is [`Formula::True`] — the same answer the undecided type
     /// gives every question.
-    pub fn open(&self, presences: &[Presence]) -> Self {
+    pub fn open(&self, fresh: &[Assigned]) -> Self {
         self.substitute(&|atom| match atom {
             Atom::Var(var) => Formula::var(var),
-            Atom::Bound(index) => presences[index as usize].formula(),
+            Atom::Bound(index) => fresh[index as usize].presence().formula(),
         })
     }
 }

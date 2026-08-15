@@ -70,7 +70,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 node = node.at(span);
             }
             node = with_symbol(node, cx, mint, symbol);
-            // A declaration's parameters print as `'a`, `'b` in the meaning
+            // A declaration's parameters print as `a`, `b` in the meaning
             // above, because that is what they are once the body is lowered.
             // Which is unreadable on its own: these rows are what map each
             // letter back to the name it was written as, and to what it stands
@@ -312,7 +312,12 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
             names_in(to, out);
         }
         Core::Sum(cases) => names_in_row(cases, out),
-        Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+        Core::Unit
+        | Core::Nat
+        | Core::Var(_)
+        | Core::Bound(_)
+        | Core::Rigid { .. }
+        | Core::Undecided => {}
     }
     names_in_labels(&ty.fields, out);
 }
