@@ -160,10 +160,10 @@ fn a_full_application_is_one_direct_call() {
     assert_eq!(
         section(source, "global main"),
         "global main:\n\
-         \x20 %7: nat = const 1\n\
-         \x20 %8: nat = const 2\n\
-         \x20 %9: nat = call add, %7, %8\n\
-         \x20 ret %9"
+         \x20 %8: nat = const 1\n\
+         \x20 %9: nat = const 2\n\
+         \x20 %10: nat = call add, %8, %9\n\
+         \x20 ret %10"
     );
     assert_eq!(
         section(source, "fn add("),
@@ -178,13 +178,13 @@ fn a_partial_application_is_a_wrapper_closure() {
     let source = "let two = fn a => fn b => a\nlet part = two 1";
     assert_eq!(
         section(source, "global part"),
-        "global part:\n  %7: nat = const 1\n  %8: fn = closure two#2, [%7]\n  ret %8"
+        "global part:\n  %8: nat = const 1\n  %9: fn = closure two#2, [%8]\n  ret %9"
     );
     // The wrapper it names takes what was captured and then the argument left,
     // and hands the lot to the uncurried function.
     assert_eq!(
         section(source, "fn two#2"),
-        "fn two#2(%2: any, %4: any):\n  %5: any = call two, %2, %4\n  ret %5"
+        "fn two#2(%4: any, %5: any):\n  %6: any = call two, %4, %5\n  ret %6"
     );
 }
 
@@ -196,11 +196,11 @@ fn a_known_function_used_as_a_value_is_its_global() {
     let source = "let two = fn a => fn b => a\nlet bare = two";
     assert_eq!(
         section(source, "global bare"),
-        "global bare:\n  %7: fn = global two\n  ret %7"
+        "global bare:\n  %8: fn = global two\n  ret %8"
     );
     assert_eq!(
         section(source, "global two"),
-        "global two:\n  %6: fn = closure two#1, []\n  ret %6"
+        "global two:\n  %7: fn = closure two#1, []\n  ret %7"
     );
     assert_eq!(
         section(source, "fn two#1"),
@@ -216,12 +216,12 @@ fn an_over_application_calls_direct_and_then_indirectly() {
     assert_eq!(
         section(source, "global over"),
         "global over:\n\
-         \x20 %11: fn = global id\n\
-         \x20 %12: nat = const 1\n\
-         \x20 %13: fn = call two, %11, %12\n\
-         \x20 %14: nat = const 2\n\
-         \x20 %15: nat = call %13, %14\n\
-         \x20 ret %15"
+         \x20 %12: fn = global id\n\
+         \x20 %13: nat = const 1\n\
+         \x20 %14: fn = call two, %12, %13\n\
+         \x20 %15: nat = const 2\n\
+         \x20 %16: nat = call %14, %15\n\
+         \x20 ret %16"
     );
 }
 
@@ -523,25 +523,78 @@ fn an_effect_polymorphic_call_forwards_its_bundle() {
 }
 
 /// A call whose callee's variable part is not the caller's own gets a bundle
-/// built at the site, holding evidence for every effect the scope can handle.
+/// built at the site, holding evidence for every effect the scope can handle —
+/// and the function handed over, which takes a record of its own rather than a
+/// bundle, is wrapped in an adapter that reads its record back out.
 #[test]
 fn a_bundle_is_built_where_none_can_be_forwarded() {
-    let printed = section(
-        "effect Log = `write : Nat -> ()\n\
+    let source = "effect Log = `write : Nat -> ()\n\
          let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
          let logger : Nat -> Nat ! `Log = fn n => n\n\
-         let use = fn w => handle piped logger 1 with | Log.`write s => {} end",
-        "fn use(",
-    );
+         let use = fn w => handle piped logger 1 with | Log.`write s => {} end";
+    let printed = section(source, "fn use(");
     assert!(
-        printed.contains("%21: struct = struct { write: %20 }"),
+        printed.contains("%22: struct = struct { write: %21 }"),
         "{printed}"
     );
     assert!(
-        printed.contains("%24: struct = struct { Log: %21 }"),
+        printed.contains("%31: struct = struct { Log: %22 }"),
         "{printed}"
     );
-    assert!(printed.contains("call piped, %22, %24, %23"), "{printed}");
+    assert!(
+        printed.contains("%30: fn = closure use#3, [%23]"),
+        "{printed}"
+    );
+    assert!(printed.contains("call piped, %30, %31, %24"), "{printed}");
+    assert_eq!(
+        section(source, "fn use#3"),
+        "fn use#3(%25: fn, %26: struct, %27: nat):\n\
+         \x20 %28: struct = project %26, \"Log\"\n\
+         \x20 %29: nat = call %25, %28, %27\n\
+         \x20 ret %29"
+    );
+}
+
+/// The evidence a function is handed is the evidence it was compiled to read.
+///
+/// A function performing `Log` takes one record of `Log`'s operations; a
+/// parameter polymorphic in its effects is handed one bundle keyed by effect
+/// name. Passing the first into the second puts an adapter between them, so
+/// that the record the body projects `"write"` out of is the record the handler
+/// built — rather than the bundle holding it.
+#[test]
+fn a_function_receives_the_evidence_it_projects() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let logger : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let use = fn w => handle piped logger 1 with | Log.`write s => {} end";
+    // The record `logger` reads is its first parameter, and the wrapper that
+    // stands for `logger` as a value passes its own first parameter straight on.
+    assert!(
+        section(source, "fn logger(").contains("%13: fn = project %11, \"write\""),
+        "{}",
+        listing(source)
+    );
+    assert_eq!(
+        section(source, "fn logger#1"),
+        "fn logger#1(%15: struct, %16: nat):\n  %17: nat = call logger, %15, %16\n  ret %17"
+    );
+    // The adapter reads that record out of the bundle `piped` was declared to
+    // take, and the bundle the call built holds the handler's record under the
+    // effect's name.
+    assert_eq!(
+        section(source, "fn use#3"),
+        "fn use#3(%27: fn, %28: struct, %29: nat):\n\
+         \x20 %30: struct = project %28, \"Log\"\n\
+         \x20 %31: nat = call %27, %30, %29\n\
+         \x20 ret %31"
+    );
+    let use_ = section(source, "fn use(");
+    assert!(
+        use_.contains("%24: struct = struct { write: %23 }"),
+        "{use_}"
+    );
+    assert!(use_.contains("%33: struct = struct { Log: %24 }"), "{use_}");
 }
 
 /// An operation used as a value becomes a wrapper taking the effect's evidence
@@ -602,19 +655,19 @@ fn the_listing_is_the_canonical_format() {
          \x20 %3: fn = closure add#2, [%2]\n\
          \x20 ret %3\n\
          \n\
-         fn add#2(%2: any, %4: any):\n\
-         \x20 %5: any = call add, %2, %4\n\
-         \x20 ret %5\n\
-         \n\
-         global add:\n\
-         \x20 %6: fn = closure add#1, []\n\
+         fn add#2(%4: any, %5: any):\n\
+         \x20 %6: any = call add, %4, %5\n\
          \x20 ret %6\n\
          \n\
+         global add:\n\
+         \x20 %7: fn = closure add#1, []\n\
+         \x20 ret %7\n\
+         \n\
          global main:\n\
-         \x20 %7: nat = const 1\n\
-         \x20 %8: nat = const 2\n\
-         \x20 %9: nat = call add, %7, %8\n\
-         \x20 ret %9\n"
+         \x20 %8: nat = const 1\n\
+         \x20 %9: nat = const 2\n\
+         \x20 %10: nat = call add, %8, %9\n\
+         \x20 ret %10\n"
     );
 }
 
@@ -766,4 +819,302 @@ fn a_nested_binding_takes_a_bundle_of_its_own() {
         section("let outer = fn z => let g = fn h => h z in 0", "fn outer#2"),
         "fn outer#2(%3: any, %1: struct, %2: fn):\n  %4: any = call %2, %1, %3\n  ret %4"
     );
+}
+
+/// Every temp in a listing is defined exactly once, which is what lets the tab
+/// light `%17` wherever it appears without asking which function it is in. The
+/// curried wrappers are where that is easiest to lose: each one receives what
+/// the one before it captured, and names it with a temp of its own rather than
+/// borrowing the number it arrived under.
+#[test]
+fn every_temp_is_defined_once_in_the_whole_listing() {
+    for source in [
+        "let three = fn a => fn b => fn c => a\nlet p = three 1",
+        "effect Log = `write : Nat -> ()\n\
+         let shout = fn x => fn y => Log.`write x\n\
+         let go = fn w => handle shout 1 with | Log.`write n => {} end",
+        "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let logger : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let use = fn w => handle piped logger 1 with | Log.`write s => {} end",
+    ] {
+        let printed = listing(source);
+        let defined = definitions(&printed);
+        let mut once = defined.clone();
+        once.sort();
+        once.dedup();
+        assert!(!defined.is_empty(), "{printed}");
+        assert_eq!(once.len(), defined.len(), "{printed}");
+    }
+}
+
+/// Every temp a listing *defines*: the parameters of each header line, and the
+/// target of each instruction. A use is never at the head of a line, so what is
+/// left out is exactly the uses.
+fn definitions(printed: &str) -> Vec<String> {
+    let mut defined = Vec::new();
+    for line in printed.lines() {
+        let line = line.trim_start();
+        match line.strip_prefix("fn ") {
+            Some(signature) => {
+                let (_, params) = signature
+                    .split_once('(')
+                    .expect("a header line names its parameters");
+                for param in params.trim_end_matches("):").split(", ") {
+                    if let Some((temp, _)) = param.split_once(':') {
+                        defined.push(temp.to_string());
+                    }
+                }
+            }
+            None => {
+                if let Some((temp, _)) = line.split_once(':')
+                    && temp.starts_with('%')
+                {
+                    defined.push(temp.to_string());
+                }
+            }
+        }
+    }
+    defined
+}
+
+/// A value takes the evidence of the row it was written with, and the position
+/// it is handed to passes the evidence of the row *that* was declared with. The
+/// two agree here — both name `Log` and nothing else — so the function goes
+/// across as it is, with no adapter between.
+#[test]
+fn evidence_of_the_same_shape_is_handed_straight_over() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let takes : (Nat -> Nat ! `Log) -> Nat ! `Log = fn f => f 1\n\
+         let noisy = fn n => let z = Log.`write n in n\n\
+         let same = fn w => handle takes noisy with | Log.`write s => {} end";
+    let printed = section(source, "fn same(");
+    assert!(printed.contains("%22: fn = global noisy"), "{printed}");
+    assert!(
+        printed.contains("%23: nat = call takes, %21, %22"),
+        "{printed}"
+    );
+}
+
+/// A row that names `Log` and carries a variable part beside it is two pieces
+/// of evidence, and a position declaring only `Log` passes one. The adapter
+/// packs what it was given into the bundle the value expects, keyed by the
+/// effect's name, and hands the record itself over unchanged.
+#[test]
+fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let takes : (Nat -> Nat ! `Log) -> Nat ! `Log = fn f => f 1\n\
+         let openish : Nat -> Nat ! `Log | ..r where let r = fn n => let z = Log.`write n in n\n\
+         let packed = fn w => handle takes openish with | Log.`write s => {} end";
+    assert_eq!(
+        section(source, "fn openish("),
+        "fn openish(%8: struct, %9: struct, %10: nat):\n\
+         \x20 %11: fn = project %8, \"write\"\n\
+         \x20 %12: unit = call %11, %10\n\
+         \x20 ret %10"
+    );
+    assert_eq!(
+        section(source, "fn packed#3"),
+        "fn packed#3(%25: fn, %26: struct, %27: nat):\n\
+         \x20 %28: struct = struct { Log: %26 }\n\
+         \x20 %29: nat = call %25, %26, %28, %27\n\
+         \x20 ret %29"
+    );
+    let printed = section(source, "fn packed(");
+    assert!(
+        printed.contains("%30: fn = closure packed#3, [%24]"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("%31: nat = call takes, %23, %30"),
+        "{printed}"
+    );
+}
+
+/// The other way round: a position polymorphic in its effects passes one
+/// bundle, and the value wants a record of its own *and* a bundle beside it.
+/// The adapter reads the record out of the bundle by the effect's name and
+/// forwards the bundle as it stands — it is already the whole of the variable
+/// part.
+#[test]
+fn an_adapter_forwards_the_bundle_it_was_handed() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let hof2 : ((Nat -> Nat ! ..r) -> Nat ! ..r) -> Nat ! ..r where let r =\n\
+           fn k => k (fn m => m)\n\
+         let both = fn g => let z = Log.`write 1 in g 2\n\
+         let fwd = fn w => handle hof2 both with | Log.`write s => {} end";
+    assert!(
+        section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn):"),
+        "{}",
+        listing(source)
+    );
+    assert_eq!(
+        section(source, "fn fwd#3"),
+        "fn fwd#3(%31: fn, %32: struct, %33: fn):\n\
+         \x20 %34: struct = project %32, \"Log\"\n\
+         \x20 %35: any = call %31, %34, %32, %33\n\
+         \x20 ret %35"
+    );
+}
+
+/// A bundle is built out of every effect the scope can handle, and each is in
+/// it once however many frames between here and the handler carry it.
+#[test]
+fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let idn = fn n => n\n\
+         let outer : Nat -> Nat ! `Log = fn n =>\n\
+           let inner : Nat -> Nat ! `Log = fn q => piped idn q in inner n";
+    // Both `outer` and the `inner` lifted out of it take `Log`'s record, and
+    // the bundle built inside `inner` names the effect once — as the record
+    // `inner` itself was handed, which is the innermost one.
+    assert!(
+        section(source, "fn outer(").starts_with("fn outer(%15: struct, %16: nat):"),
+        "{}",
+        listing(source)
+    );
+    assert_eq!(
+        section(source, "fn outer#3"),
+        "fn outer#3(%17: struct, %18: nat):\n\
+         \x20 %19: fn = global idn\n\
+         \x20 %24: fn = closure outer#2, [%19]\n\
+         \x20 %25: struct = struct { Log: %17 }\n\
+         \x20 %26: nat = call piped, %24, %25, %18\n\
+         \x20 ret %26"
+    );
+}
+
+/// A row whose variable part is a label's own presence rather than a rest has
+/// no identity to share: the bundle standing for it is nobody else's, so a call
+/// out of it builds its own rather than forwarding the one in hand.
+#[test]
+fn a_bundle_with_no_identity_is_never_forwarded() {
+    let source = "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let idn = fn n => n\n\
+         let maybe : Nat -> Nat ! `Log (when a) where let a = fn n => piped idn n";
+    assert_eq!(
+        section(source, "fn maybe("),
+        "fn maybe(%15: struct, %16: nat):\n\
+         \x20 %17: fn = global idn\n\
+         \x20 %22: fn = closure maybe#2, [%17]\n\
+         \x20 %23: struct = struct {}\n\
+         \x20 %24: nat = call piped, %22, %23, %16\n\
+         \x20 ret %24"
+    );
+}
+
+/// Everything after a `raise` is unreachable, and none of it is emitted —
+/// neither the instructions a later expression would have assigned nor the
+/// terminator a second `raise` would have ended the block with.
+#[test]
+fn nothing_after_a_raise_is_emitted() {
+    assert_eq!(
+        section(
+            "effect Fail = `oops : () -> Nat\n\
+             let recover = fn w =>\n\
+               handle Fail.`oops () with\n\
+               | Fail.`oops z => let q = raise 0 in raise 1\n\
+               | return r => r end",
+            "fn recover#2"
+        ),
+        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0\n  throw %4, %3"
+    );
+}
+
+/// A callee written where it is called is nobody's top-level definition, so
+/// there is no arity to read off it: the closure is built and then called
+/// indirectly, one argument at a time.
+#[test]
+fn a_callee_written_inline_is_called_indirectly() {
+    assert_eq!(
+        section("let main = (fn n => n) 1", "global main"),
+        "global main:\n\
+         \x20 %1: fn = closure main#1, []\n\
+         \x20 %2: nat = const 1\n\
+         \x20 %3: nat = call %1, %2\n\
+         \x20 ret %3"
+    );
+}
+
+/// A sum position no arm looks into is not dispatched on: the one arm accepts
+/// every case, so there is nothing to tell apart and no `switch_tag` to write.
+#[test]
+fn a_sum_no_arm_tests_is_not_dispatched_on() {
+    assert_eq!(
+        section("let f = fn w => match `A with | y => 0 end", "fn f("),
+        "fn f(%0: any):\n  %1: sum = tag `A\n  %2: nat = const 0\n  ret %2"
+    );
+}
+
+/// One number written in two arms is one case of the dispatch, not two: the
+/// second arm joins the case the first opened rather than adding one that
+/// could never be reached.
+#[test]
+fn a_number_written_twice_in_one_column_is_one_case() {
+    let printed = section(
+        "let f = fn s => match s with | {a: 0, b: 0} => 1 | {a: 0, b: 1} => 2 | _ => 3 end",
+        "fn f(",
+    );
+    assert_eq!(printed.matches("switch_nat %1:").count(), 1, "{printed}");
+    assert_eq!(
+        printed.lines().filter(|line| line.trim() == "0 =>").count(),
+        2,
+        "{printed}"
+    );
+}
+
+/// A case the solved type proves absent is not a case left over: a dispatch
+/// listing every case a value may be needs no `else`, even where the arms
+/// list fewer labels than the row does.
+#[test]
+fn a_case_the_type_proves_absent_leaves_nothing_over() {
+    assert_eq!(
+        section(
+            "type T r = `A Nat | \\`B | ..r\n\
+             let f : T (`C Nat) -> Nat = fn v => match v with | `A n => n | `C n => n end",
+            "fn f("
+        ),
+        "fn f(%0: sum):\n\
+         \x20 %3: nat = switch_tag %0:\n\
+         \x20   `A =>\n\
+         \x20     %1: nat = payload %0\n\
+         \x20     yield %1\n\
+         \x20   `C =>\n\
+         \x20     %2: nat = payload %0\n\
+         \x20     yield %2\n\
+         \x20 ret %3"
+    );
+}
+
+/// Lowering runs on a program every earlier phase accepted, and says so rather
+/// than lowering one that is not: a name that did not resolve is a term with no
+/// value to compute.
+#[test]
+#[should_panic(expected = "LIR runs only on programs with no errors")]
+fn a_name_that_did_not_resolve_is_refused() {
+    forced("let f = q");
+}
+
+/// And a callee inference could not make a function of is a type there is no
+/// arrow to read: the same refusal, from the other end.
+#[test]
+#[should_panic(expected = "LIR runs only on programs with no errors")]
+fn a_callee_that_is_not_a_function_is_refused() {
+    forced("let f = 1 2");
+}
+
+/// Lowering a source the earlier phases did complain about, which is what the
+/// driver and the debugger both refuse to do. Only the refusals above use it.
+fn forced(source: &str) -> lir::Output {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let lexed = token::lex(source, file);
+    let parsed = parse::parse(lexed.tokens);
+    let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
+    let mut mint = Mint::new(bundle);
+    let mut built = ir::build(&mut mint, parsed.stmts);
+    let inferred = inference::infer(&mint, &mut built.program);
+    lir::lower(&mint, &built.program, &inferred)
 }

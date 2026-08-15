@@ -679,6 +679,41 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
     assert!(nodes[2].span.is_none(), "{:#?}", nodes[2]);
 }
 
+/// Evidence is plumbing rather than prose: the record of a handler's operations
+/// and the bundle a call builds for an effect-polymorphic callee are rows the
+/// reader never wrote, so they are marked generated and point at no source. The
+/// `catch` beside them is the `handle` the reader did write, and still does.
+#[test]
+fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
+    let nodes = tab(
+        "lir",
+        "effect Log = `write : Nat -> ()\n\
+         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
+         let logger : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
+         let use = fn w => handle piped logger 1 with | Log.`write s => {} end\n",
+    );
+    let rows = flatten(&nodes);
+    let row = |text: &str| {
+        rows.iter()
+            .find(|node| node.text.contains(text))
+            .unwrap_or_else(|| panic!("`{text}` is a row of:\n{rows:#?}"))
+    };
+
+    // The handler's record of operation closures, and the bundle the call to
+    // `piped` builds out of it.
+    for text in ["= struct { write: %", "= struct { Log: %"] {
+        let node = row(text);
+        assert!(node.generated, "{node:#?}");
+        assert!(node.span.is_none(), "{node:#?}");
+    }
+
+    // The `handle` itself is the reader's, and so is the perform inside the
+    // function the evidence reaches.
+    let caught = row("= catch %");
+    assert!(!caught.generated, "{caught:#?}");
+    assert!(caught.span.is_some(), "{caught:#?}");
+}
+
 /// A temp is one temp everywhere it appears, so the tab lights every occurrence
 /// of `%17` in the whole listing rather than only the ones in a row's own
 /// function. That is the pattern it declares, and it is deliberately not the

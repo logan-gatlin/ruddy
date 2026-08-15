@@ -29,7 +29,7 @@ use crate::{
     ir::{Handler, HandlerArm, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Presence, Rest, Row, Ty, TyVar},
+    types::{Core, Presence, Rest, Row, Ty},
 };
 
 /// A value the instruction stream names. Numbered by one program-wide counter,
@@ -233,6 +233,23 @@ pub enum Rep {
     Any,
 }
 
+/// The hidden evidence one arrow asks for: a record of operation closures per
+/// effect the arrow definitely performs, in row order, and then a bundle for
+/// whatever the variable part of its row stands for.
+///
+/// A function is compiled against the shape of the row it was *written* with,
+/// and every call has to hand it that same shape. The two need not agree —
+/// passing a function that performs `Log` into a parameter declared effect
+/// polymorphic turns a record of its own into one entry of a bundle — so where
+/// they differ an adapter stands between them; see [`Lower::fitted`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Shape {
+    /// The definitely performed effects, in row order: one record each.
+    names: Vec<String>,
+    /// Whether a bundle keyed by effect name follows those records.
+    tail: bool,
+}
+
 /// One arrow of a known function's signature: what that level takes, what it
 /// gives back, the effects it may perform, and how many hidden evidence
 /// parameters those effects come to.
@@ -254,6 +271,9 @@ struct Known {
     /// argument `k` given the `k` before it.
     wrappers: Vec<FuncId>,
     levels: Vec<Level>,
+    /// The type the wrappers were built against, which is the type naming the
+    /// definition as a value stands for however it is instantiated at the use.
+    ty: Rc<Ty>,
 }
 
 /// What the variable part of an effect row is, so that a caller can tell whether
@@ -261,11 +281,11 @@ struct Known {
 /// bundle instead of building a new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestKey {
-    Var(TyVar),
+    /// The row variable a scheme quantified, which is the one identity two
+    /// rows can be known to share.
     Bound(u32),
-    /// A variable part with no identity to share: a rigid, a row a failure
-    /// abandoned, or a closed row one of whose labels is only *maybe* there.
-    /// Never forwarded.
+    /// A variable part with no identity to share: a closed row one of whose
+    /// labels is only *maybe* there. Never forwarded.
     Open,
 }
 
@@ -478,27 +498,30 @@ fn tail_key(row: &Row) -> Option<RestKey> {
         )
     });
     match &row.rest {
-        Rest::Var(var) => Some(RestKey::Var(*var)),
         Rest::Bound(index) => Some(RestKey::Bound(*index)),
-        // A rest an annotation made rigid is closed back into a `Bound` at
-        // generalization, and one a failure abandoned belongs to a program this
-        // pass is never handed — so neither has an identity worth sharing, and
-        // both get a bundle built for them rather than one forwarded.
-        Rest::Rigid { .. } | Rest::Undecided => Some(RestKey::Open),
-        // `More` cannot reach here: every row asked is flattened first.
-        Rest::Closed | Rest::More(_) => wobbly.then_some(RestKey::Open),
+        // Every other rest is one with no identity to share. `More` cannot
+        // reach here: every row asked is flattened first. A rest still a solver
+        // variable, one an annotation made rigid and one a failure abandoned
+        // are all R2's to rule out — it hands this pass solved rows alone — so
+        // what is left is the closed row, whose variable part is a label whose
+        // own presence is a variable and nothing else.
+        _ => wobbly.then_some(RestKey::Open),
     }
 }
 
-/// How many hidden parameters one arrow's effects come to: one per definitely
-/// performed effect, plus the tail bundle when the row has a variable part.
-fn evidence_arity(row: &Row) -> usize {
-    let definite = row
-        .labels
-        .values()
-        .filter(|field| definite(&field.presence))
-        .count();
-    definite + usize::from(tail_key(row).is_some())
+/// The hidden evidence one arrow's effect row comes to: a record per definitely
+/// performed effect, in row order, and a tail bundle where the row has a
+/// variable part.
+fn shape(row: &Row) -> Shape {
+    Shape {
+        names: row
+            .labels
+            .iter()
+            .filter(|(_, field)| definite(&field.presence))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        tail: tail_key(row).is_some(),
+    }
 }
 
 /// The `fn` nest at the head of a term, and the body underneath it. The nest's
@@ -560,6 +583,13 @@ fn cell(pattern: &Pattern) -> Cell {
 /// position it sits at is worth reading out of the value.
 fn tests(cell: &Cell) -> bool {
     !matches!(cell, Cell::Wild(None))
+}
+
+impl Shape {
+    /// How many hidden parameters the shape comes to.
+    fn arity(&self) -> usize {
+        self.names.len() + usize::from(self.tail)
+    }
 }
 
 impl RestKey {
@@ -625,7 +655,7 @@ impl Lower<'_> {
                 .map(|(node, _)| {
                     let (from, to, row) = self.arrow(&node.ty);
                     Level {
-                        evidence: evidence_arity(&row),
+                        evidence: shape(&row).arity(),
                         from,
                         to,
                         row,
@@ -643,6 +673,7 @@ impl Lower<'_> {
                     lifted,
                     wrappers,
                     levels,
+                    ty: decl.value.ty.clone(),
                 },
             );
         }
@@ -725,17 +756,46 @@ impl Lower<'_> {
     /// effect row flattened.
     ///
     /// Every position that asks holds a term inference gave an arrow to: a `fn`
-    /// is built as one, an operation's type is one, and a callee that is not one
-    /// is a program inference refused. A type that is somehow not an arrow
-    /// answers as the pure arrow over nothing, which keeps the pass total
-    /// without deciding anything.
+    /// is built as one, an operation's type is one, a value handed to a
+    /// parameter has the type that parameter was declared with, and a callee
+    /// that is none of those is a program inference refused — which R2 says
+    /// this pass is never handed.
     fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
         let ty = unfold(&self.inference.aliases, ty);
-        match &ty.core {
-            Core::Arrow(from, to, row) => (from.clone(), to.clone(), flat(row)),
-            // The undecided type either side of a pure arrow over nothing.
-            _ => Default::default(),
+        let Core::Arrow(from, to, row) = &ty.core else {
+            panic!("LIR runs only on programs with no errors");
+        };
+        (from.clone(), to.clone(), flat(row))
+    }
+
+    /// The type a value's evidence was built against, which is not always the
+    /// type the use site gives it.
+    ///
+    /// Naming a definition whose value is a nest of `fn`s hands over wrappers
+    /// built once, from the row that definition was written with — so however
+    /// the use instantiates the row, what arrives is still the shape the
+    /// wrappers take. Everything else was built where it was written, and there
+    /// its own solved type is the whole story.
+    fn built(&self, term: &Term) -> Rc<Ty> {
+        match &term.kind {
+            TermKind::Ident(symbol) => match self.known.get(symbol) {
+                Some(known) => known.ty.clone(),
+                None => term.ty.clone(),
+            },
+            _ => term.ty.clone(),
         }
+    }
+
+    /// Whether a value whose evidence was built for `have` can be called where
+    /// `want` was declared: the same evidence, in the same order, at every level
+    /// a call walks down.
+    fn fits(&self, want: &Rc<Ty>, have: &Rc<Ty>) -> bool {
+        if self.rep(want) != Rep::Fn {
+            return true;
+        }
+        let (_, want_to, want_row) = self.arrow(want);
+        let (_, have_to, have_row) = self.arrow(have);
+        shape(&want_row) == shape(&have_row) && self.fits(&want_to, &have_to)
     }
 
     /// Lower one top-level definition: its functions, and the global that gives
@@ -834,14 +894,24 @@ impl Lower<'_> {
     /// Each takes the arguments and evidence gathered so far as captures, its own
     /// level's evidence and argument as parameters, and hands the lot to the next
     /// wrapper — or, at the last level, to the uncurried function itself. So the
-    /// captures of one wrapper are exactly the parameters of the one before it,
-    /// which is what lets a partial application at any depth build the right
-    /// closure without knowing how the chain is wired.
+    /// captures of one wrapper are exactly as many values, held exactly as, the
+    /// parameters of the one before it, which is what lets a partial application
+    /// at any depth build the right closure without knowing how the chain is
+    /// wired.
+    ///
+    /// What travels from one step to the next is the representations, not the
+    /// temps: a temp is assigned once in the whole listing, so the wrapper that
+    /// receives a captured value names it with a temp of its own, exactly as
+    /// [`Lower::thread`] does for the captures of a lifted `fn`.
     fn curried(&mut self, known: &Known) {
         let last = known.levels.len() - 1;
-        let mut carried: Vec<Param> = Vec::new();
+        let mut carried: Vec<Rep> = Vec::new();
         for (step, level) in known.levels.iter().enumerate() {
-            let mut params = carried.clone();
+            let mut params: Vec<Param> = Vec::new();
+            for rep in &carried {
+                let temp = self.fresh(*rep);
+                params.push(Param { temp, rep: *rep });
+            }
             for _ in 0..level.evidence {
                 let temp = self.fresh(Rep::Struct);
                 params.push(Param {
@@ -877,16 +947,16 @@ impl Lower<'_> {
                 kind: End::Ret(value),
             });
             let id = known.wrappers[step];
+            carried = params.iter().map(|param| param.rep).collect();
             self.fill(
                 id,
                 Function {
                     name: self.labels[id].clone(),
-                    params: params.clone(),
+                    params,
                     body,
                     span: Span::default(),
                 },
             );
-            carried = params;
         }
     }
 
@@ -914,13 +984,7 @@ impl Lower<'_> {
     /// built: one per definitely performed effect, in row order, then the tail
     /// bundle where the row has a variable part.
     fn evidence_params(&mut self, row: &Row, params: &mut Vec<Param>) {
-        let names: Vec<String> = row
-            .labels
-            .iter()
-            .filter(|(_, field)| definite(&field.presence))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in names {
+        for name in shape(row).names {
             let temp = self.fresh(Rep::Struct);
             params.push(Param {
                 temp,
@@ -941,21 +1005,143 @@ impl Lower<'_> {
     /// The evidence one call site has to hand a callee whose arrow performs
     /// `row`: what is in scope for each definitely performed effect, and a
     /// bundle for the variable part.
-    fn evidence_args(&mut self, row: &Row, span: Span, body: &mut Body) -> Vec<Temp> {
+    fn evidence_args(&mut self, row: &Row, body: &mut Body) -> Vec<Temp> {
         let mut args = Vec::new();
-        let names: Vec<String> = row
-            .labels
-            .iter()
-            .filter(|(_, field)| definite(&field.presence))
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in names {
+        for name in shape(row).names {
             args.push(self.evidence_of(&name));
         }
         if let Some(key) = tail_key(row) {
-            args.push(self.bundle(key, span, body));
+            args.push(self.bundle(key, body));
         }
         args
+    }
+
+    /// One visible argument, fitted to the evidence the position it goes into
+    /// was compiled to hand over.
+    ///
+    /// A function takes the evidence of the row it was *written* with, and the
+    /// call passes the evidence of the row the position it fills was
+    /// *declared* with. Those name the same effects and need not put them the
+    /// same way round: handing a function that performs `Log` to a parameter
+    /// polymorphic in its effects makes that function's own record one entry of
+    /// a bundle, and handing an effect-polymorphic function to a parameter that
+    /// names `Log` does the reverse. Where the two shapes differ an adapter
+    /// stands between them, taking what the declaration passes, rebuilding out
+    /// of it what the value expects, and calling the value — which is code
+    /// nobody wrote, so all of it is generated.
+    fn fitted(&mut self, want: &Rc<Ty>, have: &Rc<Ty>, temp: Temp, body: &mut Body) -> Temp {
+        if self.fits(want, have) {
+            return temp;
+        }
+        let (want_from, want_to, want_row) = self.arrow(want);
+        let (_, have_to, have_row) = self.arrow(have);
+        let want_shape = shape(&want_row);
+        let have_shape = shape(&have_row);
+
+        self.frames.push(Frame::default());
+        let wrapped = self.thread(self.frames.len() - 2, temp);
+        let mut params: Vec<Param> = Vec::new();
+        let mut records: IndexMap<String, Temp> = IndexMap::new();
+        for name in &want_shape.names {
+            let record = self.fresh(Rep::Struct);
+            params.push(Param {
+                temp: record,
+                rep: Rep::Struct,
+            });
+            records.insert(name.clone(), record);
+        }
+        let mut carried = None;
+        if want_shape.tail {
+            let bundle = self.fresh(Rep::Struct);
+            params.push(Param {
+                temp: bundle,
+                rep: Rep::Struct,
+            });
+            carried = Some(bundle);
+        }
+        let rep = self.rep(&want_from);
+        let arg = self.fresh(rep);
+        params.push(Param { temp: arg, rep });
+
+        let mut lifted = Body::default();
+        let mut args: Vec<Temp> = Vec::new();
+        for name in &have_shape.names {
+            // A record the declaration passes on its own is handed straight
+            // over; one it does not is inside the bundle it passes instead,
+            // which is keyed by effect name.
+            let record = match records.get(name) {
+                Some(record) => *record,
+                None => {
+                    let bundle = carried
+                        .expect("the position a value fills accounts for every effect it performs");
+                    self.emit(
+                        &mut lifted,
+                        Span::default(),
+                        Rep::Struct,
+                        Op::Project {
+                            base: bundle,
+                            field: name.clone(),
+                        },
+                    )
+                }
+            };
+            args.push(record);
+        }
+        if have_shape.tail {
+            // A declaration naming no effect of its own passes the whole
+            // variable part as the one bundle it was given, and what the value
+            // calls its tail is that same bundle. Otherwise the variable part
+            // the value stands for is what the declaration named, keyed by
+            // effect name.
+            let alone = records.is_empty();
+            let bundle = match carried.filter(|_| alone) {
+                Some(bundle) => bundle,
+                None => self.emit(
+                    &mut lifted,
+                    Span::default(),
+                    Rep::Struct,
+                    Op::Struct(records),
+                ),
+            };
+            args.push(bundle);
+        }
+        args.push(arg);
+        let called = self.emit(
+            &mut lifted,
+            Span::default(),
+            self.rep(&have_to),
+            Op::Call {
+                callee: Callee::Indirect(wrapped),
+                args,
+            },
+        );
+        // What comes back is the value's next level, and the caller will go on
+        // calling it as the declaration's — so the same fitting applies again.
+        let value = self.fitted(&want_to, &have_to, called, &mut lifted);
+        let lifted = lifted.seal(Terminator {
+            span: Span::default(),
+            kind: End::Ret(value),
+        });
+        let frame = self.frames.pop().expect("the frame just pushed");
+        let name = self.lifted_name();
+        let id = self.slot(name.clone());
+        let captures: Vec<Temp> = frame.captures.iter().map(|capture| capture.outer).collect();
+        let params = Self::with_captures(&frame, params);
+        self.fill(
+            id,
+            Function {
+                name,
+                params,
+                body: lifted,
+                span: Span::default(),
+            },
+        );
+        self.emit(
+            body,
+            Span::default(),
+            Rep::Fn,
+            Op::Closure { func: id, captures },
+        )
     }
 
     /// The record of one effect's operations, as this scope has it — captured
@@ -977,7 +1163,10 @@ impl Lower<'_> {
     /// The bundle standing in for a row's variable part: the caller's own, when
     /// caller and callee share the very same variable part, and otherwise a
     /// fresh record of everything the scope can handle.
-    fn bundle(&mut self, key: RestKey, span: Span, body: &mut Body) -> Temp {
+    ///
+    /// A record built here is evidence plumbing rather than anything the reader
+    /// wrote, so it carries no span and the debugger marks it generated.
+    fn bundle(&mut self, key: RestKey, body: &mut Body) -> Temp {
         let found = self
             .frames
             .iter()
@@ -1011,7 +1200,7 @@ impl Lower<'_> {
                 (name, temp)
             })
             .collect();
-        self.emit(body, span, Rep::Struct, Op::Struct(entries))
+        self.emit(body, Span::default(), Rep::Struct, Op::Struct(entries))
     }
 
     /// The handler identity a `raise` here unwinds to, captured in if the arm it
@@ -1147,7 +1336,7 @@ impl Lower<'_> {
             }
             // R2 keeps this out of reach: a name that did not resolve is one of
             // lowering's own errors, and LIR runs only where there were none.
-            TermKind::Error => unreachable!("LIR runs only on programs with no errors"),
+            TermKind::Error => panic!("LIR runs only on programs with no errors"),
         }
     }
 
@@ -1271,25 +1460,28 @@ impl Lower<'_> {
         let mut carrying = head.ty.clone();
         for (node, written) in &applies {
             let arg = self.term(written, body);
-            callee = self.indirect(&carrying, callee, arg, node, body);
+            callee = self.indirect(&carrying, callee, written, arg, node, body);
             carrying = node.ty.clone();
         }
         callee
     }
 
     /// One indirect call: the evidence the callee's own arrow asks for, then the
-    /// one visible argument.
+    /// one visible argument, fitted to what that arrow declares of it.
+    #[allow(clippy::too_many_arguments)]
     fn indirect(
         &mut self,
         callee_ty: &Rc<Ty>,
         callee: Temp,
+        written: &Term,
         arg: Temp,
         node: &Term,
         body: &mut Body,
     ) -> Temp {
-        let (_, _, row) = self.arrow(callee_ty);
-        let mut args = self.evidence_args(&row, node.span, body);
-        args.push(arg);
+        let (from, _, row) = self.arrow(callee_ty);
+        let mut args = self.evidence_args(&row, body);
+        let have = self.built(written);
+        args.push(self.fitted(&from, &have, arg, body));
         let rep = self.rep(&node.ty);
         self.emit(
             body,
@@ -1340,7 +1532,7 @@ impl Lower<'_> {
         let mut carrying = first.ty.clone();
         for (node, written) in &applies[1..] {
             let arg = self.term(written, body);
-            value = self.indirect(&carrying, value, arg, node, body);
+            value = self.indirect(&carrying, value, written, arg, node, body);
             carrying = node.ty.clone();
         }
         value
@@ -1358,9 +1550,10 @@ impl Lower<'_> {
         // evidence around them is this pass's own, and goes in afterwards.
         let span = applies[0].0.span;
         let mut full: Vec<Temp> = Vec::new();
-        for (level, arg) in known.levels.iter().zip(&args) {
-            full.extend(self.evidence_args(&level.row, span, body));
-            full.push(*arg);
+        for ((level, (_, written)), arg) in known.levels.iter().zip(applies).zip(&args) {
+            full.extend(self.evidence_args(&level.row, body));
+            let have = self.built(written);
+            full.push(self.fitted(&level.from, &have, *arg, body));
         }
 
         let mut value = match taken == arity {
@@ -1395,7 +1588,7 @@ impl Lower<'_> {
         let mut carrying = applies[taken - 1].0.ty.clone();
         for (node, written) in &applies[taken..] {
             let arg = self.term(written, body);
-            value = self.indirect(&carrying, value, arg, node, body);
+            value = self.indirect(&carrying, value, written, arg, node, body);
             carrying = node.ty.clone();
         }
         value
@@ -1421,7 +1614,9 @@ impl Lower<'_> {
                 let closure = self.arm(arm, body);
                 entries.insert(arm.op.tracked.clone(), closure);
             }
-            let record = self.emit(body, span, Rep::Struct, Op::Struct(entries));
+            // The record itself is evidence plumbing: the arms in it are the
+            // reader's, the record holding them is this pass's own.
+            let record = self.emit(body, Span::default(), Rep::Struct, Op::Struct(entries));
             records.push((name, record));
         }
         self.top().raise_tag = held_tag;
