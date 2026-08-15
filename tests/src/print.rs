@@ -579,8 +579,13 @@ fn a_printed_effect_row_re_lowers_to_itself() {
     for (annotation, expected) in [
         ("Nat -> Nat ! `Log", "Nat -> Nat ! `Log"),
         ("Nat -> Nat ! `Log | `IO", "Nat -> Nat ! `Log | `IO"),
-        ("Nat -> Nat ! ..e", "Nat -> Nat ! ..'a"),
-        ("Nat -> Nat ! `Log | ..e", "Nat -> Nat ! `Log | ..'a"),
+        // The scheme spells its quantifiers positionally, so a declared `e`
+        // comes back as the letter its position earns.
+        ("Nat -> Nat ! ..e where let e", "Nat -> Nat ! ..a where let a"),
+        (
+            "Nat -> Nat ! `Log | ..e where let e",
+            "Nat -> Nat ! `Log | ..a where let a",
+        ),
         // Both spellings of pure.
         ("Nat -> Nat", "Nat -> Nat"),
         ("Nat -> Nat ! |", "Nat -> Nat"),
@@ -589,8 +594,8 @@ fn a_printed_effect_row_re_lowers_to_itself() {
         ("Nat -> (Nat -> Nat) ! `Log", "Nat -> (Nat -> Nat) ! `Log"),
         // A `where` clause on effect presences prints as it was written.
         (
-            "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b",
-            "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b",
+            "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b",
+            "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b",
         ),
     ] {
         // Two arguments where the annotation takes two, so that pushing the
@@ -604,12 +609,10 @@ fn a_printed_effect_row_re_lowers_to_itself() {
         let (_, scheme) = types_of(&source);
         assert_eq!(scheme, expected, "{annotation}");
         // What was printed, read back: the scheme of a definition annotated
-        // with it is the same scheme. Only where the printed form is one a
-        // reader could have written, which a quantified tail is not.
-        if !scheme.contains('\'') {
-            let again = format!("{effects}let f : {scheme} = {body}");
-            assert_eq!(types_of(&again).1, expected, "{annotation}");
-        }
+        // with it is the same scheme — a printed scheme is valid source, the
+        // declared tail included.
+        let again = format!("{effects}let f : {scheme} = {body}");
+        assert_eq!(types_of(&again).1, expected, "{annotation}");
     }
 }
 
@@ -639,8 +642,10 @@ fn both_trees_render_the_effect_forms() {
         "effect Nil = |",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
-        "effect Log = | `write : Nat -> {}\nlet f : Nat -> Nat ! \\`Log | ..e = fn x => x",
-        "effect Log = | `write : Nat -> {}\nlet f : Nat -> Nat ! `Log (when a) | ..e = fn x => x",
+        "effect Log = | `write : Nat -> {}\n\
+         let f : Nat -> Nat ! \\`Log | ..e where let e = fn x => x",
+        "effect Log = | `write : Nat -> {}\n\
+         let f : Nat -> Nat ! `Log (when a) | ..e where let a, e = fn x => x",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");

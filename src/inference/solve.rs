@@ -88,9 +88,12 @@ impl Tail {
     /// its id. What a label demanded of it is refused by name.
     fn rigid(&self) -> Option<(Rc<str>, u32)> {
         match self {
-            Tail::Core(Core::Rigid { id, name }) | Tail::Rest(Rest::Rigid { id, name }) => {
-                Some((name.clone(), *id))
-            }
+            Tail::Core(Core::Rigid { id, name })
+            | Tail::Rest(Rest::Rigid { id, name })
+            | Tail::Effects {
+                rest: Rest::Rigid { id, name },
+                ..
+            } => Some((name.clone(), *id)),
             _ => None,
         }
     }

@@ -234,15 +234,10 @@ fn no_subterm_keeps_a_solver_variable() {
             // The argument's own effect row is no part of `a`'s type, so R23's
             // closing rule never reaches it and it is named like every other
             // variable a subterm leaves over.
-            "('a -> 'a ! ..'b) -> Nat",
-            "Nat -> ('a -> 'a ! ..'b) -> Nat",
+            "(a -> a ! ..b) -> Nat",
+            "Nat -> (a -> a ! ..b) -> Nat",
             "Nat",
-            "'a -> 'a ! ..'b",
-            "'a",
-            "(a -> a) -> Nat",
-            "Nat -> (a -> a) -> Nat",
-            "Nat",
-            "a -> a",
+            "a -> a ! ..b",
             "a",
         ]
     );
@@ -1641,22 +1636,19 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
     assert_eq!(
         steps(&mint, &output, "h"),
         [
-            "bind  { x: Nat, ..?4 } ~ ?2 => ?2 := { x: Nat, ..?4 }",
+            // The annotation's own `r` is a rigid rather than a minted
+            // variable, so `h`'s numbering starts right after its own three.
+            "bind  { x: Nat, ..?3 } ~ ?1 => ?1 := { x: Nat, ..?3 }",
             // `g` performs nothing, so each application opens an empty row
             // into `h`'s own — which decides nothing about it.
-            "performs  ∅ ~ ?3 => replaced by the goals below",
-            "  bind  ?5 ~ ?3 => ?5 := ?3",
-            "struct  { y: Nat, ..?4 } ~ { x: Nat, ..?4 } => replaced by the goals below",
-            "  occurs  { y: Nat, ..?4 } ~ { x: Nat, ..?4 } => this type would have to contain itself",
-            "  recover  ?4 ~ ? => ?4 := ?",
-            "performs  ∅ ~ ?3 => replaced by the goals below",
-            "  bind  ?6 ~ ?3 => ?6 := ?3",
-            "bind  ?1 ~ ?2 -> Nat ! ..?3 => ?1 := ?2 -> Nat ! ..?3",
-            "bind  { x: Nat, ..?2 } ~ ?1 => ?1 := { x: Nat, ..?2 }",
-            "struct  { y: Nat, ..?2 } ~ { x: Nat, ..?2 } => replaced by the goals below",
-            "  occurs  { y: Nat, ..?2 } ~ { x: Nat, ..?2 } => this type would have to contain itself",
-            "  recover  ?2 ~ ? => ?2 := ?",
-            "bind  ?0 ~ ?1 -> Nat => ?0 := ?1 -> Nat",
+            "performs  ∅ ~ ?2 => replaced by the goals below",
+            "  bind  ?4 ~ ?2 => ?4 := ?2",
+            "struct  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => replaced by the goals below",
+            "  occurs  { y: Nat, ..?3 } ~ { x: Nat, ..?3 } => this type would have to contain itself",
+            "  recover  ?3 ~ ? => ?3 := ?",
+            "performs  ∅ ~ ?2 => replaced by the goals below",
+            "  bind  ?5 ~ ?2 => ?5 := ?2",
+            "bind  ?0 ~ ?1 -> Nat ! ..?2 => ?0 := ?1 -> Nat ! ..?2",
         ]
     );
 }
@@ -3485,9 +3477,7 @@ fn every_projection_complaint_underlines_the_field_it_read() {
         // The lambda's own effect row is no part of `a`'s type, so R23's
         // closing rule never reaches it and generalization names it as it
         // names every other leftover.
-        ("let a = (fn x => x).y", "no field `y` on `'a -> 'a ! ..'b`"),
-        ("let a = (`A 1).x", "no field `x` on ``A Nat | ..'a`"),
-        ("let a = (fn x => x).y", "no field `y` on `a -> a`"),
+        ("let a = (fn x => x).y", "no field `y` on `a -> a ! ..b`"),
         ("let a = (`A 1).x", "no field `x` on ``A Nat | ..a`"),
         ("let a = { y: 1 }.x", "no field `x` on `{ y: Nat }`"),
     ] {
@@ -5572,14 +5562,14 @@ fn an_effect_variable_that_links_nothing_is_closed() {
          let apply = fn f x => f x\n\
          let id = fn x => x",
     );
-    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
+    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
     assert_eq!(
         scheme(&mint, &output, "apply"),
-        "('a -> 'b ! ..'c) -> 'a -> 'b ! ..'c"
+        "(a -> b ! ..c) -> a -> b ! ..c where let a, b, c"
     );
     assert_eq!(
         scheme(&mint, &output, "compose"),
-        "('a -> 'b ! ..'c) -> ('d -> 'a ! ..'c) -> 'd -> 'b ! ..'c"
+        "(a -> b ! ..c) -> (d -> a ! ..c) -> d -> b ! ..c where let a, b, c, d"
     );
 
     let (mint, _, output) = inferred(&format!(
@@ -5610,7 +5600,7 @@ fn a_handler_discharges_what_its_arms_cover() {
     // own row.
     assert_eq!(
         scheme(&mint, &output, "run"),
-        "({} -> 'a ! `Log | ..'b) -> 'a ! ..'b"
+        "({} -> a ! `Log | ..b) -> a ! ..b where let a, b"
     );
 }
 
@@ -5651,8 +5641,8 @@ fn the_return_arm_decides_the_answer() {
         "{EFFECTS}let ret = fn _ => handle 1 with | return x => {{}} end\n\
          let same = fn _ => handle 1 with end"
     ));
-    assert_eq!(scheme(&mint, &output, "ret"), "'a -> {}");
-    assert_eq!(scheme(&mint, &output, "same"), "'a -> Nat");
+    assert_eq!(scheme(&mint, &output, "ret"), "a -> {} where let a");
+    assert_eq!(scheme(&mint, &output, "same"), "a -> Nat where let a");
 }
 
 /// An arm's body has to be what the operation gives back, whatever the handler
@@ -5763,30 +5753,34 @@ fn re_performing_a_discharged_effect_is_refused() {
 #[test]
 fn presence_written_on_an_effect_survives_into_the_scheme() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where a != b = fn x => x"
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b\n\
+         \x20 = fn x => x"
     ));
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "Nat -> Nat ! `Log (when a) | `IO (when b) where a != b"
+        "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b"
     );
 }
 
-/// An annotation is the contract, so a `..e` the reader wrote is quantified
-/// however few times it occurs — R23's closing rule may not touch one — and the
-/// too-open check still fires in the other direction when the body decides it.
+/// An annotation is the contract, and a declared `..e` is a rigid: it is
+/// quantified however few times it occurs — R23's closing rule counts solver
+/// variables and a rigid is none — and a body that performs into it is refused
+/// at the label it demanded, since the caller is who decides what `e` allows.
 #[test]
 fn an_annotations_effect_tail_is_the_readers() {
-    let (mint, _, output) = inferred(&format!("{EFFECTS}let f : Nat -> Nat ! ..e = fn x => x"));
-    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..'a");
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! ..e where let e = fn x => x"
+    ));
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..a where let a");
 
     let (_, _, output) = infer_src(&format!(
         "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
-         let f : () -> Nat ! ..e = fn _ => greet ()"
+         let f : () -> Nat ! ..e where let e = fn _ => greet ()"
     ));
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors);
     };
-    assert_eq!(error.kind.code(), "annotation-too-open");
+    assert_eq!(error.kind.code(), "rigid-field");
 }
 
 /// Two definitions that name each other are solved together and
@@ -5797,11 +5791,11 @@ fn an_annotations_effect_tail_is_the_readers() {
 #[test]
 fn a_mutually_recursive_pair_may_each_leave_effects_open() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let ping : Nat -> Nat ! ..e = fn n => pong n\n\
-         let pong : Nat -> Nat ! ..e = fn n => ping n"
+        "{EFFECTS}let ping : Nat -> Nat ! ..e where let e = fn n => pong n\n\
+         let pong : Nat -> Nat ! ..e where let e = fn n => ping n"
     ));
-    assert_eq!(scheme(&mint, &output, "ping"), "Nat -> Nat ! ..'a");
-    assert_eq!(scheme(&mint, &output, "pong"), "Nat -> Nat ! ..'a");
+    assert_eq!(scheme(&mint, &output, "ping"), "Nat -> Nat ! ..a where let a");
+    assert_eq!(scheme(&mint, &output, "pong"), "Nat -> Nat ! ..a where let a");
 }
 
 /// A declared alias is a name for a set of effects, so a row naming one
@@ -5826,9 +5820,9 @@ fn an_effect_row_unifies_against_a_declared_alias() {
 #[test]
 fn an_effect_written_absent_lowers_to_an_absent_presence() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e = fn x => x"
+        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e where let e = fn x => x"
     ));
-    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..'a");
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..a where let a");
     let symbol = symbol_named(&mint, output.schemes.keys().copied(), "f");
     let body = output.schemes[&symbol].body().clone();
     let Core::Arrow(_, _, effects) = &body.core else {
@@ -5839,7 +5833,7 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
 
     // And the condition it records is what refuses the tail standing for it.
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e = fn x => x\n\
+        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e where let e = fn x => x\n\
          let g : Nat -> Nat ! `IO = f"
     ));
     assert!(!output.errors.is_empty(), "{:#?}", output.errors);
@@ -5851,7 +5845,8 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
 #[test]
 fn a_use_site_quotes_an_effect_presence_by_its_label() {
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where a != b = fn x => x\n\
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b\n\
+         \x20 = fn x => x\n\
          let g : Nat -> Nat ! `Log | `IO = f"
     ));
     let quoted: Vec<String> = output
@@ -5874,7 +5869,7 @@ fn a_use_site_quotes_an_effect_presence_by_its_label() {
 #[test]
 fn a_performed_effect_that_may_not_be_there_is_not_refused() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) = fn x => x\n\
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) where let a = fn x => x\n\
          let g : Nat -> Nat = fn n => f n"
     ));
     assert_eq!(scheme(&mint, &output, "g"), "Nat -> Nat");
@@ -5886,8 +5881,8 @@ fn a_performed_effect_that_may_not_be_there_is_not_refused() {
 #[test]
 fn two_effect_rows_with_extras_both_ways_share_a_fresh_tail() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let p : (Nat -> Nat ! `Log | ..r) -> Nat = fn f => 1\n\
-         let q : (Nat -> Nat ! `IO | ..r) -> Nat = fn f => 1\n\
+        "{EFFECTS}let p : (Nat -> Nat ! `Log | ..r) -> Nat where let r = fn f => 1\n\
+         let q : (Nat -> Nat ! `IO | ..r) -> Nat where let r = fn f => 1\n\
          let h = fn v => {{ one: p v, two: q v }}"
     ));
     // The argument has to allow both, and the one tail the two now share
@@ -5903,7 +5898,9 @@ fn two_effect_rows_with_extras_both_ways_share_a_fresh_tail() {
 /// which is precisely what it is reporting.
 #[test]
 fn an_abandoned_effect_presence_prints_as_a_question() {
-    let (_, _, output) = infer_src(&format!("{EFFECTS}let f : Nat -> Nat ! `Log (when a) = 1"));
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) where let a = 1"
+    ));
     let quoted: Vec<String> = output
         .errors
         .iter()
@@ -5951,14 +5948,14 @@ fn a_nested_let_leaves_an_outer_binders_effects_alone() {
     let (mint, _, output) = inferred("let a = fn p => let q = fn z => p z in q");
     assert_eq!(
         scheme(&mint, &output, "a"),
-        "('a -> 'b ! ..'c) -> 'a -> 'b ! ..'c"
+        "(a -> b ! ..c) -> a -> b ! ..c where let a, b, c"
     );
     let locals: Vec<String> = output
         .locals
         .values()
         .map(|scheme| scheme.to_string())
         .collect();
-    assert_eq!(locals, ["'a -> 'b ! ..'c"]);
+    assert_eq!(locals, ["a -> b ! ..c where let a, b, c"]);
 }
 
 /// A `raise` lowering already refused still has a type: its value is walked
@@ -5973,10 +5970,10 @@ fn a_refused_raise_still_walks_its_value() {
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     // Nothing constrains what `raise` gives back, which is the typing it has
     // in ML — and the value under it is a `Nat` all the same.
-    assert_eq!(scheme(&mint, &output, "a"), "'a");
+    assert_eq!(scheme(&mint, &output, "a"), "a where let a");
     assert_eq!(
         body_types(&term_decl(&mint, &out, "a").value),
-        ["'a", "Nat"]
+        ["a", "Nat"]
     );
 }
 

@@ -3946,7 +3946,7 @@ fn a_parameter_read_two_ways_names_both() {
 
     // And a name given two rests in one *annotation* is the same mistake.
     let src = "effect Log = `write : Nat -> ()\n\
-               let f : { x: Nat, ..r } -> Nat -> Nat ! ..r = fn p => fn n => n";
+               let f : { x: Nat, ..r } -> Nat -> Nat ! ..r where let r = fn p => fn n => n";
     let (_, out) = build_src(src);
     let mixed: Vec<&str> = out
         .errors
@@ -4105,7 +4105,7 @@ fn a_signature_that_did_not_lower_is_not_told_twice() {
 /// neither is the pure one.
 #[test]
 fn a_row_that_is_only_a_tail_says_something() {
-    let (mint, out) = built("let f : Nat -> Nat ! ..e = fn x => x");
+    let (mint, out) = built("let f : Nat -> Nat ! ..e where let e = fn x => x");
     let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
     let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
     else {

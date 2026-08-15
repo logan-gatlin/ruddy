@@ -4541,13 +4541,13 @@ impl Builder<'_> {
     /// the anonymous presence instead, which is the `when _` the reader could
     /// have written and which nothing can then name.
     ///
-    /// None of that in a declaration, where the clause is refused for existing
-    /// wherever it is written: `place` is what says so, and a second complaint
-    /// about a name that could never have been declared there would be the
-    /// first one said again in different words.
+    /// None of that in a declaration or an operation's signature, where the
+    /// clause is refused for existing wherever it is written: `place` is what
+    /// says so, and a second complaint about a name that could never have been
+    /// declared there would be the first one said again in different words.
     fn when(&mut self, when: Option<Box<parse::When>>, place: Place) -> Option<Box<When>> {
         let when = when?;
-        if place == Place::Declaration {
+        if place != Place::Annotation {
             return Some(Box::new(When {
                 span: when.span,
                 name: when.name.map(|name| name.tracked),
