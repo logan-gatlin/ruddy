@@ -10,16 +10,16 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     ir::{
-        Annotation, ClauseKind, Field, PatternKind, Program, Row, SumCase, Term, TermKind,
-        TypeField, TypeKind, When,
+        Annotation, ClauseKind, Effect, EffectLabel, EffectRow, Field, Handler, PatternKind,
+        Program, Row, SumCase, Term, TermKind, TypeField, TypeKind, When,
     },
     symbol::Mint,
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_let, write_match,
-    write_project, write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_effects, write_let,
+    write_match, write_project, write_row, write_struct, write_sum, write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -108,6 +108,35 @@ impl fmt::Display for Show<'_, Program> {
         // builder lowers in is what makes a printed program re-lower into the
         // one it was printed from.
         let mut first = true;
+        // Effects before types, which is the order lowering reads them in: a
+        // `type` declaration may name an effect in an arrow it writes, and an
+        // operation's signature may name a type declared below it.
+        for (symbol, decl) in &self.node.effects {
+            if !first {
+                f.write_str("\n")?;
+            }
+            first = false;
+            write!(f, "effect {} =", self.mint.name(*symbol))?;
+            match &decl.value {
+                Effect::Operations(operations) if operations.is_empty() => f.write_str(" |")?,
+                Effect::Operations(operations) => {
+                    for (name, operation) in operations {
+                        write!(
+                            f,
+                            " | `{name} : {} -> {}",
+                            self.show(&operation.from),
+                            self.show(&operation.to),
+                        )?;
+                    }
+                }
+                Effect::Alias(named) if named.is_empty() => f.write_str(" |")?,
+                Effect::Alias(named) => {
+                    for name in named.keys() {
+                        write!(f, " | `{name}")?;
+                    }
+                }
+            }
+        }
         for (symbol, decl) in &self.node.types {
             if !first {
                 f.write_str("\n")?;
@@ -146,7 +175,8 @@ impl Grouped for Show<'_, TermKind> {
             // Self-delimiting on the right but not an application argument by
             // grammar; the parse tree's printer says the same, because it is
             // the same syntax.
-            TermKind::Match { .. } => Prec::Apply,
+            TermKind::Match { .. } | TermKind::Handle { .. } => Prec::Apply,
+            TermKind::Raise(_) => Prec::Lambda,
             // A tag carrying something groups as the application it reads as;
             // carrying nothing it groups below one, because the argument would
             // be read as the payload it has not got. The parse tree's printer
@@ -157,6 +187,7 @@ impl Grouped for Show<'_, TermKind> {
             TermKind::Tag { payload: None, .. } => Prec::Tag,
             TermKind::Apply { .. } => Prec::Apply,
             TermKind::Project { .. }
+            | TermKind::Operation { .. }
             | TermKind::Struct(_)
             | TermKind::Ident(_)
             | TermKind::Natural(_)
@@ -294,7 +325,49 @@ impl fmt::Display for Show<'_, TermKind> {
                     .map(|(pattern, body)| (self.show(pattern), self.show(body)));
                 write_match(f, &self.show(&**scrutinee), arms)
             }
+            // The arms print in the order they were written, each with its
+            // leading `|`, and the `return` arm last — where it stands is not
+            // kept, because nothing depends on it.
+            TermKind::Handle { body, handler } => self.write_handle(f, body, handler),
+            TermKind::Raise(value) => write!(f, "raise {}", self.show(&**value)),
+            TermKind::Operation { effect, op } => {
+                write!(f, "{}.`{}", self.mint.name(effect.tracked), op.tracked)
+            }
         }
+    }
+}
+
+impl Show<'_, TermKind> {
+    /// Render `handle <expr> with <arms> end`, the binders named through the
+    /// mint. A `_` binder came out of lowering as a fresh `%discard`, so it
+    /// prints as that name rather than as the `_` it was written as — which is
+    /// what every other wildcard binder in this tab does.
+    fn write_handle(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        body: &Term,
+        handler: &Handler,
+    ) -> fmt::Result {
+        write!(f, "handle {} with", self.show(body))?;
+        for arm in &handler.arms {
+            write!(
+                f,
+                " | {}.`{} {} => {}",
+                self.mint.name(arm.effect.tracked),
+                arm.op.tracked,
+                self.mint.name(arm.binder.tracked),
+                self.show(&arm.body),
+            )?;
+        }
+        if let Some(ret) = &handler.ret {
+            write!(
+                f,
+                " | return {} => {}",
+                self.mint.name(ret.binder.tracked),
+                self.show(&*ret.body),
+            )?;
+        }
+        f.write_str(" end")
     }
 }
 
@@ -340,7 +413,15 @@ impl fmt::Display for Show<'_, TypeKind> {
                 )
             }
             TypeKind::Prim(prim) => f.write_str(prim.name()),
-            TypeKind::Arrow { from, to } => write_arrow(f, &self.show(&**from), &self.show(&**to)),
+            TypeKind::Arrow { from, to, effects } => {
+                let row = self.effect_row(effects);
+                write_arrow(
+                    f,
+                    &self.show(&**from),
+                    &self.show(&**to),
+                    row.as_ref().map(|row| row as &dyn fmt::Display),
+                )
+            }
             TypeKind::Struct { fields, tail } => {
                 let fields = fields.iter().map(|(name, field)| match field {
                     TypeField::Written { when, value, .. } => Entry::Written {
@@ -469,6 +550,80 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         f.write_str(")")?;
     }
     Ok(())
+}
+
+impl Show<'_, TypeKind> {
+    /// The `! <effects>` clause an arrow carries, or `None` where none was
+    /// written — which is what a bare `A -> B` has.
+    ///
+    /// The row a reader wrote, not what it means: `A -> B ! |` wrote one and
+    /// `A -> B` wrote none, and both are the empty closed row. Aliases *are*
+    /// gone, since lowering expanded them, which is what the tab is for showing.
+    fn effect_row(&self, row: &EffectRow) -> Option<Effects> {
+        if !row.written {
+            return None;
+        }
+        let effects = row
+            .effects
+            .iter()
+            .map(|(name, label)| match label {
+                EffectLabel::Written { when, .. } => Entry::Written {
+                    name: name.clone(),
+                    mark: mark(when),
+                    holds: (),
+                },
+                EffectLabel::Absent { .. } => Entry::Absent { name: name.clone() },
+            })
+            .collect();
+        let tail = row.tail.as_ref().map(|tail| match &tail.of {
+            Row::Anything => String::new(),
+            Row::Named(name) => name.clone(),
+            Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+        });
+        Some(Effects { effects, tail })
+    }
+}
+
+/// One effect row, collected so that it can be handed to [`write_arrow`] as
+/// something that prints itself. Owned rather than borrowed for the reason the
+/// AST printer's twin is: the row is written after the result type, so a
+/// borrowed iterator would have to outlive the arrow it came from.
+struct Effects {
+    effects: Vec<Entry<String, ()>>,
+    tail: Option<String>,
+}
+
+impl fmt::Display for Effects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let effects: Vec<Entry<&str, ()>> = self
+            .effects
+            .iter()
+            .map(|entry| match entry {
+                Entry::Written { name, mark, .. } => Entry::Written {
+                    name: name.as_str(),
+                    mark: mark.as_ref().map(clone_mark),
+                    holds: (),
+                },
+                Entry::Absent { name } => Entry::Absent {
+                    name: name.as_str(),
+                },
+            })
+            .collect();
+        write_effects(
+            f,
+            &effects,
+            self.tail.as_ref().map(|tail| tail as &dyn fmt::Display),
+        )
+    }
+}
+
+/// One presence mark, copied. [`Mark`] carries no `Clone`, and the alternative
+/// is borrowing a row that has already gone out of scope.
+fn clone_mark(mark: &Mark) -> Mark {
+    match mark {
+        Mark::Undecided => Mark::Undecided,
+        Mark::When(name) => Mark::When(name.clone()),
+    }
 }
 
 /// The `when` clause a lowered label wears. `when _` is the anonymous presence,

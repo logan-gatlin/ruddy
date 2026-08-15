@@ -1177,7 +1177,7 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("solve"), "1 step");
     assert_eq!(summary("types"), "1 scheme");
     assert_eq!(summary("symbols"), "1 symbol");
-    assert_eq!(summary("ir"), "0 types · 1 term · 1 group");
+    assert_eq!(summary("ir"), "0 effects · 0 types · 1 term · 1 group");
 }
 
 /// A parameterized declaration's meaning prints its parameters as `'a`, `'b` —
@@ -1862,4 +1862,99 @@ fn a_misplaced_wildcard_reaches_the_strip() {
     );
     let at = source.find('_').expect("the `_`");
     assert_eq!(diagnostic.span, Some([at, at + 1]));
+}
+
+/// A source using effects reaches every stage: the declarations get rows, the
+/// handler shows what it discharges, and the types the tabs render carry the
+/// effect rows the compiler prints them with.
+#[test]
+fn every_stage_reports_on_a_source_using_effects() {
+    let source = "effect Log = `write : Nat -> ()\n\
+                  effect IO = `print : Nat -> ()\n\
+                  effect Console = `Log | `IO\n\
+                  type Logger = Nat -> Nat ! `Log\n\
+                  type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e\n\
+                  let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+                  let quiet : () -> Nat = fn _ =>\n\
+                    handle greet () with | Log.`write s => () | return x => x end\n\
+                  let loud : () -> Nat ! `IO = fn _ =>\n\
+                    handle greet () with | Log.`write s => IO.`print s end\n\
+                  let choose = fn v => match v with | `A x => x | _ => 0 end\n";
+    let snapshot = snapshot(source);
+    assert!(snapshot.panic.is_none());
+    for stage in &snapshot.stages {
+        assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
+        assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
+    }
+
+    // The tokens tab groups by variant, so the three reserved words and the
+    // `!` each own a label there.
+    let tokens = stage_named(&snapshot, "tokens");
+    for label in ["Effect", "Handle", "Bang"] {
+        assert!(
+            nodes(tokens).iter().any(|node| node.label == label),
+            "the tokens tab shows no {label}"
+        );
+    }
+
+    // The IR tab counts the effects beside the types and terms, and gives each
+    // declaration a row with its operations under it.
+    let ir = stage_named(&snapshot, "ir");
+    assert!(ir.summary.starts_with("3 effects · "), "{}", ir.summary);
+    assert!(
+        nodes(ir).iter().any(|node| node.label == "effect Log"),
+        "the IR tab shows no effect declaration"
+    );
+    // A handler's row says which effects it discharges, which is what R15's
+    // coverage check decided and what nothing else on the page shows.
+    let discharges: Vec<&str> = nodes(ir)
+        .iter()
+        .filter(|node| node.label == "Discharges")
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(discharges, ["`Log", "`Log"], "{discharges:?}");
+    // And the row an arrow carries is a child beside the two sides.
+    assert!(
+        nodes(ir).iter().any(|node| node.label == "Effects"),
+        "the IR tab shows no effect row"
+    );
+
+    // The Types tab renders the schemes, effect rows and all.
+    let types = stage_named(&snapshot, "types");
+    let meanings: Vec<&str> = nodes(types).iter().map(|node| node.text.as_str()).collect();
+    assert!(
+        meanings.contains(&"{} -> Nat ! `Log"),
+        "the Types tab lost the row: {meanings:?}"
+    );
+    // An alias does not survive into the type language, so `Runner`'s
+    // parameter is shown as what the body read it to be.
+    assert!(
+        nodes(types)
+            .iter()
+            .any(|node| node.text.contains("..e (effects)")),
+        "the Types tab does not say what `e` stands for"
+    );
+
+    // The Symbols tab lists an effect in its own namespace.
+    let symbols = stage_named(&snapshot, "symbols");
+    let log = nodes(symbols)
+        .into_iter()
+        .find(|node| node.label == "Log")
+        .expect("the symbols tab lists the effect");
+    assert!(
+        log.fields
+            .iter()
+            .any(|field| field.name == "namespace" && field.value == "effect"),
+        "{:?}",
+        log.fields
+    );
+}
+
+/// One stage by its id, for the tests that ask about a particular tab.
+fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
+    snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == id)
+        .unwrap_or_else(|| panic!("{id} is registered"))
 }

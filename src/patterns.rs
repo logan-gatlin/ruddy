@@ -320,7 +320,23 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
             }
         }
         TermKind::Project { base, .. } => walk(check, base, out),
-        TermKind::Ident(_) | TermKind::Natural(_) | TermKind::Error => {}
+        // A handler's arms are not value patterns and nothing here changes for
+        // them: what they hold is ordinary terms, and a match written inside
+        // one is checked exactly as a match written anywhere else is.
+        TermKind::Handle { body, handler } => {
+            walk(check, body, out);
+            for arm in &handler.arms {
+                walk(check, &arm.body, out);
+            }
+            if let Some(ret) = &handler.ret {
+                walk(check, &ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => walk(check, value, out),
+        TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
     }
 }
 

@@ -41,6 +41,43 @@ pub enum StmtKind {
         /// already refuses the `..` beside them for the same reason.
         body: Annotation,
     },
+    /// `` effect Log = `write : Nat -> () | `flush : () -> () `` — an effect
+    /// and the operations it declares — or `` effect Console = `Log | `IO ``,
+    /// a name standing for the effects it lists.
+    ///
+    /// One node for the two forms, because the parser judges nothing: which of
+    /// them a declaration is, is decided by whether its cases carry a `:`, and
+    /// a declaration that mixes them is refused where the rest of the rules
+    /// about what an effect may be live. See
+    /// [`ir::ErrorKind::MixedEffectForm`](crate::ir::ErrorKind).
+    ///
+    /// `effect` takes no parameters, so there is no list here for one: an
+    /// effect stands for the same thing wherever it is written.
+    Effect {
+        name: TrackedString,
+        /// The cases, in the order they were written. Empty for the empty
+        /// effect, `effect Nil = |`, which declares nothing and is legal.
+        cases: IndexMap<TrackedString, EffectCase>,
+    },
+}
+
+/// One case of an `effect` declaration: an operation and its signature, or a
+/// bare tag naming another effect.
+///
+/// Told apart by the `:` and by nothing else, which is what makes the two forms
+/// of the declaration a question about its cases rather than about a keyword.
+#[derive(Debug, Clone)]
+pub enum EffectCase {
+    /// `` `write : Nat -> () `` — an operation, with the signature performing
+    /// it has. Whether that signature is the plain closed arrow R3 requires is
+    /// lowering's to say.
+    ///
+    /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a signature
+    /// is a whole written type, and inlining one here would grow every case of
+    /// every declaration to the size of the ones that have one.
+    Operation { signature: Box<Type> },
+    /// `` `Log `` — a bare tag naming an effect this one stands for.
+    Alias,
 }
 
 pub type Expr = Tracked<ExprKind>;
@@ -104,6 +141,34 @@ pub enum ExprKind {
         base: Box<Expr>,
         field: TrackedString,
     },
+    /// `handle <expr> with <arms> end` — the effects the arms fully cover,
+    /// discharged.
+    ///
+    /// The `with`/`end`/`|` shape a [`Match`](ExprKind::Match) has, over arms
+    /// that name operations rather than patterns. Zero arms parse, and the
+    /// leading `|` is optional, the same two conventions a match keeps.
+    Handle {
+        body: Box<Expr>,
+        arms: Vec<HandlerArm>,
+    },
+    /// `raise <expr>` — abort to the handler around this arm rather than
+    /// resume with a value.
+    ///
+    /// The body extends as far right as it can, the way a `fn`'s does: a
+    /// `raise` does not return, so there is nothing after it for an expression
+    /// to be part of. Whether an arm encloses it is lowering's to say; see
+    /// [`ir::ErrorKind::RaiseOutsideArm`](crate::ir::ErrorKind).
+    Raise(Box<Expr>),
+    /// `` Log.`write `` — one operation of an effect, as an ordinary value.
+    ///
+    /// Always qualified, which is what tells it from a projection: a `.`
+    /// followed by a tag is this, and a `.` followed by a name is a
+    /// [`Project`](ExprKind::Project). There is no `do` and no perform form —
+    /// an operation is a value, and performing one is applying it.
+    Operation {
+        effect: TrackedString,
+        op: TrackedString,
+    },
     Ident {
         name: TrackedString,
     },
@@ -116,6 +181,36 @@ pub enum ExprKind {
 pub struct Arm {
     pub pattern: Pattern,
     pub body: Expr,
+}
+
+/// One arm of a handler: what it answers, the name it binds, and the expression
+/// it gives back.
+///
+/// The binder is an [`Arg`] rather than a [`Pattern`] — a name, or the `_` that
+/// binds nothing — which is what a `fn` header takes, and for the same reason:
+/// an arm heads a function of the operation's declared signature, and a header
+/// takes plain names.
+#[derive(Debug, Clone)]
+pub struct HandlerArm {
+    pub head: ArmHead,
+    pub binder: Arg,
+    pub body: Expr,
+}
+
+/// What one handler arm answers.
+#[derive(Debug, Clone)]
+pub enum ArmHead {
+    /// `` Log.`write s => ... `` — one operation, whose declared signature is
+    /// the arm's own.
+    Operation {
+        effect: TrackedString,
+        op: TrackedString,
+    },
+    /// `return x => ...` — the value arm, which may appear at most once and in
+    /// any position. `return` is contextual: it heads an arm here and is an
+    /// ordinary name everywhere else. The span is the keyword's, which is where
+    /// a complaint about a second one points.
+    Return { span: Span },
 }
 
 /// One argument of a `fn` header: the name it binds, or the `_` that binds
@@ -200,6 +295,14 @@ pub enum TypeKind {
     Arrow {
         from: Box<Type>,
         to: Box<Type>,
+        /// The `! <effects>` clause, when one was written.
+        ///
+        /// `None` is a bare `A -> B`, which is pure — the empty *closed* row —
+        /// and `Some` of a row with nothing in it is `A -> B ! |`, the same
+        /// type written out. The two are kept apart here and nowhere else: what
+        /// a reader wrote is what this tree says, and both lower to the same
+        /// row.
+        effects: Option<Box<EffectRow>>,
     },
     /// `<head> <arg>...` — a type applied to arguments.
     ///
@@ -270,6 +373,37 @@ pub enum SumCase {
     /// `` \`Name `` — the case is definitely absent. No payload and no `when`,
     /// exactly as [`TypeField::Absent`]: the map key's span covers the whole
     /// `` \`Name ``.
+    Absent,
+}
+
+/// The effect row an arrow carries: the effects it names, and what is known
+/// about the ones it does not.
+///
+/// A sum's row read a third way, down to the syntax — tags, `|`, an optional
+/// `..` tail, `when` clauses and the `\` of an effect written absent — with one
+/// thing left out: an effect label carries nothing, so there is no payload here
+/// for one to carry. That is the whole of the difference, and it is why this is
+/// its own node rather than a [`TypeKind::Sum`] in a third position.
+///
+/// The span covers the `!` and the row after it, which is what a complaint
+/// about the row underlines.
+#[derive(Debug, Clone)]
+pub struct EffectRow {
+    pub span: Span,
+    pub effects: IndexMap<TrackedString, EffectLabel>,
+    pub tail: Option<Tail>,
+}
+
+/// One effect named in a row: one the arrow may perform — as its `when` clause
+/// says, where it wears one — or the `\` that says it definitely may not.
+///
+/// [`SumCase`]'s twin minus the payload; see [`EffectRow`].
+#[derive(Debug, Clone)]
+pub enum EffectLabel {
+    /// `` `Log ``, or `` `Log (when a) `` — an effect the arrow may perform.
+    Written { when: Option<Box<When>> },
+    /// `` \`Log `` — the effect is definitely not performed: the `..` beside it
+    /// may not stand for it. The map key's span covers the whole `` \`Log ``.
     Absent,
 }
 
@@ -588,8 +722,58 @@ impl Parser {
         match self.peek().map(|tok| &tok.tracked) {
             Some(Kind::Let) => self.let_stmt(),
             Some(Kind::Type) => self.type_stmt(),
+            Some(Kind::Effect) => self.effect_stmt(),
             _ => self.unexpected(),
         }
+    }
+
+    /// `` effect <name> = [|] <case> ('|' <case>)* ``, where a case is a tag
+    /// with an optional `: <signature>` after it.
+    ///
+    /// The same `|` convention a sum type keeps: the leading bar is optional,
+    /// `|` alone is the empty effect, and a bar *between* cases promises
+    /// another one, so nothing after one is reported at the bar. Which of the
+    /// two forms a declaration is, is not decided here — the parser records the
+    /// cases and lowering reads the `:`s.
+    fn effect_stmt(&mut self) -> Option<Stmt> {
+        let kw = self.advance().expect("the caller peeked `effect`");
+        if self.at_wildcard() {
+            return self.wildcard(Place::Type);
+        }
+        let name = self.ident()?;
+        self.eat(&Kind::Equal)?;
+        let mut cases = IndexMap::new();
+        let mut span = kw.span.merge(name.span);
+        self.eat_if(&Kind::Pipe);
+        // The `|` that separated the last case from what comes next, once one
+        // has been read. The leading bar is not one of these: `effect Nil = |`
+        // is the empty effect and promises nothing.
+        let mut separator = None;
+        loop {
+            let Some(op) = self.tag() else {
+                if let Some(bar) = separator {
+                    self.error(bar, ErrorKind::Unexpected);
+                }
+                break;
+            };
+            span = span.merge(op.span);
+            let case = match self.eat_if(&Kind::Colon) {
+                Some(_) => {
+                    let signature = self.type_expr()?;
+                    span = span.merge(signature.span);
+                    EffectCase::Operation {
+                        signature: Box::new(signature),
+                    }
+                }
+                None => EffectCase::Alias,
+            };
+            cases.insert(op, case);
+            match self.eat_if(&Kind::Pipe) {
+                Some(pipe) => separator = Some(pipe.span),
+                None => break,
+            }
+        }
+        Some(span.track(StmtKind::Effect { name, cases }))
     }
 
     /// `let <pattern> [: <type>] = <expr>`. The ascription is optional: without
@@ -688,7 +872,8 @@ impl Parser {
         Some(func)
     }
 
-    /// `<atom>.<field>*` — postfix projection, left-associative. It sits under
+    /// `<atom>.<field>*` — postfix projection, left-associative, or the
+    /// `` Eff.`op `` an operation reference is. It sits under
     /// application rather than beside it so that `f p.x` reads as `f (p.x)`,
     /// which is what reaching into a record before passing it along looks like.
     ///
@@ -707,6 +892,20 @@ impl Parser {
             }
             if self.eat_if(&Kind::Dot).is_none() {
                 return Some(base);
+            }
+            // A `.` followed by a tag is an operation reference rather than a
+            // projection — a struct has no field with a backtick in its name —
+            // and the head has to be the name of an effect, since nothing else
+            // declares operations. Anything else on the left is reported at the
+            // tag, which is the token that decided the reading.
+            if matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Tag(_))) {
+                let ExprKind::Ident { name: effect } = base.tracked else {
+                    return self.unexpected();
+                };
+                let op = self.tag().expect("just peeked a tag");
+                let span = effect.span.merge(op.span);
+                base = span.track(ExprKind::Operation { effect, op });
+                continue;
             }
             // `x._` reads a field named nothing: the complaint is the
             // wildcard's, worded for the projection it sits in.
@@ -735,6 +934,13 @@ impl Parser {
             // is not `f` applied to a match. Projection off the `end` works
             // because the projection loop sits above this call.
             Kind::Match => self.match_expr(),
+            // Reachable from atom position for the reason a `match` is, and
+            // absent from `at_expr_atom` for the same one: `f handle ... end`
+            // is not `f` applied to a handler.
+            Kind::Handle => self.handle_expr(),
+            // The body runs as far right as it can, the way a `fn`'s does, so
+            // this is atom position and not an application argument.
+            Kind::Raise => self.raise_expr(),
             Kind::LeftBrace => self.struct_expr(),
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
@@ -906,6 +1112,92 @@ impl Parser {
             scrutinee: Box::new(scrutinee),
             arms,
         }))
+    }
+
+    /// `handle <expr> with [|] <arm> (| <arm>)* end`, where an arm is
+    /// `` Eff.`op <binder> => <expr> `` or `return <binder> => <expr>`.
+    ///
+    /// The `match` shape exactly: the handled expression ends at the `with` of
+    /// its own accord, the leading `|` is optional, a `|` between arms promises
+    /// another one, zero arms parse, and each body ends in front of the next
+    /// `|` or the `end` because neither begins an atom.
+    fn handle_expr(&mut self) -> Option<Expr> {
+        let kw = self.advance().expect("the caller peeked `handle`");
+        let body = self.expr()?;
+        self.eat(&Kind::With)?;
+        let mut arms = Vec::new();
+        let leading = self.eat_if(&Kind::Pipe).is_some();
+        if leading || !matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::End)) {
+            loop {
+                arms.push(self.handler_arm()?);
+                if self.eat_if(&Kind::Pipe).is_none() {
+                    break;
+                }
+            }
+        }
+        let close = self.eat(&Kind::End)?;
+        let span = kw.span.merge(close.span);
+        Some(span.track(ExprKind::Handle {
+            body: Box::new(body),
+            arms,
+        }))
+    }
+
+    /// One handler arm: what it answers, the name it binds, and its body.
+    ///
+    /// `return` is read by spelling and only here, which is the whole of what
+    /// makes it contextual: an arm head is either it or the name of an effect,
+    /// so one token of lookahead settles the question and the word stays a
+    /// perfectly good name everywhere else.
+    fn handler_arm(&mut self) -> Option<HandlerArm> {
+        let head = match self.at_keyword("return") {
+            true => {
+                let kw = self.advance().expect("just peeked `return`");
+                ArmHead::Return { span: kw.span }
+            }
+            false => {
+                let effect = self.ident()?;
+                self.eat(&Kind::Dot)?;
+                let Some(op) = self.tag() else {
+                    return self.unexpected();
+                };
+                ArmHead::Operation { effect, op }
+            }
+        };
+        let binder = self.binder()?;
+        self.eat(&Kind::FatArrow)?;
+        let body = self.expr()?;
+        Some(HandlerArm { head, binder, body })
+    }
+
+    /// The one name a handler arm binds, or the `_` that binds nothing — a
+    /// `fn` header's argument, read one at a time. Not a pattern: an arm heads
+    /// a function of the operation's declared signature, and a header takes
+    /// plain names.
+    fn binder(&mut self) -> Option<Arg> {
+        let Some(tok) = self.peek() else {
+            return self.unexpected();
+        };
+        let span = tok.span;
+        let kind = match &tok.tracked {
+            Kind::Identifier(name) => ArgKind::Name(name.clone()),
+            Kind::Underscore => ArgKind::Wildcard,
+            _ => return self.unexpected(),
+        };
+        self.advance();
+        Some(span.track(kind))
+    }
+
+    /// `raise <expr>` — abort to the handler around this arm.
+    ///
+    /// The body is a full expression and extends as far right as it can, the
+    /// way a `fn`'s does: a `raise` does not return, so nothing after it could
+    /// be applied to what it gives back.
+    fn raise_expr(&mut self) -> Option<Expr> {
+        let kw = self.advance().expect("the caller peeked `raise`");
+        let body = self.expr()?;
+        let span = kw.span.merge(body.span);
+        Some(span.track(ExprKind::Raise(Box::new(body))))
     }
 
     /// Whether the next token can begin a pattern — what decides whether a tag
@@ -1312,22 +1604,127 @@ impl Parser {
         Some(When { span, name })
     }
 
-    /// `<sum> [-> <type>]` — the arrow is right-associative, so
+    /// `<sum> [-> <type> [! <effects>]]` — the arrow is right-associative, so
     /// `A -> B -> C` is `A -> (B -> C)`, and everything else binds tighter, so
     /// `Pair Nat Nat -> Nat` is `(Pair Nat Nat) -> Nat` and
     /// `` `A Nat | `B -> Nat `` is a function from the sum rather than a sum
     /// whose last case carries an arrow.
+    ///
+    /// The `!` clause binds to the arrow parsed at *this* level, which the
+    /// right-associative recursion makes the innermost one: `A -> B -> C ! E`
+    /// is read by the inner call, which has just built `B -> C`, so the effects
+    /// land there. `A -> (B -> C) ! E` puts them on the outer arrow, because
+    /// the parenthesized result comes back through
+    /// [`type_atom`](Self::type_atom) and the inner call never builds an arrow
+    /// at all. There is no spelling of `(A -> B) ! E`.
+    ///
+    /// A `!` where no arrow was parsed has nothing to attach to and is reported
+    /// where it was written, rather than being left for whatever the type was
+    /// being read for to complain about a token further on.
     fn type_expr(&mut self) -> Option<Type> {
+        self.arrow(true)
+    }
+
+    /// [`type_expr`](Self::type_expr)'s recursion. `outermost` says whether
+    /// there is still an arrow waiting to be built around this one: only the
+    /// call that has none can report a `!` as attaching to nothing, since every
+    /// other call returns a `!` to the caller that is about to build the arrow
+    /// it belongs to.
+    fn arrow(&mut self, outermost: bool) -> Option<Type> {
         let from = self.type_sum()?;
         if self.eat_if(&Kind::Arrow).is_none() {
+            if outermost && self.at_bang() {
+                return self.unexpected();
+            }
             return Some(from);
         }
-        let to = self.type_expr()?;
-        let span = from.span.merge(to.span);
+        let to = self.arrow(false)?;
+        let effects = match self.at_bang() {
+            true => Some(Box::new(self.effect_row()?)),
+            false => None,
+        };
+        let span = effects
+            .as_ref()
+            .map_or_else(|| from.span.merge(to.span), |row| from.span.merge(row.span));
         Some(span.track(TypeKind::Arrow {
             from: Box::new(from),
             to: Box::new(to),
+            effects,
         }))
+    }
+
+    /// Whether the next token is the `!` that introduces an effect row.
+    fn at_bang(&self) -> bool {
+        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::Bang))
+    }
+
+    /// `` ! [|] `Eff [(when a)] ('|' ...)* ['|' ..[name]] `` — the effects an
+    /// arrow may perform, in the syntax a sum's cases are written in.
+    ///
+    /// The same shape as [`type_sum`](Self::type_sum) and the same conventions:
+    /// the leading `|` is optional, `!` followed by `|` alone is the empty row,
+    /// a `\` marks an effect as definitely not performed, and the `..` tail
+    /// comes last. What is missing is the payload — an effect carries nothing —
+    /// so a case here is a tag and the clause it may wear, and nothing else.
+    fn effect_row(&mut self) -> Option<EffectRow> {
+        let bang = self.eat(&Kind::Bang).expect("the caller peeked `!`");
+        let mut span = bang.span;
+        let mut effects = IndexMap::new();
+        let mut tail = None;
+        self.eat_if(&Kind::Pipe);
+        let mut separator = None;
+        loop {
+            if let Some(dots) = self.eat_if(&Kind::DotDot) {
+                let name = match self.peek().map(|t| &t.tracked) {
+                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
+                    _ => None,
+                };
+                let at = name
+                    .as_ref()
+                    .map_or(dots.span, |name| dots.span.merge(name.span));
+                span = span.merge(at);
+                tail = Some(Tail { span: at, name });
+                break;
+            }
+            if let Some(slash) = self.eat_if(&Kind::Backslash) {
+                // A `\` promises an effect, so anything but a tag after it is
+                // reported — the rule the sum's own absent case keeps.
+                let Some(name) = self.tag() else {
+                    return self.unexpected();
+                };
+                span = span.merge(name.span);
+                let key = slash.span.merge(name.span).track(name.tracked);
+                effects.insert(key, EffectLabel::Absent);
+            } else {
+                let Some(name) = self.tag() else {
+                    if let Some(bar) = separator {
+                        self.error(bar, ErrorKind::Unexpected);
+                    }
+                    break;
+                };
+                span = span.merge(name.span);
+                // A `when` takes parentheses here for the reason a sum case's
+                // does: an effect has no colon to end a bare clause.
+                let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
+                    true => {
+                        let when = self.when(true)?;
+                        span = span.merge(when.span);
+                        Some(Box::new(when))
+                    }
+                    false => None,
+                };
+                effects.insert(name, EffectLabel::Written { when });
+            }
+            match self.eat_if(&Kind::Pipe) {
+                Some(pipe) => separator = Some(pipe.span),
+                None => break,
+            }
+        }
+        Some(EffectRow {
+            span,
+            effects,
+            tail,
+        })
     }
 
     /// `['|'] <case> ('|' <case>)*` — a sum type, or whatever
@@ -1621,7 +2018,7 @@ impl Parser {
     /// malformed statement doesn't cascade into a flood of errors.
     fn recover(&mut self) {
         while let Some(tok) = self.peek() {
-            if matches!(tok.tracked, Kind::Let | Kind::Type) {
+            if matches!(tok.tracked, Kind::Let | Kind::Type | Kind::Effect) {
                 break;
             }
             self.advance();

@@ -16,6 +16,17 @@ pub enum Kind {
     /// they were reserved for.
     Match,
     Fn,
+    /// `effect`, opening an effect declaration.
+    Effect,
+    /// `handle`, opening a `handle <expr> with <arms> end` — the `with` and
+    /// `end` a `match` already uses, around a different set of arms.
+    Handle,
+    /// `raise`, aborting to the handler around it.
+    ///
+    /// Reserved rather than contextual, unlike the `return` at a handler arm's
+    /// head: a `raise` may sit anywhere an expression may, so there is no one
+    /// position that could read it and leave the word a name everywhere else.
+    Raise,
     Equal,
     FatArrow,
     /// `->`, the function type arrow. Distinct from [`FatArrow`](Kind::FatArrow),
@@ -34,9 +45,15 @@ pub enum Kind {
     DotDot,
     /// `!=`, the "these two presences differ" of a `where` clause. One token
     /// rather than a `!` beside an `=`, the way [`Arrow`](Kind::Arrow) is one
-    /// token: a lone `!` begins nothing, so the only thing it can be is the
-    /// head of this.
+    /// token: the longer lexeme wins, so a `!` followed by an `=` is this and
+    /// never a [`Bang`](Kind::Bang) beside an assignment.
     NotEqual,
+    /// `!`, introducing the effect row an arrow carries: `A -> B ! `Log`.
+    ///
+    /// Told from [`NotEqual`](Kind::NotEqual) by the character after it and by
+    /// nothing else, the way [`Dot`](Kind::Dot) is told from
+    /// [`DotDot`](Kind::DotDot).
+    Bang,
     /// `\`, marking a struct type's field — or a sum type's case — as one that
     /// is definitely *not* there: the `..` beside it may not stand for the
     /// label. A bare punctuation token, so `\ y` lexes the same as `\y` — the
@@ -150,19 +167,16 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 1).track(Kind::Dot));
                 }
             }
-            // `!` begins nothing on its own — there is no negation operator —
-            // so, like `-`, the only thing it can be is the head of something
-            // longer, and a lone one is reported where it was written.
+            // `!=` is the comparison of a `where` clause; a lone `!` is the
+            // effect row on an arrow. The longer lexeme wins, so `a !=b` is one
+            // comparison rather than a row mark beside an assignment.
             '!' => {
                 chars.next();
                 if let Some(&(_, '=')) = chars.peek() {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::NotEqual));
                 } else {
-                    errors.push(Error {
-                        span: file_id.span(start, 1),
-                        kind: ErrorKind::Unrecognized,
-                    });
+                    tokens.push(file_id.span(start, 1).track(Kind::Bang));
                 }
             }
             '|' => {
@@ -233,6 +247,13 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "with" => Kind::With,
                     "match" => Kind::Match,
                     "fn" => Kind::Fn,
+                    "effect" => Kind::Effect,
+                    "handle" => Kind::Handle,
+                    "raise" => Kind::Raise,
+                    // `return` is deliberately absent: it heads a handler arm
+                    // and is an ordinary name everywhere else, so the parser
+                    // recognizes it by spelling at the one position that reads
+                    // it — the rule `when` and `where` already keep.
                     "_" => Kind::Underscore,
                     _ => Kind::Identifier(ident),
                 };

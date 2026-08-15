@@ -8,7 +8,7 @@ use crate::{
     ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::{Span, Tracked},
-    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty},
+    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty},
 };
 
 use super::{
@@ -39,6 +39,56 @@ pub struct Constrain<'a> {
     /// Every annotation this walk lowered for a nested `let`, and the variables
     /// each left open. See [`Annotated`].
     pub annotated: Vec<Annotated>,
+    /// What each effect's operations were declared to be: the argument and the
+    /// result of the plain closed arrow performing one has.
+    ///
+    /// Read by the two arms that need a signature — an operation reference, and
+    /// a handler arm, whose binder and body type come straight off it. Fixed
+    /// before the first definition is walked and mentioning no variable, so
+    /// reading it is not reading the table.
+    pub operations: &'a Operations,
+    /// The effects the place being walked allows, and whether a `fn` encloses
+    /// it.
+    ///
+    /// R11's ambient. A definition's value is walked at the empty closed row —
+    /// a value is computed where no handler can reach it — a `fn` mints a fresh
+    /// row variable and walks its body at that, a handler hands its body a
+    /// larger one, and every other form passes what it was given down
+    /// unchanged.
+    pub ambient: Ambient,
+    /// The answer type of the innermost handler arm enclosing the walk, or
+    /// `None` where no arm does.
+    ///
+    /// What a `raise` is checked against. Lowering has already refused a
+    /// `raise` with no arm around it, and one under a `fn` inside an arm, so a
+    /// `None` here is a term that already drew a complaint — and the arm rule
+    /// mirrors the placement rule exactly: an arm's body sets it, a `fn` body
+    /// clears it, and a nested `handle`'s *body* keeps whatever it was handed,
+    /// because the outer handler is still on the stack while the inner one
+    /// runs.
+    pub answer: Option<Rc<Ty>>,
+}
+
+/// What every effect's operations were declared to be, by the effect and the
+/// operation's own name: the argument and the result of the plain closed arrow
+/// performing one has.
+///
+/// Named because two readers want it — generation, for an operation reference
+/// and a handler arm — and because the pair of pairs reads as nothing at all
+/// written out at each of them.
+pub type Operations = HashMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>;
+
+/// Where a term sits, as far as effects are concerned: what may be performed
+/// there, and whether a `fn` encloses it.
+///
+/// The flag is not a second reading of the row. Both a top-level definition and
+/// a function annotated `() -> Nat` are walked at the empty closed row, and the
+/// two failures are not the same failure — one has no function to widen — so
+/// which of them it is has to travel with the row rather than be read off it.
+#[derive(Debug, Clone)]
+pub struct Ambient {
+    pub row: Row,
+    pub inside: bool,
 }
 
 /// One entry of a match's column at one position: the sub-pattern an arm wrote
@@ -271,18 +321,23 @@ impl Constrain<'_> {
                 // applied as the arrow it stands for. The arrow the arm then
                 // works with is the unfolded one, which is the only shape a
                 // call site can take apart.
-                match &self.table.unfolded(self.aliases, &applied).core {
+                // What calling it may perform: the arrow's own row where the
+                // function already is one, and a fresh variable the equation
+                // below ties to it where it is not. Either way the application
+                // opens it into the ambient — R12 — which is what makes an
+                // effect row an upper bound rather than a demand.
+                let (result, performed) = match &self.table.unfolded(self.aliases, &applied).core {
                     // The function already knows what it takes, so the demand
                     // on the argument is the parameter type and the result is
                     // the arrow's own. Written this way round, a mismatch
                     // reads "expected <parameter>, found <argument>": the
                     // parameter is what the context asked for, and the
                     // argument is the term the reader can change.
-                    Core::Arrow(from, to) => {
-                        let (from, to) = (from.clone(), to.clone());
+                    Core::Arrow(from, to, does) => {
+                        let (from, to, does) = (from.clone(), to.clone(), does.clone());
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &from);
-                        to
+                        (to, does)
                     }
                     // Nothing is known about the function yet, so what the
                     // call site demands is the arrow shape itself, and the
@@ -307,19 +362,83 @@ impl Constrain<'_> {
                     _ => {
                         let param = self.table.fresh_type();
                         let result = self.table.fresh_type();
-                        let wanted = Rc::new(Ty::plain(Core::Arrow(param.clone(), result.clone())));
+                        let does = Row::of(self.table.fresh_row());
+                        let wanted = Rc::new(Ty::plain(Core::Arrow(
+                            param.clone(),
+                            result.clone(),
+                            does.clone(),
+                        )));
                         self.checks(span, &applied, &wanted);
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &param);
-                        result
+                        (result, does)
                     }
-                }
+                };
+                self.out.push(Constraint {
+                    span,
+                    kind: ConstraintKind::Performs {
+                        performed,
+                        ambient: self.ambient.row.clone(),
+                        inside: self.ambient.inside,
+                    },
+                });
+                result
             }
+            // A `fn` mints the row its own arrow carries and walks its body at
+            // it, which is what makes "what this may do" a property of the
+            // function rather than of wherever it was written.
             TermKind::Fn { arg, body } => {
                 let param = self.table.fresh_type();
+                let does = Row::of(self.table.fresh_row());
                 self.env.insert(arg.tracked, Binding::Mono(param.clone()));
+                let outer = self.enter(Ambient {
+                    row: does.clone(),
+                    inside: true,
+                });
+                // And a closure answers no arm, whichever one it was written
+                // in: it can outlive the `handle` and be called with nothing on
+                // the stack, which is why lowering refuses a `raise` here at
+                // all. The two rules mirror each other rather than one leaning
+                // on the other having run.
+                let held = self.answer.take();
                 self.infer_term(body);
-                Rc::new(Ty::plain(Core::Arrow(param, body.ty.clone())))
+                self.answer = held;
+                self.leave(outer);
+                Rc::new(Ty::plain(Core::Arrow(param, body.ty.clone(), does)))
+            }
+            // An operation is an ordinary value of its declared signature, with
+            // the effect's own label as the row of its outermost arrow, closed.
+            // So performing it is applying it, and the application's opening
+            // rule is what puts the label in the ambient.
+            TermKind::Operation { effect, op } => {
+                // Indexed rather than looked up: lowering refuses every
+                // operation reference it cannot resolve, and a signature that
+                // failed to lower is still a signature — the two sides absorb
+                // as the undecided type rather than going missing.
+                let (from, to) = &self.operations[&(effect.tracked, op.tracked.clone())];
+                let does = Row {
+                    labels: [(
+                        self.mint.name(effect.tracked).to_string(),
+                        RowField::present(Rc::new(Ty::unit())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                };
+                Rc::new(Ty::plain(Core::Arrow(from.clone(), to.clone(), does)))
+            }
+            TermKind::Handle { body, handler } => self.handle(body, handler),
+            // `raise` does not return, so its own type is a fresh variable
+            // nothing constrains — the typing `raise` has in ML — and what it
+            // carries is the handler's answer. Which handler is lowering's
+            // answer, and it has already refused every `raise` that has none.
+            TermKind::Raise(value) => {
+                self.infer_term(value);
+                if let Some(answer) = self.answer.clone() {
+                    let actual = value.ty.clone();
+                    self.checks(value.span, &actual, &answer);
+                }
+                self.table.fresh_type()
             }
             TermKind::Struct(fields) => {
                 let mut tys = IndexMap::new();
@@ -463,6 +582,97 @@ impl Constrain<'_> {
                 result
             }
         };
+    }
+
+    /// Walk `body` at a larger ambient, and every arm at the one the handler
+    /// itself sits at.
+    ///
+    /// R16, and the whole of it. A handler introduces no row of its own: like
+    /// every other term form it is checked *at* an ambient, and what it does is
+    /// hand its body `` D | ..A `` — the ambient extended with the effects it
+    /// discharges, each present. That the ambient must *lack* those is the
+    /// existing lacks condition, said here, and it is what refuses an arm
+    /// re-performing the effect its own handler discharges.
+    ///
+    /// The arms run where the `handle` was written rather than inside the
+    /// computation, so they are walked at `A` itself — which is how a handler's
+    /// own effects reach the enclosing function's row.
+    ///
+    /// An arm's value *is* the operation's result, so both halves of its type
+    /// come straight off the declaration and `Ans` appears in neither. `Ans` is
+    /// what the `return` arm gives, or the handled expression's own type where
+    /// none was written, and it is what the whole expression comes to.
+    fn handle(&mut self, body: &mut Term, handler: &mut ir::Handler) -> Rc<Ty> {
+        let answer = self.table.fresh_type();
+        let discharged: IndexMap<String, RowField> = handler
+            .discharges
+            .iter()
+            .map(|effect| {
+                (
+                    self.mint.name(effect.tracked).to_string(),
+                    RowField::present(Rc::new(Ty::unit())),
+                )
+            })
+            .collect();
+        let extended = Row {
+            labels: discharged,
+            rest: Rest::More(Rc::new(self.ambient.row.clone())),
+        };
+        // What the ambient may not stand for: an effect this handler already
+        // discharges. A row that acquired one would name it twice, which is
+        // exactly the masking R16 leaves refused.
+        self.table.note_lacks_row(&extended, Shape::Effect);
+        let outer = self.enter(Ambient {
+            row: extended,
+            inside: self.ambient.inside,
+        });
+        self.infer_term(body);
+        self.leave(outer);
+
+        // An arm answers the handler around it, whichever arm a `raise` inside
+        // it is written in.
+        let held = self.answer.replace(answer.clone());
+        for arm in &mut handler.arms {
+            // Indexed rather than looked up, for the reason an operation
+            // reference is: lowering keeps no arm whose operation it could not
+            // resolve.
+            let (from, to) = self.operations[&(arm.effect.tracked, arm.op.tracked.clone())].clone();
+            self.env.insert(arm.binder.tracked, Binding::Mono(from));
+            self.infer_term(&mut arm.body);
+            let actual = arm.body.ty.clone();
+            self.checks(arm.body.span, &actual, &to);
+        }
+        match &mut handler.ret {
+            // `| return p => e` binds `p` at the type of the handled
+            // expression and gives the answer, which is the one thing that can
+            // make the whole expression a different type from its body.
+            Some(ret) => {
+                self.env
+                    .insert(ret.binder.tracked, Binding::Mono(body.ty.clone()));
+                self.infer_term(&mut ret.body);
+                let actual = ret.body.ty.clone();
+                self.checks(ret.body.span, &actual, &answer);
+            }
+            // With none, the answer is what the body came to — said as one
+            // equation rather than as a rule of its own.
+            None => {
+                let actual = body.ty.clone();
+                self.checks(body.span, &actual, &answer);
+            }
+        }
+        self.answer = held;
+        answer
+    }
+
+    /// Walk what follows at `ambient`, handing back what was in force so the
+    /// caller can put it back. See [`Constrain::leave`].
+    fn enter(&mut self, ambient: Ambient) -> Ambient {
+        std::mem::replace(&mut self.ambient, ambient)
+    }
+
+    /// Put back the ambient [`enter`](Self::enter) took.
+    fn leave(&mut self, ambient: Ambient) {
+        self.ambient = ambient;
     }
 
     /// The type of one position of a match, from the column of sub-patterns
@@ -744,10 +954,21 @@ impl Constrain<'_> {
         // as it.
         let shape = self.table.unfolded(self.aliases, expected);
         match (&mut term.kind, &shape.core) {
-            (TermKind::Fn { arg, body }, Core::Arrow(from, to)) => {
-                let (from, to) = (from.clone(), to.clone());
+            // The lambda's arrow *is* the annotation, so its effect row is the
+            // annotation's: the body is walked at what the reader wrote it may
+            // do, and a `fn` that mints its own row here would be checking
+            // against a promise nobody made.
+            (TermKind::Fn { arg, body }, Core::Arrow(from, to, does)) => {
+                let (from, to, does) = (from.clone(), to.clone(), does.clone());
                 self.env.insert(arg.tracked, Binding::Mono(from));
+                let outer = self.enter(Ambient {
+                    row: does,
+                    inside: true,
+                });
+                let held = self.answer.take();
                 self.check_term(body, &to);
+                self.answer = held;
+                self.leave(outer);
                 term.ty = expected.clone();
             }
             // Only the exact closed shape a literal already has is pushed

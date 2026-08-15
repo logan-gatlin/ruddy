@@ -7,10 +7,11 @@
 use ruddy::{
     inference,
     ir::{
-        Annotation, Clause, ClauseKind, Decl, Pattern, PatternKind, Row, SumCase, Tail, Term,
-        TermKind, Type, TypeField, TypeKind, Variable, When,
+        Annotation, Clause, ClauseKind, Decl, Effect, EffectLabel, EffectRow, Handler, Pattern,
+        PatternKind, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind, Variable, When,
     },
     symbol::{Mint, Symbol},
+    tracking::Span,
     types::{Core, Sense},
 };
 
@@ -32,7 +33,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
     let mut ids = Ids::default();
     let mut nodes = Vec::new();
 
-    // Types first, then terms — the order `Program`'s own printer uses.
+    // Effects first, then types, then terms — the order `Program`'s own
+    // printer uses, which is the order lowering read them in.
+    for (symbol, decl) in &program.effects {
+        let node = decl_node(&mut ids, cx, mint, "effect", *symbol, decl, effect_node);
+        trace.decls.push(node.id);
+        nodes.push(node);
+    }
     for (symbol, decl) in &program.types {
         // A declaration body declares no variables, so nothing in it links to
         // one: its own parameters are symbols, and cross-highlight as those.
@@ -67,7 +74,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
     // into, which is the whole difference between a file of definitions and one
     // definition written many times.
     let summary = format!(
-        "{} · {} · {}",
+        "{} · {} · {} · {}",
+        plural(program.effects.len(), "effect"),
         plural(program.types.len(), "type"),
         plural(program.terms.len(), "term"),
         plural(program.groups.len(), "group")
@@ -128,6 +136,48 @@ fn decl_node<T>(
     node.child(value(ids, cx, mint, &decl.value))
 }
 
+/// One `effect` declaration's cases: an operation with its two sides under it,
+/// or the effect an alias names, as a row that cross-highlights to the
+/// declaration it points at.
+fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
+    let node = Node::new(ids.next(), "Cases", String::new());
+    match effect {
+        Effect::Operations(operations) => node.children(
+            operations
+                .iter()
+                .map(|(name, operation)| {
+                    Node::new(
+                        ids.next(),
+                        format!("`{name}:"),
+                        format!(
+                            "{} -> {}",
+                            print::ir::ty(&operation.from.tracked, mint),
+                            print::ir::ty(&operation.to.tracked, mint),
+                        ),
+                    )
+                    .at(operation.name_span)
+                    .child(type_node(ids, cx, mint, &operation.from, &[]))
+                    .child(type_node(ids, cx, mint, &operation.to, &[]))
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Effect::Alias(aliases) => node.children(
+            aliases
+                .iter()
+                .map(|(name, aliased)| {
+                    with_symbol(
+                        Node::new(ids.next(), "Names", format!("`{name}"))
+                            .at(named(aliased.name_span, name)),
+                        cx,
+                        mint,
+                        aliased.symbol,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
 /// One row per term, and one trace entry alongside it: the id this row was
 /// given, and the type of the term it stands for. The stage that badges the IR
 /// reads those pairs rather than walking the tree a second time.
@@ -180,7 +230,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             let shape = cx
                 .inference
                 .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
-            if let Some(Core::Arrow(from, _)) = shape.as_deref().map(|ty| &ty.core) {
+            if let Some(Core::Arrow(from, _, _)) = shape.as_deref().map(|ty| &ty.core) {
                 trace.terms.push((bound.id, from.clone()));
             }
             Node {
@@ -258,6 +308,70 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             }
             match_node
         }
+        // The handled expression, then one wrapper per arm: what it answers,
+        // the name it binds — a symbol, so it cross-highlights with its uses —
+        // and its body. The effects the handler discharges get a row of their
+        // own, since which they are is what lowering decided and nothing else
+        // on the page says.
+        TermKind::Handle { body, handler } => {
+            let mut handle_node = Node {
+                label: "Handle".into(),
+                ..node
+            }
+            .child(term_node(ids, cx, mint, body, trace))
+            .child(discharges_node(ids, cx, mint, handler));
+            for arm in &handler.arms {
+                let head = Node::new(
+                    ids.next(),
+                    "Arm",
+                    format!("{}.`{}", mint.name(arm.effect.tracked), arm.op.tracked),
+                )
+                .at(arm.effect.span)
+                .child(with_symbol(
+                    Node::new(ids.next(), "Binder", mint.name(arm.binder.tracked))
+                        .at(arm.binder.span),
+                    cx,
+                    mint,
+                    arm.binder.tracked,
+                ))
+                .child(term_node(ids, cx, mint, &arm.body, trace));
+                handle_node = handle_node.child(with_symbol(head, cx, mint, arm.effect.tracked));
+            }
+            if let Some(ret) = &handler.ret {
+                let head = Node::new(ids.next(), "Return", String::new())
+                    .at(ret.span)
+                    .child(with_symbol(
+                        Node::new(ids.next(), "Binder", mint.name(ret.binder.tracked))
+                            .at(ret.binder.span),
+                        cx,
+                        mint,
+                        ret.binder.tracked,
+                    ))
+                    .child(term_node(ids, cx, mint, &ret.body, trace));
+                handle_node = handle_node.child(head);
+            }
+            handle_node
+        }
+        TermKind::Raise(value) => Node {
+            label: "Raise".into(),
+            ..node
+        }
+        .child(term_node(ids, cx, mint, value, trace)),
+        // The effect is a symbol and cross-highlights to its declaration; the
+        // operation is a label scoped to that declaration, so it names none.
+        TermKind::Operation { effect, .. } => with_symbol(
+            Node {
+                label: "Operation".into(),
+                ..node
+            }
+            // Spanned at the effect's own name rather than at the whole
+            // `` Eff.`op ``: the row claims the effect, and a claim has to be
+            // spanned where the name it claims was written.
+            .at(effect.span),
+            cx,
+            mint,
+            effect.tracked,
+        ),
         TermKind::Struct(fields) => {
             // Built eagerly rather than through `children`: the closure a lazy
             // iterator would need borrows the trace for as long as it lives.
@@ -280,6 +394,71 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             .children(wrappers)
         }
     }
+}
+
+/// The effects a handler discharges, as a row of its own: which they are is
+/// R15's coverage check answered, and nothing else on the page shows it.
+fn discharges_node(ids: &mut Ids, cx: &Cx, mint: &Mint, handler: &Handler) -> Node {
+    let named: Vec<String> = handler
+        .discharges
+        .iter()
+        .map(|effect| format!("`{}", mint.name(effect.tracked)))
+        .collect();
+    let node = Node::new(ids.next(), "Discharges", named.join(" | "));
+    node.children(
+        handler
+            .discharges
+            .iter()
+            .map(|effect| {
+                with_symbol(
+                    Node::new(ids.next(), "", format!("`{}", mint.name(effect.tracked)))
+                        .at(effect.span),
+                    cx,
+                    mint,
+                    effect.tracked,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The `! <effects>` clause an arrow carries, as a row of its own: one child
+/// per effect it names — each cross-highlighting to the declaration it names —
+/// and the `..` tail beside them.
+fn effects_node(
+    ids: &mut Ids,
+    cx: &Cx,
+    mint: &Mint,
+    effects: &EffectRow,
+    scope: &[Variable],
+) -> Node {
+    let mut kids: Vec<Node> = effects
+        .effects
+        .iter()
+        .map(|(name, label)| {
+            let text = match label {
+                EffectLabel::Written { when, .. } => format!("`{name}{}", when_text(when)),
+                EffectLabel::Absent { .. } => format!("\\`{name}"),
+            };
+            let row = Node::new(ids.next(), text, String::new()).at(named(label.name_span(), name));
+            // A label an alias put here is *about* the effect without being an
+            // occurrence of its name — the name on the page is the alias's —
+            // so it takes the association without the span claim.
+            match label.expanded() {
+                true => match cx.symbols.get(&label.symbol()) {
+                    Some(index) => row.owner(*index),
+                    None => row,
+                },
+                false => with_symbol(row, cx, mint, label.symbol()),
+            }
+        })
+        .collect();
+    if let Some(tail) = &effects.tail {
+        kids.push(rest_node(ids, mint, tail, scope));
+    }
+    Node::new(ids.next(), "Effects", String::new())
+        .at(effects.span)
+        .children(kids)
 }
 
 /// One normalized pattern as a row per node, mirroring the AST tab's pattern
@@ -404,7 +583,7 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
         Sense::Type => variable.name.clone(),
-        Sense::Cases => format!("..{}", variable.name),
+        Sense::Cases | Sense::Effects => format!("..{}", variable.name),
         Sense::Presence => format!("when {}", variable.name),
     };
     format!("{written} ({})", variable.sense)
@@ -582,12 +761,21 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             }
             .children(kids)
         }
-        TypeKind::Arrow { from, to } => Node {
-            label: "Arrow".into(),
-            ..node
+        TypeKind::Arrow { from, to, effects } => {
+            let arrow = Node {
+                label: "Arrow".into(),
+                ..node
+            }
+            .child(type_node(ids, cx, mint, from, scope))
+            .child(type_node(ids, cx, mint, to, scope));
+            // The row is a child beside the two sides, the way the AST tab
+            // shows it — and a pure arrow, which wrote none, simply has one
+            // child fewer.
+            match effects.written {
+                true => arrow.child(effects_node(ids, cx, mint, effects, scope)),
+                false => arrow,
+            }
         }
-        .child(type_node(ids, cx, mint, from, scope))
-        .child(type_node(ids, cx, mint, to, scope)),
         TypeKind::Struct { fields, tail } => {
             let mut kids: Vec<Node> = fields
                 .iter()
@@ -625,6 +813,17 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             .children(kids)
         }
     }
+}
+
+/// Where the *name* of a label was written, without the marks it wears: the
+/// backtick that makes a tag one, and the `\` before one written absent.
+///
+/// A node claiming a symbol has to be spanned where the name is — the page
+/// paints those spans in the editor as uses of it — and a label's own span
+/// covers its marks as well. The name is the tail of the span, since every mark
+/// a label can wear comes before it.
+fn named(span: Span, name: &str) -> Span {
+    span.file_id.span(span.end() - name.len(), name.len())
 }
 
 /// The `..` tail of either shape of row, as the row of its own it is shown as.

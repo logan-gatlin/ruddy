@@ -67,12 +67,18 @@ pub struct Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Module(Symbol);
 
-/// The three disjoint worlds a symbol can live in. The same name in two
+/// The four disjoint worlds a symbol can live in. The same name in two
 /// namespaces makes two unrelated symbols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Namespace {
     Terms,
     Types,
+    /// Declared effects. Their own world rather than a corner of the types',
+    /// because a `Log` type and a `Log` effect are two things a program may
+    /// name at once and nothing written can confuse them: an effect is named in
+    /// a row after a `!` and at the head of an operation, and a type nowhere
+    /// near either.
+    Effects,
     Modules,
 }
 
@@ -226,6 +232,7 @@ impl Namespace {
         match self {
             Namespace::Terms => 'V',
             Namespace::Types => 'T',
+            Namespace::Effects => 'E',
             Namespace::Modules => 'M',
         }
     }
@@ -234,6 +241,7 @@ impl Namespace {
         match tag {
             'V' => Some(Namespace::Terms),
             'T' => Some(Namespace::Types),
+            'E' => Some(Namespace::Effects),
             'M' => Some(Namespace::Modules),
             _ => None,
         }
@@ -510,7 +518,7 @@ impl Bundles {
 /// mangled   := "_R" bundle component+
 /// bundle    := "B" len body version
 /// version   := "v" num "m" num "p" num [ "r" len body ]
-/// component := ns len body [ "s" num ]         // ns = M | T | V
+/// component := ns len body [ "s" num ]         // ns = E | M | T | V
 /// len       := the byte length of body, in decimal
 /// body      := the name, with every character outside [A-Za-z0-9] — and a
 ///              leading digit — written as "_" hex "_"

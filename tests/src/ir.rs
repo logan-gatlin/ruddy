@@ -3,8 +3,8 @@
 use indexmap::IndexMap;
 use ruddy::{
     ir::{
-        Annotation, ClauseKind, ErrorKind, Field, Output, PatternKind, SumCase, Term, TermKind,
-        TypeField, TypeKind, build,
+        Annotation, ClauseKind, Effect, ErrorKind, Field, Output, PatternKind, SumCase, Term,
+        TermKind, TypeField, TypeKind, build,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -1281,7 +1281,15 @@ fn a_parameter_kind_does_not_depend_on_declaration_order() {
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
-        assert!(matches!(out.errors[0].kind, ErrorKind::NotARow), "{src}");
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::NotARow {
+                    sense: Sense::Cases
+                }
+            ),
+            "{src}"
+        );
         assert_eq!(
             out.errors[0].span.start,
             src.find("Or Nat").expect("the use") + "Or ".len(),
@@ -1420,7 +1428,7 @@ fn only_a_row_may_be_written_where_a_row_goes() {
         assert!(
             out.errors
                 .iter()
-                .any(|error| matches!(error.kind, ErrorKind::NotARow)),
+                .any(|error| matches!(error.kind, ErrorKind::NotARow { .. })),
             "{src}: {:#?}",
             out.errors
         );
@@ -1685,7 +1693,7 @@ fn a_declared_sum_must_list_its_cases() {
 fn a_row_parameter_knows_which_shape_it_is() {
     let (_, out) = build_src("type Cases r = `A Nat | ..r  type Bad = Cases { y: Nat }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(matches!(out.errors[0].kind, ErrorKind::NotARow));
+    assert!(matches!(out.errors[0].kind, ErrorKind::NotARow { .. }));
 
     let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type Fine = WithX (`A Nat)");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -2837,6 +2845,17 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
             references_of(arg, out);
         }
         TermKind::Fn { body, .. } => references_of(body, out),
+        TermKind::Handle { body, handler } => {
+            references_of(body, out);
+            for arm in &handler.arms {
+                references_of(&arm.body, out);
+            }
+            if let Some(ret) = &handler.ret {
+                references_of(&ret.body, out);
+            }
+        }
+        TermKind::Raise(value) => references_of(value, out),
+        TermKind::Operation { .. } => {}
         TermKind::Let { value, body, .. } => {
             references_of(value, out);
             references_of(body, out);
@@ -3485,6 +3504,689 @@ fn a_declaration_may_not_carry_a_clause() {
             .map(|error| error.kind.code())
             .collect::<Vec<_>>(),
         ["open-declared-type"]
+    );
+}
+
+/// Every complaint one source made, as the codes a reporter keys on, in the
+/// order the reader would meet them.
+fn codes_of(src: &str) -> Vec<&'static str> {
+    let (_, out) = build_src(src);
+    out.errors.iter().map(|error| error.kind.code()).collect()
+}
+
+/// One effect declaration's lowered value, by the name it was declared under.
+fn effect_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Effect {
+    let symbol = *out
+        .program
+        .effects
+        .keys()
+        .find(|symbol| mint.name(**symbol) == name)
+        .unwrap_or_else(|| panic!("no effect named {name}"));
+    &out.program.effects[&symbol].value
+}
+
+/// An operation declaration keeps its operations in the order they were
+/// written, each as the two sides of the plain closed arrow performing it has —
+/// which is what a handler arm's binder and body type come off. The empty
+/// effect declares nothing and is still an effect a row may name.
+#[test]
+fn an_effect_declares_its_operations() {
+    let (mint, out) = built("effect Log = `write : Nat -> () | `flush : () -> ()");
+    let Effect::Operations(operations) = effect_of(&mint, &out, "Log") else {
+        panic!("expected an operation declaration");
+    };
+    assert_eq!(
+        operations.keys().collect::<Vec<_>>(),
+        ["write", "flush"].iter().collect::<Vec<_>>()
+    );
+    let write = &operations["write"];
+    assert!(matches!(write.from.tracked, TypeKind::Prim(Prim::Nat)));
+    assert!(matches!(
+        write.to.tracked,
+        TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
+    ));
+
+    let (mint, out) = built("effect Nil = |");
+    let Effect::Operations(operations) = effect_of(&mint, &out, "Nil") else {
+        panic!("the empty effect declares operations, of which it has none");
+    };
+    assert!(operations.is_empty());
+}
+
+/// An alias names effects and declares nothing, and expands to the effects it
+/// names wherever a row mentions it — so no alias survives into what a
+/// definition is checked against, and none can be performed through.
+#[test]
+fn an_alias_expands_to_the_effects_it_names() {
+    let src = "effect Log = `write : Nat -> ()\n\
+               effect IO = `print : Nat -> ()\n\
+               effect Console = `Log | `IO\n\
+               effect All = `Console\n\
+               let f : Nat -> Nat ! `All = fn x => x";
+    let (mint, out) = built(src);
+    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+        panic!("expected an alias");
+    };
+    assert_eq!(
+        named.keys().collect::<Vec<_>>(),
+        ["Log", "IO"].iter().collect::<Vec<_>>()
+    );
+
+    // And an alias of an alias reaches through: what a row writes is the
+    // effects, however many names stand between.
+    let effects = annotation_effects(&mint, &out, "f");
+    assert_eq!(effects, ["Log", "IO"]);
+}
+
+/// The effects a definition's annotation says it may perform, in the order the
+/// lowered row names them.
+fn annotation_effects(mint: &Mint, out: &Output, name: &str) -> Vec<String> {
+    let decl = &out.program.terms[&term_symbol(mint, out, name)];
+    let TypeKind::Arrow { effects, .. } = &decl
+        .annotation
+        .as_ref()
+        .expect("the definition is annotated")
+        .ty
+        .tracked
+    else {
+        panic!("expected an arrow");
+    };
+    effects.effects.keys().cloned().collect()
+}
+
+/// A bare `A -> B` carries the empty closed row, which is what pure means; the
+/// `! |` that spells it out lowers to the same thing and is told apart only by
+/// what the debugger prints back.
+#[test]
+fn a_bare_arrow_is_pure() {
+    let (mint, out) = built("let f : Nat -> Nat = fn x => x");
+    let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.effects.is_empty() && effects.tail.is_none());
+    assert!(!effects.written);
+
+    let (mint, out) = built("let f : Nat -> Nat ! | = fn x => x");
+    let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.effects.is_empty() && effects.tail.is_none());
+    assert!(effects.written, "the reader wrote the row out");
+}
+
+/// Every way an effect declaration can be refused, each once and at the thing
+/// the reader can change.
+#[test]
+fn an_effect_declaration_is_held_to_its_form() {
+    assert_eq!(
+        codes_of("effect Log = `write : Nat -> () | `write : () -> ()"),
+        ["duplicate-operation"]
+    );
+    assert_eq!(codes_of("effect Log = `here : Nat"), ["not-an-operation"]);
+    assert_eq!(
+        codes_of("effect IO = `print : Nat -> ()\neffect Log = `w : Nat -> () ! `IO"),
+        ["impure-operation"]
+    );
+    // The three an operation's signature may not leave open are one complaint,
+    // because one sentence naming all three is what a reader can act on.
+    for source in [
+        "effect Log = `w : { x: Nat, .. } -> ()",
+        "effect Log = `w : { x when a: Nat } -> ()",
+        "effect Log = `w : Nat -> (`A | ..r)",
+    ] {
+        assert_eq!(codes_of(source), ["impure-operation"], "{source}");
+    }
+    assert_eq!(
+        codes_of("effect Log = `write : Nat -> ()\neffect Bad = `Log | `w : Nat -> ()"),
+        ["mixed-effect-form"]
+    );
+    // A repeated effect name is a duplicate like any other, in its own
+    // namespace.
+    let out = build_src("effect Log = |\neffect Log = |").1;
+    assert_eq!(out.errors[0].kind.code(), "duplicate-effect");
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Duplicate {
+            namespace: Namespace::Effects,
+            ..
+        }
+    ));
+}
+
+/// An effect and a type of one name are two unrelated things, which is what a
+/// namespace of its own buys.
+#[test]
+fn effects_have_a_namespace_of_their_own() {
+    let (mint, out) = built(
+        "type Log = Nat\neffect Log = `write : Nat -> ()\nlet f : Log -> Log ! `Log = fn x => x",
+    );
+    assert_eq!(annotation_effects(&mint, &out, "f"), ["Log"]);
+    assert_eq!(
+        mint.namespace(*out.program.effects.keys().next().expect("one effect")),
+        Namespace::Effects
+    );
+}
+
+/// An operation reference resolves to the effect that declares it, and every
+/// way of failing to has a complaint of its own: no such effect, an alias —
+/// which declares nothing — and an effect with no such operation.
+#[test]
+fn an_operation_reference_resolves_through_its_effect() {
+    let base = "effect Log = `write : Nat -> ()\n\
+                effect IO = `print : Nat -> ()\n\
+                effect Console = `Log | `IO\n";
+    let (mint, out) = built(&format!("{base}let g = fn _ => Log.`write 1"));
+    let mut node = term_value(&mint, &out, "g");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Apply { func, .. } = node else {
+        panic!("expected an application");
+    };
+    let TermKind::Operation { effect, op } = &func.kind else {
+        panic!("expected an operation, got {:?}", func.kind);
+    };
+    assert_eq!(mint.name(effect.tracked), "Log");
+    assert_eq!(op.tracked, "write");
+
+    assert_eq!(
+        codes_of(&format!("{base}let g = fn _ => Lg.`write 1")),
+        ["undefined-effect"]
+    );
+    assert_eq!(
+        codes_of(&format!("{base}let g = fn _ => Log.`writ 1")),
+        ["unknown-operation"]
+    );
+    assert_eq!(
+        codes_of(&format!("{base}let g = fn _ => Console.`write 1")),
+        ["operation-on-alias"]
+    );
+}
+
+/// Which effects a handler discharges is settled here, before inference: every
+/// effect an arm names must have an arm for each of its operations, and a
+/// half-covered one leaves the set undecidable.
+#[test]
+fn a_handler_must_cover_every_effect_it_names() {
+    let base = "effect Log = `write : Nat -> () | `flush : () -> ()\n\
+                let p : () -> Nat ! `Log = fn _ => 0\n";
+    let (mint, out) = built(&format!(
+        "{base}let h = fn _ => handle p () with | Log.`write s => () | Log.`flush u => () end"
+    ));
+    let mut node = term_value(&mint, &out, "h");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected a handler");
+    };
+    assert_eq!(handler.arms.len(), 2);
+    assert!(handler.ret.is_none());
+    let discharged: Vec<&str> = handler
+        .discharges
+        .iter()
+        .map(|effect| mint.name(effect.tracked))
+        .collect();
+    assert_eq!(discharged, ["Log"]);
+
+    // One arm short, and the complaint names the operation with none.
+    let (_, out) = build_src(&format!(
+        "{base}let h = fn _ => handle p () with | Log.`write s => () end"
+    ));
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "partial-handler");
+    assert_eq!(
+        error.kind.to_string(),
+        "handling `Log` needs an arm for ``flush` too"
+    );
+    assert!(matches!(
+        error.kind,
+        ErrorKind::PartialHandler { ref missing, .. } if missing == &["flush".to_string()]
+    ));
+}
+
+/// A duplicate arm and a second `return` arm are refused where a duplicate
+/// anything else is: at the repeat, with the first the one that stands.
+#[test]
+fn a_handler_takes_each_arm_once() {
+    let base = "effect Log = `write : Nat -> ()\nlet p : () -> Nat ! `Log = fn _ => 0\n";
+    let (_, out) = build_src(&format!(
+        "{base}let h = fn _ => handle p () with | Log.`write s => () | Log.`write t => () end"
+    ));
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "duplicate-arm");
+    assert_eq!(error.kind.to_string(), "duplicate arm for `Log.`write`");
+
+    let (mint, out) = build_src(&format!(
+        "{base}let h = fn _ => handle p () with | return a => a | return b => b end"
+    ));
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "duplicate-return-arm");
+    // The first is the one that stands, the way a repeated definition is.
+    let mut node = term_value(&mint, &out, "h");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected a handler");
+    };
+    let ret = handler.ret.as_ref().expect("a return arm");
+    assert_eq!(mint.name(ret.binder.tracked), "a");
+}
+
+/// R17: a `raise` answers the innermost arm that lexically encloses it, and a
+/// `fn` between the two is a closure that could outlive the handler.
+#[test]
+fn raise_belongs_to_the_arm_around_it() {
+    let base = "effect Log = `write : Nat -> ()\nlet p : () -> Nat ! `Log = fn _ => 0\n";
+    let arm =
+        |body: &str| format!("{base}let h = fn _ => handle p () with | Log.`write s => {body} end");
+    // No arm anywhere.
+    assert_eq!(
+        codes_of(&format!("{base}let a = raise 1")),
+        ["raise-outside-arm"]
+    );
+    assert_eq!(
+        codes_of(&format!("{base}let a = fn _ => raise 1")),
+        ["raise-outside-arm"]
+    );
+    // The handled expression of a handler with no arm above it is the ordinary
+    // "no enclosing arm" case.
+    assert_eq!(
+        codes_of(&format!("{base}let a = fn _ => handle raise 1 with end")),
+        ["raise-outside-arm"]
+    );
+
+    // A `fn` between the `raise` and its arm — including one applied on the
+    // spot, since what matters is that a closure was written at all.
+    assert_eq!(
+        codes_of(&arm("{ g: fn _ => raise 0 }")),
+        ["raise-in-function"]
+    );
+    assert_eq!(codes_of(&arm("(fn _ => raise 0) 1")), ["raise-in-function"]);
+
+    // And every position an expression may sit in, none of which needs a rule.
+    for body in [
+        "raise 0",
+        "let a = raise 0 in ()",
+        "f (raise 0)",
+        "{ g: raise 0 }",
+        "match s with | 0 => raise 0 | _ => () end",
+        // A nested `handle`'s *body* keeps the outer arm: the outer handler is
+        // still on the stack while the inner one runs.
+        "handle raise 0 with end",
+    ] {
+        let src = format!(
+            "{base}let f = fn x => x\nlet h = fn _ => handle p () with | Log.`write s => {body} end"
+        );
+        let (_, out) = build_src(&src);
+        let raised: Vec<&str> = out
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .filter(|code| code.starts_with("raise-"))
+            .collect();
+        assert!(raised.is_empty(), "{body}: {:#?}", out.errors);
+    }
+
+    // A `return` arm is an arm, so a `raise` in one is at home too.
+    assert_eq!(
+        codes_of(&format!(
+            "{base}let h = fn _ => handle p () with | Log.`write s => () | return x => raise x end"
+        )),
+        Vec::<&str>::new()
+    );
+}
+
+/// A `type` declaration may name effects in an arrow it writes, and may take a
+/// parameter standing for an arrow's effects — a third reading beside a type
+/// and a sum's rest.
+#[test]
+fn a_declaration_may_write_and_take_effects() {
+    let (mint, out) = built(
+        "effect Log = `write : Nat -> ()\n\
+         type Logger = Nat -> Nat ! `Log\n\
+         type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e",
+    );
+    let TypeKind::Arrow { effects, .. } = &out.program.types[&type_symbol(&mint, &out, "Logger")]
+        .value
+        .tracked
+    else {
+        panic!("expected an arrow");
+    };
+    assert_eq!(effects.effects.keys().collect::<Vec<_>>(), ["Log"]);
+
+    let runner = &out.program.types[&type_symbol(&mint, &out, "Runner")];
+    assert_eq!(runner.params.len(), 1);
+    assert_eq!(
+        runner.params[0].kind,
+        ParamKind::Effects { lacks: [].into() }
+    );
+}
+
+/// The three a declaration may not leave open are refused in the effect
+/// position exactly as they are in a struct's or a sum's — unless the tail
+/// names one of the declaration's own parameters, which is supplied at every
+/// use rather than decided here.
+#[test]
+fn a_declared_effect_row_must_be_closed() {
+    let base = "effect Log = `write : Nat -> ()\n";
+    for source in [
+        "type T = Nat -> Nat ! ..",
+        "type T = Nat -> Nat ! ..e",
+        "type T = Nat -> Nat ! `Log (when a)",
+    ] {
+        let src = format!("{base}{source}");
+        let out = build_src(&src).1;
+        assert_eq!(
+            out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+            ["open-declared-type"],
+            "{source}"
+        );
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::OpenDeclaredType {
+                    shape: Shape::Effect
+                }
+            ),
+            "{source}: {:#?}",
+            out.errors[0].kind
+        );
+    }
+    assert_eq!(
+        out_message(&format!("{base}type T = Nat -> Nat ! ..e")),
+        "a declared type must list its effects exactly; `..` and `when` belong in annotations"
+    );
+}
+
+/// The first complaint one source made, worded.
+fn out_message(src: &str) -> String {
+    let (_, out) = build_src(src);
+    out.errors
+        .first()
+        .unwrap_or_else(|| panic!("{src}: no complaint"))
+        .kind
+        .to_string()
+}
+
+/// One name is one rest, and an arrow's effects are a third thing a rest can
+/// be — so a parameter used as an effect tail in one place and as a type in
+/// another is the mixed parameter it always was, with the third reading named.
+#[test]
+fn a_parameter_read_two_ways_names_both() {
+    let src = "effect Log = `write : Nat -> ()\n\
+               type M e = { f: e, g: (Nat -> Nat ! ..e) }";
+    let (_, out) = build_src(src);
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "mixed-parameter");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::MixedParameter {
+            first: Sense::Type,
+            second: Sense::Effects
+        }
+    ));
+    assert_eq!(
+        error.kind.to_string(),
+        "this stands for a whole type in one place and for the rest of an arrow's effects in another"
+    );
+
+    // And a name given two rests in one *annotation* is the same mistake.
+    let src = "effect Log = `write : Nat -> ()\n\
+               let f : { x: Nat, ..r } -> Nat -> Nat ! ..r where let r = fn p => fn n => n";
+    let (_, out) = build_src(src);
+    let mixed: Vec<&str> = out
+        .errors
+        .iter()
+        .map(|error| error.kind.code())
+        .filter(|code| *code == "mixed-tail")
+        .collect();
+    assert_eq!(mixed, ["mixed-tail"], "{:#?}", out.errors);
+}
+
+/// An effect written absent needs a `..` to speak about, the way a struct's
+/// `\y` and a sum's `` \`B `` do: a row with no tail already says every effect
+/// it does not name is not performed.
+#[test]
+fn an_absent_effect_needs_a_tail() {
+    let src = "effect Log = `write : Nat -> ()\nlet f : Nat -> Nat ! \\`Log = fn x => x";
+    let (_, out) = build_src(src);
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "absent-in-closed");
+    assert_eq!(
+        error.kind.to_string(),
+        "a type with no `..` already says ``Log` is not there"
+    );
+}
+
+/// An effect named twice in one row is a duplicate, however it got there — the
+/// two names of an alias that overlap another label included.
+#[test]
+fn an_effect_row_names_each_effect_once() {
+    let src = "effect Log = `write : Nat -> ()\nlet f : Nat -> Nat ! `Log | `Log = fn x => x";
+    assert_eq!(codes_of(src), ["duplicate-case"]);
+}
+
+/// An alias's cases are effect names and are resolved like any other: one that
+/// names nothing is undefined, and one named twice is a duplicate. Both are
+/// dropped where they stood, so the declaration still stands for whatever else
+/// it named.
+#[test]
+fn an_aliass_cases_are_resolved_and_deduplicated() {
+    assert_eq!(
+        codes_of("effect Log = `write : Nat -> ()\neffect Console = `Log | `Nope"),
+        ["undefined-effect"]
+    );
+    let (mint, out) = build_src("effect Log = `write : Nat -> ()\neffect Console = `Log | `Log");
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["duplicate-case"]
+    );
+    let Effect::Alias(named) = effect_of(&mint, &out, "Console") else {
+        panic!("expected an alias");
+    };
+    assert_eq!(named.len(), 1);
+}
+
+/// An effect a row names has to be one: an unknown name is dropped from the
+/// row where it stood, with the undefined-name complaint in the effect
+/// namespace, and whatever else the row named still stands.
+#[test]
+fn a_row_may_only_name_declared_effects() {
+    let (mint, out) =
+        build_src("effect Log = `write : Nat -> ()\nlet f : Nat -> Nat ! `Log | `Lg = fn x => x");
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["undefined-effect"]
+    );
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Effects
+        }
+    ));
+    assert_eq!(annotation_effects(&mint, &out, "f"), ["Log"]);
+}
+
+/// An arm whose operation does not resolve is dropped, so the effect it named
+/// is not counted as covered and nothing downstream is told a second time.
+#[test]
+fn an_arm_that_does_not_resolve_covers_nothing() {
+    let (mint, out) = build_src(
+        "effect Log = `write : Nat -> ()\n\
+         let p : () -> Nat ! `Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | Log.`writ s => () end",
+    );
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["unknown-operation"]
+    );
+    let mut node = term_value(&mint, &out, "h");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected a handler");
+    };
+    assert!(handler.arms.is_empty());
+    assert!(handler.discharges.is_empty());
+}
+
+/// A `\` on an effect is refused in a declaration for the reason a bare `..`
+/// is — and the row still runs its own absent-in-closed check, so a `\` with
+/// no `..` to speak about is told about too.
+#[test]
+fn a_declared_effect_row_refuses_an_absence() {
+    let codes = codes_of("effect Log = `write : Nat -> ()\ntype T = Nat -> Nat ! \\`Log");
+    assert_eq!(codes, ["absent-in-closed"]);
+}
+
+/// A declaration that mixes the two forms is read as whichever form its first
+/// case is, and every case of the other form is dropped — reported once, at
+/// the first of them, so one mistake makes one complaint however many cases
+/// went the wrong way.
+#[test]
+fn a_mixed_effect_declaration_keeps_the_form_it_opened_with() {
+    // Opening with an operation, so the bare tags are what is dropped.
+    let (mint, out) = build_src(
+        "effect Log = `write : Nat -> ()\n\
+         effect Bad = `w : Nat -> () | `Log | `Log",
+    );
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["mixed-effect-form"]
+    );
+    let Effect::Operations(operations) = effect_of(&mint, &out, "Bad") else {
+        panic!("the first case decided the form");
+    };
+    assert_eq!(operations.keys().collect::<Vec<_>>(), ["w"]);
+
+    // And opening with a bare tag, so the signatures are — including a second
+    // one, which says nothing new.
+    let (mint, out) = build_src(
+        "effect Log = `write : Nat -> ()\n\
+         effect Bad = `Log | `w : Nat -> () | `v : Nat -> ()",
+    );
+    assert_eq!(
+        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
+        ["mixed-effect-form"]
+    );
+    let Effect::Alias(named) = effect_of(&mint, &out, "Bad") else {
+        panic!("the first case decided the form");
+    };
+    assert_eq!(named.keys().collect::<Vec<_>>(), ["Log"]);
+}
+
+/// A signature that failed to lower is already a complaint, so it is not told a
+/// second time that it is not a function: the error type absorbs, here as
+/// everywhere.
+#[test]
+fn a_signature_that_did_not_lower_is_not_told_twice() {
+    assert_eq!(codes_of("effect Log = `write : Bogus"), ["undefined-type"]);
+}
+
+/// A row that names nothing may still say something: `! ..e` ends in a tail,
+/// so the arrow may perform whatever the tail stands for, and only a row with
+/// neither is the pure one.
+#[test]
+fn a_row_that_is_only_a_tail_says_something() {
+    let (mint, out) = built("let f : Nat -> Nat ! ..e where let e = fn x => x");
+    let decl = &out.program.terms[&term_symbol(&mint, &out, "f")];
+    let TypeKind::Arrow { effects, .. } = &decl.annotation.as_ref().expect("annotated").ty.tracked
+    else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.effects.is_empty());
+    assert!(effects.tail.is_some());
+    assert!(effects.written);
+}
+
+/// An effect tail counts as a use of a parameter, so a recursion handing on a
+/// type built out of one through a `!` grows exactly as one handing it on
+/// through a field does.
+#[test]
+fn an_effect_tail_makes_an_argument_grow() {
+    let codes = codes_of(
+        "effect Log = `write : Nat -> ()\n\
+         type T a = { next: T (Nat -> Nat ! ..a) }",
+    );
+    assert_eq!(codes, ["growing-recursion"]);
+}
+
+/// `return` is contextual: it heads a handler arm and is an ordinary name
+/// everywhere else, so a definition may still be called one.
+#[test]
+fn return_is_a_name_everywhere_but_an_arms_head() {
+    let (mint, out) = built(
+        "effect Log = `write : Nat -> ()\n\
+         let return = 1\n\
+         let p : () -> Nat ! `Log = fn _ => return\n\
+         let h = fn _ => handle p () with | Log.`write s => () | return x => x end",
+    );
+    assert!(matches!(
+        term_value(&mint, &out, "return"),
+        TermKind::Natural(1)
+    ));
+    let mut node = term_value(&mint, &out, "h");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected a handler");
+    };
+    assert!(handler.ret.is_some());
+}
+
+/// An arrow's effects are spliced into a row, so only a row can be written at a
+/// parameter that stands for them — and only one naming none of the effects the
+/// declaration already writes out. The two conditions a sum's rest is held to,
+/// in the effect reading.
+#[test]
+fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
+    let base = "effect Log = `write : Nat -> ()\n\
+                type Runner e = (Nat -> Nat ! `Log | ..e) -> Nat\n";
+    // Something a row cannot hold.
+    let (_, out) = build_src(&format!("{base}let f : Runner Nat -> Nat = fn r => 1"));
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "not-a-row");
+    assert!(matches!(
+        error.kind,
+        ErrorKind::NotARow {
+            sense: Sense::Effects
+        }
+    ));
+    assert_eq!(
+        error.kind.to_string(),
+        "the rest of an arrow's effects goes here, and this is not that"
+    );
+
+    // And a row naming what the declaration already names: the `..` covers
+    // only what its own row leaves out.
+    let (_, out) = build_src(&format!("{base}let f : Runner (`Log) -> Nat = fn r => 1"));
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "repeated-row-field");
+    assert_eq!(
+        error.kind.to_string(),
+        "this names ``Log`, which the function it goes into already has"
     );
 }
 

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 use ruddy::types::{
     Assigned, Atom, Core, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
-    Ty,
+    Shape, Ty,
 };
 
 #[test]
@@ -182,7 +182,7 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     };
     assert_eq!(cases.sense(), Sense::Cases);
     assert_eq!(cases.lacks(), &lacks);
-    assert_eq!(cases.cases(), Some(&lacks));
+    assert_eq!(cases.cases(), Some((Shape::Sum, &lacks)));
 }
 
 /// A label written into a type is simply there. The constructor exists so that
@@ -276,6 +276,62 @@ fn opening_a_formula_substitutes_what_was_minted() {
     ] {
         assert_eq!(presence.formula().to_string(), printed, "{presence}");
     }
+}
+
+/// A third reading of the same machinery, and the only new thing it says is
+/// where it lives: an arrow carries a row beside its two sides, and a bare
+/// `A -> B` is that row closed and empty — which is what pure means, and what
+/// the printer writes as nothing at all.
+#[test]
+fn an_arrow_carries_the_effects_calling_it_may_perform() {
+    let nat = || Rc::new(Ty::plain(Core::Nat));
+    // The constructor every position with no effects to put on an arrow goes
+    // through, so the empty row is one value rather than six literals.
+    let pure = Ty::plain(Core::pure(nat(), nat()));
+    assert_eq!(pure.to_string(), "Nat -> Nat");
+    let Core::Arrow(_, _, effects) = &pure.core else {
+        panic!("expected an arrow");
+    };
+    assert!(effects.labels.is_empty());
+    assert!(matches!(effects.rest, Rest::Closed));
+
+    let performing = Ty::plain(Core::Arrow(
+        nat(),
+        nat(),
+        Row {
+            labels: [("Log".to_string(), RowField::present(Rc::new(Ty::unit())))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Var(3),
+        },
+    ));
+    assert_eq!(performing.to_string(), "Nat -> Nat ! `Log | ..?3");
+}
+
+/// The third shape reads in its own noun and writes its labels the way a sum's
+/// are: an effect wears the backtick that makes it one, so a message about
+/// `` `Log `` never asks the reader to look for `Log`.
+#[test]
+fn an_effect_row_is_read_in_effects() {
+    assert_eq!(Shape::Effect.to_string(), "function");
+    assert_eq!(ruddy::ui::label(Shape::Effect, "Log"), "`Log");
+    assert_eq!(ruddy::ui::label(Shape::Sum, "Log"), "`Log");
+    assert_eq!(ruddy::ui::label(Shape::Struct, "x"), "x");
+}
+
+/// The third parameter reading, beside a whole type and a sum's rest. It
+/// answers the shape question a sum's does — both are spliced into a row, so
+/// only a row can go there — and carries the labels an argument written at it
+/// may not name.
+#[test]
+fn a_parameter_may_stand_for_an_arrows_effects() {
+    let lacks: indexmap::IndexSet<String> = ["Log".to_string()].into_iter().collect();
+    let effects = ParamKind::Effects {
+        lacks: lacks.clone(),
+    };
+    assert_eq!(effects.sense(), Sense::Effects);
+    assert_eq!(effects.lacks(), &lacks);
+    assert_eq!(effects.cases(), Some((Shape::Effect, &lacks)));
 }
 
 /// A scheme has one index space, not two. The presences take the low

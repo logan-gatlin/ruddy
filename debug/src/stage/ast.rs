@@ -4,8 +4,9 @@
 //! the rendered source can never drift apart: they are the same printer.
 
 use ruddy::parse::{
-    Annotation, ArgKind, Clause, ClauseKind, ClauseStmtKind, Expr, ExprKind, Pattern, PatternKind,
-    Stmt, StmtKind, SumCase, Type, TypeField, TypeKind, When,
+    Annotation, ArgKind, ArmHead, Clause, ClauseKind, ClauseStmtKind, EffectCase, EffectLabel,
+    EffectRow, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField,
+    TypeKind, When,
 };
 
 use crate::{
@@ -22,18 +23,23 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let mut ids = Ids::default();
     let nodes: Vec<Node> = stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)).collect();
 
-    let (lets, types) = stmts
-        .iter()
-        .fold((0, 0), |(l, t), stmt| match stmt.tracked {
-            StmtKind::Let { .. } => (l + 1, t),
-            StmtKind::Type { .. } => (l, t + 1),
-        });
+    let (lets, types, effects) =
+        stmts
+            .iter()
+            .fold((0, 0, 0), |(l, t, e), stmt| match stmt.tracked {
+                StmtKind::Let { .. } => (l + 1, t, e),
+                StmtKind::Type { .. } => (l, t + 1, e),
+                StmtKind::Effect { .. } => (l, t, e + 1),
+            });
 
     Stage {
         micros: Some(cx.micros.parse),
         nodes,
         debug: format!("{stmts:#?}"),
-        ..spec.stage(cx.status(), format!("{types} type · {lets} let"))
+        ..spec.stage(
+            cx.status(),
+            format!("{effects} effect · {types} type · {lets} let"),
+        )
     }
 }
 
@@ -70,6 +76,32 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
                     .child(Node::new(ids.next(), "Param", param.tracked.clone()).at(param.span));
             }
             type_node_.child(annotation_node(ids, body))
+        }
+        // The name, then one row per case: an operation with its signature
+        // under it, and an alias's case as the leaf it is. The empty effect
+        // has the name and nothing else.
+        StmtKind::Effect { name, cases } => {
+            let mut effect_node = Node {
+                label: "Effect".into(),
+                ..node
+            }
+            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            for (op, case) in cases {
+                let row = match case {
+                    EffectCase::Operation { signature } => Node::new(
+                        ids.next(),
+                        format!("`{}:", op.tracked),
+                        print::ast::ty(&signature.tracked).to_string(),
+                    )
+                    .at(op.span)
+                    .child(type_node(ids, signature)),
+                    EffectCase::Alias => {
+                        Node::new(ids.next(), "Names", format!("`{}", op.tracked)).at(op.span)
+                    }
+                };
+                effect_node = effect_node.child(row);
+            }
+            effect_node
         }
     }
 }
@@ -173,6 +205,48 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             }
             match_node
         }
+        // The handled expression first, then one wrapper per arm holding what
+        // it answers, the name it binds and its body — the match's shape,
+        // about operations instead of patterns.
+        ExprKind::Handle { body, arms } => {
+            let mut handle_node = Node {
+                label: "Handle".into(),
+                ..node
+            }
+            .child(expr_node(ids, body));
+            for arm in arms {
+                let (label, at) = match &arm.head {
+                    ArmHead::Operation { effect, op } => (
+                        format!("{}.`{}", effect.tracked, op.tracked),
+                        effect.span.merge(op.span),
+                    ),
+                    ArmHead::Return { span } => ("return".to_string(), *span),
+                };
+                let binder = match &arm.binder.tracked {
+                    ArgKind::Name(name) => name.clone(),
+                    ArgKind::Wildcard => "_".to_string(),
+                };
+                let arm_node = Node::new(ids.next(), "Arm", label)
+                    .at(at.merge(arm.body.span))
+                    .child(Node::new(ids.next(), "Binder", binder).at(arm.binder.span))
+                    .child(expr_node(ids, &arm.body));
+                handle_node = handle_node.child(arm_node);
+            }
+            handle_node
+        }
+        ExprKind::Raise(value) => Node {
+            label: "Raise".into(),
+            ..node
+        }
+        .child(expr_node(ids, value)),
+        // The effect is a name and the operation a label scoped to it, so the
+        // row carries the span the two were written at and no symbol — the
+        // parse tree resolves nothing.
+        ExprKind::Operation { effect, op } => Node {
+            label: "Operation".into(),
+            ..node
+        }
+        .at(effect.span.merge(op.span)),
         ExprKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node
@@ -338,6 +412,38 @@ fn clause_kids(ids: &mut Ids, clause: &Clause) -> Vec<Node> {
         .collect()
 }
 
+/// The `! <effects>` clause an arrow carries, as a row of its own: one child
+/// per effect it names, and the `..` tail beside them.
+fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
+    let mut kids: Vec<Node> = effects
+        .effects
+        .iter()
+        .map(|(name, label)| match label {
+            EffectLabel::Written { when } => {
+                let mark = when_text(when);
+                Node::new(
+                    ids.next(),
+                    format!("`{}{mark}", name.tracked),
+                    String::new(),
+                )
+                .at(name.span)
+            }
+            // The absent effect is a leaf wearing the `\`, spanning the whole
+            // `` \`Name `` — the struct's absent field again.
+            EffectLabel::Absent => {
+                Node::new(ids.next(), format!("\\`{}", name.tracked), String::new()).at(name.span)
+            }
+        })
+        .collect();
+    if let Some(tail) = &effects.tail {
+        let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
+        kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+    }
+    Node::new(ids.next(), "Effects", String::new())
+        .at(effects.span)
+        .children(kids)
+}
+
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
@@ -411,12 +517,21 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             }
             .children(kids)
         }
-        TypeKind::Arrow { from, to } => Node {
-            label: "Arrow".into(),
-            ..node
+        TypeKind::Arrow { from, to, effects } => {
+            let arrow = Node {
+                label: "Arrow".into(),
+                ..node
+            }
+            .child(type_node(ids, from))
+            .child(type_node(ids, to));
+            // The row is a child of its own, beside the two sides: it is the
+            // third thing the arrow says, and folding it into the result would
+            // put it on the wrong arrow.
+            match effects {
+                Some(effects) => arrow.child(effects_node(ids, effects)),
+                None => arrow,
+            }
         }
-        .child(type_node(ids, from))
-        .child(type_node(ids, to)),
         TypeKind::Apply { head, args } => Node {
             label: "Apply".into(),
             ..node

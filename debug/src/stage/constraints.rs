@@ -77,7 +77,9 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                 ConstraintKind::Let { value, body, .. } => {
                     node.children(rows(ids, value)).children(rows(ids, body))
                 }
-                ConstraintKind::Equal { .. } | ConstraintKind::Instance { .. } => node,
+                ConstraintKind::Equal { .. }
+                | ConstraintKind::Instance { .. }
+                | ConstraintKind::Performs { .. } => node,
             }
         })
         .collect()
@@ -91,7 +93,9 @@ fn counted(constraints: &[Constraint]) -> usize {
         .iter()
         .map(|constraint| match &constraint.kind {
             ConstraintKind::Let { value, body, .. } => 1 + counted(value) + counted(body),
-            ConstraintKind::Equal { .. } | ConstraintKind::Instance { .. } => 1,
+            ConstraintKind::Equal { .. }
+            | ConstraintKind::Instance { .. }
+            | ConstraintKind::Performs { .. } => 1,
         })
         .sum()
 }
