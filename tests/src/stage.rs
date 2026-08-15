@@ -1,9 +1,7 @@
 //! Tests for [`ruddy_debug::stage`].
 
-use std::rc::Rc;
-
 use regex::Regex;
-use ruddy::types::{Core, Rest, Row, Ty};
+use ruddy::types::Core;
 use ruddy_debug::{
     stage::{Build, REGISTRY, Spec, panicked, skipped},
     wire::Stage,

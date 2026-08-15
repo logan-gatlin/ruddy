@@ -193,6 +193,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         TypeError::RigidBroken {
             found: nat.clone(),
             name: "a".into(),
+            sense: Sense::Type,
             declared: Span::generated(0, 1),
         },
         TypeError::RigidField {
@@ -1603,10 +1604,24 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
         TypeError::RigidBroken {
             found: Rc::new(Ty::plain(Core::Nat)),
             name: "a".into(),
+            sense: Sense::Type,
             declared: span,
         }
         .to_string(),
         "this is `Nat`, but `a` stands for whatever type the caller picks"
+    );
+    // The effect reading quotes no arrow: the rows differ only in their
+    // tails, and the reader's fix is at the expression, not a type nobody
+    // wrote.
+    assert_eq!(
+        TypeError::RigidBroken {
+            found: Rc::new(Ty::plain(Core::Nat)),
+            name: "e".into(),
+            sense: Sense::Effects,
+            declared: span,
+        }
+        .to_string(),
+        "this decides what it may perform, but `e` stands for whatever effects the caller allows"
     );
     assert_eq!(
         TypeError::RigidField {

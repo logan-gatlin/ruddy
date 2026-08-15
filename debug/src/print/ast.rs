@@ -316,7 +316,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             TypeKind::Arrow { from, to, effects } => {
-                let row = effects.as_ref().map(effect_row);
+                let row = effects.as_deref().map(effect_row);
                 write_arrow(
                     f,
                     &Ast(&from.tracked),

@@ -1921,6 +1921,17 @@ impl fmt::Display for inference::ErrorKind {
             // agree: one of them is a name standing in for a choice the reader
             // handed to their caller, and "expected `a`, found `Nat`" says
             // nothing about why `a` cannot simply be `Nat`.
+            // The effect reading quotes no type: the two rows differ only in
+            // their tails there, and "this is `{} -> {} ! |`" points a reader
+            // at an arrow nobody wrote.
+            inference::ErrorKind::RigidBroken {
+                sense: Sense::Effects,
+                name,
+                ..
+            } => write!(
+                f,
+                "this decides what it may perform, but `{name}` stands for whatever effects the caller allows",
+            ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,
                 "this is `{found}`, but `{name}` stands for whatever type the caller picks",

@@ -302,7 +302,7 @@ pub enum TypeKind {
         /// type written out. The two are kept apart here and nowhere else: what
         /// a reader wrote is what this tree says, and both lower to the same
         /// row.
-        effects: Option<EffectRow>,
+        effects: Option<Box<EffectRow>>,
     },
     /// `<head> <arg>...` — a type applied to arguments.
     ///
@@ -1640,7 +1640,7 @@ impl Parser {
         }
         let to = self.arrow(false)?;
         let effects = match self.at_bang() {
-            true => Some(self.effect_row()?),
+            true => Some(Box::new(self.effect_row()?)),
             false => None,
         };
         let span = effects

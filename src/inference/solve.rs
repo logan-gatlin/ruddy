@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty, TyVar},
+    types::{Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
 };
 
 use super::{
@@ -669,11 +669,11 @@ impl Solve<'_> {
             // unfolding it would quote them a shape they never put on the page.
             (Core::Rigid { name, id }, other) if !matches!(other, Core::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
-                self.rigid_broken(span, goal, name, id, rhs)
+                self.rigid_broken(span, goal, name, id, Sense::Type, rhs)
             }
             (other, Core::Rigid { name, id }) if !matches!(other, Core::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
-                self.rigid_broken(span, goal, name, id, lhs)
+                self.rigid_broken(span, goal, name, id, Sense::Type, lhs)
             }
             // One declaration applied to nothing is only ever equal to itself,
             // so this saves an unfolding rather than deciding anything. Two
@@ -862,12 +862,14 @@ impl Solve<'_> {
     /// that promised it.
     ///
     /// Recorded as [`Rule::Mismatch`], which is what it is: no rule applied.
+    #[allow(clippy::too_many_arguments)]
     fn rigid_broken(
         &mut self,
         span: Span,
         goal: Goal,
         name: Rc<str>,
         id: u32,
+        sense: Sense,
         found: &Rc<Ty>,
     ) -> bool {
         let error = Error {
@@ -875,6 +877,7 @@ impl Solve<'_> {
             kind: ErrorKind::RigidBroken {
                 found: found.clone(),
                 name,
+                sense,
                 declared: self.table.declared(id),
             },
         };
@@ -1041,7 +1044,17 @@ impl Solve<'_> {
             (
                 Tail::Rest(left) | Tail::Effects { rest: left, .. },
                 Tail::Rest(right) | Tail::Effects { rest: right, .. },
-            ) => self.rests(span, left, right),
+            ) => {
+                // Which reading the pair is, for the one complaint down there
+                // that quotes it: a rigid rest broken in a sum is quoted as the
+                // sum it refused, and one broken in an effect row as the arrow
+                // that would carry it.
+                let shape = match (lhs, rhs) {
+                    (Tail::Effects { .. }, _) | (_, Tail::Effects { .. }) => Shape::Effect,
+                    _ => Shape::Sum,
+                };
+                self.rests(span, left, right, shape);
+            }
             // Two cores, and nothing else can reach here: which shape a set of
             // labels is, is decided by the syntax that wrote it, and the two
             // sides of a goal were matched on it before either arrived. So the
@@ -1079,7 +1092,7 @@ impl Solve<'_> {
     /// included. There are none to take where the callers reach this, but
     /// binding the flattened row rather than its bare end is what makes that a
     /// fact about the callers instead of something this has to be told.
-    fn rests(&mut self, span: Span, lhs: &Rest, rhs: &Rest) {
+    fn rests(&mut self, span: Span, lhs: &Rest, rhs: &Rest, shape: Shape) {
         let want = Rc::new(self.table.canon(&Row::of(lhs.clone())));
         let have = Rc::new(self.table.canon(&Row::of(rhs.clone())));
         let goal = Goal::Row {
@@ -1106,13 +1119,13 @@ impl Solve<'_> {
             }
             (Rest::Rigid { name, id }, other) if !matches!(other, Rest::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
-                let found = Rc::new(Ty::plain(Core::Sum((*have).clone())));
-                self.rigid_broken(span, goal, name, id, &found);
+                let (sense, found) = rest_found(&have, shape);
+                self.rigid_broken(span, goal, name, id, sense, &found);
             }
             (other, Rest::Rigid { name, id }) if !matches!(other, Rest::Var(_)) => {
                 let (name, id) = (name.clone(), *id);
-                let found = Rc::new(Ty::plain(Core::Sum((*want).clone())));
-                self.rigid_broken(span, goal, name, id, &found);
+                let (sense, found) = rest_found(&want, shape);
+                self.rigid_broken(span, goal, name, id, sense, &found);
             }
             (Rest::Var(var), _) => {
                 let var = *var;
@@ -1794,6 +1807,16 @@ impl Solve<'_> {
 /// about one has no written type to name — and naming the row alone would print
 /// it in the struct's braces, which is what [`Display for Row`](Row) falls back
 /// to when nothing hands it a shape.
+/// What a broken rigid rest turned out to be, quoted in its own reading: the
+/// sum that refused it, or the arrow that would have carried the effects. The
+/// sense rides along so the wording can follow it.
+fn rest_found(row: &Row, shape: Shape) -> (Sense, Rc<Ty>) {
+    match shape {
+        Shape::Effect => (Sense::Effects, row_ty(row)),
+        _ => (Sense::Cases, Rc::new(Ty::plain(Core::Sum(row.clone())))),
+    }
+}
+
 fn row_ty(row: &Row) -> Rc<Ty> {
     Rc::new(Ty::plain(Core::Arrow(
         Rc::new(Ty::unit()),

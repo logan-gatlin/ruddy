@@ -537,9 +537,13 @@ pub enum ErrorKind {
     /// it was supposed to be, and `declared` is where that variable was
     /// declared — the second place a reporter points at, the way
     /// [`ir::ErrorKind::Duplicate`](crate::ir::ErrorKind) carries one.
+    /// `sense` is the sort the variable was declared at, which is what the
+    /// wording follows: a type is something the caller picks, a rest and a row
+    /// of effects are something the caller allows.
     RigidBroken {
         found: Rc<Ty>,
         name: Rc<str>,
+        sense: Sense,
         declared: Span,
     },
     /// A label demanded of a `where let` variable: a projection, a match arm, a
@@ -3015,10 +3019,12 @@ impl Table {
             ErrorKind::RigidBroken {
                 found,
                 name,
+                sense,
                 declared,
             } => ErrorKind::RigidBroken {
                 found: self.close(found, subst),
                 name: name.clone(),
+                sense: *sense,
                 declared: *declared,
             },
             // The label and the variable are both spellings, and the span is a

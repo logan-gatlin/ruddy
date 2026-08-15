@@ -367,7 +367,7 @@ pub enum TypeKind {
         /// The effects calling it may perform, with every alias already
         /// expanded to the effects it names. Empty and closed for a bare
         /// `A -> B`, which is pure.
-        effects: EffectRow,
+        effects: Box<EffectRow>,
     },
     Ident(Symbol),
     /// A declared type applied to arguments.
@@ -5320,13 +5320,14 @@ impl Builder<'_> {
             parse::TypeKind::Arrow { from, to, effects } => {
                 let from = self.ty(*from, place);
                 let to = self.ty(*to, place);
-                let Some(effects) = self.effect_row(span, effects, place) else {
+                let Some(effects) = self.effect_row(span, effects.map(|row| *row), place)
+                else {
                     return span.track(TypeKind::Error);
                 };
                 span.track(TypeKind::Arrow {
                     from: Box::new(from),
                     to: Box::new(to),
-                    effects,
+                    effects: Box::new(effects),
                 })
             }
         }
