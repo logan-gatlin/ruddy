@@ -1475,9 +1475,17 @@ impl Table {
     /// label settled absent — no case a value could be — and keeping the outer
     /// label is the flattening agreeing with the type, never a choice between
     /// two copies that could differ.
+    ///
+    /// The budget is [`resolve`](Self::resolve)'s, kept for its reason: it
+    /// bounds what a bug in the occurs check would cost. Only a step through a
+    /// bound variable counts — a [`Rest::More`] link unwraps a finite tree and
+    /// can close no cycle — and following more bound variables than the store
+    /// holds has visited one of them twice, so an off counter is a panic the
+    /// debugger renders rather than a hang that says nothing.
     fn canon(&self, row: &Row) -> Row {
         let mut labels: IndexMap<String, RowField> = IndexMap::new();
         let mut row = row.clone();
+        let mut budget = self.vars.len();
         loop {
             for (name, field) in &row.labels {
                 labels.entry(name.clone()).or_insert_with(|| field.clone());
@@ -1485,7 +1493,12 @@ impl Table {
             let deeper = match &row.rest {
                 Rest::More(more) => (**more).clone(),
                 Rest::Var(var) => match &self.vars[*var as usize] {
-                    Slot::Bound(Assigned::Row(bound)) => (**bound).clone(),
+                    Slot::Bound(Assigned::Row(bound)) => {
+                        budget = budget.checked_sub(1).expect(
+                            "a chain of bound row variables closed a cycle the occurs check should refuse",
+                        );
+                        (**bound).clone()
+                    }
                     _ => {
                         return Row {
                             labels,
@@ -1514,12 +1527,20 @@ impl Table {
     }
 
     /// Follow a presence variable to what it stands for.
+    ///
+    /// The budget is [`resolve`](Self::resolve)'s, kept for its reason: a
+    /// chain longer than the store has visited a variable twice, so a bug in
+    /// the occurs check is a panic rather than a hang.
     fn presence_of(&self, presence: &Presence) -> Presence {
         let mut presence = presence.clone();
+        let mut budget = self.vars.len();
         while let Presence::Var(var) = presence {
             let Slot::Bound(Assigned::Presence(inner)) = &self.vars[var as usize] else {
                 break;
             };
+            budget = budget.checked_sub(1).expect(
+                "a chain of bound presence variables closed a cycle the occurs check should refuse",
+            );
             presence = inner.clone();
         }
         presence
@@ -3553,9 +3574,11 @@ fn row(
 /// may decide; `..e` is that variable shared across one annotation; and `..e`
 /// naming a parameter is the position an argument is handed to.
 ///
-/// The variables it mints land in the same range the annotation records, which
-/// is what [`Table::narrowed`] is asked about: an effect tail a reader left open
-/// is the reader's, and R23's closing rule may not touch one.
+/// The variables a bare `..` mints are ordinary solver variables, which is what
+/// makes them R23's to close: what a reader left anonymous is inference's to
+/// decide ([`Table::close_effects`]). A tail the reader *named* is out of R23's
+/// reach by construction — `..e` lowers to a rigid, which is no solver variable
+/// and is never counted.
 fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> Row {
     let mut labels = IndexMap::new();
     for (name, label) in &effects.effects {
@@ -3623,7 +3646,7 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     let mut ty = ty.clone();
     // The budget is the one [`Table::resolve`] keeps, for the reason it keeps
     // it: it bounds what a bug in that check would cost rather than restating
-    // the guarantee.
+    // the guarantee — with one honest limit, below.
     //
     // What it bounds is a chain of *name bodies*. A step whose body is another
     // name applied to something follows one declaration to the one declaration
@@ -3632,11 +3655,21 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     // and more than one such step per declaration means a declaration was
     // visited twice, which is the loop lowering refuses.
     //
-    // A step whose body is a parameter hands back an argument instead. What is
-    // left to unfold is then a piece of the type that came in rather than
-    // anything this chain reached, so it starts a new chain and the budget
-    // resets. Counting those against one bound would panic on
-    // `type Id a = a` written `Id (Id Nat)`, which is a correct program.
+    // A step whose body is a parameter hands back an argument instead, and the
+    // budget resets: what is left to unfold starts a new chain, and correct
+    // programs put no bound on how many chains one call walks. Not
+    // `aliases.len()` — `type Id a = a` written `Id (Id Nat)` is two
+    // hand-backs from one declaration — and not any function of the table:
+    // each layer of `type I1 a = I0 (I0 a)`, `type I2 a = I1 (I1 a)`, …
+    // doubles the walk, so a tower of aliases is a correct program whose walk
+    // is exponential in the declarations it holds.
+    //
+    // The honest limit: a cycle routed *through* a parameter — `type Loop =
+    // Id Loop`, were lowering not refusing it — alternates one decrement with
+    // one reset, so this budget never exhausts and the hang goes uncaught.
+    // That shape is exactly what lowering's parameter tracking exists to
+    // refuse, and by the paragraph above no budget local to this function
+    // could catch it without also refusing correct programs.
     let mut budget = aliases.len();
     while let Core::Named { symbol, args, .. } = &ty.clone().core {
         // Indexed rather than looked up: a name that repeats a declaration

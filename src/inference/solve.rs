@@ -1486,6 +1486,15 @@ impl Solve<'_> {
     /// question's assumption, and two types that differ are accepted as equal.
     /// That is the whole reason the arguments are here.
     ///
+    /// And (4) is trusted bare: no fuel backs it the way [`Table::resolve`]'s
+    /// budget backs the occurs check, so a declaration
+    /// [`ir::build`](crate::ir::build) wrongly let through is a hang here, not
+    /// a panic. Deliberate: the bound (4) actually promises — every list drawn
+    /// from a finite set of arguments — is combinatorial in the program, so
+    /// any counter tight enough to fire on a bug is tight enough to fire on a
+    /// correct program first. The refusals in `ir::build` are the whole
+    /// guarantee, and a change to them must be measured against this map.
+    ///
     /// The arguments are compared as they stand *now*, which is why
     /// [`Table::alike`] resolves instead of this stack storing them resolved on
     /// the way in. A variable inside an argument may be bound while the goal is

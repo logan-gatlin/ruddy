@@ -10,3 +10,8 @@ the item should be exported.
 
 100% code coverage in tests (including branches) is required for the compiler
 crate. The source of truth for this is `just cov`.
+
+The type system is designed around three constraints
+1. Inference/checking must provably terminate
+2. Types are structural, not nominal
+3. Inference should be total (with maybe very few exceptions)
