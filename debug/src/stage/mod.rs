@@ -20,25 +20,25 @@ use std::{collections::HashMap, rc::Rc};
 
 use ruddy::{
     ir::Param,
-    parse::Stmt,
     symbol::{Mint, Symbol},
-    token::Token,
+    tracking::FileID,
     types::{Shape, Ty},
     ui,
 };
 
-use crate::wire::{Node, Stage, Status, View};
+use crate::wire::{FileInfo, Node, Stage, Status, View};
 
 /// Everything a stage may look at. Each field is `None` when the phase that
 /// would have produced it did not run, which is what a stage reports as
 /// [`Status::Skipped`] rather than rendering an empty panel.
 pub struct Cx<'a> {
-    /// Unused by the stages that exist today, but a stage rendering text — an
-    /// assembly listing, a formatted source — starts from it.
-    #[allow(dead_code)]
-    pub source: &'a str,
-    pub tokens: Option<&'a [Token]>,
-    pub stmts: Option<&'a [Stmt]>,
+    /// Every file the loader read, in the order a [`Loc`](crate::wire::Loc)
+    /// indexes them. A stage naming the file a node came from reads its path
+    /// from here.
+    pub files: &'a [FileInfo],
+    /// What the load produced: the tokens and the parse errors of every file,
+    /// the spliced statement tree, and the identity the header declared.
+    pub bundle: Option<&'a ruddy::bundle::Output>,
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,
     pub patterns: Option<&'a ruddy::patterns::Output>,
@@ -58,6 +58,10 @@ pub struct Cx<'a> {
 /// How long each compiler phase took, in microseconds.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Phases {
+    /// The whole load: reading every file of the bundle, lexing it, parsing it
+    /// and splicing the tree. [`Phases::lex`] and [`Phases::parse`] are the
+    /// halves of it, summed across files.
+    pub load: u64,
     pub lex: u64,
     pub parse: u64,
     pub build: u64,
@@ -378,6 +382,25 @@ pub fn with_symbol(node: Node, cx: &Cx, mint: &Mint, symbol: Symbol) -> Node {
         Some(index) => node.symbol(*index),
         None => node,
     }
+}
+
+/// What to call the file a span was written in: its path, or a placeholder for
+/// a span the loader never read a file for.
+///
+/// Written once because the two tabs that group their rows by file both need
+/// it, and a tab that labelled a file differently from its neighbour would be
+/// showing the reader two names for one thing.
+pub fn file_label(cx: &Cx, id: FileID) -> String {
+    match position(cx, id) {
+        Some(at) => cx.files[at].path.clone(),
+        None => "<generated>".to_string(),
+    }
+}
+
+/// Where a file sits in [`Cx::files`], which is the index a
+/// [`Loc`](crate::wire::Loc) carries.
+fn position(cx: &Cx, id: FileID) -> Option<usize> {
+    cx.bundle?.loaded.iter().position(|file| file.id == id)
 }
 
 /// A stage whose input never arrived.

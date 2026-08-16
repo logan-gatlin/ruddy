@@ -4693,3 +4693,322 @@ fn a_declaration_may_not_hold_a_hole() {
     };
     assert!(matches!(from.tracked, TypeKind::Hole));
 }
+
+/// A symbol declared in a module is minted with that module as its parent, so
+/// its path reads as the source spells it. Nothing in `symbol.rs` changed for
+/// this: modules were always in the design, and the hoist is what finally puts
+/// something in them.
+#[test]
+fn a_symbol_is_minted_under_the_module_it_was_declared_in() {
+    let (mint, out) = built("module A =\n  module B =\n    let x = 1\n  end\nend");
+    let x = term_symbol(&mint, &out, "x");
+    assert_eq!(mint.path(x).to_string(), "test::A::B::x");
+
+    // The modules themselves are symbols like any other, in their own
+    // namespace, and nested the way they were written.
+    let b = mint.parent(x).expect("x sits in a module");
+    assert_eq!(mint.namespace(b.symbol()), Namespace::Modules);
+    assert_eq!(mint.name(b.symbol()), "B");
+    let a = mint.parent(b.symbol()).expect("B sits in a module");
+    assert_eq!(mint.name(a.symbol()), "A");
+    assert!(mint.parent(a.symbol()).is_none());
+}
+
+/// R9's walk: locals first, then the module the name is written in, then each
+/// enclosing module, then the bundle root. The first match wins, so a module's
+/// own definition shadows the root's.
+#[test]
+fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
+    let src = "let top = 1\n\
+               module A =\n  let x = top\n  module B =\n    let y = x\n  end\nend\n\
+               module C =\n  let top = 2\n  let z = top\n  let w = A::x\nend";
+    let (mint, out) = built(src);
+
+    // `A::x` reaches the root's `top`, since `A` declares none of its own.
+    let root = term_symbol(&mint, &out, "top");
+    let inner = out
+        .program
+        .terms
+        .keys()
+        .copied()
+        .find(|symbol| mint.path(*symbol).to_string() == "test::C::top")
+        .expect("C declares a top of its own");
+    assert_ne!(root, inner);
+
+    let names = |name: &str| -> Symbol {
+        let TermKind::Ident(symbol) = term_value(&mint, &out, name) else {
+            panic!("{name} is not given as a name");
+        };
+        *symbol
+    };
+    assert_eq!(names("x"), root);
+    assert_eq!(names("z"), inner);
+    // And a sibling module's name is reached only through the path that names
+    // it, which is what `w` is written as.
+    assert_eq!(names("w"), term_symbol(&mint, &out, "x"));
+}
+
+/// A sibling module's names are not in scope: reaching one unqualified is the
+/// undefined term it is, because the walk goes outward and never sideways.
+#[test]
+fn a_sibling_module_is_reached_only_by_a_path() {
+    let src = "module A =\n  let x = 1\nend\nmodule C =\n  let w = x\nend";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
+    ));
+}
+
+/// Everything is hoisted bundle-wide: every module, then every type, then every
+/// effect, then every term. Where a declaration is written never decides what
+/// can see it, so a path may name a module declared below it.
+#[test]
+fn hoisting_reaches_a_module_declared_below_its_use() {
+    let (mint, out) =
+        built("let four = Math::double 2\nmodule Math =\n  let double = fn x => x\nend");
+    let TermKind::Apply { func, .. } = term_value(&mint, &out, "four") else {
+        panic!("expected an application");
+    };
+    let TermKind::Ident(symbol) = func.kind else {
+        panic!("expected a name");
+    };
+    assert_eq!(mint.path(symbol).to_string(), "test::Math::double");
+}
+
+/// Modules are their own namespace, so one name may be a module, a type, a term
+/// and an effect at once without any of them colliding.
+#[test]
+fn a_module_a_type_a_term_and_an_effect_may_share_a_name() {
+    let (mint, out) = built("module P = end\ntype P = { x: Nat }\nlet P = 1\neffect P = |");
+    assert!(out.program.types.keys().any(|s| mint.name(*s) == "P"));
+    assert!(out.program.terms.keys().any(|s| mint.name(*s) == "P"));
+    assert!(out.program.effects.keys().any(|s| mint.name(*s) == "P"));
+    let modules: Vec<_> = mint
+        .symbols()
+        .filter(|s| mint.namespace(*s) == Namespace::Modules)
+        .collect();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(mint.name(modules[0]), "P");
+}
+
+/// Two modules of one name in one scope are the repeat they are, reported at
+/// the second and pointing back at the first — the existing `Duplicate` with
+/// the namespace modules were always minted in.
+#[test]
+fn a_repeated_module_is_a_duplicate() {
+    let src = "module A = end\nmodule A = end";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    let ErrorKind::Duplicate {
+        namespace,
+        previous,
+    } = out.errors[0].kind
+    else {
+        panic!("expected a duplicate: {:#?}", out.errors);
+    };
+    assert_eq!(namespace, Namespace::Modules);
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind('A').expect("the second")
+    );
+    assert_eq!(previous.start, src.find('A').expect("the first"));
+
+    // The same name in two different scopes is not a repeat: a module inside a
+    // module is somewhere else.
+    let (_, out) = built("module A =\n  module A = end\nend");
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+/// A path's first segment resolves by R9's walk, so a segment naming no module
+/// anywhere out to the root is reported as the undefined module it is — at the
+/// segment, not at the name after it.
+#[test]
+fn an_undefined_first_segment_is_reported_at_the_segment() {
+    let src = "let a = Nope::x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Modules
+        }
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.find("Nope").expect("the segment")
+    );
+    assert_eq!(out.errors[0].span.width, "Nope".len());
+}
+
+/// Every segment after the first resolves strictly inside the module the
+/// previous one named — no outward walk. So a middle segment naming a module
+/// that exists at the root, but not inside the one before it, is undefined.
+#[test]
+fn a_later_segment_does_not_walk_outward() {
+    let src = "module Outer = end\nmodule A = end\nlet a = A::Outer::x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Modules
+        }
+    ));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind("Outer").expect("the middle segment")
+    );
+}
+
+/// A type position takes a path as readily as an expression does, so a segment
+/// naming no module is reported there too — bare, and at the head of an
+/// application, which are the two shapes a written type can be.
+#[test]
+fn an_undefined_segment_in_a_type_is_reported_once() {
+    for src in ["type T = Nope::X", "type T = Nope::Pair Nat"] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::Undefined {
+                    namespace: Namespace::Modules
+                }
+            ),
+            "{src:?}: {:#?}",
+            out.errors[0].kind
+        );
+        assert_eq!(
+            out.errors[0].span.start,
+            src.find("Nope").expect("the segment"),
+            "{src:?}"
+        );
+    }
+}
+
+/// A final name the module does not declare is reported at that name, in the
+/// namespace the position it was written at demands — one rule, four wordings,
+/// and the module the path named is not blamed for any of them.
+#[test]
+fn an_undefined_final_name_is_reported_in_its_own_namespace() {
+    let cases = [
+        (
+            "module M = end\nlet a = M::missing",
+            Namespace::Terms,
+            "missing",
+        ),
+        (
+            "module M = end\ntype T = M::Missing",
+            Namespace::Types,
+            "Missing",
+        ),
+        (
+            "module M = end\nlet f : () -> Nat + M::!Log = fn _ => 0",
+            Namespace::Effects,
+            // A label's span wears its sigil, the way every other label's does.
+            "!Log",
+        ),
+    ];
+    for (src, namespace, at) in cases {
+        let (_, out) = build_src(src);
+        let undefined: Vec<_> = out
+            .errors
+            .iter()
+            .filter(|error| matches!(error.kind, ErrorKind::Undefined { .. }))
+            .collect();
+        assert_eq!(undefined.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(undefined[0].kind, ErrorKind::Undefined { namespace: found } if found == namespace),
+            "{src:?}: {:#?}",
+            undefined[0].kind
+        );
+        assert_eq!(
+            undefined[0].span.start,
+            src.rfind(at).expect("the name"),
+            "{src:?}"
+        );
+    }
+}
+
+/// A module that exists but whose next segment does not: the complaint is about
+/// the segment that named nothing, and the one before it is left alone.
+#[test]
+fn a_middle_segment_naming_no_module_is_reported_once() {
+    let src = "module A =\n  module B = end\nend\nlet a = A::Nope::x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind("Nope").expect("the segment")
+    );
+}
+
+/// A path reaches a type, an effect and an operation as readily as a term, in
+/// every position R6 and R7 allow. One program, because what is being pinned is
+/// that each position resolves at all.
+#[test]
+fn paths_resolve_in_every_position() {
+    let src = "module Math =\n  type Pair 'a 'b = { first: 'a, second: 'b }\nend\n\
+               module Sys =\n  effect Log = write : Nat -> ()\nend\n\
+               let p : Math::Pair Nat Nat = { first: 1, second: 2 }\n\
+               let greet : () -> Nat + Sys::!Log = fn _ => let _ = Sys::!Log.write 1 in 0\n\
+               let quiet : () -> Nat = fn _ =>\n\
+                 handle greet () with | Sys::!Log.write s => () | return x => x end";
+    let (mint, out) = built(src);
+    let pair = out
+        .program
+        .types
+        .keys()
+        .copied()
+        .find(|symbol| mint.name(*symbol) == "Pair")
+        .expect("Math declares Pair");
+    assert_eq!(mint.path(pair).to_string(), "test::Math::Pair");
+}
+
+/// A primitive lives in no module, so a path can never reach one: `M::Nat` is
+/// the undefined type it is rather than the built-in. Bare and applied alike,
+/// since applying a primitive is the one place a name that exists is counted
+/// rather than resolved.
+#[test]
+fn a_path_never_reaches_a_primitive() {
+    for src in [
+        "module M = end\ntype T = M::Nat",
+        "module M = end\ntype T = M::Nat Nat",
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(
+            matches!(
+                out.errors[0].kind,
+                ErrorKind::Undefined {
+                    namespace: Namespace::Types
+                }
+            ),
+            "{src:?}: {:#?}",
+            out.errors[0].kind
+        );
+    }
+}
+
+/// A file module the loader could not fill in has no body, and lowering treats
+/// it as the empty one it is: the module is still declared, so a path naming it
+/// resolves and one missing file costs one complaint.
+#[test]
+fn a_module_with_no_body_is_declared_and_empty() {
+    let (mint, out) = build_src("module A\nlet a = A::x");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
+    ));
+    assert!(
+        mint.symbols()
+            .any(|s| mint.namespace(s) == Namespace::Modules && mint.name(s) == "A")
+    );
+}

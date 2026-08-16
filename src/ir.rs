@@ -1098,15 +1098,33 @@ pub struct Output {
     pub errors: Vec<Error>,
 }
 
-/// The namespaces the surface grammar writes into. [`Namespace`] has a third —
-/// modules — and this language has no syntax that reaches it, so a builder
-/// holding two name tables is told which of the two rather than asked to rule
-/// out a value it can never be handed.
+/// The namespaces a `let`, a `type` and an `effect` declaration write into.
+///
+/// [`Namespace`] has a fourth — modules — which `module` writes into and which
+/// nothing else can reach: a module is declared by one statement and named only
+/// by a path's segments, so [`Builder::declare`] is told which of these three
+/// rather than asked to rule out a value it can never be handed. See
+/// [`Builder::declare_module`], which is the fourth's own door.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Terms,
     Types,
     Effects,
+}
+
+/// What resolving a path found, when it did not find a symbol.
+///
+/// The two halves of R19, told apart because only one of them is the caller's
+/// to word: a segment naming no module has already been reported where it was
+/// written, and a name the named module does not declare is reported in the
+/// namespace the position demanded — which the caller is the one that knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// A segment named no module. Reported already, at that segment.
+    Segment,
+    /// The path's own name is not declared where the segments led. Nothing has
+    /// been reported: a bare name in a type may still be a primitive.
+    Name,
 }
 
 impl From<Scope> for Namespace {
@@ -1121,14 +1139,34 @@ impl From<Scope> for Namespace {
 
 struct Builder<'a> {
     mint: &'a mut Mint,
-    /// The module being lowered into. The surface syntax has no modules yet, so
-    /// this is always the top level of the bundle; threading it now keeps
-    /// adding that syntax to one place.
+    /// The module being lowered into: `None` at the top level of the bundle,
+    /// which is a real position in the tree rather than a missing one. Every
+    /// symbol minted while it holds a module is minted under that module, and
+    /// every unqualified name is resolved starting from it.
     module: Option<Module>,
     errors: Vec<Error>,
+    /// The locals in scope, innermost last — a lambda's arguments, a nested
+    /// `let`'s name, a handler arm's binder — and nothing else. Where a global
+    /// lives is decided by its module rather than by how far down a stack it
+    /// sits, so globals are in [`Builder::globals`] instead.
+    ///
+    /// Only terms have any: a type's parameters are [`Builder::params`] and
+    /// wear a `'`, and nothing binds an effect locally.
     terms: Names,
-    types: Names,
-    effects: Names,
+    /// Every global declaration in the bundle, by the module it was written in,
+    /// the namespace it lives in and the name it was written under, with where
+    /// that name was written so a repeat can point back at it.
+    ///
+    /// Filled by the hoist before any body is lowered, so a name may be reached
+    /// from above the declaration that binds it and from another file. R9's
+    /// walk reads it once per enclosing module, outward to the bundle root.
+    globals: HashMap<(Option<Module>, Namespace, String), (Symbol, Span)>,
+    /// The modules themselves, which are their own namespace: `module Pair`,
+    /// `type Pair`, `let Pair` and `effect Pair` may all coexist in one scope.
+    /// Kept apart from [`Builder::globals`] because a [`Module`] is a symbol
+    /// already known to be one, and passing a term where a containing module
+    /// goes is what that newtype exists to rule out.
+    modules: HashMap<(Option<Module>, String), (Module, Span)>,
     /// What each declared effect stands for: itself, for one that declares
     /// operations, and the effects it names — transitively — for an alias.
     ///
@@ -1181,6 +1219,38 @@ struct Builder<'a> {
     rigids: u32,
 }
 
+/// Every declaration in the bundle, split by what it declares and paired with
+/// the module it was written in.
+///
+/// R12 in one value. Where a declaration is written — and which file it is in —
+/// decides nothing about what can see it, so the tree is taken apart into three
+/// lists before any name is bound, and each list is hoisted over the whole
+/// bundle rather than over one file or one module. Each keeps the order it was
+/// written in, depth-first through the modules, so a repeat is still reported
+/// against the first and the reports come in the order a reader would meet
+/// them.
+#[derive(Default)]
+struct Flat {
+    types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
+    effects: Vec<(Option<Module>, TrackedString, Cases)>,
+    terms: Vec<Defined>,
+}
+
+/// One `let`, as the parser read it and with the module it was written in: the
+/// pattern it binds, the annotation it may wear, and its value. Named because
+/// the tuple is the widest of the three and reads as noise inline.
+type Defined = (Option<Module>, Box<parse::Pattern>, Option<Annotated>, Body);
+
+/// A written annotation, as the parser read it. Named so [`Flat`]'s rows fit on
+/// a line apiece.
+type Annotated = parse::Annotation;
+
+/// One `effect` declaration's cases, as the parser read them.
+type Cases = IndexMap<parse::Path, parse::EffectCase>;
+
+/// One definition's value, as the parser read it.
+type Body = Tracked<Expr>;
+
 /// One name a variable statement declared, while its own annotation is being
 /// lowered.
 #[derive(Debug)]
@@ -1199,15 +1269,18 @@ struct Declared {
     labelled: bool,
 }
 
-/// Which symbol a name means, for one namespace.
+/// Which symbol a local name means.
 ///
 /// Name resolution lives here rather than in the mint: the mint's job is to
 /// make symbols unique, and this decides which name refers to which of them.
+///
+/// Locals only. A global is reached through the module it was declared in, and
+/// which modules a name may be looked for in is a walk outward rather than a
+/// position on a stack — see [`Builder::globals`].
 #[derive(Debug, Default)]
 struct Names {
-    /// Most recent binding last. Top-level definitions accumulate as they are
-    /// passed and are never removed; a lambda's arguments are pushed for the
-    /// length of its body.
+    /// Most recent binding last. A lambda's arguments are pushed for the length
+    /// of its body and released after it, which is the whole of the stack.
     bindings: Vec<Binding>,
 }
 
@@ -1215,8 +1288,6 @@ struct Names {
 struct Binding {
     name: String,
     symbol: Symbol,
-    /// Where the name was written, so a repeat can point at what it repeats.
-    span: Span,
 }
 
 /// Where a written type is being lowered from: the body of a `type`
@@ -1613,8 +1684,8 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         module: None,
         errors: Vec::new(),
         terms: Names::default(),
-        types: Names::default(),
-        effects: Names::default(),
+        globals: HashMap::new(),
+        modules: HashMap::new(),
         expanded: HashMap::new(),
         operations: HashMap::new(),
         answering: Answering::Nowhere,
@@ -1629,39 +1700,38 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         effects: IndexMap::new(),
         groups: Vec::new(),
     };
-    // Split before lowering rather than lowering in the order written: every
-    // type is declared before any term is looked at, so a term can name a type
-    // written anywhere in the program. All three halves keep the order they
-    // were written in, and all three are hoisted over themselves, so where a
-    // name is written decides nothing about what can see it.
-    let mut types = Vec::new();
-    let mut terms = Vec::new();
-    let mut effects = Vec::new();
-    for stmt in stmts {
-        match stmt.tracked {
-            StmtKind::Type { name, params, body } => types.push((name, params, body)),
-            StmtKind::Let { pattern, ty, body } => terms.push((pattern, ty, body)),
-            StmtKind::Effect { name, cases } => effects.push((name, cases)),
-        }
-    }
+    // The whole tree flattened before anything is declared: every module is
+    // minted, over every file, and what each remaining statement is written in
+    // is recorded beside it. Nothing is resolved on the way, so a module may be
+    // named from above its own declaration and from another file.
+    let mut flat = Flat::default();
+    b.flatten(stmts, &mut flat);
     // Every type's name is bound before any type's body is read, so a type can
     // name itself and two types can name each other. That is the whole of what
     // makes a recursive type writable: nothing downstream ties the knot, and
     // nothing downstream can, so a type is recursive exactly when a
     // declaration says it is. Names are bound in the order they were written,
     // so a repeated one is still reported against the first.
-    let declared: Vec<_> = types
+    let declared: Vec<_> = flat
+        .types
         .iter()
-        .map(|(name, _, _)| b.declare(Scope::Types, name))
+        .map(|(module, name, _, _)| {
+            b.module = *module;
+            b.declare(Scope::Types, name)
+        })
         .collect();
     // Every declaration's parameters, minted before any body is read, and how
     // many arguments each declaration therefore takes. Knowing the count above
     // the declaration itself is what makes a forward reference applicable:
     // `type A = B Nat` above `type B 'x = ...` has to be counted, and counting
     // it cannot wait for `B` to be lowered.
-    let bound: Vec<Vec<Param>> = types
+    let bound: Vec<Vec<Param>> = flat
+        .types
         .iter()
-        .map(|(_, params, _)| b.declare_params(params))
+        .map(|(module, _, params, _)| {
+            b.module = *module;
+            b.declare_params(params)
+        })
         .collect();
     b.arities = declared
         .iter()
@@ -1673,11 +1743,16 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // wherever a row mentions it. Their names are bound before any of their own
     // cases are read, for the reason a type's is — two effects may name each
     // other, and an operation's signature may name a type declared below it.
-    let named: Vec<_> = effects
+    let named: Vec<_> = flat
+        .effects
         .iter()
-        .map(|(name, _)| b.declare(Scope::Effects, name))
+        .map(|(module, name, _)| {
+            b.module = *module;
+            b.declare(Scope::Effects, name)
+        })
         .collect();
-    for (symbol, (name, cases)) in named.into_iter().zip(effects) {
+    for (symbol, (module, name, cases)) in named.into_iter().zip(flat.effects) {
+        b.module = module;
         let value = b.effect(cases);
         if let Some(symbol) = symbol {
             program.effects.insert(
@@ -1705,7 +1780,10 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             Effect::Alias(_) => None,
         })
         .collect();
-    for ((symbol, (name, _, body)), params) in declared.into_iter().zip(types).zip(bound) {
+    for ((symbol, (module, name, _, body)), params) in
+        declared.into_iter().zip(flat.types).zip(bound)
+    {
+        b.module = module;
         // The parameters are in scope for the length of the body and released
         // after it, the way a lambda's argument is — this is the type
         // language's only binder, and its only scope.
@@ -1804,9 +1882,11 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // like any other definition. A name a pattern repeats binds nothing here —
     // the lowering walk reports it as the pattern mistake it is, not as a
     // second definition.
-    let defined: Vec<Vec<Option<Symbol>>> = terms
+    let defined: Vec<Vec<Option<Symbol>>> = flat
+        .terms
         .iter()
-        .map(|(pattern, _, _)| {
+        .map(|(module, pattern, _, _)| {
+            b.module = *module;
             let mut names = Vec::new();
             pattern_names(pattern, &mut names);
             let mut seen: Vec<String> = Vec::new();
@@ -1822,7 +1902,8 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
                 .collect()
         })
         .collect();
-    for (declared, (pattern, ty, body)) in defined.into_iter().zip(terms) {
+    for (declared, (module, pattern, ty, body)) in defined.into_iter().zip(flat.terms) {
+        b.module = module;
         match pattern.tracked {
             // A bare name is exactly the definition the language has always
             // had. Annotation and body are lowered in the order they were
@@ -4068,21 +4149,18 @@ fn mentions_a_parameter(ty: &Type) -> bool {
 }
 
 impl Names {
+    /// Searched innermost first, so a lambda argument hides a definition of the
+    /// same name.
     fn get(&self, name: &str) -> Option<Symbol> {
-        self.find(name).map(|binding| binding.symbol)
-    }
-
-    /// Searched innermost first, so a lambda argument hides a top-level
-    /// definition of the same name.
-    fn find(&self, name: &str) -> Option<&Binding> {
         self.bindings
             .iter()
             .rev()
             .find(|binding| binding.name == name)
+            .map(|binding| binding.symbol)
     }
 
-    fn bind(&mut self, name: String, symbol: Symbol, span: Span) {
-        self.bindings.push(Binding { name, symbol, span });
+    fn bind(&mut self, name: String, symbol: Symbol) {
+        self.bindings.push(Binding { name, symbol });
     }
 
     fn mark(&self) -> usize {
@@ -4099,20 +4177,46 @@ impl Builder<'_> {
         self.errors.push(Error { span, kind });
     }
 
-    fn names(&mut self, scope: Scope) -> &mut Names {
-        match scope {
-            Scope::Terms => &mut self.terms,
-            Scope::Types => &mut self.types,
-            Scope::Effects => &mut self.effects,
+    /// Mint every module in one statement list, depth-first, and record what
+    /// each remaining statement was written in.
+    ///
+    /// Modules go first over the whole tree because everything else is declared
+    /// *into* one: a type cannot be minted under `A::B` before `A::B` is a
+    /// symbol. Nothing is resolved here — a path's segments are looked up when
+    /// the body naming them is lowered, by which time every module in the
+    /// bundle exists.
+    ///
+    /// A module whose body was never spliced in contributes an empty one, so a
+    /// file the loader could not read costs its own complaint and no other.
+    fn flatten(&mut self, stmts: Vec<Stmt>, flat: &mut Flat) {
+        let outer = self.module;
+        for stmt in stmts {
+            match stmt.tracked {
+                StmtKind::Type { name, params, body } => {
+                    flat.types.push((outer, name, params, body))
+                }
+                StmtKind::Effect { name, cases } => flat.effects.push((outer, name, cases)),
+                StmtKind::Let { pattern, ty, body } => flat.terms.push((outer, pattern, ty, body)),
+                StmtKind::Module { name, body } => {
+                    self.module = Some(self.declare_module(&name));
+                    self.flatten(body.unwrap_or_default(), flat);
+                    self.module = outer;
+                }
+            }
         }
     }
 
-    /// Bind a top-level name to a fresh symbol. `None` when the name is already
-    /// defined: the first definition is the one that stands, and the repeat is
-    /// reported against it.
+    /// Declare a global in the module being lowered into. `None` when that
+    /// module already declares the name in that namespace: the first
+    /// declaration is the one that stands, and the repeat is reported against
+    /// it.
+    ///
+    /// Only against the same module's own declarations. A name that shadows one
+    /// an enclosing module declares is what a scope is for, not a repeat.
     fn declare(&mut self, scope: Scope, name: &TrackedString) -> Option<Symbol> {
         let namespace = Namespace::from(scope);
-        if let Some(previous) = self.names(scope).find(&name.tracked).map(|b| b.span) {
+        let key = (self.module, namespace, name.tracked.clone());
+        if let Some(&(_, previous)) = self.globals.get(&key) {
             self.error(
                 name.span,
                 ErrorKind::Duplicate {
@@ -4126,9 +4230,142 @@ impl Builder<'_> {
             .mint
             .global(self.module, namespace, &name.tracked)
             .expect("the name table already ruled out a repeat");
-        self.names(scope)
-            .bind(name.tracked.clone(), symbol, name.span);
+        self.globals.insert(key, (symbol, name.span));
         Some(symbol)
+    }
+
+    /// [`declare`](Self::declare) in the module namespace, which has a door of
+    /// its own because a module is what everything else is declared *into*.
+    ///
+    /// A repeat is reported and the module already there is handed back, so the
+    /// declarations under the second `module A` join the first one's rather
+    /// than being lost — one complaint, and every name in either body still
+    /// resolves.
+    fn declare_module(&mut self, name: &TrackedString) -> Module {
+        let key = (self.module, name.tracked.clone());
+        if let Some(&(module, previous)) = self.modules.get(&key) {
+            self.error(
+                name.span,
+                ErrorKind::Duplicate {
+                    namespace: Namespace::Modules,
+                    previous,
+                },
+            );
+            return module;
+        }
+        let module = self
+            .mint
+            .module(self.module, &name.tracked)
+            .expect("the name table already ruled out a repeat");
+        self.modules.insert(key, (module, name.span));
+        module
+    }
+
+    /// The global `name` declares in `module` exactly — no outward walk.
+    fn global_in(
+        &self,
+        module: Option<Module>,
+        namespace: Namespace,
+        name: &str,
+    ) -> Option<Symbol> {
+        self.globals
+            .get(&(module, namespace, name.to_owned()))
+            .map(|&(symbol, _)| symbol)
+    }
+
+    /// R9's walk for a global: the module being lowered into, then each
+    /// enclosing module in turn, then the bundle root. The first match wins.
+    fn outward(&self, namespace: Namespace, name: &str) -> Option<Symbol> {
+        let mut at = self.module;
+        loop {
+            if let Some(symbol) = self.global_in(at, namespace, name) {
+                return Some(symbol);
+            }
+            at = self.mint.parent(at?.symbol());
+        }
+    }
+
+    /// [`outward`](Self::outward) about modules, which is how a path's first
+    /// segment is resolved.
+    fn module_outward(&self, name: &str) -> Option<Module> {
+        let mut at = self.module;
+        loop {
+            if let Some(&(module, _)) = self.modules.get(&(at, name.to_owned())) {
+                return Some(module);
+            }
+            at = self.mint.parent(at?.symbol());
+        }
+    }
+
+    /// Which module a path's segments name: `Some(None)` for a bare name, whose
+    /// segments are none at all.
+    ///
+    /// R10 in one loop. The first segment resolves by the R9 walk; every later
+    /// one strictly inside the module the previous one named, with no outward
+    /// step, because a path says where to look and a walk would let it mean
+    /// somewhere else.
+    fn segments(&mut self, path: &parse::Path) -> Option<Option<Module>> {
+        let mut at: Option<Module> = None;
+        for (index, segment) in path.modules.iter().enumerate() {
+            let found = match index {
+                0 => self.module_outward(&segment.tracked),
+                _ => self
+                    .modules
+                    .get(&(at, segment.tracked.clone()))
+                    .map(|&(module, _)| module),
+            };
+            let Some(module) = found else {
+                self.error(
+                    segment.span,
+                    ErrorKind::Undefined {
+                        namespace: Namespace::Modules,
+                    },
+                );
+                return None;
+            };
+            at = Some(module);
+        }
+        Some(at)
+    }
+
+    /// The symbol `path` names in `namespace`, or why it names none.
+    ///
+    /// A bare name is looked for among the locals first and then by R9's walk;
+    /// a qualified one strictly inside the module its segments named. Only
+    /// terms have locals, so only they are asked about them.
+    fn find(&mut self, path: &parse::Path, namespace: Namespace) -> Result<Symbol, Missing> {
+        let Some(module) = self.segments(path) else {
+            return Err(Missing::Segment);
+        };
+        let found = match module {
+            Some(module) => self.global_in(Some(module), namespace, &path.name.tracked),
+            None => self
+                .local(namespace, &path.name.tracked)
+                .or_else(|| self.outward(namespace, &path.name.tracked)),
+        };
+        found.ok_or(Missing::Name)
+    }
+
+    /// The local `name` means here, if the namespace has locals at all.
+    fn local(&self, namespace: Namespace, name: &str) -> Option<Symbol> {
+        match namespace {
+            Namespace::Terms => self.terms.get(name),
+            Namespace::Types | Namespace::Effects | Namespace::Modules => None,
+        }
+    }
+
+    /// [`find`](Self::find) with the complaint attached: a name the path's
+    /// module does not declare is reported at the name, in the namespace the
+    /// position it was written at demands.
+    fn resolve(&mut self, path: &parse::Path, namespace: Namespace) -> Option<Symbol> {
+        match self.find(path, namespace) {
+            Ok(symbol) => Some(symbol),
+            Err(Missing::Segment) => None,
+            Err(Missing::Name) => {
+                self.error(path.name.span, ErrorKind::Undefined { namespace });
+                None
+            }
+        }
     }
 
     /// Mint one declaration's parameters, in the order they were written.
@@ -4195,7 +4432,7 @@ impl Builder<'_> {
     /// dropped, leaving one complaint and a declaration that still stands for
     /// something. The empty declaration, #effect Nil = |`, has no first case
     /// and declares nothing.
-    fn effect(&mut self, cases: IndexMap<TrackedString, parse::EffectCase>) -> Effect {
+    fn effect(&mut self, cases: Cases) -> Effect {
         // The empty declaration takes the operation form: `effect Nil = |` is
         // an effect a row may name that declares nothing, rather than a name
         // standing for no effects at all.
@@ -4206,31 +4443,33 @@ impl Builder<'_> {
         for (name, case) in cases {
             match (case, aliasing) {
                 (parse::EffectCase::Operation { signature }, false) => {
-                    let lowered = self.operation(&name, *signature);
-                    if operations.contains_key(&name.tracked) {
-                        self.error(name.span, ErrorKind::DuplicateOperation);
+                    // An operation is declared here, so its key is a bare name
+                    // and the path around it is empty.
+                    let op = name.name;
+                    let lowered = self.operation(&op, *signature);
+                    if operations.contains_key(&op.tracked) {
+                        self.error(op.span, ErrorKind::DuplicateOperation);
                         continue;
                     }
-                    operations.insert(name.tracked, lowered);
+                    operations.insert(op.tracked, lowered);
                 }
                 (parse::EffectCase::Alias, true) => {
-                    let Some(symbol) = self.effects.get(&name.tracked) else {
-                        self.error(
-                            name.span,
-                            ErrorKind::Undefined {
-                                namespace: Namespace::Effects,
-                            },
-                        );
+                    let at = name.span();
+                    let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                         continue;
                     };
-                    if names.contains_key(&name.tracked) {
-                        self.error(name.span, ErrorKind::DuplicateCase);
+                    // Keyed by the name the effect was declared under rather
+                    // than by the path that reached it, so two spellings of one
+                    // effect are one case.
+                    let label = self.mint.name(symbol).to_string();
+                    if names.contains_key(&label) {
+                        self.error(at, ErrorKind::DuplicateCase);
                         continue;
                     }
                     names.insert(
-                        name.tracked,
+                        label,
                         Named {
-                            name_span: name.span,
+                            name_span: at,
                             symbol,
                         },
                     );
@@ -4244,7 +4483,7 @@ impl Builder<'_> {
                     }
                     if !mixed {
                         mixed = true;
-                        self.error(name.span, ErrorKind::MixedEffectForm);
+                        self.error(name.span(), ErrorKind::MixedEffectForm);
                     }
                 }
             }
@@ -4697,21 +4936,28 @@ impl Builder<'_> {
                 return span.track(TypeKind::Error);
             }
         };
-        let Some(symbol) = self.types.get(&name.tracked) else {
-            // A primitive takes nothing, so applying one is an arity complaint
-            // rather than a "not a constructor": the reader wrote a type that
-            // exists and gave it too much.
-            if Prim::from_name(&name.tracked).is_some() {
-                self.error(span, ErrorKind::Arity { expected: 0, found });
-            } else {
-                self.error(
-                    name.span,
-                    ErrorKind::Undefined {
-                        namespace: Namespace::Types,
-                    },
-                );
+        let symbol = match self.find(&name, Namespace::Types) {
+            Ok(symbol) => symbol,
+            // A segment named no module; the complaint is already at it.
+            Err(Missing::Segment) => return span.track(TypeKind::Error),
+            Err(Missing::Name) => {
+                // A primitive takes nothing, so applying one is an arity
+                // complaint rather than a "not a constructor": the reader wrote
+                // a type that exists and gave it too much. Only a bare name can
+                // be one — a primitive lives in no module, so a path can never
+                // reach it.
+                if name.modules.is_empty() && Prim::from_name(&name.name.tracked).is_some() {
+                    self.error(span, ErrorKind::Arity { expected: 0, found });
+                } else {
+                    self.error(
+                        name.name.span,
+                        ErrorKind::Undefined {
+                            namespace: Namespace::Types,
+                        },
+                    );
+                }
+                return span.track(TypeKind::Error);
             }
-            return span.track(TypeKind::Error);
         };
         let expected = self.arity(symbol);
         if expected != found {
@@ -4744,17 +4990,9 @@ impl Builder<'_> {
             // [`Core::Unit`](crate::types::Core::Unit) for why, and for what it
             // costs when the compiler answers.
             ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
-            ExprKind::Ident { name } => match self.terms.get(&name.tracked) {
+            ExprKind::Ident { name } => match self.resolve(&name, Namespace::Terms) {
                 Some(symbol) => TermKind::Ident(symbol).with_span(span),
-                None => {
-                    self.error(
-                        name.span,
-                        ErrorKind::Undefined {
-                            namespace: Namespace::Terms,
-                        },
-                    );
-                    TermKind::Error.with_span(span)
-                }
+                None => TermKind::Error.with_span(span),
             },
             ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
             ExprKind::Apply { func, arg } => {
@@ -4778,7 +5016,7 @@ impl Builder<'_> {
                     let symbol = match arg.tracked {
                         parse::ArgKind::Name(name) => {
                             let symbol = self.mint.local(self.module, Namespace::Terms, &name);
-                            self.terms.bind(name, symbol, span);
+                            self.terms.bind(name, symbol);
                             symbol
                         }
                         parse::ArgKind::Wildcard => self.fresh("%discard", span).tracked,
@@ -4829,7 +5067,7 @@ impl Builder<'_> {
                     let symbol = self
                         .mint
                         .local(self.module, Namespace::Terms, &name.tracked);
-                    self.terms.bind(name.tracked, symbol, name.span);
+                    self.terms.bind(name.tracked, symbol);
                     let value = self.term(*value);
                     let body = self.term(*body);
                     self.terms.release(mark);
@@ -4905,7 +5143,7 @@ impl Builder<'_> {
             // signature with the effect's own label on its outermost arrow.
             ExprKind::Operation { effect, op } => match self.operation_of(&effect, &op) {
                 Some(symbol) => TermKind::Operation {
-                    effect: effect.span.track(symbol),
+                    effect: effect.span().track(symbol),
                     op,
                 }
                 .with_span(span),
@@ -4936,23 +5174,18 @@ impl Builder<'_> {
     /// Three ways to fail and a complaint apiece: the head names no effect at
     /// all, the head is an alias — which declares no operations, so there is
     /// nothing there to perform — or the effect declares no such operation.
-    fn operation_of(&mut self, effect: &TrackedString, op: &TrackedString) -> Option<Symbol> {
-        let Some(symbol) = self.effects.get(&effect.tracked) else {
-            self.error(
-                effect.span,
-                ErrorKind::Undefined {
-                    namespace: Namespace::Effects,
-                },
-            );
-            return None;
-        };
+    fn operation_of(&mut self, effect: &parse::Path, op: &TrackedString) -> Option<Symbol> {
+        let symbol = self.resolve(effect, Namespace::Effects)?;
         match self.operations.get(&symbol) {
             Some(operations) if operations.contains(&op.tracked) => Some(symbol),
             Some(_) => {
                 self.error(
                     op.span,
                     ErrorKind::UnknownOperation {
-                        effect: effect.tracked.clone(),
+                        // The name it was declared under, not the path that
+                        // reached it: the complaint is about the effect, and
+                        // the span already shows how it was written.
+                        effect: self.mint.name(symbol).to_string(),
                         op: op.tracked.clone(),
                     },
                 );
@@ -4960,9 +5193,9 @@ impl Builder<'_> {
             }
             None => {
                 self.error(
-                    effect.span,
+                    effect.span(),
                     ErrorKind::OperationOnAlias {
-                        effect: effect.tracked.clone(),
+                        effect: self.mint.name(symbol).to_string(),
                     },
                 );
                 None
@@ -5020,19 +5253,19 @@ impl Builder<'_> {
                     };
                     let seen = covered
                         .entry(symbol)
-                        .or_insert_with(|| (effect.span, IndexSet::new()));
+                        .or_insert_with(|| (effect.span(), IndexSet::new()));
                     if !seen.1.insert(op.tracked.clone()) {
                         self.error(
                             op.span,
                             ErrorKind::DuplicateArm {
-                                effect: effect.tracked.clone(),
+                                effect: effect.name.tracked.clone(),
                                 op: op.tracked.clone(),
                             },
                         );
                         continue;
                     }
                     lowered.push(HandlerArm {
-                        effect: effect.span.track(symbol),
+                        effect: effect.span().track(symbol),
                         op,
                         binder,
                         body,
@@ -5085,7 +5318,7 @@ impl Builder<'_> {
         let symbol = match binder.tracked {
             parse::ArgKind::Name(name) => {
                 let symbol = self.mint.local(self.module, Namespace::Terms, &name);
-                self.terms.bind(name, symbol, at);
+                self.terms.bind(name, symbol);
                 symbol
             }
             // A `_` gets a symbol nothing can name, so the payload is still
@@ -5191,28 +5424,39 @@ impl Builder<'_> {
             // nobody wrote. Types being hoisted, every term sees such a
             // declaration wherever it was written; a type sees only the ones
             // above it, and reaches the built-in otherwise.
-            parse::TypeKind::Ident { name } => match self.types.get(&name.tracked) {
+            parse::TypeKind::Ident { name } => match self.find(&name, Namespace::Types) {
                 // A declaration written bare is applied to nothing, which is
                 // only enough if it takes nothing. See [`ErrorKind::Arity`].
-                Some(symbol) => match self.arity(symbol) {
+                Ok(symbol) => match self.arity(symbol) {
                     0 => span.track(TypeKind::Ident(symbol)),
                     expected => {
-                        self.error(name.span, ErrorKind::Arity { expected, found: 0 });
+                        self.error(name.span(), ErrorKind::Arity { expected, found: 0 });
                         span.track(TypeKind::Error)
                     }
                 },
-                None => match Prim::from_name(&name.tracked) {
-                    Some(prim) => span.track(TypeKind::Prim(prim)),
-                    None => {
-                        self.error(
-                            name.span,
-                            ErrorKind::Undefined {
-                                namespace: Namespace::Types,
-                            },
-                        );
-                        span.track(TypeKind::Error)
+                // A segment named no module; the complaint is already at it.
+                Err(Missing::Segment) => span.track(TypeKind::Error),
+                // A primitive lives in no module, so only a bare name can
+                // reach one.
+                Err(Missing::Name) => {
+                    let prim = name
+                        .modules
+                        .is_empty()
+                        .then(|| Prim::from_name(&name.name.tracked))
+                        .flatten();
+                    match prim {
+                        Some(prim) => span.track(TypeKind::Prim(prim)),
+                        None => {
+                            self.error(
+                                name.name.span,
+                                ErrorKind::Undefined {
+                                    namespace: Namespace::Types,
+                                },
+                            );
+                            span.track(TypeKind::Error)
+                        }
                     }
-                },
+                }
             },
             parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
             parse::TypeKind::Struct { fields, tail } => {
@@ -5384,13 +5628,8 @@ impl Builder<'_> {
         // effects rather than the name.
         let mut effects: IndexMap<String, EffectLabel> = IndexMap::new();
         for (name, label) in written.effects {
-            let Some(symbol) = self.effects.get(&name.tracked) else {
-                self.error(
-                    name.span,
-                    ErrorKind::Undefined {
-                        namespace: Namespace::Effects,
-                    },
-                );
+            let at = name.span();
+            let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                 continue;
             };
             // The clause is lowered once, before the expansion, so that a name
@@ -5413,19 +5652,19 @@ impl Builder<'_> {
                 let expanded = label_symbol != symbol;
                 let lowered = match &label {
                     parse::EffectLabel::Written { .. } => EffectLabel::Written {
-                        name_span: name.span,
+                        name_span: at,
                         symbol: label_symbol,
                         expanded,
                         when: when.clone(),
                     },
                     parse::EffectLabel::Absent => EffectLabel::Absent {
-                        name_span: name.span,
+                        name_span: at,
                         symbol: label_symbol,
                         expanded,
                     },
                 };
                 if effects.contains_key(&label_name) {
-                    self.error(name.span, ErrorKind::DuplicateCase);
+                    self.error(at, ErrorKind::DuplicateCase);
                     continue;
                 }
                 effects.insert(label_name, lowered);
@@ -5529,7 +5768,7 @@ impl Builder<'_> {
                 // The repeat binds nothing: the first binding is the one the
                 // body sees, the way a repeated definition stands.
                 if !repeat {
-                    self.terms.bind(name.tracked.clone(), symbol, name.span);
+                    self.terms.bind(name.tracked.clone(), symbol);
                 }
                 name.span.track(symbol)
             }

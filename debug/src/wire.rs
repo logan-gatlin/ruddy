@@ -5,35 +5,66 @@
 //! [`Stage`] of [`Node`]s. The page derives tabs, filtering and cross-highlighting from this
 //! shape alone, so a new stage costs a backend file and nothing else.
 
+use std::collections::HashMap;
+
+use ruddy::tracking::{FileID, Span};
 use serde::{Deserialize, Serialize};
 
-/// A byte range in the source, `[start, end)`. Always UTF-8 offsets, matching
+/// A byte range in one file, `[start, end)`. Always UTF-8 offsets, matching
 /// [`ruddy::tracking::Span`]; the page converts to UTF-16 indices itself.
 pub type Range = [usize; 2];
 
-#[derive(Debug, Deserialize)]
-pub struct CompileRequest {
-    pub source: String,
-    #[serde(default)]
-    pub revision: u64,
-    #[serde(default)]
-    pub bundle: BundleSpec,
+/// Where something was written: the file, and the range inside it.
+///
+/// A bundle is several files, so a range on its own no longer says where
+/// anything is. `file` is a position in [`Snapshot::files`], which is the one
+/// index the page and the server agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Loc {
+    pub file: u32,
+    pub range: Range,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct BundleSpec {
-    pub name: String,
-    pub version: String,
+pub struct CompileRequest {
+    /// Every file of the bundle. `main.hc` is the root; a request without one
+    /// is told so rather than compiled.
+    pub files: Vec<FileSpec>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+/// One file of a bundle, as the page holds it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileSpec {
+    /// Relative to the bundle root's directory, `/`-separated.
+    pub path: String,
+    pub source: String,
+}
+
+/// One file of a bundle, as the page reads it back: enough to turn any [`Loc`]
+/// into a line and a column without rescanning anything.
+#[derive(Debug, Serialize)]
+pub struct FileInfo {
+    pub path: String,
+    pub len: usize,
+    /// Byte offset of each line start, so the page can map an offset to a
+    /// line and column without rescanning the source.
+    pub line_starts: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
     pub revision: u64,
     pub build: u64,
-    pub source_len: usize,
-    /// Byte offset of each line start, so the page can map an offset to a
-    /// line and column without rescanning the source.
-    pub line_starts: Vec<usize>,
+    /// Every file the loader read, in load order: the root first, then
+    /// depth-first through the modules. This is the index every [`Loc`] points
+    /// into.
+    pub files: Vec<FileInfo>,
+    /// The identity the root file's header declared, as `name@version`, or
+    /// `None` when it declared none the loader could use. Read-only on the
+    /// page: a bundle is named by its source and by nothing else.
+    pub bundle: Option<String>,
     pub stages: Vec<Stage>,
     pub diagnostics: Vec<Diagnostic>,
     pub panic: Option<Panic>,
@@ -117,7 +148,17 @@ pub struct Node {
     pub label: String,
     /// The rendered value, dimmed.
     pub text: String,
-    pub span: Option<Range>,
+    /// Where the node was written, as a [`Span`]: the file by [`FileID`], which
+    /// has no wire form, and the range inside it.
+    ///
+    /// The index a [`Loc`] carries is a position in [`Snapshot::files`], which
+    /// only the driver assembling the snapshot knows — so [`Node::at`] records
+    /// the span here and [`locate`] turns it into a `Loc` once, in one walk
+    /// over the finished stages. The alternative is a file map threaded through
+    /// every tree printer in the tool, and there are ninety-odd of those.
+    #[serde(skip)]
+    pub at: Option<Span>,
+    pub span: Option<Loc>,
     /// The node came from a generated span rather than from written source.
     pub generated: bool,
     /// Index into the `symbols` stage, when this node's span is an occurrence
@@ -165,7 +206,7 @@ pub struct Diagnostic {
     /// Stable and greppable; the page filters on it.
     pub code: &'static str,
     pub message: String,
-    pub span: Option<Range>,
+    pub span: Option<Loc>,
     /// Secondary spans, e.g. the first definition a duplicate repeats.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<Related>,
@@ -183,7 +224,7 @@ pub enum Severity {
 
 #[derive(Debug, Serialize)]
 pub struct Related {
-    pub span: Option<Range>,
+    pub span: Option<Loc>,
     pub message: String,
 }
 
@@ -214,25 +255,18 @@ pub struct DocMeta {
     pub modified_ms: u128,
 }
 
+/// One document: a whole bundle, which is a directory of files rather than a
+/// single snippet.
 #[derive(Debug, Serialize)]
 pub struct Doc {
     pub name: String,
-    pub source: String,
+    pub files: Vec<FileSpec>,
     pub modified_ms: u128,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DocBody {
-    pub source: String,
-}
-
-impl Default for BundleSpec {
-    fn default() -> Self {
-        Self {
-            name: "demo".into(),
-            version: "0.1.0".into(),
-        }
-    }
+    pub files: Vec<FileSpec>,
 }
 
 impl Node {
@@ -247,10 +281,13 @@ impl Node {
 
     /// Attach the span a node was written at. A generated span carries no
     /// source range to highlight, so it is recorded as a flag instead.
-    pub fn at(mut self, span: ruddy::tracking::Span) -> Self {
+    ///
+    /// Which file the span names is not resolved here; see [`Node::at`] and
+    /// [`locate`].
+    pub fn at(mut self, span: Span) -> Self {
         match span.is_generated() {
             true => self.generated = true,
-            false => self.span = Some([span.start, span.end()]),
+            false => self.at = Some(span),
         }
         self
     }
@@ -291,6 +328,38 @@ impl Node {
     pub fn children(mut self, nodes: impl IntoIterator<Item = Node>) -> Self {
         self.children.extend(nodes);
         self
+    }
+}
+
+/// Where a span points, as the page reads it: the file's position in
+/// [`Snapshot::files`], and the range inside it.
+///
+/// `None` for a generated span, and for one naming a file the loader never read
+/// — neither is anywhere the reader could be shown.
+pub fn loc(span: Span, files: &HashMap<FileID, u32>) -> Option<Loc> {
+    match span.is_generated() {
+        true => None,
+        false => files.get(&span.file_id).map(|&file| Loc {
+            file,
+            range: [span.start, span.end()],
+        }),
+    }
+}
+
+/// Resolve every node's span into a [`Loc`], now that the file index is known.
+///
+/// One walk over the finished stages, at the one point that has both the nodes
+/// and the index. See [`Node::at`] for why it happens here rather than as each
+/// node is built.
+pub fn locate(stages: &mut [Stage], files: &HashMap<FileID, u32>) {
+    fn walk(nodes: &mut [Node], files: &HashMap<FileID, u32>) {
+        for node in nodes {
+            node.span = node.at.and_then(|span| loc(span, files));
+            walk(&mut node.children, files);
+        }
+    }
+    for stage in stages {
+        walk(&mut stage.nodes, files);
     }
 }
 

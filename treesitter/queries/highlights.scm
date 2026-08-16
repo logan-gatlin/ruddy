@@ -25,6 +25,18 @@
 (sum_case payload: (identifier) @type)
 (operation_declaration signature: (identifier) @type)
 
+; A path written where a type goes: the name at the end of it is the type, and
+; the modules in front of it are painted with every other path's, below.
+(annotation type: (path name: (identifier) @type))
+(function_type from: (path name: (identifier) @type))
+(function_type to: (path name: (identifier) @type))
+(type_application head: (path name: (identifier) @type))
+(type_application argument: (path name: (identifier) @type))
+(parenthesized_type (path name: (identifier) @type))
+(struct_type_field type: (path name: (identifier) @type))
+(sum_case payload: (path name: (identifier) @type))
+(operation_declaration signature: (path name: (identifier) @type))
+
 (type_definition name: (identifier) @type.definition)
 
 ; The one primitive there is; see `types::Prim::ALL`.
@@ -50,6 +62,17 @@
 (effect_definition name: (identifier) @module @namespace)
 (operation_declaration name: (identifier) @function)
 (operation name: (identifier) @function)
+
+; ── modules ──────────────────────────────────────────────────────────────────
+
+; `Math::` — the modules a path is reached through, whatever sort of name sits
+; at the end of it. Captured twice for the reason an effect is: the two editors
+; spell this one idea differently, and a module is exactly what each of them
+; means by its word.
+(path module: (identifier) @module @namespace)
+(effect_path module: (identifier) @module @namespace)
+
+(module_definition name: (identifier) @module @namespace)
 
 ; ── definitions and parameters ───────────────────────────────────────────────
 
@@ -88,6 +111,8 @@
   "fn"
   "effect"
   "handle"
+  "bundle"
+  "module"
 ] @keyword
 
 "raise" @keyword.return
@@ -123,6 +148,7 @@
 
 [
   ":"
+  "::"
   ","
   ";"
   "."

@@ -6,7 +6,7 @@
 // build id, which re-runs the same snippet and re-renders in place.
 
 import { createEditor } from "./editor.js";
-import { createPanes } from "./panel.js";
+import { createPanes, esc } from "./panel.js";
 import { createDiagnostics } from "./diagnostics.js";
 
 const COMPILE_AFTER = 120;
@@ -14,10 +14,24 @@ const SAVE_AFTER = 1000;
 const UI_KEY = "ruddy-debug/ui";
 const docKey = (name) => `ruddy-debug/doc/${name}`;
 
+/// The root file of every bundle, which the server decides and the page only
+/// has to agree with: `snapshot::ROOT`. A document without one still opens —
+/// the compiler says what is missing better than a refusal here would.
+const ROOT = "main.hc";
+
 const state = {
   doc: "demo",
   docs: [],
-  source: "",
+  /// Every file of the open document, root first, exactly as the compile
+  /// request carries them.
+  files: [],
+  /// Which of them is on screen. The editor holds one file at a time; the
+  /// compiler is always given all of them.
+  active: 0,
+  /// Caret and scroll per file path, so switching back puts the reader where
+  /// they were rather than at the top. In memory only: it is where you were
+  /// looking a second ago, not something worth outliving the tab.
+  where: {},
   revision: 0,
   snapshot: null,
   build: null,
@@ -33,7 +47,6 @@ const state = {
   pane: 0,
   tabs: ["ir", "ast"],
   views: {},
-  bundle: { name: "demo", version: "0.1.0" },
   width: 46,
 
   collapsed: {},
@@ -71,7 +84,12 @@ const app = {
 
   setSelection(mark) {
     state.selection = mark;
-    if (mark?.span && mark.origin !== "editor") editor.reveal(mark.span);
+    // A span names a file as well as a range now, and revealing a range in a
+    // file that is not on screen reveals nothing — so the file comes first.
+    if (mark?.span && mark.origin !== "editor") {
+      showFile(mark.span);
+      editor.reveal(mark.span);
+    }
     app.emit("highlight");
   },
 
@@ -106,6 +124,27 @@ const app = {
     return state.collapsed[stageId];
   },
 
+  /// Where the file on screen sits in the snapshot's file list, or `-1` when
+  /// the loader never read it: a file no `module` declaration names is an
+  /// orphan, and nothing the compiler said is about it.
+  fileIndex() {
+    const path = active()?.path;
+    return state.snapshot?.files.findIndex((file) => file.path === path) ?? -1;
+  },
+
+  /// The path a span was written in, or `""` when the snapshot is older than
+  /// the file list it indexes into.
+  pathOf(span) {
+    return state.snapshot?.files[span?.file]?.path ?? "";
+  },
+
+  /// Whether a span is in the file on screen. Everything the editor paints has
+  /// to pass this: the buffer holds one file, and a range from another would
+  /// land at whatever offset it happened to name.
+  here(span) {
+    return !!span && span.file === app.fileIndex();
+  },
+
   byteToChar: (byte) => offsets().toChar(byte),
   charToByte: (char) => offsets().toByte(char),
 
@@ -123,11 +162,13 @@ const app = {
   },
 
   /// `line:col` for a span of the *snapshot*, which is what the panels and the
-  /// diagnostics describe. Uses the line table the server sent, so a label can
-  /// never disagree with the tree it labels.
+  /// diagnostics describe. Uses the line table the server sent for the file the
+  /// span names, so a label can never disagree with the tree it labels — and a
+  /// span in another file of the bundle is numbered in that file's lines rather
+  /// than in the buffer's.
   spanLabel(span) {
     if (!span) return "";
-    const starts = state.snapshot?.line_starts ?? lines();
+    const starts = state.snapshot?.files[span.file]?.line_starts ?? lines();
     const at = (byte) => {
       let low = 0;
       let high = starts.length - 1;
@@ -137,8 +178,8 @@ const app = {
       }
       return `${low + 1}:${byte - starts[low] + 1}`;
     };
-    const from = at(span[0]);
-    const to = at(span[1]);
+    const from = at(span.range[0]);
+    const to = at(span.range[1]);
     return from === to ? from : `${from}-${to}`;
   },
 
@@ -148,17 +189,20 @@ const app = {
 // ── boot ─────────────────────────────────────────────────────────────────
 
 loadUi();
-const editor = createEditor(el("editor-pane"), app);
+const editor = createEditor(el("editor-host"), app);
 const panes = createPanes(el("panes"), app);
 const diagnostics = createDiagnostics(el("diagnostics"), app);
 
 wireTitlebar();
+wireFiles();
 wireKeys();
 wireDrag();
 connect();
 
 app.on("input", (text) => {
-  state.source = text;
+  const file = active();
+  if (!file) return;
+  file.source = text;
   state.offsets = null;
   state.lines = null;
   cacheLocally();
@@ -168,7 +212,8 @@ app.on("input", (text) => {
 
 app.on("caret", (byte) => {
   if (!state.follow) return;
-  app.setSelection({ origin: "editor", span: [byte, byte], symbol: null, stage: null, node: null });
+  const span = { file: app.fileIndex(), range: [byte, byte] };
+  app.setSelection({ origin: "editor", span, symbol: null, stage: null, node: null });
 });
 
 app.on("snapshot", renderTitlebar);
@@ -190,23 +235,50 @@ async function openDoc(name) {
 
   // The server copy wins, except when this browser holds an edit that never
   // made it there — a crash, a lost connection, a closed tab mid-keystroke.
-  let source = server?.source ?? cached?.source ?? "";
+  let files = server?.files ?? cached?.files ?? [];
   state.notice = "";
-  if (cached && cached.source !== source && (!server || cached.at > server.modified_ms)) {
-    source = cached.source;
+  if (cached && !sameFiles(cached.files, files) && (!server || cached.at > server.modified_ms)) {
+    files = cached.files;
     state.notice = `restored unsaved changes to ${name}`;
   }
+  // A document nobody has written yet — the switcher creates one by opening a
+  // name that does not exist — starts as the one file a bundle cannot do
+  // without.
+  if (!files.length) files = [{ path: ROOT, source: "" }];
 
   state.doc = name;
-  state.source = source;
+  state.files = files;
+  state.active = 0;
+  state.where = {};
   state.offsets = null;
   state.lines = null;
   state.selection = null;
-  editor.setValue(source);
+  editor.setValue(files[0].source, { caret: 0, top: 0, left: 0 });
+  renderFiles();
   saveUi();
   renderTitlebar();
   await compileNow();
   editor.focus();
+}
+
+/// The file on screen, and its text. Everything that says "the buffer" means
+/// this one; the rest of the bundle is only ever a compile away.
+function active() {
+  return state.files[state.active] ?? null;
+}
+
+function source() {
+  return active()?.source ?? "";
+}
+
+/// Whether two file lists hold the same bundle. Paths and contents, in order:
+/// the server hands them back in the order it wants the strip shown in, so a
+/// list that only differs in order is a different list.
+function sameFiles(a, b) {
+  return (
+    a?.length === b?.length &&
+    a.every((file, i) => file.path === b[i].path && file.source === b[i].source)
+  );
 }
 
 let cacheTimer = null;
@@ -218,7 +290,7 @@ function cacheLocally() {
   cacheTimer = setTimeout(() => {
     try {
       const at = Date.now();
-      localStorage.setItem(docKey(state.doc), JSON.stringify({ source: state.source, at }));
+      localStorage.setItem(docKey(state.doc), JSON.stringify({ files: state.files, at }));
     } catch {
       // A full quota is not worth interrupting the loop over; the server copy
       // is the durable one anyway.
@@ -245,7 +317,7 @@ async function saveNow() {
   try {
     await fetch(`/docs/${encodeURIComponent(state.doc)}`, {
       method: "PUT",
-      body: JSON.stringify({ source: state.source }),
+      body: JSON.stringify({ files: state.files }),
     });
   } catch {
     // Offline: the local copy already has it, and the next save will catch up.
@@ -273,7 +345,7 @@ async function compileNow() {
     const response = await fetch("/compile", {
       method: "POST",
       signal: controller.signal,
-      body: JSON.stringify({ source: state.source, revision, bundle: state.bundle }),
+      body: JSON.stringify({ files: state.files, revision }),
     });
     const snapshot = await response.json();
     // A slower earlier compile must never overwrite a newer one.
@@ -349,23 +421,19 @@ function wireTitlebar() {
   el("doc-button").addEventListener("click", openSwitcher);
   el("follow").addEventListener("click", () => toggleFollow());
   el("split").addEventListener("click", () => toggleSplit());
-
-  for (const [id, field] of [
-    ["bundle-name", "name"],
-    ["bundle-version", "version"],
-  ]) {
-    el(id).addEventListener("change", () => {
-      state.bundle[field] = el(id).value.trim();
-      saveUi();
-      compileNow();
-    });
-  }
 }
 
 function renderTitlebar() {
   el("doc-name").textContent = state.doc;
-  el("bundle-name").value = state.bundle.name;
-  el("bundle-version").value = state.bundle.version;
+
+  // Read-only: a bundle is named by its own source, so the chip reports what
+  // the root file's header declared rather than offering a second place to say
+  // it. Nothing to show is itself worth showing — that program mints its
+  // symbols under a fallback identity.
+  const bundle = state.snapshot?.bundle ?? null;
+  el("bundle").textContent = bundle ?? `no bundle header in ${ROOT}`;
+  el("bundle").classList.toggle("none", !bundle);
+
   el("follow").classList.toggle("on", state.follow);
   el("split").classList.toggle("on", state.split);
 
@@ -489,7 +557,6 @@ el("overlay-input").addEventListener("keydown", (event) => {
     const doc = found[switcherAt];
     closeSwitcher();
     if (doc.create) {
-      state.source = "";
       openDoc(doc.name).then(saveNow);
     } else {
       openDoc(doc.name);
@@ -500,6 +567,214 @@ el("overlay-input").addEventListener("keydown", (event) => {
 el("overlay").addEventListener("mousedown", (event) => {
   if (event.target === el("overlay")) closeSwitcher();
 });
+
+// ── the file strip ───────────────────────────────────────────────────────
+//
+// A document is a bundle, so the editor holds one file of several. The strip
+// is the whole of that: which files there are, which one is on screen, and the
+// three things you can do to the set. `main.hc` gets no special treatment —
+// renaming or deleting it is allowed, and what happens is that the compiler
+// says the bundle has lost its root, which is a better teacher than a disabled
+// button.
+
+/// The tab being renamed, or created when its index is `-1`. Renaming happens
+/// in place rather than in a dialog: the name is already on screen, and the
+/// only thing a dialog would add is a second place to look.
+let renaming = null;
+
+function wireFiles() {
+  const strip = el("files");
+
+  strip.addEventListener("click", (event) => {
+    const act = event.target.closest("[data-act]")?.dataset.act;
+    if (act === "add") return startRename(-1);
+
+    const tab = event.target.closest(".ftab");
+    if (!tab || tab.dataset.index === undefined) return;
+    const index = Number(tab.dataset.index);
+    if (act === "rename") return startRename(index);
+    if (act === "delete") return deleteFile(index);
+    selectFile(index);
+    editor.focus();
+  });
+
+  // The name is what you would try to edit, so double-clicking it does.
+  strip.addEventListener("dblclick", (event) => {
+    const tab = event.target.closest(".ftab");
+    if (tab?.dataset.index !== undefined) startRename(Number(tab.dataset.index));
+  });
+
+  strip.addEventListener("keydown", (event) => {
+    if (!event.target.matches(".fname")) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitRename(event.target);
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelRename();
+    }
+  });
+
+  // Clicking away cancels rather than commits: a half-typed name is not a file
+  // anybody asked for, and the tab it came from is still there to try again.
+  strip.addEventListener("focusout", (event) => {
+    if (event.target.matches(".fname") && renaming) cancelRename();
+  });
+}
+
+function renderFiles() {
+  const strip = el("files");
+  const tabs = state.files.map((file, i) => {
+    if (renaming?.index === i) return nameBox(file.path);
+    const on = i === state.active ? " on" : "";
+    return (
+      `<span class="ftab${on}" data-index="${i}">` +
+      `<span class="name">${esc(file.path)}</span>` +
+      `<span class="act" data-act="rename" title="Rename">✎</span>` +
+      `<span class="act" data-act="delete" title="Delete">✕</span>` +
+      `</span>`
+    );
+  });
+  if (renaming?.index === -1) tabs.push(nameBox(""));
+  strip.innerHTML =
+    tabs.join("") + `<span class="ftab add" data-act="add" title="New file">+</span>`;
+
+  const box = strip.querySelector(".fname");
+  if (!box) return;
+  box.focus();
+  // Select the module name and leave the `.hc` alone: renaming a file is
+  // almost always renaming the module it holds.
+  box.setSelectionRange(0, Math.max(0, box.value.length - ".hc".length));
+}
+
+function nameBox(value) {
+  return (
+    `<span class="ftab editing">` +
+    `<input class="fname" spellcheck="false" autocomplete="off" placeholder="Name.hc" ` +
+    `value="${esc(value)}" size="${Math.max(8, value.length + 1)}" />` +
+    `</span>`
+  );
+}
+
+function startRename(index) {
+  renaming = { index };
+  renderFiles();
+}
+
+function cancelRename() {
+  renaming = null;
+  renderFiles();
+  editor.focus();
+}
+
+/// Take the name in the box, if it is one the server would accept. A refusal
+/// leaves the box exactly as it is, since the reader is one keystroke from a
+/// legal name and throwing away what they typed would not help them find it.
+function commitRename(box) {
+  const path = box.value.trim();
+  const { index } = renaming;
+  const clash = state.files.some((file, i) => i !== index && file.path === path);
+  if (!validPath(path) || clash) {
+    box.classList.add("bad");
+    state.notice = clash
+      ? `this bundle already has a ${path}`
+      : `${path || "a file"} is not a path a file can have: ` +
+        "letters, digits, `_` and `-`, `/` between folders, ending in `.hc`";
+    app.emit("status");
+    return;
+  }
+
+  state.notice = "";
+  renaming = null;
+  if (index === -1) {
+    state.files.push({ path, source: "" });
+    state.active = state.files.length - 1;
+    state.offsets = null;
+    state.lines = null;
+    editor.setValue("", { caret: 0, top: 0, left: 0 });
+    renderFiles();
+    app.emit("file");
+  } else {
+    const file = state.files[index];
+    state.where[path] = state.where[file.path];
+    delete state.where[file.path];
+    file.path = path;
+    renderFiles();
+  }
+  editor.focus();
+  saveNow();
+  compileNow();
+}
+
+function deleteFile(index) {
+  const file = state.files[index];
+  if (!file) return;
+  // The last file cannot go: a document with no files is not an empty bundle,
+  // it is a deleted document, and deleting one is not something the strip does.
+  if (state.files.length === 1) {
+    state.notice = "a document keeps at least one file; Ctrl+P opens another one";
+    return app.emit("status");
+  }
+  if (file.source.trim() && !confirm(`delete ${file.path}?`)) return;
+
+  state.files.splice(index, 1);
+  delete state.where[file.path];
+  state.notice = "";
+  const after = state.active > index ? state.active - 1 : state.active;
+  state.active = Math.min(after, state.files.length - 1);
+  state.offsets = null;
+  state.lines = null;
+  const shown = active();
+  editor.setValue(shown.source, state.where[shown.path] ?? { caret: 0, top: 0, left: 0 });
+  renderFiles();
+  app.emit("file");
+  editor.focus();
+  saveNow();
+  compileNow();
+}
+
+/// Put a file on screen, remembering where the reader was in the one leaving.
+function selectFile(index) {
+  const file = state.files[index];
+  if (!file || index === state.active) return;
+  remember();
+  state.active = index;
+  state.offsets = null;
+  state.lines = null;
+  editor.setValue(file.source, state.where[file.path] ?? { caret: 0, top: 0, left: 0 });
+  renderFiles();
+  // Not a new snapshot — the same one, read for a different file. The editor
+  // repaints from it and the strip tells the diagnostics which paths to name.
+  app.emit("file");
+}
+
+function remember() {
+  const file = active();
+  if (file) state.where[file.path] = editor.where();
+}
+
+/// Switch to the file a span was written in, when it is not the one on screen.
+function showFile(span) {
+  const path = app.pathOf(span);
+  if (!path || path === active()?.path) return;
+  const index = state.files.findIndex((file) => file.path === path);
+  if (index >= 0) selectFile(index);
+}
+
+/// The shape `docs::valid_file_path` accepts, checked where the name was typed:
+/// a relative `/`-separated path of segments drawn from a small alphabet,
+/// ending in `.hc`. The server refuses anything else with a 400, and a 400 the
+/// reader never sees is a file that silently did not appear.
+function validPath(path) {
+  if (!path.endsWith(".hc") || path.length > 128) return false;
+  const segments = path.split("/");
+  return segments.every((segment, i) => {
+    const last = i === segments.length - 1;
+    const name = last ? segment.slice(0, -".hc".length) : segment;
+    return /^[A-Za-z0-9_-]+$/.test(name);
+  });
+}
 
 // ── keys ─────────────────────────────────────────────────────────────────
 
@@ -598,8 +873,8 @@ function loadUi() {
 }
 
 function saveUi() {
-  const { doc, follow, split, tabs, views, bundle, width } = state;
-  localStorage.setItem(UI_KEY, JSON.stringify({ doc, follow, split, tabs, views, bundle, width }));
+  const { doc, follow, split, tabs, views, width } = state;
+  localStorage.setItem(UI_KEY, JSON.stringify({ doc, follow, split, tabs, views, width }));
 }
 
 // ── offsets ──────────────────────────────────────────────────────────────
@@ -607,9 +882,12 @@ function saveUi() {
 /// Spans are UTF-8 byte offsets and JavaScript strings are UTF-16, so every
 /// span has to be converted before it can index the buffer. Pure-ASCII source
 /// — nearly always — takes the identity path.
+///
+/// Of the file on screen: a span from another file of the bundle is never
+/// converted, because there is nothing in the buffer for it to point at.
 function offsets() {
   if (state.offsets) return state.offsets;
-  const text = state.source;
+  const text = source();
   let ascii = true;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) > 127) {
@@ -651,7 +929,7 @@ function byteLength(text) {
 function lines() {
   if (state.lines) return state.lines;
   const starts = [0];
-  const text = state.source;
+  const text = source();
   const map = offsets();
   for (let i = 0; i < text.length; i++) {
     if (text[i] === "\n") starts.push(map.toByte(i + 1));

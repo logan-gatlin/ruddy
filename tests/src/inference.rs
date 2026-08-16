@@ -6354,3 +6354,16 @@ fn a_variable_tail_takes_a_declared_rest() {
     };
     assert_eq!(error.kind.code(), "rigid-broken");
 }
+
+/// Inference is indifferent to modules: a type declared in one and used from
+/// another unifies exactly as it would have inside one file. One case, because
+/// there is nothing here for a broad sweep to find — a symbol's module is the
+/// mint's business, and by the time a constraint exists there are only symbols.
+#[test]
+fn a_type_declared_in_one_module_unifies_with_a_use_in_another() {
+    let (mint, _, output) = inferred(
+        "module Math =\n  type Pair 'a 'b = { first: 'a, second: 'b }\nend\n\
+         module Use =\n  let first = fn p => p.first\n  let p : Math::Pair Nat Nat = { first: 1, second: 2 }\n  let n : Nat = first p\nend",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+}

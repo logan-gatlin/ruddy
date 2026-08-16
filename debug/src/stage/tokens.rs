@@ -11,31 +11,48 @@ use crate::{
 };
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
-    let Some(tokens) = cx.tokens else {
+    let Some(loaded) = cx.bundle else {
         return crate::stage::skipped(spec, "lexing did not run");
     };
 
+    // One row per file, with that file's tokens under it: a bundle is several
+    // streams rather than one, and a flat list would run the last token of one
+    // file into the first of the next with nothing to say where the seam was.
     let mut ids = Ids::default();
-    let nodes: Vec<Node> = tokens
+    let mut counted = 0;
+    let nodes: Vec<Node> = loaded
+        .loaded
         .iter()
-        .map(|token| {
-            Node::new(ids.next(), label(&token.tracked), token.tracked.to_string())
-                .at(token.span)
-                .field(
-                    "bytes",
-                    format!("{}..{}", token.span.start, token.span.end()),
-                )
-                // Underscored fields are for the page, not for the table: this
-                // one is the class the editor paints the token with.
-                .field("_class", class(&token.tracked))
+        .map(|file| {
+            counted += file.tokens.len();
+            Node::new(
+                ids.next(),
+                "File",
+                format!("{} · {}", file.path, plural(file.tokens.len(), "token")),
+            )
+            .children(file.tokens.iter().map(|token| {
+                Node::new(ids.next(), label(&token.tracked), token.tracked.to_string())
+                    .at(token.span)
+                    .field(
+                        "bytes",
+                        format!("{}..{}", token.span.start, token.span.end()),
+                    )
+                    // Underscored fields are for the page, not for the table:
+                    // this one is the class the editor paints the token with.
+                    .field("_class", class(&token.tracked))
+            }))
         })
         .collect();
 
-    let summary = plural(nodes.len(), "token");
+    let summary = format!(
+        "{} · {}",
+        plural(counted, "token"),
+        plural(nodes.len(), "file")
+    );
     Stage {
         micros: Some(cx.micros.lex),
         nodes,
-        debug: format!("{tokens:#?}"),
+        debug: format!("{:#?}", loaded.loaded),
         ..spec.stage(cx.status(), summary)
     }
 }
@@ -54,10 +71,13 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Effect => "Effect",
         Kind::Handle => "Handle",
         Kind::Raise => "Raise",
+        Kind::Bundle => "Bundle",
+        Kind::Module => "Module",
         Kind::Equal => "Equal",
         Kind::FatArrow => "FatArrow",
         Kind::Arrow => "Arrow",
         Kind::Colon => "Colon",
+        Kind::ColonColon => "ColonColon",
         Kind::Comma => "Comma",
         Kind::Semicolon => "Semicolon",
         Kind::Dot => "Dot",
@@ -99,6 +119,7 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::FatArrow
         | Kind::Arrow
         | Kind::Colon
+        | Kind::ColonColon
         | Kind::Comma
         | Kind::Dot
         | Kind::DotDot

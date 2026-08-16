@@ -46,6 +46,7 @@ use std::fmt;
 use indexmap::IndexMap;
 
 use crate::{
+    bundle,
     inference::{self, Constraint, ConstraintKind, Effect, Goal, Origin, Rule},
     ir, parse, patterns,
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
@@ -276,10 +277,13 @@ impl fmt::Display for Kind {
             Kind::Effect => f.write_str("effect"),
             Kind::Handle => f.write_str("handle"),
             Kind::Raise => f.write_str("raise"),
+            Kind::Bundle => f.write_str("bundle"),
+            Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
             Kind::Arrow => f.write_str("->"),
             Kind::Colon => f.write_str(":"),
+            Kind::ColonColon => f.write_str("::"),
             Kind::Comma => f.write_str(","),
             Kind::Semicolon => f.write_str(";"),
             Kind::Dot => f.write_str("."),
@@ -477,6 +481,54 @@ impl fmt::Display for ir::Witness {
     }
 }
 
+impl bundle::ErrorKind {
+    /// A stable, greppable name for this kind of error, the way every other
+    /// phase's are coded.
+    pub fn code(&self) -> &'static str {
+        match self {
+            bundle::ErrorKind::ModuleFileMissing { .. } => "module-file-missing",
+            bundle::ErrorKind::ModuleFileAmbiguous { .. } => "module-file-ambiguous",
+            bundle::ErrorKind::MisplacedBundleDeclaration => "misplaced-bundle-declaration",
+            bundle::ErrorKind::MissingBundleDeclaration => "missing-bundle-declaration",
+            bundle::ErrorKind::BadBundleIdentity => "bad-bundle-identity",
+        }
+    }
+}
+
+/// What loading could not do, in a phrase.
+///
+/// The two about a module's file name the exact paths that were looked for,
+/// because that is the whole of the fix: a reader who is told "no file" still
+/// has to work out where one would have gone, and the loader already knows.
+impl fmt::Display for bundle::ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            bundle::ErrorKind::ModuleFileMissing { beside, inside } => write!(
+                f,
+                "this module has no file; create `{beside}` or `{inside}`",
+            ),
+            // Which of the two was meant is not the compiler's to guess, so it
+            // says what to delete rather than which one it took.
+            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
+                f,
+                "this module has two files; delete one of `{beside}` or `{inside}`",
+            ),
+            bundle::ErrorKind::MisplacedBundleDeclaration => {
+                f.write_str("remove this bundle declaration; only the root file has one")
+            }
+            bundle::ErrorKind::MissingBundleDeclaration => {
+                f.write_str("add `bundle <name> <version>` at the top of this file")
+            }
+            // The name is the only thing that can be refused: build metadata is
+            // the other reason [`Bundle::new`] says no, and the header grammar
+            // has no way to spell one.
+            bundle::ErrorKind::BadBundleIdentity => f.write_str(
+                "a bundle name must start with a letter and use only letters, digits, `-` and `_`",
+            ),
+        }
+    }
+}
+
 impl ir::ErrorKind {
     /// A stable, greppable name for this kind of error. The namespace is part
     /// of the code rather than only of the message: a reporter that wants to
@@ -487,12 +539,14 @@ impl ir::ErrorKind {
             ir::ErrorKind::Undefined { namespace } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
-                Namespace::Terms | Namespace::Modules => "undefined-term",
+                Namespace::Modules => "undefined-module",
+                Namespace::Terms => "undefined-term",
             },
             ir::ErrorKind::Duplicate { namespace, .. } => match namespace {
                 Namespace::Types => "duplicate-type",
                 Namespace::Effects => "duplicate-effect",
-                Namespace::Terms | Namespace::Modules => "duplicate-term",
+                Namespace::Modules => "duplicate-module",
+                Namespace::Terms => "duplicate-term",
             },
             ir::ErrorKind::DuplicateField => "duplicate-field",
             // The shape is not part of the code, for the reason a repeated row

@@ -1,11 +1,44 @@
+use std::fmt;
+
 use indexmap::IndexMap;
 
 use crate::{
+    symbol::Version,
     token::{Kind, Token},
     tracking::{Span, Tracked, TrackedString},
 };
 
 pub type Stmt = Tracked<StmtKind>;
+
+/// The header a bundle's root file begins with: `bundle demo 0.1.0`.
+///
+/// Read wherever it is written, and required in the root file and forbidden
+/// everywhere else by [`bundle::load`](crate::bundle::load) rather than here —
+/// only the loader knows which file it is looking at.
+#[derive(Debug, Clone)]
+pub struct Header {
+    pub name: TrackedString,
+    pub version: Tracked<Version>,
+    /// The whole header: the keyword, the name and the three version parts.
+    pub span: Span,
+}
+
+/// A name, and the modules it is reached through: `Math::Vec::zero`.
+///
+/// A bare name is a path with no segments, which is what makes this the one
+/// node every naming position holds — a term, a type, and the sigilled label of
+/// an effect. The segments are the modules to walk, outermost first; `name` is
+/// the thing itself, and what namespace it lives in is decided by the position
+/// it was written at rather than by anything here.
+///
+/// `::` binds tighter than application and than projection, so `Math::mk 1 2`
+/// applies `Math::mk` and `Math::p.x` projects `x` out of `Math::p`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Path {
+    /// The modules to walk, outermost first. Empty for a bare name.
+    pub modules: Vec<TrackedString>,
+    pub name: TrackedString,
+}
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
@@ -64,7 +97,25 @@ pub enum StmtKind {
         name: TrackedString,
         /// The cases, in the order they were written. Empty for the empty
         /// effect, `effect Nil = |`, which declares nothing and is legal.
-        cases: IndexMap<TrackedString, EffectCase>,
+        ///
+        /// Keyed by [`Path`] because an alias names an effect from elsewhere,
+        /// and elsewhere may be another module: `effect Console = Sys::!Log`.
+        /// An operation is declared here rather than named, so its key is a
+        /// path with no segments — the parser reads a bare name at that
+        /// position and nothing else.
+        cases: IndexMap<Path, EffectCase>,
+    },
+    /// `module A = <stmts> end`, or `module A` for one whose body is another
+    /// file.
+    ///
+    /// One node for the two forms, told apart by whether there is a body:
+    /// `None` says the body was not written here, and
+    /// [`bundle::load`](crate::bundle::load) is what fills it in from the file
+    /// the module's path names. Nothing downstream sees the difference — by the
+    /// time [`ir::build`](crate::ir::build) runs, every module carries a body.
+    Module {
+        name: TrackedString,
+        body: Option<Vec<Stmt>>,
     },
 }
 
@@ -174,11 +225,14 @@ pub enum ExprKind {
     /// field off. There is no `do` and no perform form — an operation is a
     /// value, and performing one is applying it.
     Operation {
-        effect: TrackedString,
+        /// The effect, path and all: `Sys::!Log.write` names the `Log` declared
+        /// in `Sys`. The path qualifies the whole sigilled label, so the
+        /// segments come before the `!`.
+        effect: Path,
         op: TrackedString,
     },
     Ident {
-        name: TrackedString,
+        name: Path,
     },
     Natural(u128),
     Unit,
@@ -209,11 +263,9 @@ pub struct HandlerArm {
 #[derive(Debug, Clone)]
 pub enum ArmHead {
     /// `!Log.write s => ...` — one operation, whose declared signature is
-    /// the arm's own.
-    Operation {
-        effect: TrackedString,
-        op: TrackedString,
-    },
+    /// the arm's own. The effect is a whole path, exactly as
+    /// [`ExprKind::Operation`] holds one.
+    Operation { effect: Path, op: TrackedString },
     /// `return x => ...` — the value arm, which may appear at most once and in
     /// any position. `return` is contextual: it heads an arm here and is an
     /// ordinary name everywhere else. The span is the keyword's, which is where
@@ -328,7 +380,7 @@ pub enum TypeKind {
         args: Vec<Type>,
     },
     Ident {
-        name: TrackedString,
+        name: Path,
     },
     /// `'a` — a variable: the parameter of the declaration this type is the
     /// body of, or a variable of the annotation it is written in.
@@ -436,7 +488,9 @@ pub enum SumCase {
 #[derive(Debug, Clone)]
 pub struct EffectRow {
     pub span: Span,
-    pub effects: IndexMap<TrackedString, EffectLabel>,
+    /// Keyed by [`Path`]: an effect declared in another module is named
+    /// `Sys::!Log` here, and the path qualifies the whole sigilled label.
+    pub effects: IndexMap<Path, EffectLabel>,
     pub tail: Option<Tail>,
 }
 
@@ -611,6 +665,11 @@ pub enum Place {
 
 #[derive(Debug, Clone)]
 pub struct Output {
+    /// The `bundle` header, when the file opened with one. Read wherever it is
+    /// written and required nowhere: which file is the root — and so which file
+    /// must have one and which may not — is
+    /// [`bundle::load`](crate::bundle::load)'s to know.
+    pub header: Option<Header>,
     pub stmts: Vec<Stmt>,
     pub errors: Vec<Error>,
 }
@@ -619,6 +678,37 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<Error>,
+}
+
+impl Path {
+    /// A bare name: a path with no modules to walk.
+    pub fn bare(name: TrackedString) -> Self {
+        Self {
+            modules: Vec::new(),
+            name,
+        }
+    }
+
+    /// Where the whole path was written: the first segment, when there is one,
+    /// through the name at the end.
+    pub fn span(&self) -> Span {
+        match self.modules.first() {
+            Some(first) => first.span.merge(self.name.span),
+            None => self.name.span,
+        }
+    }
+}
+
+/// `Math::Vec::zero` — the segments and the name, as they were written. The
+/// sigil a label wears is not part of a path, so an effect's prints bare and
+/// whoever shows one writes the `!` back on.
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for module in &self.modules {
+            write!(f, "{}::", module.tracked)?;
+        }
+        f.write_str(&self.name.tracked)
+    }
 }
 
 impl Annotation {
@@ -634,24 +724,22 @@ impl Annotation {
 
 pub fn parse(toks: Vec<Token>) -> Output {
     let mut p = Parser::new(toks);
-    let mut stmts = Vec::new();
-
-    while p.peek().is_some() {
-        let before = p.pos;
-        match p.stmt() {
-            Some(stmt) => stmts.push(stmt),
-            None => {
-                // Guarantee forward progress before recovering so a malformed
-                // leading token can't spin the loop forever.
-                if p.pos == before {
-                    p.advance();
-                }
-                p.recover();
-            }
-        }
-    }
+    // The header is read where it was written and demanded nowhere: a file with
+    // none simply has none here, and whether that is a mistake depends on which
+    // file it is — which is [`bundle::load`](crate::bundle::load)'s to know. A
+    // malformed one is reported like any other malformed statement and the
+    // cursor recovers to the next one, so the rest of the file is still read.
+    let header = match matches!(p.peek().map(|tok| &tok.tracked), Some(Kind::Bundle)) {
+        true => p.header().or_else(|| {
+            p.recover();
+            None
+        }),
+        false => None,
+    };
+    let stmts = p.stmts(None);
 
     Output {
+        header,
         stmts,
         errors: p.errors,
     }
@@ -812,21 +900,103 @@ impl Parser {
         name
     }
 
-    /// [`tag`](Self::tag) about the other sigil: the next token if it is an
-    /// effect, without the `!`. Silent on anything else for the same reason —
-    /// a row ends where its labels stop, and the caller has somewhere to go.
-    fn effect(&mut self) -> Option<TrackedString> {
+    /// [`tag`](Self::tag) about the other sigil: an effect label and the
+    /// `<module>::` path in front of it, without the `!`. Silent on anything
+    /// else for the same reason — a row ends where its labels stop, and the
+    /// caller has somewhere to go.
+    ///
+    /// The path in front is read speculatively: a run of names leading
+    /// somewhere other than a label is not part of one, so the cursor goes back
+    /// where it was and the caller reads whatever it really is.
+    fn effect(&mut self) -> Option<Path> {
+        let mark = self.pos;
+        let modules = self.path_modules();
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
-                Kind::EffectLabel(name) => Some(tok.span.track(name.clone())),
-                _ => None,
+                Kind::EffectLabel(name) => tok.span.track(name.clone()),
+                _ => {
+                    self.pos = mark;
+                    return None;
+                }
             },
-            None => None,
+            None => {
+                self.pos = mark;
+                return None;
+            }
         };
-        if name.is_some() {
-            self.advance();
+        self.advance();
+        Some(Path { modules, name })
+    }
+
+    /// `bundle <name> <major>.<minor>.<patch>` — the header a bundle's root
+    /// file begins with.
+    ///
+    /// The version needs no token of its own: `0.1.0` already lexes as three
+    /// naturals with dots between them, which is why a prerelease is simply
+    /// unwritable — there is no lexeme for one.
+    fn header(&mut self) -> Option<Header> {
+        let kw = self.advance().expect("the caller peeked `bundle`");
+        let name = self.ident()?;
+        let version = self.version()?;
+        Some(Header {
+            span: kw.span.merge(version.span),
+            name,
+            version,
+        })
+    }
+
+    /// `<major>.<minor>.<patch>`, each part a natural literal.
+    fn version(&mut self) -> Option<Tracked<Version>> {
+        let (major, span) = self.version_part()?;
+        self.eat(&Kind::Dot)?;
+        let (minor, _) = self.version_part()?;
+        self.eat(&Kind::Dot)?;
+        let (patch, last) = self.version_part()?;
+        Some(span.merge(last).track(Version::new(major, minor, patch)))
+    }
+
+    /// One part of a version: a natural literal that fits in the `u64` a
+    /// [`Version`] holds. One that does not is the unexpected token it is —
+    /// there is nothing else the digits could have been meant as.
+    fn version_part(&mut self) -> Option<(u64, Span)> {
+        let read = match self.peek() {
+            Some(tok) => match tok.tracked {
+                Kind::Natural(value) => u64::try_from(value).ok().map(|part| (part, tok.span)),
+                _ => return self.unexpected(),
+            },
+            None => return self.unexpected(),
+        };
+        let read = match read {
+            Some(read) => read,
+            None => return self.unexpected(),
+        };
+        self.advance();
+        Some(read)
+    }
+
+    /// A run of statements: the whole file, or the body of an inline module.
+    ///
+    /// `closing` is the token the run ends in front of — `end` for a module's
+    /// body — or `None` for the file, which ends where the tokens do. The
+    /// closer is left where it is: the caller consumes it, so a body that ran
+    /// out of input is reported by whoever wanted the `end`.
+    fn stmts(&mut self, closing: Option<&Kind>) -> Vec<Stmt> {
+        let mut stmts = Vec::new();
+        while self.peek().is_some() && !closing.is_some_and(|kind| self.at(kind)) {
+            let before = self.pos;
+            match self.stmt() {
+                Some(stmt) => stmts.push(stmt),
+                None => {
+                    // Guarantee forward progress before recovering so a
+                    // malformed leading token can't spin the loop forever.
+                    if self.pos == before {
+                        self.advance();
+                    }
+                    self.recover();
+                }
+            }
         }
-        name
+        stmts
     }
 
     fn stmt(&mut self) -> Option<Stmt> {
@@ -834,8 +1004,90 @@ impl Parser {
             Some(Kind::Let) => self.let_stmt(),
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
+            Some(Kind::Module) => self.module_stmt(),
             _ => self.unexpected(),
         }
+    }
+
+    /// `module <Name> = <stmts> end`, or `module <Name>` for a module whose
+    /// body is another file.
+    ///
+    /// The name is a bare one: a declaration binds a name rather than reaching
+    /// one, so `module A::B` is the unexpected `::` it looks like. The body of
+    /// the inline form is a statement list of any length, empty included —
+    /// `module A = end` declares a module with nothing in it.
+    fn module_stmt(&mut self) -> Option<Stmt> {
+        let kw = self.advance().expect("the caller peeked `module`");
+        let name = self.ident()?;
+        let mut span = kw.span.merge(name.span);
+        let body = match self.eat_if(&Kind::Equal) {
+            None => None,
+            Some(_) => {
+                let stmts = self.stmts(Some(&Kind::End));
+                let close = self.eat(&Kind::End)?;
+                span = span.merge(close.span);
+                Some(stmts)
+            }
+        };
+        Some(span.track(StmtKind::Module { name, body }))
+    }
+
+    /// Whether the next token is of this kind, payload ignored.
+    fn at(&self, want: &Kind) -> bool {
+        self.peek()
+            .is_some_and(|tok| std::mem::discriminant(&tok.tracked) == std::mem::discriminant(want))
+    }
+
+    /// The `<module>::` prefix of a path at the cursor, consumed. Empty when
+    /// nothing there is one, which is what makes a bare name a path with no
+    /// segments rather than a second kind of node.
+    fn path_modules(&mut self) -> Vec<TrackedString> {
+        let mut modules = Vec::new();
+        while matches!(
+            self.peek().map(|tok| &tok.tracked),
+            Some(Kind::Identifier(_))
+        ) && matches!(
+            self.toks.get(self.pos + 1).map(|tok| &tok.tracked),
+            Some(Kind::ColonColon)
+        ) {
+            modules.push(self.ident().expect("the loop peeked a name"));
+            self.advance();
+        }
+        modules
+    }
+
+    /// Where the `<module>::` prefix starting at `at` ends. Read without
+    /// consuming anything, so a position that has to know what a run of names
+    /// is *leading to* — a row of effects, told from a type by the sigil on its
+    /// first label — can look past it.
+    fn past_modules(&self, mut at: usize) -> usize {
+        while matches!(
+            self.toks.get(at).map(|tok| &tok.tracked),
+            Some(Kind::Identifier(_))
+        ) && matches!(
+            self.toks.get(at + 1).map(|tok| &tok.tracked),
+            Some(Kind::ColonColon)
+        ) {
+            at += 2;
+        }
+        at
+    }
+
+    /// `<module>::<module>::<name>` — a path, and the one node every naming
+    /// position holds. A bare name is one with no segments, which is why there
+    /// is nothing else to read here.
+    fn path(&mut self) -> Option<Path> {
+        let modules = self.path_modules();
+        let name = self.ident()?;
+        Some(Path { modules, name })
+    }
+
+    /// Whether an effect label — path and all — begins at `at`.
+    fn at_effect_label(&self, at: usize) -> bool {
+        matches!(
+            self.toks.get(self.past_modules(at)).map(|tok| &tok.tracked),
+            Some(Kind::EffectLabel(_))
+        )
     }
 
     /// `effect <name> = [|] <case> ('|' <case>)*`, where a case is an operation
@@ -881,7 +1133,9 @@ impl Parser {
                     let signature = self.type_expr()?;
                     span = span.merge(signature.span);
                     (
-                        op,
+                        // An operation is declared here rather than named, so
+                        // it is a bare name and the path around it is empty.
+                        Path::bare(op),
                         EffectCase::Operation {
                             signature: Box::new(signature),
                         },
@@ -894,7 +1148,7 @@ impl Parser {
                     break;
                 }
             };
-            span = span.merge(name.span);
+            span = span.merge(name.span());
             // An alias may be unioned onto the last with the `+` an effect row
             // writes — the two say the same thing, and this is the one form of
             // the declaration that is a union of effects. An operation's
@@ -1072,11 +1326,18 @@ impl Parser {
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
             Kind::EffectLabel(_) => self.operation_expr(),
-            Kind::Identifier(name) => {
-                let name = span.track(name.clone());
-                self.advance();
-                Some(span.track(ExprKind::Ident { name }))
-            }
+            // A name, or a path ending in one — and, since `::` binds tighter
+            // than everything, a path ending in an effect label is an operation
+            // rather than a name: `Sys::!Log.write` is read here, where a bare
+            // `!Log.write` is read by the arm above.
+            Kind::Identifier(_) => match self.at_effect_label(self.pos) {
+                true => self.operation_expr(),
+                false => {
+                    let name = self.path()?;
+                    let span = name.span();
+                    Some(span.track(ExprKind::Ident { name }))
+                }
+            },
             &Kind::Natural(value) => {
                 self.advance();
                 Some(span.track(ExprKind::Natural(value)))
@@ -1160,6 +1421,7 @@ impl Parser {
     /// than lowered into a complaint about a term the reader never wrote.
     fn operation_expr(&mut self) -> Option<Expr> {
         let effect = self.effect().expect("the caller peeked an effect");
+        let at = effect.span();
         self.eat(&Kind::Dot)?;
         // `!Log._` names an operation nothing: the complaint is the wildcard's,
         // worded for the projection it most nearly is.
@@ -1167,7 +1429,7 @@ impl Parser {
             return self.wildcard(Place::Projection);
         }
         let op = self.ident()?;
-        let span = effect.span.merge(op.span);
+        let span = at.merge(op.span);
         Some(span.track(ExprKind::Operation { effect, op }))
     }
 
@@ -1851,12 +2113,12 @@ impl Parser {
     /// one with labels beside it already could be.
     fn at_effects(&self) -> bool {
         match self.peek().map(|tok| &tok.tracked) {
-            Some(Kind::EffectLabel(_) | Kind::DotDot) => true,
-            Some(Kind::Backslash) => matches!(
-                self.toks.get(self.pos + 1).map(|tok| &tok.tracked),
-                Some(Kind::EffectLabel(_))
-            ),
-            _ => false,
+            Some(Kind::DotDot) => true,
+            Some(Kind::Backslash) => self.at_effect_label(self.pos + 1),
+            // A label may wear a path, so a run of names is read past before
+            // the sigil is looked for: `Sys::!Log` is a row and `Math::Pair` is
+            // a type, and the two are told apart by nothing else.
+            _ => self.at_effect_label(self.pos),
         }
     }
 
@@ -1898,8 +2160,14 @@ impl Parser {
                 let Some(name) = self.effect() else {
                     return self.unexpected();
                 };
-                span = span.merge(name.span);
-                let key = slash.span.merge(name.span).track(name.tracked);
+                span = span.merge(name.span());
+                // The `\` rides on the key's own span, so a complaint about the
+                // entry underlines the absence mark along with the label it
+                // marks — the rule a struct's absent field keeps.
+                let key = Path {
+                    name: slash.span.merge(name.name.span).track(name.name.tracked),
+                    modules: name.modules,
+                };
                 effects.insert(key, EffectLabel::Absent);
             } else {
                 let Some(name) = self.effect() else {
@@ -1908,7 +2176,7 @@ impl Parser {
                     }
                     break;
                 };
-                span = span.merge(name.span);
+                span = span.merge(name.span());
                 // A `when` takes parentheses here for the reason a sum case's
                 // does: an effect has no colon to end a bare clause.
                 let when = match self.at_left_paren() && self.keyword_at(self.pos + 1, "when") {
@@ -2124,9 +2392,11 @@ impl Parser {
         match &tok.tracked {
             Kind::LeftBrace => self.struct_type(),
             Kind::LeftParen => self.paren_type(),
-            Kind::Identifier(name) => {
-                let name = span.track(name.clone());
-                self.advance();
+            // A name, or a path ending in one: `Math::Pair` is as much a type
+            // atom as `Pair` is, and may head an application like any other.
+            Kind::Identifier(_) => {
+                let name = self.path()?;
+                let span = name.span();
                 Some(span.track(TypeKind::Ident { name }))
             }
             Kind::Variable(name) => {
@@ -2229,9 +2499,16 @@ impl Parser {
 
     /// Skip tokens until the start of the next statement (or EOF) so a single
     /// malformed statement doesn't cascade into a flood of errors.
+    ///
+    /// An `end` stops it too, though it begins no statement: it closes the
+    /// inline module a malformed statement may be inside, and running past one
+    /// would take the rest of the enclosing file with it.
     fn recover(&mut self) {
         while let Some(tok) = self.peek() {
-            if matches!(tok.tracked, Kind::Let | Kind::Type | Kind::Effect) {
+            if matches!(
+                tok.tracked,
+                Kind::Let | Kind::Type | Kind::Effect | Kind::Module | Kind::End
+            ) {
                 break;
             }
             self.advance();

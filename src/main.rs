@@ -1,33 +1,29 @@
 use std::process::ExitCode;
 
 use ruddy::{
-    inference, ir, lir, parse, patterns,
-    symbol::{Bundle, Mint, Version},
-    token,
+    bundle::{self, Disk, Files},
+    inference, ir, lir, patterns,
+    symbol::Mint,
     tracking::{FileManager, Span},
     ui,
 };
 
+/// The bundle root, read from the working directory. The directory holding it
+/// is what every module's file is looked for under.
 const DEMO_PATH: &str = "demo.hc";
 
-const DEMO_BUNDLE: &str = "demo";
-const DEMO_VERSION: Version = Version::new(0, 1, 0);
-
 fn main() -> ExitCode {
-    let source = match std::fs::read_to_string(DEMO_PATH) {
-        Ok(source) => source,
-        Err(err) => {
-            eprintln!("error: could not read {DEMO_PATH}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // The whole bundle comes off the disk beside `demo.hc`, so a `module A`
+    // written in it is looked for at `A.hc` or `A/module.hc` the way it would
+    // be anywhere else.
+    let fs = Disk::new(".");
+    if fs.read(DEMO_PATH).is_none() {
+        eprintln!("error: could not read {DEMO_PATH}");
+        return ExitCode::FAILURE;
+    }
 
-    // Register the source so its span offsets refer to a real file.
     let mut files = FileManager::new();
-    let file_id = files.register_new_file(DEMO_PATH.to_string(), source.clone());
-
-    let lexed = token::lex(&source, file_id);
-    let parsed = parse::parse(lexed.tokens);
+    let loaded = bundle::load(&mut files, &fs, DEMO_PATH);
 
     // Neither the parse tree nor the lowered program is printed here. Rendering
     // a tree back as surface syntax lives in the debugger, which this crate
@@ -36,15 +32,21 @@ fn main() -> ExitCode {
     // its caller regardless: the diagnostics below.
 
     // The mint lives as long as the symbols it hands out, which for a driver
-    // means the rest of the run.
-    let bundle = Bundle::new(DEMO_BUNDLE, DEMO_VERSION).expect("the demo bundle name is valid");
-    let mut mint = Mint::new(bundle);
-    let mut built = ir::build(&mut mint, parsed.stmts);
+    // means the rest of the run. The identity is the root file's own, or the
+    // fallback when it had none the loader could use — the later phases still
+    // run either way, so one missing line does not hide every other complaint.
+    let mut mint = Mint::new(loaded.bundle.clone().unwrap_or_else(bundle::fallback));
+    let mut built = ir::build(&mut mint, loaded.stmts.clone());
     let inferred = inference::infer(&mint, &mut built.program);
     let checked = patterns::check(&built.program, &inferred);
 
-    let errors = lexed.errors.len()
-        + parsed.errors.len()
+    let read: usize = loaded
+        .loaded
+        .iter()
+        .map(|file| file.lex_errors.len() + file.parse_errors.len())
+        .sum();
+    let errors = loaded.errors.len()
+        + read
         + built.errors.len()
         + inferred.errors.len()
         + checked.errors.len();
@@ -62,35 +64,61 @@ fn main() -> ExitCode {
     // this driver and the debugger's diagnostic strip cannot describe the same
     // program differently. What is left to a reporter is layout: the order, the
     // indentation, and how a span is quoted.
+    //
+    // A span names the file it was written in, so a bundle of several is quoted
+    // out of whichever one the complaint is about. The sources are read back
+    // off the loader rather than off the disk a second time: what was compiled
+    // is what is quoted.
+    let sources: Vec<(String, String)> = loaded
+        .loaded
+        .iter()
+        .map(|file| {
+            let registered = files.get_file(file.id);
+            (registered.path.clone(), registered.content.clone())
+        })
+        .collect();
+    let at = |span: Span| {
+        loaded
+            .loaded
+            .iter()
+            .position(|file| file.id == span.file_id)
+            .map(|index| &sources[index])
+    };
+
     eprintln!("{errors} error(s):");
-    for err in &lexed.errors {
-        report(&source, err.span, &err.kind.to_string());
+    for file in &loaded.loaded {
+        for err in &file.lex_errors {
+            report(at(err.span), err.span, &err.kind.to_string());
+        }
+        for err in &file.parse_errors {
+            report(at(err.span), err.span, &err.to_string());
+        }
     }
-    for err in &parsed.errors {
-        report(&source, err.span, &err.to_string());
+    for err in &loaded.errors {
+        report(at(err.span), err.span, &err.kind.to_string());
     }
     for err in &built.errors {
-        report(&source, err.span, &err.kind.to_string());
+        report(at(err.span), err.span, &err.kind.to_string());
         // A repeat is only legible next to what it repeats, so the definition
         // that stands gets a line of its own, indented under the error. A
         // repeated parameter is the same thing said about a smaller scope, and
         // carries the same second span for the same reason.
         if let Some((previous, note)) = elsewhere(&err.kind) {
-            report(&source, previous, &format!("  {note}"));
+            report(at(previous), previous, &format!("  {note}"));
         }
     }
     for err in &inferred.errors {
-        report(&source, err.span, &err.kind.to_string());
+        report(at(err.span), err.span, &err.kind.to_string());
         // A broken promise is only legible next to the promise, which is on
         // another line: the first use of the variable gets a line
         // of its own, indented under the error, exactly as a repeat's first
         // definition does.
         if let Some((declared, note)) = promised(&err.kind) {
-            report(&source, declared, &format!("  {note}"));
+            report(at(declared), declared, &format!("  {note}"));
         }
     }
     for err in &checked.errors {
-        report(&source, err.span, &err.kind.to_string());
+        report(at(err.span), err.span, &err.kind.to_string());
     }
     ExitCode::FAILURE
 }
@@ -125,11 +153,19 @@ fn promised(kind: &inference::ErrorKind) -> Option<(Span, &'static str)> {
 /// the span's byte offset back to a human-readable position in the source. A
 /// span with no width covers no characters to quote: it marks where something
 /// the parser needed would have gone, so it is named rather than quoted.
-fn report(source: &str, span: Span, message: &str) {
+///
+/// A span whose file is not one the loader read — the generated file every
+/// compiler-made span sits in — has no source to quote and no path to name, so
+/// it is printed as the position it is.
+fn report(file: Option<&(String, String)>, span: Span, message: &str) {
+    let Some((path, source)) = file else {
+        eprintln!("  {message}");
+        return;
+    };
     let (line, col) = line_col(source, span.start);
     match source.get(span.start..span.end()) {
-        Some("") | None => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: end of input"),
-        Some(snippet) => eprintln!("  {DEMO_PATH}:{line}:{col}: {message}: {snippet:?}"),
+        Some("") | None => eprintln!("  {path}:{line}:{col}: {message}: end of input"),
+        Some(snippet) => eprintln!("  {path}:{line}:{col}: {message}: {snippet:?}"),
     }
 }
 

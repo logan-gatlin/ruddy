@@ -3,9 +3,27 @@
 use regex::Regex;
 use ruddy::types::Core;
 use ruddy_debug::{
+    snapshot::{ROOT, compile},
     stage::{Build, REGISTRY, Spec, panicked, skipped},
-    wire::Stage,
+    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage},
 };
+
+/// The header every snippet is compiled under: a bundle's root file must open
+/// with one, so a snippet that did not write its own would be told so. Every
+/// span in the snippet therefore sits this many bytes further in.
+const HEADER: &str = "bundle demo 0.1.0\n";
+
+/// A bundle of three files, one per shape a module's body can come from: an
+/// inline module, a module beside its parent, and a module inside the directory
+/// its parent's name spells.
+const NESTED: &[(&str, &str)] = &[
+    (
+        ROOT,
+        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2\n",
+    ),
+    ("Math.hc", "module Vec\nlet double = fn x => x\n"),
+    ("Math/Vec.hc", "let zero = 0\n"),
+];
 
 /// The page finds a stage's variables by the pattern the stage declares, and by
 /// nothing else — it never learns what a match means. It both colours them and
@@ -208,31 +226,12 @@ fn position(id: &str) -> Option<usize> {
 /// failed and the checks stood aside.
 #[test]
 fn the_patterns_tab_renders_verdicts_and_coverage() {
-    use ruddy_debug::{
-        snapshot::compile,
-        wire::{BundleSpec, CompileRequest, Node},
-    };
-
-    let tab = |source: &str| -> Vec<Node> {
-        let snapshot = compile(
-            &CompileRequest {
-                source: source.to_string(),
-                revision: 0,
-                bundle: BundleSpec::default(),
-            },
-            0,
-        );
-        let stage = snapshot
-            .stages
-            .into_iter()
-            .find(|stage| stage.id == "patterns")
-            .expect("the patterns stage is registered");
-        stage.nodes
-    };
-
     // A misplaced catch-all: the arm rows carry the verdicts, the scrutinee
     // type is the match row's text, and the match stays exhaustive.
-    let nodes = tab("let f = fn n => match n with | x => 1 | 2 => 3 | 4 => 5 end");
+    let nodes = tab(
+        "patterns",
+        "let f = fn n => match n with | x => 1 | 2 => 3 | 4 => 5 end",
+    );
     assert_eq!(nodes.len(), 1, "{nodes:#?}");
     let rows: Vec<(&str, &str)> = nodes[0]
         .children
@@ -255,7 +254,10 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
 
     // An unhandled match: the coverage row carries the witness, marked as the
     // error it reports.
-    let nodes = tab("let bad = match {x: 1, y: 2} with {x} => {} | {y} => {} end");
+    let nodes = tab(
+        "patterns",
+        "let bad = match {x: 1, y: 2} with {x} => {} | {y} => {} end",
+    );
     let coverage = nodes[0]
         .children
         .iter()
@@ -265,7 +267,10 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     assert!(coverage.error);
 
     // An unreachable arm is marked as the error its row reports.
-    let nodes = tab("let f = fn e => match e with | #A x => 1 | #A y => 2 end");
+    let nodes = tab(
+        "patterns",
+        "let f = fn e => match e with | #A x => 1 | #A y => 2 end",
+    );
     let unreachable = nodes[0]
         .children
         .iter()
@@ -276,7 +281,10 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
 
     // A mixed match: the checks stood aside, and the tab says so per arm and
     // for the coverage.
-    let nodes = tab("let f = fn e => match e with | 1 => 2 | #A => 3 end");
+    let nodes = tab(
+        "patterns",
+        "let f = fn e => match e with | 1 => 2 | #A => 3 end",
+    );
     let verdicts: Vec<&str> = nodes[0]
         .children
         .iter()
@@ -297,32 +305,13 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
 /// what the patterns phase walks that definition under.
 #[test]
 fn the_presence_tab_renders_the_store_and_the_clauses() {
-    use ruddy_debug::{
-        snapshot::compile,
-        wire::{BundleSpec, CompileRequest, Node},
-    };
-
-    let tab = |source: &str| -> Vec<Node> {
-        let snapshot = compile(
-            &CompileRequest {
-                source: source.to_string(),
-                revision: 0,
-                bundle: BundleSpec::default(),
-            },
-            0,
-        );
-        snapshot
-            .stages
-            .into_iter()
-            .find(|stage| stage.id == "presence")
-            .expect("the presence stage is registered")
-            .nodes
-    };
-
     // A match whose column converted: one coverage batch, satisfiable, with a
     // disjunct per arm and the labels its presences decide — and the clause
     // the definition ends up publishing.
-    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end");
+    let nodes = tab(
+        "presence",
+        "let p = fn a => match a with | {x} => {} | {y} => {} end",
+    );
     let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
     assert_eq!(labels, ["match-coverage", "let p"], "{nodes:#?}");
     assert_eq!(nodes[1].text, "where 'a != 'b");
@@ -344,7 +333,10 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
 
     // A use site that cannot be satisfied: the batch that flipped the store is
     // marked as the error it owns, and it is the only one that is.
-    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}");
+    let nodes = tab(
+        "presence",
+        "let p = fn a => match a with | {x} => {} | {y} => {} end\nlet bad = p {}",
+    );
     let flipped: Vec<&str> = nodes
         .iter()
         .filter(|node| node.error)
@@ -376,9 +368,12 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // unsatisfiable verdict too — and each of them names the batch that did the
     // flipping rather than itself, which would blame each in turn for the one
     // thing only the first of them did.
-    let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+    let nodes = tab(
+        "presence",
+        "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = p {}\n\
-         let q = fn a => match a with | {x} => {} | {y} => {} end");
+         let q = fn a => match a with | {x} => {} | {y} => {} end",
+    );
     let unsatisfiable: Vec<&str> = nodes
         .iter()
         .filter_map(|node| node.children.iter().find(|child| child.label == "verdict"))
@@ -394,7 +389,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     );
 
     // An annotation's own clause is a batch of its own.
-    let nodes = tab("let f : { x when 'a: Nat } where 'a = { x: 1 }");
+    let nodes = tab("presence", "let f : { x when 'a: Nat } where 'a = { x: 1 }");
     assert!(
         nodes.iter().any(|node| node.label == "annotation"),
         "{nodes:#?}"
@@ -404,11 +399,14 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // row, and it is not the scheme's clause: a definition whose presences all
     // live in a nested binding publishes no clause at all and is still walked
     // under everything the store says about them.
-    let nodes = tab("let outer = fn z =>\n  \
+    let nodes = tab(
+        "presence",
+        "let outer = fn z =>\n  \
            let g = fn v =>\n    \
              let w = match v with | {x} => 0 | {y} => 0 end in\n    \
              match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end in\n  \
-           0");
+           0",
+    );
     let outer = nodes
         .iter()
         .find(|node| node.label == "let outer")
@@ -424,7 +422,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     // A program that constrains nothing still says so, per definition: the
     // ordinary case is a tab full of "unconstrained" rather than an empty one,
     // promise row included.
-    let nodes = tab("let id = fn x => x");
+    let nodes = tab("presence", "let id = fn x => x");
     assert_eq!(nodes.len(), 1, "{nodes:#?}");
     assert_eq!(nodes[0].label, "let id");
     assert_eq!(nodes[0].text, "unconstrained");
@@ -441,24 +439,10 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
 /// empty on purpose.
 #[test]
 fn the_presence_tab_counts_what_it_rendered() {
-    use ruddy_debug::{
-        snapshot::compile,
-        wire::{BundleSpec, CompileRequest},
-    };
-
-    let snapshot = compile(
-        &CompileRequest {
-            source: "let p = fn a => match a with | {x} => {} | {y} => {} end".to_string(),
-            revision: 0,
-            bundle: BundleSpec::default(),
-        },
-        0,
+    let stage = stage(
+        "presence",
+        "let p = fn a => match a with | {x} => {} | {y} => {} end",
     );
-    let stage = snapshot
-        .stages
-        .into_iter()
-        .find(|stage| stage.id == "presence")
-        .expect("the presence stage is registered");
     assert_eq!(stage.summary, "1 constraint");
     assert!(stage.micros.is_some());
 }
@@ -523,8 +507,8 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
         .iter()
         .find(|node| node.label == "Variable b")
         .expect("the row is there");
-    let at = source.find("..'b").expect("the tail") + 2;
-    assert_eq!(declared.span, Some([at, at + 2]));
+    let tail = source.find("..'b").expect("the tail") + 2;
+    assert_eq!(declared.span, at([tail, tail + 2]));
 
     // A named tail keeps its as-written spelling in the type beside them.
     assert!(
@@ -729,25 +713,9 @@ fn the_lir_tab_lights_a_temp_wherever_it_appears() {
 /// half a listing of a program that does not type.
 #[test]
 fn the_lir_tab_skips_a_program_with_errors() {
-    use ruddy_debug::{
-        snapshot::compile,
-        wire::{BundleSpec, CompileRequest, Status},
-    };
+    use ruddy_debug::wire::Status;
 
-    let stage = |source: &str| {
-        compile(
-            &CompileRequest {
-                source: source.to_string(),
-                revision: 0,
-                bundle: BundleSpec::default(),
-            },
-            0,
-        )
-        .stages
-        .into_iter()
-        .find(|stage| stage.id == "lir")
-        .expect("the lir stage is registered")
-    };
+    let stage = |source: &str| stage("lir", source);
 
     let ok = stage("let f = fn a => a\n");
     assert_eq!(ok.status, Status::Ok);
@@ -762,32 +730,217 @@ fn the_lir_tab_skips_a_program_with_errors() {
     assert!(bad.micros.is_none());
 }
 
-/// The rows of one stage over one source, for the tests above.
-fn tab(id: &'static str, source: &str) -> Vec<ruddy_debug::wire::Node> {
-    use ruddy_debug::{
-        snapshot::compile,
-        wire::{BundleSpec, CompileRequest},
+/// The Tokens tab is one row per file with that file's own stream under it. A
+/// bundle is several streams rather than one, and a flat list would run the last
+/// token of one file into the first of the next with nothing to say where the
+/// seam was.
+#[test]
+fn the_tokens_tab_groups_its_rows_by_file() {
+    let stage = named(bundle(NESTED), "tokens");
+
+    // One row per file, in load order, each labelled with its path and what it
+    // holds — so the row says how much is behind it while it is collapsed.
+    let rows: Vec<(&str, &str)> = stage
+        .nodes
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("File", "main.hc · 16 tokens"),
+            ("File", "Math.hc · 9 tokens"),
+            ("File", "Math/Vec.hc · 4 tokens"),
+        ],
+        "{:#?}",
+        stage.nodes
+    );
+
+    // The tokens themselves are the children, and each is a span in the file it
+    // is a child of.
+    for (index, file) in stage.nodes.iter().enumerate() {
+        assert!(!file.children.is_empty(), "{} is empty", file.text);
+        for token in &file.children {
+            let at = token.span.expect("a token was written somewhere");
+            assert_eq!(at.file, index as u32, "{} {:?}", token.label, token.text);
+        }
+    }
+
+    // And the summary counts both: the tokens are what the tab renders, and the
+    // files are what it renders them under.
+    assert_eq!(stage.summary, "29 tokens · 3 files");
+}
+
+/// The AST tab is one row per file holding the statements written in *that*
+/// file. The tree the loader hands over is spliced, so a module whose body came
+/// from another file has to be rendered as the leaf it was written as — nesting
+/// its statements here as well as under their own file would show the reader one
+/// program in two places.
+#[test]
+fn the_ast_tab_groups_its_rows_by_file() {
+    let stage = named(bundle(NESTED), "ast");
+
+    let files: Vec<(&str, &str)> = stage
+        .nodes
+        .iter()
+        .map(|node| (node.label.as_str(), node.text.as_str()))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("File", "main.hc"),
+            ("File", "Math.hc"),
+            ("File", "Math/Vec.hc"),
+        ],
+        "{:#?}",
+        stage.nodes
+    );
+
+    let children = |at: usize| -> Vec<&str> {
+        stage.nodes[at]
+            .children
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect()
+    };
+    // The root file leads with the header, which is the file's own first line
+    // rather than a statement — there is no node in the statement list for it
+    // to be.
+    assert_eq!(children(0), ["Bundle", "Module", "Let"]);
+    assert_eq!(stage.nodes[0].children[0].text, "bundle demo 0.1.0");
+    // And the module whose body is in `Math.hc` carries its name and nothing
+    // else: the body is that file's row.
+    let math = &stage.nodes[0].children[1];
+    assert_eq!(
+        math.children
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Name"],
+        "{math:#?}"
+    );
+    assert_eq!(children(1), ["Module", "Let"]);
+    assert_eq!(children(2), ["Let"]);
+
+    // A module written inline is the other half of the rule: its statements
+    // were written in this file, so this file's row is where they go.
+    let nodes = tab("ast", "module A =\n  let x = 1\nend\n");
+    let inline = &nodes[0].children[1];
+    assert_eq!(inline.label, "Module");
+    let kids: Vec<&str> = inline
+        .children
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    assert_eq!(kids, ["Name", "Let"], "{inline:#?}");
+
+    // The summary counts each kind of declaration the bundle holds, across
+    // every file of it.
+    assert_eq!(
+        named(bundle(NESTED), "ast").summary,
+        "2 module · 0 effect · 0 type · 3 let"
+    );
+}
+
+/// The Symbols tab says where each symbol sits — which module declared it, and
+/// which file that module was written in. A name is no longer enough to say
+/// where a symbol came from, and the mangled name it round-trips through is the
+/// only other thing on the row that knows.
+#[test]
+fn the_symbols_tab_says_which_module_and_file_a_symbol_came_from() {
+    let stage = named(bundle(NESTED), "symbols");
+    let field = |name: &str, of: &str| -> String {
+        stage
+            .nodes
+            .iter()
+            .find(|node| node.label == name)
+            .unwrap_or_else(|| panic!("no row for {name}: {:#?}", stage.nodes))
+            .fields
+            .iter()
+            .find(|field| field.name == of)
+            .unwrap_or_else(|| panic!("{name} has no {of}"))
+            .value
+            .clone()
     };
 
-    let snapshot = compile(
+    // Two modules deep, declared in the file its own path spells.
+    assert_eq!(field("zero", "module"), "Math::Vec");
+    assert_eq!(field("zero", "file"), "Math/Vec.hc");
+    // One deep, in the file its parent's declaration named.
+    assert_eq!(field("double", "module"), "Math");
+    assert_eq!(field("double", "file"), "Math.hc");
+    // And at the bundle root, which is a real position in the tree rather than
+    // a missing one — so it is written as one rather than left blank.
+    assert_eq!(field("four", "module"), "—");
+    assert_eq!(field("four", "file"), "main.hc");
+
+    // A local is written inside a definition rather than declared, so there is
+    // no declaration to read a file off: the column is blank, and the module is
+    // still the one it was written in.
+    assert_eq!(field("x", "scope"), "local");
+    assert_eq!(field("x", "file"), "");
+    assert_eq!(field("x", "module"), "Math");
+
+    // Every row still round-trips through the mangler, which now has an `M`
+    // component per enclosing module to lose.
+    for node in &stage.nodes {
+        assert_eq!(field(&node.label, "demangle"), "ok", "{}", node.label);
+        assert!(!node.error, "{}", node.label);
+    }
+
+    // The summary counts what a bundle made worth counting.
+    assert_eq!(stage.summary, "6 symbols · 3 files · 2 modules");
+}
+
+/// A whole bundle, each file exactly as written — the request the page posts,
+/// with nothing added to it.
+fn bundle(files: &[(&str, &str)]) -> Snapshot {
+    compile(
         &CompileRequest {
-            source: source.to_string(),
+            files: files
+                .iter()
+                .map(|(path, source)| FileSpec {
+                    path: (*path).to_string(),
+                    source: (*source).to_string(),
+                })
+                .collect(),
             revision: 0,
-            bundle: BundleSpec::default(),
         },
         0,
-    );
+    )
+}
+
+/// One stage over one snippet, compiled as the whole of a bundle's root file.
+fn stage(id: &'static str, snippet: &str) -> Stage {
+    named(bundle(&[(ROOT, &format!("{HEADER}{snippet}"))]), id)
+}
+
+/// One stage of a snapshot, by the id it is registered under.
+fn named(snapshot: Snapshot, id: &'static str) -> Stage {
     snapshot
         .stages
         .into_iter()
         .find(|stage| stage.id == id)
         .unwrap_or_else(|| panic!("{id} is registered"))
-        .nodes
+}
+
+/// The rows of one stage over one snippet, for the tests above.
+fn tab(id: &'static str, snippet: &str) -> Vec<Node> {
+    stage(id, snippet).nodes
+}
+
+/// Where a range written in a snippet's own offsets ends up on the wire: in the
+/// root file, [`HEADER`] bytes further in than the snippet spells it.
+fn at(range: [usize; 2]) -> Option<Loc> {
+    Some(Loc {
+        file: 0,
+        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
+    })
 }
 
 /// Every row of a tree, parents before children — the shape of the tree is not
 /// what these tests are about.
-fn flatten(nodes: &[ruddy_debug::wire::Node]) -> Vec<&ruddy_debug::wire::Node> {
+fn flatten(nodes: &[Node]) -> Vec<&Node> {
     let mut out = Vec::new();
     for node in nodes {
         out.push(node);

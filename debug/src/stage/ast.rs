@@ -3,9 +3,16 @@
 //! Each node's `text` is that subtree's own `Display` output, so the tree and
 //! the rendered source can never drift apart: they are the same printer.
 
-use ruddy::parse::{
-    Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
-    ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind, When,
+use std::fmt;
+
+use ruddy::{
+    bundle,
+    parse::{
+        Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
+        ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
+        When,
+    },
+    tracking::FileID,
 };
 
 use crate::{
@@ -15,36 +22,137 @@ use crate::{
 };
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
-    let Some(stmts) = cx.stmts else {
+    let Some(loaded) = cx.bundle else {
         return crate::stage::skipped(spec, "parsing did not run");
     };
 
+    // One row per file, holding the statements written in *that* file. The tree
+    // the loader hands over is spliced — a file module's body sits under the
+    // declaration that named it — so a module whose body came from elsewhere is
+    // rendered as the leaf it was written as, and its statements appear under
+    // their own file instead. Nesting them twice would show the reader one
+    // program in two places.
     let mut ids = Ids::default();
-    let nodes: Vec<Node> = stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)).collect();
-
-    let (lets, types, effects) =
-        stmts
-            .iter()
-            .fold((0, 0, 0), |(l, t, e), stmt| match stmt.tracked {
-                StmtKind::Let { .. } => (l + 1, t, e),
-                StmtKind::Type { .. } => (l, t + 1, e),
-                StmtKind::Effect { .. } => (l, t, e + 1),
-            });
+    let mut counts = Counts::default();
+    let nodes: Vec<Node> = loaded
+        .loaded
+        .iter()
+        .enumerate()
+        .map(|(at, file)| {
+            let stmts = written_in(&loaded.stmts, file.id);
+            for stmt in &stmts {
+                counts.add(&stmt.tracked);
+            }
+            // The header belongs to the root file and to no other, which is the
+            // one thing the root's row has that the rest have not.
+            let header = match at {
+                0 => header_node(&mut ids, loaded),
+                _ => None,
+            };
+            Node::new(ids.next(), "File", file.path.clone())
+                .children(header)
+                .children(stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)))
+        })
+        .collect();
 
     Stage {
         micros: Some(cx.micros.parse),
         nodes,
-        debug: format!("{stmts:#?}"),
-        ..spec.stage(
-            cx.status(),
-            format!("{effects} effect · {types} type · {lets} let"),
+        debug: format!("{:#?}", loaded.stmts),
+        ..spec.stage(cx.status(), counts.to_string())
+    }
+}
+
+/// How many of each kind of declaration a file holds, for the pane bar.
+#[derive(Default)]
+struct Counts {
+    lets: usize,
+    types: usize,
+    effects: usize,
+    modules: usize,
+}
+
+impl Counts {
+    fn add(&mut self, stmt: &StmtKind) {
+        match stmt {
+            StmtKind::Let { .. } => self.lets += 1,
+            StmtKind::Type { .. } => self.types += 1,
+            StmtKind::Effect { .. } => self.effects += 1,
+            StmtKind::Module { .. } => self.modules += 1,
+        }
+    }
+}
+
+impl fmt::Display for Counts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} module · {} effect · {} type · {} let",
+            self.modules, self.effects, self.types, self.lets
         )
     }
+}
+
+/// The statements of one file, gathered out of the spliced tree.
+///
+/// A file's statements are the ones its own spans cover, so the walk descends
+/// through a module only while it stays in the same file and stops at the seam
+/// where another file's body was spliced in.
+fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
+    fn walk<'a>(stmts: &'a [Stmt], file: FileID, out: &mut Vec<&'a Stmt>) {
+        for stmt in stmts {
+            if stmt.span.file_id == file {
+                out.push(stmt);
+                continue;
+            }
+            if let StmtKind::Module {
+                body: Some(body), ..
+            } = &stmt.tracked
+            {
+                walk(body, file, out);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(stmts, file, &mut found);
+    found
+}
+
+/// The `bundle` header, when the root file declared one the loader could use.
+///
+/// Read off the loaded identity rather than off a statement, because the header
+/// is not one: it is the file's own first line, and there is no node in the
+/// statement list for it to be.
+fn header_node(ids: &mut Ids, loaded: &bundle::Output) -> Option<Node> {
+    let bundle = loaded.bundle.as_ref()?;
+    Some(Node::new(
+        ids.next(),
+        "Bundle",
+        format!("bundle {} {}", bundle.name(), bundle.version()),
+    ))
 }
 
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
     let node = Node::new(ids.next(), "", print::ast::stmt(&stmt.tracked).to_string()).at(stmt.span);
     match &stmt.tracked {
+        // A module's own row is its name and, when the body was written inline,
+        // the statements in it. A body that came from another file is left to
+        // that file's own row; see [`written_in`].
+        StmtKind::Module { name, body } => {
+            let mut module = Node {
+                label: "Module".into(),
+                ..node
+            }
+            .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
+            let inline = body
+                .iter()
+                .flatten()
+                .filter(|stmt| stmt.span.file_id == name.span.file_id);
+            for stmt in inline {
+                module = module.child(stmt_node(ids, stmt));
+            }
+            module
+        }
         StmtKind::Let { pattern, ty, body } => {
             let mut let_node = Node {
                 label: "Let".into(),
@@ -90,13 +198,13 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
                 let row = match case {
                     EffectCase::Operation { signature } => Node::new(
                         ids.next(),
-                        format!("{}:", op.tracked),
+                        format!("{}:", op.name.tracked),
                         print::ast::ty(&signature.tracked).to_string(),
                     )
-                    .at(op.span)
+                    .at(op.span())
                     .child(type_node(ids, signature)),
                     EffectCase::Alias => {
-                        Node::new(ids.next(), "Names", format!("!{}", op.tracked)).at(op.span)
+                        Node::new(ids.next(), "Names", print::ast::effect(op)).at(op.span())
                     }
                 };
                 effect_node = effect_node.child(row);
@@ -217,8 +325,8 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             for arm in arms {
                 let (label, at) = match &arm.head {
                     ArmHead::Operation { effect, op } => (
-                        format!("!{}.{}", effect.tracked, op.tracked),
-                        effect.span.merge(op.span),
+                        format!("{}.{}", print::ast::effect(effect), op.tracked),
+                        effect.span().merge(op.span),
                     ),
                     ArmHead::Return { span } => ("return".to_string(), *span),
                 };
@@ -246,12 +354,12 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "Operation".into(),
             ..node
         }
-        .at(effect.span.merge(op.span)),
+        .at(effect.span().merge(op.span)),
         ExprKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node
         }
-        .at(name.span),
+        .at(name.span()),
         ExprKind::Natural(_) => Node {
             label: "Natural".into(),
             ..node
@@ -413,16 +521,19 @@ fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
                 let mark = when_text(when);
                 Node::new(
                     ids.next(),
-                    format!("!{}{mark}", name.tracked),
+                    format!("{}{mark}", print::ast::effect(name)),
                     String::new(),
                 )
-                .at(name.span)
+                .at(name.span())
             }
             // The absent effect is a leaf wearing the `\`, spanning the whole
             // `\!Name` — the struct's absent field again.
-            EffectLabel::Absent => {
-                Node::new(ids.next(), format!("\\!{}", name.tracked), String::new()).at(name.span)
-            }
+            EffectLabel::Absent => Node::new(
+                ids.next(),
+                format!("\\{}", print::ast::effect(name)),
+                String::new(),
+            )
+            .at(name.span()),
         })
         .collect();
     if let Some(tail) = &effects.tail {
@@ -536,7 +647,7 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             label: "Ident".into(),
             ..node
         }
-        .at(name.span),
+        .at(name.span()),
         // A variable of the annotation around it: a leaf, spanned at the whole
         // `'a` — the sigil is part of the lexeme a reader selects.
         TypeKind::Variable { name } => Node {

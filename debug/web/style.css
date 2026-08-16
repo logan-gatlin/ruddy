@@ -155,17 +155,15 @@ input {
   border-color: var(--symbol);
 }
 
+/* Read-only: what the root file's header says, reported rather than offered.
+   A bundle with no usable header still compiles, under a fallback identity, so
+   that reads as absence rather than as an error. */
 .bundle {
-  cursor: text;
+  cursor: default;
 }
-.bundle input {
-  border: 0;
-  background: transparent;
-  outline: none;
-  padding: 0;
-}
-.bundle .at {
+.bundle.none {
   color: var(--fg-faint);
+  font-style: italic;
 }
 
 .timings {
@@ -193,8 +191,17 @@ input {
   width: 46%;
   min-width: 220px;
   display: flex;
+  /* The file strip above, the editor below: a bundle is several files and the
+     editor holds one of them, so which one has to be on screen next to it. */
+  flex-direction: column;
   min-height: 0;
   background: var(--bg);
+}
+
+#editor-host {
+  display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
 #drag {
@@ -213,6 +220,93 @@ input {
   flex-direction: column;
   min-width: 0;
   border-left: 1px solid var(--line);
+}
+
+/* ── the file strip ────────────────────────────────────────────────────────
+   One tab per file of the bundle, in load order, with the root first. The
+   tabs are the same chips the panel bar uses, because they do the same job:
+   pick one of several things to look at. */
+
+.files {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 26px;
+  padding: 0 6px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.files::-webkit-scrollbar {
+  display: none;
+}
+
+.ftab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  height: 19px;
+  padding: 0 4px 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--bg-raised);
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.ftab:hover {
+  color: var(--fg);
+  border-color: var(--fg-faint);
+}
+.ftab.on {
+  color: var(--fg);
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.ftab.add {
+  padding: 0 7px;
+  color: var(--fg-faint);
+}
+
+/* Rename and delete stay out of the way until the tab is pointed at: they are
+   two characters wide, and on eight tabs at once they would read as the strip
+   rather than as what one tab can do. The tab on screen keeps them, since that
+   is the one a hand is already on. */
+.ftab .act {
+  color: transparent;
+  font-size: 0.85em;
+}
+.ftab:hover .act,
+.ftab.on .act {
+  color: var(--fg-faint);
+}
+.ftab .act:hover {
+  color: var(--fg);
+}
+.ftab .act[data-act="delete"]:hover {
+  color: var(--error);
+}
+
+/* Renaming happens where the name is. The box is the tab, so nothing moves
+   between reading the name and typing over it. */
+.ftab.editing {
+  padding: 0;
+  border-color: var(--accent);
+}
+.fname {
+  height: 17px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  outline: none;
+}
+.fname.bad {
+  color: var(--error);
 }
 
 /* ── editor ────────────────────────────────────────────────────────────── */
@@ -653,6 +747,12 @@ pre.raw .hi {
 .diag-row .code {
   color: var(--fg-faint);
   flex: none;
+}
+/* The file a diagnostic is in, shown only when it is not the one in the editor:
+   in the accent, because it is the one part of the row that says "this is
+   somewhere else". */
+.diag-row .file {
+  color: var(--accent);
 }
 .diag-row .rel {
   color: var(--fg-faint);

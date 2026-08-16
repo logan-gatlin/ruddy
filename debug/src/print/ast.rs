@@ -11,13 +11,13 @@ use indexmap::IndexMap;
 use ruddy::{
     parse::{
         Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
-        ExprKind, HandlerArm, Rest, StmtKind, SumCase, TypeField, TypeKind, When, Where,
+        ExprKind, HandlerArm, Path, Rest, StmtKind, SumCase, TypeField, TypeKind, When, Where,
     },
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_effects, write_let,
+    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow, write_let,
     write_match, write_project, write_row, write_struct, write_sum, write_tag,
 };
 
@@ -95,6 +95,20 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 }
                 write!(f, " = {}", Ast(&body.tracked.tracked))
             }
+            // A module written inline, with its own statements between the `=`
+            // and the `end`; one whose body is another file has nothing after
+            // the name, which is exactly how it was written.
+            StmtKind::Module { name, body } => {
+                write!(f, "module {}", name.tracked)?;
+                let Some(body) = body else {
+                    return Ok(());
+                };
+                f.write_str(" =")?;
+                for stmt in body {
+                    write!(f, " {}", Ast(&stmt.tracked))?;
+                }
+                f.write_str(" end")
+            }
             StmtKind::Type { name, params, body } => {
                 write!(f, "type {}", name.tracked)?;
                 for param in params {
@@ -119,10 +133,10 @@ impl fmt::Display for Ast<'_, StmtKind> {
                         // alias is the effect it names, unioned onto the last
                         // with the `+` a row writes.
                         EffectCase::Operation { signature } => {
-                            write!(f, " | {} : {}", name.tracked, Ast(&signature.tracked))?
+                            write!(f, " | {} : {}", name.name.tracked, Ast(&signature.tracked))?
                         }
-                        EffectCase::Alias if at == 0 => write!(f, " !{}", name.tracked)?,
-                        EffectCase::Alias => write!(f, " + !{}", name.tracked)?,
+                        EffectCase::Alias if at == 0 => write!(f, " {}", labelled(name))?,
+                        EffectCase::Alias => write!(f, " + {}", labelled(name))?,
                     }
                 }
                 Ok(())
@@ -170,6 +184,25 @@ impl fmt::Display for Ast<'_, Where> {
         }
         Ok(())
     }
+}
+
+/// One effect label as it was written: the modules it is reached through, then
+/// the `!` and the name.
+///
+/// The sigil sits on the label rather than in front of the path, which is what
+/// `Sys::!Log` says: the path qualifies the whole sigilled label, and a printer
+/// that wrote `!Sys::Log` would be showing a spelling the source cannot use.
+/// Every position that writes one goes through here — a row's labels, an
+/// alias's cases, an operation, and a handler arm's head — so the four cannot
+/// spell the same effect four ways.
+fn labelled(path: &Path) -> String {
+    let mut out = String::new();
+    for module in &path.modules {
+        out.push_str(&module.tracked);
+        out.push_str("::");
+    }
+    out.push_str(&label(Shape::Effect, &path.name.tracked));
+    out
 }
 
 /// What follows a `..`, as it was written: a variable with its sigil, or
@@ -302,9 +335,9 @@ impl fmt::Display for Ast<'_, ExprKind> {
             }
             ExprKind::Raise(value) => write!(f, "raise {}", Ast(&value.tracked)),
             ExprKind::Operation { effect, op } => {
-                write!(f, "!{}.{}", effect.tracked, op.tracked)
+                write!(f, "{}.{}", labelled(effect), op.tracked)
             }
-            ExprKind::Ident { name } => f.write_str(&name.tracked),
+            ExprKind::Ident { name } => write!(f, "{name}"),
             ExprKind::Natural(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
         }
@@ -372,7 +405,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 Ast(&head.tracked),
                 args.iter().map(|arg| Ast(&arg.tracked)),
             ),
-            TypeKind::Ident { name } => f.write_str(&name.tracked),
+            TypeKind::Ident { name } => write!(f, "{name}"),
             // The sigil is written back on: it is how the name was spelled, and
             // a variable printing bare would come back as a type's name.
             TypeKind::Variable { name } => write!(f, "'{}", name.tracked),
@@ -401,7 +434,7 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
 fn write_arm(f: &mut fmt::Formatter<'_>, arm: &HandlerArm) -> fmt::Result {
     f.write_str(" | ")?;
     match &arm.head {
-        ArmHead::Operation { effect, op } => write!(f, "!{}.{}", effect.tracked, op.tracked)?,
+        ArmHead::Operation { effect, op } => write!(f, "{}.{}", labelled(effect), op.tracked)?,
         ArmHead::Return { .. } => f.write_str("return")?,
     }
     let binder = match &arm.binder.tracked {
@@ -423,12 +456,12 @@ fn effect_row(row: &EffectRow) -> Effects {
         .iter()
         .map(|(name, label)| match label {
             EffectLabel::Written { when } => Entry::Written {
-                name: name.tracked.clone(),
+                name: labelled(name),
                 mark: mark(when),
                 holds: (),
             },
             EffectLabel::Absent => Entry::Absent {
-                name: name.tracked.clone(),
+                name: labelled(name),
             },
         })
         .collect();
@@ -440,42 +473,65 @@ fn effect_row(row: &EffectRow) -> Effects {
 /// something that prints itself. The entries have to be owned rather than
 /// borrowed: the row is written *after* the result type, so the iterator would
 /// have to outlive the borrow of the arrow it came from.
+///
+/// Each name is the whole written label, sigil and path alike; see
+/// [`Display for Effects`](Effects).
 struct Effects {
     effects: Vec<Entry<String, ()>>,
     tail: Option<String>,
 }
 
+/// A written row, spelled here rather than by [`write_effects`].
+///
+/// The one place the two printers part company, and only over where the sigil
+/// goes. The compiler's writer puts the `!` in front of the name it is handed,
+/// which is right for every row it ever prints: a semantic row is keyed by the
+/// name an effect was *declared* under, and a declared name has no path in it.
+/// A written one does — `Sys::!Log` qualifies the whole sigilled label — and
+/// `!Sys::Log` is not a spelling the source can use, so a printed row would not
+/// read back as the one it came from.
+///
+/// What the two still share is the label itself: each goes through
+/// [`label`](ruddy::ui::label), so the sigil this row wears and the sigil a
+/// complaint about the same effect quotes cannot drift apart.
 impl fmt::Display for Effects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let effects: Vec<Entry<&str, ()>> = self
-            .effects
-            .iter()
-            .map(|entry| match entry {
-                Entry::Written { name, mark, .. } => Entry::Written {
-                    name: name.as_str(),
-                    mark: mark.as_ref().map(clone_mark),
-                    holds: (),
-                },
-                Entry::Absent { name } => Entry::Absent {
-                    name: name.as_str(),
-                },
-            })
-            .collect();
-        write_effects(
-            f,
-            &effects,
-            self.tail.as_ref().map(|tail| tail as &dyn fmt::Display),
-        )
-    }
-}
-
-/// One presence mark, copied. [`Mark`] is a compiler type and carries no
-/// `Clone`, so the debugger makes its own — one line, and the alternative is
-/// borrowing a row that has already gone out of scope.
-fn clone_mark(mark: &Mark) -> Mark {
-    match mark {
-        Mark::Undecided => Mark::Undecided,
-        Mark::When(name) => Mark::When(name.clone()),
+        let mut first = true;
+        for effect in &self.effects {
+            if !first {
+                f.write_str(" + ")?;
+            }
+            first = false;
+            match effect {
+                Entry::Written { name, mark, .. } => {
+                    f.write_str(name)?;
+                    match mark {
+                        // The `?` no syntax reads. Nothing in a parse tree is
+                        // ever one — only a failed inference produces it — so
+                        // this arm is here to keep the two writers the same
+                        // shape rather than because a row can reach it.
+                        Some(Mark::Undecided) => f.write_str("?")?,
+                        // Parenthesized for the reason a sum case's is: an
+                        // effect has no colon to end a bare clause.
+                        Some(Mark::When(name_of)) => write!(f, " (when {name_of})")?,
+                        None => {}
+                    }
+                }
+                Entry::Absent { name } => write!(f, "\\{name}")?,
+            }
+        }
+        match &self.tail {
+            Some(tail) => {
+                if !first {
+                    f.write_str(" + ")?;
+                }
+                write!(f, "..{tail}")
+            }
+            // The empty row, which a reader only reaches by writing `+ |` and
+            // meaning it: the row that allows nothing at all.
+            None if first => f.write_str("|"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -494,6 +550,13 @@ pub fn expr(kind: &ExprKind) -> impl fmt::Display + '_ {
 /// beside an annotation.
 pub fn clause(kind: &ClauseKind) -> impl fmt::Display + '_ {
     Ast(kind)
+}
+
+/// Render one effect label as it was written — `!Log`, or `Sys::!Log` for one
+/// reached through a module. The AST tab shows labels in rows of its own, and
+/// this is what keeps them spelled the way the printed tree spells them.
+pub fn effect(path: &Path) -> String {
+    labelled(path)
 }
 
 /// Render one written type, the [`expr`] counterpart.
