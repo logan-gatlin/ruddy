@@ -1,0 +1,178 @@
+================================================================================
+An arrow carries the effects calling it may perform
+================================================================================
+
+let greet : () -> Nat + !Log = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (unit)
+        (identifier)
+        (effect_row
+          (effect_case
+            (effect_label)))))
+    (identifier)))
+
+================================================================================
+The row binds to the innermost arrow
+================================================================================
+
+let a : A -> B -> C + !Log = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (identifier)
+        (function_type
+          (identifier)
+          (identifier)
+          (effect_row
+            (effect_case
+              (effect_label))))))
+    (identifier)))
+
+================================================================================
+Parentheses put the row on the outer arrow
+================================================================================
+
+let a : A -> (B -> C) + !Log = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (identifier)
+        (parenthesized_type
+          (function_type
+            (identifier)
+            (identifier)))
+        (effect_row
+          (effect_case
+            (effect_label)))))
+    (identifier)))
+
+================================================================================
+The empty row is written out
+================================================================================
+
+let pure : Nat -> Nat + | = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (identifier)
+        (identifier)
+        (effect_row)))
+    (identifier)))
+
+================================================================================
+A row's rest is handed on
+================================================================================
+
+let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g n => g n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (parenthesized_type
+          (function_type
+            (identifier)
+            (identifier)
+            (effect_row
+              (rest
+                (type_variable)))))
+        (function_type
+          (identifier)
+          (identifier)
+          (effect_row
+            (rest
+              (type_variable))))))
+    (function
+      (identifier)
+      (identifier)
+      (application
+        (identifier)
+        (identifier)))))
+
+================================================================================
+An effect written absent, and one whose presence a when clause names
+================================================================================
+
+let a : Nat -> Nat + \!Log + !IO (when 'p) = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (identifier)
+        (identifier)
+        (effect_row
+          (absent_effect
+            (effect_label))
+          (effect_case
+            (effect_label)
+            (parenthesized_when
+              (when_clause
+                (type_variable)))))))
+    (identifier)))
+
+================================================================================
+A row written where a type goes
+================================================================================
+
+let consoled : Runner (!Log + !IO) -> Nat = f
+
+let rested : Runner (..'e) -> Nat = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (type_application
+          (identifier)
+          (parenthesized_type
+            (effect_type
+              (effect_case
+                (effect_label))
+              (effect_case
+                (effect_label)))))
+        (identifier)))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (type_application
+          (identifier)
+          (parenthesized_type
+            (effect_type
+              (rest
+                (type_variable)))))
+        (identifier)))
+    (identifier)))

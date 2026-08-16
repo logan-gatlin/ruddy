@@ -1,0 +1,203 @@
+================================================================================
+The arrow is right-associative and everything else binds tighter
+================================================================================
+
+let a : Pair Nat Nat -> Nat -> Nat = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (type_application
+          (identifier)
+          (identifier)
+          (identifier))
+        (function_type
+          (identifier)
+          (identifier))))
+    (identifier)))
+
+================================================================================
+A struct type, with a when clause, an absent field and a tail
+================================================================================
+
+let a : { x: Nat, y when 'p: Nat, \z, ..'r } -> Nat = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (identifier))
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (type_variable))
+            (identifier))
+          (absent_field
+            (identifier))
+          (rest
+            (type_variable)))
+        (identifier)))
+    (identifier)))
+
+================================================================================
+A tail names a declaration's parameter
+================================================================================
+
+type Tagged r = { tag: Nat, ..r }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (identifier)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (identifier)
+          (identifier))
+        (rest
+          (identifier))))))
+
+================================================================================
+A sum type, with an optional leading bar
+================================================================================
+
+type Option T = #Some T | #None
+
+type Tree a = | #Leaf | #Branch { value: a }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)
+          (identifier))
+        (sum_case
+          (tag)))))
+  (type_definition
+    (identifier)
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag))
+        (sum_case
+          (tag)
+          (struct_type
+            (struct_type_field
+              (identifier)
+              (identifier))))))))
+
+================================================================================
+The empty sum is written with nothing but punctuation
+================================================================================
+
+type Void = |
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type))))
+
+================================================================================
+A sum's when clause takes parentheses, and a case may be absent
+================================================================================
+
+type Narrow = #A (when 'p) Nat | \#B | ..'r
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)
+          (parenthesized_when
+            (when_clause
+              (type_variable)))
+          (identifier))
+        (absent_case
+          (tag))
+        (rest
+          (type_variable))))))
+
+================================================================================
+A case carries one atom
+================================================================================
+
+type Carried = #Some (Pair A B) | #Other Nat
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)
+          (parenthesized_type
+            (type_application
+              (identifier)
+              (identifier)
+              (identifier))))
+        (sum_case
+          (tag)
+          (identifier))))))
+
+================================================================================
+The hole is a position left for inference to decide
+================================================================================
+
+let a : _ -> Nat = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (hole)
+        (identifier)))
+    (identifier)))
+
+================================================================================
+A variable needs no declaration
+================================================================================
+
+let identical : 'a -> 'a = fn x => x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (type_variable)
+        (type_variable)))
+    (function
+      (identifier)
+      (identifier))))

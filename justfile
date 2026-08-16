@@ -57,6 +57,71 @@ debug *args:
 demo:
     cargo run --quiet
 
+# Regenerate the tree-sitter parser and run its corpus tests.
+grammar *args:
+    #!/usr/bin/env bash
+    # Needs npm; the CLI installs into `treesitter/node_modules`.
+    set -euo pipefail
+    cd "{{justfile_directory()}}/treesitter"
+    [ -x node_modules/.bin/tree-sitter ] || npm install --silent --no-audit --no-fund
+    node_modules/.bin/tree-sitter generate
+    node_modules/.bin/tree-sitter test {{args}}
+
+# Install the grammar and its highlights into the local Helix configuration.
+helix:
+    #!/usr/bin/env bash
+    # The parser as the shared object Helix loads a grammar by, the queries
+    # beside it, and the language entry appended to `languages.toml` when it is
+    # not already there. The parser installed is the generated one in the tree,
+    # so run `just grammar` first if `treesitter/grammar.js` has moved on.
+    set -euo pipefail
+    grammar="{{justfile_directory()}}/treesitter"
+    config="${XDG_CONFIG_HOME:-$HOME/.config}/helix"
+    runtime="$config/runtime"
+    languages="$config/languages.toml"
+
+    if [ ! -f "$grammar/src/parser.c" ]; then
+        echo "no generated parser; run 'just grammar' first" >&2
+        exit 1
+    fi
+
+    mkdir -p "$runtime/grammars" "$runtime/queries/ruddy"
+
+    # What `hx --grammar build` does, minus the fetch: one translation unit,
+    # no external scanner, under the name the language entry asks for.
+    cc -O2 -fPIC -shared -I "$grammar/src" \
+        -o "$runtime/grammars/ruddy.so" "$grammar/src/parser.c"
+    echo "built $runtime/grammars/ruddy.so"
+
+    cp "$grammar"/queries/*.scm "$runtime/queries/ruddy/"
+    echo "copied $(ls "$grammar"/queries/*.scm | wc -l) queries to $runtime/queries/ruddy"
+
+    # Appended rather than written: `languages.toml` is the editor's own file
+    # and everything else in it is somebody else's language.
+    if grep -qs 'name = "ruddy"' "$languages"; then
+        echo "$languages already names ruddy — left as it is"
+    else
+        # Indented to the recipe's own margin, which `just` strips before bash
+        # ever sees it, so what lands in the file starts at the left.
+        cat >> "$languages" <<EOF
+
+    [[language]]
+    name = "ruddy"
+    scope = "source.ruddy"
+    injection-regex = "ruddy"
+    file-types = ["hc"]
+    indent = { tab-width = 2, unit = "  " }
+    grammar = "ruddy"
+
+    [[grammar]]
+    name = "ruddy"
+    source = { path = "$grammar" }
+    EOF
+        echo "appended the ruddy language to $languages"
+    fi
+
+    echo "open a .hc file, or check with: hx --health ruddy"
+
 # Everything CI would run.
 check: fmt-check clippy test
 

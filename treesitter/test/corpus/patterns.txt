@@ -1,0 +1,130 @@
+================================================================================
+The shapes a value may be taken apart as
+================================================================================
+
+let a = match v with
+  | x => 0
+  | _ => 0
+  | 1 => 0
+  | () => 0
+  | (y) => 0
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (identifier)
+        (natural))
+      (match_arm
+        (wildcard)
+        (natural))
+      (match_arm
+        (natural)
+        (natural))
+      (match_arm
+        (unit)
+        (natural))
+      (match_arm
+        (parenthesized_pattern
+          (identifier))
+        (natural)))))
+
+================================================================================
+A struct pattern puns a bare field name
+================================================================================
+
+let a = match v with
+  | { x, y: inner } => x
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (struct_pattern
+          (struct_pattern_field
+            (identifier))
+          (struct_pattern_field
+            (identifier)
+            (identifier)))
+        (identifier)))))
+
+================================================================================
+A struct pattern written open matches at least its fields
+================================================================================
+
+let a = match v with
+  | { x, .. } => x
+  | { .. } => 0
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (struct_pattern
+          (struct_pattern_field
+            (identifier))
+          (rest_pattern))
+        (identifier))
+      (match_arm
+        (struct_pattern
+          (rest_pattern))
+        (natural)))))
+
+================================================================================
+A tag pattern's payload is taken greedily
+================================================================================
+
+let a = match v with
+  | #A #B x => x
+  | #None => 0
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (tag_pattern
+          (tag)
+          (tag_pattern
+            (tag)
+            (identifier)))
+        (identifier))
+      (match_arm
+        (tag_pattern
+          (tag))
+        (natural)))))
+
+================================================================================
+A function header takes names and the discard
+================================================================================
+
+let konst = fn x _ => x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (wildcard)
+      (identifier))))
