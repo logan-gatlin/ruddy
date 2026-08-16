@@ -64,7 +64,7 @@ A declaration, with and without parameters
 
 type Boxed = { value: Nat }
 
-type Pair A B = { first: A, second: B }
+type Pair 'A 'B = { first: 'A, second: 'B }
 
 --------------------------------------------------------------------------------
 
@@ -78,16 +78,16 @@ type Pair A B = { first: A, second: B }
           (identifier)))))
   (type_definition
     (identifier)
-    (identifier)
-    (identifier)
+    (type_variable)
+    (type_variable)
     (annotation
       (struct_type
         (struct_type_field
           (identifier)
-          (identifier))
+          (type_variable))
         (struct_type_field
           (identifier)
-          (identifier))))))
+          (type_variable))))))
 
 ================================================================================
 An effect declaring its operations

@@ -98,7 +98,7 @@ impl fmt::Display for Ast<'_, StmtKind> {
             StmtKind::Type { name, params, body } => {
                 write!(f, "type {}", name.tracked)?;
                 for param in params {
-                    write!(f, " {}", param.tracked)?;
+                    write!(f, " '{}", param.tracked)?;
                 }
                 write!(f, " = {}", annotation(body))
             }
@@ -172,12 +172,11 @@ impl fmt::Display for Ast<'_, Where> {
     }
 }
 
-/// What follows a `..`, as it was written: a parameter bare, a variable with
-/// its sigil, or nothing at all for the tail that names none.
+/// What follows a `..`, as it was written: a variable with its sigil, or
+/// nothing at all for the tail that names none.
 fn rest(of: &Rest) -> String {
     match of {
         Rest::Anything => String::new(),
-        Rest::Param(name) => name.tracked.clone(),
         Rest::Variable(name) => format!("'{}", name.tracked),
     }
 }

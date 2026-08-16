@@ -4,7 +4,10 @@
 ; a `let ... in`, a match arm and a handler arm each bind for their own body,
 ; so each of those is one too.
 
+; A `type` declaration's parameters bind for its body and nowhere else, which
+; makes the declaration a scope the way a `fn` is.
 (source_file) @local.scope
+(type_definition) @local.scope
 (function) @local.scope
 (let_expression) @local.scope
 (match_arm) @local.scope
@@ -29,6 +32,10 @@
 ; ── what a name may resolve to ───────────────────────────────────────────────
 
 (type_definition name: (identifier) @local.definition.type)
-(type_definition parameter: (identifier) @local.definition.type)
+(type_definition parameter: (type_variable) @local.definition.type)
 
 (identifier) @local.reference
+
+; A parameter is written `'a` wherever it is used, so a variable is a reference
+; the way a bare name is — including the `..'a` that tails a row.
+(type_variable) @local.reference

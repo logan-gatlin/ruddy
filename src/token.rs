@@ -95,16 +95,18 @@ pub enum Kind {
     /// not. An effect is written bare where it is declared, and both spellings
     /// name one symbol.
     EffectLabel(String),
-    /// `'a` — a variable of the annotation it is written in: a type this
-    /// definition's caller picks, the rest of a row, or the presence a `when`
-    /// names.
+    /// `'a` — a variable: a type this definition's caller picks, the rest of a
+    /// row, the presence a `when` names, or one of the parameters a `type`
+    /// declaration's header binds.
     ///
-    /// The third sigil, and the one that needs no declaration to go with it.
-    /// A bare name in a type is a name that has to resolve — a parameter, a
-    /// declared type, a primitive — so a variable needs a mark of its own to be
-    /// told from one, and the mark is what lets it be introduced where it is
-    /// used. Two annotations that each write `'a` write two variables; the
-    /// scope is the one annotation, which is what makes a variable unnecessary.
+    /// The third sigil, and the one thing every use of it has in common is that
+    /// something outside the type decides what it stands for. A bare name in a
+    /// type is a name that has to resolve — a declared type, a primitive — so a
+    /// variable needs a mark of its own to be told from one, and the mark is
+    /// what lets it be introduced where it is used. Two annotations that each
+    /// write `'a` write two variables; the scope is the one annotation, or the
+    /// one declaration, which is what makes a declaration statement
+    /// unnecessary.
     Variable(String),
     /// A natural number literal. Bounded by `u128` rather than unbounded like
     /// the naturals themselves; a literal that does not fit is rejected by the

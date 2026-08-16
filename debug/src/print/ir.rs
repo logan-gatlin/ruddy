@@ -147,7 +147,7 @@ impl fmt::Display for Show<'_, Program> {
             first = false;
             write!(f, "type {}", self.mint.name(*symbol))?;
             for param in &decl.params {
-                write!(f, " {}", self.mint.name(param.symbol))?;
+                write!(f, " '{}", self.mint.name(param.symbol))?;
             }
             write!(f, " = {}", self.show(&decl.value))?;
         }
@@ -387,9 +387,10 @@ impl fmt::Display for Show<'_, TypeKind> {
             // is what the reader wrote and what re-parses to the same use.
             TypeKind::Var(name) => write!(f, "'{name}"),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
-            // A parameter prints as the name it was declared with, which is
-            // what makes this printer's output match the parse tree's.
-            TypeKind::Param { symbol, .. } => f.write_str(self.mint.name(*symbol)),
+            // A parameter prints as the name it was declared with, sigil and
+            // all, which is what makes this printer's output match the parse
+            // tree's — and what makes it re-parse.
+            TypeKind::Param { symbol, .. } => write!(f, "'{}", self.mint.name(*symbol)),
             TypeKind::Apply { head, args, .. } => write_applied(
                 f,
                 self.mint.name(*head),
@@ -417,7 +418,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 let tail = tail.as_ref().map(|tail| match &tail.of {
                     Row::Anything => String::new(),
                     Row::Named(name) => format!("'{name}"),
-                    Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+                    Row::Param { symbol, .. } => format!("'{}", self.mint.name(*symbol)),
                 });
                 write_sum(
                     f,
@@ -451,7 +452,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                     Row::Named(name) => format!("'{name}"),
                     // A row parameter prints as the name it was declared with,
                     // for the reason a type parameter does.
-                    Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+                    Row::Param { symbol, .. } => format!("'{}", self.mint.name(*symbol)),
                 });
                 write_row(
                     f,
@@ -575,7 +576,7 @@ impl Show<'_, TypeKind> {
         let tail = row.tail.as_ref().map(|tail| match &tail.of {
             Row::Anything => String::new(),
             Row::Named(name) => format!("'{name}"),
-            Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
+            Row::Param { symbol, .. } => format!("'{}", self.mint.name(*symbol)),
         });
         Some(Effects { effects, tail })
     }

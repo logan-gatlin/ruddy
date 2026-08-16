@@ -296,7 +296,7 @@ fn walk(
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
     match &ty.core {
         // The arguments are walked though the body is not: a declaration
-        // reached only through one — `type Rose a = { kids: List (Rose a) }` —
+        // reached only through one — `type Rose 'a = { kids: List (Rose 'a) }` —
         // is mentioned just as much as one written bare, and a row that missed
         // it would not show as recursive.
         Core::Named { symbol, args, .. } => {

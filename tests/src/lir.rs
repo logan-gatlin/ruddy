@@ -688,7 +688,7 @@ fn an_empty_program_lowers_to_an_empty_output() {
 fn a_declared_sums_cases_are_flattened_before_dispatch() {
     assert_eq!(
         section(
-            "type Fallible r = #Err Nat | ..r\n\
+            "type Fallible 'r = #Err Nat | ..'r\n\
              let h : Fallible (#Ok Nat) -> Nat =\n\
                fn t => match t with | #Err n => n | #Ok n => n end",
             "fn h("
@@ -1638,7 +1638,7 @@ fn a_number_written_twice_in_one_column_is_one_case() {
 fn a_case_the_type_proves_absent_leaves_nothing_over() {
     assert_eq!(
         section(
-            "type T r = #A Nat | \\#B | ..r\n\
+            "type T 'r = #A Nat | \\#B | ..'r\n\
              let f : T (#C Nat) -> Nat = fn v => match v with | #A n => n | #C n => n end",
             "fn f("
         ),

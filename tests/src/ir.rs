@@ -733,7 +733,6 @@ fn a_declared_type_must_be_closed() {
     // refused, and the struct that carried it lowers to the error type.
     for src in [
         "type T = { x: Nat, .. }",
-        "type T = { x: Nat, ..r }",
         "type T = { x when 'a: Nat }",
         "type T = { a: { b: Nat, .. } }",
     ] {
@@ -792,7 +791,7 @@ fn repeated_names_in_sibling_structs_are_fine() {
 /// which is what unfolding later hands an argument to.
 #[test]
 fn a_declaration_binds_its_parameters() {
-    let (_, out) = built("type Pair A B = { a: A, b: B }");
+    let (_, out) = built("type Pair 'A 'B = { a: 'A, b: 'B }");
     let decl = out.program.types.values().next().expect("one declaration");
     assert_eq!(decl.params.len(), 2);
 
@@ -813,7 +812,7 @@ fn a_declaration_binds_its_parameters() {
 /// somewhere 'else is undefined rather than a reference to it.
 #[test]
 fn a_parameter_is_out_of_scope_outside_its_declaration() {
-    let (_, out) = build_src("type Pair A B = { a: A, b: B }  type Other = A");
+    let (_, out) = build_src("type Pair 'A 'B = { a: 'A, b: 'B }  type Other = A");
     assert_eq!(
         out.errors
             .iter()
@@ -834,7 +833,7 @@ fn a_parameter_is_out_of_scope_outside_its_declaration() {
 /// body. That is what a scope is for, so it is not a repeat.
 #[test]
 fn a_parameter_shadows_a_declared_type() {
-    let (_, out) = built("type Nat = { n: Nat }  type Box Nat = { it: Nat }");
+    let (_, out) = built("type Nat = { n: Nat }  type Box 'Nat = { it: 'Nat }");
     let boxed = out
         .program
         .types
@@ -856,13 +855,17 @@ fn a_parameter_shadows_a_declared_type() {
 #[test]
 fn a_type_takes_the_arguments_it_declares() {
     for (src, expected, found) in [
-        ("type Pair A B = { a: A, b: B }  type M = Pair Nat", 2, 1),
         (
-            "type Pair A B = { a: A, b: B }  type M = Pair Nat Nat Nat",
+            "type Pair 'A 'B = { a: 'A, b: 'B }  type M = Pair Nat",
+            2,
+            1,
+        ),
+        (
+            "type Pair 'A 'B = { a: 'A, b: 'B }  type M = Pair Nat Nat Nat",
             2,
             3,
         ),
-        ("type Pair A B = { a: A, b: B }  type M = Pair", 2, 0),
+        ("type Pair 'A 'B = { a: 'A, b: 'B }  type M = Pair", 2, 0),
         ("type T = Nat  type M = T Nat", 0, 1),
     ] {
         let (_, out) = build_src(src);
@@ -912,11 +915,11 @@ fn a_head_that_cannot_be_applied_is_still_lowered() {
 #[test]
 fn errors_are_reported_in_source_order() {
     for src in [
-        "type W r = { x: Nat, ..r }\nlet a : W Nat -> Nat = fn v => 1\nlet b = nosuchname",
-        "type W r = { x: Nat, ..r }\nlet a = nosuchname\nlet b : W Nat -> Nat = fn v => 1",
+        "type W 'r = { x: Nat, ..'r }\nlet a : W Nat -> Nat = fn v => 1\nlet b = nosuchname",
+        "type W 'r = { x: Nat, ..'r }\nlet a = nosuchname\nlet b : W Nat -> Nat = fn v => 1",
         "let f : { x: Bogus } Nat = 1",
-        "type Bad a = { x: a, ..a }\nlet c = alsomissing",
-        "type L a = { next: L { x: a } }\nlet d = missing",
+        "type Bad 'a = { x: 'a, ..'a }\nlet c = alsomissing",
+        "type L 'a = { next: L { x: 'a } }\nlet d = missing",
     ] {
         let (_, out) = build_src(src);
         let offsets: Vec<usize> = out.errors.iter().map(|error| error.span.start).collect();
@@ -965,7 +968,7 @@ fn only_a_declared_type_can_be_applied() {
 /// *are* about the name.
 #[test]
 fn a_wrong_argument_count_underlines_the_whole_application() {
-    let src = "type Pair a b = { f: a, s: b }  let p: Pair Nat Nat Nat = 1";
+    let src = "type Pair 'a 'b = { f: 'a, s: 'b }  let p: Pair Nat Nat Nat = 1";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::Arity { .. }));
@@ -986,9 +989,9 @@ fn separate_recursive_groups_do_not_restrict_each_other() {
     // own parameter; neither is the other's business, and the declaration that
     // merely leads into one belongs to no group at all.
     let (_, out) = build_src(
-        "type A a = { x: B a }  type B b = { x: A b }  \
-         type C c = { x: D { y: c } }  type D d = { x: C d }  \
-         type E e = { x: A e }",
+        "type A 'a = { x: B 'a }  type B 'b = { x: A 'b }  \
+         type C 'c = { x: D { y: 'c } }  type D 'd = { x: C 'd }  \
+         type E 'e = { x: A 'e }",
     );
     let offenders: Vec<usize> = out
         .errors
@@ -1004,7 +1007,7 @@ fn separate_recursive_groups_do_not_restrict_each_other() {
 /// of its own. Refusing this is what keeps the language free of higher kinds.
 #[test]
 fn a_parameter_may_not_be_applied() {
-    let (_, out) = build_src("type Flip f a = f a");
+    let (_, out) = build_src("type Flip 'f 'a = 'f 'a");
     assert!(
         out.errors
             .iter()
@@ -1016,7 +1019,7 @@ fn a_parameter_may_not_be_applied() {
 
 #[test]
 fn a_declaration_binds_each_parameter_once() {
-    let (_, out) = build_src("type Pair A A = { a: A }");
+    let (_, out) = build_src("type Pair 'A 'A = { a: 'A }");
     assert!(
         out.errors
             .iter()
@@ -1031,7 +1034,7 @@ fn a_declaration_binds_each_parameter_once() {
 /// that was written asked for an argument no body could name.
 #[test]
 fn a_repeated_parameter_is_not_counted_twice() {
-    let (mint, out) = build_src("type P A A = { x: A }  let v : P Nat = { x: 1 }");
+    let (mint, out) = build_src("type P 'A 'A = { x: 'A }  let v : P Nat = { x: 1 }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
@@ -1047,7 +1050,7 @@ fn a_repeated_parameter_is_not_counted_twice() {
 /// does. A body that is a parameter is not the same thing: it says its argument.
 #[test]
 fn a_type_defined_only_as_another_name_is_still_circular() {
-    let (_, out) = build_src("type A a = B a  type B b = A b");
+    let (_, out) = build_src("type A 'a = B 'a  type B 'b = A 'b");
     assert!(
         out.errors
             .iter()
@@ -1057,7 +1060,7 @@ fn a_type_defined_only_as_another_name_is_still_circular() {
     );
 
     // The identity constructor: useless, but it says what its argument is.
-    let (_, out) = build_src("type Id a = a");
+    let (_, out) = build_src("type Id 'a = 'a");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -1067,10 +1070,10 @@ fn a_type_defined_only_as_another_name_is_still_circular() {
 #[test]
 fn a_loop_can_close_through_a_parameter() {
     for src in [
-        "type A a = a  type B = A B",
-        "type A a = a  type B = A C  type C = A B",
+        "type A 'a = 'a  type B = A B",
+        "type A 'a = 'a  type B = A C  type C = A B",
         // The loop that goes out through an argument and comes back in.
-        "type S a = U (S a)  type U b = b",
+        "type S 'a = U (S 'a)  type U 'b = 'b",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1086,11 +1089,11 @@ fn a_loop_can_close_through_a_parameter() {
     // not following it round: each step hands back a smaller piece of what was
     // written.
     for src in [
-        "type Id a = a  type Y = Id (Id Nat)",
+        "type Id 'a = 'a  type Y = Id (Id Nat)",
         // The case a per-slot approximation reports wrongly: `Id` is handed an
         // `X` somewhere 'else, which says nothing about `X`.
-        "type Id a = a  type X = Id Nat  type Y = { f: Id X }",
-        "type G g = g  type F a = G (G a)  type H = F Nat",
+        "type Id 'a = 'a  type X = Id Nat  type Y = { f: Id X }",
+        "type G 'g = 'g  type F 'a = G (G 'a)  type H = F Nat",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -1098,7 +1101,7 @@ fn a_loop_can_close_through_a_parameter() {
 
     // Only the declarations on the loop are told; one that merely names one
     // has nothing to fix.
-    let (mint, out) = build_src("type A a = a  type B = A B  type P = B");
+    let (mint, out) = build_src("type A 'a = 'a  type B = A B  type P = B");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let b = out.program.types[&type_symbol(&mint, &out, "B")].name_span;
     assert!(out.errors[0].span.start >= b.start);
@@ -1117,46 +1120,46 @@ fn a_loop_can_close_through_a_parameter() {
 #[test]
 fn recursion_may_not_make_its_argument_bigger() {
     for src in [
-        "type List a = { head: a, tail: List a }",
+        "type List 'a = { head: 'a, tail: List 'a }",
         // Mutual recursion, each member handing on its own parameter.
-        "type Tree a = { node: a, kids: Forest a }  \
-         type Forest a = { head: Tree a, tail: Forest a }",
+        "type Tree 'a = { node: 'a, kids: Forest 'a }  \
+         type Forest 'a = { head: Tree 'a, tail: Forest 'a }",
         // A different group's argument is unrestricted: only the `Rose a`
         // inside `List` is the group's business, and it hands on `a`.
-        "type List a = { head: a, tail: List a }  \
-         type Rose a = { node: a, kids: List (Rose a) }",
+        "type List 'a = { head: 'a, tail: List 'a }  \
+         type Rose 'a = { node: 'a, kids: List (Rose 'a) }",
         // A longer circle, every member in one group.
-        "type A a = { x: B a }  type B b = { x: C b }  type C c = { x: A c }",
+        "type A 'a = { x: B 'a }  type B 'b = { x: C 'b }  type C 'c = { x: A 'c }",
         // An argument that mentions no parameter is written out in the program
         // and is the same type every round, so it cannot grow.
-        "type T a = { next: T Nat }",
-        "type Tree a = { value: a, kids: Forest }  \
+        "type T 'a = { next: T Nat }",
+        "type Tree 'a = { value: 'a, kids: Forest }  \
          type Forest = { head: Tree Nat, tail: Forest }",
         // Both at once, in one group.
-        "type T a = { next: T a, other: T Nat }",
+        "type T 'a = { next: T 'a, other: T Nat }",
         // Order and repetition are free: a permutation only ever shuffles what
         // came in.
-        "type A a b = { x: B b a }  type B c d = { x: A d c }",
+        "type A 'a 'b = { x: B 'b 'a }  type B 'c 'd = { x: A 'd 'c }",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
     }
 
     for src in [
-        "type T a = { next: T { x: a } }",
-        "type A a = { x: B { y: a } }  type B b = { x: A b }",
+        "type T 'a = { next: T { x: 'a } }",
+        "type A 'a = { x: B { y: 'a } }  type B 'b = { x: A 'b }",
         // A parameter in a `..` tail is as much a way of growing as one in a
         // field, and is the one place a parameter is not written as a name.
-        "type A r = { x: A { ..r } }",
+        "type A 'r = { x: A { ..'r } }",
         // Every other way a type can be built out of a parameter: handed to
         // another declaration, put on either side of an arrow, or made a
         // case's payload. Each of them is a type that gets bigger every round,
         // and the walk that looks for a parameter has to reach all of them.
-        "type Box b = { it: b }  type T a = { next: T (Box a) }",
-        "type T a = { next: T (a -> Nat) }",
-        "type T a = { next: T (Nat -> a) }",
-        "type T a = { next: T (#A a) }",
-        "type T r = { next: T (#A Nat | ..r) }",
+        "type Box 'b = { it: 'b }  type T 'a = { next: T (Box 'a) }",
+        "type T 'a = { next: T ('a -> Nat) }",
+        "type T 'a = { next: T (Nat -> 'a) }",
+        "type T 'a = { next: T (#A 'a) }",
+        "type T 'r = { next: T (#A Nat | ..'r) }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1179,25 +1182,25 @@ fn recursion_may_not_make_its_argument_bigger() {
 #[test]
 fn a_parameter_stands_for_what_the_body_uses_it_as() {
     for (src, expected) in [
-        ("type WithX r = { x: Nat, ..r }", vec![row(&["x"])]),
-        ("type Box A = { it: A }", vec![row(&[])]),
-        ("type Ghost a = Nat", vec![row(&[])]),
-        ("type Bare r = { ..r }", vec![row(&[])]),
+        ("type WithX 'r = { x: Nat, ..'r }", vec![row(&["x"])]),
+        ("type Box 'A = { it: 'A }", vec![row(&[])]),
+        ("type Ghost 'a = Nat", vec![row(&[])]),
+        ("type Bare 'r = { ..'r }", vec![row(&[])]),
         (
-            "type Two r = { x: Nat, y: Nat, ..r }",
+            "type Two 'r = { x: Nat, y: Nat, ..'r }",
             vec![row(&["x", "y"])],
         ),
         // Two rows in one body, each naming its own fields: the parameter may
         // not stand for anything either of them writes out.
         (
-            "type Twice r = { a: { x: Nat, ..r }, b: { y: Nat, ..r } }",
+            "type Twice 'r = { a: { x: Nat, ..'r }, b: { y: Nat, ..'r } }",
             vec![row(&["x", "y"])],
         ),
         (
-            "type Both A r = { it: A, ..r }",
+            "type Both 'A 'r = { it: 'A, ..'r }",
             vec![row(&[]), row(&["it"])],
         ),
-        ("type Fn A B = A -> B", vec![row(&[]), row(&[])]),
+        ("type Fn 'A 'B = 'A -> 'B", vec![row(&[]), row(&[])]),
     ] {
         let (_, out) = built(src);
         let decl = out.program.types.values().next().expect("one declaration");
@@ -1215,15 +1218,15 @@ fn a_kind_travels_through_an_argument() {
     // Along a chain, against the order the declarations are written in. What
     // the row may not name travels with it: `Outer` names no field of its own,
     // and its argument still ends up where `Inner`'s `x` sits.
-    let (_, out) = built("type Outer s = Inner s  type Inner r = { x: Nat, ..r }");
+    let (_, out) = built("type Outer 's = Inner 's  type Inner 'r = { x: Nat, ..'r }");
     for decl in out.program.types.values() {
         assert_eq!(decl.params[0].kind, row(&["x"]));
     }
 
     // And around a circle, where 'no declaration decides its own.
     let (_, out) = built(
-        "type A x = { hop: B x, ..x }\n\
-         type B y = { hop: A y }",
+        "type A 'x = { hop: B 'x, ..'x }\n\
+         type B 'y = { hop: A 'y }",
     );
     for decl in out.program.types.values() {
         assert_eq!(decl.params[0].kind, row(&["hop"]));
@@ -1232,7 +1235,8 @@ fn a_kind_travels_through_an_argument() {
     // A row written out as an argument is not the parameter handed on, but its
     // own tail still lands where the callee's tail sat — so it collects the
     // callee's labels as well as the ones written beside it.
-    let (mint, out) = built("type Inner r = { x: Nat, ..r }  type Wrap s = Inner { y: Nat, ..s }");
+    let (mint, out) =
+        built("type Inner 'r = { x: Nat, ..'r }  type Wrap 's = Inner { y: Nat, ..'s }");
     let wrap = &out.program.types[&type_symbol(&mint, &out, "Wrap")];
     assert_eq!(wrap.params[0].kind, row(&["y", "x"]));
 }
@@ -1246,10 +1250,10 @@ fn a_kind_travels_through_an_argument() {
 #[test]
 fn a_parameter_may_not_stand_for_both() {
     for src in [
-        "type Bad r = { g: (#A | ..r), f: r }",
+        "type Bad 'r = { g: (#A | ..'r), f: 'r }",
         // Through an argument: `Inner` makes `r` a sum's rest, the field makes
         // it a type.
-        "type Inner r = #A Nat | ..r  type Bad a = { it: a, more: Inner a }",
+        "type Inner 'r = #A Nat | ..'r  type Bad 'a = { it: 'a, more: Inner 'a }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1264,7 +1268,7 @@ fn a_parameter_may_not_stand_for_both() {
     // And a parameter used as a field's type and as a struct's `..` is not one:
     // both say "a type", so the declaration simply takes the union of what they
     // demand, which is the lacks set.
-    let (mint, out) = built("type W r = { f: r, ..r }");
+    let (mint, out) = built("type W 'r = { f: 'r, ..'r }");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let w = &out.program.types[&type_symbol(&mint, &out, "W")];
     assert_eq!(w.params[0].kind, row(&["f"]));
@@ -1276,8 +1280,8 @@ fn a_parameter_may_not_stand_for_both() {
 #[test]
 fn a_parameter_kind_does_not_depend_on_declaration_order() {
     for src in [
-        "type Or r = #A | ..r  type Bad = Or Nat",
-        "type Bad = Or Nat  type Or r = #A | ..r",
+        "type Or 'r = #A | ..'r  type Bad = Or Nat",
+        "type Bad = Or Nat  type Or 'r = #A | ..'r",
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
@@ -1302,8 +1306,8 @@ fn a_parameter_kind_does_not_depend_on_declaration_order() {
     // A struct's `..` reads the same either way round, and takes anything at
     // all: `WithX Nat` is well-formed however the two were ordered.
     for src in [
-        "type WithX r = { x: Nat, ..r }  type Fine = WithX Nat",
-        "type Fine = WithX Nat  type WithX r = { x: Nat, ..r }",
+        "type WithX 'r = { x: Nat, ..'r }  type Fine = WithX Nat",
+        "type Fine = WithX Nat  type WithX 'r = { x: Nat, ..'r }",
     ] {
         let (mint, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -1318,8 +1322,8 @@ fn a_parameter_kind_does_not_depend_on_declaration_order() {
 #[test]
 fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
     for src in [
-        "type V a = { f: a, g: W a }  type W r = #X Nat | ..r",
-        "type W r = #X Nat | ..r  type V a = { f: a, g: W a }",
+        "type V 'a = { f: 'a, g: W 'a }  type W 'r = #X Nat | ..'r",
+        "type W 'r = #X Nat | ..'r  type V 'a = { f: 'a, g: W 'a }",
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
@@ -1356,7 +1360,7 @@ fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
 /// right.
 #[test]
 fn a_mixed_parameter_absorbs_its_own_use_sites() {
-    let src = "type Bad a = { x: (#A | ..a), y: a }\n\
+    let src = "type Bad 'a = { x: (#A | ..'a), y: 'a }\n\
                let f: Bad Nat = { x: #A, y: 1 }\n\
                let g: Bad Nat -> Nat = fn v => v.y\n\
                let h: Bad Nat -> Nat = fn v => 1";
@@ -1381,10 +1385,10 @@ fn a_mixed_parameter_absorbs_its_own_use_sites() {
 /// thing about their own parameter and are right about it.
 #[test]
 fn a_mixed_parameter_is_reported_once_along_a_chain() {
-    let src = "type W r = #X Nat | ..r\n\
-               type U t = { a: W t, b: t }\n\
-               type V u = U u\n\
-               type Q q = V q";
+    let src = "type W 'r = #X Nat | ..'r\n\
+               type U 't = { a: W 't, b: 't }\n\
+               type V 'u = U 'u\n\
+               type Q 'q = V 'q";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -1419,10 +1423,10 @@ fn a_mixed_parameter_is_reported_once_along_a_chain() {
 #[test]
 fn only_a_row_may_be_written_where_a_row_goes() {
     for src in [
-        "type Or r = #A | ..r  let f : Or Nat -> Nat = fn p => 1",
-        "type Or r = #A | ..r  let f : Or (Nat -> Nat) -> Nat = fn p => 1",
-        "type Or r = #A | ..r  let f : Or { y: Nat } -> Nat = fn p => 1",
-        "type Or r = #A | ..r  type Bad = Or Nat",
+        "type Or 'r = #A | ..'r  let f : Or Nat -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  let f : Or (Nat -> Nat) -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  let f : Or { y: Nat } -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  type Bad = Or Nat",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1436,9 +1440,9 @@ fn only_a_row_may_be_written_where_a_row_goes() {
 
     // A sum is one, and so is another sum's row parameter handed straight on.
     for src in [
-        "type Or r = #A | ..r  let f : Or (#B Nat) -> Nat = fn p => 1",
-        "type Or r = #A | ..r  let f : Or (|) -> Nat = fn p => 1",
-        "type Or r = #A | ..r  type Pass s = Or s",
+        "type Or 'r = #A | ..'r  let f : Or (#B Nat) -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  let f : Or (|) -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  type Pass 's = Or 's",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -1451,15 +1455,15 @@ fn only_a_row_may_be_written_where_a_row_goes() {
 #[test]
 fn a_struct_tail_admits_any_argument() {
     for src in [
-        "type WithX r = { x: Nat, ..r }  let f : WithX Nat -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  let f : WithX (Nat -> Nat) -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  let f : WithX (#A | #B) -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  let f : WithX { y: Nat, .. } -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  type Foo = { y: Nat }  \
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX Nat -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX (Nat -> Nat) -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX (#A | #B) -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX { y: Nat, .. } -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  type Foo = { y: Nat }  \
          let f : WithX Foo -> Nat = fn p => p.y",
-        "type WithX r = { x: Nat, ..r }  type Pass s = WithX s",
-        "type WithX r = { x: Nat, ..r }  let f : WithX {} -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  type Pass 's = WithX 's",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX {} -> Nat = fn p => p.x",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -1473,7 +1477,7 @@ fn a_struct_tail_admits_any_argument() {
 /// something later happened to flatten the row.
 #[test]
 fn a_row_argument_may_not_name_what_the_declaration_names() {
-    let src = "type WithX r = { x: Nat, ..r }  let f : WithX { x: Nat } -> Nat = fn p => p.x";
+    let src = "type WithX 'r = { x: Nat, ..'r }  let f : WithX { x: Nat } -> Nat = fn p => p.x";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
@@ -1490,7 +1494,7 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
     // The labels travel with the parameter, so a declaration that hands its
     // own on refuses the same argument without naming anything itself.
     let (_, out) = build_src(
-        "type WithX r = { x: Nat, ..r }  type Pass s = WithX s  \
+        "type WithX 'r = { x: Nat, ..'r }  type Pass 's = WithX 's  \
                               let f : Pass { x: Nat } -> Nat = fn p => p.x",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
@@ -1501,9 +1505,9 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
 
     // A label the declaration does not name is what a `..` is for.
     for src in [
-        "type WithX r = { x: Nat, ..r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  let f : WithX {} -> Nat = fn p => p.x",
-        "type WithX r = { x: Nat, ..r }  type Pass s = WithX s",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  let f : WithX {} -> Nat = fn p => p.x",
+        "type WithX 'r = { x: Nat, ..'r }  type Pass 's = WithX 's",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -1512,11 +1516,11 @@ fn a_row_argument_may_not_name_what_the_declaration_names() {
 
 /// A `..` naming a parameter is the one way a declared type may be left open,
 /// because what it stands for is supplied at every use rather than decided
-/// here. A bare `..` and a `when` are still refused, and so is a name that binds
-/// nothing.
+/// here. A bare `..` and a `when` are still refused; a name the header does not
+/// bind is refused too, in the words a variable written in a declaration gets.
 #[test]
 fn a_declaration_is_open_only_through_a_parameter() {
-    let (_, out) = built("type WithX r = { x: Nat, ..r }");
+    let (_, out) = built("type WithX 'r = { x: Nat, ..'r }");
     assert!(matches!(
         out.program
             .types
@@ -1528,11 +1532,20 @@ fn a_declaration_is_open_only_through_a_parameter() {
         TypeKind::Struct { tail: Some(_), .. }
     ));
 
+    for src in ["type T = { x: Nat, ..'r }", "type T 'a = { x: Nat, ..'r }"] {
+        let (_, out) = build_src(src);
+        assert!(
+            out.errors
+                .iter()
+                .any(|error| matches!(error.kind, ErrorKind::VariableInDeclaration)),
+            "{src}: {:#?}",
+            out.errors
+        );
+    }
+
     for src in [
         "type T = { x: Nat, .. }",
-        "type T = { x: Nat, ..r }",
-        "type T A = { x: Nat, ..r }",
-        "type T r = { x when 'a: Nat, ..r }",
+        "type T 'r = { x when 'a: Nat, ..'r }",
     ] {
         let (_, out) = build_src(src);
         assert!(
@@ -1548,14 +1561,13 @@ fn a_declaration_is_open_only_through_a_parameter() {
     }
 }
 
-/// A parameter hides a primitive for the length of the body, the way a
-/// declaration of the same name already did. Outside the body the primitive is
-/// back, so `type Box Nat = { it: Nat }` takes one type and `Box Nat` hands it
-/// the built-in — confusing to write, but the resolution order is the one the
-/// rest of the language already uses, and it should not quietly be a third.
+/// A parameter cannot hide anything, whatever it is named. The sigil is what
+/// keeps the two apart: `'Nat` is the parameter and `Nat` is the built-in, so
+/// `type Box 'Nat = { it: 'Nat }` takes one type and `Box Nat` hands it the
+/// primitive — no resolution order to get wrong, and no name to be surprised by.
 #[test]
-fn a_parameter_shadows_a_primitive() {
-    let (_, out) = built("type Box Nat = { it: Nat }  let b : Box Nat -> Nat = fn p => p.it");
+fn a_parameter_cannot_hide_a_primitive() {
+    let (_, out) = built("type Box 'Nat = { it: 'Nat }  let b : Box Nat -> Nat = fn p => p.it");
 
     let boxed = out.program.types.values().next().expect("the declaration");
     let TypeKind::Struct { fields, .. } = &boxed.value.tracked else {
@@ -1566,7 +1578,7 @@ fn a_parameter_shadows_a_primitive() {
             fields["it"].value().map(|value| &value.tracked),
             Some(TypeKind::Param { index: 0, .. })
         ),
-        "inside the body the parameter wins: {:#?}",
+        "inside the body the sigil names the parameter: {:#?}",
         fields["it"]
     );
 
@@ -1585,7 +1597,7 @@ fn a_parameter_shadows_a_primitive() {
     };
     assert!(
         matches!(args[0].tracked, TypeKind::Prim(Prim::Nat)),
-        "outside it the primitive is back: {:#?}",
+        "and the bare name is the primitive: {:#?}",
         args[0]
     );
 }
@@ -1595,7 +1607,7 @@ fn a_parameter_shadows_a_primitive() {
 /// it means unit, but the unit is inference's to supply, not the tree's.
 #[test]
 fn lowers_a_sum_type() {
-    let src = "type Option T = #Some T | #None";
+    let src = "type Option 'T = #Some 'T | #None";
     let (mint, out) = built(src);
     let decl = &out.program.types[&type_symbol(&mint, &out, "Option")];
     let TypeKind::Sum { cases, tail } = &decl.value.tracked else {
@@ -1664,11 +1676,7 @@ fn a_repeated_case_is_reported_once() {
 /// fields describes a type its writer never wrote.
 #[test]
 fn a_declared_sum_must_list_its_cases() {
-    for src in [
-        "type T = #A Nat | ..",
-        "type T = #A Nat | ..r",
-        "type T = #A (when 'a) Nat | #B",
-    ] {
+    for src in ["type T = #A Nat | ..", "type T = #A (when 'a) Nat | #B"] {
         let (_, out) = build_src(src);
         assert!(
             out.errors.iter().any(|error| matches!(
@@ -1682,7 +1690,7 @@ fn a_declared_sum_must_list_its_cases() {
     // A tail naming one of the declaration's own parameters is the exception,
     // for the reason it is the exception for a struct: what it stands for is
     // supplied at every use rather than decided here.
-    let (mint, out) = built("type Tagged r = #Err Nat | ..r");
+    let (mint, out) = built("type Tagged 'r = #Err Nat | ..'r");
     let decl = &out.program.types[&type_symbol(&mint, &out, "Tagged")];
     assert_eq!(decl.params[0].kind, cases(&["Err"]));
 }
@@ -1691,18 +1699,18 @@ fn a_declared_sum_must_list_its_cases() {
 /// a struct's tail is the type's core and takes anything, including a sum.
 #[test]
 fn a_row_parameter_knows_which_shape_it_is() {
-    let (_, out) = build_src("type Cases r = #A Nat | ..r  type Bad = Cases { y: Nat }");
+    let (_, out) = build_src("type Cases 'r = #A Nat | ..'r  type Bad = Cases { y: Nat }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::NotARow { .. }));
 
-    let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type Fine = WithX (#A Nat)");
+    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Fine = WithX (#A Nat)");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     // And a parameter handed to both is a parameter that has to say which it
     // meant: a whole type in one place, the rest of a sum in the other.
     let (_, out) = build_src(
-        "type WithX r = { x: Nat, ..r }  type Cases s = #A Nat | ..s  \
-         type Bad t = { it: WithX t, also: Cases t }",
+        "type WithX 'r = { x: Nat, ..'r }  type Cases 's = #A Nat | ..'s  \
+         type Bad 't = { it: WithX 't, also: Cases 't }",
     );
     assert!(
         out.errors
@@ -1718,7 +1726,7 @@ fn a_row_parameter_knows_which_shape_it_is() {
 /// the case twice, and the two copies could carry different things.
 #[test]
 fn a_sum_argument_may_not_repeat_a_case() {
-    let (_, out) = build_src("type Cases r = #A Nat | ..r  type Bad = Cases (#A Nat)");
+    let (_, out) = build_src("type Cases 'r = #A Nat | ..'r  type Bad = Cases (#A Nat)");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
         matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, shape }
@@ -1732,7 +1740,7 @@ fn a_sum_argument_may_not_repeat_a_case() {
     // sat, so it may not stand for `#A` either. Written out and not just
     // handed on — that is the edge a sum used to be left off, and the argument
     // it let through was accepted with the case carrying the wrong type.
-    let src = "type Cases q = #A Nat | ..q  type OuterC p = Cases (#B Nat | ..p)  \
+    let src = "type Cases 'q = #A Nat | ..'q  type OuterC 'p = Cases (#B Nat | ..'p)  \
                type Bad = OuterC (#A Nat)";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
@@ -1751,7 +1759,7 @@ fn a_sum_argument_may_not_repeat_a_case() {
 
     // A case neither of them names is what the `..` is for.
     let (_, out) = build_src(
-        "type Cases q = #A Nat | ..q  type OuterC p = Cases (#B Nat | ..p)  \
+        "type Cases 'q = #A Nat | ..'q  type OuterC 'p = Cases (#B Nat | ..'p)  \
          type Fine = OuterC (#C Nat)",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -1761,7 +1769,7 @@ fn a_sum_argument_may_not_repeat_a_case() {
 /// case is a shape one step in, which is all a declaration has to reach.
 #[test]
 fn a_sum_makes_a_type_recursive_rather_than_circular() {
-    let (mint, out) = built("type List a = #Nil | #Cons { head: a, tail: List a }");
+    let (mint, out) = built("type List 'a = #Nil | #Cons { head: 'a, tail: List 'a }");
     let decl = &out.program.types[&type_symbol(&mint, &out, "List")];
     assert!(matches!(decl.value.tracked, TypeKind::Sum { .. }));
     // And the parameter reaches a position of what the declaration stands
@@ -1769,7 +1777,7 @@ fn a_sum_makes_a_type_recursive_rather_than_circular() {
     assert!(decl.params[0].relevant);
 
     // The recursion that still cannot be allowed is the one that grows.
-    let (_, out) = build_src("type T a = #Next (T { x: a })");
+    let (_, out) = build_src("type T 'a = #Next (T { x: 'a })");
     assert!(
         out.errors
             .iter()
@@ -1917,25 +1925,15 @@ fn applying_an_undeclared_name_is_an_undefined_type() {
     );
 }
 
-/// A `..` names a rest, and a rest is a declaration's parameter or a `where
-/// let` variable and nothing else. A declared *type* of the same spelling has
-/// nothing to do with it: a tail is a use, and a name nothing declared as a
-/// variable stands for nothing at all.
+/// A `..` names a rest, and a rest is a variable: a declaration's parameter, or
+/// one of the annotation it is written in. A declared *type* of the same
+/// spelling has nothing to do with it, and cannot even be written there — a
+/// bare name after the dots is refused where it is read.
 #[test]
 fn a_tail_naming_a_declared_type_is_not_a_rest() {
     let src = "type T = Nat  let f : { x: Nat, ..T } -> Nat = fn r => r.x";
-    let (_, out) = build_src(src);
+    let out = ruddy::parse::parse(ruddy::token::lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
-    assert!(
-        matches!(
-            out.errors[0].kind,
-            ErrorKind::Undefined {
-                namespace: Namespace::Types
-            }
-        ),
-        "{:#?}",
-        out.errors
-    );
     assert_eq!(out.errors[0].span.start, src.rfind('T').expect("the tail"));
 
     // Written with its sigil it is a rest like any other, and the declaration
@@ -1951,7 +1949,7 @@ fn a_tail_naming_a_declared_type_is_not_a_rest() {
 /// nothing they can act on.
 #[test]
 fn an_erroneous_row_argument_absorbs() {
-    let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type P = WithX Missing");
+    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type P = WithX Missing");
 
     // The undefined name, and nothing about the shape it failed to have.
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
@@ -2135,7 +2133,7 @@ fn the_groups_hold_every_definition_once() {
 /// and keeps its own wording.
 #[test]
 fn a_declaration_that_adds_fields_to_itself_is_refused() {
-    let (mint, out) = build_src("type WithX r = { x: Nat, ..r }\ntype T = WithX T");
+    let (mint, out) = build_src("type WithX 'r = { x: Nat, ..'r }\ntype T = WithX T");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "endless-fields");
     let t = &out.program.types[&type_symbol(&mint, &out, "T")];
@@ -2152,9 +2150,9 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
     // Every declaration on the loop is told, and every one is erased — the way
     // a circular one is.
     let (mint, out) = build_src(
-        "type WithX r = { x: Nat, ..r }\n\
-         type A r = B r\n\
-         type B r = WithX (A r)",
+        "type WithX 'r = { x: Nat, ..'r }\n\
+         type A 'r = B 'r\n\
+         type B 'r = WithX (A 'r)",
     );
     assert_eq!(out.errors.len(), 2, "{:#?}", out.errors);
     for error in &out.errors {
@@ -2189,13 +2187,13 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
 #[test]
 fn what_an_argument_carries_is_read_through_its_name() {
     // Written out: the field is right there.
-    let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type Bad = WithX { x: Nat }");
+    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX { x: Nat }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
 
     // Through the name: `WithX Nat` carries an `x`, so handing it to `WithX`
     // again names `x` twice.
-    let (_, out) = build_src("type WithX r = { x: Nat, ..r }  type Bad = WithX (WithX Nat)");
+    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX (WithX Nat)");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
         matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, .. } if field == "x"),
@@ -2205,10 +2203,10 @@ fn what_an_argument_carries_is_read_through_its_name() {
 
     // And a name that carries something else is fine, however deep it is.
     for src in [
-        "type WithX r = { x: Nat, ..r }  type Foo = { y: Nat }  type Fine = WithX Foo",
-        "type WithY r = { y: Nat, ..r }  type WithX r = { x: Nat, ..r }  \
+        "type WithX 'r = { x: Nat, ..'r }  type Foo = { y: Nat }  type Fine = WithX Foo",
+        "type WithY 'r = { y: Nat, ..'r }  type WithX 'r = { x: Nat, ..'r }  \
          type Also = WithX (WithY Nat)",
-        "type WithX r = { x: Nat, ..r }  type Id a = a  type Fine = WithX (Id Nat)",
+        "type WithX 'r = { x: Nat, ..'r }  type Id 'a = 'a  type Fine = WithX (Id Nat)",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -2220,7 +2218,7 @@ fn what_an_argument_carries_is_read_through_its_name() {
 /// about a row nobody wrote would be that mistake said twice.
 #[test]
 fn an_erased_argument_is_let_through_a_sum_tail() {
-    let (_, out) = build_src("type Or r = #A | ..r  type Bad = Or Bogus");
+    let (_, out) = build_src("type Or 'r = #A | ..'r  type Bad = Or Bogus");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 }
@@ -2386,7 +2384,7 @@ fn a_nested_let_reaching_a_shape_is_not_circular() {
 /// would be a `RepeatedRowField` never reported.
 #[test]
 fn a_nested_annotation_reaches_the_row_argument_check() {
-    let src = "type WithX r = { x: Nat, ..r }\nlet e = let n : WithX { x: Nat } = 1 in n";
+    let src = "type WithX 'r = { x: Nat, ..'r }\nlet e = let n : WithX { x: Nat } = 1 in n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2530,13 +2528,11 @@ fn an_absent_label_needs_a_tail() {
     // A declaration's tail must name a parameter (the existing rule), so a
     // `\` beside an unbound `..'r` is that one complaint, unchanged — the
     // absence itself is fine wherever the tail is.
-    let (_, out) = build_src("type T = { \\y, ..r }");
+    let (_, out) = build_src("type T = { \\y, ..'r }");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
-        ErrorKind::OpenDeclaredType {
-            shape: Shape::Struct
-        }
+        ErrorKind::VariableInDeclaration
     ));
 
     // And a closed declaration gets the same complaint an annotation does.
@@ -2587,12 +2583,12 @@ fn a_label_named_present_and_absent_is_a_duplicate() {
 /// field named `y` makes it say.
 #[test]
 fn an_absent_label_joins_a_parameters_lacks() {
-    let (_, out) = built("type T r = { x: Nat, \\y, ..r }");
+    let (_, out) = built("type T 'r = { x: Nat, \\y, ..'r }");
     let decl = out.program.types.values().next().expect("the declaration");
     assert_eq!(decl.params.len(), 1);
     assert_eq!(decl.params[0].kind, row(&["x", "y"]));
 
-    let (_, out) = built("type NoErr r = #Ok Nat | \\#Err | ..r");
+    let (_, out) = built("type NoErr 'r = #Ok Nat | \\#Err | ..'r");
     let decl = out.program.types.values().next().expect("the declaration");
     assert_eq!(decl.params[0].kind, cases(&["Ok", "Err"]));
 }
@@ -2602,7 +2598,7 @@ fn an_absent_label_joins_a_parameters_lacks() {
 /// names.
 #[test]
 fn an_argument_may_not_name_an_absent_label() {
-    let src = "type T r = { x: Nat, \\y, ..r }\nlet v : T { y: Nat } = { x: 1, y: 2 }";
+    let src = "type T 'r = { x: Nat, \\y, ..'r }\nlet v : T { y: Nat } = { x: 1, y: 2 }";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2617,7 +2613,7 @@ fn an_argument_may_not_name_an_absent_label() {
         src.find("{ y: Nat }").expect("the argument")
     );
 
-    let src = "type NoErr r = #Ok Nat | \\#Err | ..r\nlet x : NoErr (#Err Nat) = #Ok 1";
+    let src = "type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Err Nat) = #Ok 1";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2630,7 +2626,7 @@ fn an_argument_may_not_name_an_absent_label() {
 
     // An argument that names none of them is welcome.
     let (_, out) =
-        build_src("type NoErr r = #Ok Nat | \\#Err | ..r\nlet x : NoErr (#Warn Nat) = #Ok 1");
+        build_src("type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Warn Nat) = #Ok 1");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -2639,12 +2635,12 @@ fn an_argument_may_not_name_an_absent_label() {
 #[test]
 fn displays_absent_labels_as_written() {
     assert_eq!(
-        display_program("type T r = { x: Nat, \\y, ..r }"),
-        "type T r = { x: Nat, \\y, ..r }"
+        display_program("type T 'r = { x: Nat, \\y, ..'r }"),
+        "type T 'r = { x: Nat, \\y, ..'r }"
     );
     assert_eq!(
-        display_program("type NoErr r = #Ok Nat | \\#Err | ..r"),
-        "type NoErr r = #Ok Nat | \\#Err | ..r"
+        display_program("type NoErr 'r = #Ok Nat | \\#Err | ..'r"),
+        "type NoErr 'r = #Ok Nat | \\#Err | ..'r"
     );
     assert_eq!(
         display_program("let f : { \\y, ..'r } -> { ..'r } = fn a => a"),
@@ -2657,11 +2653,11 @@ fn displays_absent_labels_as_written() {
 /// grow — in either shape.
 #[test]
 fn a_recursive_declaration_may_write_an_absence() {
-    let (_, out) = built("type T r = { \\y, next: T r, ..r }");
+    let (_, out) = built("type T 'r = { \\y, next: T 'r, ..'r }");
     let decl = out.program.types.values().next().expect("the declaration");
     assert_eq!(decl.params[0].kind, row(&["y", "next"]));
 
-    let (_, out) = built("type S r = #A (S r) | \\#B | ..r");
+    let (_, out) = built("type S 'r = #A (S 'r) | \\#B | ..'r");
     let decl = out.program.types.values().next().expect("the declaration");
     assert_eq!(decl.params[0].kind, cases(&["A", "B"]));
 }
@@ -3836,7 +3832,7 @@ fn a_declaration_may_write_and_take_effects() {
     let (mint, out) = built(
         "effect Log = write : Nat -> ()\n\
          type Logger = Nat -> Nat + !Log\n\
-         type Runner e = (Nat -> Nat + ..e) -> Nat + ..e",
+         type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e",
     );
     let TypeKind::Arrow { effects, .. } = &out.program.types[&type_symbol(&mint, &out, "Logger")]
         .value
@@ -3863,7 +3859,6 @@ fn a_declared_effect_row_must_be_closed() {
     let base = "effect Log = write : Nat -> ()\n";
     for source in [
         "type T = Nat -> Nat + ..",
-        "type T = Nat -> Nat + ..e",
         "type T = Nat -> Nat + !Log (when 'a)",
     ] {
         let src = format!("{base}{source}");
@@ -3885,7 +3880,7 @@ fn a_declared_effect_row_must_be_closed() {
         );
     }
     assert_eq!(
-        out_message(&format!("{base}type T = Nat -> Nat + ..e")),
+        out_message(&format!("{base}type T = Nat -> Nat + ..")),
         "a declared type must list its effects exactly; `..` and `when` belong in annotations"
     );
 }
@@ -3906,7 +3901,7 @@ fn out_message(src: &str) -> String {
 #[test]
 fn a_parameter_read_two_ways_names_both() {
     let src = "effect Log = write : Nat -> ()\n\
-               type M e = { f: e, g: (Nat -> Nat + ..e) }";
+               type M 'e = { f: 'e, g: (Nat -> Nat + ..'e) }";
     let (_, out) = build_src(src);
     let [error] = &out.errors[..] else {
         panic!("{:#?}", out.errors);
@@ -4103,7 +4098,7 @@ fn a_row_that_is_only_a_tail_says_something() {
 fn an_effect_tail_makes_an_argument_grow() {
     let codes = codes_of(
         "effect Log = write : Nat -> ()\n\
-         type T a = { next: T (Nat -> Nat + ..a) }",
+         type T 'a = { next: T (Nat -> Nat + ..'a) }",
     );
     assert_eq!(codes, ["growing-recursion"]);
 }
@@ -4139,7 +4134,7 @@ fn return_is_a_name_everywhere_but_an_arms_head() {
 #[test]
 fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
     let base = "effect Log = write : Nat -> ()\n\
-                type Runner e = (Nat -> Nat + !Log + ..e) -> Nat\n";
+                type Runner 'e = (Nat -> Nat + !Log + ..'e) -> Nat\n";
     // Something a row cannot hold.
     let (_, out) = build_src(&format!("{base}let f : Runner Nat -> Nat = fn r => 1"));
     let [error] = &out.errors[..] else {
@@ -4182,7 +4177,7 @@ fn a_row_of_effects_may_be_an_argument() {
     let base = "effect Log = write : Nat -> ()\n\
                 effect IO = print : Nat -> ()\n\
                 effect Console = !Log + !IO\n\
-                type Runner e = (Nat -> Nat + ..e) -> Nat\n";
+                type Runner 'e = (Nat -> Nat + ..'e) -> Nat\n";
 
     // One effect, written back as the row it is.
     let (mint, out) = build_src(&format!("{base}let f : Runner (!Log) -> Nat = fn r => 1"));
@@ -4233,11 +4228,11 @@ fn a_row_of_effects_may_be_an_argument() {
 
     // A declaration may hand one on, tail and all: what the tail names is used
     // as effects, exactly as a tail on the declaration's own arrow would be.
-    let (mint, out) = build_src(&format!("{base}type Wrap e = Runner (!Log + ..e)"));
+    let (mint, out) = build_src(&format!("{base}type Wrap 'e = Runner (!Log + ..'e)"));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let printed = print::ir::program(&out.program, &mint).to_string();
     assert!(
-        printed.contains("type Wrap e = Runner (!Log + ..e)"),
+        printed.contains("type Wrap 'e = Runner (!Log + ..'e)"),
         "{printed}"
     );
 
@@ -4269,13 +4264,13 @@ fn a_row_of_effects_may_be_an_argument() {
     // A row handed round a recursion unchanged is not growth: what a
     // declaration hands itself has to get bigger to be one, and a row with no
     // tail to splice into is the same row every time round.
-    let (_, out) = build_src(&format!("{base}type Same e = {{ next: Same (!Log) }}"));
+    let (_, out) = build_src(&format!("{base}type Same 'e = {{ next: Same (!Log) }}"));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     // And a row handed round a recursion grows, exactly as a struct handed on
     // with a field added does: the declaration would never come back round.
     let (_, out) = build_src(&format!(
-        "{base}type Loop e = {{ next: Loop (!Log + ..e) }}"
+        "{base}type Loop 'e = {{ next: Loop (!Log + ..'e) }}"
     ));
     assert!(
         out.errors
@@ -4350,7 +4345,7 @@ fn a_bare_name_resolves_in_one_order() {
 
     // A declaration's parameter still comes first, and a declaration has no
     // variables at all for it to be shadowed by.
-    let (mint, out) = built("type Box a = { it: a }");
+    let (mint, out) = built("type Box 'a = { it: 'a }");
     let symbol = type_symbol(&mint, &out, "Box");
     let TypeKind::Struct { fields, .. } = &out.program.types[&symbol].value.tracked else {
         panic!("expected a struct");
@@ -4361,51 +4356,40 @@ fn a_bare_name_resolves_in_one_order() {
     assert!(matches!(value.tracked, TypeKind::Param { .. }));
 }
 
-/// A bare name in a type position, in a `..`, or in a `when` resolves to
-/// something declared elsewhere — and a name nothing declared stands for
-/// nothing at all. The sigil is what buys that back: `a` needs no declaration
-/// because it is not a name of anything.
+/// A bare name in a type position resolves to something declared elsewhere —
+/// and a name nothing declared stands for nothing at all. The sigil is what
+/// buys that back: `'a` needs no declaration because it is not a name of
+/// anything.
 #[test]
 fn an_undeclared_name_is_undefined_wherever_it_is_used() {
-    for (src, at) in [
-        // A type position, twice — one report per use.
-        ("let bad : a -> a = fn x => x", 2),
-        // A struct's tail and a sum's tail.
-        ("let bad : { x: Nat, ..r } -> Nat = fn p => p.x", 1),
-        ("let bad : (#A Nat | ..r) -> Nat = fn p => 0", 1),
-    ] {
-        let (_, out) = build_src(src);
-        assert_eq!(out.errors.len(), at, "{src}: {:#?}", out.errors);
-        for error in &out.errors {
-            assert!(
-                matches!(
-                    error.kind,
-                    ErrorKind::Undefined {
-                        namespace: Namespace::Types
-                    }
-                ),
-                "{src}: {:#?}",
-                out.errors
-            );
-        }
+    // A type position, twice — one report per use.
+    let src = "let bad : a -> a = fn x => x";
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 2, "{src}: {:#?}", out.errors);
+    for error in &out.errors {
+        assert!(
+            matches!(
+                error.kind,
+                ErrorKind::Undefined {
+                    namespace: Namespace::Types
+                }
+            ),
+            "{src}: {:#?}",
+            out.errors
+        );
     }
 
-    // At the name rather than at the `..` in front of it: the name is the whole
-    // of what the reader can change.
-    let src = "let bad : { x: Nat, ..r } -> Nat = fn p => p.x";
-    let (_, out) = build_src(src);
-    assert_eq!(out.errors[0].span.start, src.find("..r").expect("tail") + 2);
-
-    // And a `when` takes no bare name at all: a presence is a variable, so
-    // there is nothing there for a name to resolve to.
-    let out = ruddy::parse::parse(
-        ruddy::token::lex(
-            "let bad : { x when a: Nat } -> Nat = fn p => 0",
-            FileID::GENERATED,
-        )
-        .tokens,
-    );
-    assert!(!out.errors.is_empty(), "{:#?}", out.errors);
+    // A `..` and a `when` take no bare name at all: each stands for something
+    // the sigil introduces, so there is nothing there for a name to resolve to
+    // and the parser never builds one.
+    for src in [
+        "let bad : { x: Nat, ..r } -> Nat = fn p => p.x",
+        "let bad : (#A Nat | ..r) -> Nat = fn p => 0",
+        "let bad : { x when a: Nat } -> Nat = fn p => 0",
+    ] {
+        let out = ruddy::parse::parse(ruddy::token::lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src}: {:#?}", out.errors);
+    }
 
     // A sigilled name is a variable wherever it is written, and needs nothing.
     let (_, out) = build_src("let good : 'a -> { x: Nat, ..'r } -> Nat = fn x => fn p => p.x");
@@ -4603,7 +4587,7 @@ fn a_formula_names_only_what_a_when_wears() {
 /// reports each.
 #[test]
 fn a_declaration_may_declare_nothing_in_its_where() {
-    let src = "type Bad r = { x: Nat, ..'r }";
+    let src = "type Bad = { x: Nat, ..'r }";
     let (mint, out) = build_src(src);
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);

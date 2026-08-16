@@ -346,12 +346,16 @@ pub fn plural(count: usize, noun: &str) -> String {
 /// case with its `#` — through [`ui::label`], so this row and the
 /// compiler's own complaint about the same parameter name it the same way.
 pub fn stands_for(mint: &Mint, param: &Param) -> String {
-    let name = mint.name(param.symbol);
+    // Sigil and all, the way [`stands_for_variable`](crate::stage::ir) spells
+    // the other kind of variable: a parameter is written `'a` and tailed `..'a`,
+    // and a row that dropped the mark would be showing a spelling the source
+    // cannot use.
+    let name = format!("'{}", mint.name(param.symbol));
     let lacks = param.kind.lacks();
     let (opener, shape) = match param.kind.cases() {
         Some((shape @ Shape::Effect, _)) => (format!("..{name} (effects)"), shape),
         Some((shape, _)) => (format!("..{name} (sum)"), shape),
-        None if lacks.is_empty() => return name.to_string(),
+        None if lacks.is_empty() => return name,
         None => (format!("..{name} (struct)"), Shape::Struct),
     };
     if lacks.is_empty() {

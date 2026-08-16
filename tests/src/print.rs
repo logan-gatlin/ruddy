@@ -228,25 +228,25 @@ fn a_row_reads_as_written_and_as_quantified() {
 #[test]
 fn both_trees_render_an_application_the_same_way() {
     for source in [
-        "type Pair A B = { first: A, second: B }",
-        "type Pair A B = { first: A, second: B }\ntype P = Pair Nat Nat",
+        "type Pair 'A 'B = { first: 'A, second: 'B }",
+        "type Pair 'A 'B = { first: 'A, second: 'B }\ntype P = Pair Nat Nat",
         // An argument that is itself an application, and one that is an arrow:
         // the two positions that need parentheses to survive.
-        "type Box A = { it: A }\ntype N = Box (Box Nat)",
-        "type Box A = { it: A }\ntype F = Box (Nat -> Nat)",
+        "type Box 'A = { it: 'A }\ntype N = Box (Box Nat)",
+        "type Box 'A = { it: 'A }\ntype F = Box (Nat -> Nat)",
         // An application on the left of an arrow needs none, because it stops
         // at the arrow of its own accord.
-        "type Box A = { it: A }\ntype G = Box Nat -> Nat",
+        "type Box 'A = { it: 'A }\ntype G = Box Nat -> Nat",
         // A parameter used bare, as the whole body.
-        "type Id A = A",
+        "type Id 'A = 'A",
         // Recursion through a parameterized declaration, handed its own
         // parameter.
-        "type List a = { head: a, tail: List a }",
+        "type List 'a = { head: 'a, tail: List 'a }",
         // A row parameter: the `..` is written in the body, not at the head,
         // so both printers have to reach the parameter through the tail.
-        "type WithX r = { x: Nat, ..r }",
-        "type Both A r = { it: A, ..r }",
-        "type WithX r = { x: Nat, ..r }\ntype P = WithX { y: Nat }",
+        "type WithX 'r = { x: Nat, ..'r }",
+        "type Both 'A 'r = { it: 'A, ..'r }",
+        "type WithX 'r = { x: Nat, ..'r }\ntype P = WithX { y: Nat }",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -260,7 +260,7 @@ fn both_trees_render_an_application_the_same_way() {
 #[test]
 fn both_trees_render_a_sum_the_same_way() {
     for source in [
-        "type Option T = #Some T | #None",
+        "type Option 'T = #Some 'T | #None",
         "let v = #Some 1",
         "let n = #None",
         "let f = fn x => #Wrap x",
@@ -273,7 +273,7 @@ fn both_trees_render_a_sum_the_same_way() {
         // The two forms that write no case, and so print the leading bar the
         // rest of them do not.
         "type Void = |",
-        "type Only r = | ..r",
+        "type Only 'r = | ..'r",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -572,8 +572,8 @@ fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
 #[test]
 fn a_printed_effect_row_re_lowers_to_itself() {
     let effects = "effect Log = write : Nat -> ()\neffect IO = print : Nat -> ()\n";
-    // A scheme's quantified tail prints `..a`, which is a letter no reader
-    // could have written and no parser reads back — the rule every other
+    // A scheme's quantified tail prints `..'a`, which is a letter the writer
+    // did not choose and no re-lowering could recover — the rule every other
     // quantified variable already keeps. So what is re-lowered is the concrete
     // half, and the open half is only asserted to print as itself.
     for (annotation, expected) in [

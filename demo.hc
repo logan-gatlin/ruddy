@@ -4,7 +4,7 @@ let compose = fn f g x => f (g x)
 
 let point = { x: origin, y: shift base }
 
-type Pair A B = { first: A, second: B }
+type Pair 'A 'B = { first: 'A, second: 'B }
 
 type Boxed = { value: Nat }
 
@@ -16,11 +16,11 @@ type Pairs = Pair Nat Nat -> Pair Nat Nat
 
 let swap : Pair Nat Boxed -> Pair Boxed Nat = fn p => { first: p.second, second: p.first }
 
-type Stack a = { top: a, rest: Stack a }
+type Stack 'a = { top: 'a, rest: Stack 'a }
 
 let peek : Stack Nat -> Nat = fn s => s.top
 
-type Tagged r = { tag: Nat, ..r }
+type Tagged 'r = { tag: Nat, ..'r }
 
 let tag : Tagged { note: Nat } -> Nat = fn t => t.tag
 
@@ -62,7 +62,7 @@ let both : { x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b
       | {} => {}
     end
 
-type Option T = #Some T | #None
+type Option 'T = #Some 'T | #None
 
 let some = #Some 1
 
@@ -70,11 +70,11 @@ let nothing : Option Nat = #None
 
 let wrap = fn x => #Some x
 
-type Tree a = #Leaf | #Branch { value: a, kids: Tree a }
+type Tree 'a = #Leaf | #Branch { value: 'a, kids: Tree 'a }
 
 let leaf : Tree Nat = #Leaf
 
-type Fallible r = #Err Nat | ..r
+type Fallible 'r = #Err Nat | ..'r
 
 let handled : Fallible (#Ok Nat) -> Nat = fn t => 0
 
@@ -169,7 +169,7 @@ let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g n => g n
 
 type Logger = Nat -> Nat + !Log
 
-type Runner e = (Nat -> Nat + ..e) -> Nat + ..e
+type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e
 
 let logged : Runner (!Log) -> Nat = fn r => 0
 

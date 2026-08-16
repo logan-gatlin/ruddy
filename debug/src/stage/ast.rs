@@ -71,8 +71,9 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
             for param in params {
-                type_node_ = type_node_
-                    .child(Node::new(ids.next(), "Param", param.tracked.clone()).at(param.span));
+                type_node_ = type_node_.child(
+                    Node::new(ids.next(), "Param", format!("'{}", param.tracked)).at(param.span),
+                );
             }
             type_node_.child(annotation_node(ids, body))
         }
@@ -366,11 +367,10 @@ fn annotation_node(ids: &mut Ids, annotation: &Annotation) -> Node {
 }
 
 /// The `..` and whatever it names, as the row it stands for is written: a
-/// parameter bare, a variable with its sigil.
+/// variable with its sigil, or the dots alone.
 fn rest_text(of: &Rest) -> String {
     match of {
         Rest::Anything => "..".to_string(),
-        Rest::Param(name) => format!("..{}", name.tracked),
         Rest::Variable(name) => format!("..'{}", name.tracked),
     }
 }

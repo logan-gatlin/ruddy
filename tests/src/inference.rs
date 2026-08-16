@@ -922,7 +922,7 @@ fn a_row_repeating_two_fields_is_one_complaint() {
     // first label is the one named, and the argument absorbs, so the second is
     // not a second complaint.
     let (_, out, _) = infer_src(
-        "type W r = { x: Nat, y: Nat, ..r }\n\
+        "type W 'r = { x: Nat, y: Nat, ..'r }\n\
          let p : W { x: Nat, y: Nat } = { x: 1, y: 2 }",
     );
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
@@ -1479,7 +1479,7 @@ fn lowering_errors_are_absorbed_not_echoed() {
 #[test]
 fn a_bad_row_argument_is_absorbed_not_echoed() {
     let (_, out, output) = infer_src(
-        "type Or r = #A | ..r\n\
+        "type Or 'r = #A | ..'r\n\
          let f : Or Nat -> Nat = fn p => 1",
     );
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
@@ -1886,14 +1886,14 @@ fn a_projection_solves_wherever_it_falls_in_the_list() {
 #[test]
 fn a_constructor_stands_for_its_body_with_its_arguments_put_in() {
     let (mint, _, output) = inferred(
-        "type Pair A B = { first: A, second: B }\n\
+        "type Pair 'A 'B = { first: 'A, second: 'B }\n\
          let p : Pair Nat Nat = { first: 1, second: 2 }",
     );
     assert_eq!(scheme(&mint, &output, "p"), "Pair Nat Nat");
 
     // The argument reaches the field it was substituted into.
     let (_, _, output) = infer_src(
-        "type Pair A B = { first: A, second: B }\n\
+        "type Pair 'A 'B = { first: 'A, second: 'B }\n\
          let p : Pair Nat Nat = { first: 1, second: {} }",
     );
     assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
@@ -1905,7 +1905,7 @@ fn a_constructor_stands_for_its_body_with_its_arguments_put_in() {
 #[test]
 fn applications_of_one_declaration_are_equal_by_their_arguments() {
     let (_, _, output) = inferred(
-        "type Pair A B = { first: A, second: B }\n\
+        "type Pair 'A 'B = { first: 'A, second: 'B }\n\
          let same : Pair Nat Nat -> Pair Nat Nat = fn p => p",
     );
     let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
@@ -1916,7 +1916,7 @@ fn applications_of_one_declaration_are_equal_by_their_arguments() {
     // what the reader is shown: the types they wrote, not a field of a body
     // neither of them put on the page.
     let (_, _, output) = infer_src(
-        "type Pair A B = { first: A, second: B }\n\
+        "type Pair 'A 'B = { first: 'A, second: 'B }\n\
          let f : Pair Nat Nat -> Nat = fn p => p.first\n\
          let g : Pair Nat {} -> Nat = fn p => f p",
     );
@@ -1940,15 +1940,15 @@ fn applications_of_one_declaration_are_equal_by_their_arguments() {
 #[test]
 fn applications_of_different_declarations_unfold() {
     let (_, _, output) = inferred(
-        "type Box A = { it: A }\n\
-         type Crate A = { it: A }\n\
+        "type Box 'A = { it: 'A }\n\
+         type Crate 'A = { it: 'A }\n\
          let f : Box Nat -> Crate Nat = fn b => b",
     );
     let rules: Vec<Rule> = output.steps.iter().map(|step| step.rule).collect();
     assert!(rules.contains(&Rule::Unfold), "rules: {rules:?}");
 }
 
-/// A parameter a declaration discards buys no distinction. `type Ptr a = Nat`
+/// A parameter a declaration discards buys no distinction. `type Ptr 'a = Nat`
 /// stands for `Nat` whatever it is applied to, so `Ptr A` and `Ptr B` are one
 /// type — the language has no phantom types, and congruence is refused here
 /// precisely because taking it would say otherwise.
@@ -1959,7 +1959,7 @@ fn applications_of_different_declarations_unfold() {
 #[test]
 fn a_constructor_that_ignores_a_parameter_is_transparent() {
     let (mint, _, output) = inferred(
-        "type Ptr a = Nat\n\
+        "type Ptr 'a = Nat\n\
          type A = { a: Nat }\n\
          type B = { b: Nat }\n\
          let x : Ptr A = 1\n\
@@ -1978,8 +1978,8 @@ fn a_constructor_that_ignores_a_parameter_is_transparent() {
     // A parameter reaching the body only through something that discards it is
     // discarded too, however many hand-offs there are in between.
     let (_, _, output) = inferred(
-        "type Ptr a = Nat\n\
-         type Alias b = Ptr b\n\
+        "type Ptr 'a = Nat\n\
+         type Alias 'b = Ptr 'b\n\
          type A = { a: Nat }\n\
          type B = { b: Nat }\n\
          let x : Alias A = 1\n\
@@ -1990,7 +1990,7 @@ fn a_constructor_that_ignores_a_parameter_is_transparent() {
 
     // What is still refused is a difference the declaration keeps.
     let (_, _, output) = infer_src(
-        "type Box a = { it: a }\n\
+        "type Box 'a = { it: 'a }\n\
          let x : Box Nat = { it: 1 }\n\
          let y : Box {} = x",
     );
@@ -2006,9 +2006,9 @@ fn a_constructor_that_ignores_a_parameter_is_transparent() {
 #[test]
 fn a_recursion_at_a_fixed_argument_still_comes_back_round() {
     let (mint, _, output) = inferred(
-        "type Tree a = { value: a, kids: Forest }\n\
+        "type Tree 'a = { value: 'a, kids: Forest }\n\
          type Forest = { head: Tree Nat, tail: Forest }\n\
-         type Wood a = { value: a, kids: Grove }\n\
+         type Wood 'a = { value: 'a, kids: Grove }\n\
          type Grove = { head: Wood Nat, tail: Grove }\n\
          let f : Forest -> Grove = fn x => x",
     );
@@ -2046,9 +2046,9 @@ fn a_recursion_at_a_fixed_argument_still_comes_back_round() {
 #[test]
 fn an_assumption_is_read_against_what_has_since_been_decided() {
     let (mint, _, output) = inferred(
-        "type Tree a = { value: a, kids: Forest }\n\
+        "type Tree 'a = { value: 'a, kids: Forest }\n\
          type Forest = { head: Tree { x: Nat }, tail: Forest }\n\
-         type Wood a = { value: a, kids: Grove }\n\
+         type Wood 'a = { value: 'a, kids: Grove }\n\
          type Grove = { head: Wood { x: Nat }, tail: Grove }\n\
          let peek : Tree { x when 'a: Nat } -> Forest = fn t => t.kids\n\
          let q : Wood { x: Nat } -> Grove = fn w => peek w",
@@ -2091,10 +2091,10 @@ fn an_assumption_is_read_against_what_has_since_been_decided() {
 #[test]
 fn a_pair_of_declarations_is_not_assumed_equal_at_other_arguments() {
     let (_, out, output) = infer_src(
-        "type Tree x = { v: x, k: Bush }\n\
+        "type Tree 'x = { v: 'x, k: Bush }\n\
          type Bush = { t: Tree {}, f: Forest }\n\
          type Forest = { t: Tree Nat }\n\
-         type Tree2 x = { v: x, k: Bush2 }\n\
+         type Tree2 'x = { v: 'x, k: Bush2 }\n\
          type Bush2 = { t: Tree2 Nat, f: Forest2 }\n\
          type Forest2 = { t: Tree2 Nat }\n\
          let f : Forest -> Forest2 = fn x => x",
@@ -2112,8 +2112,8 @@ fn a_pair_of_declarations_is_not_assumed_equal_at_other_arguments() {
 #[test]
 fn a_recursive_constructor_does_not_unfold_forever() {
     let (mint, _, output) = inferred(
-        "type List a = { head: a, tail: List a }\n\
-         type Seq a = { head: a, tail: Seq a }\n\
+        "type List 'a = { head: 'a, tail: List 'a }\n\
+         type Seq 'a = { head: 'a, tail: Seq 'a }\n\
          let f : List Nat -> Seq Nat = fn x => x",
     );
     assert_eq!(scheme(&mint, &output, "f"), "List Nat -> Seq Nat");
@@ -2123,7 +2123,7 @@ fn a_recursive_constructor_does_not_unfold_forever() {
 /// opening the scheme reaches every `A` in the body.
 #[test]
 fn a_repeated_parameter_leaves_one_argument_to_supply() {
-    let (mint, _, output) = infer_src("type P A A = { x: A }\nlet v : P Nat = { x: 1 }");
+    let (mint, _, output) = infer_src("type P 'A 'A = { x: 'A }\nlet v : P Nat = { x: 1 }");
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     assert_eq!(scheme(&mint, &output, "v"), "P Nat");
 }
@@ -2133,15 +2133,15 @@ fn a_repeated_parameter_leaves_one_argument_to_supply() {
 /// not following it round.
 #[test]
 fn a_pass_through_declaration_may_be_nested() {
-    let (mint, _, output) = inferred("type Id a = a\nlet x : Id (Id Nat) = 1");
+    let (mint, _, output) = inferred("type Id 'a = 'a\nlet x : Id (Id Nat) = 1");
     assert_eq!(scheme(&mint, &output, "x"), "Id (Id Nat)");
 
     // Deeper than there are declarations, which is what the old bound could
     // not survive.
-    inferred("type Id a = a\nlet z : Id (Id (Id (Id Nat))) = 1");
+    inferred("type Id 'a = 'a\nlet z : Id (Id (Id (Id Nat))) = 1");
 
     // And it still unfolds to something: the literal is checked against `Nat`.
-    let (_, _, output) = infer_src("type Id a = a\nlet y : Id (Id Nat) = {}");
+    let (_, _, output) = infer_src("type Id 'a = 'a\nlet y : Id (Id Nat) = {}");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "type-mismatch");
 }
@@ -2154,7 +2154,7 @@ fn a_pass_through_declaration_may_be_nested() {
 #[test]
 fn a_row_inside_an_argument_still_lacks_what_it_names() {
     let (_, _, output) = infer_src(
-        "type Box A = { it: A }\n\
+        "type Box 'A = { it: 'A }\n\
          let f : Box { x: Nat, ..'r } -> { ..'r } -> Nat = fn b => fn c => 1\n\
          let z = fn b => f b { x: 1 }",
     );
@@ -2168,7 +2168,7 @@ fn a_row_inside_an_argument_still_lacks_what_it_names() {
 #[test]
 fn an_open_argument_is_generalized_with_its_definition() {
     let (mint, _, output) = inferred(
-        "type Box A = { it: A }\n\
+        "type Box 'A = { it: 'A }\n\
          let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
     );
     assert_eq!(
@@ -2182,7 +2182,7 @@ fn an_open_argument_is_generalized_with_its_definition() {
 #[test]
 fn no_solver_variable_survives_inside_an_argument() {
     let (_, _, output) = inferred(
-        "type Box A = { it: A }\n\
+        "type Box 'A = { it: 'A }\n\
          let wrap : Box { x: Nat, .. } -> Nat = fn b => b.it.x",
     );
     for scheme in output.schemes.values() {
@@ -2199,7 +2199,7 @@ fn no_solver_variable_survives_inside_an_argument() {
 #[test]
 fn a_row_argument_is_spliced_into_the_tail() {
     let (mint, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
          let n = f { x: 1, y: 2 }",
     );
@@ -2207,7 +2207,7 @@ fn a_row_argument_is_spliced_into_the_tail() {
 
     // Given nothing, the declaration is just its own fields.
     let (_, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let g : WithX {} -> Nat = fn p => p.x\n\
          let m = g { x: 1 }",
     );
@@ -2215,7 +2215,7 @@ fn a_row_argument_is_spliced_into_the_tail() {
 
     // And the spliced field really is required: the row said `y` is there.
     let (_, _, output) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { y: Nat } -> Nat = fn p => p.x\n\
          let n = f { x: 1 }",
     );
@@ -2234,7 +2234,7 @@ fn a_row_argument_is_spliced_into_the_tail() {
 #[test]
 fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     let (_, out, _) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { x: Nat } -> Nat = fn p => p.x",
     );
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
@@ -2245,7 +2245,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     // The condition is only on the variable once something has asked for the
     // declaration's shape, which the projection here is what does.
     let (_, _, output) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let g : WithX { ..'s } -> { ..'s } -> Nat = fn p => fn q => 1\n\
          let z = fn p => g p { x: p.x }",
     );
@@ -2255,7 +2255,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     // Naming the field rather than covering it is not the same thing, and is
     // fine: the row still stands for what the declaration does not name.
     let (_, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let ok : WithX { ..'s } -> { x: Nat, ..'s } = fn p => p",
     );
     assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
@@ -2276,7 +2276,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
 #[test]
 fn a_row_condition_survives_a_goal_that_never_unfolds() {
     let (_, out, output) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { ..'s } -> { ..'s } -> Nat = fn a => fn b => 1\n\
          let g = fn q => f q { x: 1 }",
     );
@@ -2287,7 +2287,7 @@ fn a_row_condition_survives_a_goal_that_never_unfolds() {
     // A label `WithX` does not name is what the `..` was for, and travels the
     // same route with nothing to say.
     let (_, _, output) = infer_src(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { ..'s } -> { ..'s } -> Nat = fn a => fn b => 1\n\
          let g = fn q => f q { y: 1 }",
     );
@@ -2306,7 +2306,7 @@ fn a_row_condition_survives_a_goal_that_never_unfolds() {
 /// rule: one complaint about the row, at the row, and nothing said twice.
 #[test]
 fn a_refused_row_is_not_compared_afterwards() {
-    let src = "type W r = { x: Nat, ..r }\nlet p : W { x: {} } = { x: {} }";
+    let src = "type W 'r = { x: Nat, ..'r }\nlet p : W { x: {} } = { x: {} }";
     let (_, out, output) = infer_src(src);
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
@@ -2329,7 +2329,7 @@ fn a_refused_row_is_not_compared_afterwards() {
 /// declaration, one legal and one not, is what tells the two apart.
 #[test]
 fn the_lacks_condition_is_said_again_at_each_use() {
-    let src = "type WithX r = { x: Nat, ..r }\n\
+    let src = "type WithX 'r = { x: Nat, ..'r }\n\
                let fine : WithX { y: Nat } -> Nat = fn p => p.x\n\
                let bad : WithX { x: Nat } -> Nat = fn p => p.x\n\
                let also : WithX { z: Nat } -> Nat = fn p => p.x";
@@ -2351,7 +2351,7 @@ fn the_lacks_condition_is_said_again_at_each_use() {
 #[test]
 fn a_row_parameter_leaves_the_declaration_closed_to_the_solver() {
     let (mint, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX { y: Nat } -> Nat = fn p => p.x",
     );
     assert_eq!(scheme(&mint, &output, "f"), "WithX { y: Nat } -> Nat");
@@ -2371,9 +2371,9 @@ fn a_recursion_that_cannot_grow_always_comes_back_round() {
     // A group member mentioned at a fixed argument that is itself a member of
     // the group.
     inferred(
-        "type A a = { x: A B, v: a }\n\
+        "type A 'a = { x: A B, v: 'a }\n\
          type B = { y: A Nat }\n\
-         type C a = { x: C D, v: a }\n\
+         type C 'a = { x: C D, v: 'a }\n\
          type D = { y: C Nat }\n\
          let f : A Nat -> C Nat = fn z => z",
     );
@@ -2381,18 +2381,18 @@ fn a_recursion_that_cannot_grow_always_comes_back_round() {
     // Asked at an argument the declarations never mention, so the goal has to
     // travel one round before it repeats.
     inferred(
-        "type T a = { next: T Nat }\n\
-         type U a = { next: U Nat }\n\
+        "type T 'a = { next: T Nat }\n\
+         type U 'a = { next: U Nat }\n\
          let f : T {} -> U {} = fn x => x",
     );
 
     // A permutation: the arguments only ever swap places, so the lists they
     // make are finitely many.
     inferred(
-        "type A a b = { x: B b a, v: a }\n\
-         type B c d = { x: A d c, v: c }\n\
-         type P a b = { x: Q b a, v: a }\n\
-         type Q c d = { x: P d c, v: c }\n\
+        "type A 'a 'b = { x: B 'b 'a, v: 'a }\n\
+         type B 'c 'd = { x: A 'd 'c, v: 'c }\n\
+         type P 'a 'b = { x: Q 'b 'a, v: 'a }\n\
+         type Q 'c 'd = { x: P 'd 'c, v: 'c }\n\
          let f : A Nat {} -> P Nat {} = fn x => x",
     );
 }
@@ -2421,7 +2421,7 @@ fn a_tag_is_open_where_a_struct_literal_is_closed() {
 #[test]
 fn a_tag_fits_a_declaration_that_allows_its_case() {
     let (mint, _, out) = inferred(
-        "type Option T = #Some T | #None\n\
+        "type Option 'T = #Some 'T | #None\n\
          let some : Option Nat = #Some 1\n\
          let none : Option Nat = #None",
     );
@@ -2431,7 +2431,7 @@ fn a_tag_fits_a_declaration_that_allows_its_case() {
     // And the annotation is what the definition means downstream, so a second
     // definition can take it as the declared type.
     let (mint, _, out) = inferred(
-        "type Option T = #Some T | #None\n\
+        "type Option 'T = #Some 'T | #None\n\
          let some : Option Nat = #Some 1\n\
          let again : Option Nat = some",
     );
@@ -2488,7 +2488,7 @@ fn a_struct_and_a_sum_are_never_the_same_type() {
 #[test]
 fn a_declaration_may_take_the_rest_of_a_sum() {
     let (mint, _, out) = inferred(
-        "type Fallible r = #Err Nat | ..r\n\
+        "type Fallible 'r = #Err Nat | ..'r\n\
          let ok : Fallible (#Ok Nat) = #Ok 1",
     );
     assert_eq!(scheme(&mint, &out, "ok"), "Fallible (#Ok Nat)");
@@ -2497,7 +2497,7 @@ fn a_declaration_may_take_the_rest_of_a_sum() {
     // site repeating one of its cases is refused where the argument is
     // written — before anything unfolds.
     let (_, out, _) = infer_src(
-        "type Fallible r = #Err Nat | ..r\n\
+        "type Fallible 'r = #Err Nat | ..'r\n\
          let bad : Fallible (#Err Nat) = #Err 1",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
@@ -2584,7 +2584,7 @@ fn a_case_may_be_marked_optional() {
 #[test]
 fn a_sum_may_name_itself() {
     let (mint, _, out) = inferred(
-        "type List a = #Nil | #Cons { head: a, tail: List a }\n\
+        "type List 'a = #Nil | #Cons { head: 'a, tail: List 'a }\n\
          let empty : List Nat = #Nil\n\
          let one : List Nat = #Cons { head: 1, tail: empty }",
     );
@@ -2868,7 +2868,7 @@ fn two_presences_that_already_agree_need_no_rule_of_their_own() {
 /// condition is recorded only where 'there is one.
 #[test]
 fn a_rest_that_stands_for_everything_forbids_nothing() {
-    let (mint, _, output) = inferred("type Only r = { ..r }\nlet v : Only { x: Nat } = { x: 1 }");
+    let (mint, _, output) = inferred("type Only 'r = { ..'r }\nlet v : Only { x: Nat } = { x: 1 }");
     assert_eq!(scheme(&mint, &output, "v"), "Only { x: Nat }");
 }
 
@@ -2879,8 +2879,8 @@ fn a_rest_that_stands_for_everything_forbids_nothing() {
 #[test]
 fn a_recursive_constructor_carrying_an_arrow_comes_back_round() {
     let (mint, _, output) = inferred(
-        "type List a = { head: a, tail: List a }\n\
-         type Seq a = { head: a, tail: Seq a }\n\
+        "type List 'a = { head: 'a, tail: List 'a }\n\
+         type Seq 'a = { head: 'a, tail: Seq 'a }\n\
          let f : List (Nat -> Nat) -> Seq (Nat -> Nat) = fn x => x",
     );
     assert_eq!(
@@ -2916,10 +2916,10 @@ fn a_demand_on_the_actual_side_still_names_the_type_with_no_fields() {
 #[test]
 fn an_assumption_matches_through_a_variable_the_two_sides_share() {
     let (mint, _, output) = inferred(
-        "type Tree a = { value: a, kids: Nest a }\n\
-         type Nest a = { head: Tree a, tail: Nest a }\n\
-         type Wood a = { value: a, kids: Grove a }\n\
-         type Grove a = { head: Wood a, tail: Grove a }\n\
+        "type Tree 'a = { value: 'a, kids: Nest 'a }\n\
+         type Nest 'a = { head: Tree 'a, tail: Nest 'a }\n\
+         type Wood 'a = { value: 'a, kids: Grove 'a }\n\
+         type Grove 'a = { head: Wood 'a, tail: Grove 'a }\n\
          let peek : Tree { x when 'a: Nat } -> Nat = fn t => 1\n\
          let take : Wood { x when 'b: Nat } -> Nat = fn w => 2\n\
          let q = fn w => { a: peek w, b: take w }",
@@ -2941,8 +2941,8 @@ fn an_assumption_compares_arguments_of_every_shape() {
     // one row, and the row picked up a field whose type nothing decides, so the
     // comparison reaches a variable against itself.
     let (mint, _, output) = inferred(
-        "type A r = { next: B r, ..r }\n\
-         type B r = { next: A r, ..r }\n\
+        "type A 'r = { next: B 'r, ..'r }\n\
+         type B 'r = { next: A 'r, ..'r }\n\
          let use : { ..'s } -> A { ..'s } -> B { ..'s } -> Nat = fn c => fn x => fn y => 1\n\
          let n = fn z => fn w => use { j: w } z z",
     );
@@ -2950,8 +2950,8 @@ fn an_assumption_compares_arguments_of_every_shape() {
 
     // An argument that is a sum, compared case by case.
     let (mint, _, output) = inferred(
-        "type A a = { v: a, next: B a }\n\
-         type B a = { v: a, next: A a }\n\
+        "type A 'a = { v: 'a, next: B 'a }\n\
+         type B 'a = { v: 'a, next: A 'a }\n\
          let f : A (#X | #Y) -> Nat = fn p => 1\n\
          let g : B (#X | #Y) -> Nat = fn p => 1\n\
          let h = fn z => { a: f z, b: g z }",
@@ -2964,8 +2964,8 @@ fn an_assumption_compares_arguments_of_every_shape() {
     // Two rows still open, at the same tail: the same row, so the goal is the
     // one already on the stack.
     let (mint, _, output) = inferred(
-        "type A r = { next: B r, ..r }\n\
-         type B r = { next: A r, ..r }\n\
+        "type A 'r = { next: B 'r, ..'r }\n\
+         type B 'r = { next: A 'r, ..'r }\n\
          let use : A { p: Nat, ..'s } -> B { p: Nat, ..'s } -> Nat = fn x => fn y => 1\n\
          let n = fn z => use z z",
     );
@@ -2976,8 +2976,8 @@ fn an_assumption_compares_arguments_of_every_shape() {
     // as at the open one they were reached with, and assuming the one for the
     // other would answer a question nobody asked.
     let (mint, _, output) = inferred(
-        "type A r = { next: B r, alt: B { p: Nat }, ..r }\n\
-         type B r = { next: A r, alt: A { p: Nat }, ..r }\n\
+        "type A 'r = { next: B 'r, alt: B { p: Nat }, ..'r }\n\
+         type B 'r = { next: A 'r, alt: A { p: Nat }, ..'r }\n\
          let use : A { p: Nat, ..'s } -> B { p: Nat, ..'s } -> Nat = fn x => fn y => 1\n\
          let n = fn z => use z z",
     );
@@ -2991,7 +2991,7 @@ fn an_assumption_compares_arguments_of_every_shape() {
 #[test]
 fn one_declaration_applied_to_something_is_not_settled_by_its_name() {
     let (mint, _, output) = inferred(
-        "type List a = { head: a, tail: List a }\n\
+        "type List 'a = { head: 'a, tail: List 'a }\n\
          let f : List Nat -> Nat = fn x => 1\n\
          let g : List Nat -> Nat = fn x => f x",
     );
@@ -3059,8 +3059,8 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
          let f : Tree ({} -> Nat) -> Tree2 ({} -> Nat) = fn x => x",
     ] {
         let src = format!(
-            "type Tree x = {{ v: x, k: Bush }}\n\
-             type Tree2 x = {{ v: x, k: Bush2 }}\n{src}"
+            "type Tree 'x = {{ v: 'x, k: Bush }}\n\
+             type Tree2 'x = {{ v: 'x, k: Bush2 }}\n{src}"
         );
         let (_, out, output) = infer_src(&src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -3072,9 +3072,9 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
     // unannotated so that unifying the two presences is not the annotation being
     // narrowed.
     let (mint, _, output) = inferred(
-        "type Tree x = { v: x, k: Bush }\n\
+        "type Tree 'x = { v: 'x, k: Bush }\n\
          type Bush = { t: Tree { a: Nat } }\n\
-         type Tree2 x = { v: x, k: Bush2 }\n\
+         type Tree2 'x = { v: 'x, k: Bush2 }\n\
          type Bush2 = { t: Tree2 { a: Nat } }\n\
          let g : Tree { a when 'a: Nat } -> Nat = fn x => 1\n\
          let h : Tree2 { a when 'b: Nat } -> Nat = fn x => 2\n\
@@ -3294,9 +3294,9 @@ fn fields_on_every_type_change_only_the_schemes_a_projection_reaches() {
     // A sum's own field row is empty and closed, so nothing about sums prints
     // with a `with` either — and a declaration taking a row is untouched.
     let (mint, _, output) = inferred(
-        "type Option T = #Some T | #None\n\
+        "type Option 'T = #Some 'T | #None\n\
          let some = #Some 1\n\
-         type Tagged r = { tag: Nat, ..r }\n\
+         type Tagged 'r = { tag: Nat, ..'r }\n\
          let tag : Tagged { note: Nat } -> Nat = fn t => t.tag\n",
     );
     assert_eq!(scheme(&mint, &output, "some"), "#Some Nat | ..'a");
@@ -3594,7 +3594,7 @@ fn the_labels_of_two_types_are_decided_by_what_their_cores_allow() {
 #[test]
 fn a_struct_tail_handed_a_known_type_unfolds_to_a_with() {
     let (mint, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX Nat -> Nat = fn p => p.x",
     );
     // The scheme reads as the name the reader wrote.
@@ -3612,7 +3612,7 @@ fn a_struct_tail_handed_a_known_type_unfolds_to_a_with() {
     // A declared type carrying no fields of its own is the ordinary case and
     // wears no `with` at all.
     let (mint, _, output) = inferred(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          type Foo = { y: Nat }\n\
          let g : WithX Foo -> Nat = fn p => p.y\n\
          let a : WithX { y: Nat } = { x: 1, y: 2 }\n\
@@ -3625,7 +3625,7 @@ fn a_struct_tail_handed_a_known_type_unfolds_to_a_with() {
     // A parameter read as a field's type and as the `..` is one reading twice,
     // so the declaration means what both said and unfolds to it.
     let (mint, _, output) = inferred(
-        "type W r = { f: r, ..r }\n\
+        "type W 'r = { f: 'r, ..'r }\n\
          let w : W { y: Nat } = { f: { y: 3 }, y: 4 }",
     );
     assert_eq!(scheme(&mint, &output, "w"), "W { y: Nat }");
@@ -3774,7 +3774,7 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
 #[test]
 fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
     let (_, out, output) = infer_src(
-        "type Or r = #A | ..r\n\
+        "type Or 'r = #A | ..'r\n\
          let f : Or (#B Nat | ..'s) -> Nat = fn p => 1",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -3783,7 +3783,7 @@ fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
     // And the condition bites where the argument's own tail would have to take
     // the case the declaration already names.
     let (_, _, output) = infer_src(
-        "type Or r = #A | ..r\n\
+        "type Or 'r = #A | ..'r\n\
          let mk : (#A) -> Nat = fn p => 1\n\
          let f : Or (#B Nat | ..'s) -> Nat = fn p => f p",
     );
@@ -3802,10 +3802,10 @@ fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
 #[test]
 fn an_assumption_compares_a_sum_argument_as_a_sum() {
     let (mint, _, output) = inferred(
-        "type Tree a = { value: a, kids: Nest a }\n\
-         type Nest a = { head: Tree (#A Nat), other: Tree (#C Nat), tail: Nest a }\n\
-         type Wood a = { value: a, kids: Grove a }\n\
-         type Grove a = { head: Wood (#A Nat), other: Wood (#C Nat), tail: Grove a }\n\
+        "type Tree 'a = { value: 'a, kids: Nest 'a }\n\
+         type Nest 'a = { head: Tree (#A Nat), other: Tree (#C Nat), tail: Nest 'a }\n\
+         type Wood 'a = { value: 'a, kids: Grove 'a }\n\
+         type Grove 'a = { head: Wood (#A Nat), other: Wood (#C Nat), tail: Grove 'a }\n\
          let f : Tree (#A Nat | ..'r) -> Nat = fn t => 1\n\
          let g : Wood (#A Nat | ..'r) -> Nat = fn w => 1\n\
          let h = fn v => { one: f v, two: g v }",
@@ -4121,7 +4121,7 @@ fn a_published_scheme_keeps_its_presences_below_its_types() {
             "#A Nat | ..'a -> Nat",
         ),
         (
-            "type Box A = { it: A }\n\
+            "type Box 'A = { it: 'A }\n\
              let k = let f : Box 'b -> 'b = fn x => x.it in f",
             "Box 'a -> 'a",
         ),
@@ -4241,11 +4241,11 @@ fn an_ascribed_absence_refuses_the_field_and_nothing_else() {
 #[test]
 fn an_ascribed_absence_refuses_the_case_and_nothing_else() {
     let (mint, _, output) =
-        inferred("type NoErr r = #Ok Nat | \\#Err | ..r\nlet ok : NoErr (#Warn Nat) = #Ok 1");
+        inferred("type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet ok : NoErr (#Warn Nat) = #Ok 1");
     assert_eq!(scheme(&mint, &output, "ok"), "NoErr (#Warn Nat)");
 
     let (_, out, output) =
-        infer_src("type NoErr r = #Ok Nat | \\#Err | ..r\nlet bad : NoErr (#Warn Nat) = #Err 1");
+        infer_src("type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet bad : NoErr (#Warn Nat) = #Err 1");
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert!(!output.errors.is_empty(), "the absent case was allowed");
     assert!(
@@ -4304,7 +4304,7 @@ fn a_shared_rest_lacks_the_absent_label() {
 #[test]
 fn a_match_without_a_default_closes_the_sum() {
     let (mint, _, output) = inferred(
-        "type Option T = #Some T | #None\n\
+        "type Option 'T = #Some 'T | #None\n\
          let get = fn opt => match opt with | #Some x => x | #None => 0 end",
     );
     assert_eq!(scheme(&mint, &output, "get"), "#Some Nat | #None -> Nat");
@@ -4671,9 +4671,9 @@ fn a_wildcard_struct_leaf_still_demands_its_field() {
 /// binding for anything to constrain.
 #[test]
 fn a_wildcard_arm_types_as_a_named_catch_all() {
-    let with_wildcard = "type Option T = #Some T | #None\n\
+    let with_wildcard = "type Option 'T = #Some 'T | #None\n\
                          let get = fn opt => match opt with | #Some x => x | _ => 0 end";
-    let with_name = "type Option T = #Some T | #None\n\
+    let with_name = "type Option 'T = #Some 'T | #None\n\
                      let get = fn opt => match opt with | #Some x => x | z => 0 end";
     let (mint, _, output) = inferred(with_wildcard);
     let wild = scheme(&mint, &output, "get");
@@ -4684,7 +4684,7 @@ fn a_wildcard_arm_types_as_a_named_catch_all() {
     assert_eq!(wild, "#Some Nat | ..'a -> Nat");
 
     let (mint, _, output) = inferred(
-        "type Option T = #Some T | #None\n\
+        "type Option 'T = #Some 'T | #None\n\
          let get : Option Nat -> Nat = fn opt => match opt with | #Some x => x | _ => 0 end",
     );
     assert_eq!(scheme(&mint, &output, "get"), "Option Nat -> Nat");
@@ -5330,7 +5330,7 @@ fn an_annotation_that_rules_itself_out_is_refused() {
 #[test]
 fn a_use_site_reads_labels_through_the_whole_type() {
     let (_, _, output) = inferred(
-        "type Box a = { it: a }\n\
+        "type Box 'a = { it: 'a }\n\
          let p : { x when 'a: Nat, y when 'b: Nat } -> Box (#A Nat | #B (when 'c)) where 'a != 'b =\n\
          \x20 fn v => { it: #A 1 }\n\
          let q = p { x: 1 }",
@@ -5545,7 +5545,7 @@ fn an_arms_body_is_the_operations_result() {
 #[test]
 fn a_row_of_effects_may_be_handed_to_a_declaration() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}type Runner e = (Nat -> Nat + ..e) -> Nat\n\
+        "{EFFECTS}type Runner 'e = (Nat -> Nat + ..'e) -> Nat\n\
          let run : Runner (!Log) -> Nat = fn r => 1\n\
          let both : Runner (!Log + !IO) -> Nat = fn r => 1"
     ));
@@ -5560,7 +5560,7 @@ fn a_row_of_effects_may_be_handed_to_a_declaration() {
     // Unfolded — which is what a complaint about the type shows — the row is
     // the arrow's own effects, and reads as the effects it is.
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}type Runner e = (Nat -> Nat + ..e) -> Nat\n\
+        "{EFFECTS}type Runner 'e = (Nat -> Nat + ..'e) -> Nat\n\
          let bad : Runner (!Log) = 1"
     ));
     let [error] = &output.errors[..] else {
@@ -5871,8 +5871,8 @@ fn an_abandoned_effect_presence_prints_as_a_question() {
 #[test]
 fn an_assumption_compares_the_arguments_it_was_pushed_at() {
     let (mint, _, output) = inferred(
-        "type A a = { v: a, next: A (Nat -> {}) }\n\
-         type B a = { v: a, next: B (Nat -> {}) }\n\
+        "type A 'a = { v: 'a, next: A (Nat -> {}) }\n\
+         type B 'a = { v: 'a, next: B (Nat -> {}) }\n\
          let f : A (Nat -> Nat) -> Nat = fn x => 1\n\
          let g : B (Nat -> Nat) -> Nat = fn x => 1\n\
          let h = fn v => { one: f v, two: g v }",

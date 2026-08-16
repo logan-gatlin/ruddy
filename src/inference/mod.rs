@@ -579,7 +579,7 @@ pub enum ErrorKind {
     /// at the declaring name, which is the line that has to change.
     RigidEscapes { name: Rc<str> },
     /// A `..` was decided to stand for a label the row it tails already names.
-    /// `{ x: Nat, ..r }` says "an `x`, plus whatever else `r` is", so `r`
+    /// `{ x: Nat, ..'r }` says "an `x`, plus whatever else `'r` is", so `'r`
     /// standing for anything that certainly has an `x` of its own would name
     /// the field twice — and the two copies could disagree. Certainly has,
     /// because presence is the whole of what a second copy is: an `x` settled
@@ -1855,8 +1855,9 @@ impl Table {
             // must acquire the labels around it.
             //
             // And the declaration has something to say about the argument
-            // itself, at every position it takes a row: `type WithX r = { x:
-            // Nat, ..r }` says whatever is written for `r` has no `x`, and that
+            // itself, at every position it takes a row: `type WithX 'r = { x:
+            // Nat, ..'r }` says whatever is written for `'r` has no `x`, and
+            // that
             // holds whether or not anything ever unfolds `WithX` to find out.
             // Recorded here, where the application is, rather than left to
             // [`Solve::unfold`] — a goal decided by [`Rule::Congruent`] never
@@ -2337,8 +2338,8 @@ impl Table {
     /// this table's variables.
     ///
     /// A declaration's body says which of its rows a `..` parameter is the tail
-    /// of, but the condition that follows — `type WithX r = { x: Nat, ..r }`
-    /// says `r` has no `x` — is not part of the body. It lived beside variables
+    /// of, but the condition that follows — `type WithX 'r = { x: Nat, ..'r }`
+    /// says `'r` has no `x` — is not part of the body. It lived beside variables
     /// the declaration never had, and this use site's are new, so it has to be
     /// said again of them. Exactly what [`Constrain::instantiate`] does for a
     /// scheme, for exactly the same reason.
@@ -2468,7 +2469,7 @@ impl Table {
     /// `value`'s own rows impose their names on their own tails, which is
     /// [`note_lacks`](Self::note_lacks).
     ///
-    /// Without this a condition would survive exactly one binding: `..r`
+    /// Without this a condition would survive exactly one binding: `..'r`
     /// absorbing a `y` continues as a fresh tail, and that tail is where the
     /// next field to conflict would arrive.
     fn inherit_lacks(&mut self, var: TyVar, value: &Assigned) {
@@ -2533,7 +2534,7 @@ impl Table {
     /// genuinely does link two arrows occurs twice and is quantified.
     ///
     /// Only variables inference minted, which after a variable is what an
-    /// effect tail a reader kept is *not*: a named `..e` is declared and lowers
+    /// effect tail a reader kept is *not*: a named `..'e` is declared and lowers
     /// to a rigid, which is no solver variable and is never counted here. What
     /// the reader left anonymous — a bare `+ ..`, or no row at all — is
     /// inference's to decide, and this is the deciding.
@@ -2777,7 +2778,7 @@ impl Table {
             }
             Core::Sum(cases) => self.quantify_row(cases, subst, level, presences),
             // An argument left open is the definition's to quantify, the same
-            // as one written anywhere else: `WithX ..a -> Nat` names its tail
+            // as one written anywhere else: `WithX ..'a -> Nat` names its tail
             // because this descends.
             Core::Named { args, .. } => {
                 for arg in args.iter() {
@@ -3197,12 +3198,12 @@ fn shift_labels(labels: &IndexMap<String, RowField>, by: u32) -> IndexMap<String
 /// itself; the mint is here only to spell it, never to decide anything.
 ///
 /// The table is here for the parts of an annotation that stand for something
-/// the definition gets to decide: a `..` tail, a `..r` tail, and a `when` field
+/// the definition gets to decide: a `..` tail, a `..'r` tail, and a `when` field
 /// each lower to a fresh variable, minted at the level the annotation is
 /// lowered at so that what stays unconstrained is quantified with the
 /// definition. One call is one annotation, which is the whole scope of a
-/// tail's name: every `..r` in it shares one variable, and no other
-/// annotation's `r` can reach it.
+/// tail's name: every `..'r` in it shares one variable, and no other
+/// annotation's `'r` can reach it.
 ///
 /// A `type` declaration's body reaches none of that. A `when` and a bare `..` are
 /// refused there outright, and the one tail it may have names a row parameter,
@@ -3215,7 +3216,7 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
     let mut tails = Tails::default();
     let lowered = lower(mint, table, &mut tails, ty);
     // A tail stands for the fields its row did not write out, and this is
-    // where that is first true of a written one: `{ x: Nat, ..r }` says `r`
+    // where that is first true of a written one: `{ x: Nat, ..'r }` says `'r`
     // has no `x`. See [`Table::lacks`].
     table.note_lacks(&lowered);
     lowered
@@ -3567,8 +3568,8 @@ fn presence(table: &mut Table, tails: &Tails, when: &Option<Box<ir::When>>) -> P
 }
 
 /// The cases of a written sum and what its `..` stands for, assembled into the
-/// row. `..` is a variable this definition may decide, `..r` is that variable
-/// shared across one annotation, and `..r` naming a parameter is a position an
+/// row. `..` is a variable this definition may decide, `..'r` is that variable
+/// shared across one annotation, and `..'r` naming a parameter is a position an
 /// argument is handed to.
 fn row(
     table: &mut Table,
@@ -3579,7 +3580,7 @@ fn row(
     let rest = match tail.as_ref().map(|tail| &tail.of) {
         None => Rest::Closed,
         Some(ir::Row::Anything) => table.fresh_row(),
-        // The rigid its declaration minted, shared by every `..r` in this one
+        // The rigid its declaration minted, shared by every `..'r` in this one
         // annotation. Indexed for the reason [`presence`] is.
         Some(ir::Row::Named(name)) => tails.rows[name].clone(),
         // A row parameter is its position, the same as a type one: what it
@@ -3596,13 +3597,13 @@ fn row(
 /// nothing, so every label holds [`Ty::unit`] and no walk ever looks at it. The
 /// tail goes the same four ways a sum's does — no `..` is [`Rest::Closed`],
 /// which is what a pure arrow has; a bare `..` is a variable this definition
-/// may decide; `..e` is that variable shared across one annotation; and `..e`
+/// may decide; `..'e` is that variable shared across one annotation; and `..'e`
 /// naming a parameter is the position an argument is handed to.
 ///
 /// The variables a bare `..` mints are ordinary solver variables, which is what
 /// makes them R23's to close: what a reader left anonymous is inference's to
 /// decide ([`Table::close_effects`]). A tail the reader *named* is out of R23's
-/// reach by construction — `..e` lowers to a rigid, which is no solver variable
+/// reach by construction — `..'e` lowers to a rigid, which is no solver variable
 /// and is never counted.
 fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> Row {
     let mut labels = IndexMap::new();
@@ -3630,7 +3631,7 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
 /// type, so each of the four tails lowers to the core that already means it. No
 /// tail at all is [`Core::Unit`] — the type with nothing of its own, which
 /// allows no field it does not name. A bare `..` is a variable this definition
-/// may decide, `..r` is that variable shared across one annotation, and `..r`
+/// may decide, `..'r` is that variable shared across one annotation, and `..'r`
 /// naming a parameter is a [`Core::Bound`], the position an argument is handed
 /// to — which is what keeps a declaration's body free of solver variables.
 fn core_tail(table: &mut Table, tails: &mut Tails, tail: &Option<Tail>) -> Core {
@@ -3683,9 +3684,9 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     // A step whose body is a parameter hands back an argument instead, and the
     // budget resets: what is left to unfold starts a new chain, and correct
     // programs put no bound on how many chains one call walks. Not
-    // `aliases.len()` — `type Id a = a` written `Id (Id Nat)` is two
+    // `aliases.len()` — `type Id 'a = 'a` written `Id (Id Nat)` is two
     // hand-backs from one declaration — and not any function of the table:
-    // each layer of `type I1 a = I0 (I0 a)`, `type I2 a = I1 (I1 a)`, …
+    // each layer of `type I1 'a = I0 (I0 'a)`, `type I2 'a = I1 (I1 'a)`, …
     // doubles the walk, so a tower of aliases is a correct program whose walk
     // is exponential in the declarations it holds.
     //
@@ -3768,7 +3769,7 @@ impl Ty {
         let core = match &self.core {
             // Not a leaf: what the variable stands for may carry fields, and
             // the fields written outside it are kept over them. This is what a
-            // struct's row parameter is — `type WithX r = { x: Nat, ..r }` puts
+            // struct's row parameter is — `type WithX 'r = { x: Nat, ..'r }` puts
             // its parameter here — so opening one is the substitution every
             // other position already had.
             Core::Bound(index) => {
@@ -3779,7 +3780,8 @@ impl Ty {
             }
             Core::Sum(cases) => Core::Sum(cases.open(fresh)),
             // A declaration's own body reaches here holding its parameters, so
-            // `type Wrap a = { inner: Pair a a }` depends on this arm entirely.
+            // `type Wrap 'a = { inner: Pair 'a 'a }` depends on this arm
+            // entirely.
             Core::Named { symbol, name, args } => Core::Named {
                 symbol: *symbol,
                 name: name.clone(),

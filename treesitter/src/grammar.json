@@ -103,7 +103,7 @@
             "name": "parameter",
             "content": {
               "type": "SYMBOL",
-              "name": "identifier"
+              "name": "type_variable"
             }
           }
         },
@@ -1814,17 +1814,8 @@
               "type": "FIELD",
               "name": "name",
               "content": {
-                "type": "CHOICE",
-                "members": [
-                  {
-                    "type": "SYMBOL",
-                    "name": "identifier"
-                  },
-                  {
-                    "type": "SYMBOL",
-                    "name": "type_variable"
-                  }
-                ]
+                "type": "SYMBOL",
+                "name": "type_variable"
               }
             },
             {

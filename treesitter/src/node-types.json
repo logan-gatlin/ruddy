@@ -1741,10 +1741,6 @@
         "required": false,
         "types": [
           {
-            "type": "identifier",
-            "named": true
-          },
-          {
             "type": "type_variable",
             "named": true
           }
@@ -2320,7 +2316,7 @@
         "required": false,
         "types": [
           {
-            "type": "identifier",
+            "type": "type_variable",
             "named": true
           }
         ]

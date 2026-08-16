@@ -26,9 +26,16 @@ pub enum StmtKind {
     },
     Type {
         name: TrackedString,
-        /// The parameters the declaration binds, in the order written. Empty
-        /// for the plain `type T = ...`, which is every declaration the
-        /// language had before it could take any.
+        /// The parameters the declaration binds, in the order written, each
+        /// without its `'`. Empty for the plain `type T = ...`, which is every
+        /// declaration the language had before it could take any.
+        ///
+        /// Written as variables — `type Pair 'a 'b` — because that is what
+        /// they are: the one thing a use site picks. A bare name in a type
+        /// resolves to something declared elsewhere, and a parameter resolves
+        /// to nothing at all until the declaration is applied, so it wears the
+        /// same `'` an annotation's variable does. See
+        /// [`Kind::Variable`](crate::token::Kind::Variable).
         ///
         /// What each one stands for — a type, or the fields a row does not
         /// name — is not written here and is not the parser's to know: it
@@ -323,13 +330,19 @@ pub enum TypeKind {
     Ident {
         name: TrackedString,
     },
-    /// `'a` — a variable of the annotation this type is written in.
+    /// `'a` — a variable: the parameter of the declaration this type is the
+    /// body of, or a variable of the annotation it is written in.
     ///
     /// Its own node rather than an [`Ident`](TypeKind::Ident), because the
     /// sigil has already told them apart: a bare name resolves to something
-    /// declared elsewhere — a parameter, a declared type, a primitive — and
-    /// this one resolves to nothing at all. It is introduced by being written,
-    /// and what it stands for is whatever the uses beside it need.
+    /// declared elsewhere — a declared type or a primitive — and this one
+    /// resolves to whatever the type it is written in hands it.
+    ///
+    /// Which of the two it is, is not the parser's to know: a declaration binds
+    /// its parameters in its header and an annotation binds nothing, so the
+    /// answer is a question about the scope the type sits in. See
+    /// [`ir::ErrorKind::VariableInDeclaration`](crate::ir::ErrorKind), which is
+    /// what a declaration writing one its header did not bind is told.
     Variable {
         name: TrackedString,
     },
@@ -346,7 +359,7 @@ pub enum TypeKind {
     /// the labels, the `+`s between them, a `\` on any written absent, and the
     /// `..` tail last. Its span is the row's own.
     ///
-    /// A row of nothing but a tail is written `..r`, with no labels in front of
+    /// A row of nothing but a tail is written `..'r`, with no labels in front of
     /// it. That is the one form with no effect in it at all, and it is how a
     /// rest is handed on by itself.
     ///
@@ -388,7 +401,7 @@ pub enum TypeField {
 /// or the `\` that says the case is not there at all.
 ///
 /// A `when` is not what a `..` tail says. `#A (when a) Nat | #B` allows `A`
-/// or not and nothing else beyond `B`; `#B | ..r` allows anything at all
+/// or not and nothing else beyond `B`; `#B | ..'r` allows anything at all
 /// beyond `B`. Neither can be written as the other, which is why both are here.
 ///
 /// `payload` is `None` for a case written bare. That means unit — the same
@@ -527,18 +540,17 @@ pub struct Tail {
 
 /// What a tail stands for, as written.
 ///
-/// The sigil decides which of the two named forms it is, and nothing else does:
-/// a declaration's parameter is bound in its header and written bare, and a
-/// variable is introduced by being written and wears its `'`. Keeping them
-/// apart here is what lets lowering resolve one and mint the other without
-/// asking what kind of thing it is in.
+/// Two forms rather than three: a named tail is a variable, and whether that
+/// variable is the parameter of the declaration this type is the body of is a
+/// question about the scope around it rather than about the syntax. A bare name
+/// after the dots is no tail at all — it names something declared elsewhere, and
+/// nothing declared elsewhere is the rest of a row.
 #[derive(Debug, Clone)]
 pub enum Rest {
     /// `..` — anything at all, named by nothing and shared with no other tail.
     Anything,
-    /// `..e` — the parameter of the declaration this type is the body of.
-    Param(TrackedString),
-    /// `..'r` — a variable of the annotation this type is written in.
+    /// `..'r` — the parameter of the declaration this type is the body of, or a
+    /// variable of the annotation it is written in.
     Variable(TrackedString),
 }
 
@@ -547,7 +559,7 @@ impl Rest {
     pub fn span(&self) -> Option<Span> {
         match self {
             Rest::Anything => None,
-            Rest::Param(name) | Rest::Variable(name) => Some(name.span),
+            Rest::Variable(name) => Some(name.span),
         }
     }
 }
@@ -592,8 +604,8 @@ pub enum Place {
     /// Not a type expression any more: `_` there is
     /// [`TypeKind::Hole`], the position left for inference to decide. What is
     /// left are the three places a `_` still names nothing — a declaration
-    /// binds names rather than types, and a formula is written about presences
-    /// a `when` gave names to.
+    /// binds a name and variables rather than types, and a formula is written
+    /// about presences a `when` gave names to.
     Type,
 }
 
@@ -728,12 +740,11 @@ impl Parser {
         }
     }
 
-    /// What a `..` stands for: the parameter or variable named after it, or
-    /// nothing at all. Read wherever a tail is, so that the three tails of the
-    /// three shapes agree on what may follow the dots by construction.
+    /// What a `..` stands for: the variable named after it, or nothing at all.
+    /// Read wherever a tail is, so that the three tails of the three shapes
+    /// agree on what may follow the dots by construction.
     fn rest_name(&mut self) -> Rest {
         match self.peek().map(|tok| &tok.tracked) {
-            Some(Kind::Identifier(_)) => Rest::Param(self.ident().expect("just peeked a name")),
             Some(Kind::Variable(_)) => {
                 Rest::Variable(self.variable().expect("just peeked a variable"))
             }
@@ -927,7 +938,7 @@ impl Parser {
         }))
     }
 
-    /// `type <name> <param>* = <type>`. The parameters are plain names, and the
+    /// `type <name> <'param>* = <type>`. The parameters are variables, and the
     /// list ends at the `=` — so an empty one is not the error an empty
     /// [`function_expr`](Self::function_expr) argument list is: a type taking
     /// no parameters is the ordinary case.
@@ -941,11 +952,8 @@ impl Parser {
         }
         let name = self.ident()?;
         let mut params = Vec::new();
-        while matches!(
-            self.peek().map(|tok| &tok.tracked),
-            Some(Kind::Identifier(_))
-        ) {
-            params.push(self.ident().expect("the loop peeked a name"));
+        while matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Variable(_))) {
+            params.push(self.variable().expect("the loop peeked a variable"));
         }
         if self.at_wildcard() {
             return self.wildcard(Place::Type);
@@ -1837,9 +1845,9 @@ impl Parser {
     /// says which row is being written.
     ///
     /// A leading `..` is a row of no labels, which is the same row whichever
-    /// shape it is read as: `..r` names a rest and nothing else, so there is
+    /// shape it is read as: `..'r` names a rest and nothing else, so there is
     /// nothing in it for a shape to disagree about. It is read here so that a
-    /// rest can be handed to a declaration on its own — `LogFn (..r)` — the way
+    /// rest can be handed to a declaration on its own — `LogFn (..'r)` — the way
     /// one with labels beside it already could be.
     fn at_effects(&self) -> bool {
         match self.peek().map(|tok| &tok.tracked) {
@@ -1932,7 +1940,7 @@ impl Parser {
     /// tag, or the `\` of a case written absent. The leading `|` is optional,
     /// as it is in every language that writes sums this way, and it is what
     /// makes the two degenerate forms writable — `|` alone is the sum with no
-    /// cases, and `| ..r` is the sum that is nothing but its tail.
+    /// cases, and `| ..'r` is the sum that is nothing but its tail.
     ///
     /// The tail is the `..` a struct type already has, standing for the cases
     /// not written out rather than the fields, and it comes last for the same
@@ -1991,7 +1999,7 @@ impl Parser {
                 let key = slash.span.merge(name.span).track(name.tracked);
                 cases.insert(key, SumCase::Absent);
             } else {
-                // `|` with nothing after it is the empty sum, and `| ..r` broke
+                // `|` with nothing after it is the empty sum, and `| ..'r` broke
                 // out above, so the only thing left that a case can begin with
                 // is a tag. Anything else ends the sum rather than failing: a
                 // `->` or a `)` after the last case is somebody else's token.

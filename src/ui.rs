@@ -603,7 +603,7 @@ impl fmt::Display for ir::ErrorKind {
             // in the header is the fix, and naming it is shorter than
             // describing it.
             ir::ErrorKind::VariableInDeclaration => f.write_str(
-                "a declared type's variables are its parameters, so there is nothing here for a caller to pick; write `type T a = ...`",
+                "a declared type's variables are its parameters, so this one has to be written in its header; write `type T 'a = ...`",
             ),
             // And the same about a `_`, which leaves open the one thing a
             // declaration has no way to leave open.
@@ -888,8 +888,8 @@ impl fmt::Display for Shape {
 /// [`ir::ErrorKind::MixedParameter`] and [`ir::ErrorKind::MixedTail`] each say
 /// twice and [`ir::ErrorKind::NotARow`] once.
 ///
-/// The rest of a struct is a whole type, so it has no phrase of its own: `..r`
-/// in a struct puts whatever is written for `r` in the type's core, and there is
+/// The rest of a struct is a whole type, so it has no phrase of its own: `..'r`
+/// in a struct puts whatever is written for `'r` in the type's core, and there is
 /// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1071,8 +1071,8 @@ impl Grouped for Core {
 /// Not the whole string, though, and deliberately not. A tail is written by
 /// whoever knows what it stands for, and the two readers know different
 /// things: the IR tab is showing a type as it was written, so it spells a
-/// named tail `..r`, while a scheme is showing what the definition was
-/// inferred to be, so it spells the same tail `..a`. `tests/src/print.rs`
+/// named tail `..'r`, while a scheme is showing what the definition was
+/// inferred to be, so it spells the same tail `..'a`. `tests/src/print.rs`
 /// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1543,7 +1543,7 @@ impl fmt::Display for Formula {
 /// the same either way — it stands for the labels not named, and what it stands
 /// for is spelled by what it resolved to.
 ///
-/// A splice that came to nothing is no tail. `..r` handed a closed row that
+/// A splice that came to nothing is no tail. `..'r` handed a closed row that
 /// names nothing leaves a tail saying exactly what [`Rest::Closed`] says, and
 /// the answer has to be the same for both: `∅` is the solver's mark for a row
 /// with nothing more to come and is never part of a printed type, so
@@ -2160,8 +2160,8 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
 /// The leading `|` the grammar allows is not written — `#A | #B` reads
 /// better inline, and inside the parentheses a nested sum needs it would be
 /// noise. It comes back for the one form that cannot do without it: a sum with
-/// no cases written out is `|`, and `| ..r` for one that is only a tail, since
-/// a bare `..r` begins no type the parser would read back.
+/// no cases written out is `|`, and `| ..'r` for one that is only a tail, since
+/// a bare `..'r` begins no type the parser would read back.
 pub fn write_sum<K: fmt::Display, V: Grouped>(
     f: &mut fmt::Formatter<'_>,
     cases: impl IntoIterator<Item = Entry<K, Option<V>>>,
@@ -2201,7 +2201,7 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
 ///
 /// [`write_sum`] minus two things, and both differences are the syntax's. An
 /// effect carries nothing, so no case writes a payload; and a row that is
-/// nothing but a tail is written `..e` rather than `+ ..e`, because the `+`
+/// nothing but a tail is written `..'e` rather than `+ ..'e`, because the `+`
 /// before it already says a row begins here and a second one would be noise.
 /// The empty closed row writes nothing at all, which is what a pure arrow is —
 /// so the caller leaves the whole clause off rather than calling this.

@@ -549,7 +549,7 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
 /// stands for follows from where the type uses it, exactly as a declaration
 /// parameter's does. The rows carry the declaring name's span, and the
 /// variable's own id as their [`Node::link`], which every use of that name in
-/// the type carries too — so clicking a `..r` in the type lights the `let r`
+/// the type carries too — so clicking a `..'r` in the type lights the `let r`
 /// that declared it, the same cross-highlighting a declaration's header gets
 /// from its symbols.
 fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation) -> Node {
@@ -842,7 +842,7 @@ fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail, scope: &[Variable]) -> Nod
     let (name, link) = match &tail.of {
         Row::Anything => (String::new(), None),
         Row::Named(name) => (format!("'{name}"), link_of(scope, name)),
-        Row::Param { symbol, .. } => (mint.name(*symbol).to_string(), None),
+        Row::Param { symbol, .. } => (format!("'{}", mint.name(*symbol)), None),
     };
     linked(
         Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span),

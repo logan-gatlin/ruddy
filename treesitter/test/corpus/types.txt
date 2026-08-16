@@ -53,46 +53,46 @@ let a : { x: Nat, y when 'p: Nat, \z, ..'r } -> Nat = f
 A tail names a declaration's parameter
 ================================================================================
 
-type Tagged r = { tag: Nat, ..r }
+type Tagged 'r = { tag: Nat, ..'r }
 
 --------------------------------------------------------------------------------
 
 (source_file
   (type_definition
     (identifier)
-    (identifier)
+    (type_variable)
     (annotation
       (struct_type
         (struct_type_field
           (identifier)
           (identifier))
         (rest
-          (identifier))))))
+          (type_variable))))))
 
 ================================================================================
 A sum type, with an optional leading bar
 ================================================================================
 
-type Option T = #Some T | #None
+type Option 'T = #Some 'T | #None
 
-type Tree a = | #Leaf | #Branch { value: a }
+type Tree 'a = | #Leaf | #Branch { value: 'a }
 
 --------------------------------------------------------------------------------
 
 (source_file
   (type_definition
     (identifier)
-    (identifier)
+    (type_variable)
     (annotation
       (sum_type
         (sum_case
           (tag)
-          (identifier))
+          (type_variable))
         (sum_case
           (tag)))))
   (type_definition
     (identifier)
-    (identifier)
+    (type_variable)
     (annotation
       (sum_type
         (sum_case
@@ -102,7 +102,7 @@ type Tree a = | #Leaf | #Branch { value: a }
           (struct_type
             (struct_type_field
               (identifier)
-              (identifier))))))))
+              (type_variable))))))))
 
 ================================================================================
 The empty sum is written with nothing but punctuation

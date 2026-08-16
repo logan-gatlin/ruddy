@@ -23,7 +23,8 @@ use super::{
 ///
 /// The one thing the two shapes still differ in, and so the one thing the shared
 /// label rule has to be told. A struct's fields run out where the core beside
-/// them says they do — `{ x: Nat, ..r }` is the type `r` carrying an `x` — and a
+/// them says they do — `{ x: Nat, ..'r }` is the type `'r` carrying an `x` —
+/// and a
 /// sum's cases run out where its row's [`Rest`] says they do, because
 /// [`Core::Sum`] is the only core with a case row and there is nowhere else for
 /// a sum's tail to live.
@@ -251,7 +252,7 @@ pub struct Solve<'a> {
     pub aliases: &'a IndexMap<Symbol, Scheme>,
     /// The declarations that are nominal within themselves: those every
     /// parameter of which survives unfolding, as `Pair`'s and `WithX`'s do and
-    /// `Ptr`'s in `type Ptr a = Nat` does not.
+    /// `Ptr`'s in `type Ptr 'a = Nat` does not.
     ///
     /// The one thing [`Rule::Congruent`] is allowed to decide by. Where every
     /// parameter reaches a position of the body, each argument sits in a
@@ -940,10 +941,10 @@ impl Solve<'_> {
         // both-sided case binds cleanly every round and never converges, so
         // the pair is refused here — the same cycle, caught one level up.
         //
-        // A label certainly absent is the exception. `{ \y, ..r }` against
-        // `{ ..r }` differs in nothing a value could have: the absence says
-        // `r` may not stand for a `y`, which is the condition the row already
-        // put on `r` when it was written — so the label grows nothing and the
+        // A label certainly absent is the exception. `{ \y, ..'r }` against
+        // `{ ..'r }` differs in nothing a value could have: the absence says
+        // `'r` may not stand for a `y`, which is the condition the row already
+        // put on `'r` when it was written — so the label grows nothing and the
         // two sides are one row. The condition is said of the tail once more
         // here, since this path skips the absorption that would otherwise
         // carry it, and the labels ask nothing further.
@@ -1478,8 +1479,8 @@ impl Solve<'_> {
     ///    finite acyclic order.
     ///
     /// Without (4) nothing finite would come back. A declaration written
-    /// `type T a = { next: T { x: a } }` grows its argument every round, so no
-    /// goal about it is ever asked twice, and the stack only gets longer.
+    /// `type T 'a = { next: T { x: 'a } }` grows its argument every round, so
+    /// no goal about it is ever asked twice, and the stack only gets longer.
     /// Without (3) the key would be unsound rather than merely coarse —
     /// keyed on the two names alone, a declaration reached inside its own group
     /// at two different arguments has its second question answered by the first

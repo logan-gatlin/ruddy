@@ -162,8 +162,11 @@ fn a_node_naming_a_symbol_is_spanned_at_the_name() {
             let name = names
                 .get(&index)
                 .unwrap_or_else(|| panic!("{}: {} points at no symbol row", stage.id, node.label));
+            // A span covers the whole lexeme, and a sigil is not part of the
+            // name it heads: a type parameter is written `'a` and named `a`,
+            // the way a tag's `#` and an effect's `!` are no part of theirs.
             assert_eq!(
-                &DEMO[start..end],
+                DEMO[start..end].trim_start_matches(['\'', '#', '!']),
                 *name,
                 "{}: {} claims to name {name} at {start}..{end}",
                 stage.id,
@@ -726,13 +729,13 @@ fn an_argument_wears_its_type_through_a_declared_type() {
     // closed and no `..` belongs on it — `∅` is the solver's mark for a row with
     // nothing left to come, and never part of a type a reader is shown.
     assert_eq!(
-        badge("type F r = { x: Nat, ..r } -> Nat\nlet f : F {} = fn p => p.x\n"),
+        badge("type F 'r = { x: Nat, ..'r } -> Nat\nlet f : F {} = fn p => p.x\n"),
         "{ x: Nat }"
     );
     // And a sum's tail reads in cases, because it is the row of a sum. Spelled
     // in braces it would show a reader a case list as if it were fields.
     assert_eq!(
-        badge("type G r = (#Err Nat | ..r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1\n"),
+        badge("type G 'r = (#Err Nat | ..'r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1\n"),
         "#Err Nat | ..#Ok Nat"
     );
 }
@@ -841,9 +844,9 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
 #[test]
 fn an_assumed_step_shows_the_goal_it_was_keyed_on() {
     let snapshot = snapshot(
-        "type Tree a = { value: a, kids: Forest }\n\
+        "type Tree 'a = { value: 'a, kids: Forest }\n\
          type Forest = { head: Tree Nat, tail: Forest }\n\
-         type Wood a = { value: a, kids: Grove }\n\
+         type Wood 'a = { value: 'a, kids: Grove }\n\
          type Grove = { head: Wood Nat, tail: Grove }\n\
          let f : Forest -> Grove = fn x => x\n",
     );
@@ -1187,7 +1190,7 @@ fn a_count_of_one_is_said_in_the_singular() {
 /// most need reading.
 #[test]
 fn the_types_tab_maps_each_letter_back_to_its_parameter() {
-    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let snap = snapshot("type Pair 'A 'B = { first: 'A, second: 'B }");
     let stage = snap
         .stages
         .iter()
@@ -1206,7 +1209,7 @@ fn the_types_tab_maps_each_letter_back_to_its_parameter() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
+    assert_eq!(letters, vec![("'a", "'A"), ("'b", "'B")]);
 }
 
 /// The IR tab shows a `type` declaration's binders, as the AST tab and the
@@ -1215,7 +1218,7 @@ fn the_types_tab_maps_each_letter_back_to_its_parameter() {
 /// binder they point back at had no row to be pointed at.
 #[test]
 fn the_ir_tab_shows_a_declarations_parameters() {
-    let snap = snapshot("type Ghost a = Nat\ntype WithX r = { x: Nat, ..r }");
+    let snap = snapshot("type Ghost 'a = Nat\ntype WithX 'r = { x: Nat, ..'r }");
     let stage = snap
         .stages
         .iter()
@@ -1232,8 +1235,8 @@ fn the_ir_tab_shows_a_declarations_parameters() {
     assert_eq!(
         params,
         [
-            ("a", Some([11, 12])),
-            ("..r (struct) without x", Some([30, 31]))
+            ("'a", Some([11, 13])),
+            ("..'r (struct) without x", Some([31, 33]))
         ]
     );
 
@@ -1262,15 +1265,15 @@ fn the_ir_tab_shows_a_declarations_parameters() {
 /// the complaint is about.
 #[test]
 fn a_duplicate_parameter_carries_the_name_it_repeats() {
-    let snapshot = snapshot("type Pair A A = { first: A, second: A }\n");
+    let snapshot = snapshot("type Pair 'A 'A = { first: 'A, second: 'A }\n");
     let duplicate = snapshot
         .diagnostics
         .iter()
         .find(|diagnostic| diagnostic.code == "duplicate-parameter")
         .expect("the repeat is reported");
-    assert_eq!(duplicate.span, Some([12, 13]));
+    assert_eq!(duplicate.span, Some([13, 15]));
     assert_eq!(duplicate.related.len(), 1);
-    assert_eq!(duplicate.related[0].span, Some([10, 11]));
+    assert_eq!(duplicate.related[0].span, Some([10, 12]));
 }
 
 /// The IR tab shows an application as its head and its arguments, and the head
@@ -1278,7 +1281,7 @@ fn a_duplicate_parameter_carries_the_name_it_repeats() {
 /// declares it.
 #[test]
 fn the_ir_tab_takes_an_application_apart() {
-    let snap = snapshot("type Box A = { it: A }\ntype N = Box Nat");
+    let snap = snapshot("type Box 'A = { it: 'A }\ntype N = Box Nat");
     let stage = snap
         .stages
         .iter()
@@ -1311,7 +1314,7 @@ fn the_ir_tab_takes_an_application_apart() {
 /// spells every parameter `a` alike.
 #[test]
 fn the_types_tab_says_which_parameters_are_rows() {
-    let snap = snapshot("type Both A r = { it: A, ..r }");
+    let snap = snapshot("type Both 'A 'r = { it: 'A, ..'r }");
     let stage = snap
         .stages
         .iter()
@@ -1329,14 +1332,14 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .collect();
     assert_eq!(
         letters,
-        vec![("'a", "A"), ("'b", "..r (struct) without it")]
+        vec![("'a", "'A"), ("'b", "..'r (struct) without it")]
     );
 
     // A struct's `..` beside no fields at all forbids nothing, and there is
     // nothing else about it to show: the rest of a struct *is* a whole type, so
     // a parameter with an empty lacks set is a type parameter and the row says
     // so by saying only the name.
-    let snap = snapshot("type Bare r = { ..r }");
+    let snap = snapshot("type Bare 'r = { ..'r }");
     let stage = snap
         .stages
         .iter()
@@ -1346,7 +1349,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "r");
+    assert_eq!(bare.children[0].text, "'r");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -1354,7 +1357,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
 /// and the path it is listed under is one `demangle` can read back.
 #[test]
 fn a_type_parameter_is_a_symbol_like_any_other() {
-    let snap = snapshot("type Pair A B = { first: A, second: B }");
+    let snap = snapshot("type Pair 'A 'B = { first: 'A, second: 'B }");
     let stage = snap
         .stages
         .iter()
@@ -1375,7 +1378,7 @@ fn a_type_parameter_is_a_symbol_like_any_other() {
 /// the definition ends with.
 #[test]
 fn sums_reach_every_stage() {
-    let source = "type Fallible r = #Err Nat | ..r\nlet e : Fallible (#Ok Nat) = #Err 1\n";
+    let source = "type Fallible 'r = #Err Nat | ..'r\nlet e : Fallible (#Ok Nat) = #Err 1\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1422,7 +1425,7 @@ fn sums_reach_every_stage() {
         // A case is a row of the sum's, wearing its `#` in the label, and
         // the tail is a row of its own — the same two shapes a struct has.
         assert_eq!(labelled(id, "#Err"), ["Nat"], "{id}");
-        assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
+        assert_eq!(labelled(id, "Rest"), ["..'r"], "{id}");
         // And the tag in the term is a node that names no symbol, the way a
         // field name is.
         assert_eq!(labelled(id, "Tag"), ["#Err 1"], "{id}");
@@ -1435,7 +1438,7 @@ fn sums_reach_every_stage() {
         .find(|node| node.label == "type Fallible")
         .expect("a row for the declaration");
     assert_eq!(fallible.text, "#Err Nat | ..'a");
-    assert_eq!(fallible.children[0].text, "..r (sum) without #Err");
+    assert_eq!(fallible.children[0].text, "..'r (sum) without #Err");
 
     // And the definition's scheme is the declared type, applied to the row the
     // use site handed it.
@@ -1506,7 +1509,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
     // the projection against it, and the goal it asks shows what the name
     // stands for.
     let unfolded = snapshot(
-        "type WithX r = { x: Nat, ..r }\n\
+        "type WithX 'r = { x: Nat, ..'r }\n\
          let f : WithX Nat -> Nat = fn p => p.x\n",
     );
     assert!(
@@ -1608,7 +1611,7 @@ fn a_nested_let_reaches_every_stage() {
 #[test]
 fn every_stage_reports_on_explicit_absence() {
     let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
-                  type NoErr r = #Ok Nat | \\#Err | ..r\n\
+                  type NoErr 'r = #Ok Nat | \\#Err | ..'r\n\
                   let ok : NoErr (#Warn Nat) = #Ok 1\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
@@ -1876,7 +1879,7 @@ fn every_stage_reports_on_a_source_using_effects() {
                   effect IO = print : Nat -> ()\n\
                   effect Console = !Log + !IO\n\
                   type Logger = Nat -> Nat + !Log\n\
-                  type Runner e = (Nat -> Nat + ..e) -> Nat + ..e\n\
+                  type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e\n\
                   let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
                   let quiet : () -> Nat = fn _ =>\n\
                     handle greet () with | !Log.write s => () | return x => x end\n\
@@ -1934,7 +1937,7 @@ fn every_stage_reports_on_a_source_using_effects() {
     assert!(
         nodes(types)
             .iter()
-            .any(|node| node.text.contains("..e (effects)")),
+            .any(|node| node.text.contains("..'e (effects)")),
         "the Types tab does not say what `e` stands for"
     );
 

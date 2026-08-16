@@ -125,8 +125,8 @@ pub struct Param {
     /// a position of what the declaration stands for, rather than being handed
     /// to something that throws it away.
     ///
-    /// `a` in `type Box a = { it: a }` does, and `a` in `type Ptr a = Nat` does
-    /// not. The difference is the whole of what
+    /// `'a` in `type Box 'a = { it: 'a }` does, and `'a` in `type Ptr 'a = Nat`
+    /// does not. The difference is the whole of what
     /// [`Rule::Congruent`](crate::inference::Rule) may be taken on: comparing
     /// two applications argument by argument agrees with comparing what they
     /// stand for exactly when every argument reaches the body, so a
@@ -608,18 +608,18 @@ pub enum Row {
     /// declaration holds for every definition and so cannot leave the question
     /// open. See [`ErrorKind::OpenDeclaredType`].
     Anything,
-    /// `..r` in an annotation, naming one of the variables its a variable
+    /// `..'r` in an annotation, naming one of the variables its a variable
     /// declared: a name scoped to that one annotation, staying a string for the
     /// reason [`Field`]'s keys do — it is not a path anything can refer to, so
-    /// there is no symbol to resolve it to. Two `..r` in one annotation stand
-    /// for one rest; another annotation's `r` is unrelated.
+    /// there is no symbol to resolve it to. Two `..'r` in one annotation stand
+    /// for one rest; another annotation's `'r` is unrelated.
     ///
     /// A use rather than a binder. `r` has to have been declared, or the
     /// annotation is refused with [`ErrorKind::Undefined`] — which is what
     /// makes a rest a promise the body can be held to instead of a variable the
     /// body may quietly decide.
     Named(String),
-    /// `..r` naming a row parameter of the declaration being lowered. This is
+    /// `..'r` naming a row parameter of the declaration being lowered. This is
     /// the one tail a declaration may have, and the only way a declared type
     /// can be left open: what it stands for is supplied at every use rather
     /// than decided once here, so the body still mentions no solver variable.
@@ -685,7 +685,7 @@ pub enum ErrorKind {
     /// one, so there is nothing for the declaration to mean.
     ///
     /// A declaration that stands for one of its own arguments is a link in
-    /// such a chain rather than an end to it: `type A a = a` hands back
+    /// such a chain rather than an end to it: `type A 'a = 'a` hands back
     /// whatever it was given, so `type B = A B` leads back to `B` with only a
     /// hand-off in between and reaches no shape either. What closes the loop
     /// is the whole chain, so the loop is looked for by following what each
@@ -731,15 +731,19 @@ pub enum ErrorKind {
     /// own rather than that one because a clause sits beside the type rather
     /// than inside a row, so there is no shape to word it in.
     ClauseInDeclaration,
-    /// A `let` statement in a `type` declaration's `where` clause, as in
-    /// A variable written in a `type` declaration's body or an operation's
-    /// signature, as in `type Bad = { x: 'a }`.
+    /// A variable written in a `type` declaration's body that its header does
+    /// not bind, or one written in an operation's signature at all, as in
+    /// `type Bad = { x: 'a }`.
     ///
     /// [`ErrorKind::ClauseInDeclaration`]'s sibling, and refused for a reason
     /// of its own rather than for that one's: a variable is something the
     /// caller picks, and a declaration says the same thing wherever it is used,
     /// so its own variables are its parameters and they are written in its
     /// header. Reported at each name, so a body with several reports each.
+    ///
+    /// The fix is the header, which is why this is one complaint rather than
+    /// two: `type Bad = { x: Nat, ..'r }` left a row open by naming something
+    /// nothing binds, and writing `'r` beside the name is what closes it.
     VariableInDeclaration,
     /// A `_` in a `type` declaration's body, as in `type Bad = { x: _ }`.
     ///
@@ -778,22 +782,22 @@ pub enum ErrorKind {
     /// a parenthesized arrow.
     NotAConstructor,
     /// A parameter used as the head of an application, as in
-    /// `type Flip f a = f a`.
+    /// `type Flip 'f 'a = 'f 'a`.
     ///
     /// A parameter stands for one type, never for something still waiting for
     /// types of its own. Refusing this is what keeps every declaration's
     /// parameters plain — each one a type, and nothing higher — so that
     /// checking an application is counting rather than a language of its own.
     ParameterApplied,
-    /// One declaration binding a name twice: `type Pair A A = ...`.
+    /// One declaration binding a name twice: `type Pair 'A 'A = ...`.
     DuplicateParameter {
         previous: Span,
     },
     /// A type that leads back to itself having been given an argument built out
-    /// of what it takes, as in `type T a = { next: T { x: a } }`.
+    /// of what it takes, as in `type T 'a = { next: T { x: 'a } }`.
     ///
     /// One reason, and it is growth. Unfolding that declaration hands on
-    /// `{ x: a }`, then `{ x: { x: a } }`, and so on: the argument is bigger
+    /// `{ x: 'a }`, then `{ x: { x: 'a } }`, and so on: the argument is bigger
     /// every time and never comes back round, so there is no finite answer to
     /// whether two of them are the same type.
     ///
@@ -806,7 +810,7 @@ pub enum ErrorKind {
     /// it.
     GrowingRecursion,
     /// One a variable variable used at two sorts in one annotation, as in
-    /// `{ x: Nat, ..r } -> (#A Nat | ..r)` or
+    /// `{ x: Nat, ..'r } -> (#A Nat | ..'r)` or
     /// `{ x when 'a: Nat } -> 'a`.
     ///
     /// A declared variable stands for one thing, and there are three things it
@@ -834,15 +838,17 @@ pub enum ErrorKind {
         previous: Span,
     },
     /// A parameter used as both of the things a parameter can be — a whole type
-    /// and the rest of a sum — as in `type M r = { g: (#A | ..r), f: r }`.
+    /// and the rest of a sum — as in `type M 'r = { g: (#A | ..'r), f: 'r }`.
     ///
-    /// `type W r = { f: r, ..r }` is *not* one. The rest of a struct is a whole
-    /// type, so both uses say the same thing about `r` and the declaration is
-    /// well-formed; only a sum's rest is a second reading to disagree with.
+    /// `type W 'r = { f: 'r, ..'r }` is *not* one. The rest of a struct is a
+    /// whole type, so both uses say the same thing about `'r` and the
+    /// declaration is well-formed; only a sum's rest is a second reading to
+    /// disagree with.
     ///
-    /// A parameter is written bare, so what it stands for is read off its
-    /// uses. Two uses that disagree leave nothing to read, and neither of them
-    /// is the wrong one — it is the declaration that has to say which it meant.
+    /// A parameter is written as a name and nothing more, so what it stands
+    /// for is read off its uses. Two uses that disagree leave nothing to read,
+    /// and neither of them is the wrong one — it is the declaration that has to
+    /// say which it meant.
     ///
     /// The two readings can meet across declarations, when one hands its
     /// parameter to another and uses it as a type as well. The declaration
@@ -866,7 +872,7 @@ pub enum ErrorKind {
     },
     /// Something that cannot stand for the rest of a sum's cases, written where
     /// a sum's row parameter goes: `Or Nat` against
-    /// `type Or r = #A | ..r`.
+    /// `type Or 'r = #A | ..'r`.
     ///
     /// A sum can stand for one, and so can another sum's row parameter. A struct
     /// cannot, and neither can a declared name, though the latter looks as
@@ -887,8 +893,8 @@ pub enum ErrorKind {
         sense: Sense,
     },
     /// An argument naming a label the declaration it is handed to already
-    /// names: `WithX { x: Nat }` against `type WithX r = { x: Nat, ..r }`, and
-    /// `Or (#A)` against `type Or r = #A | ..r`.
+    /// names: `WithX { x: Nat }` against `type WithX 'r = { x: Nat, ..'r }`,
+    /// and `Or (#A)` against `type Or 'r = #A | ..'r`.
     ///
     /// A `..` covers the labels its own row does not write out, so what is
     /// spliced in may not write out any of them: the type would name the label
@@ -910,8 +916,8 @@ pub enum ErrorKind {
         field: String,
     },
     /// A declaration whose fields never run out: `type T = WithX T` against
-    /// `type WithX r = { x: Nat, ..r }`, or a pair reaching each other the same
-    /// way.
+    /// `type WithX 'r = { x: Nat, ..'r }`, or a pair reaching each other the
+    /// same way.
     ///
     /// A struct's `..` is the type's core, so a declaration written at one is a
     /// declaration in the core position of what the first stands for. Following
@@ -1146,14 +1152,21 @@ struct Builder<'a> {
     /// wrote: a repeated name binds nothing, so there is nothing in the body
     /// that could name the argument it would ask for.
     arities: HashMap<Symbol, usize>,
-    /// The parameters of the declaration being lowered, by symbol, and where
-    /// each sits in its list. Empty outside a `type` body, which is what makes
-    /// a parameter unwritable in an annotation.
-    params: HashMap<Symbol, u32>,
+    /// The parameters of the declaration being lowered, by the name they were
+    /// written under, with the symbol each was minted as and where it sits in
+    /// the list. Empty outside a `type` body, which is what makes a parameter
+    /// unwritable in an annotation — a `'a` written there is a variable
+    /// instead, which is the same name meaning the one other thing it can.
+    ///
+    /// Keyed by name rather than by symbol, and kept out of [`Builder::types`]:
+    /// a parameter wears the `'` an annotation's variable does, so it is not a
+    /// name a bare word in a type could reach and has no business in the scope
+    /// bare words are resolved against.
+    params: HashMap<String, (Symbol, u32)>,
     /// What the a variable statements of the annotation being lowered
     /// declared, in the order they were written. Cleared for every written
-    /// type, which is the whole scope of a declared variable: `..r` twice in
-    /// one annotation stands for one rest, and another annotation's `r` is
+    /// type, which is the whole scope of a declared variable: `..'r` twice in
+    /// one annotation stands for one rest, and another annotation's `'r` is
     /// unrelated.
     ///
     /// The one scope a `where` clause establishes, and so the one table a
@@ -1257,7 +1270,7 @@ enum Fact {
     /// that slot may not name.
     Hands(u32, Slot),
     /// The parameter is the tail of a row written out as an argument, as `s` is
-    /// in `WithX { y: Nat, ..s }`. The row goes where the callee's own tail
+    /// in `WithX { y: Nat, ..'s }`. The row goes where the callee's own tail
     /// sat, so this tail inherits the callee's obligation as well as its own
     /// row's — but the *argument* is a row rather than the parameter, so this
     /// says nothing about which of the two readings anything has.
@@ -1309,9 +1322,9 @@ enum Stands {
     /// One of the declaration's own parameters, and whether reaching it went
     /// through a struct's fields.
     ///
-    /// `type Id a = a` stands for its parameter outright, and
-    /// `type WithX r = { x: Nat, ..r }` stands for its parameter *with an `x` in
-    /// front of it* — the fields are written beside the `..`, and the `..` is
+    /// `type Id 'a = 'a` stands for its parameter outright, and
+    /// `type WithX 'r = { x: Nat, ..'r }` stands for its parameter *with an `x`
+    /// in front of it* — the fields are written beside the `..`, and the `..` is
     /// the core, so what the declaration stands for is the argument carrying
     /// them. That is the one step that tells [`ErrorKind::EndlessFields`] from
     /// [`ErrorKind::Circular`]: a loop with such a step on it adds a field every
@@ -1644,7 +1657,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // Every declaration's parameters, minted before any body is read, and how
     // many arguments each declaration therefore takes. Knowing the count above
     // the declaration itself is what makes a forward reference applicable:
-    // `type A = B Nat` above `type B x = ...` has to be counted, and counting
+    // `type A = B Nat` above `type B 'x = ...` has to be counted, and counting
     // it cannot wait for `B` to be lowered.
     let bound: Vec<Vec<Param>> = types
         .iter()
@@ -1696,13 +1709,12 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         // The parameters are in scope for the length of the body and released
         // after it, the way a lambda's argument is — this is the type
         // language's only binder, and its only scope.
-        let mark = b.types.mark();
         b.scope_params(&params);
         // A declaration's body is read as an annotation so that a `where`
         // written there can be refused rather than misparsed; what survives is
         // the type, since a refused clause is dropped.
         let value = b.written(body, Place::Declaration).ty;
-        b.types.release(mark);
+        b.params.clear();
         if let Some(symbol) = symbol {
             program.types.insert(
                 symbol,
@@ -2032,12 +2044,13 @@ fn expansions(
 /// step in, and the loop through it is the recursion this language is for; it
 /// is a name standing for a name standing for the first that never says
 /// anything. A name, or a parameter, which is the argument written for it:
-/// `type A a = a` says no more about `type B = A B` than a bare name would,
+/// `type A 'a = 'a` says no more about `type B = A B` than a bare name would,
 /// because what `A` stands for is whatever it was handed.
 ///
 /// A struct whose `..` names a parameter is such a hand-off too, and that is the
-/// one thing this walk had to learn: `type WithX r = { x: Nat, ..r }` stands for
-/// its argument with an `x` in front of it, because the `..` is the type's core.
+/// one thing this walk had to learn: `type WithX 'r = { x: Nat, ..'r }` stands
+/// for its argument with an `x` in front of it, because the `..` is the type's
+/// core.
 /// So `type T = WithX T` reaches `T` again with a field added, which is a loop
 /// like any other and is [`ErrorKind::EndlessFields`] rather than
 /// [`ErrorKind::Circular`]. See [`Stands::Param`].
@@ -2979,12 +2992,13 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
 /// What each parameter of each declaration stands for, worked out from how the
 /// bodies use them, and every parameter used both ways.
 ///
-/// A parameter is written bare, so its kind is read off its uses: a name in a
-/// `..` tail stands for a row, a name anywhere else stands for a type, and a
-/// name handed straight on to another declaration stands for whatever that
-/// declaration's parameter in that position stands for. The third is what makes
-/// this an inference rather than a scan — declarations are hoisted and may name
-/// each other, so `type A x = B x` and `type B y = A y` constrain each other in
+/// A parameter is written as a name and nothing more, so its kind is read off
+/// its uses: a name in a `..` tail stands for a row, a name anywhere else stands
+/// for a type, and a name handed straight on to another declaration stands for
+/// whatever that declaration's parameter in that position stands for. The third
+/// is what makes this an inference rather than a scan — declarations are hoisted
+/// and may name each other, so `type A 'x = B 'x` and `type B 'y = A 'y`
+/// constrain each other in
 /// a circle.
 ///
 /// Which is why the answer is a reachability question and not an assignment: a
@@ -3000,7 +3014,7 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
 /// checked against what `WithX` takes, by [`row_arguments`]. A declaration says
 /// what it takes, and a use site is not the declaration.
 ///
-/// A slot nothing said anything about stands for a type: `type Ghost a = Nat`
+/// A slot nothing said anything about stands for a type: `type Ghost 'a = Nat`
 /// takes a type, because that is what a reader writing `Ghost Nat` will expect
 /// and there is nothing to contradict it.
 ///
@@ -3188,7 +3202,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
             {
                 // A struct's `..` is the type's core, so the parameter stands
                 // for a whole type — the same reading a parameter written
-                // anywhere else has, which is why `type W r = { f: r, ..r }` is
+                // anywhere else has, which is why `type W 'r = { f: 'r, ..'r }` is
                 // well-formed.
                 //
                 // The fields written beside it are exactly what it may not
@@ -3562,9 +3576,9 @@ fn cases_named(ty: &Type) -> impl Iterator<Item = &String> {
 /// names outright, and the parameters whose arguments' labels join them.
 ///
 /// Two sets rather than one because a struct's `..` is the type's core, so
-/// `type WithX r = { x: Nat, ..r }` carries an `x` *and* whatever is written for
-/// `r`. Which that is cannot be known until a use site writes one, so the slot
-/// is recorded here and read where the argument is.
+/// `type WithX 'r = { x: Nat, ..'r }` carries an `x` *and* whatever is written
+/// for `'r`. Which that is cannot be known until a use site writes one, so the
+/// slot is recorded here and read where the argument is.
 #[derive(Debug, Clone, Default)]
 struct Carried {
     /// Insertion-ordered, so a complaint about an argument breaking the rule
@@ -3639,7 +3653,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
                 slots,
             }
         }
-        // The body is the parameter, as in `type Id a = a`: whatever is written
+        // The body is the parameter, as in `type Id 'a = 'a`: whatever is written
         // there is the whole of what the declaration stands for, fields
         // included.
         TypeKind::Param { index, .. } => Carried {
@@ -3686,8 +3700,8 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
 /// Two declarations are in one group when each leads to the other, and inside a
 /// group every mention of a member must hand it arguments that cannot grow —
 /// see [`grows`] for what that allows. Across groups nothing is restricted:
-/// `type Rose a = { kids: List (Rose a) }` is fine because `List` is somebody
-/// else's group, and only the `Rose a` inside it is the group's business.
+/// `type Rose 'a = { kids: List (Rose 'a) }` is fine because `List` is somebody
+/// else's group, and only the `Rose 'a` inside it is the group's business.
 ///
 /// See [`ErrorKind::GrowingRecursion`] for why the restriction is here, and
 /// [`Solve::unfold`](crate::inference) for what rests on it.
@@ -3775,9 +3789,9 @@ fn closure<T: Copy + Eq + Hash>(edges: &IndexMap<T, Vec<T>>) -> IndexMap<T, Inde
 /// A parameter written anywhere in the body reaches one, except inside an
 /// argument to another declaration — there it reaches one only if *that* slot
 /// does, because unfolding the head is what decides whether the argument is
-/// kept or thrown away. `a` in `type Box a = { it: a }` reaches one; `a` in
-/// `type Ptr a = Nat` never appears and so reaches none; `a` in
-/// `type Alias a = Ptr a` appears only where `Ptr` discards it, so it reaches
+/// kept or thrown away. `'a` in `type Box 'a = { it: 'a }` reaches one; `'a` in
+/// `type Ptr 'a = Nat` never appears and so reaches none; `'a` in
+/// `type Alias 'a = Ptr 'a` appears only where `Ptr` discards it, so it reaches
 /// none either.
 ///
 /// Which makes this a fixpoint over the declaration graph for the same reason
@@ -3791,7 +3805,7 @@ fn closure<T: Copy + Eq + Hash>(edges: &IndexMap<T, Vec<T>>) -> IndexMap<T, Inde
 /// [`Rule::Congruent`](crate::inference::Rule) decide something unfolding
 /// disagrees with.
 ///
-/// A `..r` tail counts as an occurrence, being the one place a parameter is not
+/// A `..'r` tail counts as an occurrence, being the one place a parameter is not
 /// written as a [`TypeKind::Param`]: what is spliced in there is as much part
 /// of what the declaration stands for as a field is.
 fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
@@ -3949,21 +3963,21 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
 ///
 /// An argument is safe when it is one of two things:
 ///
-/// - one of the mentioning declaration's own parameters, written bare — it is
+/// - one of the mentioning declaration's own parameters, written alone — it is
 ///   then whatever came in, passed straight through;
 /// - a type mentioning no parameter at all — it is then written out in full in
 ///   the program and is the same type every time round, however many names or
 ///   applications it is built from.
 ///
 /// Anything else is a type built *out of* a parameter, and that is what grows:
-/// `type T a = { next: T { x: a } }` hands on `{ x: a }`, then `{ x: { x: a } }`,
-/// and never comes back round.
+/// `type T 'a = { next: T { x: 'a } }` hands on `{ x: 'a }`, then
+/// `{ x: { x: 'a } }`, and never comes back round.
 ///
 /// So the arguments a group can reach are drawn from the arguments it was given
 /// at the use site plus the finitely many param-free types written inside it —
 /// a finite set, and therefore finitely many argument lists, which is what makes
 /// the solver's assumption repeat. Order and repetition are free:
-/// `type A a b = { x: B b a }` only ever permutes what it was handed. See
+/// `type A 'a 'b = { x: B 'b 'a }` only ever permutes what it was handed. See
 /// [`ErrorKind::GrowingRecursion`] and [`Solve::unfold`](crate::inference).
 fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
     match &ty.tracked {
@@ -4020,7 +4034,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
 /// of them, since a parameter is scoped to the declaration that binds it, so
 /// this asks about parameters at all rather than about a particular list.
 ///
-/// The `..r` tail counts. It is the one place a parameter appears without being
+/// The `..'r` tail counts. It is the one place a parameter appears without being
 /// a [`TypeKind::Param`] node, and a type handed on with a parameter in its tail
 /// grows exactly as one with a parameter in a field does.
 fn mentions_a_parameter(ty: &Type) -> bool {
@@ -4157,14 +4171,17 @@ impl Builder<'_> {
     }
 
     /// Put one declaration's parameters in scope for the length of its body,
-    /// as the parameter scope [`ty`](Self::ty) resolves against. The caller
+    /// as the variable scope [`ty`](Self::ty) resolves against. The caller
     /// releases them; see [`build`].
+    ///
+    /// No stack and no marks, unlike [`Names`]: a declaration's body is the
+    /// whole scope of its parameters and no declaration nests inside another,
+    /// so the table holds one declaration's worth at a time and emptying it is
+    /// the whole of releasing them.
     fn scope_params(&mut self, params: &[Param]) {
-        self.params.clear();
         for (index, param) in params.iter().enumerate() {
             let name = self.mint.name(param.symbol).to_string();
-            self.params.insert(param.symbol, index as u32);
-            self.types.bind(name, param.symbol, param.span);
+            self.params.insert(name, (param.symbol, index as u32));
         }
     }
 
@@ -4282,10 +4299,10 @@ impl Builder<'_> {
     /// only reading under which a declaration's tail means anything: what it
     /// stands for is supplied at every use rather than decided here, so the
     /// body still mentions no solver variable and every walk can still stop at
-    /// a name. Anything else in a declaration — a bare `..`, or a name that
-    /// binds nothing — is a question a declaration cannot leave open, and is
-    /// reported here rather than by the caller, since only here is it known
-    /// which of the three a tail turned out to be.
+    /// a name. Anything else in a declaration — a bare `..`, or a variable its
+    /// header did not bind — is a question the declaration cannot leave open,
+    /// and is reported here rather than by the caller, since only here is it
+    /// known which of the three a tail turned out to be.
     fn row(&mut self, span: Span, of: parse::Rest, place: Place, shape: Shape) -> Option<Row> {
         let name = match of {
             parse::Rest::Anything => {
@@ -4294,34 +4311,17 @@ impl Builder<'_> {
                 }
                 return Some(Row::Anything);
             }
-            // A bare name is the parameter of the declaration this is the body
-            // of, and a declaration's only tail is one of those: anything else
-            // written bare is a question the declaration cannot leave open,
-            // whatever it might have been.
-            parse::Rest::Param(name) => {
-                if let Some(symbol) = self.types.get(&name.tracked)
-                    && let Some(&index) = self.params.get(&symbol)
-                {
-                    return Some(Row::Param { symbol, index });
-                }
-                if let Some(kind) = openness(place, shape) {
-                    self.error(span, kind);
-                    return Some(Row::Anything);
-                }
-                self.error(
-                    name.span,
-                    ErrorKind::Undefined {
-                        namespace: Namespace::Types,
-                    },
-                );
-                return None;
-            }
             parse::Rest::Variable(name) => name,
         };
-        // A variable's tail is an annotation's, and neither a declaration nor an
-        // operation's signature has one: each says the same thing wherever it is
-        // used. Reported and dropped, the way a refused `..` is — the type
-        // beside it stands.
+        // The parameter of the declaration this is the body of, if it is one,
+        // and a declaration's only tail is one of those.
+        if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
+            return Some(Row::Param { symbol, index });
+        }
+        // Otherwise it is an annotation's variable, and neither a declaration
+        // nor an operation's signature has one: each says the same thing
+        // wherever it is used. Reported and dropped, the way a refused `..` is —
+        // the type beside it stands.
         if let Some(kind) = wherever(place) {
             self.error(name.span, kind);
             return Some(Row::Anything);
@@ -4397,7 +4397,7 @@ impl Builder<'_> {
     /// declaration's body, or a definition's annotation — which is the scope a
     /// declared variable lives in, and so the scope this clears. Every other
     /// caller of [`ty`](Self::ty) is inside one of these and shares its scope,
-    /// which is exactly what makes two `..r` in one annotation stand for one
+    /// which is exactly what makes two `..'r` in one annotation stand for one
     /// rest and two `when a` for one presence.
     ///
     /// Two passes, in this order and no other. The type first, since a variable
@@ -4675,12 +4675,16 @@ impl Builder<'_> {
         let head_span = head.span;
         let name = match head.tracked {
             parse::TypeKind::Ident { name } => name,
-            // A variable stands for one type outright, the way a declaration's
-            // parameter does, so there is nothing here to give arguments to.
-            // Read as a type all the same, so the one thing gone wrong is not
-            // joined by a complaint about the name itself.
+            // A declaration's parameter stands for one type outright, and so
+            // does an annotation's variable, so there is nothing here to give
+            // arguments to either way. A variable is read as a type all the
+            // same, so the one thing gone wrong is not joined by a complaint
+            // about the name itself; a parameter is already known and needs no
+            // reading.
             parse::TypeKind::Variable { name } => {
-                self.variable(&name, Sense::Type);
+                if !self.params.contains_key(&name.tracked) {
+                    self.variable(&name, Sense::Type);
+                }
                 self.error(head_span, ErrorKind::ParameterApplied);
                 return span.track(TypeKind::Error);
             }
@@ -4709,10 +4713,6 @@ impl Builder<'_> {
             }
             return span.track(TypeKind::Error);
         };
-        if self.params.contains_key(&symbol) {
-            self.error(head_span, ErrorKind::ParameterApplied);
-            return span.track(TypeKind::Error);
-        }
         let expected = self.arity(symbol);
         if expected != found {
             // Once, at the application — the whole of it, head and arguments
@@ -5160,17 +5160,17 @@ impl Builder<'_> {
                 }
                 Place::Annotation => span.track(TypeKind::Hole),
             },
-            // Four things a bare name can be, in this order: a declaration's
-            // parameter, a variable, a declared type, a primitive.
-            //
-            // A declaration is looked for before a primitive, so a `type Nat`
-            // of one's own shadows the built-in rather than colliding with a
-            // declaration nobody wrote; and a variable shadows both
-            // for the extent of its own annotation, for exactly the same
-            // reason. Types being hoisted, every term sees such a declaration
-            // wherever it was written; a type sees only the ones above it, and
-            // reaches the built-in otherwise.
+            // Two things a `'a` can be, in this order: the parameter of the
+            // declaration this is the body of, or a variable of the annotation
+            // it is written in. A declaration binds its parameters in its
+            // header and an annotation binds nothing, so the two never both
+            // apply — which is what lets one sigil serve both.
             parse::TypeKind::Variable { name } => {
+                // A parameter stands for one type outright, so the name alone
+                // is the whole of writing one and there is nothing to count.
+                if let Some(&(symbol, index)) = self.params.get(&name.tracked) {
+                    return span.track(TypeKind::Param { symbol, index });
+                }
                 // A declaration and an operation's signature each say the same
                 // thing wherever they are used, so neither has anything for a
                 // caller to pick — and each says so in its own words.
@@ -5183,22 +5183,23 @@ impl Builder<'_> {
                     false => span.track(TypeKind::Error),
                 }
             }
+            // Two things a bare name can be, in this order: a declared type or
+            // a primitive.
+            //
+            // A declaration is looked for first, so a `type Nat` of one's own
+            // shadows the built-in rather than colliding with a declaration
+            // nobody wrote. Types being hoisted, every term sees such a
+            // declaration wherever it was written; a type sees only the ones
+            // above it, and reaches the built-in otherwise.
             parse::TypeKind::Ident { name } => match self.types.get(&name.tracked) {
-                Some(symbol) => match self.params.get(&symbol) {
-                    // A parameter stands for one type outright, so a bare name
-                    // is the only way to write one and there is nothing to
-                    // count.
-                    Some(&index) => span.track(TypeKind::Param { symbol, index }),
-                    // A declaration written bare is applied to nothing, which
-                    // is only enough if it takes nothing. See
-                    // [`ErrorKind::Arity`].
-                    None => match self.arity(symbol) {
-                        0 => span.track(TypeKind::Ident(symbol)),
-                        expected => {
-                            self.error(name.span, ErrorKind::Arity { expected, found: 0 });
-                            span.track(TypeKind::Error)
-                        }
-                    },
+                // A declaration written bare is applied to nothing, which is
+                // only enough if it takes nothing. See [`ErrorKind::Arity`].
+                Some(symbol) => match self.arity(symbol) {
+                    0 => span.track(TypeKind::Ident(symbol)),
+                    expected => {
+                        self.error(name.span, ErrorKind::Arity { expected, found: 0 });
+                        span.track(TypeKind::Error)
+                    }
                 },
                 None => match Prim::from_name(&name.tracked) {
                     Some(prim) => span.track(TypeKind::Prim(prim)),

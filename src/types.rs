@@ -49,11 +49,11 @@ pub type TyVar = u32;
 /// them the way it refuses a `Nat` against an arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Shape {
-    /// `{ x: Nat, ..r }` — a value has every field the row says is there.
+    /// `{ x: Nat, ..'r }` — a value has every field the row says is there.
     Struct,
-    /// `#A Nat | ..r` — a value is one of the cases the row says is there.
+    /// `#A Nat | ..'r` — a value is one of the cases the row says is there.
     Sum,
-    /// `A -> B + !Log + ..r` — calling the arrow may perform every effect
+    /// `A -> B + !Log + ..'r` — calling the arrow may perform every effect
     /// the row says is there, and no other.
     ///
     /// A third reading of the same machinery, not a third machinery: an effect
@@ -72,8 +72,8 @@ pub enum Shape {
 ///
 /// Four of them rather than two, because a variable can be two
 /// things a declaration's parameter never can: the presence a `when` names, and
-/// nothing here — the rest of a struct *is* a type, since `..r` in a struct
-/// puts whatever is written for `r` in the type's core. A sum's rest and an
+/// nothing here — the rest of a struct *is* a type, since `..'r` in a struct
+/// puts whatever is written for `'r` in the type's core. A sum's rest and an
 /// arrow's effects are readings of their own, for the reason [`Rest`] gives:
 /// neither is a position a whole type could go in.
 ///
@@ -83,8 +83,8 @@ pub enum Shape {
 pub enum Sense {
     Type,
     Cases,
-    /// The effects an arrow may perform: `..e` in `type Runner e = (Nat -> Nat
-    /// + ..e) -> Nat + ..e`.
+    /// The effects an arrow may perform: `..'e` in `type Runner 'e = (Nat -> Nat
+    /// + ..'e) -> Nat + ..'e`.
     Effects,
     /// Whether one label is there — what a `when a` names and what a `where`
     /// clause's formula is written about.
@@ -93,8 +93,8 @@ pub enum Sense {
 
 /// What one parameter of a `type` declaration stands for.
 ///
-/// Written nowhere: a parameter is a bare name, and which of these it is
-/// follows from where the body uses it — `..r` in a sum makes a rest of cases,
+/// Written nowhere: a parameter is a name and a sigil, and which of these it is
+/// follows from where the body uses it — `..'r` in a sum makes a rest of cases,
 /// anything else makes a type. Worked out in [`ir::build`](crate::ir::build),
 /// and carried here so that the readers who need it — lowering, inference and
 /// the debugger — agree.
@@ -104,11 +104,11 @@ pub enum Sense {
 /// these, every declaration takes a fixed list of them, and nothing takes a
 /// declaration.
 ///
-/// Both carry the labels an argument written there may not name. `r` in
-/// `type WithX r = { x: Nat, ..r }` is a [`ParamKind::Type`] whose set is `{x}`:
-/// the core covers the fields the declaration does not write out, so an `r` with
-/// an `x` of its own would give the type two fields of one name, and the two
-/// copies could disagree. Carrying the set rather than a bare flag is what lets
+/// Both carry the labels an argument written there may not name. `'r` in
+/// `type WithX 'r = { x: Nat, ..'r }` is a [`ParamKind::Type`] whose set is
+/// `{x}`: the core covers the fields the declaration does not write out, so an
+/// `'r` with an `x` of its own would give the type two fields of one name, and
+/// the two copies could disagree. Carrying the set rather than a bare flag is what lets
 /// the condition be said where the argument is written, at the span the reader
 /// can act on, instead of being discovered later by whatever happened to
 /// flatten the labels — or never at all.
@@ -119,13 +119,14 @@ pub enum Sense {
 /// about an argument breaking the rule twice always names the same label first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
-    /// Stands for a type. `A` in `type Pair A B`, and `r` in
-    /// `type WithX r = { x: Nat, ..r }` alike — the rest of a struct is a type,
-    /// so there is nothing else for it to be, and `WithX Nat` is as well-formed
+    /// Stands for a type. `'A` in `type Pair 'A 'B`, and `'r` in
+    /// `type WithX 'r = { x: Nat, ..'r }` alike — the rest of a struct is a
+    /// type, so there is nothing else for it to be, and `WithX Nat` is as
+    /// well-formed
     /// as `WithX { y: Nat }`.
     Type { lacks: IndexSet<String> },
     /// Stands for the cases a sum does not name — and, with them, the cases it
-    /// may therefore not name itself. `r` in `type Or r = #A | ..r`.
+    /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
     ///
     /// The one reading that is not a type, and the reason it is enforced rather
     /// than substituted: a sum's rest is spliced into [`Core::Sum`]'s row, so
@@ -133,8 +134,8 @@ pub enum ParamKind {
     /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
     Cases { lacks: IndexSet<String> },
     /// Stands for the effects an arrow does not name — and, with them, the
-    /// effects it may therefore not name itself. `e` in
-    /// `type Runner e = (Nat -> Nat + ..e) -> Nat + ..e`.
+    /// effects it may therefore not name itself. `'e` in
+    /// `type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e`.
     ///
     /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
     /// row's rest is spliced into the row [`Core::Arrow`] carries, so anything
@@ -195,7 +196,7 @@ pub enum Formula {
 /// presences among them.
 ///
 /// One numbering, not two. Every variable a scheme quantifies prints as a bare
-/// letter — a type as `a`, a struct's rest as `..a`, a presence as `when a` —
+/// letter — a type as `'a`, a struct's rest as `..'a`, a presence as `when 'a` —
 /// so two alphabets would be two things spelled the same way with nothing to
 /// tell them apart. The presences take the low positions, `0..presences`, and
 /// the types and rows the rest, `presences..count`, which is what lets a bare
@@ -224,7 +225,7 @@ pub struct Scheme {
 /// there used to be a rule about structs and a complaint for everything else.
 ///
 /// The fields are a bare label map with no tail of their own, because the core
-/// beside them *is* their tail: `{ x: Nat, ..r }` is the type `r` carrying an
+/// beside them *is* their tail: `{ x: Nat, ..'r }` is the type `'r` carrying an
 /// `x`, and what the type says about the fields it does not name is the whole of
 /// what its core says. So one variable does the work two used to — `fn a => a.x`
 /// is `{ x: 'a, ..'b } -> 'a` — and substituting for a struct's `..` is
@@ -291,8 +292,8 @@ pub enum Core {
     /// stands for is supplied from outside, but the type it sits in may carry
     /// fields of its own, and those are spliced onto whatever arrives.
     ///
-    /// Which is exactly a struct's row parameter. `type WithX r = { x: Nat,
-    /// ..r }` lowers to this at index 0 with an `x` beside it, so `WithX Nat`
+    /// Which is exactly a struct's row parameter. `type WithX 'r = { x: Nat,
+    /// ..'r }` lowers to this at index 0 with an `x` beside it, so `WithX Nat`
     /// opens to a `Nat` carrying an `x` and `WithX { y: Nat }` to a struct
     /// carrying both — one substitution, and the one the compiler already had.
     Bound(u32),
@@ -352,7 +353,7 @@ pub enum Core {
     /// complete there, which is the whole of what makes it safe to take: it can
     /// only ever agree with unfolding.
     ///
-    /// A parameter the declaration discards buys no distinction. `type Ptr a =
+    /// A parameter the declaration discards buys no distinction. `type Ptr 'a =
     /// Nat` stands for `Nat` whatever it is applied to, so `Ptr A` and `Ptr B`
     /// are one type — the language has no phantom types, and a declaration is
     /// nominal within itself only where being nominal agrees with what it
@@ -504,7 +505,7 @@ impl ParamKind {
     /// so it is asked in one place rather than matched out at each of them.
     ///
     /// Empty for the parameters that are only ever handed a type, which is most
-    /// of them: `A` in `type Pair A B` sits in no row and forbids nothing.
+    /// of them: `'A` in `type Pair 'A 'B` sits in no row and forbids nothing.
     pub fn lacks(&self) -> &IndexSet<String> {
         match self {
             ParamKind::Type { lacks }
@@ -660,7 +661,7 @@ impl Ty {
     /// thing anything still asks a type for a row about.
     ///
     /// Anything else is an argument [`ir::build`](crate::ir::build) already
-    /// refused and erased — `Or Nat` for `type Or r = #A | ..r` is the
+    /// refused and erased — `Or Nat` for `type Or 'r = #A | ..'r` is the
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {

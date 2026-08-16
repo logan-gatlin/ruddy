@@ -26,17 +26,14 @@
 (operation_declaration signature: (identifier) @type)
 
 (type_definition name: (identifier) @type.definition)
-(type_definition parameter: (identifier) @variable.parameter)
-
-; `..r` names the declaration parameter the rest of a row stands for.
-(rest name: (identifier) @variable.parameter)
 
 ; The one primitive there is; see `types::Prim::ALL`.
 ((identifier) @type.builtin
   (#eq? @type.builtin "Nat"))
 
-; `'a` — a variable of the annotation it is written in, and the presences a
-; `where` clause is written about.
+; `'a` — a declaration's parameter, a variable of the annotation it is written
+; in, and the presences a `where` clause is written about. One capture for all
+; three, because they are one token and one idea: the thing a use site picks.
 (type_variable) @variable.parameter
 
 ; ── labels ───────────────────────────────────────────────────────────────────

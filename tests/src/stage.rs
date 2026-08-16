@@ -566,7 +566,7 @@ fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
 
     // A declaration declares no such variables, so nothing in one is grouped
     // this way: its parameters are symbols and light up as those.
-    let tree = tab("ir", "type Pair a = { fst: a, snd: a }");
+    let tree = tab("ir", "type Pair 'a = { fst: 'a, snd: 'a }");
     let rows = flatten(&tree);
     assert!(rows.iter().all(|node| node.link.is_none()), "{rows:#?}");
 }

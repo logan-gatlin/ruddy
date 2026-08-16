@@ -707,8 +707,8 @@ fn type_application_binds_tighter_than_the_arrow() {
 #[test]
 fn a_declaration_binds_parameters_at_its_head() {
     assert_eq!(
-        parse_one("type Pair A B = { a: A, b: B }"),
-        "type Pair A B = { a: A, b: B }"
+        parse_one("type Pair 'A 'B = { a: 'A, b: 'B }"),
+        "type Pair 'A 'B = { a: 'A, b: 'B }"
     );
     // Taking none is still the ordinary case, and prints with no room left for
     // a list that is not there.
@@ -738,13 +738,13 @@ fn a_comma_tells_a_field_from_a_tail() {
 #[test]
 fn sum_types() {
     assert_eq!(
-        parse_one("type Option T = #Some T | #None"),
-        "type Option T = #Some T | #None"
+        parse_one("type Option 'T = #Some 'T | #None"),
+        "type Option 'T = #Some 'T | #None"
     );
     // The leading `|` is accepted and dropped.
     assert_eq!(
-        parse_one("type Option T = | #Some T | #None"),
-        "type Option T = #Some T | #None"
+        parse_one("type Option 'T = | #Some 'T | #None"),
+        "type Option 'T = #Some 'T | #None"
     );
     // One case is a sum like any other.
     assert_eq!(parse_one("type Just = #It Nat"), "type Just = #It Nat");
@@ -761,7 +761,7 @@ fn sum_types() {
 #[test]
 fn a_sum_with_no_cases_is_a_bare_bar() {
     assert_eq!(parse_one("type Void = |"), "type Void = |");
-    assert_eq!(parse_one("type Only r = | ..r"), "type Only r = | ..r");
+    assert_eq!(parse_one("type Only 'r = | ..'r"), "type Only 'r = | ..'r");
 }
 
 /// A `|` between two cases promises a second one, so one with nothing after it
@@ -788,7 +788,7 @@ fn a_bar_promising_a_case_that_never_comes_is_reported() {
 
     // The leading bar promises nothing, and neither does a case with no bar
     // after it.
-    for src in ["type Void = |", "type Only r = | ..r", "type T = #A | #B"] {
+    for src in ["type Void = |", "type Only 'r = | ..'r", "type T = #A | #B"] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
     }
@@ -802,8 +802,8 @@ fn a_sum_may_be_left_open() {
         "let x : #A Nat | .. = y"
     );
     assert_eq!(
-        parse_one("type Tagged r = #Err Nat | ..r"),
-        "type Tagged r = #Err Nat | ..r"
+        parse_one("type Tagged 'r = #Err Nat | ..'r"),
+        "type Tagged 'r = #Err Nat | ..'r"
     );
 }
 
@@ -819,7 +819,7 @@ fn a_sum_case_may_be_written_absent() {
         "let x : \\#B | .. = y",
         "let x : #A | \\#B = y",
         "let x : \\#A | #B Nat | \\#C | .. = y",
-        "type NoErr r = #Ok Nat | \\#Err | ..r",
+        "type NoErr 'r = #Ok Nat | \\#Err | ..'r",
     ] {
         assert_eq!(parse_one(src), src);
     }
@@ -924,8 +924,8 @@ fn a_sum_and_a_struct_nest_without_help() {
         "let x : { f: #A Nat | #B, g: Nat } = y"
     );
     assert_eq!(
-        parse_one("type List a = #Nil | #Cons { head: a, tail: List a }"),
-        "type List a = #Nil | #Cons { head: a, tail: List a }"
+        parse_one("type List 'a = #Nil | #Cons { head: 'a, tail: List 'a }"),
+        "type List 'a = #Nil | #Cons { head: 'a, tail: List 'a }"
     );
     // A case with no payload followed by another field ends where the comma
     // does, since a comma begins no atom.

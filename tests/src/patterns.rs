@@ -426,7 +426,7 @@ fn a_report_names_the_match_and_its_scrutinee() {
 #[test]
 fn an_aliased_scrutinee_is_unfolded() {
     let checks = clean(
-        "type Fallible r = #Err Nat | ..r\n\
+        "type Fallible 'r = #Err Nat | ..'r\n\
          let f : Fallible (#Ok Nat) -> Nat = \
          fn t => match t with | #Err n => n | #Ok k => k end",
     );

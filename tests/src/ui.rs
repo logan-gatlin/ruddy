@@ -578,8 +578,8 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
 /// from it — so these are pinned as printing and nothing more.
 ///
 /// Not an oversight in the printer. What a row's tail and a field's `?` stand
-/// for is an identity: `{ x: Nat, ..a } -> { x: Nat, ..a }` says the two
-/// tails are the *same* rest, and `..a` is how that is spelled. The surface
+/// for is an identity: `{ x: Nat, ..'a } -> { x: Nat, ..'a }` says the two
+/// tails are the *same* rest, and `..'a` is how that is spelled. The surface
 /// syntax has `..'r`, which says the same thing by a name the writer chose —
 /// but a scheme has no names to offer, only numbers the quantifier handed out,
 /// so printing one back as `..'r` would be inventing a name that was never
@@ -1156,11 +1156,11 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // halves in pieces the way a path does.
     // An explicitly absent label in each shape, so a refusal inside the `\`
     // the printers write for one comes back too.
-    let source = "type Pair a b = { first: a, second: b }\n\
+    let source = "type Pair 'a 'b = { first: 'a, second: 'b }\n\
                   let f = fn g => fn p => g p.first\n\
                   let h = let n : Nat = 1 in n\n\
                   let v : { first: Nat, second: Nat } = { first: 1, second: 2 }\n\
-                  type Gap r = { first: Nat, \\hole, ..r }\n\
+                  type Gap 'r = { first: Nat, \\hole, ..'r }\n\
                   let w : #Ok Nat | \\#Err | .. = #Ok 1";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
@@ -1282,7 +1282,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         }))
     };
 
-    // `type G r = #Err Nat | ..r` applied to `#Ok Nat`, and to a row
+    // `type G 'r = #Err Nat | ..'r` applied to `#Ok Nat`, and to a row
     // naming nothing, which leaves the sum closed at the case it wrote.
     let err_nat = |rest: Rest| {
         Rc::new(Ty::plain(Core::Sum(Row {
@@ -1547,8 +1547,8 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     let span = Span::generated(0, 1);
     assert_eq!(
         IrError::VariableInDeclaration.to_string(),
-        "a declared type's variables are its parameters, so there is nothing here \
-         for a caller to pick; write `type T a = ...`"
+        "a declared type's variables are its parameters, so this one has to be \
+         written in its header; write `type T 'a = ...`"
     );
     assert_eq!(
         IrError::HoleInDeclaration.to_string(),

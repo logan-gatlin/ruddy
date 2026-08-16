@@ -100,11 +100,17 @@ module.exports = grammar({
       field('body', $._expression),
     ),
 
-    /** `type <name> <param>* = <annotation>` */
+    /**
+     * `type <name> <'param>* = <annotation>`
+     *
+     * The parameters are variables, and wear the `'` an annotation's variable
+     * does: a bare name in a type resolves to something declared elsewhere, and
+     * a parameter resolves to whatever the use site hands it.
+     */
     type_definition: $ => seq(
       'type',
       field('name', $.identifier),
-      repeat(field('parameter', $.identifier)),
+      repeat(field('parameter', $.type_variable)),
       '=',
       field('body', $.annotation),
     ),
@@ -465,11 +471,11 @@ module.exports = grammar({
     absent_field: $ => seq('\\', field('name', $.identifier)),
 
     /**
-     * `..`, `..r` or `..'r` — what is known about the labels not written out.
-     * Bare it is anything at all; named it is a declaration's parameter, and
-     * with a sigil it is a variable of the annotation it is written in.
+     * `..` or `..'r` — what is known about the labels not written out. Bare it
+     * is anything at all; named it is a variable, which is a declaration's
+     * parameter inside a `type` body and one of the annotation's own outside.
      */
-    rest: $ => seq('..', optional(field('name', choice($.identifier, $.type_variable)))),
+    rest: $ => seq('..', optional(field('name', $.type_variable))),
 
     /** `when 'a`, or the `when _` that no formula may name. */
     when_clause: $ => seq('when', field('name', choice($.type_variable, $.wildcard))),
@@ -527,7 +533,10 @@ module.exports = grammar({
     /** `!Log` — an effect, named. The `!` is not part of the name. */
     effect_label: _ => new RegExp(EFFECT.source, 'u'),
 
-    /** `'a` — a variable of the annotation it is written in. */
+    /**
+     * `'a` — a variable: the parameter of the declaration it is written in, or
+     * a variable of the annotation it is written in.
+     */
     type_variable: _ => new RegExp(VARIABLE.source, 'u'),
 
     /**
