@@ -141,7 +141,7 @@ pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
             cases, fallback, ..
         } => cases
             .iter()
-            .map(|case| (Some(format!("`{}", case.name)), &case.block))
+            .map(|case| (Some(format!("#{}", case.name)), &case.block))
             .chain(
                 fallback
                     .iter()
@@ -218,11 +218,11 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Tag {
             name,
             payload: None,
-        } => format!("tag `{name}"),
+        } => format!("tag #{name}"),
         Op::Tag {
             name,
             payload: Some(temp),
-        } => format!("tag `{name}, %{temp}"),
+        } => format!("tag #{name}, %{temp}"),
         Op::Payload(temp) => format!("payload %{temp}"),
         Op::Closure { func, captures } => {
             let held: Vec<String> = captures.iter().map(|temp| format!("%{temp}")).collect();

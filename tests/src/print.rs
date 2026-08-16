@@ -49,8 +49,8 @@ fn both_trees_render_a_struct_the_same_way() {
         "let f = fn r => { wrapped: r.x }",
         // Open rows and named presences: the `..` tail, named or not, and the
         // `when` clause are one rendering rule too.
-        "let g : { a: Nat, ..r } -> Nat where let r = fn p => p.a",
-        "let h : { a when a: Nat, .. } -> Nat where let a = fn p => p.a",
+        "let g : { a: Nat, ..'r } -> Nat = fn p => p.a",
+        "let h : { a when 'a: Nat, .. } -> Nat = fn p => p.a",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -192,7 +192,7 @@ fn a_type_reads_the_same_whichever_printer_reached_it() {
 }
 
 /// A row's two spellings, one per reader: the annotation keeps the tail as it
-/// was written — `..`, or `..r` by name — while the scheme spells the
+/// was written — `..`, or `..'r` by name — while the scheme spells the
 /// variable the quantifier numbered it as. Everything before the tail is the
 /// same rule in both, which is what this pins.
 #[test]
@@ -201,17 +201,17 @@ fn a_row_reads_as_written_and_as_quantified() {
         (
             "let f : { x: Nat, .. } -> Nat = fn p => p.x",
             "{ x: Nat, .. } -> Nat",
-            "{ x: Nat, ..a } -> Nat where let a",
+            "{ x: Nat, ..'a } -> Nat",
         ),
         (
-            "let g : { x: Nat, ..r } -> { x: Nat, ..r } where let r = fn p => p",
-            "{ x: Nat, ..r } -> { x: Nat, ..r } where let r",
-            "{ x: Nat, ..a } -> { x: Nat, ..a } where let a",
+            "let g : { x: Nat, ..'r } -> { x: Nat, ..'r } = fn p => p",
+            "{ x: Nat, ..'r } -> { x: Nat, ..'r }",
+            "{ x: Nat, ..'a } -> { x: Nat, ..'a }",
         ),
         (
-            "let h : { x when a: Nat, y: Nat } -> Nat where let a = fn r => r.y",
-            "{ x when a: Nat, y: Nat } -> Nat where let a",
-            "{ x when a: Nat, y: Nat } -> Nat where let a",
+            "let h : { x when 'a: Nat, y: Nat } -> Nat = fn r => r.y",
+            "{ x when 'a: Nat, y: Nat } -> Nat",
+            "{ x when 'a: Nat, y: Nat } -> Nat",
         ),
     ] {
         let (as_written, as_inferred) = types_of(source);
@@ -255,21 +255,21 @@ fn both_trees_render_an_application_the_same_way() {
 }
 
 /// A sum renders the same way in both trees, for the reason a struct does: the
-/// bars, the backticks and the `..` are one rule in `print`, and both printers
+/// bars, the `#`s and the `..` are one rule in `print`, and both printers
 /// read it.
 #[test]
 fn both_trees_render_a_sum_the_same_way() {
     for source in [
-        "type Option T = `Some T | `None",
-        "let v = `Some 1",
-        "let n = `None",
-        "let f = fn x => `Wrap x",
-        "let p = fn f => `Some (f 1)",
+        "type Option T = #Some T | #None",
+        "let v = #Some 1",
+        "let n = #None",
+        "let f = fn x => #Wrap x",
+        "let p = fn f => #Some (f 1)",
         // A case whose presence a `when` names, and a tail: the two ways a sum
         // is left open, both of which only an annotation may write.
-        "let o : `A (when a) Nat | `B where let a = `B",
-        "let t : `A Nat | .. = `A 1",
-        "let r : `A Nat | ..s where let s = `A 1",
+        "let o : #A (when 'a) Nat | #B = #B",
+        "let t : #A Nat | .. = #A 1",
+        "let r : #A Nat | ..'s = #A 1",
         // The two forms that write no case, and so print the leading bar the
         // rest of them do not.
         "type Void = |",
@@ -283,22 +283,22 @@ fn both_trees_render_a_sum_the_same_way() {
 
 /// A tag with no payload is a word still waiting for one, so both printers put
 /// it in parentheses wherever an atom could follow it. Without them the printed
-/// source reads back as a different tree: `` f (`A) 1 `` is `f` applied to the
-/// case and then to `1`, while `` f `A 1 `` is `f` applied to a case carrying
+/// source reads back as a different tree: `f (#A) 1` is `f` applied to the
+/// case and then to `1`, while `f #A 1` is `f` applied to a case carrying
 /// `1` — one printed program, two meanings, and the one it re-parses as is not
 /// the one it was printed from.
 #[test]
 fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
     for source in [
-        "let f = fn a => a\nlet v = f (`A) 1",
-        "let f = fn a => a\nlet v = f (`A)",
-        "let f = fn a => a\nlet v = (`A) 1",
+        "let f = fn a => a\nlet v = f (#A) 1",
+        "let f = fn a => a\nlet v = f (#A)",
+        "let f = fn a => a\nlet v = (#A) 1",
         // As a payload, where the same argument applies: the inner tag would
         // take the `1` the outer one is applied to.
-        "let f = fn a => a\nlet v = `Some (`A) 1",
+        "let f = fn a => a\nlet v = #Some (#A) 1",
         // Carrying something it groups as the application it reads as, and
         // takes no parentheses at the head of one.
-        "let v = `Some 1 2",
+        "let v = #Some 1 2",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -307,20 +307,20 @@ fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
 }
 
 /// A case carrying unit is written with no payload, and prints with none — so
-/// `` `None `` survives lowering as itself rather than coming back as the
-/// `` `None {} `` it means. The struct's `()` is the other way round on
+/// `#None` survives lowering as itself rather than coming back as the
+/// `#None {}` it means. The struct's `()` is the other way round on
 /// purpose: there, two spellings of one written type collapse to one.
 #[test]
 fn a_case_carrying_nothing_keeps_its_missing_payload() {
-    let (ast, ir) = printed("type Flag = `On | `Off");
-    assert_eq!(ast, "type Flag = `On | `Off");
-    assert_eq!(ir, "type Flag = `On | `Off");
+    let (ast, ir) = printed("type Flag = #On | #Off");
+    assert_eq!(ast, "type Flag = #On | #Off");
+    assert_eq!(ir, "type Flag = #On | #Off");
 
     // Written out, the unit stays written out: it is a payload the reader
     // put on the page, and `{}` is what `()` already prints as.
-    let (ast, ir) = printed("type Flag = `On () | `Off {}");
-    assert_eq!(ast, "type Flag = `On () | `Off {}");
-    assert_eq!(ir, "type Flag = `On {} | `Off {}");
+    let (ast, ir) = printed("type Flag = #On () | #Off {}");
+    assert_eq!(ast, "type Flag = #On () | #Off {}");
+    assert_eq!(ir, "type Flag = #On {} | #Off {}");
 }
 
 /// A printed program re-lowers into the one it was printed from, definitions
@@ -355,12 +355,12 @@ fn recursion_and_forward_references_round_trip() {
 #[test]
 fn a_match_and_its_patterns_round_trip() {
     for source in [
-        "let f = fn v => match v with | `Some x => x | `None => 0 end",
+        "let f = fn v => match v with | #Some x => x | #None => 0 end",
         "let f = fn v => match v with | 0 => 1 | 1 => 2 | k => k end",
         "let f = fn v => match v with | () => 1 end",
         "let f = fn v => match v with | {} => 1 end",
-        "let f = fn v => match v with | { a: `A, b: { c: x } } => x | r => 0 end",
-        "let f = fn v => match v with | `A (`X x) => x | `A w => 0 | r => 1 end",
+        "let f = fn v => match v with | { a: #A, b: { c: x } } => x | r => 0 end",
+        "let f = fn v => match v with | #A (#X x) => x | #A w => 0 | r => 1 end",
         "let f = fn v => match v with end",
         "let f = fn v => (match v with | w => w end).x",
     ] {
@@ -418,10 +418,10 @@ fn a_nested_let_round_trips() {
 #[test]
 fn a_wildcard_pattern_round_trips() {
     for source in [
-        "let f = fn v => match v with | `Some x => x | _ => 0 end",
-        "let f = fn v => match v with | `Some _ => 1 | `None => 0 end",
+        "let f = fn v => match v with | #Some x => x | _ => 0 end",
+        "let f = fn v => match v with | #Some _ => 1 | #None => 0 end",
         "let f = fn v => match v with | { a: _, b: x } => x end",
-        "let f = fn v => match v with | `Pair { a: _, b: _ } => 1 | _ => 2 end",
+        "let f = fn v => match v with | #Pair { a: _, b: _ } => 1 | _ => 2 end",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
@@ -485,15 +485,15 @@ fn both_trees_render_a_pattern_rest() {
 #[test]
 fn both_trees_render_a_where_clause_the_same_way() {
     for source in [
-        "let f : { x when a: Nat } where let a; a = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where let a, b; a != b = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where let a, b; a = b = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where let a, b; not (a and b) = { x: 1 }",
-        "let f : { x when a: Nat, y when b: Nat } where let a, b; a or b = { x: 1 }",
+        "let f : { x when 'a: Nat } where 'a = { x: 1 }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1 }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a = 'b = { x: 1 }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where not ('a and 'b) = { x: 1 }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a or 'b = { x: 1 }",
         // The anonymous presence is spelled back as the `_` it was written as.
         "let f : { x when _: Nat } = { x: 1 }",
         // And a sum's clause takes the parentheses the grammar needs.
-        "let f : `A (when a) Nat | `B (when b) where let a, b = `B",
+        "let f : #A (when 'a) Nat | #B (when 'b) = #B",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -509,9 +509,9 @@ fn a_scheme_prints_the_clause_it_requires() {
     for (source, expected) in [
         (
             "let p = fn a => match a with | {x} => {} | {y} => {} end",
-            "{ x when a: c, y when b: d } -> {} where let a, b, c, d; a != b",
+            "{ x when 'a: 'c, y when 'b: 'd } -> {} where 'a != 'b",
         ),
-        ("let id = fn x => x", "a -> a where let a"),
+        ("let id = fn x => x", "'a -> 'a"),
     ] {
         let mut files = FileManager::new();
         let file = files.register_new_file("<test>".to_string(), source.to_string());
@@ -535,22 +535,22 @@ fn a_scheme_prints_the_clause_it_requires() {
 
 /// R24's four cases, each asserted to re-lower to itself.
 ///
-/// The `!` binds to the arrow parsed at its own level, so the printer
+/// The `+` binds to the arrow parsed at its own level, so the printer
 /// parenthesizes an arrow's result exactly when *that* arrow carries a row and
 /// the result is itself an arrow — and in no other case. Bracketing whenever
 /// the result carries one, which looks safer, would move the row to the wrong
 /// arrow on re-reading; the round trip is what says so.
 #[test]
 fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
-    let effects = "effect Log = | `write : Nat -> {}\n";
+    let effects = "effect Log = | write : Nat -> {}\n";
     for body in [
         // A row, and a result that is not an arrow: no parentheses.
-        "Nat -> Nat ! `Log",
+        "Nat -> Nat + !Log",
         // No outer row, and the inner arrow carries one: none either.
-        "Nat -> Nat -> Nat ! `Log",
+        "Nat -> Nat -> Nat + !Log",
         // A row, and a result that is an arrow: parentheses, or the row would
         // read as the inner arrow's.
-        "Nat -> (Nat -> Nat) ! `Log",
+        "Nat -> (Nat -> Nat) + !Log",
         // Neither carries one: none.
         "Nat -> Nat -> Nat",
     ] {
@@ -567,42 +567,36 @@ fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
 
 /// A printed *semantic* type re-lowers to the type it was printed from, which
 /// is what a diagnostic quoting one rests on. The two spellings of the empty
-/// row meet here: `A -> B ! |` and `A -> B` are one type, so the scheme prints
+/// row meet here: `A -> B + |` and `A -> B` are one type, so the scheme prints
 /// bare either way.
 #[test]
 fn a_printed_effect_row_re_lowers_to_itself() {
-    let effects = "effect Log = `write : Nat -> ()\neffect IO = `print : Nat -> ()\n";
-    // A scheme's quantified tail prints `..'a`, which is a letter no reader
+    let effects = "effect Log = write : Nat -> ()\neffect IO = print : Nat -> ()\n";
+    // A scheme's quantified tail prints `..a`, which is a letter no reader
     // could have written and no parser reads back — the rule every other
     // quantified variable already keeps. So what is re-lowered is the concrete
     // half, and the open half is only asserted to print as itself.
     for (annotation, expected) in [
-        ("Nat -> Nat ! `Log", "Nat -> Nat ! `Log"),
-        ("Nat -> Nat ! `Log | `IO", "Nat -> Nat ! `Log | `IO"),
+        ("Nat -> Nat + !Log", "Nat -> Nat + !Log"),
+        ("Nat -> Nat + !Log + !IO", "Nat -> Nat + !Log + !IO"),
         // The scheme spells its quantifiers positionally, so a declared `e`
         // comes back as the letter its position earns.
-        (
-            "Nat -> Nat ! ..e where let e",
-            "Nat -> Nat ! ..a where let a",
-        ),
-        (
-            "Nat -> Nat ! `Log | ..e where let e",
-            "Nat -> Nat ! `Log | ..a where let a",
-        ),
+        ("Nat -> Nat + ..'e", "Nat -> Nat + ..'a"),
+        ("Nat -> Nat + !Log + ..'e", "Nat -> Nat + !Log + ..'a"),
         // Both spellings of pure.
         ("Nat -> Nat", "Nat -> Nat"),
-        ("Nat -> Nat ! |", "Nat -> Nat"),
+        ("Nat -> Nat + |", "Nat -> Nat"),
         // The two arrow-binding cases, as a definition's own type.
-        ("Nat -> Nat -> Nat ! `Log", "Nat -> Nat -> Nat ! `Log"),
-        ("Nat -> (Nat -> Nat) ! `Log", "Nat -> (Nat -> Nat) ! `Log"),
+        ("Nat -> Nat -> Nat + !Log", "Nat -> Nat -> Nat + !Log"),
+        ("Nat -> (Nat -> Nat) + !Log", "Nat -> (Nat -> Nat) + !Log"),
         // A `where` clause on effect presences prints as it was written.
         (
-            "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b",
-            "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b",
+            "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b",
+            "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b",
         ),
     ] {
         // Two arguments where the annotation takes two, so that pushing the
-        // written type into the lambda has somewhere to put each of them.
+        // written type into the lambda has somewhere 'to put each of them.
         let arrows = annotation.matches("->").count();
         let body = match arrows {
             1 => "fn x => x".to_string(),
@@ -624,14 +618,14 @@ fn a_printed_effect_row_re_lowers_to_itself() {
 /// re-lowers.
 #[test]
 fn an_alias_prints_as_the_effects_it_names() {
-    let source = "effect Log = `write : Nat -> ()\n\
-                  effect IO = `print : Nat -> ()\n\
-                  effect Console = `Log | `IO\n\
-                  let f : Nat -> Nat ! `Console = fn x => x";
+    let source = "effect Log = write : Nat -> ()\n\
+                  effect IO = print : Nat -> ()\n\
+                  effect Console = !Log + !IO\n\
+                  let f : Nat -> Nat + !Console = fn x => x";
     let (written, scheme) = types_of(source);
     // The IR keeps the row expanded, since expansion is lowering's.
-    assert_eq!(written, "Nat -> Nat ! `Log | `IO");
-    assert_eq!(scheme, "Nat -> Nat ! `Log | `IO");
+    assert_eq!(written, "Nat -> Nat + !Log + !IO");
+    assert_eq!(scheme, "Nat -> Nat + !Log + !IO");
 }
 
 /// Both trees render an effect declaration, a handler and an operation
@@ -640,23 +634,23 @@ fn an_alias_prints_as_the_effects_it_names() {
 #[test]
 fn both_trees_render_the_effect_forms() {
     for source in [
-        "effect Log = | `write : Nat -> {}",
-        "effect Log = | `write : Nat -> {} | `flush : {} -> {}",
+        "effect Log = | write : Nat -> {}",
+        "effect Log = | write : Nat -> {} | flush : {} -> {}",
         "effect Nil = |",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
-        "effect Log = | `write : Nat -> {}\n\
-         let f : Nat -> Nat ! \\`Log | ..e where let e = fn x => x",
-        "effect Log = | `write : Nat -> {}\n\
-         let f : Nat -> Nat ! `Log (when a) | ..e where let a, e = fn x => x",
+        "effect Log = | write : Nat -> {}\n\
+         let f : Nat -> Nat + \\!Log + ..'e = fn x => x",
+        "effect Log = | write : Nat -> {}\n\
+         let f : Nat -> Nat + !Log (when 'a) + ..'e = fn x => x",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
         assert_eq!(ir, source, "{source}");
     }
 
-    let source = "effect Log = | `write : Nat -> {}\n\
-                  let h = fn n => handle Log.`write n with | Log.`write s => {} | return x => x end";
+    let source = "effect Log = | write : Nat -> {}\n\
+                  let h = fn n => handle !Log.write n with | !Log.write s => {} | return x => x end";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);
     assert_eq!(ir, source);
@@ -664,7 +658,7 @@ fn both_trees_render_the_effect_forms() {
     assert_eq!(again, ir);
 }
 
-/// Every variable a scheme quantifies prints as the bare letter a `where let`
+/// Every variable a scheme quantifies prints as the bare letter a `where 'let`
 /// declares it as — no prefix, whichever of the three sorts it is — and the
 /// clause beside the type is what says which letters those are.
 #[test]
@@ -698,7 +692,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     let scheme = Scheme::constrained(4, 1, body, Formula::True);
     assert_eq!(
         scheme.to_string(),
-        "{ x: b, ..c } -> `A (when a) b | ..d where let a, b, c, d"
+        "{ x: 'b, ..'c } -> #A (when 'a) 'b | ..'d"
     );
 
     // A formula follows the declarations, separated by the `;` the grammar
@@ -731,7 +725,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     );
     assert_eq!(
         both.to_string(),
-        "{ x when a: Nat, y when b: Nat } where let a, b; a != b"
+        "{ x when 'a: Nat, y when 'b: Nat } where 'a != 'b"
     );
 
     // A scheme requiring something of a presence it does not itself quantify
@@ -745,7 +739,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     let plain = Scheme::new(0, Rc::new(Ty::plain(Core::Nat)));
     assert_eq!(plain.to_string(), "Nat");
 
-    // A rigid prints as the name its `where let` gave it, in either sort.
+    // A rigid prints as the name its `where 'let` gave it, in either sort.
     let rigid = Rc::new(Ty {
         core: Core::Rigid {
             id: 0,
@@ -761,7 +755,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
         .into_iter()
         .collect(),
     });
-    assert_eq!(rigid.to_string(), "{ x: a, ..r }");
+    assert_eq!(rigid.to_string(), "{ x: 'a, ..'r }");
 
     // And a solver variable is unchanged: `?3` for a type or a rest, `?3` in a
     // `when` for a presence, a bare `?` for the undecided.
@@ -781,7 +775,7 @@ fn a_scheme_declares_the_letters_it_quantifies() {
 }
 
 /// A printed scheme is valid source. `let id = fn x => x` reports
-/// `a -> a where let a`, and pasting that back as an annotation re-lowers to
+/// `a -> a`, and pasting that back as an annotation re-lowers to
 /// the type it was printed from — which an implied quantifier could not do,
 /// since a bare `a` in an annotation is a name that has to have been declared.
 #[test]
@@ -789,7 +783,7 @@ fn a_printed_scheme_reads_back_as_source() {
     for source in [
         "let id = fn x => x",
         "let getx = fn p => p.x",
-        "let wrap = fn x => `Some x",
+        "let wrap = fn x => #Some x",
         "let both = fn a => match a with | {x} => {} | {y} => {} end",
     ] {
         let printed = printed_scheme(source);

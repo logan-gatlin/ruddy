@@ -116,10 +116,10 @@ pub struct Trace {
 /// written by the language rather than stood in for.
 ///
 /// A variable a scheme quantifies is deliberately not here. It prints as a
-/// bare letter now, the way a `where let` declares it, and a bare letter is
+/// bare letter now, the way a variable declares it, and a bare letter is
 /// exactly what an ordinary name looks like: a pattern matching one would light
 /// up every field called `a` on the page. What tells a reader which letters a
-/// scheme quantifies is the `where let` clause printed beside the type, which
+/// scheme quantifies is the a variable clause printed beside the type, which
 /// is a better answer than a highlight anyway — it is the source they could
 /// paste back.
 ///
@@ -196,7 +196,7 @@ pub const REGISTRY: &[Spec] = &[
         title: "Types",
         view: View::Tree,
         // A scheme's own letters are not lit — they are spelled exactly as
-        // names are, and the `where let` beside the type is what declares
+        // names are, and the a variable beside the type is what declares
         // them — so what is left to follow is the solver's own variables, and
         // only inside one scheme. Generalization numbers each definition's
         // quantifiers from scratch, so two rows spelling `?3` in the *types*
@@ -343,7 +343,7 @@ pub fn plural(count: usize, noun: &str) -> String {
 /// readings of their own, and say which they are.
 ///
 /// The labels are spelled the way their own shape spells them — a field bare, a
-/// case with its backtick — through [`ui::label`], so this row and the
+/// case with its `#` — through [`ui::label`], so this row and the
 /// compiler's own complaint about the same parameter name it the same way.
 pub fn stands_for(mint: &Mint, param: &Param) -> String {
     let name = mint.name(param.symbol);

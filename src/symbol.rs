@@ -76,7 +76,7 @@ pub enum Namespace {
     /// Declared effects. Their own world rather than a corner of the types',
     /// because a `Log` type and a `Log` effect are two things a program may
     /// name at once and nothing written can confuse them: an effect is named in
-    /// a row after a `!` and at the head of an operation, and a type nowhere
+    /// a row after a `+` and at the head of an operation, and a type nowhere
     /// near either.
     Effects,
     Modules,

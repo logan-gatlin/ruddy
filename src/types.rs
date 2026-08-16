@@ -44,16 +44,16 @@ pub type TyVar = u32;
 /// and never a second copy of a fact the position already settles.
 ///
 /// Never inferred and never defaulted: which one a set of labels is, is decided
-/// by the syntax that wrote it — braces or backticks — and travels with the type
+/// by the syntax that wrote it — braces or `#`s — and travels with the type
 /// from there. Two of different shapes are two types, and the solver refuses
 /// them the way it refuses a `Nat` against an arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Shape {
     /// `{ x: Nat, ..r }` — a value has every field the row says is there.
     Struct,
-    /// `` `A Nat | ..r `` — a value is one of the cases the row says is there.
+    /// `#A Nat | ..r` — a value is one of the cases the row says is there.
     Sum,
-    /// `` A -> B ! `Log | ..r `` — calling the arrow may perform every effect
+    /// `A -> B + !Log + ..r` — calling the arrow may perform every effect
     /// the row says is there, and no other.
     ///
     /// A third reading of the same machinery, not a third machinery: an effect
@@ -70,7 +70,7 @@ pub enum Shape {
 /// can name the two readings without quoting a set of labels nobody asked
 /// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
 ///
-/// Four of them rather than two, because a `where let` variable can be two
+/// Four of them rather than two, because a variable can be two
 /// things a declaration's parameter never can: the presence a `when` names, and
 /// nothing here — the rest of a struct *is* a type, since `..r` in a struct
 /// puts whatever is written for `r` in the type's core. A sum's rest and an
@@ -84,7 +84,7 @@ pub enum Sense {
     Type,
     Cases,
     /// The effects an arrow may perform: `..e` in `type Runner e = (Nat -> Nat
-    /// ! ..e) -> Nat ! ..e`.
+    /// + ..e) -> Nat + ..e`.
     Effects,
     /// Whether one label is there — what a `when a` names and what a `where`
     /// clause's formula is written about.
@@ -125,7 +125,7 @@ pub enum ParamKind {
     /// as `WithX { y: Nat }`.
     Type { lacks: IndexSet<String> },
     /// Stands for the cases a sum does not name — and, with them, the cases it
-    /// may therefore not name itself. `r` in `` type Or r = `A | ..r ``.
+    /// may therefore not name itself. `r` in `type Or r = #A | ..r`.
     ///
     /// The one reading that is not a type, and the reason it is enforced rather
     /// than substituted: a sum's rest is spliced into [`Core::Sum`]'s row, so
@@ -134,7 +134,7 @@ pub enum ParamKind {
     Cases { lacks: IndexSet<String> },
     /// Stands for the effects an arrow does not name — and, with them, the
     /// effects it may therefore not name itself. `e` in
-    /// `type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e`.
+    /// `type Runner e = (Nat -> Nat + ..e) -> Nat + ..e`.
     ///
     /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
     /// row's rest is spliced into the row [`Core::Arrow`] carries, so anything
@@ -248,7 +248,7 @@ pub enum Core {
     /// there is one type here and one spelling for it.
     Unit,
     Nat,
-    /// `A -> B ! E` — what it takes, what it gives back, and the effects
+    /// `A -> B + E` — what it takes, what it gives back, and the effects
     /// calling it may perform.
     ///
     /// The row is an *upper bound* and never a demand on the caller: a closed
@@ -296,7 +296,7 @@ pub enum Core {
     /// opens to a `Nat` carrying an `x` and `WithX { y: Nat }` to a struct
     /// carrying both — one substitution, and the one the compiler already had.
     Bound(u32),
-    /// A variable an annotation's `where let` declared, while the body under
+    /// A variable an annotation introduced, while the body under
     /// that annotation is being checked.
     ///
     /// Rigid: equal only to a rigid with the same `id`, and never bound to
@@ -426,7 +426,7 @@ pub enum Rest {
     /// A tail a scheme quantified, or one a declaration takes as a sum's rest.
     /// A leaf: what it stands for is supplied from outside.
     Bound(u32),
-    /// A rest an annotation's `where let` declared: [`Core::Rigid`] about a
+    /// A rest an annotation introduced: [`Core::Rigid`] about a
     /// sum's cases, and rigid for the same reason and on the same terms.
     Rigid {
         id: u32,
@@ -468,13 +468,13 @@ pub struct RowField {
 pub enum Presence {
     Present,
     /// The label is definitely not there. Written as `\name` in a struct type
-    /// and `` \`Name `` in a sum — the one spelling of absence the surface
+    /// and `\#Name` in a sum — the one spelling of absence the surface
     /// syntax has — and otherwise arising from solving, when an open row meets
     /// a closed one that lacks the label.
     Absent,
     Var(TyVar),
     /// A presence a scheme quantified, which prints as the `when` clause on its
-    /// label: `{x when a: Nat}`, and `` `A (when a) Nat ``.
+    /// label: `{x when a: Nat}`, and `#A (when a) Nat`.
     Bound(u32),
     /// A failure abandoned the question, or a reporter froze it. The one
     /// presence that still prints as a `?`, and no syntax reads one back.
@@ -556,7 +556,7 @@ impl Assigned {
     ///
     /// Three ways to arrive, and the middle one is why this is a conversion
     /// rather than a lookup. A row outright is the row. A *type* is what a use
-    /// site writes — `` Fallible (`Ok Nat) `` hands a sum where a set of cases
+    /// site writes — `Fallible (#Ok Nat)` hands a sum where a set of cases
     /// goes — so it is read for the cases it allows. And a type that is only a
     /// bare variable is the commonest of the three: instantiating a scheme mints
     /// one variable per quantified position, and a position the scheme used as a
@@ -660,7 +660,7 @@ impl Ty {
     /// thing anything still asks a type for a row about.
     ///
     /// Anything else is an argument [`ir::build`](crate::ir::build) already
-    /// refused and erased — `` Or Nat `` for `` type Or r = `A | ..r `` is the
+    /// refused and erased — `Or Nat` for `type Or r = #A | ..r` is the
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {

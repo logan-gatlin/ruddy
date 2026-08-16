@@ -61,7 +61,7 @@ enum Tail {
 /// the tail's — and nothing further in that could come to disagree with it.
 ///
 /// The type is carried as well as the labels because a complaint is about the
-/// type. `` (`A 1).x `` is a missing *field* on a sum-cored type: the labels that
+/// type. `(#A 1).x` is a missing *field* on a sum-cored type: the labels that
 /// went wrong are that type's fields, and the type beside the word is the whole
 /// of what the reader wrote.
 #[derive(Clone, Copy)]
@@ -86,7 +86,7 @@ impl Tail {
         }
     }
 
-    /// The `where let` variable this tail is, if it is one: its spelling and
+    /// The a variable variable this tail is, if it is one: its spelling and
     /// its id. What a label demanded of it is refused by name.
     fn rigid(&self) -> Option<(Rc<str>, u32)> {
         match self {
@@ -334,8 +334,8 @@ impl Solve<'_> {
     /// R12's opening rule, and the one rule in the solver that widens rather
     /// than equates. A callee whose row still ends in a variable takes the
     /// ambient outright — its tail absorbs the difference — and a closed one is
-    /// opened first, so `` `Log `` performed where `` `Log | `IO `` is allowed
-    /// goes through and the `` `IO `` stays the ambient's own.
+    /// opened first, so `!Log` performed where `!Log | !IO` is allowed
+    /// goes through and the `!IO` stays the ambient's own.
     ///
     /// Which effects the ambient cannot possibly take is decided here rather
     /// than left to the row rule below, because the complaint is a different
@@ -455,7 +455,7 @@ impl Solve<'_> {
         } else {
             self.table.required(bound)
         };
-        // A `where let` variable this binding did not declare means nothing in
+        // A variable this binding did not declare means nothing in
         // the scheme it is about to publish, exactly as it means nothing in a
         // definition's. See [`Table::escapes`](super::Table).
         self.table.escapes(bound, rigids, self.errors);
@@ -655,7 +655,7 @@ impl Solve<'_> {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
             }
-            // A `where let` variable is equal to itself and to nothing else.
+            // A variable is equal to itself and to nothing else.
             // Two rigids with one id are the same variable however differently
             // the two sides were reached; two with different ids are two
             // promises about two independent choices the caller makes, and one
@@ -782,7 +782,7 @@ impl Solve<'_> {
             }
             // Three goals rather than two, and the third is not opened: an
             // annotation says what it says, so `let h : Nat -> Nat = f` with
-            // `f : Nat -> Nat ! `Log` is refused. Opening happens where a
+            // `f : Nat -> Nat + !Log` is refused. Opening happens where a
             // function is *applied* and nowhere else. See R13.
             (Core::Arrow(from1, to1, does1), Core::Arrow(from2, to2, does2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
@@ -852,7 +852,7 @@ impl Solve<'_> {
     /// Named as the two whole types rather than as their cores: a `Nat` against
     /// `{ x: Nat }` is a mismatch of what the reader wrote, and the cores alone
     /// would quote them a unit they never mentioned.
-    /// A `where let` variable met something it cannot be: report it, abandon
+    /// A variable met something it cannot be: report it, abandon
     /// what the goal was about, and say the labels beside them are not worth
     /// deciding.
     ///
@@ -1353,7 +1353,7 @@ impl Solve<'_> {
 
         for (name, field) in &extras {
             let presence = self.table.presence_of(&field.presence);
-            // A label certainly there, demanded of a `where let` variable. The
+            // A label certainly there, demanded of a variable. The
             // variable stands for whatever the caller picks, so it may not have
             // one — and unlike a closed row, which at least lists what it does
             // allow, there is nothing here to show the reader but the promise

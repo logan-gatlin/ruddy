@@ -77,7 +77,7 @@ fn a_row_is_reachable_only_through_a_sum() {
         rest: Rest::Var(2),
     };
     let sum = Ty::plain(Core::Sum(cases));
-    assert_eq!(sum.to_string(), "`A | ..?2");
+    assert_eq!(sum.to_string(), "#A | ..?2");
     assert_eq!(sum.cases().labels.len(), 1);
 
     // Everything else allows no case it has not been shown, which it says as
@@ -168,7 +168,7 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     assert_eq!(plain.cases(), None);
 
     let lacks: indexmap::IndexSet<String> = ["x".to_string()].into_iter().collect();
-    // A struct's `..r` is a type parameter with fields it may not name, which is
+    // A struct's `..'r` is a type parameter with fields it may not name, which is
     // why `WithX Nat` is well-formed and `WithX { x: Nat }` is not.
     let fielded = ParamKind::Type {
         lacks: lacks.clone(),
@@ -222,12 +222,12 @@ fn a_formula_is_walked_by_one_substitution() {
     for (formula, swapped) in [
         (Formula::True, "always"),
         (Formula::False, "never"),
-        (a.clone(), "a"),
-        (a.clone().not(), "not a"),
-        (a.clone().and(b.clone()), "a and b"),
-        (a.clone().or(b.clone()), "a or b"),
-        (a.clone().iff(b.clone()), "a = b"),
-        (a.clone().xor(b.clone()), "a != b"),
+        (a.clone(), "'a"),
+        (a.clone().not(), "not 'a"),
+        (a.clone().and(b.clone()), "'a and 'b"),
+        (a.clone().or(b.clone()), "'a or 'b"),
+        (a.clone().iff(b.clone()), "'a = 'b"),
+        (a.clone().xor(b.clone()), "'a != 'b"),
     ] {
         assert_eq!(formula.substitute(&swap).to_string(), swapped);
     }
@@ -240,7 +240,7 @@ fn a_formula_is_walked_by_one_substitution() {
 fn renaming_leaves_the_quantified_variables_alone() {
     let formula = Formula::var(0).and(Formula::bound(1));
     let renamed = formula.rename(&|var| Formula::var(var + 10));
-    assert_eq!(renamed.to_string(), "?10 and b");
+    assert_eq!(renamed.to_string(), "?10 and 'b");
 }
 
 /// Opening a scheme's formula hands each variable it quantified whatever
@@ -270,7 +270,7 @@ fn opening_a_formula_substitutes_what_was_minted() {
         (Presence::Present, "always"),
         (Presence::Absent, "never"),
         (Presence::Var(2), "?2"),
-        (Presence::Bound(1), "b"),
+        (Presence::Bound(1), "'b"),
         // A failure abandoned the question, so there is nothing to require.
         (Presence::Undecided, "always"),
     ] {
@@ -305,17 +305,18 @@ fn an_arrow_carries_the_effects_calling_it_may_perform() {
             rest: Rest::Var(3),
         },
     ));
-    assert_eq!(performing.to_string(), "Nat -> Nat ! `Log | ..?3");
+    assert_eq!(performing.to_string(), "Nat -> Nat + !Log + ..?3");
 }
 
-/// The third shape reads in its own noun and writes its labels the way a sum's
-/// are: an effect wears the backtick that makes it one, so a message about
-/// `` `Log `` never asks the reader to look for `Log`.
+/// The third shape reads in its own noun and writes its labels its own way: an
+/// effect wears the `!` that makes it one, so a message about `!Log` never asks
+/// the reader to look for `Log` — and never reads like one about the case
+/// `#Log` either.
 #[test]
 fn an_effect_row_is_read_in_effects() {
     assert_eq!(Shape::Effect.to_string(), "function");
-    assert_eq!(ruddy::ui::label(Shape::Effect, "Log"), "`Log");
-    assert_eq!(ruddy::ui::label(Shape::Sum, "Log"), "`Log");
+    assert_eq!(ruddy::ui::label(Shape::Effect, "Log"), "!Log");
+    assert_eq!(ruddy::ui::label(Shape::Sum, "Log"), "#Log");
     assert_eq!(ruddy::ui::label(Shape::Struct, "x"), "x");
 }
 
@@ -417,7 +418,7 @@ fn a_rigid_is_a_leaf_that_opening_leaves_alone() {
         id: 5,
         name: "s".into(),
     }))));
-    assert_eq!(cases.to_string(), "| ..s");
+    assert_eq!(cases.to_string(), "| ..'s");
     let opened = cases.open(&[Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))]);
-    assert_eq!(opened.to_string(), "| ..s");
+    assert_eq!(opened.to_string(), "| ..'s");
 }

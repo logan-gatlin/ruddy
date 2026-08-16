@@ -323,11 +323,6 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
     let elsewhere = match &error.kind {
         ir::ErrorKind::Duplicate { previous, .. }
         | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
-        // A `where let` declares rather than defines, so its repeat points back
-        // with the note about a declaration. See [`ui::FIRST_DECLARATION`].
-        ir::ErrorKind::DuplicateVariable { previous, .. } => {
-            Some((*previous, ui::FIRST_DECLARATION))
-        }
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,
     };
@@ -341,7 +336,7 @@ fn ir_diagnostic(source: &str, error: &ir::Error) -> Diagnostic {
 }
 
 /// Inference's errors, two of which have a second place to point at: the
-/// `where let` that declared the variable a body broke its promise about. The
+/// a variable that declared the variable a body broke its promise about. The
 /// same pairing [`ir_diagnostic`] makes one phase earlier, and shown the same
 /// way — one diagnostic with two highlights, because a broken promise is only
 /// legible next to the promise.

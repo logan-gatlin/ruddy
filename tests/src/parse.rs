@@ -71,11 +71,11 @@ fn open_struct_types() {
         "let x : { a: A, .. } = y"
     );
     assert_eq!(
-        parse_one("let x : { a: A, ..r } = y"),
-        "let x : { a: A, ..r } = y"
+        parse_one("let x : { a: A, ..'r } = y"),
+        "let x : { a: A, ..'r } = y"
     );
     assert_eq!(parse_one("let x : { .. } = y"), "let x : { .. } = y");
-    assert_eq!(parse_one("let x : { ..r } = y"), "let x : { ..r } = y");
+    assert_eq!(parse_one("let x : { ..'r } = y"), "let x : { ..'r } = y");
 }
 
 /// A struct field writes its `when` clause bare between the label and the
@@ -84,14 +84,14 @@ fn open_struct_types() {
 #[test]
 fn a_struct_field_may_name_its_presence() {
     for src in [
-        "let x : { a when a: A } = y",
-        "let x : { a when a: A, b: B, ..r } = y",
+        "let x : { a when 'a: A } = y",
+        "let x : { a when 'a: A, b: B, ..'r } = y",
         // `when _` is the anonymous presence: a variable this definition
         // decides that no formula can name.
         "let x : { a when _: A } = y",
         // Two labels of one name share one presence, which is how a type says
         // two fields are there together.
-        "let x : { a when p: A, b when p: B } = y",
+        "let x : { a when 'p: A, b when 'p: B } = y",
     ] {
         assert_eq!(parse_one(src), src);
     }
@@ -106,12 +106,12 @@ fn a_label_may_be_called_when() {
         "let x : { when: A } = y"
     );
     assert_eq!(
-        parse_one("let x : { when when a: A } = y"),
-        "let x : { when when a: A } = y"
+        parse_one("let x : { when when 'a: A } = y"),
+        "let x : { when when 'a: A } = y"
     );
 }
 
-/// The contextual keywords are ordinary identifiers everywhere but the type
+/// The contextual keywords are ordinary identifiers everywhere 'but the type
 /// positions that read them, so terms and labels of those names still work.
 #[test]
 fn the_clause_keywords_are_contextual() {
@@ -135,12 +135,12 @@ fn the_clause_keywords_are_contextual() {
 #[test]
 fn a_sum_case_parenthesizes_its_presence() {
     for src in [
-        "let x : `A (when a) Nat | `B = y",
-        "let x : `A (when a) | `B (when b) Nat = y",
-        "let x : `A (when _) Nat = y",
+        "let x : #A (when 'a) Nat | #B = y",
+        "let x : #A (when 'a) | #B (when 'b) Nat = y",
+        "let x : #A (when _) Nat = y",
         // A parenthesized payload is still a payload: nothing has changed
         // about a case carrying a type that needed brackets.
-        "let x : `A (Nat -> Nat) = y",
+        "let x : #A (Nat -> Nat) = y",
     ] {
         assert_eq!(parse_one(src), src);
     }
@@ -153,10 +153,10 @@ fn a_when_clause_must_name_something() {
     for (src, at) in [
         ("let x : { a when: A } = y", ": A } = y"),
         ("let x : { a when 1: A } = y", "1: A } = y"),
-        ("let x : `A (when a Nat = y", "Nat = y"),
+        ("let x : #A (when 'a Nat = y", "Nat = y"),
         // Unparenthesized in a sum, the `when` is read as the payload type it
-        // looks like and the name after it is nobody's token.
-        ("let x : `A when a = y", "a = y"),
+        // looks like and the variable after it is nobody's token.
+        ("let x : #A when 'a = y", "'a = y"),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -175,29 +175,29 @@ fn a_when_clause_must_name_something() {
 #[test]
 fn where_clauses_read_at_every_level() {
     for src in [
-        "let x : { a when a: A } where a = y",
-        "let x : { a when a: A } where not a = y",
-        "let x : { a when a: A } where not not a = y",
-        "let x : { a when a: A, b when b: B } where a and b = y",
-        "let x : { a when a: A, b when b: B } where a or b = y",
-        "let x : { a when a: A, b when b: B } where a = b = y",
-        "let x : { a when a: A, b when b: B } where a != b = y",
+        "let x : { a when 'a: A } where 'a = y",
+        "let x : { a when 'a: A } where not 'a = y",
+        "let x : { a when 'a: A } where not not 'a = y",
+        "let x : { a when 'a: A, b when 'b: B } where 'a and 'b = y",
+        "let x : { a when 'a: A, b when 'b: B } where 'a or 'b = y",
+        "let x : { a when 'a: A, b when 'b: B } where 'a = 'b = y",
+        "let x : { a when 'a: A, b when 'b: B } where 'a != 'b = y",
         // `and` binds tighter than `or`, which binds tighter than the
         // comparison — so these need no parentheses at all.
-        "let x : { a when a: A, b when b: B, c when c: C } where a or b and c = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where a and b or c = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where a = b or c = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a or 'b and 'c = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a and 'b or 'c = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a = 'b or 'c = y",
         // And these do, because the grammar reads them the other way round
         // without them.
-        "let x : { a when a: A, b when b: B, c when c: C } where (a or b) and c = y",
-        "let x : { a when a: A, b when b: B } where not (a and b) = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where a and (b or c) = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where (a = b) or c = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where a != (b = c) = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where ('a or 'b) and 'c = y",
+        "let x : { a when 'a: A, b when 'b: B } where not ('a and 'b) = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a and ('b or 'c) = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where ('a = 'b) or 'c = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a != ('b = 'c) = y",
         // A clause ends a whole written type, so it sits outside the arrow.
-        "let x : { a when a: A } -> B where a = y",
+        "let x : { a when 'a: A } -> B where 'a = y",
         // And a declaration's body reads one too, for lowering to refuse.
-        "type T = { a when a: A } where a",
+        "type T = { a when 'a: A } where 'a",
     ] {
         assert_eq!(parse_one(src), src);
     }
@@ -207,16 +207,16 @@ fn where_clauses_read_at_every_level() {
 /// rather than folded one way or the other.
 ///
 /// A definition's own `=` is the exception, and not the grammar bending: in
-/// `where a != b = v` the `=` is what introduces the value, and the clause has
+/// `where a != 'b = v` the `=` is what introduces the value, and the clause has
 /// already ended. What tells the clause's `=` from that one is that the
 /// clause's is followed by it.
 #[test]
 fn a_comparison_does_not_chain() {
     for src in [
-        "type T = { a when a: A, b when b: B, c when c: C } where a = b = c",
-        "type T = { a when a: A, b when b: B, c when c: C } where a != b != c",
-        "let x : { a when a: A, b when b: B, c when c: C } where a != b != c = y",
-        "let x : { a when a: A, b when b: B, c when c: C } where (a = b = c) = y",
+        "type T = { a when 'a: A, b when 'b: B, c when 'c: C } where 'a = 'b = 'c",
+        "type T = { a when 'a: A, b when 'b: B, c when 'c: C } where 'a != 'b != 'c",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where 'a != 'b != 'c = y",
+        "let x : { a when 'a: A, b when 'b: B, c when 'c: C } where ('a = 'b = 'c) = y",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -225,40 +225,35 @@ fn a_comparison_does_not_chain() {
     // A single comparison over a definition still reads, with the `=` after it
     // introducing the value.
     assert_eq!(
-        parse_one("let x : { a when a: A, b when b: B } where a = b = y"),
-        "let x : { a when a: A, b when b: B } where a = b = y"
+        parse_one("let x : { a when 'a: A, b when 'b: B } where 'a = 'b = y"),
+        "let x : { a when 'a: A, b when 'b: B } where 'a = 'b = y"
     );
     // And so does a clause of one name, whose `=` is the definition's alone.
     assert_eq!(
-        parse_one("let x : { a when a: A } where a = y"),
-        "let x : { a when a: A } where a = y"
+        parse_one("let x : { a when 'a: A } where 'a = y"),
+        "let x : { a when 'a: A } where 'a = y"
     );
 }
 
-/// A `where` clause is a `;`-separated list of statements, and a declaration
-/// statement is the keyword `let` and one or more comma-separated names.
-/// Statements may appear in any order and may be interleaved, and several
-/// declaration statements accumulate their names.
+/// A `where` clause is a `;`-separated list of constraints, conjoined in
+/// written order. Nothing declares anything: a variable is introduced where it
+/// is used, so what is left here is what a formula was always for.
 #[test]
 fn a_where_clause_is_a_statement_list() {
     for src in [
-        // One declaration statement, which is the whole clause.
-        "let id : a -> a where let a = fn x => x",
-        // Several names in one, and several statements.
-        "let h : a -> b where let a, b = fn x => x",
-        "let h : a -> b where let a; let b = fn x => x",
-        // Interleaved with the constraints, in any order.
-        "let f : { x when a: A, y when b: B } where let a, b; a = b = z",
-        "let f : { x when a: A, y when b: B } where a = b; let a, b = z",
-        "let f : { x when a: A, y when b: B } where let a; a = b; let b = z",
-        // A constraint-only clause is what the language already had, and reads
-        // as one statement.
-        "let f : { x when a: A } where a = z",
-        // Three statements, and the last one still tells its `=` from the
-        // definition's.
-        "let f : { x when a: A, y when b: B } where let a; let b; a = b = z",
+        // No clause at all, which is what an annotation with no presence to
+        // constrain writes now.
+        "let id : 'a -> 'a = fn x => x",
+        "let h : 'a -> 'b = fn x => x",
+        // One constraint, and several.
+        "let f : { x when 'a: A } where 'a = z",
+        "let f : { x when 'a: A, y when 'b: B } where 'a = 'b = z",
+        "let f : { x when 'a: A, y when 'b: B } where 'a; 'b = z",
+        "let f : { x when 'a: A, y when 'b: B, z when 'c: C } where 'a; 'b; 'c = z",
+        // The last one still tells its `=` from the definition's.
+        "let f : { x when 'a: A, y when 'b: B } where 'b; 'a = 'b = z",
         // And a declaration's body reads one too, for lowering to refuse.
-        "type T = { x: A } where let r",
+        "type T = { x when 'a: A } where 'a",
     ] {
         assert_eq!(parse_one(src), src);
     }
@@ -269,9 +264,9 @@ fn a_where_clause_is_a_statement_list() {
 #[test]
 fn a_trailing_separator_is_unexpected() {
     for src in [
-        "type T = { x when a: A } where a;",
-        "type T = { x when a: A } where let a;",
-        "let f : { x when a: A } where a; = z",
+        "type T = { x when 'a: A } where 'a;",
+        "type T = { x when 'a: A } where ",
+        "let f : { x when 'a: A } where 'a; = z",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         let [error] = out.errors.as_slice() else {
@@ -289,7 +284,7 @@ fn a_type_hole_parses_as_a_type() {
         "let k : _ -> Nat = fn x => 0",
         "let k : _ -> _ = fn x => x",
         "let k : { x: _, y: _ } -> Nat = fn p => 0",
-        "let k : `Some _ | `None = nothing",
+        "let k : #Some _ | #None = nothing",
         "let k : List _ = nil",
     ] {
         assert_eq!(parse_one(src), src);
@@ -327,11 +322,11 @@ fn a_clause_may_not_name_the_discard() {
 fn a_struct_field_may_be_written_absent() {
     for src in [
         "let x : { a: A, \\y, .. } = z",
-        "let x : { a: A, \\y, ..r } = z",
+        "let x : { a: A, \\y, ..'r } = z",
         "let x : { \\y } = z",
         "let x : { \\y, a: A, .. } = z",
-        "let x : { a: A, \\y, b when a: B, .. } = z",
-        "let x : { a: A, b when a: B, \\y, ..r } = z",
+        "let x : { a: A, \\y, b when 'a: B, .. } = z",
+        "let x : { a: A, b when 'a: B, \\y, ..'r } = z",
         // Two absences of one name are both recorded, the way two fields of
         // one name are: rejecting a repeat is the IR's job.
         "let x : { \\y, \\y, .. } = z",
@@ -363,14 +358,14 @@ fn an_absent_label_spans_its_mark() {
     assert_eq!(name.span.start, src.find("\\y").expect("the mark"));
     assert_eq!(name.span.width, 2);
 
-    let src = "let x : `Ok Nat | \\`Err | ..r = z";
+    let src = "let x : #Ok Nat | \\#Err | ..'r = z";
     let TypeKind::Sum { cases, .. } = ascribed(src).tracked else {
         panic!("expected a sum type");
     };
     let (name, case) = cases.get_index(1).expect("the absent case");
     assert!(matches!(case, SumCase::Absent));
     assert_eq!(name.tracked, "Err");
-    assert_eq!(name.span.start, src.find("\\`Err").expect("the mark"));
+    assert_eq!(name.span.start, src.find("\\#Err").expect("the mark"));
     assert_eq!(name.span.width, 5);
 }
 
@@ -380,7 +375,7 @@ fn a_tail_ends_the_field_list() {
     // the named ones to claim: nothing may follow it, not even a comma.
     for src in [
         "let x : { .., a: A } = y",
-        "let x : { a: A, ..r, } = y",
+        "let x : { a: A, ..'r, } = y",
         "let x : { a: A .. } = y",
         "let x : { ..1 } = y",
         "let x : { a? A } = y",
@@ -581,7 +576,7 @@ fn a_projection_needs_a_field_name() {
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
 }
 
-/// `..` belongs to a struct type and nowhere else, so meeting one where an
+/// `..` belongs to a struct type and nowhere 'else, so meeting one where 'an
 /// expression is being read is an error rather than a place to stop.
 ///
 /// Stopping was the bug: the projection ended cleanly at the `..`, so did the
@@ -593,9 +588,9 @@ fn a_projection_needs_a_field_name() {
 fn a_dot_dot_cannot_follow_an_expression() {
     for src in [
         "let a = p..x",
-        "let a = p...x",
+        "let a = p...'x",
         "let a = p..",
-        "let a = 1 ..x",
+        "let a = 1 ..'x",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without error");
@@ -603,7 +598,7 @@ fn a_dot_dot_cannot_follow_an_expression() {
     }
 
     // And the `..` a struct type is entitled to is untouched.
-    assert_eq!(parse_one("let x : { ..r } = y"), "let x : { ..r } = y");
+    assert_eq!(parse_one("let x : { ..'r } = y"), "let x : { ..'r } = y");
 }
 
 /// Nothing is silently stood in for a missing expression or type: a position
@@ -727,12 +722,12 @@ fn a_declaration_binds_parameters_at_its_head() {
 #[test]
 fn a_comma_tells_a_field_from_a_tail() {
     assert_eq!(
-        parse_one("let x : { f: List T, ..r } = y"),
-        "let x : { f: List T, ..r } = y"
+        parse_one("let x : { f: List T, ..'r } = y"),
+        "let x : { f: List T, ..'r } = y"
     );
     assert_eq!(
-        parse_one("let x : { f: List, ..r } = y"),
-        "let x : { f: List, ..r } = y"
+        parse_one("let x : { f: List, ..'r } = y"),
+        "let x : { f: List, ..'r } = y"
     );
 }
 
@@ -743,26 +738,26 @@ fn a_comma_tells_a_field_from_a_tail() {
 #[test]
 fn sum_types() {
     assert_eq!(
-        parse_one("type Option T = `Some T | `None"),
-        "type Option T = `Some T | `None"
+        parse_one("type Option T = #Some T | #None"),
+        "type Option T = #Some T | #None"
     );
     // The leading `|` is accepted and dropped.
     assert_eq!(
-        parse_one("type Option T = | `Some T | `None"),
-        "type Option T = `Some T | `None"
+        parse_one("type Option T = | #Some T | #None"),
+        "type Option T = #Some T | #None"
     );
     // One case is a sum like any other.
-    assert_eq!(parse_one("type Just = `It Nat"), "type Just = `It Nat");
+    assert_eq!(parse_one("type Just = #It Nat"), "type Just = #It Nat");
     // And a case may be marked with a `when`, which no tail can say for it.
     assert_eq!(
-        parse_one("let x : `A (when a) Nat | `B = y"),
-        "let x : `A (when a) Nat | `B = y"
+        parse_one("let x : #A (when 'a) Nat | #B = y"),
+        "let x : #A (when 'a) Nat | #B = y"
     );
 }
 
 /// The two forms that write no case at all. Neither would be read back as a
 /// sum without the leading `|`, which is why the printer writes one there and
-/// nowhere else.
+/// nowhere 'else.
 #[test]
 fn a_sum_with_no_cases_is_a_bare_bar() {
     assert_eq!(parse_one("type Void = |"), "type Void = |");
@@ -770,8 +765,8 @@ fn a_sum_with_no_cases_is_a_bare_bar() {
 }
 
 /// A `|` between two cases promises a second one, so one with nothing after it
-/// is reported. Left silent, the annotation in `` let x : `A Nat | = 1 `` read
-/// as `` `A Nat `` and the bar the writer meant something by vanished without a
+/// is reported. Left silent, the annotation in `let x : #A Nat | = 1` read
+/// as `#A Nat` and the bar the writer meant something by vanished without a
 /// word.
 ///
 /// The leading bar is the exception, and the only one: `|` alone is the sum
@@ -781,9 +776,9 @@ fn a_sum_with_no_cases_is_a_bare_bar() {
 #[test]
 fn a_bar_promising_a_case_that_never_comes_is_reported() {
     for (src, at) in [
-        ("let x : `A Nat | = 1", 15),
-        ("let x : `A Nat | | `B = 1", 15),
-        ("type T = `A | ", 12),
+        ("let x : #A Nat | = 1", 15),
+        ("let x : #A Nat | | #B = 1", 15),
+        ("type T = #A | ", 12),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         let first = out.errors.first().unwrap_or_else(|| panic!("{src}"));
@@ -793,7 +788,7 @@ fn a_bar_promising_a_case_that_never_comes_is_reported() {
 
     // The leading bar promises nothing, and neither does a case with no bar
     // after it.
-    for src in ["type Void = |", "type Only r = | ..r", "type T = `A | `B"] {
+    for src in ["type Void = |", "type Only r = | ..r", "type T = #A | #B"] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
     }
@@ -803,39 +798,39 @@ fn a_bar_promising_a_case_that_never_comes_is_reported() {
 #[test]
 fn a_sum_may_be_left_open() {
     assert_eq!(
-        parse_one("let x : `A Nat | .. = y"),
-        "let x : `A Nat | .. = y"
+        parse_one("let x : #A Nat | .. = y"),
+        "let x : #A Nat | .. = y"
     );
     assert_eq!(
-        parse_one("type Tagged r = `Err Nat | ..r"),
-        "type Tagged r = `Err Nat | ..r"
+        parse_one("type Tagged r = #Err Nat | ..r"),
+        "type Tagged r = #Err Nat | ..r"
     );
 }
 
-/// `` \`Tag `` is accepted wherever a case may be written, and a leading `\`
+/// `\#Tag` is accepted wherever a case may be written, and a leading `\`
 /// begins a sum the way a leading tag or `|` does — with or without the
-/// leading bar. The case keeps its backtick, so it is spelled the same way
+/// leading bar. The case keeps its `#`, so it is spelled the same way
 /// present or absent, and a closed sum with one parses here: refusing it is
 /// lowering's rule.
 #[test]
 fn a_sum_case_may_be_written_absent() {
     for src in [
-        "let x : `Ok Nat | \\`Err | ..r = y",
-        "let x : \\`B | .. = y",
-        "let x : `A | \\`B = y",
-        "let x : \\`A | `B Nat | \\`C | .. = y",
-        "type NoErr r = `Ok Nat | \\`Err | ..r",
+        "let x : #Ok Nat | \\#Err | ..'r = y",
+        "let x : \\#B | .. = y",
+        "let x : #A | \\#B = y",
+        "let x : \\#A | #B Nat | \\#C | .. = y",
+        "type NoErr r = #Ok Nat | \\#Err | ..r",
     ] {
         assert_eq!(parse_one(src), src);
     }
     // The leading `|` is accepted and dropped, exactly as it is before a tag.
     assert_eq!(
-        parse_one("let x : | \\`B | .. = y"),
-        "let x : \\`B | .. = y"
+        parse_one("let x : | \\#B | .. = y"),
+        "let x : \\#B | .. = y"
     );
 }
 
-/// An absent label is bare: `\y` takes no `:` type and no `when`, `` \`B `` no
+/// An absent label is bare: `\y` takes no `:` type and no `when`, `\#B` no
 /// payload and no `when`, a `\` needs a name after it, and a `\` begins no
 /// expression at all. Each is the ordinary unexpected-token report, at the
 /// token that has no place — and the statement is dropped, as for any other
@@ -846,8 +841,8 @@ fn an_absent_label_is_bare() {
     for (src, from) in [
         ("let x : { \\y: Nat, .. } = 1", ": Nat, .. } = 1"),
         ("let x : { \\y when a, .. } = 1", "when a, .. } = 1"),
-        ("let x : \\`B (when a) | .. = 1", "(when a) | .. = 1"),
-        ("let x : `A | \\`B Nat | .. = 1", "Nat | .. = 1"),
+        ("let x : \\#B (when 'a) | .. = 1", "(when 'a) | .. = 1"),
+        ("let x : #A | \\#B Nat | .. = 1", "Nat | .. = 1"),
         ("let x : { \\, .. } = 1", ", .. } = 1"),
         // In a type, what follows a `\` must be a tag or a field name.
         ("let x : \\= 1", "= 1"),
@@ -864,59 +859,59 @@ fn an_absent_label_is_bare() {
 
 /// A case carries one atom, the same as a tag in a term does, so anything with
 /// a space in it takes parentheses — and an arrow is looser than a sum, so
-/// `` `A Nat -> Nat `` is a function *from* the sum rather than a case carrying
+/// `#A Nat -> Nat` is a function *from* the sum rather than a case carrying
 /// an arrow. The printer puts the parentheses back where the grammar needs
 /// them.
 #[test]
 fn a_case_carries_one_atom() {
     assert_eq!(
-        parse_one("type F = `Some (Pair A B)"),
-        "type F = `Some (Pair A B)"
+        parse_one("type F = #Some (Pair A B)"),
+        "type F = #Some (Pair A B)"
     );
     assert_eq!(
-        parse_one("type F = `A Nat -> Nat"),
-        "type F = `A Nat -> Nat"
+        parse_one("type F = #A Nat -> Nat"),
+        "type F = #A Nat -> Nat"
     );
     assert_eq!(
-        parse_one("type F = `A (Nat -> Nat)"),
-        "type F = `A (Nat -> Nat)"
+        parse_one("type F = #A (Nat -> Nat)"),
+        "type F = #A (Nat -> Nat)"
     );
     // A sum in a position an argument could follow needs parentheses of its
     // own, which is the whole of why it sits above the arrow.
     assert_eq!(
-        parse_one("type F = Pair (`A Nat | `B) Nat"),
-        "type F = Pair (`A Nat | `B) Nat"
+        parse_one("type F = Pair (#A Nat | #B) Nat"),
+        "type F = Pair (#A Nat | #B) Nat"
     );
     // To the right of an arrow nothing can follow it, so none are written.
     assert_eq!(
-        parse_one("type F = Nat -> `A Nat | `B"),
-        "type F = Nat -> `A Nat | `B"
+        parse_one("type F = Nat -> #A Nat | #B"),
+        "type F = Nat -> #A Nat | #B"
     );
 }
 
-/// A tag takes one operand, and takes it greedily: `` f `A 1 `` is `f` applied
+/// A tag takes one operand, and takes it greedily: `f #A 1` is `f` applied
 /// to the case rather than the case applied to `1`. A tag carries one thing, so
 /// there is nothing the other reading could mean.
 #[test]
 fn a_tag_binds_tighter_than_application() {
-    assert_eq!(parse_one("let v = `Some 1"), "let v = `Some 1");
-    assert_eq!(parse_one("let v = `None"), "let v = `None");
-    assert_eq!(parse_one("let v = f `A 1"), "let v = f (`A 1)");
+    assert_eq!(parse_one("let v = #Some 1"), "let v = #Some 1");
+    assert_eq!(parse_one("let v = #None"), "let v = #None");
+    assert_eq!(parse_one("let v = f #A 1"), "let v = f (#A 1)");
     // Which is why a bare tag written as an argument comes back in
     // parentheses: nothing follows it here, but the printer decides one node
     // at a time, and a second argument after it would be read as the payload
     // it has not got.
-    assert_eq!(parse_one("let v = f `A"), "let v = f (`A)");
-    // The same rule at the head of an application, where leaving them off
+    assert_eq!(parse_one("let v = f #A"), "let v = f (#A)");
+    // The same rule at the head of an application, where 'leaving them off
     // would turn the argument into a payload and print the tree above.
-    assert_eq!(parse_one("let v = f (`A) 1"), "let v = f (`A) 1");
-    assert_eq!(parse_one("let v = (`A) 1"), "let v = (`A) 1");
+    assert_eq!(parse_one("let v = f (#A) 1"), "let v = f (#A) 1");
+    assert_eq!(parse_one("let v = (#A) 1"), "let v = (#A) 1");
     // The payload is a projection, so the field is carried rather than the
     // record it was read off.
-    assert_eq!(parse_one("let v = `Some p.x"), "let v = `Some p.x");
+    assert_eq!(parse_one("let v = #Some p.x"), "let v = #Some p.x");
     // And an application as a payload takes parentheses, which the printer
     // supplies because the tag groups as an application itself.
-    assert_eq!(parse_one("let v = `Some (f x)"), "let v = `Some (f x)");
+    assert_eq!(parse_one("let v = #Some (f x)"), "let v = #Some (f x)");
 }
 
 /// The two shapes nest inside each other, and each closes itself: a struct's
@@ -925,18 +920,18 @@ fn a_tag_binds_tighter_than_application() {
 #[test]
 fn a_sum_and_a_struct_nest_without_help() {
     assert_eq!(
-        parse_one("let x : { f: `A Nat | `B, g: Nat } = y"),
-        "let x : { f: `A Nat | `B, g: Nat } = y"
+        parse_one("let x : { f: #A Nat | #B, g: Nat } = y"),
+        "let x : { f: #A Nat | #B, g: Nat } = y"
     );
     assert_eq!(
-        parse_one("type List a = `Nil | `Cons { head: a, tail: List a }"),
-        "type List a = `Nil | `Cons { head: a, tail: List a }"
+        parse_one("type List a = #Nil | #Cons { head: a, tail: List a }"),
+        "type List a = #Nil | #Cons { head: a, tail: List a }"
     );
     // A case with no payload followed by another field ends where the comma
     // does, since a comma begins no atom.
     assert_eq!(
-        parse_one("let x : { f: `A, g: Nat } = y"),
-        "let x : { f: `A, g: Nat } = y"
+        parse_one("let x : { f: #A, g: Nat } = y"),
+        "let x : { f: #A, g: Nat } = y"
     );
 }
 
@@ -964,7 +959,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "let v = { x: }",
         "let v = { x: 1",
         // A case's payload, which is an atom taken greedily.
-        "let v = `A {",
+        "let v = #A {",
         // Parentheses, around an expression that is not one and around one
         // that is never closed.
         "let v = (let)",
@@ -974,7 +969,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "let f = fn x =>",
         // The type language keeps the same positions: a case's payload, an
         // argument, a field's label, a field's type, and the parentheses.
-        "type X = `A {",
+        "type X = #A {",
         "type X = Box {",
         "type X = { 1: Nat }",
         "type X = { a: }",
@@ -1028,7 +1023,7 @@ fn a_lets_body_runs_as_far_right_as_it_can() {
     );
 }
 
-/// A `let` may start an expression anywhere an atom may.
+/// A `let` may start an expression anywhere 'an atom may.
 #[test]
 fn a_let_starts_an_expression_wherever_an_atom_does() {
     for (src, printed) in [
@@ -1128,14 +1123,14 @@ fn a_let_expression_reports_where_it_fails() {
 #[test]
 fn parses_match_expressions() {
     assert_eq!(
-        parse_one("let a = match x with `Some y => y | `None => 0 end"),
-        "let a = match x with | `Some y => y | `None => 0 end"
+        parse_one("let a = match x with #Some y => y | #None => 0 end"),
+        "let a = match x with | #Some y => y | #None => 0 end"
     );
     // The leading bar is optional and not recorded: both spellings are one
     // tree.
     assert_eq!(
-        parse_one("let a = match x with | `Some y => y end"),
-        "let a = match x with | `Some y => y end"
+        parse_one("let a = match x with | #Some y => y end"),
+        "let a = match x with | #Some y => y end"
     );
     assert_eq!(
         parse_one("let a = match x with end"),
@@ -1183,8 +1178,8 @@ fn a_match_is_not_an_application_argument() {
 }
 
 /// Every kind of pattern, everywhere a pattern goes: puns, renames, nesting,
-/// naturals, `()`, and the tag payload taken greedily — `` `A `B x `` is
-/// `` `A `` carrying `` (`B x) ``, which the printer brackets and the grammar
+/// naturals, `()`, and the tag payload taken greedily — `#A #B x` is
+/// `#A` carrying `(#B x)`, which the printer brackets and the grammar
 /// reads back the same.
 #[test]
 fn parses_every_kind_of_pattern() {
@@ -1208,13 +1203,13 @@ fn parses_every_kind_of_pattern() {
             "let a = match x with | { pos: { x, y } } => x end",
         ),
         (
-            "let a = match x with `A `B y => y end",
-            "let a = match x with | `A (`B y) => y end",
+            "let a = match x with #A #B y => y end",
+            "let a = match x with | #A (#B y) => y end",
         ),
         // The parenthesized spelling is the same tree.
         (
-            "let a = match x with `A (`B y) => y end",
-            "let a = match x with | `A (`B y) => y end",
+            "let a = match x with #A (#B y) => y end",
+            "let a = match x with | #A (#B y) => y end",
         ),
         (
             "let a = match x with 0 => 1 | k => k end",
@@ -1231,8 +1226,8 @@ fn parses_every_kind_of_pattern() {
             "let a = match x with | w => w end",
         ),
         (
-            "let a = match x with `Cons { head: `Some y, tail: t } => y end",
-            "let a = match x with | `Cons { head: `Some y, tail: t } => y end",
+            "let a = match x with #Cons { head: #Some y, tail: t } => y end",
+            "let a = match x with | #Cons { head: #Some y, tail: t } => y end",
         ),
     ] {
         assert_eq!(parse_one(src), printed, "{src}");
@@ -1254,7 +1249,7 @@ fn parses_pattern_lets() {
     );
     // The parser records what was written and judges nothing: a refutable
     // pattern on a `let` parses, and refusing it is lowering's rule.
-    assert_eq!(parse_one("let `Some x = opt"), "let `Some x = opt");
+    assert_eq!(parse_one("let #Some x = opt"), "let #Some x = opt");
     assert_eq!(parse_one("let 0 = n"), "let 0 = n");
 }
 
@@ -1268,11 +1263,11 @@ fn a_match_reports_where_it_fails() {
         ("let a = match x with => 1 end", "=> 1 end"),
         // A `|` between arms promises another one; `end` is where the promise
         // breaks.
-        ("let a = match x with `A y => 1 | end", "end"),
+        ("let a = match x with #A y => 1 | end", "end"),
         // An arm without a body: `|` begins no expression.
         (
-            "let a = match x with `A y => | `B z => 2 end",
-            "| `B z => 2 end",
+            "let a = match x with #A y => | #B z => 2 end",
+            "| #B z => 2 end",
         ),
         // `match` is a keyword now, so it no longer names anything.
         ("let match = 1", "match = 1"),
@@ -1286,7 +1281,7 @@ fn a_match_reports_where_it_fails() {
     }
 
     // A match with no `end` runs out of input, and is reported there.
-    let src = "let a = match x with `A y => 1";
+    let src = "let a = match x with #A y => 1";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, src.len());
@@ -1305,14 +1300,14 @@ fn a_pattern_at_the_end_of_input_is_reported_there() {
     }
 }
 
-/// A bare tag as another tag's payload is bracketed when printed — it would
+/// A bare tag as another tag's payload is bracketed when 'printed — it would
 /// otherwise swallow whatever follows as the payload it has not got — and the
 /// bracketed form reads back to the same tree.
 #[test]
 fn a_bare_tag_payload_is_bracketed() {
     assert_eq!(
-        parse_one("let a = match x with `A `B => 1 end"),
-        "let a = match x with | `A (`B) => 1 end"
+        parse_one("let a = match x with #A #B => 1 end"),
+        "let a = match x with | #A (#B) => 1 end"
     );
 }
 
@@ -1338,8 +1333,8 @@ fn a_wildcard_parses_in_every_pattern_position() {
         ),
         // A tag's payload, taken greedily like any other.
         (
-            "let a = match x with `Some _ => 1 | `None => 0 end",
-            "let a = match x with | `Some _ => 1 | `None => 0 end",
+            "let a = match x with #Some _ => 1 | #None => 0 end",
+            "let a = match x with | #Some _ => 1 | #None => 0 end",
         ),
         // The pattern of a `let`, statement and expression.
         ("let _ = f 1", "let _ = f 1"),
@@ -1348,8 +1343,8 @@ fn a_wildcard_parses_in_every_pattern_position() {
         // Nested, and repeated: two `_` in one pattern parse — whether that
         // binds anything twice is not a question, since it binds nothing.
         (
-            "let a = match x with `Pair { a: _, b: _ } => 1 | _ => 2 end",
-            "let a = match x with | `Pair { a: _, b: _ } => 1 | _ => 2 end",
+            "let a = match x with #Pair { a: _, b: _ } => 1 | _ => 2 end",
+            "let a = match x with | #Pair { a: _, b: _ } => 1 | _ => 2 end",
         ),
     ] {
         assert_eq!(parse_one(src), printed, "{src}");
@@ -1384,15 +1379,17 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         ("let a = match x with { _: 1 } => 0 end", Place::Field),
         // The pun: a field bound to its own name, which `_` is not.
         ("let a = match x with {_} => 0 end", Place::Pun),
-        // A projection.
+        // A projection, and the operation that most nearly is one: `!Log._`
+        // names nothing to perform the way `x._` names no field.
         ("let p = x._", Place::Projection),
+        ("let p = !Log._", Place::Projection),
         // A `type` declaration's name and its parameters, which are names
         // rather than types — a `_` in a type is the hole, and reads.
         ("type _ = Nat", Place::Type),
         ("type T _ = Nat", Place::Type),
         // And a name in a `where` clause's formula, which is written about a
         // presence a `when` gave a name to.
-        ("let f : { x when a: Nat } where _ = { x: 1 }", Place::Type),
+        ("let f : { x when 'a: Nat } where _ = { x: 1 }", Place::Type),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -1485,55 +1482,62 @@ fn a_rest_must_end_the_struct_pattern() {
 #[test]
 fn effect_declarations() {
     assert_eq!(
-        parse_one("effect Log = `write : Nat -> ()"),
-        "effect Log = | `write : Nat -> ()"
+        parse_one("effect Log = write : Nat -> ()"),
+        "effect Log = | write : Nat -> ()"
     );
     assert_eq!(
-        parse_one("effect Log = `write : Nat -> () | `flush : () -> ()"),
-        "effect Log = | `write : Nat -> () | `flush : () -> ()"
+        parse_one("effect Log = write : Nat -> () | flush : () -> ()"),
+        "effect Log = | write : Nat -> () | flush : () -> ()"
     );
-    // An alias: bare tags, no signatures.
+    // An alias: effects, no signatures, unioned with the `+` a row writes —
+    // and no leading mark, since a union has nothing to lead with.
     assert_eq!(
-        parse_one("effect Console = `Log | `IO"),
-        "effect Console = | `Log | `IO"
+        parse_one("effect Console = !Log + !IO"),
+        "effect Console = !Log + !IO"
     );
-    // The leading `|` is optional, as it is on a sum.
+    // A bar between aliases is the union too, and prints back as the `+` it
+    // means: the leading one is still optional, as it is on a sum.
     assert_eq!(
-        parse_one("effect Console = | `Log"),
-        "effect Console = | `Log"
+        parse_one("effect Console = | !Log | !IO"),
+        "effect Console = !Log + !IO"
+    );
+    assert_eq!(
+        parse_one("effect Console = | !Log"),
+        "effect Console = !Log"
     );
     // The empty effect declares nothing and is written with the bar alone.
     assert_eq!(parse_one("effect Nil = |"), "effect Nil = |");
-    // A mix of the two forms parses; refusing it is lowering's.
+    // A mix of the two forms parses; refusing it is lowering's. Each case
+    // prints with the mark its own form writes, which is what re-parses.
     assert_eq!(
-        parse_one("effect Bad = `Log | `w : Nat -> ()"),
-        "effect Bad = | `Log | `w : Nat -> ()"
+        parse_one("effect Bad = !Log | w : Nat -> ()"),
+        "effect Bad = !Log | w : Nat -> ()"
     );
 }
 
-/// A `|` between cases promises another one, so nothing after it is reported
-/// at the bar — the rule a sum type keeps. The leading bar promises nothing.
+/// A mark between cases promises another one, so nothing after it is reported
+/// at the mark — the rule a sum type keeps. The leading bar promises nothing.
 #[test]
 fn an_effect_case_list_ends_at_a_bar_that_promised_one() {
-    let out = parse(lex("effect E = `a | ", FileID::GENERATED).tokens);
+    let out = parse(lex("effect E = !a + ", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
 }
 
-/// The `!` clause binds to the arrow parsed at its own level, which the
+/// The `+` clause binds to the arrow parsed at its own level, which the
 /// right-associative recursion makes the innermost one. There is no spelling of
-/// `(A -> B) ! E`, so the printer's parentheses are the only thing that says
+/// `(A -> B) + E`, so the printer's parentheses are the only thing that says
 /// which arrow a row is on — and the round-trip in [`parse_one`] is what holds
 /// it to that.
 #[test]
 fn an_effect_row_binds_to_the_innermost_arrow() {
     // Bare: the row sits on the one arrow there is.
     assert_eq!(
-        parse_one("let f : A -> B ! `Log = g"),
-        "let f : A -> B ! `Log = g"
+        parse_one("let f : A -> B + !Log = g"),
+        "let f : A -> B + !Log = g"
     );
     // Three types, one arrow written twice: the row is on `B -> C`.
-    let inner = parse_stmt("let f : A -> B -> C ! `Log = g");
+    let inner = parse_stmt("let f : A -> B -> C + !Log = g");
     let TypeKind::Arrow { to, effects, .. } = arrow_of(&inner) else {
         panic!("expected an arrow");
     };
@@ -1549,13 +1553,13 @@ fn an_effect_row_binds_to_the_innermost_arrow() {
         "the inner arrow carries it: {to:#?}"
     );
     assert_eq!(
-        parse_one("let f : A -> B -> C ! `Log = g"),
-        "let f : A -> B -> C ! `Log = g"
+        parse_one("let f : A -> B -> C + !Log = g"),
+        "let f : A -> B -> C + !Log = g"
     );
 
     // Parenthesized, the result comes back through an atom and never builds an
     // arrow at this level, so the row lands on the outer one.
-    let outer = parse_stmt("let f : A -> (B -> C) ! `Log = g");
+    let outer = parse_stmt("let f : A -> (B -> C) + !Log = g");
     let TypeKind::Arrow { to, effects, .. } = arrow_of(&outer) else {
         panic!("expected an arrow");
     };
@@ -1565,64 +1569,96 @@ fn an_effect_row_binds_to_the_innermost_arrow() {
         "the inner arrow carries none: {to:#?}"
     );
     assert_eq!(
-        parse_one("let f : A -> (B -> C) ! `Log = g"),
-        "let f : A -> (B -> C) ! `Log = g"
+        parse_one("let f : A -> (B -> C) + !Log = g"),
+        "let f : A -> (B -> C) + !Log = g"
     );
 
     // And a higher-order argument that may perform something.
     assert_eq!(
-        parse_one("let f : (A -> B ! `Log) -> C = g"),
-        "let f : (A -> B ! `Log) -> C = g"
+        parse_one("let f : (A -> B + !Log) -> C = g"),
+        "let f : (A -> B + !Log) -> C = g"
     );
 }
 
 /// The row is written in the syntax a sum's cases are: a `|` between effects,
 /// an optional `..` tail, a `when` clause in parentheses, and the `\` of one
-/// written absent. `! |` is the empty row — the same thing a bare arrow means,
+/// written absent. `+ |` is the empty row — the same thing a bare arrow means,
 /// written out.
 #[test]
 fn an_effect_row_is_written_as_a_sum_row_is() {
     for source in [
-        "let f : A -> B ! `Log | `IO = g",
-        "let f : A -> B ! `Log | ..e = g",
-        "let f : A -> B ! ..e = g",
-        "let f : A -> B ! `Log (when a) | `IO (when b) = g",
-        "let f : A -> B ! \\`IO | ..e = g",
-        "let f : A -> B ! | = g",
-        "let f : A -> B ! `Log where a = g",
+        "let f : A -> B + !Log + !IO = g",
+        "let f : A -> B + !Log + ..'e = g",
+        "let f : A -> B + ..'e = g",
+        "let f : A -> B + !Log (when 'a) + !IO (when 'b) = g",
+        "let f : A -> B + \\!IO + ..'e = g",
+        "let f : A -> B + | = g",
+        "let f : A -> B + !Log where 'a = g",
     ] {
         assert_eq!(parse_one(source), source);
     }
 }
 
-/// A `!` with no arrow to attach to is reported where it was written rather
-/// than left for whatever the type was being read for to complain about a
-/// token further along.
+/// A row of effects is a type at one position — an argument — and is written
+/// there as an arrow's row is, minus the `+` that hangs one off an arrow. The
+/// sigil on the first label is the whole of what tells it from a sum.
 #[test]
-fn a_bang_with_no_arrow_is_a_parse_error() {
-    for source in ["let x : Nat ! `Log = 1", "type T = Nat ! `Log"] {
+fn a_row_of_effects_is_written_as_an_argument() {
+    for source in [
+        "let f : Runner (!Log) -> Nat = g",
+        "let f : Runner (!Log + !IO) -> Nat = g",
+        "let f : Runner (!Log (when 'a) + ..'r) -> Nat = g",
+        "let f : Runner (\\!Log + ..) -> Nat = g",
+        // Nothing but a rest, which is the row a declaration is handed when
+        // the caller is passing on whatever it was given.
+        "let f : Runner (..'r) -> Nat = g",
+        "let f : Runner (..) -> Nat = g",
+        // Not only inside parentheses: a row is a type wherever the grammar
+        // reads one, and refusing the rest is lowering's.
+        "let f : !Log = g",
+    ] {
+        assert_eq!(parse_one(source), source);
+    }
+    // A `\` heads a sum's absent case as well, so what follows it is what
+    // says which of the two rows is being written.
+    assert_eq!(
+        parse_one("let f : Fallible (\\#Ok) -> Nat = g"),
+        "let f : Fallible (\\#Ok) -> Nat = g"
+    );
+    // A `\` in front of neither is the unexpected token it looks like.
+    let out = parse(lex("let f : Runner (\\1) -> Nat = g", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+/// A `+` with no arrow to attach to is reported where it was written rather
+/// than left for whatever the type was being read for to complain about a
+/// token further along. The mark is what the row is reported at, which is the
+/// whole of what it is still there for.
+#[test]
+fn a_row_with_no_arrow_is_a_parse_error() {
+    for source in ["let x : Nat + !Log = 1", "type T = Nat + !Log"] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
         assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source}");
-        let bang = source.find('!').expect("the source writes one");
-        assert_eq!(out.errors[0].span.start, bang, "{source}");
+        let plus = source.find('+').expect("the source writes one");
+        assert_eq!(out.errors[0].span.start, plus, "{source}");
     }
 }
 
 /// `handle` keeps a `match`'s shape: the leading `|` is optional, zero arms
 /// parse, and each body ends at the next `|` or the `end` of its own accord.
-/// The `return` arm may sit anywhere among them.
+/// The `return` arm may sit anywhere 'among them.
 #[test]
 fn handle_expressions() {
     for source in [
         "let a = handle e with end",
-        "let a = handle e with | Log.`write s => () end",
-        "let a = handle e with | Log.`write s => () | Log.`flush _ => () end",
+        "let a = handle e with | !Log.write s => () end",
+        "let a = handle e with | !Log.write s => () | !Log.flush _ => () end",
         "let a = handle e with | return x => x end",
-        "let a = handle e with | return x => x | Log.`write s => () end",
-        "let a = handle e with | Log.`write s => () | return x => x end",
+        "let a = handle e with | return x => x | !Log.write s => () end",
+        "let a = handle e with | !Log.write s => () | return x => x end",
         // The handled expression ends at the `with` however far right it runs.
-        "let a = handle f x y with | Log.`write s => () end",
+        "let a = handle f x y with | !Log.write s => () end",
         // And a handler is self-delimiting — the `end` closes it — so it may
         // head an application with no parentheses, exactly as a match does.
         "let a = handle e with end 1",
@@ -1631,8 +1667,8 @@ fn handle_expressions() {
     }
     // The leading bar is optional and printed back on.
     assert_eq!(
-        parse_one("let a = handle e with Log.`write s => () end"),
-        "let a = handle e with | Log.`write s => () end"
+        parse_one("let a = handle e with !Log.write s => () end"),
+        "let a = handle e with | !Log.write s => () end"
     );
 }
 
@@ -1643,23 +1679,29 @@ fn raise_expressions() {
     assert_eq!(parse_one("let a = raise 1"), "let a = raise 1");
     assert_eq!(parse_one("let a = raise f x"), "let a = raise f x");
     assert_eq!(
-        parse_one("let a = handle e with | Log.`write s => raise 0 end"),
-        "let a = handle e with | Log.`write s => raise 0 end"
+        parse_one("let a = handle e with | !Log.write s => raise 0 end"),
+        "let a = handle e with | !Log.write s => raise 0 end"
     );
 }
 
-/// A `.` followed by a tag is an operation reference and a `.` followed by a
-/// name is a projection — one token of lookahead, and the two productions
-/// cannot swallow each other.
+/// An effect heads an operation reference and nothing else heads one, so the
+/// `.` after it reads a name that is never a field: the two productions cannot
+/// swallow each other, and neither needs lookahead to be told from the other.
 #[test]
-fn an_operation_is_told_from_a_projection_by_the_backtick() {
-    assert_eq!(parse_one("let a = Log.`write"), "let a = Log.`write");
+fn an_operation_is_told_from_a_projection_by_the_sigil() {
+    assert_eq!(parse_one("let a = !Log.write"), "let a = !Log.write");
     assert_eq!(parse_one("let a = base.field"), "let a = base.field");
     // An operation is a value like any other, so it applies and is applied.
-    assert_eq!(parse_one("let a = Log.`write 1"), "let a = Log.`write 1");
-    assert_eq!(parse_one("let a = f Log.`write"), "let a = f Log.`write");
-    // Only a name may head one: nothing else declares operations.
-    let out = parse(lex("let a = (f x).`op", FileID::GENERATED).tokens);
+    assert_eq!(parse_one("let a = !Log.write 1"), "let a = !Log.write 1");
+    assert_eq!(parse_one("let a = f !Log.write"), "let a = f !Log.write");
+    // A projection off a case is still a projection: the sigil that heads it
+    // says which row the label belongs to, so neither reading is in doubt. The
+    // printed form brackets the case, which is how a tag carrying a payload is
+    // told from one being read off.
+    assert_eq!(parse_one("let a = #Ok.x"), "let a = (#Ok).x");
+    // An effect is a value of nothing, so one written alone is refused where
+    // it stands rather than lowered into a complaint about a term.
+    let out = parse(lex("let a = !Log", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
 }
@@ -1691,13 +1733,22 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
         // A declaration's name is a name; a `_` is not one, and a type is
         // nothing a value could be thrown away from.
         ("effect _ = |", "_"),
-        // An arm head is `` Eff.`op `` — a `.` promises an operation.
-        ("let a = handle e with | Log.write s => () end", "write"),
+        // An arm head is `!Eff.op`, so a bare name is not one: an arm heads
+        // an operation, and only the sigil says which effect's.
+        ("let a = handle e with | Log.write s => () end", "Log"),
         // A binder is a name or `_`, as a `fn` header's argument is.
-        ("let a = handle e with | Log.`write 1 => () end", "1"),
-        // A `\` promises an effect, so anything but a tag after it is
+        ("let a = handle e with | !Log.write 1 => () end", "1"),
+        // The operation an arm answers is a name, and so is the one a
+        // reference reads: the `.` promises one either way.
+        ("let a = !Log.1", "1"),
+        // An operation declares a signature, so the `:` is not optional: a
+        // case with no `:` is the alias it does not look like.
+        ("effect E = op | w : Nat -> ()", "|"),
+        // And the signature is a type, whatever else was written there.
+        ("effect E = op : ,", ","),
+        // A `\` promises an effect, so anything but one after it is
         // reported — the rule a sum's absent case keeps.
-        ("let f : A -> B ! \\x = g", "x"),
+        ("let f : A -> B + \\x = g", "x"),
     ] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
@@ -1707,17 +1758,22 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
 
     // A `|` between effects promises another one, so nothing after it is
     // reported at the bar — the leading one promises nothing.
-    let out = parse(lex("let f : A -> B ! `Log | = g", FileID::GENERATED).tokens);
+    // A `+` with no row after it at all promises nothing: the row is empty,
+    // and what follows is somebody else's token to refuse.
+    let out = parse(lex("let f : A -> B + = g", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{:#?}", out.errors);
+
+    let out = parse(lex("let f : A -> B + !Log + = g", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    let bar = "let f : A -> B ! `Log ".len();
+    let bar = "let f : A -> B + !Log ".len();
     assert_eq!(out.errors[0].span.start, bar);
 }
 
-/// Running out of input where an arm's binder goes is reported at the end of
+/// Running out of input where 'an arm's binder goes is reported at the end of
 /// what there was, the way every other production that needs more reports it.
 #[test]
 fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
-    let source = "let a = handle e with | Log.`write";
+    let source = "let a = handle e with | !Log.write";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);

@@ -30,15 +30,15 @@ pub struct Program {
 ///
 /// The two forms of R3 and R4, told apart by whether the cases carry a `:` and
 /// kept apart from there on: an alias declares no operations, so
-/// `` Console.`write `` has nothing to resolve to, and an operation declaration
+/// `!Console.write` has nothing to resolve to, and an operation declaration
 /// stands for itself alone.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// `` effect Log = `write : Nat -> () `` — the operations, by name, in the
+    /// `effect Log = write : Nat -> ()` — the operations, by name, in the
     /// order they were written. Empty for the empty effect, `effect Nil = |`,
     /// which declares nothing.
     Operations(IndexMap<String, Operation>),
-    /// `` effect Console = `Log | `IO `` — the effects this name stands for.
+    /// `effect Console = !Log + !IO` — the effects this name stands for.
     ///
     /// Kept as it was written, though nothing downstream reads an alias: a row
     /// naming one is expanded to its labels at lowering, so no alias survives
@@ -50,7 +50,7 @@ pub enum Effect {
 /// One operation of an effect: the plain closed arrow performing it has.
 ///
 /// The two sides rather than one arrow node, because that is what the arm rule
-/// of R16 wants: a handler arm for `` `op : A -> B `` binds its binder at `A`
+/// of R16 wants: a handler arm for `op : A -> B` binds its binder at `A`
 /// and has body type `B`, and neither half is ever read as a whole arrow.
 #[derive(Debug, Clone)]
 pub struct Operation {
@@ -181,7 +181,7 @@ pub enum TermKind {
         body: Box<Term>,
     },
     Struct(IndexMap<String, Field<Term>>),
-    /// `` `Some 1 `` — one case of a sum, with what it carries.
+    /// `#Some 1` — one case of a sum, with what it carries.
     ///
     /// The name stays a string for the reason [`Field`]'s keys do: it is a
     /// label scoped to whichever sum turns out to be on the other side, not a
@@ -190,7 +190,7 @@ pub enum TermKind {
     ///
     /// A case carrying nothing keeps its `None` rather than being handed a
     /// `{}` here. `()` and `{}` are two spellings of one *written* type and so
-    /// meet in this pass; `` `None `` writes no type at all, and inventing one
+    /// meet in this pass; `#None` writes no type at all, and inventing one
     /// would put a node on the page the reader never wrote. What it means is
     /// unit all the same, which [`inference`](crate::inference) says where it
     /// builds the type rather than the tree.
@@ -239,11 +239,11 @@ pub enum TermKind {
     /// carrying one could outlive the `handle` and be called with nothing on
     /// the stack. See [`ErrorKind::RaiseInFunction`].
     Raise(Box<Term>),
-    /// `` Log.`write `` — one operation of an effect, as an ordinary value.
+    /// `!Log.write` — one operation of an effect, as an ordinary value.
     ///
     /// The operation's name stays a string for the reason [`Field`]'s keys do:
     /// it is scoped to the declaration that declares it, and two effects may
-    /// each declare a `` `write ``. What it resolved to is the effect beside
+    /// each declare a `write`. What it resolved to is the effect beside
     /// it, and lowering has already checked that the name is one of that
     /// effect's.
     Operation {
@@ -352,7 +352,7 @@ pub enum TypeKind {
         /// parameter — see [`ErrorKind::OpenDeclaredType`].
         tail: Option<Tail>,
     },
-    /// `` `Some T | `None `` — a sum type, as the cases it allows.
+    /// `#Some T | #None` — a sum type, as the cases it allows.
     ///
     /// The struct's twin down to the [`Tail`]: what a `..` stands for, and
     /// what it may be inside a declaration, is the same question about cases
@@ -402,7 +402,14 @@ pub enum TypeKind {
         index: u32,
     },
     Prim(Prim),
-    /// A variable the annotation's `where let` declared, used in a type
+    /// `!Log + !IO` — a row of effects handed to a declaration as an argument,
+    /// resolved and with every alias expanded, exactly as an arrow's own row is.
+    ///
+    /// The one position a row reaches without an arrow around it. Everywhere
+    /// else it is [`ErrorKind::EffectsOutsideRow`], so a reader of the tree can
+    /// take a row here as being spliced into whatever the parameter is used as.
+    Effects(Box<EffectRow>),
+    /// A variable the annotation's an annotation introduced, used in a type
     /// position.
     ///
     /// The name stays a string for the reason [`Row::Named`] does: it is scoped
@@ -486,7 +493,7 @@ pub enum ClauseKind {
 #[derive(Debug, Clone)]
 pub struct Annotation {
     pub ty: Type,
-    /// What the `where let` statements declared, in the order they were
+    /// What the a variable statements declared, in the order they were
     /// written, each with the sort its uses gave it.
     ///
     /// Carried rather than left to be read back out of the lowered type,
@@ -498,7 +505,7 @@ pub struct Annotation {
     pub clause: Option<Clause>,
 }
 
-/// One variable a `where let` statement declared.
+/// One variable a variable statement declared.
 #[derive(Debug, Clone)]
 pub struct Variable {
     /// Where the name was written, so a complaint about what the body did with
@@ -526,28 +533,28 @@ pub struct Variable {
 /// shows.
 #[derive(Debug, Clone)]
 pub enum SumCase {
-    /// `` `Name [(when a)] [T] ``, as written.
+    /// `#Name [(when a)] [T]`, as written.
     Written {
         name_span: Span,
         when: Option<Box<When>>,
         payload: Option<Type>,
     },
-    /// `` \`Name `` — the case is explicitly absent, carrying nothing.
-    /// `name_span` covers the whole `` \`Name ``.
+    /// `\#Name` — the case is explicitly absent, carrying nothing.
+    /// `name_span` covers the whole `\#Name`.
     Absent { name_span: Span },
 }
 
 /// The effects an arrow may perform, lowered: the effects it names, and what is
 /// known about the ones it does not.
 ///
-/// Aliases are gone by the time one of these exists — `` `Console `` lowers to
+/// Aliases are gone by the time one of these exists — `!Console` lowers to
 /// the labels it stands for — so nothing downstream has an alias to look
 /// through, and a printed type shows the effects rather than the name. See
 /// [`Builder::expansions`].
 ///
 /// `written` is `false` for the row a bare `A -> B` has, which is the empty
 /// closed one. Kept so that the debugger's AST and IR tabs can print an arrow
-/// back as it stood: `A -> B ! |` writes a row and `A -> B` writes none, and
+/// back as it stood: `A -> B + |` writes a row and `A -> B` writes none, and
 /// both mean this.
 #[derive(Debug, Clone, Default)]
 pub struct EffectRow {
@@ -565,21 +572,21 @@ pub struct EffectRow {
 /// name resolved to.
 #[derive(Debug, Clone)]
 pub enum EffectLabel {
-    /// `` `Log ``, or `` `Log (when a) ``.
+    /// `!Log`, or `!Log (when a)`.
     Written {
         name_span: Span,
         symbol: Symbol,
         /// Whether this label came out of an alias rather than being written.
         ///
-        /// `` `Console `` stands for `` `Log `` and `` `IO ``, and neither of
+        /// `!Console` stands for `!Log` and `!IO`, and neither of
         /// those names is anywhere on the page — `name_span` is the alias's.
         /// What reads this is the debugger, which may paint a span in the
         /// editor as a use of a name only where the name really is.
         expanded: bool,
         when: Option<Box<When>>,
     },
-    /// `` \`Log `` — definitely not performed. `name_span` covers the whole
-    /// `` \`Log ``.
+    /// `\!Log` — definitely not performed. `name_span` covers the whole
+    /// `\!Log`.
     Absent {
         name_span: Span,
         symbol: Symbol,
@@ -601,7 +608,7 @@ pub enum Row {
     /// declaration holds for every definition and so cannot leave the question
     /// open. See [`ErrorKind::OpenDeclaredType`].
     Anything,
-    /// `..r` in an annotation, naming one of the variables its `where let`
+    /// `..r` in an annotation, naming one of the variables its a variable
     /// declared: a name scoped to that one annotation, staying a string for the
     /// reason [`Field`]'s keys do — it is not a path anything can refer to, so
     /// there is no symbol to resolve it to. Two `..r` in one annotation stand
@@ -653,7 +660,7 @@ pub enum ErrorKind {
     /// three being a set of labels a name may appear in once.
     DuplicateCase,
     /// An explicitly absent label in a composite with no `..` tail, as in
-    /// `{ a: Nat, \y }` or `` `A | \`B ``.
+    /// `{ a: Nat, \y }` or `#A | \#B`.
     ///
     /// A `\` says the `..` beside it may not stand for the label, and a type
     /// with no `..` already says that of every label it does not name — so
@@ -663,7 +670,7 @@ pub enum ErrorKind {
     ///
     /// The shape and the label are carried for the wording alone, the way
     /// [`ErrorKind::RepeatedRowField`] carries them: the complaint quotes the
-    /// label the way it was written, backtick and all for a case.
+    /// label the way it was written, `#` and all for a case.
     AbsentInClosed {
         shape: Shape,
         label: String,
@@ -708,9 +715,9 @@ pub enum ErrorKind {
     /// declaration's body mentions no solver variable, which is what lets every
     /// walk stop at a name instead of descending into what it stands for.
     ///
-    /// The shape is carried for the wording alone: `` type X = `A (when a) Nat ``
+    /// The shape is carried for the wording alone: `type X = #A (when a) Nat`
     /// is the same mistake made about cases, and a complaint that said "fields"
-    /// to someone who wrote backticks would be describing a type they never
+    /// to someone who wrote `#`s would be describing a type they never
     /// wrote.
     OpenDeclaredType {
         shape: Shape,
@@ -725,13 +732,14 @@ pub enum ErrorKind {
     /// than inside a row, so there is no shape to word it in.
     ClauseInDeclaration,
     /// A `let` statement in a `type` declaration's `where` clause, as in
-    /// `type Bad r = { x: Nat, ..r } where let r`.
+    /// A variable written in a `type` declaration's body or an operation's
+    /// signature, as in `type Bad = { x: 'a }`.
     ///
-    /// [`ErrorKind::ClauseInDeclaration`]'s sibling about the other kind of
-    /// statement, and refused for a reason of its own rather than for that
-    /// one's: a declaration's variables are its parameters, written in its
-    /// header, so there is nothing here for a `let` to declare. Reported at the
-    /// statement, so a clause with several bad statements reports each.
+    /// [`ErrorKind::ClauseInDeclaration`]'s sibling, and refused for a reason
+    /// of its own rather than for that one's: a variable is something the
+    /// caller picks, and a declaration says the same thing wherever it is used,
+    /// so its own variables are its parameters and they are written in its
+    /// header. Reported at each name, so a body with several reports each.
     VariableInDeclaration,
     /// A `_` in a `type` declaration's body, as in `type Bad = { x: _ }`.
     ///
@@ -742,7 +750,7 @@ pub enum ErrorKind {
     /// there is no shape to word it in.
     HoleInDeclaration,
     /// A `where` clause naming something no `when` in the same type gives a
-    /// label to, as in `{ x when a: Nat } -> Nat where let a, c; a = c`.
+    /// label to, as in `{ x when 'a: Nat } -> Nat where 'a = 'c`.
     ///
     /// A formula is written about presences, and a presence is what a `when`
     /// puts on a label — so a name the type never wears is a name the formula
@@ -750,30 +758,10 @@ pub enum ErrorKind {
     /// a formula about a presence no label carries constrains nothing, and a
     /// reader who wrote one meant a name they also wrote on a label.
     ///
-    /// Both halves of that reach here: a name nothing declares at all, and one
-    /// declared but worn by no `when`. The reader's fix is the same either way
-    /// — put the name on a label — so the complaint is the same too.
+    /// Both halves of that reach here: a name the type never writes at all, and
+    /// one it writes somewhere other than on a label. The reader's fix is the
+    /// same either way — put the name on a label — so the complaint is too.
     UnboundPresence {
-        name: String,
-    },
-    /// A `where let` declaring one name twice, as in `where let a; let a` or
-    /// `where let a, a`.
-    ///
-    /// [`ErrorKind::Duplicate`] about a smaller scope, and the first
-    /// declaration is the one that stands, exactly as it is there. Reported at
-    /// the repeat, pointing back at what it repeats.
-    DuplicateVariable {
-        name: String,
-        previous: Span,
-    },
-    /// A `where let` declaring a name the type beside it never uses, as in
-    /// `let bad : Nat -> Nat where let a = fn x => x`.
-    ///
-    /// A declaration with no use has no sort to be read off it, so there is
-    /// nothing for the variable to be. Refused rather than dropped: the reader
-    /// wrote the name meaning to use it, and which of the two they meant to
-    /// change is theirs to say.
-    UnusedVariable {
         name: String,
     },
     /// A type given a different number of arguments than it takes, including a
@@ -817,9 +805,9 @@ pub enum ErrorKind {
     /// the condition and [`Solve::unfold`](crate::inference) for what rests on
     /// it.
     GrowingRecursion,
-    /// One `where let` variable used at two sorts in one annotation, as in
-    /// `{ x: Nat, ..r } -> (`A Nat | ..r)` or
-    /// `{ x when a: Nat } -> a where let a`.
+    /// One a variable variable used at two sorts in one annotation, as in
+    /// `{ x: Nat, ..r } -> (#A Nat | ..r)` or
+    /// `{ x when 'a: Nat } -> 'a`.
     ///
     /// A declared variable stands for one thing, and there are three things it
     /// could be: a whole type — which is what a struct's `..` is, since the
@@ -846,7 +834,7 @@ pub enum ErrorKind {
         previous: Span,
     },
     /// A parameter used as both of the things a parameter can be — a whole type
-    /// and the rest of a sum — as in `` type M r = { g: (`A | ..r), f: r } ``.
+    /// and the rest of a sum — as in `type M r = { g: (#A | ..r), f: r }`.
     ///
     /// `type W r = { f: r, ..r }` is *not* one. The rest of a struct is a whole
     /// type, so both uses say the same thing about `r` and the declaration is
@@ -877,8 +865,8 @@ pub enum ErrorKind {
         second: Sense,
     },
     /// Something that cannot stand for the rest of a sum's cases, written where
-    /// a sum's row parameter goes: `` Or Nat `` against
-    /// `` type Or r = `A | ..r ``.
+    /// a sum's row parameter goes: `Or Nat` against
+    /// `type Or r = #A | ..r`.
     ///
     /// A sum can stand for one, and so can another sum's row parameter. A struct
     /// cannot, and neither can a declared name, though the latter looks as
@@ -900,7 +888,7 @@ pub enum ErrorKind {
     },
     /// An argument naming a label the declaration it is handed to already
     /// names: `WithX { x: Nat }` against `type WithX r = { x: Nat, ..r }`, and
-    /// `` Or (`A) `` against `` type Or r = `A | ..r ``.
+    /// `Or (#A)` against `type Or r = #A | ..r`.
     ///
     /// A `..` covers the labels its own row does not write out, so what is
     /// spliced in may not write out any of them: the type would name the label
@@ -942,7 +930,7 @@ pub enum ErrorKind {
     /// is reported, so there is nothing further to say — the same choice
     /// [`ErrorKind::Circular`] makes.
     EndlessFields,
-    /// A pattern that can fail, written on a `let` — `let `Some x = opt`. A
+    /// A pattern that can fail, written on a `let` — `let #Some x = opt`. A
     /// binding has no arms to fall through to, so it has to accept every
     /// value, and a tag or a number anywhere in the pattern is a value it
     /// would not.
@@ -962,14 +950,14 @@ pub enum ErrorKind {
         name: String,
     },
     /// A second operation of a name in one effect:
-    /// `` effect Log = `write : Nat -> () | `write : () -> () ``.
+    /// `effect Log = write : Nat -> () | write : () -> ()`.
     ///
     /// [`ErrorKind::DuplicateCase`]'s twin, and scoped the same way: an
     /// operation belongs to its own declaration, so two effects may each
-    /// declare a `` `write `` and two `` `write `` in one may not.
+    /// declare a `write` and two `write` in one may not.
     DuplicateOperation,
     /// An operation whose signature is not a function, as in
-    /// `` effect Log = `write : Nat ``.
+    /// `effect Log = write : Nat`.
     ///
     /// Performing an operation is applying it, so an operation that is not an
     /// arrow would be performed by mention — there would be nowhere for the
@@ -986,19 +974,30 @@ pub enum ErrorKind {
     /// All three say something a definition gets to decide, and an operation's
     /// signature holds for every performance of it — the reason a `type`
     /// declaration refuses the same three. It is a complaint of its own rather
-    /// than [`ErrorKind::OpenDeclaredType`] because the `!` is refused here and
+    /// than [`ErrorKind::OpenDeclaredType`] because the `+` is refused here and
     /// nowhere else, and one sentence naming all three is what a reader can act
     /// on.
     ImpureOperation,
     /// An effect declaration whose cases mix the two forms:
-    /// `` effect Bad = `Log | `write : Nat -> () ``.
+    /// `effect Bad = !Log + write : Nat -> ()`.
     ///
-    /// The `:` is what tells an operation from a name, so a declaration with
-    /// some of each says two things at once and neither of them wholly. Refused
-    /// rather than read one way: which of the two was meant is the writer's to
-    /// say.
+    /// The sigil is what tells an operation from an effect, so a declaration
+    /// with some of each says two things at once and neither of them wholly.
+    /// Refused rather than read one way: which of the two was meant is the
+    /// writer's to say.
     MixedEffectForm,
-    /// `` Console.`write `` where `Console` is an alias.
+    /// A row of effects written where a type goes: `let x : !Log = 1`.
+    ///
+    /// A row is not a type. The one place one may be written without an arrow
+    /// to carry it is an argument — `Runner (!Log)` hands a declaration the
+    /// effects its own `..` stands for — and everywhere else there is nothing
+    /// for a set of effects to mean.
+    ///
+    /// Whether the parameter it was handed to is used as effects at all is a
+    /// separate question, asked where every other row argument's is; see
+    /// [`ErrorKind::NotARow`].
+    EffectsOutsideRow,
+    /// `!Console.write` where `Console` is an alias.
     ///
     /// An alias is a name for a set of effects and declares nothing of its own,
     /// so there is no operation here to refer to. The name is carried for the
@@ -1006,7 +1005,7 @@ pub enum ErrorKind {
     OperationOnAlias {
         effect: String,
     },
-    /// An operation an effect does not declare: `` Log.`writ ``.
+    /// An operation an effect does not declare: `!Log.writ`.
     ///
     /// [`ErrorKind::Undefined`]'s cousin, and not it: an operation is a label
     /// scoped to its own declaration rather than a name in a namespace, so what
@@ -1016,8 +1015,8 @@ pub enum ErrorKind {
         op: String,
     },
     /// A handler naming an effect it does not fully cover, as in
-    /// `` handle p () with | Log.`write s => () end `` where `Log` also
-    /// declares `` `flush ``.
+    /// `handle p () with | !Log.write s => () end` where `Log` also
+    /// declares `flush`.
     ///
     /// Which effects a handler discharges has to be known before inference —
     /// the body is checked at an ambient the discharged effects extend — and a
@@ -1132,8 +1131,8 @@ struct Builder<'a> {
     /// declaration it names. See [`Builder::expansions`].
     expanded: HashMap<Symbol, IndexMap<String, Symbol>>,
     /// The operations each effect *declares*, in the order it declares them.
-    /// An alias has no entry at all, which is what tells `` Console.`write ``
-    /// from `` Log.`writ ``: one names something that declares no operations,
+    /// An alias has no entry at all, which is what tells `!Console.write`
+    /// from `!Log.writ`: one names something that declares no operations,
     /// and the other an operation the effect does not have.
     operations: HashMap<Symbol, IndexSet<String>>,
     /// Which handler arm, if any, lexically encloses the term being lowered.
@@ -1151,7 +1150,7 @@ struct Builder<'a> {
     /// each sits in its list. Empty outside a `type` body, which is what makes
     /// a parameter unwritable in an annotation.
     params: HashMap<Symbol, u32>,
-    /// What the `where let` statements of the annotation being lowered
+    /// What the a variable statements of the annotation being lowered
     /// declared, in the order they were written. Cleared for every written
     /// type, which is the whole scope of a declared variable: `..r` twice in
     /// one annotation stands for one rest, and another annotation's `r` is
@@ -1169,7 +1168,7 @@ struct Builder<'a> {
     rigids: u32,
 }
 
-/// One name a `where let` statement declared, while its own annotation is being
+/// One name a variable statement declared, while its own annotation is being
 /// lowered.
 #[derive(Debug)]
 struct Declared {
@@ -1215,7 +1214,7 @@ enum Place {
     Declaration,
     /// An operation's signature inside an `effect` declaration. Held closed
     /// like a declaration's body, and told about it in its own words, because
-    /// the `!` an operation may not carry is refused here and nowhere else.
+    /// the `+` an operation may not carry is refused here and nowhere else.
     Operation,
     Annotation,
 }
@@ -1399,7 +1398,7 @@ enum Calm {
 /// struct's field, or into the payload of one tag. A path of these names a
 /// *position* of a match — the unit R7 types column-wise and the matrix
 /// algorithm draws values from — and the payload step carries its tag because
-/// different cases carry different payloads: `` `A ``'s payload and `` `B ``'s
+/// different cases carry different payloads: `#A`'s payload and `#B`'s
 /// are two positions, not one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Step {
@@ -1529,7 +1528,7 @@ impl TypeField {
 
 impl EffectLabel {
     /// Where the label was written: the name of a performed effect, the whole
-    /// `` \`Log `` of one written absent.
+    /// `\!Log` of one written absent.
     pub fn name_span(&self) -> Span {
         match self {
             EffectLabel::Written { name_span, .. } | EffectLabel::Absent { name_span, .. } => {
@@ -1558,7 +1557,7 @@ impl EffectLabel {
     }
 
     /// The `when` clause the label wears, when it wears one. An absent label
-    /// never does: `` \`Log `` says the effect is not performed outright.
+    /// never does: `\!Log` says the effect is not performed outright.
     pub fn when(&self) -> Option<&When> {
         match self {
             EffectLabel::Written { when, .. } => when.as_deref(),
@@ -2121,6 +2120,7 @@ impl Follow<'_> {
             TypeKind::Struct { .. }
             | TypeKind::Sum { .. }
             | TypeKind::Arrow { .. }
+            | TypeKind::Effects(_)
             | TypeKind::Prim(_)
             | TypeKind::Var(_)
             | TypeKind::Hole
@@ -3117,6 +3117,22 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
     }
 }
 
+/// What a row of effects says about the parameter its `..` names: that the
+/// parameter is used as effects, and may not name what the row already does.
+///
+/// One function because there are two rows now — an arrow's own, and the one an
+/// argument may be — and what each says of its tail is the same sentence.
+fn says_effects(effects: &EffectRow, out: &mut impl FnMut(Fact)) {
+    if let Some(Tail {
+        of: Row::Param { index, .. },
+        ..
+    }) = effects.tail
+    {
+        let lacks = effects.effects.keys().cloned().collect();
+        out(Fact::Says(index, ParamKind::Effects { lacks }));
+    }
+}
+
 /// A slot together with everything it leads to, which is the set every question
 /// in [`kinds`] is answered over: a slot stands for whatever it says of itself
 /// joined with whatever every slot it hands itself on to says.
@@ -3209,15 +3225,12 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
         TypeKind::Arrow { from, to, effects } => {
             constrain(from, out);
             constrain(to, out);
-            if let Some(Tail {
-                of: Row::Param { index, .. },
-                ..
-            }) = effects.tail
-            {
-                let lacks = effects.effects.keys().cloned().collect();
-                out(Fact::Says(index, ParamKind::Effects { lacks }));
-            }
+            says_effects(effects, out);
         }
+        // A row written as an argument says of its own tail exactly what an
+        // arrow's row says: whatever the tail names is used as effects, and may
+        // not name what the row already does.
+        TypeKind::Effects(effects) => says_effects(effects, out),
         TypeKind::Apply { head, args, .. } => {
             for (at, arg) in args.iter().enumerate() {
                 let slot = (*head, at as u32);
@@ -3378,6 +3391,9 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 walk(from, kinds, carries, rows, out);
                 walk(to, kinds, carries, rows, out);
             }
+            // A row holds labels and a tail, and neither is a type: there is
+            // nothing inside one for an argument to be written at.
+            TypeKind::Effects(_) => {}
             TypeKind::Struct { fields, .. } => {
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
@@ -3519,7 +3535,7 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
 fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
     match &ty.tracked {
         TypeKind::Error => true,
-        TypeKind::Sum { .. } => true,
+        TypeKind::Sum { .. } | TypeKind::Effects(_) => true,
         TypeKind::Param { symbol, .. } => rows.contains(symbol),
         _ => false,
     }
@@ -3532,11 +3548,14 @@ fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
 /// carries this condition — and an erased argument absorbed a complaint already
 /// made.
 fn cases_named(ty: &Type) -> impl Iterator<Item = &String> {
-    let cases = match &ty.tracked {
-        TypeKind::Sum { cases, .. } => Some(cases),
-        _ => None,
+    let cases: Box<dyn Iterator<Item = &String>> = match &ty.tracked {
+        TypeKind::Sum { cases, .. } => Box::new(cases.keys()),
+        // A row's labels are the effects it names, which is the same question
+        // asked of the row a sum writes.
+        TypeKind::Effects(effects) => Box::new(effects.effects.keys()),
+        _ => Box::new(std::iter::empty()),
     };
-    cases.into_iter().flat_map(|cases| cases.keys())
+    cases
 }
 
 /// What a written type carries at the top level of its field row: the labels it
@@ -3603,7 +3622,7 @@ fn carrying(types: &IndexMap<Symbol, Decl<Type>>) -> HashMap<Symbol, Carried> {
 /// name, or an application, carries what the declaration it names carries,
 /// joined with what is carried by each argument written at a parameter that
 /// declaration puts in its core. Everything else carries nothing — a sum carries
-/// no *fields*, so `` WithX (`A | `B) `` is fine.
+/// no *fields*, so `WithX (#A | #B)` is fine.
 fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
     match &ty.tracked {
         TypeKind::Struct { fields, tail } => {
@@ -3653,6 +3672,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
         }
         TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
+        | TypeKind::Effects(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
@@ -3809,6 +3829,17 @@ fn relevance(types: &IndexMap<Symbol, Decl<Type>>) -> HashSet<Slot> {
                     out(*index, under);
                 }
             }
+            // A row of effects is its tail, as far as this is concerned: the
+            // labels are names and only what is spliced in can grow.
+            TypeKind::Effects(effects) => {
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = effects.tail
+                {
+                    out(index, under);
+                }
+            }
             TypeKind::Arrow { from, to, effects } => {
                 occurrences(from, under, out);
                 occurrences(to, under, out);
@@ -3889,6 +3920,8 @@ fn mentioned(ty: &Type, out: &mut Vec<Symbol>) {
             mentioned(from, out);
             mentioned(to, out);
         }
+        // An effect is not a declared type, so a row of them names none.
+        TypeKind::Effects(_) => {}
         TypeKind::Struct { fields, .. } => {
             for field in fields.values() {
                 if let Some(value) = field.value() {
@@ -3959,6 +3992,7 @@ fn grows(ty: &Type, group: &[Symbol], report: &mut impl FnMut(Span)) {
             grows(from, group, report);
             grows(to, group, report);
         }
+        TypeKind::Effects(_) => {}
         TypeKind::Struct { fields, .. } => {
             for field in fields.values() {
                 if let Some(value) = field.value() {
@@ -3998,6 +4032,7 @@ fn mentions_a_parameter(ty: &Type) -> bool {
                 || mentions_a_parameter(from)
                 || mentions_a_parameter(to)
         }
+        TypeKind::Effects(effects) => tails_a_parameter(&effects.tail),
         TypeKind::Struct { fields, tail } => {
             tails_a_parameter(tail)
                 || fields
@@ -4141,7 +4176,7 @@ impl Builder<'_> {
     /// where the majority is not the point, so a mixed declaration is read as
     /// whichever form its *first* case is and every case of the other form is
     /// dropped, leaving one complaint and a declaration that still stands for
-    /// something. The empty declaration, `effect Nil = |`, has no first case
+    /// something. The empty declaration, #effect Nil = |`, has no first case
     /// and declares nothing.
     fn effect(&mut self, cases: IndexMap<TrackedString, parse::EffectCase>) -> Effect {
         // The empty declaration takes the operation form: `effect Nil = |` is
@@ -4211,7 +4246,7 @@ impl Builder<'_> {
     /// sides fall back to the error type, which absorbs.
     fn operation(&mut self, name: &TrackedString, signature: parse::Type) -> Operation {
         // A signature is a whole written type, so it is a scope of its own for
-        // the reason an annotation is — even though it has no `where let` of
+        // the reason an annotation is — even though it has no a variable of
         // its own to put anything in it.
         self.vars.clear();
         let span = signature.span;
@@ -4251,98 +4286,83 @@ impl Builder<'_> {
     /// binds nothing — is a question a declaration cannot leave open, and is
     /// reported here rather than by the caller, since only here is it known
     /// which of the three a tail turned out to be.
-    fn row(
-        &mut self,
-        span: Span,
-        name: Option<TrackedString>,
-        place: Place,
-        shape: Shape,
-    ) -> Option<Row> {
-        let Some(name) = name else {
-            if let Some(kind) = openness(place, shape) {
-                self.error(span, kind);
+    fn row(&mut self, span: Span, of: parse::Rest, place: Place, shape: Shape) -> Option<Row> {
+        let name = match of {
+            parse::Rest::Anything => {
+                if let Some(kind) = openness(place, shape) {
+                    self.error(span, kind);
+                }
+                return Some(Row::Anything);
             }
-            return Some(Row::Anything);
+            // A bare name is the parameter of the declaration this is the body
+            // of, and a declaration's only tail is one of those: anything else
+            // written bare is a question the declaration cannot leave open,
+            // whatever it might have been.
+            parse::Rest::Param(name) => {
+                if let Some(symbol) = self.types.get(&name.tracked)
+                    && let Some(&index) = self.params.get(&symbol)
+                {
+                    return Some(Row::Param { symbol, index });
+                }
+                if let Some(kind) = openness(place, shape) {
+                    self.error(span, kind);
+                    return Some(Row::Anything);
+                }
+                self.error(
+                    name.span,
+                    ErrorKind::Undefined {
+                        namespace: Namespace::Types,
+                    },
+                );
+                return None;
+            }
+            parse::Rest::Variable(name) => name,
         };
-        if let Some(symbol) = self.types.get(&name.tracked)
-            && let Some(&index) = self.params.get(&symbol)
-        {
-            return Some(Row::Param { symbol, index });
-        }
-        // A declaration's only tail is a parameter, so a name that is not one
-        // is a question the declaration cannot leave open, whatever else it
-        // might have been. The `where let` scope below is an annotation's, and
-        // neither a declaration nor an operation's signature has one.
-        if let Some(kind) = openness(place, shape) {
-            self.error(span, kind);
+        // A variable's tail is an annotation's, and neither a declaration nor an
+        // operation's signature has one: each says the same thing wherever it is
+        // used. Reported and dropped, the way a refused `..` is — the type
+        // beside it stands.
+        if let Some(kind) = wherever(place) {
+            self.error(name.span, kind);
             return Some(Row::Anything);
-        }
-        // A named tail is a *use* of a declared variable, so a name nothing
-        // declared stands for nothing at all — reported at the name rather than
-        // at the whole `..r`, since the name is what the reader can fix.
-        if !self.vars.contains_key(&name.tracked) {
-            self.error(
-                name.span,
-                ErrorKind::Undefined {
-                    namespace: Namespace::Types,
-                },
-            );
-            return None;
         }
         // And one variable stands for one thing. A struct's `..` is the type its
         // fields sit on and a sum's is the cases it does not write out, so the
         // two are a whole type and the rest of a sum — which is what a name
         // given both would have to be at once. `None` says the row absorbs; see
         // [`ErrorKind::MixedTail`].
-        match self.used(&name, sense(shape)) {
+        match self.variable(&name, sense(shape)) {
             true => Some(Row::Named(name.tracked)),
             false => None,
         }
     }
 
-    /// Whether a bare name resolves to a `where let` variable rather than to
-    /// something further down the order.
+    /// Read one variable of the annotation being lowered at `sense`, minting it
+    /// if this is the first time it has been written, and say whether the
+    /// reading stands.
     ///
-    /// A declaration's parameter comes first and never shares a scope with one
-    /// — a declaration has no `where let` to declare anything — but the order
-    /// is written out here rather than left to that fact holding.
-    fn declared_variable(&self, name: &TrackedString) -> bool {
-        let param = self
-            .types
-            .get(&name.tracked)
-            .is_some_and(|symbol| self.params.contains_key(&symbol));
-        !param && self.vars.contains_key(&name.tracked)
-    }
-
-    /// Declare one `where let` name for the annotation being lowered. A repeat
-    /// is reported against the earlier declaration and declares nothing, the
-    /// way a repeated top-level name does.
-    fn declare_variable(&mut self, name: &TrackedString) {
-        if let Some(previous) = self.vars.get(&name.tracked).map(|declared| declared.span) {
-            self.error(
-                name.span,
-                ErrorKind::DuplicateVariable {
-                    name: name.tracked.clone(),
-                    previous,
+    /// A variable is introduced by being used: `'a` is a variable wherever it
+    /// is written, and the span kept is the first use's, which is where a
+    /// complaint about what the rest of the annotation did with it points.
+    fn variable(&mut self, name: &TrackedString, sense: Sense) -> bool {
+        if !self.vars.contains_key(&name.tracked) {
+            let id = self.rigids;
+            self.rigids += 1;
+            self.vars.insert(
+                name.tracked.clone(),
+                Declared {
+                    span: name.span,
+                    id,
+                    sense: None,
+                    labelled: false,
                 },
             );
-            return;
         }
-        let id = self.rigids;
-        self.rigids += 1;
-        self.vars.insert(
-            name.tracked.clone(),
-            Declared {
-                span: name.span,
-                id,
-                sense: None,
-                labelled: false,
-            },
-        );
+        self.used(name, sense)
     }
 
-    /// Read one declared variable at `sense`, and say whether that reading
-    /// stands.
+    /// Read one variable already minted at `sense`, and say whether that
+    /// reading stands.
     ///
     /// The first use decides what the variable is; every use after it is held
     /// to that. A use that disagrees is reported where it was written — the one
@@ -4380,46 +4400,23 @@ impl Builder<'_> {
     /// which is exactly what makes two `..r` in one annotation stand for one
     /// rest and two `when a` for one presence.
     ///
-    /// Three passes over one clause, in this order and no other. The
-    /// declarations first, because a use may be written above the statement
-    /// that declares it and every one of them has to resolve. Then the type,
-    /// which is where a variable's sort is read off its uses. Then the
-    /// constraints, whatever order a reader's eye takes the two in, because a
-    /// formula is written about presences and which variables are presences is
-    /// a thing only the type's `when`s can have said.
+    /// Two passes, in this order and no other. The type first, since a variable
+    /// is introduced by being written in it and its sort is read off its uses.
+    /// Then the constraints, because a formula is written about presences and
+    /// which variables are presences is a thing only the type's `when`s can
+    /// have said.
     fn written(&mut self, written: parse::Annotation, place: Place) -> Annotation {
         self.vars.clear();
-        // The declarations before the type, whatever order the statements were
-        // written in: R3 lets them be interleaved with the constraints and put
-        // after the type they are about, and a use has to find every one of
-        // them however late it was written.
-        let stmts = written.clause.map_or_else(Vec::new, |clause| clause.stmts);
-        for stmt in &stmts {
-            let parse::ClauseStmtKind::Let(names) = &stmt.tracked else {
-                continue;
-            };
-            // A declaration's variables are its parameters, so there is nothing
-            // here for a `let` to declare. Refused at the statement, and
-            // dropped — the type beside it stands, exactly as a declaration
-            // with a refused `..` keeps everything else it said.
-            if place == Place::Declaration {
-                self.error(stmt.span, ErrorKind::VariableInDeclaration);
-                continue;
-            }
-            for name in names {
-                self.declare_variable(name);
-            }
-        }
+        let clauses = written
+            .clause
+            .map_or_else(Vec::new, |clause| clause.clauses);
         let ty = self.ty(written.ty, place);
         // Then the constraints, which are resolved against what the type just
         // read: a formula is written about presences, and which variables are
         // presences is a thing only the `when`s can have said.
         let mut clause: Option<Clause> = None;
         let mut absorbed = false;
-        for stmt in stmts {
-            let parse::ClauseStmtKind::Constraint(written) = stmt.tracked else {
-                continue;
-            };
+        for written in clauses {
             // A declaration says the same thing wherever it is used, so it has
             // no presence of its own for a formula to relate.
             if place == Place::Declaration {
@@ -4442,18 +4439,6 @@ impl Builder<'_> {
                     span.track(ClauseKind::And(Box::new(before), Box::new(lowered)))
                 }
             });
-        }
-        // A `where let` name nothing uses has no sort to be read off it, so
-        // there is nothing for it to be. Reported in the order the names were
-        // declared, which is the order the reader wrote them.
-        let unused: Vec<(String, Span)> = self
-            .vars
-            .iter()
-            .filter(|(_, declared)| declared.sense.is_none())
-            .map(|(name, declared)| (name.clone(), declared.span))
-            .collect();
-        for (name, span) in unused {
-            self.error(span, ErrorKind::UnusedVariable { name });
         }
         let variables = self
             .vars
@@ -4535,9 +4520,9 @@ impl Builder<'_> {
 
     /// Lower one label's `when` clause.
     ///
-    /// A named `when` is a *use* of a declared variable, not a binder: `a` has
-    /// to have been declared, or the annotation is refused. A name that was not
-    /// — or one the type already read another way — leaves the label wearing
+    /// A named `when` is a use of a variable like any other, and introduces one
+    /// where it is the first: `when 'a` says the label is there when `'a` says
+    /// so. A name the type already read another way leaves the label wearing
     /// the anonymous presence instead, which is the `when _` the reader could
     /// have written and which nothing can then name.
     ///
@@ -4554,23 +4539,14 @@ impl Builder<'_> {
             }));
         }
         let name = when.name.and_then(|name| {
-            if !self.vars.contains_key(&name.tracked) {
-                self.error(
-                    name.span,
-                    ErrorKind::Undefined {
-                        namespace: Namespace::Types,
-                    },
-                );
-                return None;
-            }
-            if !self.used(&name, Sense::Presence) {
+            if !self.variable(&name, Sense::Presence) {
                 return None;
             }
             // Worn by a label, which is what a formula needs of a name before
             // it can say anything about it.
             self.vars
                 .get_mut(&name.tracked)
-                .expect("the declaration was just found")
+                .expect("the variable was just minted")
                 .labelled = true;
             Some(name.tracked)
         });
@@ -4593,7 +4569,7 @@ impl Builder<'_> {
             return Ok(None);
         };
         let span = tail.span;
-        match self.row(span, tail.name, place, shape) {
+        match self.row(span, tail.of, place, shape) {
             Some(of) => Ok(Some(Tail { span, of })),
             None => Err(()),
         }
@@ -4692,10 +4668,22 @@ impl Builder<'_> {
         place: Place,
     ) -> Type {
         let found = args.len();
-        let args: Vec<Type> = args.into_iter().map(|arg| self.ty(arg, place)).collect();
+        let args: Vec<Type> = args
+            .into_iter()
+            .map(|arg| self.argument(arg, place))
+            .collect();
         let head_span = head.span;
         let name = match head.tracked {
             parse::TypeKind::Ident { name } => name,
+            // A variable stands for one type outright, the way a declaration's
+            // parameter does, so there is nothing here to give arguments to.
+            // Read as a type all the same, so the one thing gone wrong is not
+            // joined by a complaint about the name itself.
+            parse::TypeKind::Variable { name } => {
+                self.variable(&name, Sense::Type);
+                self.error(head_span, ErrorKind::ParameterApplied);
+                return span.track(TypeKind::Error);
+            }
             // Something that is not a name cannot be applied, but it is still a
             // written type: it is lowered for its own complaints and the result
             // dropped, since there is nothing here for a head to be part of.
@@ -4705,15 +4693,6 @@ impl Builder<'_> {
                 return span.track(TypeKind::Error);
             }
         };
-        // A `where let` variable stands for one type outright, the way a
-        // declaration's parameter does, so there is nothing here to give
-        // arguments to. Read as a type all the same, so that the one thing gone
-        // wrong is not joined by a complaint that the name is never used.
-        if self.declared_variable(&name) {
-            self.used(&name, Sense::Type);
-            self.error(head_span, ErrorKind::ParameterApplied);
-            return span.track(TypeKind::Error);
-        }
         let Some(symbol) = self.types.get(&name.tracked) else {
             // A primitive takes nothing, so applying one is an arity complaint
             // rather than a "not a constructor": the reader wrote a type that
@@ -4951,7 +4930,7 @@ impl Builder<'_> {
         }
     }
 
-    /// Which effect declares the operation `Eff.`op` names, or `None` when
+    /// Which effect declares the operation `!Eff.op` names, or `None` when
     /// nothing does.
     ///
     /// Three ways to fail and a complaint apiece: the head names no effect at
@@ -5132,9 +5111,37 @@ impl Builder<'_> {
     /// anything else is scoped to its annotation and resolved by inference, so
     /// it passes through here as the string it was written as. See
     /// [`row`](Self::row).
+    /// [`ty`](Self::ty) at the one position a row of effects may be written
+    /// without an arrow to carry it: an argument.
+    ///
+    /// Whether the parameter it lands at is used as effects is asked later, by
+    /// [`row_arguments`], which asks it of a sum's row too. What is decided
+    /// here is only that a row was allowed to be written at all.
+    fn argument(&mut self, ty: parse::Type, place: Place) -> Type {
+        let span = ty.span;
+        match ty.tracked {
+            parse::TypeKind::Effects(written) => {
+                match self.effect_row(span, Some(*written), place) {
+                    Some(row) => span.track(TypeKind::Effects(Box::new(row))),
+                    None => span.track(TypeKind::Error),
+                }
+            }
+            written => self.ty(span.track(written), place),
+        }
+    }
+
     fn ty(&mut self, ty: parse::Type, place: Place) -> Type {
         let span = ty.span;
         match ty.tracked {
+            // A row where a type goes. Lowered all the same and the result
+            // dropped, the way a head that cannot be applied is: the effects it
+            // names are still names, and a reader who wrote one wrong should be
+            // told about that too.
+            parse::TypeKind::Effects(written) => {
+                self.effect_row(span, Some(*written), place);
+                self.error(span, ErrorKind::EffectsOutsideRow);
+                span.track(TypeKind::Error)
+            }
             // As in [`term`](Self::term): the two surface spellings of the
             // empty struct, `()` and `{}`, meet here. See
             // [`Core::Unit`](crate::types::Core::Unit).
@@ -5154,17 +5161,24 @@ impl Builder<'_> {
                 Place::Annotation => span.track(TypeKind::Hole),
             },
             // Four things a bare name can be, in this order: a declaration's
-            // parameter, a `where let` variable, a declared type, a primitive.
+            // parameter, a variable, a declared type, a primitive.
             //
             // A declaration is looked for before a primitive, so a `type Nat`
             // of one's own shadows the built-in rather than colliding with a
-            // declaration nobody wrote; and a `where let` variable shadows both
+            // declaration nobody wrote; and a variable shadows both
             // for the extent of its own annotation, for exactly the same
             // reason. Types being hoisted, every term sees such a declaration
             // wherever it was written; a type sees only the ones above it, and
             // reaches the built-in otherwise.
-            parse::TypeKind::Ident { name } if self.declared_variable(&name) => {
-                match self.used(&name, Sense::Type) {
+            parse::TypeKind::Variable { name } => {
+                // A declaration and an operation's signature each say the same
+                // thing wherever they are used, so neither has anything for a
+                // caller to pick — and each says so in its own words.
+                if let Some(kind) = wherever(place) {
+                    self.error(name.span, kind);
+                    return span.track(TypeKind::Error);
+                }
+                match self.variable(&name, Sense::Type) {
                     true => span.track(TypeKind::Var(name.tracked)),
                     false => span.track(TypeKind::Error),
                 }
@@ -5332,7 +5346,7 @@ impl Builder<'_> {
         }
     }
 
-    /// Lower the `!` clause on one arrow: resolve every effect it names,
+    /// Lower the `+` clause on one arrow: resolve every effect it names,
     /// expand every alias among them, and hold the row to being closed where
     /// the position demands it.
     ///
@@ -5341,7 +5355,7 @@ impl Builder<'_> {
     /// would stand for is exactly what could not be worked out.
     ///
     /// A bare `A -> B` writes no clause and is the empty closed row, which is
-    /// what pure means. An operation's signature may write none at all: the `!`
+    /// what pure means. An operation's signature may write none at all: the `+`
     /// is refused there, once, and the row falls back to the pure one so the
     /// arrow itself still stands.
     fn effect_row(
@@ -5907,6 +5921,20 @@ fn sense(shape: Shape) -> Sense {
     }
 }
 
+/// What a variable written here is told, or `None` where one may be written.
+///
+/// The two positions that hold for every use of what they describe refuse one,
+/// and each in its own words: a declaration's variables are its parameters, and
+/// an operation's signature is the one place the same sentence is worded about
+/// the `+`, the `..` and the `when` beside it.
+fn wherever(place: Place) -> Option<ErrorKind> {
+    match place {
+        Place::Annotation => None,
+        Place::Declaration => Some(ErrorKind::VariableInDeclaration),
+        Place::Operation => Some(ErrorKind::ImpureOperation),
+    }
+}
+
 /// What a row written here is told when it is left open, or `None` where being
 /// open is allowed.
 ///
@@ -5914,7 +5942,7 @@ fn sense(shape: Shape) -> Sense {
 /// each stand for something a definition gets to decide, and the two positions
 /// that hold for every definition — a `type` declaration's body and an
 /// operation's signature — therefore refuse both. They differ only in the words:
-/// an operation's signature refuses the `!` beside them, which a declaration's
+/// an operation's signature refuses the `+` beside them, which a declaration's
 /// body allows, so a reader who wrote one is told about all three at once.
 fn openness(place: Place, shape: Shape) -> Option<ErrorKind> {
     match place {

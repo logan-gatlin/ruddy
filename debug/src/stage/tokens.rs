@@ -62,11 +62,13 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Semicolon => "Semicolon",
         Kind::Dot => "Dot",
         Kind::DotDot => "DotDot",
-        Kind::Bang => "Bang",
+        Kind::Plus => "Plus",
         Kind::NotEqual => "NotEqual",
         Kind::Backslash => "Backslash",
         Kind::Pipe => "Pipe",
         Kind::Tag(_) => "Tag",
+        Kind::EffectLabel(_) => "EffectLabel",
+        Kind::Variable(_) => "Variable",
         Kind::LeftBrace => "LeftBrace",
         Kind::RightBrace => "RightBrace",
         Kind::LeftParen => "LeftParen",
@@ -83,12 +85,16 @@ pub fn label(kind: &Kind) -> &'static str {
 ///
 /// A tag has a class of its own rather than sharing the identifier's: it names
 /// a case rather than a definition, nothing ever resolves it, and a reader
-/// scanning a sum wants to see where the cases are.
+/// scanning a sum wants to see where the cases are. An effect has a third,
+/// because it is neither: it resolves to a declaration, like a name, and wears
+/// a sigil, like a tag.
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
         Kind::Natural(_) => "number",
         Kind::Tag(_) => "tag",
+        Kind::EffectLabel(_) => "effect",
+        Kind::Variable(_) => "variable",
         Kind::Equal
         | Kind::FatArrow
         | Kind::Arrow
@@ -98,6 +104,7 @@ pub fn class(kind: &Kind) -> &'static str {
         | Kind::DotDot
         | Kind::NotEqual
         | Kind::Backslash
+        | Kind::Plus
         | Kind::Pipe
         | Kind::LeftBrace
         | Kind::RightBrace

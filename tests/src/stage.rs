@@ -45,13 +45,13 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     }
 
     // And a variable a scheme quantified is deliberately outside the pattern:
-    // it prints as the bare letter a `where let` declares it as, which is
-    // exactly what a field or a name looks like, so lighting one would light
-    // half the page. The `where let` clause beside the type is what says which
-    // letters a scheme quantifies.
+    // it prints as the `'a` a reader writes one with, and lighting those would
+    // light every annotation on the page. The sigil is what says which letters
+    // a scheme quantifies, so nothing else has to.
     for index in [0, 25, 26] {
         let printed = Core::Bound(index).to_string();
         let mut chars = printed.chars();
+        assert_eq!(chars.next(), Some('\''), "{printed}");
         assert!(
             chars.next().is_some_and(|c| c.is_ascii_lowercase()),
             "{printed}"
@@ -82,7 +82,7 @@ fn a_presence_mark_is_not_lit_as_a_variable() {
     // The optional fields' `?`s sit against their labels and stay dark, and so
     // do the letters the scheme beside them quantifies.
     let matches: Vec<&str> = pattern
-        .find_iter("{ a when a: Nat, b when b: b } where let a, b")
+        .find_iter("{ a when 'a: Nat, b when 'b: 'b }")
         .map(|found| found.as_str())
         .collect();
     assert_eq!(matches, Vec::<&str>::new());
@@ -98,9 +98,9 @@ fn a_presence_mark_is_not_lit_as_a_variable() {
 
 /// The notation is shared, but how far one spelling reaches is not. A `?4` is
 /// one entry of the solver's one table, so it is the same variable in every
-/// row of the Constraints and Solve tabs. A scheme's `'a` is not: generalization
-/// numbers each definition's quantifiers from `'a` again, so `id : 'a -> 'a`
-/// and `k : 'a -> 'b -> 'a` share a spelling and nothing else — and the page
+/// row of the Constraints and Solve tabs. A scheme's `a` is not: generalization
+/// numbers each definition's quantifiers from `a` again, so `id : a -> a`
+/// and `k : a -> 'b -> a` share a spelling and nothing else — and the page
 /// matches on spelling alone, which is why the Types tab has to say so.
 #[test]
 fn only_the_types_tab_scopes_a_name_to_its_row() {
@@ -265,18 +265,18 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     assert!(coverage.error);
 
     // An unreachable arm is marked as the error its row reports.
-    let nodes = tab("let f = fn e => match e with | `A x => 1 | `A y => 2 end");
+    let nodes = tab("let f = fn e => match e with | #A x => 1 | #A y => 2 end");
     let unreachable = nodes[0]
         .children
         .iter()
         .find(|child| child.label == "unreachable")
         .expect("an unreachable row");
     assert!(unreachable.error);
-    assert_eq!(unreachable.text, "`A y");
+    assert_eq!(unreachable.text, "#A y");
 
     // A mixed match: the checks stood aside, and the tab says so per arm and
     // for the coverage.
-    let nodes = tab("let f = fn e => match e with | 1 => 2 | `A => 3 end");
+    let nodes = tab("let f = fn e => match e with | 1 => 2 | #A => 3 end");
     let verdicts: Vec<&str> = nodes[0]
         .children
         .iter()
@@ -325,7 +325,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     let nodes = tab("let p = fn a => match a with | {x} => {} | {y} => {} end");
     let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
     assert_eq!(labels, ["match-coverage", "let p"], "{nodes:#?}");
-    assert_eq!(nodes[1].text, "where a != b");
+    assert_eq!(nodes[1].text, "where 'a != 'b");
     assert_eq!(nodes[1].children[0].label, "patterns assume");
     let rows: Vec<(&str, &str)> = nodes[0]
         .children
@@ -394,7 +394,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     );
 
     // An annotation's own clause is a batch of its own.
-    let nodes = tab("let f : { x when a: Nat } where let a; a = { x: 1 }");
+    let nodes = tab("let f : { x when 'a: Nat } where 'a = { x: 1 }");
     assert!(
         nodes.iter().any(|node| node.label == "annotation"),
         "{nodes:#?}"
@@ -419,7 +419,7 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         .iter()
         .find(|child| child.label == "patterns assume")
         .expect("the promise row");
-    assert_eq!(assumed.text, "a and not b or not a and b", "{nodes:#?}");
+    assert_eq!(assumed.text, "'a and not 'b or not 'a and 'b", "{nodes:#?}");
 
     // A program that constrains nothing still says so, per definition: the
     // ordinary case is a tab full of "unconstrained" rather than an empty one,
@@ -470,7 +470,7 @@ fn the_presence_tab_counts_what_it_rendered() {
 fn the_ast_tab_renders_the_where_statement_list() {
     let tree = tab(
         "ast",
-        "let both : { x when a: c, y when b: _ } -> {} where let a, b; a = b; let c = fn v => v",
+        "let both : { x when 'a: 'c, y when 'b: _ } -> {} where 'a = 'b; 'a = fn v => v",
     );
     let rows = flatten(&tree);
     // The clause is a row of its own beside the type, spelled as it was
@@ -479,22 +479,14 @@ fn the_ast_tab_renders_the_where_statement_list() {
         .iter()
         .find(|node| node.label == "Where")
         .expect("the clause is a row");
-    assert_eq!(clause.text, "let a, b; a = b; let c");
+    assert_eq!(clause.text, "'a = 'b; 'a");
     // One row per statement, labelled by which of the two it is.
     let stmts: Vec<&str> = clause
         .children
         .iter()
         .map(|node| node.label.as_str())
         .collect();
-    assert_eq!(stmts, ["Let", "Constraint", "Let"]);
-    // And one row per declared name, spanned where it was written, so a use in
-    // the type lights the declaration it resolves to.
-    let names: Vec<&str> = clause.children[0]
-        .children
-        .iter()
-        .map(|node| node.text.as_str())
-        .collect();
-    assert_eq!(names, ["a", "b"]);
+    assert_eq!(stmts, ["Constraint", "Constraint"]);
     // The hole is a leaf of its own, not a name and not an error.
     assert!(
         rows.iter()
@@ -503,13 +495,12 @@ fn the_ast_tab_renders_the_where_statement_list() {
     );
 }
 
-/// The IR tab says what each declared variable turned out to stand for, which
-/// is the whole of what it adds over the AST's: the name is written bare, and
-/// which of the three sorts it has follows from where the type uses it.
+/// The IR tab says what each variable turned out to stand for, which is the
+/// whole of what it adds over the AST's: the name is written as its uses spell
+/// it, and which of the three sorts it has follows from where the type uses it.
 #[test]
 fn the_ir_tab_says_what_each_declared_variable_stands_for() {
-    let source = "let f : { x when a: c, ..b } -> (`A Nat | ..d) \
-                  where let a, b, c, d = fn p => p";
+    let source = "let f : { x when 'a: 'c, ..'b } -> (#A Nat | ..'d) = fn p => p";
     let tree = tab("ir", source);
     let rows = flatten(&tree);
     let stands: Vec<(&str, &str)> = rows
@@ -520,46 +511,43 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
     assert_eq!(
         stands,
         [
-            ("Variable a", "when a (a presence)"),
-            ("Variable b", "b (a whole type)"),
-            ("Variable c", "c (a whole type)"),
-            ("Variable d", "..d (the rest of a sum's cases)"),
+            ("Variable a", "when 'a (a presence)"),
+            ("Variable c", "'c (a whole type)"),
+            ("Variable b", "'b (a whole type)"),
+            ("Variable d", "..'d (the rest of a sum's cases)"),
         ]
     );
-    // Each row is spanned at the name it declares, so clicking a `..b` in the
-    // type lights the `let b` that declared it.
+    // Each row is spanned at the first use, which is where the variable was
+    // introduced, so clicking a `..'b` in the type lights it.
     let declared = rows
         .iter()
         .find(|node| node.label == "Variable b")
         .expect("the row is there");
-    let at = source.find("let a, b").expect("the statement") + 7;
-    assert_eq!(declared.span, Some([at, at + 1]));
+    let at = source.find("..'b").expect("the tail") + 2;
+    assert_eq!(declared.span, Some([at, at + 2]));
 
     // A named tail keeps its as-written spelling in the type beside them.
     assert!(
         rows.iter()
-            .any(|node| node.label == "Rest" && node.text == "..b"),
+            .any(|node| node.label == "Rest" && node.text == "..'b"),
         "{rows:#?}"
     );
     // And a use in a type position is a row of its own, named rather than
     // resolved to a symbol.
     assert!(
         rows.iter()
-            .any(|node| node.label == "Var" && node.text == "c"),
+            .any(|node| node.label == "Var" && node.text == "'c"),
         "{rows:#?}"
     );
 }
 
-/// A use of a declared variable in the type is grouped with the `where let`
+/// A use of a declared variable in the type is grouped with the `where 'let`
 /// statement that declared it, the way a declaration parameter is grouped with
 /// its header — by a link the page paints, since a variable scoped to one
 /// annotation reaches no symbol table. Two variables are two groups.
 #[test]
 fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
-    let tree = tab(
-        "ir",
-        "let f : { x: c, ..b } -> Nat where let b, c = fn p => 0",
-    );
+    let tree = tab("ir", "let f : { x: 'c, ..'b } -> Nat = fn p => 0");
     let rows = flatten(&tree);
     let link = |label: &str, text: &str| {
         rows.iter()
@@ -567,10 +555,10 @@ fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
             .unwrap_or_else(|| panic!("`{label}` `{text}` is a row: {rows:#?}"))
             .link
     };
-    let b = link("Variable b", "b");
-    let c = link("Variable c", "c");
-    assert_eq!(link("Rest", "..b"), b);
-    assert_eq!(link("Var", "c"), c);
+    let b = link("Variable b", "'b");
+    let c = link("Variable c", "'c");
+    assert_eq!(link("Rest", "..'b"), b);
+    assert_eq!(link("Var", "'c"), c);
     // Both are a group at all, and they are not the same group: two names that
     // stand for two things may not light each other.
     assert!(b.is_some() && c.is_some(), "{rows:#?}");
@@ -584,32 +572,32 @@ fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
 }
 
 /// The Types tab shows the published schemes in the spelling the CLI reports,
-/// `where let` clause and all — so the tab and the compiler's own answer cannot
+/// `where 'let` clause and all — so the tab and the compiler's own answer cannot
 /// drift — and the Solve tab shows a rigid in a goal as the name it was
 /// declared with.
 #[test]
 fn the_type_tabs_show_the_new_spelling() {
-    let source = "let id : a -> a where let a = fn x => x";
+    let source = "let id : 'a -> 'a = fn x => x";
     let tree = tab("types", source);
     let rows = flatten(&tree);
     let scheme = rows
         .iter()
         .find(|node| node.label == "let id")
         .expect("the definition has a row");
-    assert_eq!(scheme.text, "a -> a where let a");
+    assert_eq!(scheme.text, "'a -> 'a");
 
     // A rigid appears in the solve as its name rather than as a `?`, which is
     // what makes a step about one readable at all.
     let tree = tab("solve", source);
     let rows = flatten(&tree);
     assert!(
-        rows.iter().any(|node| node.text.contains(" ~ a")),
+        rows.iter().any(|node| node.text.contains(" ~ 'a")),
         "{rows:#?}"
     );
 
     // And the rule that refuses one is a step like any other, red and carrying
     // the same words the strip does.
-    let tree = tab("solve", "let g : a -> a where let a = fn x => 0");
+    let tree = tab("solve", "let g : 'a -> 'a = fn x => 0");
     let rows = flatten(&tree);
     let refused = rows
         .iter()
@@ -623,7 +611,7 @@ fn the_type_tabs_show_the_new_spelling() {
         .expect("a failed step carries what it said");
     assert_eq!(
         error.value,
-        "this is `Nat`, but `a` stands for whatever type the caller picks"
+        "this is `Nat`, but `'a` stands for whatever type the caller picks"
     );
 }
 
@@ -636,7 +624,7 @@ fn the_type_tabs_show_the_new_spelling() {
 fn the_lir_tab_renders_the_listing_as_a_tree() {
     let nodes = tab(
         "lir",
-        "let f = fn a => match a with | `A n => n | b => 0 end",
+        "let f = fn a => match a with | #A n => n | b => 0 end",
     );
     let roots: Vec<(&str, &str)> = nodes
         .iter()
@@ -661,7 +649,7 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(cases, ["`A =>", "else =>"], "{switch:#?}");
+    assert_eq!(cases, ["#A =>", "else =>"], "{switch:#?}");
     let inside: Vec<(&str, &str)> = switch.children[0]
         .children
         .iter()
@@ -687,10 +675,10 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
 fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
     let nodes = tab(
         "lir",
-        "effect Log = `write : Nat -> ()\n\
-         let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g => fn n => g n\n\
-         let logger : Nat -> Nat ! `Log = fn n => let z = Log.`write n in n\n\
-         let use = fn w => handle piped logger 1 with | Log.`write s => {} end\n",
+        "effect Log = write : Nat -> ()\n\
+         let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
+         let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
+         let use = fn w => handle piped logger 1 with | !Log.write s => {} end\n",
     );
     let rows = flatten(&nodes);
     let row = |text: &str| {

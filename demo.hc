@@ -46,43 +46,43 @@ let getx = fn p => p.x
 
 let dot = getx { x: 3, y: 4 }
 
-let open : { small: Nat, ..extra } -> Nat where let extra = fn s => s.small
+let open : { small: Nat, ..'extra } -> Nat = fn s => s.small
 
-let opt : { label when a: Nat, value: Nat, .. } -> Nat where let a = fn r => r.value
+let opt : { label when 'a: Nat, value: Nat, .. } -> Nat = fn r => r.value
 
 let either = fn v => match v with
   | {x} => {}
   | {y} => {}
 end
 
-let both : { x when a: c, y when b: d } -> {} where let a, b; a = b; let c, d
+let both : { x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b
   = fn v =>
     match v with
       | {x, y} => {}
       | {} => {}
     end
 
-type Option T = `Some T | `None
+type Option T = #Some T | #None
 
-let some = `Some 1
+let some = #Some 1
 
-let nothing : Option Nat = `None
+let nothing : Option Nat = #None
 
-let wrap = fn x => `Some x
+let wrap = fn x => #Some x
 
-type Tree a = `Leaf | `Branch { value: a, kids: Tree a }
+type Tree a = #Leaf | #Branch { value: a, kids: Tree a }
 
-let leaf : Tree Nat = `Leaf
+let leaf : Tree Nat = #Leaf
 
-type Fallible r = `Err Nat | ..r
+type Fallible r = #Err Nat | ..r
 
-let handled : Fallible (`Ok Nat) -> Nat = fn t => 0
+let handled : Fallible (#Ok Nat) -> Nat = fn t => 0
 
-let identical : a -> a where let a = fn x => x
+let identical : 'a -> 'a = fn x => x
 
-let firstly : { x: a, .. } -> a where let a = fn p => p.x
+let firstly : { x: 'a, .. } -> 'a = fn p => p.x
 
-let widened : (`Err Nat | ..r) -> Nat where let r = fn t => 0
+let widened : (#Err Nat | ..'r) -> Nat = fn t => 0
 
 let anonymous : { .. } -> Nat = fn s => 0
 
@@ -94,7 +94,7 @@ let narrowed : Nat -> Nat = fn x => x
 
 type Nest = { kids: Nest }
 
-let depth : { kids: Nest, ..r } -> Nat where let r = fn n => depth n.kids
+let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids
 
 let repeat = fn x => repeat x
 
@@ -131,45 +131,49 @@ let _ = id 7
 let konst = fn x _ => x
 
 let unwrap = fn opt => match opt with
-  | `Some x => x
+  | #Some x => x
   | _ => 0
   end
 
-effect Log = `write : Nat -> ()
+effect Log = write : Nat -> ()
 
-effect IO = `print : Nat -> ()
+effect IO = print : Nat -> ()
 
-effect Console = `Log | `IO
+effect Console = !Log + !IO
 
-let greet : () -> Nat ! `Log = fn _ =>
-  let _ = Log.`write 1 in
+let greet : () -> Nat + !Log = fn _ =>
+  let _ = !Log.write 1 in
   0
 
 let quiet : () -> Nat = fn _ =>
   handle greet () with
-    | Log.`write s => ()
+    | !Log.write s => ()
     | return x => x
   end
 
-let loud : () -> Nat ! `Console = fn _ =>
+let loud : () -> Nat + !Console = fn _ =>
   handle greet () with
-    | Log.`write s => IO.`print s
+    | !Log.write s => !IO.print s
   end
 
-effect Fail = `oops : () -> Nat
+effect Fail = oops : () -> Nat
 
 let recover : () -> Nat = fn _ =>
-  handle Fail.`oops () with
-    | Fail.`oops _ => raise 0
+  handle !Fail.oops () with
+    | !Fail.oops _ => raise 0
   end
 
-let runs = fn g => handle g () with | Log.`write s => () end
+let runs = fn g => handle g () with | !Log.write s => () end
 
-let piped : (Nat -> Nat ! ..e) -> Nat -> Nat ! ..e where let e = fn g n => g n
+let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g n => g n
 
-type Logger = Nat -> Nat ! `Log
+type Logger = Nat -> Nat + !Log
 
-type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e
+type Runner e = (Nat -> Nat + ..e) -> Nat + ..e
+
+let logged : Runner (!Log) -> Nat = fn r => 0
+
+let consoled : Runner (!Log + !IO) -> Nat = fn r => 0
 
 let bad = @
 

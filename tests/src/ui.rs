@@ -147,13 +147,6 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         IrError::DuplicateReturn { previous: span },
         IrError::RaiseOutsideArm,
         IrError::RaiseInFunction,
-        IrError::DuplicateVariable {
-            name: "a".to_string(),
-            previous: span,
-        },
-        IrError::UnusedVariable {
-            name: "a".to_string(),
-        },
     ] {
         all.push(("ir", kind.code(), kind.to_string()));
     }
@@ -321,8 +314,8 @@ fn every_rule_is_named_and_explained_distinctly() {
 
 /// The two rules that decide one label at a time say which kind of label it
 /// was, because a reader stepping through a solve is reading about their own
-/// program: "whether the field is there" over a goal about `` `Some `` and
-/// `` `None `` describes something they never wrote. The same reason
+/// program: "whether the field is there" over a goal about `#Some` and
+/// `#None` describes something they never wrote. The same reason
 /// `Rule::Struct` and `Rule::Sum` are two rules rather than one worded about
 /// rows — and the reason neither says "label", a word the language does not
 /// have anywhere a reader can see it.
@@ -504,9 +497,9 @@ fn round_trip(prelude: &str, printed: &str) -> String {
 
     let (symbol, _) = built.program.terms.last().expect("the definition");
     let scheme = inferred.schemes[symbol].to_string();
-    // The `where let` a scheme now declares its letters with is not part of the
+    // The `where 'let` a scheme now declares its letters with is not part of the
     // row being read: what this reads back is the one field's type.
-    let body = scheme.split(" where let ").next().unwrap_or(&scheme);
+    let body = scheme.split(" where 'let ").next().unwrap_or(&scheme);
     body.strip_prefix("{ v: ")
         .and_then(|rest| rest.strip_suffix(" } -> Nat"))
         .unwrap_or_else(|| panic!("{source}: unexpected scheme `{scheme}`"))
@@ -585,11 +578,11 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
 /// from it — so these are pinned as printing and nothing more.
 ///
 /// Not an oversight in the printer. What a row's tail and a field's `?` stand
-/// for is an identity: `{ x: Nat, ..'a } -> { x: Nat, ..'a }` says the two
-/// tails are the *same* rest, and `..'a` is how that is spelled. The surface
-/// syntax has `..r`, which says the same thing by a name the writer chose —
+/// for is an identity: `{ x: Nat, ..a } -> { x: Nat, ..a }` says the two
+/// tails are the *same* rest, and `..a` is how that is spelled. The surface
+/// syntax has `..'r`, which says the same thing by a name the writer chose —
 /// but a scheme has no names to offer, only numbers the quantifier handed out,
-/// so printing one back as `..r` would be inventing a name that was never
+/// so printing one back as `..'r` would be inventing a name that was never
 /// written. `..` alone loses the identity, and `?` on a field is likewise a
 /// variable the syntax gives no way to name.
 ///
@@ -611,7 +604,7 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
                 .collect(),
         }
         .to_string(),
-        "{ x: Nat, ..a }"
+        "{ x: Nat, ..'a }"
     );
     assert_eq!(
         Ty {
@@ -632,7 +625,7 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
             fields: Default::default(),
         }
         .to_string(),
-        "a"
+        "'a"
     );
 
     // A field's presence prints as its surface spelling too: certainly there
@@ -661,20 +654,20 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
             .collect(),
         }
         .to_string(),
-        "{ x when a: Nat }"
+        "{ x when 'a: Nat }"
     );
 
     // `{ x: Nat, .. }` does parse, and what it parses to is a row with a fresh
     // tail of its own — not the one it was printed from. The string survives;
     // the identity it was standing for does not.
-    assert_eq!(round_trip("", "{ x: Nat, .. }"), "{ x: Nat, ..a }");
+    assert_eq!(round_trip("", "{ x: Nat, .. }"), "{ x: Nat, ..'a }");
 }
 
 /// The notes are held in [`ui`] rather than in either reporter, because both
 /// print them: the CLI as a second indented line, the strip as a second
 /// highlight on the same diagnostic. One for the complaints about a name
 /// defined twice, one for the name declared twice in one `where` clause, one
-/// for the name used two ways, and one for the `where let` a body broke its
+/// for the name used two ways, and one for the `where 'let` a body broke its
 /// promise about — the second place is a definition in the first, a declaration
 /// in the second and the fourth, and a use in the third.
 #[test]
@@ -713,7 +706,7 @@ fn the_notes_pointing_elsewhere_are_worded_once() {
 /// word and the type printed beside it cannot come out disagreeing, and it is
 /// what this pins.
 #[test]
-fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
+fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
     let sum = Rc::new(Ty::plain(Core::Sum(Row {
         labels: [(
             "A".to_string(),
@@ -733,13 +726,13 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
         base: sum.clone(),
         field: "B".to_string(),
     };
-    assert_eq!(missing.to_string(), "no case ``B` on ``A Nat`");
+    assert_eq!(missing.to_string(), "no case `#B` on `#A Nat`");
     let extra = TypeError::ExtraField {
         shape: Shape::Sum,
         base: sum.clone(),
         field: "B".to_string(),
     };
-    assert!(extra.to_string().contains("extra case ``B`"), "{extra}");
+    assert!(extra.to_string().contains("extra case `#B`"), "{extra}");
     // The same two about a struct keep the wording they always had.
     let field = TypeError::MissingField {
         shape: Shape::Struct,
@@ -757,7 +750,7 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
         field: "A".to_string(),
     };
     assert!(repeated.to_string().contains("cases"), "{repeated}");
-    assert!(repeated.to_string().contains("``A`"), "{repeated}");
+    assert!(repeated.to_string().contains("`#A`"), "{repeated}");
     let not_a_row = IrError::NotARow {
         sense: Sense::Cases,
     };
@@ -783,7 +776,7 @@ fn a_complaint_about_a_sum_says_case_and_writes_the_backtick() {
 
 /// One wording for both shapes of an absence with no `..` to speak about,
 /// quoting the label the way it was written: a field bare, a case wearing the
-/// backtick that makes it one.
+/// `#` that makes it one.
 #[test]
 fn an_absence_in_a_closed_type_quotes_the_label_as_written() {
     let field = IrError::AbsentInClosed {
@@ -803,7 +796,7 @@ fn an_absence_in_a_closed_type_quotes_the_label_as_written() {
     assert_eq!(case.code(), field.code());
     assert_eq!(
         case.to_string(),
-        "a type with no `..` already says ``B` is not there"
+        "a type with no `..` already says `#B` is not there"
     );
 }
 
@@ -813,7 +806,7 @@ fn an_absence_in_a_closed_type_quotes_the_label_as_written() {
 #[test]
 fn a_written_absence_is_not_printed() {
     let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
-                  let s : `Ok Nat | \\`Err | .. = `Ok 1\n";
+                  let s : #Ok Nat | \\#Err | .. = #Ok 1\n";
     let lexed = token::lex(source, FileID::GENERATED);
     assert!(lexed.errors.is_empty(), "{:#?}", lexed.errors);
     let parsed = parse::parse(lexed.tokens);
@@ -831,13 +824,7 @@ fn a_written_absence_is_not_printed() {
         .keys()
         .map(|symbol| inferred.schemes[symbol].to_string())
         .collect();
-    assert_eq!(
-        printed,
-        [
-            "{ x: Nat, ..a } -> Nat where let a",
-            "`Ok Nat | ..a where let a"
-        ]
-    );
+    assert_eq!(printed, ["{ x: Nat, ..'a } -> Nat", "#Ok Nat | ..'a"]);
 }
 
 /// A parameter read more than one way names the two readings it was found to
@@ -901,7 +888,7 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
     }
 
     // The three that carry something print it, and re-lex to themselves as
-    // well: the backtick stays on, and a number keeps its value.
+    // well: the `#` stays on, and a number keeps its value.
     for kind in [
         TokenKind::Tag("Some".to_string()),
         TokenKind::Identifier("x".to_string()),
@@ -974,7 +961,7 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
         .collect(),
         rest: Rest::Closed,
     })));
-    assert_eq!(sum.to_string(), "`A Nat");
+    assert_eq!(sum.to_string(), "#A Nat");
 
     // A case carrying anything that is not unit keeps its payload: only the
     // type with nothing of its own and no fields is written as no payload at
@@ -993,7 +980,7 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
         .collect(),
         rest: Rest::Closed,
     })));
-    assert_eq!(open.to_string(), "`A { x: {}, ..a }");
+    assert_eq!(open.to_string(), "#A { x: {}, ..'a }");
 
     // The two forms that write no case at all keep the leading bar, which is
     // the only thing that makes either read back as a sum.
@@ -1006,7 +993,7 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
         labels: Default::default(),
         rest: Rest::Bound(0),
     })));
-    assert_eq!(only_tail.to_string(), "| ..a");
+    assert_eq!(only_tail.to_string(), "| ..'a");
 }
 
 /// A sink that accepts `left` writes and then fails, so a printer can be run
@@ -1045,7 +1032,7 @@ fn write_count(shown: &dyn fmt::Display) -> usize {
 }
 
 /// Fail the sink at each write in turn and check the printer says so. A `?`
-/// dropped anywhere in a printer would show up here as a render that claimed to
+/// dropped anywhere 'in a printer would show up here as a render that claimed to
 /// succeed after the sink had refused it — and, for the printers that write in
 /// pieces, as a half-written type reaching whoever asked for it.
 fn every_failure_is_reported(what: &str, shown: &dyn fmt::Display) {
@@ -1174,7 +1161,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
                   let h = let n : Nat = 1 in n\n\
                   let v : { first: Nat, second: Nat } = { first: 1, second: 2 }\n\
                   type Gap r = { first: Nat, \\hole, ..r }\n\
-                  let w : `Ok Nat | \\`Err | .. = `Ok 1";
+                  let w : #Ok Nat | \\#Err | .. = #Ok 1";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut program_mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid"));
@@ -1190,8 +1177,8 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // the surface tree rather than the lowered one — through every form a
     // written row can take, so a refusal at any of its writes comes back
     // whichever form is being written.
-    let source = "let x : { first: Nat, opt when b: Nat, \\hole, .. } \
-                  -> (|) -> (| ..r) -> (`Ok Nat | `Err (when a) | \\`B | ..) -> (`A | `B) = 1";
+    let source = "let x : { first: Nat, opt when 'b: Nat, \\hole, .. } \
+                  -> (|) -> (| ..'r) -> (#Ok Nat | #Err (when 'a) | \\#B | ..) -> (#A | #B) = 1";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     every_failure_is_reported(
@@ -1225,18 +1212,18 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
         Core::Nat,
         vec![("x", RowField::present(Rc::new(Ty::plain(Core::Bound(0)))))],
     );
-    assert_eq!(quantified.to_string(), "Nat with { x: a }");
+    assert_eq!(quantified.to_string(), "Nat with { x: 'a }");
 
     // Either side of an arrow, bare: nothing in an arrow can swallow the
     // fields, and bracketing here would be noise on the commonest form there
     // is — the type of an unannotated accessor.
     assert_eq!(
         Ty::plain(Core::pure(quantified.clone(), nat.clone())).to_string(),
-        "Nat with { x: a } -> Nat"
+        "Nat with { x: 'a } -> Nat"
     );
     assert_eq!(
         Ty::plain(Core::pure(nat.clone(), quantified.clone())).to_string(),
-        "Nat -> Nat with { x: a }"
+        "Nat -> Nat with { x: 'a }"
     );
 
     // An argument of a declared type, bracketed: the fields would otherwise
@@ -1252,7 +1239,7 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
             args: Rc::from([quantified.clone(), nat.clone()]),
         })
         .to_string(),
-        "Pair (Nat with { x: a }) Nat"
+        "Pair (Nat with { x: 'a }) Nat"
     );
 
     // And a tag's payload, for the same reason.
@@ -1264,7 +1251,7 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
             rest: Rest::Closed,
         }))
         .to_string(),
-        "`Some (Nat with { x: a })"
+        "#Some (Nat with { x: 'a })"
     );
 }
 
@@ -1273,9 +1260,9 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
 /// all.
 ///
 /// Both are what a sum's row parameter leaves behind, so both are what the
-/// debugger's IR tab shows for a term checked against a declared type. `..r`
+/// debugger's IR tab shows for a term checked against a declared type. `..'r`
 /// handed a sum's cases is those cases, and spelling them with colons would show
-/// a reader a case list as if it were a set of fields. `..r` handed nothing
+/// a reader a case list as if it were a set of fields. `..'r` handed nothing
 /// allows nothing more, which is what a closed row already says — and the
 /// solver's own mark for that is never part of a printed type.
 ///
@@ -1295,7 +1282,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         }))
     };
 
-    // `` type G r = `Err Nat | ..r `` applied to `` `Ok Nat ``, and to a row
+    // `type G r = #Err Nat | ..r` applied to `#Ok Nat`, and to a row
     // naming nothing, which leaves the sum closed at the case it wrote.
     let err_nat = |rest: Rest| {
         Rc::new(Ty::plain(Core::Sum(Row {
@@ -1311,16 +1298,16 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
             Rest::Closed
         ))
         .to_string(),
-        "`Err Nat | ..`Ok Nat"
+        "#Err Nat | ..#Ok Nat"
     );
-    assert_eq!(err_nat(more(vec![], Rest::Closed)).to_string(), "`Err Nat");
+    assert_eq!(err_nat(more(vec![], Rest::Closed)).to_string(), "#Err Nat");
 
     // A chain of splices is read to its end, and a case the splice settled
     // absent counts for nothing on the way: what is written is whatever the
     // chain still leaves open.
     assert_eq!(
         err_nat(more(vec![], more(vec![], Rest::Closed))).to_string(),
-        "`Err Nat"
+        "#Err Nat"
     );
     assert_eq!(
         err_nat(more(
@@ -1334,7 +1321,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
             Rest::Var(3)
         ))
         .to_string(),
-        "`Err Nat | ..?3"
+        "#Err Nat | ..?3"
     );
 
     // A case whose payload is unit is still a case carrying unit, so it prints
@@ -1347,7 +1334,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
             rest: Rest::Closed,
         }))
         .to_string(),
-        "`A"
+        "#A"
     );
 }
 
@@ -1385,7 +1372,7 @@ fn the_three_sorts_each_print_on_their_own() {
     for (rest, printed) in [
         (Rest::Closed, "∅"),
         (Rest::Var(4), "?4"),
-        (Rest::Bound(0), "a"),
+        (Rest::Bound(0), "'a"),
         (Rest::Undecided, "?"),
         (Rest::More(Rc::new(Row::closed())), "∅"),
     ] {
@@ -1396,9 +1383,9 @@ fn the_three_sorts_each_print_on_their_own() {
         (Presence::Present, "present"),
         (Presence::Absent, "absent"),
         (Presence::Var(4), "?4"),
-        // A presence has its own alphabet, and no quote: the letter is the
-        // name a `when` clause gave it.
-        (Presence::Bound(1), "b"),
+        // A presence is a variable like the other two, and wears the sigil a
+        // `when` clause writes it with.
+        (Presence::Bound(1), "'b"),
         (Presence::Undecided, "?"),
     ] {
         assert_eq!(presence.to_string(), printed);
@@ -1476,13 +1463,13 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
         base: sum.clone(),
         field: "x".to_string(),
     };
-    assert_eq!(missing_field.to_string(), "no field `x` on ``A Nat`");
+    assert_eq!(missing_field.to_string(), "no field `x` on `#A Nat`");
     let missing_case = TypeError::MissingField {
         shape: Shape::Sum,
         base: sum.clone(),
         field: "B".to_string(),
     };
-    assert_eq!(missing_case.to_string(), "no case ``B` on ``A Nat`");
+    assert_eq!(missing_case.to_string(), "no case `#B` on `#A Nat`");
     assert_eq!(missing_field.code(), missing_case.code());
 
     // And the same for the extra one, whose sentence names the noun twice.
@@ -1493,7 +1480,7 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
     };
     assert_eq!(
         extra_field.to_string(),
-        "extra field `x`: the type ``A Nat` lists every field it allows"
+        "extra field `x`: the type `#A Nat` lists every field it allows"
     );
     let extra_case = TypeError::ExtraField {
         shape: Shape::Sum,
@@ -1502,7 +1489,7 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
     };
     assert_eq!(
         extra_case.to_string(),
-        "extra case ``B`: the type ``A Nat` lists every case it allows"
+        "extra case `#B`: the type `#A Nat` lists every case it allows"
     );
 }
 
@@ -1534,7 +1521,7 @@ fn nothing_is_coded_as_not_a_struct_any_more() {
 /// The complaint about an annotation the definition narrowed is gone, and with
 /// it its code. Every `..`, `when _` and `_` a reader writes is a hole now —
 /// there to be decided, which is what a hole is for — and what an annotation
-/// still promises is what its `where let` declares, held to at the expression
+/// still promises is what its `where 'let` declares, held to at the expression
 /// that breaks it.
 #[test]
 fn nothing_is_coded_as_annotation_too_open_any_more() {
@@ -1542,46 +1529,26 @@ fn nothing_is_coded_as_annotation_too_open_any_more() {
     assert!(!codes.contains("annotation-too-open"), "{codes:#?}");
 
     // What replaces it is nothing at all in inference, and three complaints
-    // about the promise a `where let` makes.
+    // about the promise a `where 'let` makes.
     for code in ["rigid-broken", "rigid-field", "rigid-escapes"] {
         assert!(codes.contains(code), "{code}");
     }
     // And lowering gained four, about the clause itself.
-    for code in [
-        "unused-variable",
-        "duplicate-variable",
-        "variable-in-declaration",
-        "hole-in-declaration",
-    ] {
+    for code in ["variable-in-declaration", "hole-in-declaration"] {
         assert!(codes.contains(code), "{code}");
     }
 }
 
-/// Every complaint the `where let` clause can raise, rendered. A wording is
-/// read once by whoever reads the compiler's output and never again, so each
-/// is pinned here where the whole surface can be read at once.
+/// Every complaint a variable can raise, rendered. A wording is read once by
+/// whoever reads the compiler's output and never again, so each is pinned here
+/// where the whole surface can be read at once.
 #[test]
-fn the_declared_variable_complaints_read_as_what_went_wrong() {
+fn the_variable_complaints_read_as_what_went_wrong() {
     let span = Span::generated(0, 1);
-    assert_eq!(
-        IrError::UnusedVariable {
-            name: "a".to_string(),
-        }
-        .to_string(),
-        "this declares `a`, but nothing in the type beside it uses that name"
-    );
-    assert_eq!(
-        IrError::DuplicateVariable {
-            name: "a".to_string(),
-            previous: span,
-        }
-        .to_string(),
-        "`a` is declared twice in one `where` clause"
-    );
     assert_eq!(
         IrError::VariableInDeclaration.to_string(),
         "a declared type's variables are its parameters, so there is nothing here \
-         for a `let` to declare; write `type T a = ...`"
+         for a caller to pick; write `type T a = ...`"
     );
     assert_eq!(
         IrError::HoleInDeclaration.to_string(),
@@ -1595,7 +1562,7 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
             name: "b".to_string(),
         }
         .to_string(),
-        "this clause names `b`, but no `when` in the type beside it gives it a label"
+        "this clause names `'b`, but no `when` in the type beside it gives it a label"
     );
 
     // And the three inference raises, each naming what the expression turned
@@ -1608,7 +1575,7 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this is `Nat`, but `a` stands for whatever type the caller picks"
+        "this is `Nat`, but `'a` stands for whatever type the caller picks"
     );
     // The effect reading quotes no arrow: the rows differ only in their
     // tails, and the reader's fix is at the expression, not a type nobody
@@ -1621,7 +1588,7 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this decides what it may perform, but `e` stands for whatever effects the caller allows"
+        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
     );
     assert_eq!(
         TypeError::RigidField {
@@ -1631,11 +1598,11 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a field `x`, but `r` stands for whatever type the caller picks, \
+        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
          so it may not have one"
     );
-    // In the reader's own nouns: someone who wrote backticks is told about a
-    // case, and the label is quoted with the backtick that makes it one.
+    // In the reader's own nouns: someone who wrote `#`s is told about a
+    // case, and the label is quoted with the `#` that makes it one.
     assert_eq!(
         TypeError::RigidField {
             shape: Shape::Sum,
@@ -1644,12 +1611,12 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
             declared: span,
         }
         .to_string(),
-        "this reads a case ``B`, but `r` stands for whatever type the caller picks, \
+        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
          so it may not have one"
     );
     assert_eq!(
         TypeError::RigidEscapes { name: "a".into() }.to_string(),
-        "`a` stands for whatever the caller picks, so it can't be part of a type \
+        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
          outside the annotation that declared it"
     );
 }
@@ -1661,8 +1628,8 @@ fn the_declared_variable_complaints_read_as_what_went_wrong() {
 /// core is something a `..` has a spelling for; and anything else wears the
 /// `with` that no source syntax writes.
 ///
-/// The braced forms are the point. `{ x: 'a, ..'b }` is what a reader would
-/// have written, and `'b with { x: 'a }` is not something the parser could read
+/// The braced forms are the point. `{ x: a, ..'b }` is what a reader would
+/// have written, and `'b with { x: a }` is not something the parser could read
 /// back — so the `..` spelling is what keeps a printed type re-lowerable to the
 /// type it was printed from.
 #[test]
@@ -1682,7 +1649,7 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
     // No labels: the core alone, whatever the core is.
     for (core, printed) in [
         (Core::Nat, "Nat"),
-        (Core::Bound(0), "a"),
+        (Core::Bound(0), "'a"),
         (Core::Var(3), "?3"),
         (Core::Undecided, "?"),
         (Core::Unit, "{}"),
@@ -1704,7 +1671,7 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
             vec![("x", RowField::present(Rc::new(Ty::plain(Core::Bound(0)))))],
         )
         .to_string(),
-        "{ x: a, ..b }"
+        "{ x: 'a, ..'b }"
     );
     assert_eq!(
         with_fields(Core::Undecided, x()).to_string(),
@@ -1739,7 +1706,7 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
             )],
         )
         .to_string(),
-        "{ x when a: Nat, .. }"
+        "{ x when 'a: Nat, .. }"
     );
 
     // A field the solver settled absent is not part of what the type says, so
@@ -1781,7 +1748,7 @@ fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
             x(),
         )
         .to_string(),
-        "(`A) with { x: Nat }"
+        "(#A) with { x: Nat }"
     );
     assert_eq!(
         with_fields(with_x(), vec![("y", RowField::present(nat))]).to_string(),
@@ -1817,7 +1784,7 @@ fn the_complaints_about_a_declarations_own_labels_are_worded_once() {
     };
     assert_eq!(
         case.to_string(),
-        "this names ``A`, which the sum it goes into already has"
+        "this names `#A`, which the sum it goes into already has"
     );
     assert_eq!(field.code(), case.code());
 }
@@ -1848,7 +1815,7 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
         "this is used as a whole type here and as the rest of a sum's cases \
          before it, and a name can only stand for one of them"
     );
-    // The third sense, which only a `where let` variable can have: a formula is
+    // The third sense, which only a `where 'let` variable can have: a formula is
     // written about presences, so a name in one is read as a presence.
     assert_eq!(
         said(Sense::Type, Sense::Presence),
@@ -1974,7 +1941,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
 }
 
 /// The complaints pattern matching added, worded and coded. The wording quotes
-/// what the reader wrote — the tag with its backtick, the number as itself,
+/// what the reader wrote — the tag with its `#`, the number as itself,
 /// the name that was bound twice — and the codes are the stable names the
 /// error tests in `ir.rs` key on.
 #[test]
@@ -1985,7 +1952,7 @@ fn the_pattern_complaints_say_what_was_written() {
     assert_eq!(case.code(), "binding-can-fail");
     assert_eq!(
         case.to_string(),
-        "this binding has to accept every value, but a value here might not be ``Some`"
+        "this binding has to accept every value, but a value here might not be `#Some`"
     );
     // A number is the same complaint made about the other kind of test, and
     // the same code: what went wrong is the binding either way.
@@ -2020,7 +1987,7 @@ fn the_pattern_complaints_say_what_was_written() {
     );
 
     // The unhandled-values complaint renders its witness in source syntax:
-    // the hole's own example value, backticks and braces as a reader would
+    // the hole's own example value, `#`s and braces as a reader would
     // write them.
     let hole = PatternError::UnhandledValues {
         witness: ir::Witness::Struct(
@@ -2047,7 +2014,7 @@ fn the_pattern_complaints_say_what_was_written() {
     assert_eq!(hole.code(), "unhandled-values");
     assert_eq!(
         hole.to_string(),
-        "some values are not handled — for example `{ a: `A, b: `Y }`; add an arm for them or a final arm naming the rest"
+        "some values are not handled — for example `{ a: #A, b: #Y }`; add an arm for them or a final arm naming the rest"
     );
 
     // The mixed match lost its dedicated complaint: the solver's ordinary
@@ -2081,7 +2048,7 @@ fn a_witness_renders_in_source_syntax() {
             payload: Some(Box::new(ir::Witness::Natural(1))),
         }
         .to_string(),
-        "`A 1"
+        "#A 1"
     );
     // A payload that is itself a tag — bare or carrying — or prose, is
     // bracketed: the example has to read back as the one value it is.
@@ -2094,7 +2061,7 @@ fn a_witness_renders_in_source_syntax() {
             })),
         }
         .to_string(),
-        "`A (`X 1)"
+        "#A (#X 1)"
     );
     assert_eq!(
         ir::Witness::Tag {
@@ -2105,7 +2072,7 @@ fn a_witness_renders_in_source_syntax() {
             })),
         }
         .to_string(),
-        "`A (`X)"
+        "#A (#X)"
     );
     assert_eq!(
         ir::Witness::Tag {
@@ -2116,7 +2083,7 @@ fn a_witness_renders_in_source_syntax() {
             ]))),
         }
         .to_string(),
-        "`B (anything other than `X or `Y)"
+        "#B (anything other than #X or #Y)"
     );
     // A struct witness beside a prose field: the field list reads on.
     assert_eq!(
@@ -2135,7 +2102,7 @@ fn a_witness_renders_in_source_syntax() {
             .collect(),
         )
         .to_string(),
-        "{ a: `A, b: anything other than `X }"
+        "{ a: #A, b: anything other than #X }"
     );
 
     // R13: a field held present with any value at all prints pun-style —
@@ -2247,28 +2214,31 @@ fn a_formula_prints_in_the_where_grammar() {
     let b = Formula::bound(1);
     let c = Formula::bound(2);
     for (formula, printed) in [
-        (a.clone(), "a"),
-        (a.clone().not(), "not a"),
-        (a.clone().not().not(), "a"),
-        (a.clone().and(b.clone()), "a and b"),
-        (a.clone().or(b.clone()), "a or b"),
-        (a.clone().iff(b.clone()), "a = b"),
-        (a.clone().xor(b.clone()), "a != b"),
+        (a.clone(), "'a"),
+        (a.clone().not(), "not 'a"),
+        (a.clone().not().not(), "'a"),
+        (a.clone().and(b.clone()), "'a and 'b"),
+        (a.clone().or(b.clone()), "'a or 'b"),
+        (a.clone().iff(b.clone()), "'a = 'b"),
+        (a.clone().xor(b.clone()), "'a != 'b"),
         // `and` binds tighter than `or`, which binds tighter than a
         // comparison, so none of these needs a bracket.
-        (a.clone().or(b.clone().and(c.clone())), "a or b and c"),
-        (a.clone().and(b.clone()).or(c.clone()), "a and b or c"),
-        (a.clone().iff(b.clone().or(c.clone())), "a = b or c"),
+        (a.clone().or(b.clone().and(c.clone())), "'a or 'b and 'c"),
+        (a.clone().and(b.clone()).or(c.clone()), "'a and 'b or 'c"),
+        (a.clone().iff(b.clone().or(c.clone())), "'a = 'b or 'c"),
         // And these do, because the grammar reads them the other way round
         // without them.
-        (a.clone().or(b.clone()).and(c.clone()), "(a or b) and c"),
-        (a.clone().and(b.clone()).not(), "not (a and b)"),
-        (a.clone().and(b.clone().or(c.clone())), "a and (b or c)"),
-        (a.clone().iff(b.clone()).or(c.clone()), "(a = b) or c"),
-        (a.clone().xor(b.clone().iff(c.clone())), "a != (b = c)"),
+        (a.clone().or(b.clone()).and(c.clone()), "('a or 'b) and 'c"),
+        (a.clone().and(b.clone()).not(), "not ('a and 'b)"),
+        (a.clone().and(b.clone().or(c.clone())), "'a and ('b or 'c)"),
+        (a.clone().iff(b.clone()).or(c.clone()), "('a = 'b) or 'c"),
+        (a.clone().xor(b.clone().iff(c.clone())), "'a != ('b = 'c)"),
         // Left-associative, so a right-nested one of the same level brackets.
-        (a.clone().or(b.clone().or(c.clone())), "a or (b or c)"),
-        (a.clone().and(b.clone().and(c.clone())), "a and (b and c)"),
+        (a.clone().or(b.clone().or(c.clone())), "'a or ('b or 'c)"),
+        (
+            a.clone().and(b.clone().and(c.clone())),
+            "'a and ('b and 'c)",
+        ),
         // Neither constant has a spelling in the grammar, and neither has to.
         (Formula::True, "always"),
         (Formula::False, "never"),
@@ -2282,25 +2252,25 @@ fn a_formula_prints_in_the_where_grammar() {
 #[test]
 fn a_printed_formula_reads_back_as_itself() {
     for clause in [
-        "a",
-        "not a",
-        "a and b",
-        "a or b",
-        "a = b",
-        "a != b",
-        "a or b and c",
-        "a and b or c",
-        "a = b or c",
-        "(a or b) and c",
-        "not (a and b)",
-        "a and (b or c)",
-        "(a = b) or c",
-        "a != (b = c)",
-        "a or (b or c)",
-        "a and (b and c)",
+        "'a",
+        "not 'a",
+        "'a and 'b",
+        "'a or 'b",
+        "'a = 'b",
+        "'a != 'b",
+        "'a or 'b and 'c",
+        "'a and 'b or 'c",
+        "'a = 'b or 'c",
+        "('a or 'b) and 'c",
+        "not ('a and 'b)",
+        "'a and ('b or 'c)",
+        "('a = 'b) or 'c",
+        "'a != ('b = 'c)",
+        "'a or ('b or 'c)",
+        "'a and ('b and 'c)",
     ] {
         let src =
-            format!("type T = {{ a when a: Nat, b when b: Nat, c when c: Nat }} where {clause}");
+            format!("type T = {{ a when 'a: Nat, b when 'b: Nat, c when 'c: Nat }} where {clause}");
         let out = parse::parse(token::lex(&src, FileID::GENERATED).tokens);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
         let parse::StmtKind::Type { body, .. } = &out.stmts[0].tracked else {
@@ -2345,19 +2315,20 @@ fn an_abandoned_presence_still_prints_as_a_question_mark() {
             rest: Rest::Closed,
         }))
         .to_string(),
-        "`A? Nat"
+        "#A? Nat"
     );
 }
 
-/// A presence has an alphabet of its own — the bare `a` of a `when` clause —
-/// and a type variable keeps its quote. The two pools are independent, so one
-/// scheme's `'a` and `a` are two variables however alike they look.
+/// Every sort a scheme quantifies prints from one alphabet and wears one
+/// sigil: a type, a rest and a presence all read `'a` at index nought, because
+/// that is how each of them is written. A scheme's one index space is what
+/// keeps two of them from ever colliding.
 #[test]
 fn the_two_alphabets_are_told_apart_by_the_quote() {
-    assert_eq!(Core::Bound(0).to_string(), "a");
-    assert_eq!(Presence::Bound(0).to_string(), "a");
-    assert_eq!(Presence::Bound(26).to_string(), "a1");
-    assert_eq!(Formula::bound(25).to_string(), "z");
+    assert_eq!(Core::Bound(0).to_string(), "'a");
+    assert_eq!(Presence::Bound(0).to_string(), "'a");
+    assert_eq!(Presence::Bound(26).to_string(), "'a1");
+    assert_eq!(Formula::bound(25).to_string(), "'z");
     assert_eq!(Formula::var(3).to_string(), "?3");
 }
 
@@ -2396,11 +2367,11 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::NotAnOperation {
                 name: "here".to_string(),
             },
-            "an operation must be a function: write ``here : Nat -> ()`",
+            "an operation must be a function: write `here : Nat -> ()`",
         ),
         (
             IrError::ImpureOperation,
-            "an operation's signature must be plain; `!`, `..` and `when` belong in annotations",
+            "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
         ),
         (
             IrError::MixedEffectForm,
@@ -2410,28 +2381,28 @@ fn the_effect_complaints_are_read_in_effects() {
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
-            "an alias names effects and declares no operations, so `Console` has none to perform",
+            "an alias names effects and declares no operations, so `!Console` has none to perform",
         ),
         (
             IrError::UnknownOperation {
                 effect: "Log".to_string(),
                 op: "writ".to_string(),
             },
-            "no operation ``writ` on effect `Log`",
+            "no operation `writ` on effect `!Log`",
         ),
         (
             IrError::PartialHandler {
                 effect: "Log".to_string(),
                 missing: vec!["flush".to_string()],
             },
-            "handling `Log` needs an arm for ``flush` too",
+            "handling `!Log` needs an arm for `flush` too",
         ),
         (
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
                 op: "write".to_string(),
             },
-            "duplicate arm for `Log.`write`",
+            "duplicate arm for `!Log.write`",
         ),
         (
             IrError::DuplicateReturn {
@@ -2440,6 +2411,10 @@ fn the_effect_complaints_are_read_in_effects() {
             "duplicate return arm",
         ),
         (IrError::RaiseOutsideArm, "raise belongs in a handler arm"),
+        (
+            IrError::EffectsOutsideRow,
+            "effects belong on an arrow, or at a parameter a type uses as its own",
+        ),
         (
             IrError::RaiseInFunction,
             "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
@@ -2459,13 +2434,13 @@ fn the_effect_complaints_are_read_in_effects() {
             TypeError::Unhandled {
                 effect: "Log".to_string(),
             },
-            "nothing can handle ``Log` here: a definition's value is computed outside every handler",
+            "nothing can handle `!Log` here: a definition's value is computed outside every handler",
         ),
         (
             TypeError::NotAllowed {
                 effect: "Log".to_string(),
             },
-            "this function performs ``Log`, which its type does not allow",
+            "this function performs `!Log`, which its type does not allow",
         ),
         (
             TypeError::ExtraField {
@@ -2476,14 +2451,14 @@ fn the_effect_complaints_are_read_in_effects() {
                 ))),
                 field: "Log".to_string(),
             },
-            "extra effect ``Log`: the type `Nat -> Nat` lists every effect it allows",
+            "extra effect `!Log`: the type `Nat -> Nat` lists every effect it allows",
         ),
         (
             TypeError::RepeatedField {
                 shape: Shape::Effect,
                 field: "Log".to_string(),
             },
-            "`..` covers only the effects a type does not already name, and here it would have to cover ``Log`",
+            "`..` covers only the effects a type does not already name, and here it would have to cover `!Log`",
         ),
     ] {
         assert_eq!(kind.to_string(), message, "{}", kind.code());
@@ -2504,15 +2479,15 @@ fn a_partial_handler_names_every_operation_with_no_arm() {
     };
     assert_eq!(
         named(&["flush"]),
-        "handling `Log` needs an arm for ``flush` too"
+        "handling `!Log` needs an arm for `flush` too"
     );
     assert_eq!(
         named(&["flush", "close"]),
-        "handling `Log` needs an arm for ``flush` and ``close` too"
+        "handling `!Log` needs an arm for `flush` and `close` too"
     );
     assert_eq!(
         named(&["flush", "close", "sync"]),
-        "handling `Log` needs an arm for ``flush`, ``close` and ``sync` too"
+        "handling `!Log` needs an arm for `flush`, `close` and `sync` too"
     );
 }
 
@@ -2537,7 +2512,7 @@ fn the_performs_constraint_reads_as_a_widening() {
     assert_eq!(kind.code(), "performs");
     assert_eq!(
         kind.to_string(),
-        "`Log performed where `Log | `IO | ..?3 is allowed"
+        "!Log performed where !Log + !IO + ..?3 is allowed"
     );
     // The empty row writes the `|` it is spelled with rather than nothing at
     // all, which would leave the line with a gap in it.
@@ -2549,16 +2524,19 @@ fn the_performs_constraint_reads_as_a_widening() {
     assert_eq!(empty.to_string(), "| performed where | is allowed");
 }
 
-/// The token spellings of the three reserved words and the `!` that introduces
-/// an effect row, so a printed stream re-lexes to the tokens it came from.
+/// The token spellings of the three reserved words, the `+` that introduces an
+/// effect row and the effect itself, so a printed stream re-lexes to the tokens
+/// it came from. An effect keeps its `!` for the reason a tag keeps its `#`: a
+/// bare name would come back as an identifier.
 #[test]
 fn the_effect_tokens_print_as_they_were_written() {
     for (kind, spelled) in [
         (TokenKind::Effect, "effect"),
         (TokenKind::Handle, "handle"),
         (TokenKind::Raise, "raise"),
-        (TokenKind::Bang, "!"),
+        (TokenKind::Plus, "+"),
         (TokenKind::NotEqual, "!="),
+        (TokenKind::EffectLabel("Log".to_string()), "!Log"),
     ] {
         assert_eq!(kind.to_string(), spelled);
     }

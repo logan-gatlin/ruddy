@@ -148,7 +148,7 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                 .map(|(name, operation)| {
                     Node::new(
                         ids.next(),
-                        format!("`{name}:"),
+                        format!("{name}:"),
                         format!(
                             "{} -> {}",
                             print::ir::ty(&operation.from.tracked, mint),
@@ -166,7 +166,7 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                 .iter()
                 .map(|(name, aliased)| {
                     with_symbol(
-                        Node::new(ids.next(), "Names", format!("`{name}"))
+                        Node::new(ids.next(), "Names", format!("!{name}"))
                             .at(named(aliased.name_span, name)),
                         cx,
                         mint,
@@ -324,9 +324,9 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 let head = Node::new(
                     ids.next(),
                     "Arm",
-                    format!("{}.`{}", mint.name(arm.effect.tracked), arm.op.tracked),
+                    format!("!{}.{}", mint.name(arm.effect.tracked), arm.op.tracked),
                 )
-                .at(arm.effect.span)
+                .at(named(arm.effect.span, mint.name(arm.effect.tracked)))
                 .child(with_symbol(
                     Node::new(ids.next(), "Binder", mint.name(arm.binder.tracked))
                         .at(arm.binder.span),
@@ -365,9 +365,10 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 ..node
             }
             // Spanned at the effect's own name rather than at the whole
-            // `` Eff.`op ``: the row claims the effect, and a claim has to be
-            // spanned where the name it claims was written.
-            .at(effect.span),
+            // `!Eff.op`, and inside the `!` at that: the row claims the effect,
+            // and a claim has to be spanned where the name it claims was
+            // written.
+            .at(named(effect.span, mint.name(effect.tracked))),
             cx,
             mint,
             effect.tracked,
@@ -399,20 +400,20 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
 /// The effects a handler discharges, as a row of its own: which they are is
 /// R15's coverage check answered, and nothing else on the page shows it.
 fn discharges_node(ids: &mut Ids, cx: &Cx, mint: &Mint, handler: &Handler) -> Node {
-    let named: Vec<String> = handler
+    let labels: Vec<String> = handler
         .discharges
         .iter()
-        .map(|effect| format!("`{}", mint.name(effect.tracked)))
+        .map(|effect| format!("!{}", mint.name(effect.tracked)))
         .collect();
-    let node = Node::new(ids.next(), "Discharges", named.join(" | "));
+    let node = Node::new(ids.next(), "Discharges", labels.join(" | "));
     node.children(
         handler
             .discharges
             .iter()
             .map(|effect| {
                 with_symbol(
-                    Node::new(ids.next(), "", format!("`{}", mint.name(effect.tracked)))
-                        .at(effect.span),
+                    Node::new(ids.next(), "", format!("!{}", mint.name(effect.tracked)))
+                        .at(named(effect.span, mint.name(effect.tracked))),
                     cx,
                     mint,
                     effect.tracked,
@@ -422,7 +423,7 @@ fn discharges_node(ids: &mut Ids, cx: &Cx, mint: &Mint, handler: &Handler) -> No
     )
 }
 
-/// The `! <effects>` clause an arrow carries, as a row of its own: one child
+/// The `+ <effects>` clause an arrow carries, as a row of its own: one child
 /// per effect it names — each cross-highlighting to the declaration it names —
 /// and the `..` tail beside them.
 fn effects_node(
@@ -437,8 +438,8 @@ fn effects_node(
         .iter()
         .map(|(name, label)| {
             let text = match label {
-                EffectLabel::Written { when, .. } => format!("`{name}{}", when_text(when)),
-                EffectLabel::Absent { .. } => format!("\\`{name}"),
+                EffectLabel::Written { when, .. } => format!("!{name}{}", when_text(when)),
+                EffectLabel::Absent { .. } => format!("\\!{name}"),
             };
             let row = Node::new(ids.next(), text, String::new()).at(named(label.name_span(), name));
             // A label an alias put here is *about* the effect without being an
@@ -535,7 +536,7 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
     }
 }
 
-/// One lowered ascription: the type, the variables its `where let` declared,
+/// One lowered ascription: the type, the variables its an annotation introduced,
 /// and — when one was written — the formula beside them.
 ///
 /// All three are siblings of the type rather than children, exactly as the AST
@@ -576,15 +577,15 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 /// What one declared variable turned out to stand for: the way its uses spell
 /// it, and the reading behind that spelling.
 ///
-/// The [`stands_for`] of a `where let` name, and the reading comes off the
+/// The [`stands_for`] of a variable, and the reading comes off the
 /// compiler's own `Display for Sense` for the reason that one's labels come off
 /// `ui::label`: a row here and a complaint about the same variable should not
 /// be able to call it two different things.
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
-        Sense::Type => variable.name.clone(),
-        Sense::Cases | Sense::Effects => format!("..{}", variable.name),
-        Sense::Presence => format!("when {}", variable.name),
+        Sense::Type => format!("'{}", variable.name),
+        Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
+        Sense::Presence => format!("when '{}", variable.name),
     };
     format!("{written} ({})", variable.sense)
 }
@@ -620,7 +621,7 @@ fn when_text(when: &Option<Box<When>>) -> String {
     match when {
         None => String::new(),
         Some(when) => match &when.name {
-            Some(name) => format!(" when {name}"),
+            Some(name) => format!(" when '{name}"),
             None => " when _".to_string(),
         },
     }
@@ -657,6 +658,9 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             ..node
         }
         .error(),
+        // A row handed to a declaration as its effects, shown as the row an
+        // arrow carries is: the labels claim their symbols the same way.
+        TypeKind::Effects(effects) => effects_node(ids, cx, mint, effects, scope),
         // A position left for inference to decide, written `_` by the reader
         // or by the pattern desugar's exact demand: it binds nothing and names
         // nothing, so there is nothing to cross-highlight.
@@ -664,7 +668,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
             label: "Hole".into(),
             ..node
         },
-        // A use of a `where let` variable. The name is scoped to its own
+        // A use of a variable. The name is scoped to its own
         // annotation and resolves to no symbol, so instead of a symbol the row
         // carries the declared variable's id as its link, which is what groups
         // it with the `Variable` row that declared it.
@@ -739,16 +743,16 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                             print::ir::ty(&ty.tracked, mint).to_string()
                         });
                         let node =
-                            Node::new(ids.next(), format!("`{name}{mark}"), text).at(*name_span);
+                            Node::new(ids.next(), format!("#{name}{mark}"), text).at(*name_span);
                         match payload {
                             Some(payload) => node.child(type_node(ids, cx, mint, payload, scope)),
                             None => node,
                         }
                     }
                     // An absent case is a leaf wearing the `\`, spanning the
-                    // whole `` \`Name `` for cross-highlighting.
+                    // whole `\#Name` for cross-highlighting.
                     SumCase::Absent { name_span } => {
-                        Node::new(ids.next(), format!("\\`{name}"), String::new()).at(*name_span)
+                        Node::new(ids.next(), format!("\\#{name}"), String::new()).at(*name_span)
                     }
                 })
                 .collect();
@@ -816,7 +820,8 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
 }
 
 /// Where the *name* of a label was written, without the marks it wears: the
-/// backtick that makes a tag one, and the `\` before one written absent.
+/// `#` that makes a tag one, the `!` that makes an effect one, and the `\`
+/// before either written absent.
 ///
 /// A node claiming a symbol has to be spanned where the name is — the page
 /// paints those spans in the editor as uses of it — and a label's own span
@@ -836,7 +841,7 @@ fn named(span: Span, name: &str) -> Span {
 fn rest_node(ids: &mut Ids, mint: &Mint, tail: &Tail, scope: &[Variable]) -> Node {
     let (name, link) = match &tail.of {
         Row::Anything => (String::new(), None),
-        Row::Named(name) => (name.clone(), link_of(scope, name)),
+        Row::Named(name) => (format!("'{name}"), link_of(scope, name)),
         Row::Param { symbol, .. } => (mint.name(*symbol).to_string(), None),
     };
     linked(

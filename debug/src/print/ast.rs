@@ -10,8 +10,8 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ArmHead, ClauseKind, ClauseStmtKind, EffectCase, EffectLabel,
-        EffectRow, ExprKind, HandlerArm, StmtKind, SumCase, TypeField, TypeKind, When, Where,
+        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
+        ExprKind, HandlerArm, Rest, StmtKind, SumCase, TypeField, TypeKind, When, Where,
     },
     tracking::Tracked,
 };
@@ -29,11 +29,15 @@ impl Grouped for Ast<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.0 {
             TypeKind::Arrow { .. } => Prec::Arrow,
-            TypeKind::Sum { .. } => Prec::Sum,
+            // A row of effects binds as a sum does: it is written with the same
+            // labels and the same tail, and needs the same brackets around it.
+            TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
-            TypeKind::Struct { .. } | TypeKind::Ident { .. } | TypeKind::Hole | TypeKind::Unit => {
-                Prec::Atom
-            }
+            TypeKind::Struct { .. }
+            | TypeKind::Ident { .. }
+            | TypeKind::Variable { .. }
+            | TypeKind::Hole
+            | TypeKind::Unit => Prec::Atom,
         }
     }
 }
@@ -56,7 +60,7 @@ impl Grouped for Ast<'_, ExprKind> {
             // a `raise` would be read as part of what it carries.
             ExprKind::Raise(_) => Prec::Lambda,
             // A tag carrying something groups as the application it reads as:
-            // anything appended to `` `A x `` would be read as applying the
+            // anything appended to `#A x` would be read as applying the
             // case rather than as a second argument to it. Carrying nothing it
             // is not a word but a word still waiting for one, so it groups
             // below an application — see [`Prec::Tag`].
@@ -98,19 +102,27 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 }
                 write!(f, " = {}", annotation(body))
             }
-            // The `|` is written before every case, first included: the
+            // The `|` is written before every operation, first included: the
             // grammar makes the leading one optional, so the printed form
             // re-parses, and the empty effect is `effect Nil = |` with the one
-            // bar and nothing after it.
+            // bar and nothing after it. An alias list writes its `+`s between
+            // its effects instead, which is where a row writes them.
             StmtKind::Effect { name, cases } => {
                 write!(f, "effect {} =", name.tracked)?;
                 if cases.is_empty() {
                     return f.write_str(" |");
                 }
-                for (op, case) in cases {
-                    write!(f, " | `{}", op.tracked)?;
-                    if let EffectCase::Operation { signature } = case {
-                        write!(f, " : {}", Ast(&signature.tracked))?;
+                for (at, (name, case)) in cases.iter().enumerate() {
+                    match case {
+                        // An operation is a name and the signature it declares,
+                        // written after the `|` that separates declarations; an
+                        // alias is the effect it names, unioned onto the last
+                        // with the `+` a row writes.
+                        EffectCase::Operation { signature } => {
+                            write!(f, " | {} : {}", name.tracked, Ast(&signature.tracked))?
+                        }
+                        EffectCase::Alias if at == 0 => write!(f, " !{}", name.tracked)?,
+                        EffectCase::Alias => write!(f, " + !{}", name.tracked)?,
                     }
                 }
                 Ok(())
@@ -150,37 +162,23 @@ pub fn where_clause(clause: &Where) -> impl fmt::Display + '_ {
 
 impl fmt::Display for Ast<'_, Where> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (at, stmt) in self.0.stmts.iter().enumerate() {
+        for (at, clause) in self.0.clauses.iter().enumerate() {
             if at > 0 {
                 f.write_str("; ")?;
             }
-            write!(f, "{}", Ast(&stmt.tracked))?;
+            write!(f, "{}", Ast(&clause.tracked))?;
         }
         Ok(())
     }
 }
 
-/// One statement of a `where` clause, as it was written: a `let` and the names
-/// it declares, or the formula.
-pub fn clause_stmt(kind: &ClauseStmtKind) -> impl fmt::Display + '_ {
-    Ast(kind)
-}
-
-impl fmt::Display for Ast<'_, ClauseStmtKind> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            ClauseStmtKind::Let(names) => {
-                f.write_str("let ")?;
-                for (at, name) in names.iter().enumerate() {
-                    if at > 0 {
-                        f.write_str(", ")?;
-                    }
-                    f.write_str(&name.tracked)?;
-                }
-                Ok(())
-            }
-            ClauseStmtKind::Constraint(clause) => write!(f, "{}", Ast(&clause.tracked)),
-        }
+/// What follows a `..`, as it was written: a parameter bare, a variable with
+/// its sigil, or nothing at all for the tail that names none.
+fn rest(of: &Rest) -> String {
+    match of {
+        Rest::Anything => String::new(),
+        Rest::Param(name) => name.tracked.clone(),
+        Rest::Variable(name) => format!("'{}", name.tracked),
     }
 }
 
@@ -215,7 +213,9 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         f.write_str("(")?;
     }
     match clause {
-        ClauseKind::Name(name) => f.write_str(name)?,
+        // A formula names presences, and a presence is a variable: the sigil
+        // is written back on so the clause re-parses.
+        ClauseKind::Name(name) => write!(f, "'{name}")?,
         ClauseKind::Not(inner) => {
             f.write_str("not ")?;
             clause_at(f, &inner.tracked, 3)?;
@@ -281,7 +281,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write_project(f, &Ast(&base.tracked), &field.tracked)
             }
             // A term's tag is written by the same rule a type's case is, so
-            // `` `Some 1 `` and `` `Some Nat `` cannot come out spelled
+            // `#Some 1` and `#Some Nat` cannot come out spelled
             // differently. It never wears a `when`: that says a case may or may
             // not be allowed, which is a claim about a type and not something
             // a value can be.
@@ -303,7 +303,7 @@ impl fmt::Display for Ast<'_, ExprKind> {
             }
             ExprKind::Raise(value) => write!(f, "raise {}", Ast(&value.tracked)),
             ExprKind::Operation { effect, op } => {
-                write!(f, "{}.`{}", effect.tracked, op.tracked)
+                write!(f, "!{}.{}", effect.tracked, op.tracked)
             }
             ExprKind::Ident { name } => f.write_str(&name.tracked),
             ExprKind::Natural(value) => write!(f, "{value}"),
@@ -337,15 +337,17 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 });
                 // The tail renders as what follows the `..`: a name, or
                 // nothing for the anonymous one. `write_row` writes the dots.
-                let tail = tail
-                    .as_ref()
-                    .map(|tail| tail.name.as_ref().map_or("", |name| name.tracked.as_str()));
+                let tail = tail.as_ref().map(|tail| rest(&tail.of));
                 write_row(
                     f,
                     fields,
                     tail.as_ref().map(|tail| tail as &dyn fmt::Display),
                 )
             }
+            // The row an argument may be, written as an arrow's is minus the
+            // `+` that hangs one off an arrow. [`effect_row`] is what an
+            // arrow's own goes through, so the two cannot drift apart.
+            TypeKind::Effects(row) => effect_row(row).fmt(f),
             TypeKind::Sum { cases, tail } => {
                 let cases = cases.iter().map(|(name, case)| match case {
                     SumCase::Written { when, payload } => Entry::Written {
@@ -359,9 +361,7 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 });
                 // The tail renders as it does for a struct: what follows the
                 // `..`, with `write_sum` writing the dots and the bars.
-                let tail = tail
-                    .as_ref()
-                    .map(|tail| tail.name.as_ref().map_or("", |name| name.tracked.as_str()));
+                let tail = tail.as_ref().map(|tail| rest(&tail.of));
                 write_sum(
                     f,
                     cases,
@@ -374,6 +374,9 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 args.iter().map(|arg| Ast(&arg.tracked)),
             ),
             TypeKind::Ident { name } => f.write_str(&name.tracked),
+            // The sigil is written back on: it is how the name was spelled, and
+            // a variable printing bare would come back as a type's name.
+            TypeKind::Variable { name } => write!(f, "'{}", name.tracked),
             // The hole as written: `_`, a position left for inference.
             TypeKind::Hole => f.write_str("_"),
             TypeKind::Unit => f.write_str("()"),
@@ -387,8 +390,10 @@ impl fmt::Display for Ast<'_, TypeKind> {
 /// which only a failed inference produces.
 fn mark(when: &Option<Box<When>>) -> Option<Mark> {
     let when = when.as_ref()?;
+    // The sigil is written back on: a presence is a variable, and one printing
+    // bare would read as a type's name. The anonymous `when _` names none.
     Some(Mark::When(match &when.name {
-        Some(name) => name.tracked.clone(),
+        Some(name) => format!("'{}", name.tracked.clone()),
         None => "_".to_string(),
     }))
 }
@@ -397,7 +402,7 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
 fn write_arm(f: &mut fmt::Formatter<'_>, arm: &HandlerArm) -> fmt::Result {
     f.write_str(" | ")?;
     match &arm.head {
-        ArmHead::Operation { effect, op } => write!(f, "{}.`{}", effect.tracked, op.tracked)?,
+        ArmHead::Operation { effect, op } => write!(f, "!{}.{}", effect.tracked, op.tracked)?,
         ArmHead::Return { .. } => f.write_str("return")?,
     }
     let binder = match &arm.binder.tracked {
@@ -407,11 +412,11 @@ fn write_arm(f: &mut fmt::Formatter<'_>, arm: &HandlerArm) -> fmt::Result {
     write!(f, " {binder} => {}", Ast(&arm.body.tracked))
 }
 
-/// The `! <effects>` clause an arrow may carry, as it was written — the row
-/// after the `!`, which [`write_arrow`] writes the mark for.
+/// The `+ <effects>` clause an arrow may carry, as it was written — the row
+/// after the `+`, which [`write_arrow`] writes the mark for.
 ///
 /// Written as it stands rather than as what it means, which is what keeps the
-/// AST tab honest: `A -> B ! |` wrote a row and `A -> B` wrote none, and both
+/// AST tab honest: `A -> B + |` wrote a row and `A -> B` wrote none, and both
 /// are the empty closed one.
 fn effect_row(row: &EffectRow) -> Effects {
     let effects = row
@@ -428,11 +433,7 @@ fn effect_row(row: &EffectRow) -> Effects {
             },
         })
         .collect();
-    let tail = row.tail.as_ref().map(|tail| {
-        tail.name
-            .as_ref()
-            .map_or_else(String::new, |name| name.tracked.clone())
-    });
+    let tail = row.tail.as_ref().map(|tail| rest(&tail.of));
     Effects { effects, tail }
 }
 
