@@ -1,0 +1,136 @@
+================================================================================
+A comparison, and the definition's own equals after it
+================================================================================
+
+let both : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a = 'b = fn v => {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (type_variable))
+            (identifier))
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (type_variable))
+            (identifier)))
+        (struct_type))
+      (where_clause
+        (clause_comparison
+          (type_variable)
+          (type_variable))))
+    (function
+      (identifier)
+      (struct_expression))))
+
+================================================================================
+A clause that is a name alone
+================================================================================
+
+let one : { x when 'a: Nat } -> {} where 'a = fn v => {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (type_variable))
+            (identifier)))
+        (struct_type))
+      (where_clause
+        (type_variable)))
+    (function
+      (identifier)
+      (struct_expression))))
+
+================================================================================
+Loosest to tightest: comparison, or, and, not, parentheses
+================================================================================
+
+type Formula = { x when 'a: Nat } where not 'a or 'b and ('c != 'd)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (identifier)
+          (when_clause
+            (type_variable))
+          (identifier)))
+      (where_clause
+        (clause_or
+          (clause_not
+            (type_variable))
+          (clause_and
+            (type_variable)
+            (parenthesized_clause
+              (clause_comparison
+                (type_variable)
+                (type_variable)))))))))
+
+================================================================================
+Statements are separated by semicolons
+================================================================================
+
+type Several = { x when 'a: Nat } where 'a = 'b; 'c != 'd
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (identifier)
+          (when_clause
+            (type_variable))
+          (identifier)))
+      (where_clause
+        (clause_comparison
+          (type_variable)
+          (type_variable))
+        (clause_comparison
+          (type_variable)
+          (type_variable))))))
+
+================================================================================
+A when clause may name nothing
+================================================================================
+
+let anon : { flag when _: Nat, .. } -> Nat = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (when_clause
+              (wildcard))
+            (identifier))
+          (rest))
+        (identifier)))
+    (identifier)))

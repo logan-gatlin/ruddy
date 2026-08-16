@@ -1,6 +1,8 @@
 For every new feature added to the compiler, make sure the debugger (./debug/)
 supports the change as well. Consider adding new features to the debugger
 if they would be helpful. Every compiler phase should get a new tab.
+For every grammar change, update the treesitter grammar (./treesitter/) and its
+highlights; `just grammar` regenerates the parser and runs its corpus tests.
 
 Every test in the workspace lives in the `ruddy-tests` crate (./tests/), one
 module per module under test. `src/` and `debug/src/` carry no `#[cfg(test)]`

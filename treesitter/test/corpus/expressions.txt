@@ -1,0 +1,268 @@
+================================================================================
+Application is left-associative
+================================================================================
+
+let a = f x y
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (application
+        (identifier)
+        (identifier))
+      (identifier))))
+
+================================================================================
+Projection binds tighter than application
+================================================================================
+
+let a = f p.x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (projection
+        (identifier)
+        (identifier)))))
+
+================================================================================
+A tag takes its payload before an application takes another argument
+================================================================================
+
+let a = f #A 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (tag_expression
+        (tag)
+        (natural)))))
+
+================================================================================
+A tag's payload is taken greedily
+================================================================================
+
+let a = #A #B x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (tag_expression
+      (tag)
+      (tag_expression
+        (tag)
+        (identifier)))))
+
+================================================================================
+A function's body runs as far right as it can
+================================================================================
+
+let a = f fn x => g x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (function
+        (identifier)
+        (application
+          (identifier)
+          (identifier))))))
+
+================================================================================
+A binding for the length of one expression
+================================================================================
+
+let named =
+  let half = { v: 21 } in
+  { doubled: half.v, original: half }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (let_expression
+      (identifier)
+      (struct_expression
+        (struct_field
+          (identifier)
+          (natural)))
+      (struct_expression
+        (struct_field
+          (identifier)
+          (projection
+            (identifier)
+            (identifier)))
+        (struct_field
+          (identifier)
+          (identifier))))))
+
+================================================================================
+A match, and the empty one
+================================================================================
+
+let unwrap = fn opt => match opt with
+  | #Some x => x
+  | _ => 0
+  end
+
+let absurd = fn v => match v with end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (match_expression
+        (identifier)
+        (match_arm
+          (tag_pattern
+            (tag)
+            (identifier))
+          (identifier))
+        (match_arm
+          (wildcard)
+          (natural)))))
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (match_expression
+        (identifier)))))
+
+================================================================================
+A handler, with a value arm
+================================================================================
+
+let quiet = fn _ =>
+  handle greet () with
+    | !Log.write s => ()
+    | return x => x
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (wildcard)
+      (handle_expression
+        (application
+          (identifier)
+          (unit))
+        (handler_arm
+          (operation
+            (effect_label)
+            (identifier))
+          (identifier)
+          (unit))
+        (handler_arm
+          (identifier)
+          (identifier))))))
+
+================================================================================
+An operation is a value, and performing one is applying it
+================================================================================
+
+let a = !Log.write 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (operation
+        (effect_label)
+        (identifier))
+      (natural))))
+
+================================================================================
+Raising aborts to the handler around the arm
+================================================================================
+
+let a = handle f () with | !Fail.oops _ => raise 0 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (handle_expression
+      (application
+        (identifier)
+        (unit))
+      (handler_arm
+        (operation
+          (effect_label)
+          (identifier))
+        (wildcard)
+        (raise_expression
+          (natural))))))
+
+================================================================================
+A struct, with a trailing comma, and the unit
+================================================================================
+
+let a = { x: 1, y: 2, }
+
+let b = ()
+
+let c = {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (identifier)
+        (natural))
+      (struct_field
+        (identifier)
+        (natural))))
+  (let_definition
+    (identifier)
+    (unit))
+  (let_definition
+    (identifier)
+    (struct_expression)))
+
+================================================================================
+Parentheses group and are then discarded
+================================================================================
+
+let a = f (g x)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (identifier)
+      (parenthesized_expression
+        (application
+          (identifier)
+          (identifier))))))
