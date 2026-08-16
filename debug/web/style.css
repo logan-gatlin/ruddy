@@ -27,6 +27,9 @@
   /* A sum's cases. Kin to a literal rather than to a name, because that is
      what a tag is: nothing resolves it, and it stands for itself. */
   --tag: #f7c76c;
+  /* An effect. A name that does resolve, unlike a tag, so it is told apart
+     from one — the same distinction the `!` draws in the source. */
+  --effect: #6cc7f7;
   --unlexed: #ff6b6b;
 
   --row: 20px;
@@ -57,6 +60,7 @@
     --ident: #1f2430;
     --number: #b4531a;
     --tag: #8a6216;
+    --effect: #15607f;
     --unlexed: #c92a2a;
   }
 }
@@ -319,6 +323,9 @@ input {
 }
 .hl .tag {
   color: var(--tag);
+}
+.hl .effect {
+  color: var(--effect);
 }
 .hl .unlexed {
   color: var(--unlexed);

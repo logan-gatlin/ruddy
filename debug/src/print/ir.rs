@@ -123,7 +123,7 @@ impl fmt::Display for Show<'_, Program> {
                     for (name, operation) in operations {
                         write!(
                             f,
-                            " | `{name} : {} -> {}",
+                            " | {name} : {} -> {}",
                             self.show(&operation.from),
                             self.show(&operation.to),
                         )?;
@@ -131,8 +131,11 @@ impl fmt::Display for Show<'_, Program> {
                 }
                 Effect::Alias(named) if named.is_empty() => f.write_str(" |")?,
                 Effect::Alias(named) => {
-                    for name in named.keys() {
-                        write!(f, " | `{name}")?;
+                    for (at, name) in named.keys().enumerate() {
+                        match at {
+                            0 => write!(f, " !{name}")?,
+                            _ => write!(f, " + !{name}")?,
+                        }
                     }
                 }
             }
@@ -258,7 +261,9 @@ impl Grouped for Show<'_, TypeKind> {
     fn prec(&self) -> Prec {
         match self.node {
             TypeKind::Arrow { .. } => Prec::Arrow,
-            TypeKind::Sum { .. } => Prec::Sum,
+            // A row of effects binds as a sum does: same labels, same tail,
+            // same brackets around it.
+            TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. }
             | TypeKind::Ident(_)
@@ -331,7 +336,7 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Handle { body, handler } => self.write_handle(f, body, handler),
             TermKind::Raise(value) => write!(f, "raise {}", self.show(&**value)),
             TermKind::Operation { effect, op } => {
-                write!(f, "{}.`{}", self.mint.name(effect.tracked), op.tracked)
+                write!(f, "!{}.{}", self.mint.name(effect.tracked), op.tracked)
             }
         }
     }
@@ -352,7 +357,7 @@ impl Show<'_, TermKind> {
         for arm in &handler.arms {
             write!(
                 f,
-                " | {}.`{} {} => {}",
+                " | !{}.{} {} => {}",
                 self.mint.name(arm.effect.tracked),
                 arm.op.tracked,
                 self.mint.name(arm.binder.tracked),
@@ -378,9 +383,9 @@ impl fmt::Display for Show<'_, TypeKind> {
             // The hole, as written: `_`, whether the reader left it or the
             // pattern desugar did.
             TypeKind::Hole => f.write_str("_"),
-            // A `where let` variable, as the name it was declared with — which
+            // A variable, as the name it was declared with — which
             // is what the reader wrote and what re-parses to the same use.
-            TypeKind::Var(name) => f.write_str(name),
+            TypeKind::Var(name) => write!(f, "'{name}"),
             TypeKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
             // A parameter prints as the name it was declared with, which is
             // what makes this printer's output match the parse tree's.
@@ -390,6 +395,14 @@ impl fmt::Display for Show<'_, TypeKind> {
                 self.mint.name(*head),
                 args.iter().map(|arg| self.show(arg)),
             ),
+            // The row an argument may be, through the one function an arrow's
+            // own row goes through. A row written here is always written, so
+            // the `None` [`effect_row`](Show::effect_row) gives a row nobody
+            // wrote cannot arrive.
+            TypeKind::Effects(row) => match self.effect_row(row) {
+                Some(row) => row.fmt(f),
+                None => f.write_str("<error>"),
+            },
             TypeKind::Sum { cases, tail } => {
                 let cases = cases.iter().map(|(name, case)| match case {
                     SumCase::Written { when, payload, .. } => Entry::Written {
@@ -403,7 +416,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 // parameter as the name it was declared with.
                 let tail = tail.as_ref().map(|tail| match &tail.of {
                     Row::Anything => String::new(),
-                    Row::Named(name) => name.clone(),
+                    Row::Named(name) => format!("'{name}"),
                     Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
                 });
                 write_sum(
@@ -435,7 +448,7 @@ impl fmt::Display for Show<'_, TypeKind> {
                 // nothing for the anonymous one. `write_row` writes the dots.
                 let tail = tail.as_ref().map(|tail| match &tail.of {
                     Row::Anything => String::new(),
-                    Row::Named(name) => name.clone(),
+                    Row::Named(name) => format!("'{name}"),
                     // A row parameter prints as the name it was declared with,
                     // for the reason a type parameter does.
                     Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
@@ -453,36 +466,18 @@ impl fmt::Display for Show<'_, TypeKind> {
 /// An annotation prints as the type it ascribes and the `where` clause after
 /// it, which is what a reader wrote and what re-parses back to it.
 ///
-/// The clause is two statements at most, however many the reader wrote: the
-/// declarations are gathered into one `let`, in the order they were declared,
-/// and the constraints into the one formula lowering conjoined them to. What
-/// comes out re-lowers to the same annotation, which is the round trip that
-/// matters here — a `;` the reader put between two comparisons is not a fact
-/// the IR keeps, any more than the parentheses around one are.
+/// The clause is one statement, however many the reader wrote: lowering
+/// conjoined them into the one formula. What comes out re-lowers to the same
+/// annotation, which is the round trip that matters here — a `;` the reader put
+/// between two comparisons is not a fact the IR keeps, any more than the
+/// parentheses around one are. The variables are not written out at all: each
+/// is introduced where it is used, so the type beside them already says which
+/// there are.
 impl fmt::Display for Show<'_, Annotation> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.show(&self.node.ty))?;
-        let declared = !self.node.variables.is_empty();
-        if !declared && self.node.clause.is_none() {
-            return Ok(());
-        }
-        f.write_str(" where")?;
-        if declared {
-            let names: Vec<&str> = self
-                .node
-                .variables
-                .iter()
-                .map(|variable| variable.name.as_str())
-                .collect();
-            write!(f, " let {}", names.join(", "))?;
-        }
         match &self.node.clause {
-            Some(clause) => {
-                if declared {
-                    f.write_str(";")?;
-                }
-                write!(f, " {}", self.show(clause))
-            }
+            Some(clause) => write!(f, " where {}", self.show(clause)),
             None => Ok(()),
         }
     }
@@ -518,7 +513,9 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
         f.write_str("(")?;
     }
     match clause {
-        ClauseKind::Name(name) => f.write_str(name)?,
+        // A formula names presences, and a presence is a variable: the sigil
+        // is written back on so the clause re-parses.
+        ClauseKind::Name(name) => write!(f, "'{name}")?,
         ClauseKind::Not(inner) => {
             f.write_str("not ")?;
             clause_at(f, &inner.tracked, 3)?;
@@ -553,10 +550,10 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
 }
 
 impl Show<'_, TypeKind> {
-    /// The `! <effects>` clause an arrow carries, or `None` where none was
+    /// The `+ <effects>` clause an arrow carries, or `None` where none was
     /// written — which is what a bare `A -> B` has.
     ///
-    /// The row a reader wrote, not what it means: `A -> B ! |` wrote one and
+    /// The row a reader wrote, not what it means: `A -> B + |` wrote one and
     /// `A -> B` wrote none, and both are the empty closed row. Aliases *are*
     /// gone, since lowering expanded them, which is what the tab is for showing.
     fn effect_row(&self, row: &EffectRow) -> Option<Effects> {
@@ -577,7 +574,7 @@ impl Show<'_, TypeKind> {
             .collect();
         let tail = row.tail.as_ref().map(|tail| match &tail.of {
             Row::Anything => String::new(),
-            Row::Named(name) => name.clone(),
+            Row::Named(name) => format!("'{name}"),
             Row::Param { symbol, .. } => self.mint.name(*symbol).to_string(),
         });
         Some(Effects { effects, tail })
@@ -630,8 +627,10 @@ fn clone_mark(mark: &Mark) -> Mark {
 /// spelled back as the `_` it was written as.
 fn mark(when: &Option<Box<When>>) -> Option<Mark> {
     let when = when.as_ref()?;
+    // The sigil is written back on: a presence is a variable, and one printing
+    // bare would read as a type's name. The anonymous `when _` names none.
     Some(Mark::When(match &when.name {
-        Some(name) => name.clone(),
+        Some(name) => format!("'{}", name.clone()),
         None => "_".to_string(),
     }))
 }
@@ -651,7 +650,7 @@ pub fn term<'a>(kind: &'a TermKind, mint: &'a Mint) -> impl fmt::Display + 'a {
     Show { node: kind, mint }
 }
 
-/// Render one lowered ascription: the type, the variables its `where let`
+/// Render one lowered ascription: the type, the variables its a variable
 /// declared, and the formula beside them. The [`ty`] counterpart for the whole
 /// of what a definition was ascribed.
 pub fn annotation<'a>(node: &'a Annotation, mint: &'a Mint) -> impl fmt::Display + 'a {

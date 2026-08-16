@@ -307,7 +307,7 @@ fn the_surface_prerequisites_reach_every_stage() {
 /// the definition ends with.
 #[test]
 fn rows_reach_every_stage() {
-    let source = "let f : { x when a: Nat, y: Nat, ..r } -> Nat where let a, r = fn p => p.y\n";
+    let source = "let f : { x when 'a: Nat, y: Nat, ..'r } -> Nat = fn p => p.y\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -335,17 +335,15 @@ fn rows_reach_every_stage() {
     // reserved — which is what keeps a term or a label of that name writable.
     assert_eq!(
         labelled("tokens", "Identifier"),
-        [
-            "f", "x", "when", "a", "Nat", "y", "Nat", "r", "Nat", "where", "a", "r", "p", "p", "y"
-        ]
+        ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
     );
 
     for id in ["ast", "ir"] {
         // The field whose presence a `when` names is a row of the struct's like
         // any other, wearing the clause in its label; the tail is a row of its
         // own.
-        assert_eq!(labelled(id, "x when a:"), ["Nat"], "{id}");
-        assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
+        assert_eq!(labelled(id, "x when 'a:"), ["Nat"], "{id}");
+        assert_eq!(labelled(id, "Rest"), ["..'r"], "{id}");
     }
 
     // The projection's demand is an ordinary equality against an open row,
@@ -370,10 +368,7 @@ fn rows_reach_every_stage() {
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(
-        types,
-        ["{ x when a: Nat, y: Nat, ..b } -> Nat where let a, b"]
-    );
+    assert_eq!(types, ["{ x when 'a: Nat, y: Nat, ..'b } -> Nat"]);
 }
 
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps
@@ -466,33 +461,12 @@ fn a_duplicate_carries_the_definition_it_repeats() {
     assert_eq!(duplicate.related[0].message, "first defined here");
 }
 
-/// A name declared twice in one `where` clause points back the same way, and
-/// says declared rather than defined: a clause says what a name will stand for,
-/// and the type beside it is what defines anything.
-#[test]
-fn a_duplicate_variable_points_back_at_the_declaration_that_stands() {
-    let source = "let worse : a -> a where let a; let a = fn x => x\n";
-    let snapshot = snapshot(source);
-    let duplicate = snapshot
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "duplicate-variable")
-        .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
-    let first = source.find("let a").expect("the first declaration") + 4;
-    let second = source.rfind("let a").expect("the repeat") + 4;
-    assert_eq!(duplicate.span, Some([second, second + 1]));
-    assert_eq!(duplicate.related.len(), 1);
-    assert_eq!(duplicate.related[0].span, Some([first, first + 1]));
-    assert_eq!(duplicate.related[0].message, "first declared here");
-}
-
 /// A name given two rests of different shapes is the same kind of complaint:
-/// half of what went wrong is the `..` somewhere else on the page, so the strip
+/// half of what went wrong is the `..` somewhere 'else on the page, so the strip
 /// highlights that one too rather than leaving the reader to find it.
 #[test]
 fn a_mixed_tail_carries_the_use_it_clashes_with() {
-    let source =
-        "let f : { x: Nat, ..r } -> (`A Nat | ..r) -> Nat where let r = fn a => fn b => 1\n";
+    let source = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1\n";
     let snapshot = snapshot(source);
     let mixed = snapshot
         .diagnostics
@@ -501,9 +475,9 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
         .unwrap_or_else(|| panic!("{:#?}", snapshot.diagnostics));
     // At the name rather than at the `..` in front of it: the name is the one
     // thing the reader can change, and is what the second use points back to.
-    let first = source.find("..r").expect("the first tail") + 2;
+    let first = source.find("..'r").expect("the first tail") + 2;
     assert_eq!(mixed.related.len(), 1);
-    assert_eq!(mixed.related[0].span, Some([first, first + 1]));
+    assert_eq!(mixed.related[0].span, Some([first, first + 2]));
     // Worded as a use rather than as a definition: nothing here was defined
     // twice.
     assert_eq!(mixed.related[0].message, "first used here");
@@ -537,7 +511,7 @@ fn inferred_types_reach_the_panels() {
         .into_iter()
         .find(|node| node.label == "let id")
         .expect("the definition has a row");
-    assert_eq!(scheme.text, "a -> a where let a");
+    assert_eq!(scheme.text, "'a -> 'a");
 
     let badges = stage("types-ir");
     assert_eq!(badges.annotates, Some("ir"));
@@ -550,7 +524,7 @@ fn inferred_types_reach_the_panels() {
     }
     // The declaration row wears the scheme.
     let texts: Vec<_> = badges.nodes.iter().map(|node| node.text.as_str()).collect();
-    assert!(texts.contains(&"a -> a"), "{texts:?}");
+    assert!(texts.contains(&"'a -> 'a"), "{texts:?}");
 }
 
 /// Every row the IR stage renders a term on wears the type inference gave it.
@@ -663,7 +637,7 @@ fn the_types_tab_says_which_declarations_are_recursive() {
     // declaration written below the first of them.
     assert_eq!(recursion("forest"), Some("forest, tree"));
     assert_eq!(recursion("tree"), Some("tree, forest"));
-    // And an alias that leads nowhere says nothing.
+    // And an alias that leads nowhere 'says nothing.
     assert_eq!(recursion("Endo"), None);
 }
 
@@ -707,7 +681,7 @@ fn the_types_tab_says_which_definitions_are_recursive() {
     // A pair typed together names itself first and then the rest of its group.
     assert_eq!(recursion("even"), Some("even, odd"));
     assert_eq!(recursion("odd"), Some("odd, even"));
-    // And a definition that refers back into its group nowhere says nothing.
+    // And a definition that refers back into its group nowhere 'says nothing.
     assert_eq!(recursion("plain"), None);
 }
 
@@ -758,8 +732,8 @@ fn an_argument_wears_its_type_through_a_declared_type() {
     // And a sum's tail reads in cases, because it is the row of a sum. Spelled
     // in braces it would show a reader a case list as if it were fields.
     assert_eq!(
-        badge("type G r = (`Err Nat | ..r) -> Nat\nlet g : G (`Ok Nat) = fn p => 1\n"),
-        "`Err Nat | ..`Ok Nat"
+        badge("type G r = (#Err Nat | ..r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1\n"),
+        "#Err Nat | ..#Ok Nat"
     );
 }
 
@@ -794,7 +768,7 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     // promised it: what the lacks condition rules on is the *fresh* rest a use
     // of the published scheme gets.
     let repeated = snapshot(
-        "let h : { ..r } -> { x: { y: Nat, ..r } } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { ..'r } -> { x: { y: Nat, ..'r } } -> Nat = fn a => fn b => 1\n\
          let z = h { y: {} } { x: { y: 1 } }\n",
     );
     let [diagnostic] = repeated.diagnostics.as_slice() else {
@@ -837,7 +811,7 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
 
     // A body deciding what its annotation declared reaches the strip too, and
     // carries the declaration as a second highlight — the promise it broke.
-    let source = "let bad : a -> Nat where let a = fn p => p.x\n";
+    let source = "let bad : 'a -> Nat = fn p => p.x\n";
     let broken = snapshot(source);
     let [diagnostic] = broken.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", broken.diagnostics);
@@ -846,9 +820,9 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     // Spanned at the projection, which is the expression that broke it.
     let read = source.rfind('x').expect("the field");
     assert_eq!(diagnostic.span, Some([read, read + 1]));
-    let declared = source.rfind("let a").expect("the declaration") + 4;
+    let declared = source.find("'a").expect("the first use");
     assert_eq!(diagnostic.related.len(), 1);
-    assert_eq!(diagnostic.related[0].span, Some([declared, declared + 1]));
+    assert_eq!(diagnostic.related[0].span, Some([declared, declared + 2]));
     assert_eq!(diagnostic.related[0].message, "declared here");
 
     let flat = snapshot("let n = 1\nlet bad = n.x\n");
@@ -1206,7 +1180,7 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("ir"), "0 effects · 0 types · 1 term · 1 group");
 }
 
-/// A parameterized declaration's meaning prints its parameters as `'a`, `'b` —
+/// A parameterized declaration's meaning prints its parameters as `a`, `'b` —
 /// which says nothing on its own about which is which. The Types tab carries a
 /// row per parameter mapping each letter back to the name it was written as,
 /// and without them the tab is unreadable for exactly the declarations that
@@ -1225,18 +1199,18 @@ fn the_types_tab_maps_each_letter_back_to_its_parameter() {
         .iter()
         .find(|node| node.label == "type Pair")
         .expect("a row for the declaration");
-    assert_eq!(pair.text, "{ first: a, second: b } where let a, b");
+    assert_eq!(pair.text, "{ first: 'a, second: 'b }");
 
     let letters: Vec<(&str, &str)> = pair
         .children
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("a", "A"), ("b", "B")]);
+    assert_eq!(letters, vec![("'a", "A"), ("'b", "B")]);
 }
 
 /// The IR tab shows a `type` declaration's binders, as the AST tab and the
-/// Types tab both do. Without them the tab was the one panel where clicking a
+/// Types tab both do. Without them the tab was the one panel where 'clicking a
 /// parameter lit nothing up — the body's uses of it carry the symbol, and the
 /// binder they point back at had no row to be pointed at.
 #[test]
@@ -1334,7 +1308,7 @@ fn the_ir_tab_takes_an_application_apart() {
 /// The Types tab says which parameters stand for a set of fields, and which
 /// fields that set may not contain, because nothing else on the row does: a row
 /// is the only reason a declared type can be open, and the meaning column
-/// spells every parameter `'a` alike.
+/// spells every parameter `a` alike.
 #[test]
 fn the_types_tab_says_which_parameters_are_rows() {
     let snap = snapshot("type Both A r = { it: A, ..r }");
@@ -1353,7 +1327,10 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .iter()
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
-    assert_eq!(letters, vec![("a", "A"), ("b", "..r (struct) without it")]);
+    assert_eq!(
+        letters,
+        vec![("'a", "A"), ("'b", "..r (struct) without it")]
+    );
 
     // A struct's `..` beside no fields at all forbids nothing, and there is
     // nothing else about it to show: the rest of a struct *is* a whole type, so
@@ -1398,7 +1375,7 @@ fn a_type_parameter_is_a_symbol_like_any_other() {
 /// the definition ends with.
 #[test]
 fn sums_reach_every_stage() {
-    let source = "type Fallible r = `Err Nat | ..r\nlet e : Fallible (`Ok Nat) = `Err 1\n";
+    let source = "type Fallible r = #Err Nat | ..r\nlet e : Fallible (#Ok Nat) = #Err 1\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1425,7 +1402,7 @@ fn sums_reach_every_stage() {
     // differently from the names around it.
     assert_eq!(
         labelled("tokens", "Tag"),
-        ["`Err", "`Ok", "`Err"],
+        ["#Err", "#Ok", "#Err"],
         "{:#?}",
         nodes(stage("tokens"))
     );
@@ -1442,23 +1419,23 @@ fn sums_reach_every_stage() {
     assert_eq!(class, Some("tag"));
 
     for id in ["ast", "ir"] {
-        // A case is a row of the sum's, wearing its backtick in the label, and
+        // A case is a row of the sum's, wearing its `#` in the label, and
         // the tail is a row of its own — the same two shapes a struct has.
-        assert_eq!(labelled(id, "`Err"), ["Nat"], "{id}");
+        assert_eq!(labelled(id, "#Err"), ["Nat"], "{id}");
         assert_eq!(labelled(id, "Rest"), ["..r"], "{id}");
         // And the tag in the term is a node that names no symbol, the way a
         // field name is.
-        assert_eq!(labelled(id, "Tag"), ["`Err 1"], "{id}");
+        assert_eq!(labelled(id, "Tag"), ["#Err 1"], "{id}");
     }
 
     // The Types tab says which shape the parameter stands for, since the
-    // meaning column spells it `'a` like any other.
+    // meaning column spells it `a` like any other.
     let fallible = nodes(stage("types"))
         .into_iter()
         .find(|node| node.label == "type Fallible")
         .expect("a row for the declaration");
-    assert_eq!(fallible.text, "`Err Nat | ..a where let a");
-    assert_eq!(fallible.children[0].text, "..r (sum) without `Err");
+    assert_eq!(fallible.text, "#Err Nat | ..'a");
+    assert_eq!(fallible.children[0].text, "..r (sum) without #Err");
 
     // And the definition's scheme is the declared type, applied to the row the
     // use site handed it.
@@ -1467,7 +1444,7 @@ fn sums_reach_every_stage() {
         .iter()
         .map(|node| node.text.as_str())
         .collect();
-    assert!(types.contains(&"Fallible (`Ok Nat)"), "{types:?}");
+    assert!(types.contains(&"Fallible (#Ok Nat)"), "{types:?}");
 }
 
 /// A type carrying fields reaches every tab that shows a type, because they all
@@ -1494,7 +1471,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
         .map(|node| node.text.clone())
         .find(|text| text.contains(".."))
         .expect("the scheme prints an open end");
-    assert_eq!(scheme, "{ x: a, ..b } -> a where let a, b");
+    assert_eq!(scheme, "{ x: 'a, ..'b } -> 'a");
 
     // And the IR tab's inline badges, which the types stage paints on: the
     // binder `p` wears the base's own type.
@@ -1506,7 +1483,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
     assert!(
         nodes(badges)
             .iter()
-            .any(|node| node.text == "{ x: a, ..b }"),
+            .any(|node| node.text == "{ x: 'a, ..'b }"),
         "{:#?}",
         nodes(badges)
     );
@@ -1626,13 +1603,13 @@ fn a_nested_let_reaches_every_stage() {
 
 /// Every tab renders a program using explicit absence without error: the
 /// Tokens tab shows the backslash like any other punctuation token, the AST
-/// and IR tabs render `\y` and `` \`Err `` as written, and the type tabs take
+/// and IR tabs render `\y` and `\#Err` as written, and the type tabs take
 /// the absent entries in stride.
 #[test]
 fn every_stage_reports_on_explicit_absence() {
     let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
-                  type NoErr r = `Ok Nat | \\`Err | ..r\n\
-                  let ok : NoErr (`Warn Nat) = `Ok 1\n";
+                  type NoErr r = #Ok Nat | \\#Err | ..r\n\
+                  let ok : NoErr (#Warn Nat) = #Ok 1\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     assert!(
@@ -1669,7 +1646,7 @@ fn every_stage_reports_on_explicit_absence() {
         "the AST tab renders the absent field"
     );
     assert!(
-        ast.iter().any(|node| node.label == "\\`Err"),
+        ast.iter().any(|node| node.label == "\\#Err"),
         "the AST tab renders the absent case"
     );
 
@@ -1679,7 +1656,7 @@ fn every_stage_reports_on_explicit_absence() {
         "the IR tab renders the absent field"
     );
     assert!(
-        ir.iter().any(|node| node.label == "\\`Err"),
+        ir.iter().any(|node| node.label == "\\#Err"),
         "the IR tab renders the absent case"
     );
 }
@@ -1694,7 +1671,7 @@ fn every_stage_reports_on_explicit_absence() {
 #[test]
 fn a_match_and_a_pattern_let_reach_every_stage() {
     let source = "let {x, y} = { x: 1, y: 2 }\n\
-                  let f = fn e => match e with | `A `X a => x | { g: `G p } => p | r => y end\n";
+                  let f = fn e => match e with | #A #X a => x | { g: #G p } => p | r => y end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     let stage = |id: &str| {
@@ -1784,7 +1761,7 @@ fn a_wildcard_reaches_every_stage() {
     let source = "let _ = 1\n\
                   let const = fn x _ => x\n\
                   let use_y = fn p => let { x: _, y } = p in y\n\
-                  let f = fn e => match e with | `Some _ => 1 | _ => 0 end\n";
+                  let f = fn e => match e with | #Some _ => 1 | _ => 0 end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     assert!(
@@ -1895,17 +1872,17 @@ fn a_misplaced_wildcard_reaches_the_strip() {
 /// effect rows the compiler prints them with.
 #[test]
 fn every_stage_reports_on_a_source_using_effects() {
-    let source = "effect Log = `write : Nat -> ()\n\
-                  effect IO = `print : Nat -> ()\n\
-                  effect Console = `Log | `IO\n\
-                  type Logger = Nat -> Nat ! `Log\n\
-                  type Runner e = (Nat -> Nat ! ..e) -> Nat ! ..e\n\
-                  let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+    let source = "effect Log = write : Nat -> ()\n\
+                  effect IO = print : Nat -> ()\n\
+                  effect Console = !Log + !IO\n\
+                  type Logger = Nat -> Nat + !Log\n\
+                  type Runner e = (Nat -> Nat + ..e) -> Nat + ..e\n\
+                  let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
                   let quiet : () -> Nat = fn _ =>\n\
-                    handle greet () with | Log.`write s => () | return x => x end\n\
-                  let loud : () -> Nat ! `IO = fn _ =>\n\
-                    handle greet () with | Log.`write s => IO.`print s end\n\
-                  let choose = fn v => match v with | `A x => x | _ => 0 end\n";
+                    handle greet () with | !Log.write s => () | return x => x end\n\
+                  let loud : () -> Nat + !IO = fn _ =>\n\
+                    handle greet () with | !Log.write s => !IO.print s end\n\
+                  let choose = fn v => match v with | #A x => x | _ => 0 end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
@@ -1913,10 +1890,10 @@ fn every_stage_reports_on_a_source_using_effects() {
         assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
     }
 
-    // The tokens tab groups by variant, so the three reserved words and the
-    // `!` each own a label there.
+    // The tokens tab groups by variant, so the three reserved words, the `+`
+    // and the effect itself each own a label there.
     let tokens = stage_named(&snapshot, "tokens");
-    for label in ["Effect", "Handle", "Bang"] {
+    for label in ["Effect", "Handle", "Plus", "EffectLabel"] {
         assert!(
             nodes(tokens).iter().any(|node| node.label == label),
             "the tokens tab shows no {label}"
@@ -1938,7 +1915,7 @@ fn every_stage_reports_on_a_source_using_effects() {
         .filter(|node| node.label == "Discharges")
         .map(|node| node.text.as_str())
         .collect();
-    assert_eq!(discharges, ["`Log", "`Log"], "{discharges:?}");
+    assert_eq!(discharges, ["!Log", "!Log"], "{discharges:?}");
     // And the row an arrow carries is a child beside the two sides.
     assert!(
         nodes(ir).iter().any(|node| node.label == "Effects"),
@@ -1949,7 +1926,7 @@ fn every_stage_reports_on_a_source_using_effects() {
     let types = stage_named(&snapshot, "types");
     let meanings: Vec<&str> = nodes(types).iter().map(|node| node.text.as_str()).collect();
     assert!(
-        meanings.contains(&"{} -> Nat ! `Log"),
+        meanings.contains(&"{} -> Nat + !Log"),
         "the Types tab lost the row: {meanings:?}"
     );
     // An alias does not survive into the type language, so `Runner`'s

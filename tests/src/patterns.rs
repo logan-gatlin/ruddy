@@ -280,18 +280,18 @@ fn naturals_still_need_a_final_catch_all() {
 /// nested natural column is worded with the witness written out.
 #[test]
 fn sum_checks_read_the_solved_row() {
-    let src = "let f = fn e => match e with | `A x => 1 | `A y => 2 end";
+    let src = "let f = fn e => match e with | #A x => 1 | #A y => 2 end";
     let (_, _, checks) = checked(src);
     assert_eq!(
         errors(&checks),
         [format!(
             "unreachable-arm@{}",
-            src.find("`A y").expect("the shadowed arm")
+            src.find("#A y").expect("the shadowed arm")
         )],
         "{checks:#?}"
     );
 
-    let src = "let f = fn e => match e with | `A 0 => 1 end";
+    let src = "let f = fn e => match e with | #A 0 => 1 end";
     let (_, _, checks) = checked(src);
     assert_eq!(
         errors(&checks),
@@ -301,19 +301,19 @@ fn sum_checks_read_the_solved_row() {
         )],
         "{checks:#?}"
     );
-    assert_eq!(witness_of(&checks), "`A 1");
+    assert_eq!(witness_of(&checks), "#A 1");
 
     // The hole across two columns: each covered, the combination not.
-    let src = "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `B, b: `Y } => 2 end";
+    let src = "let f = fn e => match e with | { a: #A, b: #X } => 1 | { a: #B, b: #Y } => 2 end";
     let (_, _, checks) = checked(src);
     assert_eq!(checks.errors.len(), 1, "{:#?}", checks.errors);
-    assert_eq!(witness_of(&checks), "{ a: `A, b: `Y }");
+    assert_eq!(witness_of(&checks), "{ a: #A, b: #Y }");
 
     // An open position's rest is worded as "anything other than" what was
     // listed.
-    let src = "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `B, b: w } => 2 end";
+    let src = "let f = fn e => match e with | { a: #A, b: #X } => 1 | { a: #B, b: w } => 2 end";
     let (_, _, checks) = checked(src);
-    assert_eq!(witness_of(&checks), "{ a: `A, b: anything other than `X }");
+    assert_eq!(witness_of(&checks), "{ a: #A, b: anything other than #X }");
 }
 
 /// The empty match stays silent: the scrutinee is the empty sum, which has no
@@ -333,7 +333,7 @@ fn an_empty_match_stays_silent() {
 fn a_failed_typing_skips_the_checks() {
     // Numbers and cases at one position: the solver's mismatch is the whole
     // story, and every arm reports as skipped.
-    let src = "let f = fn e => match e with | 1 => 2 | `A => 3 end";
+    let src = "let f = fn e => match e with | 1 => 2 | #A => 3 end";
     let (out, inferred, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
@@ -343,7 +343,7 @@ fn a_failed_typing_skips_the_checks() {
     assert_eq!(verdicts(report), [Verdict::Skipped, Verdict::Skipped]);
 
     // At a nested position too: the payloads of one tag are one position.
-    let src = "let f = fn e => match e with | `A 0 => 1 | `A `X => 2 | r => 3 end";
+    let src = "let f = fn e => match e with | #A 0 => 1 | #A #X => 2 | r => 3 end";
     let (_, inferred, checks) = checked(src);
     assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
@@ -409,7 +409,7 @@ fn a_solved_absent_field_starves_its_arm() {
 /// scrutinee type, and the scrutinee's own span for cross-highlighting.
 #[test]
 fn a_report_names_the_match_and_its_scrutinee() {
-    let src = "let get = fn opt => match opt with | `Some x => x | `None => 0 end";
+    let src = "let get = fn opt => match opt with | #Some x => x | #None => 0 end";
     let checks = clean(src);
     let report = sole_report(&checks);
     assert_eq!(report.span.start, src.find("match").expect("the match"));
@@ -417,7 +417,7 @@ fn a_report_names_the_match_and_its_scrutinee() {
         report.scrutinee_span.start,
         src.find("opt with").expect("the scrutinee")
     );
-    assert_eq!(report.scrutinee.to_string(), "`Some Nat | `None");
+    assert_eq!(report.scrutinee.to_string(), "#Some Nat | #None");
 }
 
 /// A scrutinee behind a declared name: the checks look through the alias, and
@@ -426,9 +426,9 @@ fn a_report_names_the_match_and_its_scrutinee() {
 #[test]
 fn an_aliased_scrutinee_is_unfolded() {
     let checks = clean(
-        "type Fallible r = `Err Nat | ..r\n\
-         let f : Fallible (`Ok Nat) -> Nat = \
-         fn t => match t with | `Err n => n | `Ok k => k end",
+        "type Fallible r = #Err Nat | ..r\n\
+         let f : Fallible (#Ok Nat) -> Nat = \
+         fn t => match t with | #Err n => n | #Ok k => k end",
     );
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
@@ -487,7 +487,7 @@ fn an_annotated_absence_starves_the_demanding_arm() {
     );
 }
 
-/// A field's presence abandoned by a failure elsewhere in the group reads as
+/// A field's presence abandoned by a failure elsewhere 'in the group reads as
 /// undecided, and the checks stand aside rather than reason from it.
 #[test]
 fn an_abandoned_presence_skips_the_checks() {
@@ -511,7 +511,7 @@ fn an_abandoned_presence_skips_the_checks() {
 /// being "anything other than" nothing.
 #[test]
 fn an_open_sum_with_no_cases_witnesses_as_anything() {
-    let src = "let f : { a: Nat, b: (\\`X | ..r), .. } -> Nat where let r = \
+    let src = "let f : { a: Nat, b: (\\#X | ..'r), .. } -> Nat = \
                fn v => match v with | {a: 0, ..} => 1 end";
     let (out, _, checks) = checked(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -526,13 +526,13 @@ fn an_open_sum_with_no_cases_witnesses_as_anything() {
 #[test]
 fn a_failed_tag_test_skips_the_checks() {
     // No sum at all: the scrutinee solved to `Nat`.
-    let (_, inferred, checks) = checked("let f = match 5 with | `A => 1 end");
+    let (_, inferred, checks) = checked("let f = match 5 with | #A => 1 end");
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 
     // A sum without the case: the literal's own row never acquired `A`.
-    let (_, inferred, checks) = checked("let f = match `B 1 with | `A x => x end");
+    let (_, inferred, checks) = checked("let f = match #B 1 with | #A x => x end");
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
@@ -540,8 +540,8 @@ fn a_failed_tag_test_skips_the_checks() {
     // A case the refinement settled absent: the binder's view has no `Some`
     // left, so testing it again is the mismatch — and only the mismatch.
     let src = "let f = fn v => match v with \
-               | `Some x => 1 \
-               | r => match r with | `Some y => 2 | w => 3 end end";
+               | #Some x => 1 \
+               | r => match r with | #Some y => 2 | w => 3 end end";
     let (_, inferred, checks) = checked(src);
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
@@ -560,7 +560,7 @@ fn a_failed_tag_test_skips_the_checks() {
 /// reason from a row whose remainder is nobody's answer.
 #[test]
 fn an_abandoned_sum_rest_skips_the_checks() {
-    let src = "let f = fn v => match v with | `A x => 1 | r => g v end\n\
+    let src = "let f = fn v => match v with | #A x => 1 | r => g v end\n\
                let g = fn w => let n : Nat = w in f w";
     let (_, inferred, checks) = checked(src);
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
@@ -602,7 +602,7 @@ fn arms_above_a_misplaced_catch_all_keep_their_verdicts() {
 #[test]
 fn an_empty_match_over_a_real_sum_is_skipped() {
     let (_, inferred, checks) =
-        checked("let f = fn v => let w : (`A Nat | ..) = v in match v with end");
+        checked("let f = fn v => let w : (#A Nat | ..) = v in match v with end");
     assert!(!inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
     let report = sole_report(&checks);
@@ -924,7 +924,7 @@ fn a_nested_binding_reads_the_store_for_reachability() {
 #[test]
 fn a_nested_written_clause_shapes_the_witness() {
     let src = "let solo = fn v =>\n\
-               \x20 let inner : {p when c: Nat, q when d: Nat} -> Nat where let c, d; c != d =\n\
+               \x20 let inner : {p when 'c: Nat, q when 'd: Nat} -> Nat where 'c != 'd =\n\
                \x20   fn w => match w with | {p: 1} => 0 | {q} => 0 end in\n\
                \x20 0";
     let (out, inferred, checks) = checked(src);

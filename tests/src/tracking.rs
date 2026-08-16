@@ -4,7 +4,7 @@ use ruddy::tracking::{FileID, FileManager, Span, Tracked};
 
 #[test]
 fn a_span_with_nowhere_to_point_points_at_generated_code() {
-    // The default is what a span is when nobody wrote the thing it spans:
+    // The default is what a span is when 'nobody wrote the thing it spans:
     // width zero, offset zero, and the file every generated span shares.
     let span = Span::default();
 

@@ -349,7 +349,7 @@ pub enum Rule {
     ///
     /// One rule in the code and two here, because a reader stepping through a
     /// solve is reading about their program: a line about fields over a goal
-    /// about `` `Some `` and `` `None `` describes something they never wrote.
+    /// about `#Some` and `#None` describes something they never wrote.
     /// See [`Solve::labels`], which is both.
     Sum,
     /// Whether one field is there, decided: present agrees with present and
@@ -432,7 +432,7 @@ pub enum ConstraintKind {
         /// requires of its presences: R10 makes the clause the contract, so a
         /// use of the name sees it rather than whatever the value worked out.
         promised: Formula,
-        /// The `where let` variables the annotation declared, which are the
+        /// The variables the annotation declared, which are the
         /// ones the scheme this publishes may quantify. Empty where none was
         /// written. See [`ErrorKind::RigidEscapes`].
         rigids: Vec<u32>,
@@ -497,7 +497,7 @@ pub enum ErrorKind {
     ///
     /// Which of the two it is, is carried, because `base` no longer answers
     /// it. Every type has fields *and* may have cases, so a base can be a
-    /// sum-cored type that is missing a *field* — `` (`A 1).x `` is exactly
+    /// sum-cored type that is missing a *field* — `(#A 1).x` is exactly
     /// that, and reading the noun off the base would call it a case. The
     /// solver knows which row it was deciding at the moment it failed, so the
     /// shape is set there. One complaint, because it is one thing gone wrong —
@@ -534,7 +534,7 @@ pub enum ErrorKind {
         base: Rc<Ty>,
         field: String,
     },
-    /// A body deciding what one of its annotation's `where let` variables is.
+    /// A body deciding what one of its annotation's variables is.
     ///
     /// `a` stands for whatever the caller picks, so a body that makes it a
     /// `Nat` — or makes it the *other* variable the annotation declared — has
@@ -557,7 +557,7 @@ pub enum ErrorKind {
         sense: Sense,
         declared: Span,
     },
-    /// A label demanded of a `where let` variable: a projection, a match arm, a
+    /// A label demanded of a variable: a projection, a match arm, a
     /// struct literal's field set.
     ///
     /// What replaces the lacks bookkeeping for a rigid. An ordinary open row
@@ -570,7 +570,7 @@ pub enum ErrorKind {
         name: Rc<str>,
         declared: Span,
     },
-    /// A `where let` variable reaching a type outside the annotation that
+    /// A variable reaching a type outside the annotation that
     /// declared it.
     ///
     /// A rigid stands for whatever the caller of *that* annotation picks, so it
@@ -716,7 +716,7 @@ struct Scoped {
     /// lowered annotation, or a variable standing for whatever the body turns
     /// out to be.
     bound: Rc<Ty>,
-    /// The `where let` variables its annotation declared, which are the ones
+    /// The variables its annotation declared, which are the ones
     /// its scheme is entitled to quantify. Empty for a definition with no
     /// annotation, which is entitled to none. See
     /// [`ErrorKind::RigidEscapes`].
@@ -821,7 +821,7 @@ struct Table {
     /// value.
     ///
     /// A sum's tail is under the same condition, for the same reason and with
-    /// its own labels: `` `A Nat | ..?3 `` reads the same sentence about cases.
+    /// its own labels: `#A Nat | ..?3` reads the same sentence about cases.
     /// So the shape says which of the two a condition came from, and a
     /// [`Shape::Struct`] one is always on a core variable while a
     /// [`Shape::Sum`] one is always on a tail.
@@ -848,7 +848,7 @@ struct Table {
     /// use-site and annotation checks, and — through
     /// [`Output::store`] — in the patterns phase. Never by unification.
     store: Store,
-    /// Where each `where let` variable in the program was declared, by the id
+    /// Where each a variable variable in the program was declared, by the id
     /// its annotation gave it.
     ///
     /// A [`Core::Rigid`] carries its spelling but not its span — a type is
@@ -881,7 +881,7 @@ struct Table {
 struct Subst {
     types: HashMap<TyVar, u32>,
     presences: HashMap<TyVar, u32>,
-    /// The `where let` variables an annotated definition's own scheme
+    /// The variables an annotated definition's own scheme
     /// re-quantifies: rigid while the body was checked, and an ordinary
     /// quantified position once it has been. See [`ErrorKind::RigidEscapes`]
     /// for the one that may not be.
@@ -998,7 +998,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // downstream.
                 //
                 // Which is honest because the variables it declared are rigid
-                // while the body is checked. A `where let` name is a promise
+                // while the body is checked. A variable is a promise
                 // about every caller, so nothing the body does may decide it —
                 // and a body that tries is refused at the expression that
                 // tried, which is the line the reader can change. What is left
@@ -1164,7 +1164,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             // complaint written into the middle of it would move everybody
             // else's.
             let told = errors.len();
-            // A `where let` variable stands for whatever *this* annotation's
+            // A variable stands for whatever *this* annotation's
             // caller picks, so it means nothing in anybody else's type. A
             // scheme that would quantify one it did not declare is refused at
             // the declaration, which is the line the reader has to change.
@@ -1529,7 +1529,7 @@ impl Table {
         }
     }
 
-    /// Where the `where let` name behind one rigid was written: the second
+    /// Where the variable behind one rigid was written: the second
     /// place a rigid complaint points at.
     ///
     /// Indexed rather than looked up: every rigid in a type was minted by
@@ -2212,7 +2212,7 @@ impl Table {
                 self.presences_in(&from, found);
                 self.presences_in(&to, found);
                 // An effect's presence is quantified like any other — a
-                // `` `Log (when a) `` on an arrow is a presence the scheme
+                // `!Log (when a)` on an arrow is a presence the scheme
                 // names — so one missed here would vanish from the scheme
                 // instead of being reported.
                 self.presences_in_row(&effects, found);
@@ -2359,7 +2359,7 @@ impl Table {
         unfolded
     }
 
-    /// Every `where let` variable a type still mentions that the scheme being
+    /// Every a variable variable a type still mentions that the scheme being
     /// generalized into may not quantify, reported at the declaration.
     ///
     /// A walk rather than a level or a rank discipline on variables, and that
@@ -2529,13 +2529,13 @@ impl Table {
     /// it sits on one arrow and no other, so quantifying it would publish a
     /// scheme whose caller may choose what the definition performs — which no
     /// definition means. Closing it to the empty row is what makes
-    /// `fn x => x` read `'a -> 'a` rather than `'a -> 'a ! ..'b`, and one that
+    /// `fn x => x` read `'a -> 'a` rather than `'a -> 'a + ..'b`, and one that
     /// genuinely does link two arrows occurs twice and is quantified.
     ///
-    /// Only variables inference minted, which after `where let` is what an
+    /// Only variables inference minted, which after a variable is what an
     /// effect tail a reader kept is *not*: a named `..e` is declared and lowers
     /// to a rigid, which is no solver variable and is never counted here. What
-    /// the reader left anonymous — a bare `! ..`, or no row at all — is
+    /// the reader left anonymous — a bare `+ ..`, or no row at all — is
     /// inference's to decide, and this is the deciding.
     ///
     /// And only what this scheme would quantify: a variable below `level`
@@ -2722,7 +2722,7 @@ impl Table {
     /// print as the earlier letter.
     ///
     /// The presences go first and in full, because they take the low positions
-    /// of the one index space a scheme has: what a `where let` lists is every
+    /// of the one index space a scheme has: what a variable lists is every
     /// letter in index order, and a numbering that interleaved the two sorts
     /// would still be correct but would put the letters in an order nobody
     /// reading the type left to right could predict. Whichever pass runs, a
@@ -2897,7 +2897,7 @@ impl Table {
     ///
     /// A tail the solve bound to a row is spliced in, so that what outlives the
     /// solver is one flat row rather than a chain of them:
-    /// `` `A | ..(`B) `` is not a type anyone wrote. [`canon`](Self::canon) is what does
+    /// `#A | ..(#B)` is not a type anyone wrote. [`canon`](Self::canon) is what does
     /// that, and it is lossless: a tail stands for the labels its row does not
     /// write out, and [`Solve::assign`] refuses to bind one to a row that
     /// certainly has one of them, so the one copy a chain can repeat by the
@@ -3221,7 +3221,7 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
     lowered
 }
 
-/// What one annotation's `where let` declared, ready for the type beside it to
+/// What one annotation's an annotation introduced, ready for the type beside it to
 /// be lowered against.
 ///
 /// One map per sort a variable can have, because the three are three sorts of
@@ -3248,7 +3248,7 @@ struct Tails {
 /// against, the scheme a use of its own name inside that body instantiates, and
 /// what it promised about its presences.
 struct Lowered {
-    /// The skolemized type. Its `where let` variables are rigids and its holes
+    /// The skolemized type. Its variables are rigids and its holes
     /// are ordinary solver variables, which is the whole of the difference
     /// between what the annotation promises and what it leaves to inference.
     ty: Rc<Ty>,
@@ -3335,7 +3335,13 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     // In one fixed order, because they come out of a hash map and the order it
     // hands them over is nobody's: a complaint about the clause names its
     // presences the same way on every run, which alphabetical is enough for.
-    let mut names: Vec<(String, Presence)> = tails.presences.into_iter().collect();
+    // Spelled with the sigil they were written with: a complaint about the
+    // clause quotes what the reader can find on the page.
+    let mut names: Vec<(String, Presence)> = tails
+        .presences
+        .into_iter()
+        .map(|(name, presence)| (format!("'{name}"), presence))
+        .collect();
     names.sort_by(|(one, _), (other, _)| one.cmp(other));
     Lowered {
         ty,
@@ -3460,6 +3466,13 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             lower(mint, table, tails, to),
             effect_row(table, tails, effects),
         ),
+        // A row handed to a declaration as an argument, which is the one place
+        // a row arrives without an arrow around it. It lowers to the row it is
+        // — [`Core::Sum`] is a set of labels and a rest, which is what a row of
+        // effects is too — and the position it is spliced into is what says
+        // which of the three it is being read as. See
+        // [`types::Shape`](crate::types::Shape).
+        TypeKind::Effects(effects) => Core::Sum(effect_row(table, tails, effects)),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it. A
         // field written `\name` is [`Presence::Absent`] in the position it was
@@ -3523,7 +3536,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
         // to be decided, whoever left it — and the variable is what lets a
         // projection of a field and the demand for it share one answer.
         TypeKind::Hole => Core::Var(table.fresh_core()),
-        // A `where let` variable in a type position: the rigid its declaration
+        // A variable in a type position: the rigid its declaration
         // minted, shared by every mention of the name in this one annotation.
         //
         // Indexed rather than looked up: lowering refused a name nothing

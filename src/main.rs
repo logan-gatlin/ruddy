@@ -82,7 +82,7 @@ fn main() -> ExitCode {
     for err in &inferred.errors {
         report(&source, err.span, &err.kind.to_string());
         // A broken promise is only legible next to the promise, which is on
-        // another line: the `where let` that declared the variable gets a line
+        // another line: the first use of the variable gets a line
         // of its own, indented under the error, exactly as a repeat's first
         // definition does.
         if let Some((declared, note)) = promised(&err.kind) {
@@ -105,17 +105,12 @@ fn elsewhere(kind: &ir::ErrorKind) -> Option<(Span, &'static str)> {
     match kind {
         ir::ErrorKind::Duplicate { previous, .. }
         | ir::ErrorKind::DuplicateParameter { previous } => Some((*previous, ui::FIRST_DEFINITION)),
-        // A `where let` says what a name will stand for rather than defining
-        // anything, so the note it points back with says so.
-        ir::ErrorKind::DuplicateVariable { previous, .. } => {
-            Some((*previous, ui::FIRST_DECLARATION))
-        }
         ir::ErrorKind::MixedTail { previous, .. } => Some((*previous, ui::FIRST_USE)),
         _ => None,
     }
 }
 
-/// Inference's second place: where the `where let` variable a body broke its
+/// Inference's second place: where the variable a body broke its
 /// promise about was declared. [`elsewhere`]'s twin one phase later — see
 /// [`ui::DECLARED_HERE`].
 fn promised(kind: &inference::ErrorKind) -> Option<(Span, &'static str)> {

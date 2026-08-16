@@ -151,7 +151,7 @@ fn body_types(term: &Term) -> Vec<String> {
     body_tys(term).iter().map(Rc::<Ty>::to_string).collect()
 }
 
-/// Whether a type still names one of the solver's variables anywhere inside
+/// Whether a type still names one of the solver's variables anywhere 'inside
 /// it. An undecided core does not count: it is a type, and it prints as one.
 fn mentions_a_variable(ty: &Ty) -> bool {
     let core = match &ty.core {
@@ -203,16 +203,16 @@ fn a_literal_is_a_nat() {
 #[test]
 fn the_identity_generalizes() {
     let (mint, out, output) = inferred("let id = fn x => x");
-    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
 
     // Zonking spells the body's types with the same letters as the scheme:
-    // the lambda is 'a -> 'a and the variable inside it is 'a.
+    // the lambda is a -> a and the variable inside it is a.
     let decl = term_decl(&mint, &out, "id");
-    assert_eq!(decl.value.ty.to_string(), "a -> a");
+    assert_eq!(decl.value.ty.to_string(), "'a -> 'a");
     let TermKind::Fn { body, .. } = &decl.value.kind else {
         panic!("expected a lambda");
     };
-    assert_eq!(body.ty.to_string(), "a");
+    assert_eq!(body.ty.to_string(), "'a");
 }
 
 /// Nothing downstream is given the solver's variable table, so nothing
@@ -234,11 +234,11 @@ fn no_subterm_keeps_a_solver_variable() {
             // The argument's own effect row is no part of `a`'s type, so R23's
             // closing rule never reaches it and it is named like every other
             // variable a subterm leaves over.
-            "(a -> a ! ..b) -> Nat",
-            "Nat -> (a -> a ! ..b) -> Nat",
+            "('a -> 'a + ..'b) -> Nat",
+            "Nat -> ('a -> 'a + ..'b) -> Nat",
             "Nat",
-            "a -> a ! ..b",
-            "a",
+            "'a -> 'a + ..'b",
+            "'a",
         ]
     );
 
@@ -268,13 +268,13 @@ fn quantifiers_are_named_in_first_occurrence_order() {
     // occurs once and is closed. See R22 and R23.
     assert_eq!(
         scheme(&mint, &output, "apply"),
-        "(a -> b ! ..c) -> a -> b ! ..c where let a, b, c"
+        "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
     );
 
     let (mint, _, output) = inferred("let compose = fn f g x => f (g x)");
     assert_eq!(
         scheme(&mint, &output, "compose"),
-        "(a -> b ! ..c) -> (d -> a ! ..c) -> d -> b ! ..c where let a, b, c, d"
+        "('a -> 'b + ..'c) -> ('d -> 'a + ..'c) -> 'd -> 'b + ..'c"
     );
 }
 
@@ -408,7 +408,7 @@ fn an_argument_mismatch_names_the_parameter_as_the_expectation() {
     // demanded arrow is what worded the mismatch above backwards, and it made
     // this arrow's own specificity an accident of the argument being a
     // literal: for `fn x => 1 x` the same mistake read `Nat -> ?` or `? -> ?`
-    // depending only on where else in the definition `x` was mentioned.
+    // depending only on where 'else in the definition `x` was mentioned.
     let (_, _, output) = infer_src("let bad = 1 1");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
@@ -435,7 +435,7 @@ fn a_failed_definition_is_undecided_rather_than_polymorphic() {
     // argument's own type — which nothing failed about — still may.
     let (mint, _, output) = infer_src("let f = fn x => (fn r => r.a) { b: x }\nlet g = f { b: 1 }");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
-    assert_eq!(scheme(&mint, &output, "f"), "a -> ? where let a");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> ?");
     assert_eq!(scheme(&mint, &output, "g"), "?");
 
     // And for one abandoned by the occurs check. The call site says `f` is a
@@ -472,7 +472,7 @@ fn a_definition_whose_fields_failed_is_not_refused_again_at_every_use() {
         .collect();
     assert_eq!(
         messages,
-        ["extra field `x`: the type `Nat -> a` lists every field it allows"],
+        ["extra field `x`: the type `Nat -> 'a` lists every field it allows"],
         "{:#?}",
         output.errors
     );
@@ -480,7 +480,7 @@ fn a_definition_whose_fields_failed_is_not_refused_again_at_every_use() {
     // which unifies with anything, so both calls go through.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x: ?, .. } -> { a: ?, b: a } where let a"
+        "{ x: ?, .. } -> { a: ?, b: 'a }"
     );
 
     // The same shape one binder further out, where the two projections share a
@@ -503,9 +503,9 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
             // `?0` is the definition's own variable, minted before the body was
             // walked so that the body could have named it; `?1` is `f`, and
             // `?2` is the row the lambda's own arrow carries.
-            "bind  ?3 -> ?4 ! ..?5 ~ ?1 => ?1 := ?3 -> ?4 ! ..?5",
+            "bind  ?3 -> ?4 + ..?5 ~ ?1 => ?1 := ?3 -> ?4 + ..?5",
             // Only the argument asks `f` to be its own parameter.
-            "occurs  ?3 ~ ?3 -> ?4 ! ..?5 => this type would have to contain itself",
+            "occurs  ?3 ~ ?3 -> ?4 + ..?5 => this type would have to contain itself",
             "recover  ?3 ~ ? => ?3 := ?",
             "recover  ?4 ~ ? => ?4 := ?",
             "recover  ?5 ~ ? => ?5 := ?",
@@ -516,7 +516,7 @@ fn a_failed_occurs_check_is_a_rule_of_its_own() {
             "  recover  ?2 ~ ? => ?2 := ?",
             // And the definition is what its body turned out to be, which is
             // the last thing every unannotated definition says.
-            "bind  ?0 ~ ?1 -> ?4 ! ..?2 => ?0 := ?1 -> ?4 ! ..?2",
+            "bind  ?0 ~ ?1 -> ?4 + ..?2 => ?0 := ?1 -> ?4 + ..?2",
         ]
     );
     // No step claims to have bound anything by the rule that failed. The bind
@@ -559,16 +559,13 @@ fn an_unannotated_projection_infers_an_open_row() {
     // nothing here needs an annotation — the definition is polymorphic in the
     // base's core, in the field's type and in the rest of the row.
     let (mint, _, output) = inferred("let f = fn p => p.x");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: a, ..b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: 'a, ..'b } -> 'a");
 
     // A chain demands a nested shape, each link open past the field it reads.
     let (mint, _, output) = inferred("let r = fn x => x.a.b.c");
     assert_eq!(
         scheme(&mint, &output, "r"),
-        "{ a: { b: { c: a, ..b }, ..c }, ..d } -> a where let a, b, c, d"
+        "{ a: { b: { c: 'a, ..'b }, ..'c }, ..'d } -> 'a"
     );
 
     // Two projections composed off one base still name one row: the demands
@@ -576,7 +573,7 @@ fn an_unannotated_projection_infers_an_open_row() {
     let (mint, _, output) = inferred("let r = fn x => (fn y => y.q) x.a");
     assert_eq!(
         scheme(&mint, &output, "r"),
-        "{ a: { q: a, ..b }, ..c } -> a where let a, b, c"
+        "{ a: { q: 'a, ..'b }, ..'c } -> 'a"
     );
 
     // And the open row closes at a use: applying the accessor to a literal
@@ -598,10 +595,7 @@ fn an_unannotated_projection_infers_an_open_row() {
 #[test]
 fn an_open_annotation_generalizes_its_tail() {
     let (mint, _, output) = inferred("let f : { x: Nat, .. } -> Nat = fn p => p.x");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
 
     // The tail instantiates per use, so one accessor serves a narrower and a
     // wider struct alike — which is what `..` is for.
@@ -621,16 +615,16 @@ fn an_open_annotation_generalizes_its_tail() {
 
 #[test]
 fn a_named_tail_is_shared_within_one_annotation() {
-    // The same `..r` on both sides of the arrow: whatever extra fields the
+    // The same `..'r` on both sides of the arrow: whatever extra fields the
     // argument carries, the result carries too — and the scheme says so with
     // one letter.
     let (mint, _, output) = inferred(
-        "let keep : { x: Nat, ..r } -> { x: Nat, ..r } where let r = fn p => p\n\
+        "let keep : { x: Nat, ..'r } -> { x: Nat, ..'r } = fn p => p\n\
          let q = keep { x: 1, y: {} }",
     );
     assert_eq!(
         scheme(&mint, &output, "keep"),
-        "{ x: Nat, ..a } -> { x: Nat, ..a } where let a"
+        "{ x: Nat, ..'a } -> { x: Nat, ..'a }"
     );
     assert_eq!(scheme(&mint, &output, "q"), "{ x: Nat, y: {} }");
 }
@@ -641,19 +635,13 @@ fn a_tail_name_is_scoped_to_its_annotation() {
     // two definitions stay independently polymorphic and each prints its own
     // first letter.
     let (mint, _, output) = inferred(
-        "let f : { x: Nat, ..r } -> Nat where let r = fn p => p.x\n\
-         let g : { y: Nat, ..r } -> Nat where let r = fn p => p.y\n\
+        "let f : { x: Nat, ..'r } -> Nat = fn p => p.x\n\
+         let g : { y: Nat, ..'r } -> Nat = fn p => p.y\n\
          let n = f { x: 1, extra: 2 }\n\
          let m = g { y: 1, other: 2 }",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "{ y: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "{ y: Nat, ..'a } -> Nat");
     assert_eq!(scheme(&mint, &output, "n"), "Nat");
     assert_eq!(scheme(&mint, &output, "m"), "Nat");
 }
@@ -661,22 +649,22 @@ fn a_tail_name_is_scoped_to_its_annotation() {
 #[test]
 fn an_optional_field_may_be_absent_present_or_wrong() {
     let (mint, _, output) = inferred(
-        "let f : { x when a: Nat, y: Nat, .. } -> Nat where let a = fn r => r.y\n\
+        "let f : { x when 'a: Nat, y: Nat, .. } -> Nat = fn r => r.y\n\
          let a = f { y: 1 }\n\
          let b = f { x: 5, y: 1 }",
     );
     // The presence variable is quantified too, but it prints in its own
-    // alphabet as the `when a` on its field — the tail is still `'a`.
+    // alphabet as the `when a` on its field — the tail is still `a`.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, y: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, y: Nat, ..'b } -> Nat"
     );
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "Nat");
 
     // Optional is not untyped: when the field is there, it is a Nat.
     let (_, _, output) = infer_src(
-        "let f : { x when a: Nat, y: Nat } -> Nat where let a = fn r => r.y\nlet c = f { x: {}, y: 1 }",
+        "let f : { x when 'a: Nat, y: Nat } -> Nat = fn r => r.y\nlet c = f { x: {}, y: 1 }",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
@@ -687,7 +675,7 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
     );
 }
 
-/// An annotation is the contract, and a `where let` variable is what makes it
+/// An annotation is the contract, and a `where 'let` variable is what makes it
 /// one: it stands for whatever the caller picks, so nothing the body does may
 /// decide it, and a body that tries is refused at the expression that tried.
 ///
@@ -698,7 +686,7 @@ fn an_optional_field_may_be_absent_present_or_wrong() {
 fn a_declared_variable_is_the_definitions_to_leave_alone() {
     // The body projects `x` off something that stands for whatever the caller
     // picks, so it may not have one. Reported at the projection.
-    let src = "let f : a -> Nat where let a = fn p => p.x";
+    let src = "let f : 'a -> Nat = fn p => p.x";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
@@ -706,7 +694,7 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     assert_eq!(error.kind.code(), "rigid-field");
     assert_eq!(
         error.kind.to_string(),
-        "this reads a field `x`, but `a` stands for whatever type the caller picks, \
+        "this reads a field `x`, but `'a` stands for whatever type the caller picks, \
          so it may not have one"
     );
     assert_eq!(error.span.start, src.rfind('x').expect("the field"));
@@ -714,14 +702,13 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     let ErrorKind::RigidField { declared, .. } = error.kind else {
         panic!("the complaint was just matched");
     };
-    assert_eq!(
-        declared.start,
-        src.rfind("let a").expect("the declaration") + 4
-    );
+    // The first use is where a variable is introduced, so that is where the
+    // promise it broke points back to.
+    assert_eq!(declared.start, src.find("'a").expect("the first use"));
 
     // A declared rest is the same promise about the fields a row does not name,
     // and returning one fixed struct where it stands is the same refusal.
-    let src = "let f : { ..r } -> { x: Nat, ..r } where let r = fn p => { x: 0 }";
+    let src = "let f : { ..'r } -> { x: Nat, ..'r } = fn p => { x: 0 }";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
@@ -731,7 +718,7 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     // A value binding is a definition too, and a concrete value decides
     // whatever it is written under — so a declared variable over one is refused
     // wherever the value says what it is.
-    let (_, _, output) = infer_src("let x : a where let a = { a: 1 }");
+    let (_, _, output) = infer_src("let x : 'a = { a: 1 }");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
@@ -742,8 +729,8 @@ fn a_declared_variable_is_the_definitions_to_leave_alone() {
     // treats two independent promises as one — and each is refused against the
     // other where the body brought them together.
     for src in [
-        "let f : { ..r } -> { ..s } -> { ..r } where let r, s = fn p => fn q => q",
-        "let f : a -> b -> a where let a, b = fn p => fn q => q",
+        "let f : { ..'r } -> { ..'s } -> { ..'r } = fn p => fn q => q",
+        "let f : 'a -> 'b -> 'a = fn p => fn q => q",
     ] {
         let (_, _, output) = infer_src(src);
         let [error] = output.errors.as_slice() else {
@@ -762,32 +749,29 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     // A field read off an otherwise open row: the projection's demand takes
     // the annotation's tail, not the other way round.
     let (mint, _, output) = inferred("let f : { x: Nat, .. } -> Nat = fn p => p.x");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
 
     // A tail carried straight through, and used at a wider struct.
     let (mint, _, output) = inferred(
-        "let keep : { x: Nat, ..r } -> { x: Nat, ..r } where let r = fn p => p\n\
+        "let keep : { x: Nat, ..'r } -> { x: Nat, ..'r } = fn p => p\n\
          let q = keep { x: 1, y: {} }",
     );
     assert_eq!(
         scheme(&mint, &output, "keep"),
-        "{ x: Nat, ..a } -> { x: Nat, ..a } where let a"
+        "{ x: Nat, ..'a } -> { x: Nat, ..'a }"
     );
     assert_eq!(scheme(&mint, &output, "q"), "{ x: Nat, y: {} }");
 
     // An optional field the body never reads stays optional, whether a caller
     // supplies it or not.
     let (mint, _, output) = inferred(
-        "let f : { x when a: Nat, y: Nat, .. } -> Nat where let a = fn r => r.y\n\
+        "let f : { x when 'a: Nat, y: Nat, .. } -> Nat = fn r => r.y\n\
          let a = f { y: 1 }\n\
          let b = f { x: 5, y: 1 }",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, y: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, y: Nat, ..'b } -> Nat"
     );
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "Nat");
@@ -796,8 +780,8 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     // ties one of its `..`s to a variable of somebody else's has not narrowed
     // anything, and the scheme prints the type that was written.
     let (mint, _, output) =
-        inferred("let f : { ..r } -> { ..s } -> { ..r } where let r, s = fn p => fn q => p");
-    assert_eq!(scheme(&mint, &output, "f"), "a -> b -> a where let a, b");
+        inferred("let f : { ..'r } -> { ..'s } -> { ..'r } = fn p => fn q => p");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'b -> 'a");
 
     // Which is what a binding group turns on. Two definitions that name each
     // other are solved together and monomorphically, so the annotated one's
@@ -806,8 +790,7 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     // the type the reader wrote is the type that was checked. Either way round,
     // since which member is walked first decides which side of that unification
     // gets bound.
-    let annotated =
-        "let f : { x when a: Nat, y when b: Nat } -> {} where let a, b; a != b = fn v => g v";
+    let annotated = "let f : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn v => g v";
     let matching = "let g = fn v => match v with | {x} => {} | {y} => f v end";
     for src in [
         format!("{annotated}\n{matching}"),
@@ -816,7 +799,7 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
         let (mint, _, output) = inferred(&src);
         assert_eq!(
             scheme(&mint, &output, "f"),
-            "{ x when a: Nat, y when b: Nat } -> {} where let a, b; a != b"
+            "{ x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b"
         );
     }
 
@@ -825,17 +808,11 @@ fn an_annotation_the_definition_keeps_open_is_no_complaint() {
     // read. One of the two tails is bound to the other and both are still open,
     // which is the type each of them says it has.
     let (mint, _, output) = inferred(
-        "let f : (`A Nat | ..r) -> Nat where let r = fn p => g p\n\
-         let g : (`A Nat | ..s) -> Nat where let s = fn p => f p",
+        "let f : (#A Nat | ..'r) -> Nat = fn p => g p\n\
+         let g : (#A Nat | ..'s) -> Nat = fn p => f p",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "`A Nat | ..a -> Nat where let a"
-    );
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "`A Nat | ..a -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "#A Nat | ..'a -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "#A Nat | ..'a -> Nat");
 }
 
 /// One mistake is one complaint. Everything a failure abandons it also
@@ -849,16 +826,14 @@ fn a_definition_that_already_failed_is_not_also_told_off_for_its_annotation() {
     // the suppression above cannot be what saves this one. The annotation's
     // variables were bound — to the undecided row, by the recovery that follows
     // absorbing the error term — and that is not a narrowing.
-    let (_, out, output) =
-        infer_src("let f : { x when a: Nat, .. } -> Nat where let a = fn p => nope p");
+    let (_, out, output) = infer_src("let f : { x when 'a: Nat, .. } -> Nat = fn p => nope p");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
 
     // And one of inference's own: the field the body asks for is not the one
     // the type has, which is the thing to fix. That it also pinned the tail
     // on the way is not a second mistake.
-    let (_, _, output) =
-        infer_src("let f : { x when a: Nat, y: Nat } -> Nat where let a = fn p => p.q");
+    let (_, _, output) = infer_src("let f : { x when 'a: Nat, y: Nat } -> Nat = fn p => p.q");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
@@ -871,12 +846,12 @@ fn a_definition_that_already_failed_is_not_also_told_off_for_its_annotation() {
 #[test]
 fn two_rows_sharing_a_tail_cannot_differ() {
     let (mint, _, output) = infer_src(
-        "let g : { x: Nat, ..r } -> { y: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let g : { x: Nat, ..'r } -> { y: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn c => g c c",
     );
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "{ x: Nat, ..a } -> { y: Nat, ..a } -> Nat where let a"
+        "{ x: Nat, ..'a } -> { y: Nat, ..'a } -> Nat"
     );
     assert!(
         output
@@ -904,11 +879,11 @@ fn a_tail_may_not_take_a_field_its_own_row_names() {
     // Reached through a call rather than through `h`'s own body, and that is
     // where the condition has to be said again: the scheme quantifies the
     // shared tail, and losing the condition on the way out of a scheme is how
-    // this one used to be reported — as an incidental ``Nat ~ {}`` mismatch,
+    // this one used to be reported — as an incidental `Nat ~ {}` mismatch,
     // and only because the two rows happened to meet a second time. Inside the
     // body `r` is rigid instead, which is a stronger refusal in other words.
     let (_, _, output) = infer_src(
-        "let h : { ..r } -> { x: { y: Nat, ..r } } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { ..'r } -> { x: { y: Nat, ..'r } } -> Nat = fn a => fn b => 1\n\
          let z = h { y: {} } { x: { y: 1 } }",
     );
     let [error] = output.errors.as_slice() else {
@@ -924,7 +899,7 @@ fn a_tail_may_not_take_a_field_its_own_row_names() {
     // two fields it may not have is one row gone wrong, and it names the
     // first of them in the order the row writes them.
     let (_, _, output) = infer_src(
-        "let h : { ..r } -> { x: { a: Nat, b: Nat, ..r } } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { ..'r } -> { x: { a: Nat, b: Nat, ..'r } } -> Nat = fn a => fn b => 1\n\
          let z = h { a: 1, b: 2 } { x: { a: 1, b: 2 } }",
     );
     let [error] = output.errors.as_slice() else {
@@ -956,11 +931,11 @@ fn a_row_repeating_two_fields_is_one_complaint() {
         ir::ErrorKind::RepeatedRowField { field, .. } if field == "x"
     ));
 
-    // The same thing reached through a variable, where only the solve can know
+    // The same thing reached through a variable, where 'only the solve can know
     // it: the tail `r` stands for the rest of a row that already names `x` and
     // `y`, and the second argument is what says what that rest is.
     let (_, out, output) = infer_src(
-        "let h : { x: Nat, y: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { x: Nat, y: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let k = fn p q => h p { x: 1, y: 2 }",
     );
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
@@ -983,7 +958,7 @@ fn what_a_tail_may_not_be_is_carried_across_a_binding() {
     // which no annotation ever mentioned — that has to refuse the `y` the
     // last projection asks for.
     let (_, _, output) = infer_src(
-        "let h : { y: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { y: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let k = fn p q => { m: h p q, n: q.w, o: q.y }",
     );
     let [error] = output.errors.as_slice() else {
@@ -994,17 +969,17 @@ fn what_a_tail_may_not_be_is_carried_across_a_binding() {
     // And a tail that never conflicts is still free: sharing one `r` across
     // rows that all agree costs nothing.
     let (mint, _, output) = inferred(
-        "let h : { y: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { y: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let z = h { y: 1, q: 2 } { q: 2 }",
     );
     assert_eq!(scheme(&mint, &output, "z"), "Nat");
     let (mint, _, output) = inferred(
-        "let h : { y: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let h : { y: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let k = fn p q => { m: h p q, n: q.w }",
     );
     assert_eq!(
         scheme(&mint, &output, "k"),
-        "{ y: Nat, w: a, ..b } -> { w: a, ..b } -> { m: Nat, n: a } where let a, b"
+        "{ y: Nat, w: 'a, ..'b } -> { w: 'a, ..'b } -> { m: Nat, n: 'a }"
     );
 }
 
@@ -1037,7 +1012,7 @@ fn names_a_solver_index(message: &str) -> bool {
 /// solver's bookkeeping rather than anything they wrote — and the index is a
 /// counter over the whole program, so it is not even a number they could count
 /// to. Resolving error payloads against an empty substitution left every one
-/// of them like that, beside a scheme calling the same type `'a`.
+/// of them like that, beside a scheme calling the same type `a`.
 #[test]
 fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
     let src = "let g = fn x y => ({ p: x, q: y }).missing";
@@ -1047,12 +1022,12 @@ fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
     };
     assert_eq!(
         error.kind.to_string(),
-        "no field `missing` on `{ p: a, q: b }`"
+        "no field `missing` on `{ p: 'a, q: 'b }`"
     );
-    assert_eq!(scheme(&mint, &output, "g"), "a -> b -> ? where let a, b");
+    assert_eq!(scheme(&mint, &output, "g"), "'a -> 'b -> ?");
 
     // The counter runs over the whole program, so a definition solved after
-    // others is where an index shows through as something unplaceable.
+    // others is where 'an index shows through as something unplaceable.
     let (_, _, output) = infer_src(&format!(
         "let f = fn a b c => {{ p: a, q: b, r: c }}\n{src}"
     ));
@@ -1061,7 +1036,7 @@ fn a_diagnostic_spells_a_variable_the_way_the_scheme_does() {
     };
     assert_eq!(
         error.kind.to_string(),
-        "no field `missing` on `{ p: a, q: b }`"
+        "no field `missing` on `{ p: 'a, q: 'b }`"
     );
 
     // Every payload that carries a type, over every complaint that has one.
@@ -1103,16 +1078,16 @@ fn a_projection_off_a_non_struct_names_the_type_with_no_fields() {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
     assert_eq!(error.kind.code(), "missing-field");
-    assert_eq!(error.kind.to_string(), "no field `b` on `a -> b`");
+    assert_eq!(error.kind.to_string(), "no field `b` on `'a -> 'b`");
 
     // And a sum-cored base, which is the case that decides the noun: the row
     // that went wrong is the type's *fields*, so the reader is told about a
     // field even though the type beside it is written in cases.
-    let (_, _, output) = infer_src("let bad = (`A 1).x");
+    let (_, _, output) = infer_src("let bad = (#A 1).x");
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
     };
-    assert_eq!(error.kind.to_string(), "no field `x` on ``A Nat | ..a`");
+    assert_eq!(error.kind.to_string(), "no field `x` on `#A Nat | ..'a`");
 
     // A closed struct against a `Nat` stays an ordinary mismatch, both ways
     // round: the reader wrote both of those types, and naming both is more
@@ -1504,7 +1479,7 @@ fn lowering_errors_are_absorbed_not_echoed() {
 #[test]
 fn a_bad_row_argument_is_absorbed_not_echoed() {
     let (_, out, output) = infer_src(
-        "type Or r = `A | ..r\n\
+        "type Or r = #A | ..r\n\
          let f : Or Nat -> Nat = fn p => 1",
     );
     assert_eq!(out.errors.len(), 1, "ir errors: {:#?}", out.errors);
@@ -1577,8 +1552,8 @@ fn closing_a_row_from_both_sides_agrees_with_itself() {
     // first side binds the shared continuation to `∅`, and the second finds it
     // already there and says so.
     let (mint, _, output) = infer_src(
-        "let f : (`A Nat) -> Nat = fn p => 1\n\
-         let g : (`B Nat) -> Nat = fn p => 1\n\
+        "let f : (#A Nat) -> Nat = fn p => 1\n\
+         let g : (#B Nat) -> Nat = fn p => 1\n\
          let h = fn v => { one: f v, two: g v }",
     );
     let taken = steps(&mint, &output, "h");
@@ -1623,14 +1598,14 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
             "struct  { z: ?7, ..?8 } ~ { x: ?3, y: ?5, ..?9 } => replaced by the goals below",
             "  bind  ?8 ~ { x: ?3, y: ?5, ..?10 } => ?8 := { x: ?3, y: ?5, ..?10 }",
             "  bind  { z: ?7, ..?10 } ~ ?9 => ?9 := { z: ?7, ..?10 }",
-            "bind  ?0 ~ ?1 -> { a: ?3, b: ?5, c: ?7 } ! ..?2 => ?0 := ?1 -> { a: ?3, b: ?5, c: ?7 } ! ..?2",
+            "bind  ?0 ~ ?1 -> { a: ?3, b: ?5, c: ?7 } + ..?2 => ?0 := ?1 -> { a: ?3, b: ?5, c: ?7 } + ..?2",
         ]
     );
 
     // The guard against two rows sharing one tail is part of the rule too, so
     // it fails under the step rather than instead of it.
     let (mint, _, output) = infer_src(
-        "let g : { x: Nat, ..r } -> { y: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let g : { x: Nat, ..'r } -> { y: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn c => g c c",
     );
     assert_eq!(
@@ -1648,7 +1623,7 @@ fn a_struct_rule_owns_the_steps_beneath_it() {
             "  recover  ?3 ~ ? => ?3 := ?",
             "performs  ∅ ~ ?2 => replaced by the goals below",
             "  bind  ?5 ~ ?2 => ?5 := ?2",
-            "bind  ?0 ~ ?1 -> Nat ! ..?2 => ?0 := ?1 -> Nat ! ..?2",
+            "bind  ?0 ~ ?1 -> Nat + ..?2 => ?0 := ?1 -> Nat + ..?2",
         ]
     );
 }
@@ -1851,7 +1826,7 @@ fn a_field_complaint_keeps_the_optional_fields_of_the_type_it_names() {
     // absent — in the same struct rule that refuses `c`. The type in the
     // message is the annotation, with the presence the failure abandoned
     // printed as the `?` that says exactly that.
-    let src = "let g : { a when a: Nat, b: Nat } -> Nat = fn r => r.b\nlet z = g { b: 1, c: 2 }";
+    let src = "let g : { a when 'a: Nat, b: Nat } -> Nat = fn r => r.b\nlet z = g { b: 1, c: 2 }";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected exactly one error: {:#?}", output.errors);
@@ -1880,7 +1855,7 @@ fn a_field_complaint_keeps_the_optional_fields_of_the_type_it_names() {
     // it does not have — and the optional field survives in the one that
     // mentions it.
     let (_, _, output) =
-        infer_src("let g : { a when a: Nat, b: Nat } -> Nat = fn r => r.b\nlet z = g { c: 2 }");
+        infer_src("let g : { a when 'a: Nat, b: Nat } -> Nat = fn r => r.b\nlet z = g { c: 2 }");
     let messages: Vec<String> = output
         .errors
         .iter()
@@ -1924,7 +1899,7 @@ fn a_constructor_stands_for_its_body_with_its_arguments_put_in() {
     assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
 }
 
-/// Two applications of one declaration are equal when their arguments are, and
+/// Two applications of one declaration are equal when 'their arguments are, and
 /// that is decided without unfolding either. Deciding it here is what keeps a
 /// declaration that leads back to itself from unfolding forever.
 #[test]
@@ -2075,12 +2050,12 @@ fn an_assumption_is_read_against_what_has_since_been_decided() {
          type Forest = { head: Tree { x: Nat }, tail: Forest }\n\
          type Wood a = { value: a, kids: Grove }\n\
          type Grove = { head: Wood { x: Nat }, tail: Grove }\n\
-         let peek : Tree { x when a: Nat } -> Forest where let a = fn t => t.kids\n\
+         let peek : Tree { x when 'a: Nat } -> Forest = fn t => t.kids\n\
          let q : Wood { x: Nat } -> Grove = fn w => peek w",
     );
     assert_eq!(
         scheme(&mint, &output, "peek"),
-        "Tree { x when a: Nat } -> Forest where let a"
+        "Tree { x when 'a: Nat } -> Forest"
     );
     assert_eq!(
         steps(&mint, &output, "q")[..9],
@@ -2180,7 +2155,7 @@ fn a_pass_through_declaration_may_be_nested() {
 fn a_row_inside_an_argument_still_lacks_what_it_names() {
     let (_, _, output) = infer_src(
         "type Box A = { it: A }\n\
-         let f : Box { x: Nat, ..r } -> { ..r } -> Nat where let r = fn b => fn c => 1\n\
+         let f : Box { x: Nat, ..'r } -> { ..'r } -> Nat = fn b => fn c => 1\n\
          let z = fn b => f b { x: 1 }",
     );
     assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
@@ -2188,7 +2163,7 @@ fn a_row_inside_an_argument_still_lacks_what_it_names() {
 }
 
 /// A quantified argument is the definition's to generalize, the same as one
-/// written anywhere else. This is what fails if `quantify` or `zonk` stops at a
+/// written anywhere 'else. This is what fails if `quantify` or `zonk` stops at a
 /// name instead of descending into what it was applied to.
 #[test]
 fn an_open_argument_is_generalized_with_its_definition() {
@@ -2198,7 +2173,7 @@ fn an_open_argument_is_generalized_with_its_definition() {
     );
     assert_eq!(
         scheme(&mint, &output, "wrap"),
-        "Box { x: Nat, ..a } -> Nat where let a"
+        "Box { x: Nat, ..'a } -> Nat"
     );
 }
 
@@ -2255,7 +2230,7 @@ fn a_row_argument_is_spliced_into_the_tail() {
 /// A row written out is refused where it is written, because what the
 /// declaration names is part of what its parameter stands for and lowering has
 /// both. A row that only turns out to name the field once the solve says what
-/// it is has nowhere earlier to be caught, and is caught at the binding.
+/// it is has nowhere 'earlier to be caught, and is caught at the binding.
 #[test]
 fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     let (_, out, _) = infer_src(
@@ -2271,7 +2246,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     // declaration's shape, which the projection here is what does.
     let (_, _, output) = infer_src(
         "type WithX r = { x: Nat, ..r }\n\
-         let g : WithX { ..s } -> { ..s } -> Nat where let s = fn p => fn q => 1\n\
+         let g : WithX { ..'s } -> { ..'s } -> Nat = fn p => fn q => 1\n\
          let z = fn p => g p { x: p.x }",
     );
     assert_eq!(output.errors.len(), 1, "errors: {:#?}", output.errors);
@@ -2281,7 +2256,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
     // fine: the row still stands for what the declaration does not name.
     let (_, _, output) = inferred(
         "type WithX r = { x: Nat, ..r }\n\
-         let ok : WithX { ..s } -> { x: Nat, ..s } where let s = fn p => p",
+         let ok : WithX { ..'s } -> { x: Nat, ..'s } = fn p => p",
     );
     assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
 }
@@ -2302,7 +2277,7 @@ fn a_row_argument_may_not_repeat_a_field_the_type_names() {
 fn a_row_condition_survives_a_goal_that_never_unfolds() {
     let (_, out, output) = infer_src(
         "type WithX r = { x: Nat, ..r }\n\
-         let f : WithX { ..s } -> { ..s } -> Nat where let s = fn a => fn b => 1\n\
+         let f : WithX { ..'s } -> { ..'s } -> Nat = fn a => fn b => 1\n\
          let g = fn q => f q { x: 1 }",
     );
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
@@ -2313,7 +2288,7 @@ fn a_row_condition_survives_a_goal_that_never_unfolds() {
     // same route with nothing to say.
     let (_, _, output) = infer_src(
         "type WithX r = { x: Nat, ..r }\n\
-         let f : WithX { ..s } -> { ..s } -> Nat where let s = fn a => fn b => 1\n\
+         let f : WithX { ..'s } -> { ..'s } -> Nat = fn a => fn b => 1\n\
          let g = fn q => f q { y: 1 }",
     );
     assert!(output.errors.is_empty(), "errors: {:#?}", output.errors);
@@ -2342,7 +2317,7 @@ fn a_refused_row_is_not_compared_afterwards() {
 
     // Nothing says it again where it was said: what inference is left with is
     // the definition's own body against the fields `W` declares, which is a
-    // complaint about somewhere else or none at all.
+    // complaint about somewhere 'else or 'none at all.
     for error in &output.errors {
         assert_ne!(error.span.start, out.errors[0].span.start, "{:#?}", error);
         assert_ne!(error.kind.code(), "repeated-field", "{error:#?}");
@@ -2428,20 +2403,17 @@ fn a_recursion_that_cannot_grow_always_comes_back_round() {
 /// whole of what makes a sum row-polymorphic.
 #[test]
 fn a_tag_is_open_where_a_struct_literal_is_closed() {
-    let (mint, _, out) = inferred("let v = `Some 1");
-    assert_eq!(scheme(&mint, &out, "v"), "`Some Nat | ..a where let a");
+    let (mint, _, out) = inferred("let v = #Some 1");
+    assert_eq!(scheme(&mint, &out, "v"), "#Some Nat | ..'a");
 
     // A case written bare carries unit, which is the same type `()` has.
-    let (mint, _, out) = inferred("let n = `None");
-    assert_eq!(scheme(&mint, &out, "n"), "`None | ..a where let a");
+    let (mint, _, out) = inferred("let n = #None");
+    assert_eq!(scheme(&mint, &out, "n"), "#None | ..'a");
 
     // The payload is inferred like anything else, so a function over one is
     // polymorphic in what it wraps as well as in the cases it allows.
-    let (mint, _, out) = inferred("let wrap = fn x => `Some x");
-    assert_eq!(
-        scheme(&mint, &out, "wrap"),
-        "a -> `Some a | ..b where let a, b"
-    );
+    let (mint, _, out) = inferred("let wrap = fn x => #Some x");
+    assert_eq!(scheme(&mint, &out, "wrap"), "'a -> #Some 'a | ..'b");
 }
 
 /// A declared sum lists every case there is, so a literal naming one of them
@@ -2449,9 +2421,9 @@ fn a_tag_is_open_where_a_struct_literal_is_closed() {
 #[test]
 fn a_tag_fits_a_declaration_that_allows_its_case() {
     let (mint, _, out) = inferred(
-        "type Option T = `Some T | `None\n\
-         let some : Option Nat = `Some 1\n\
-         let none : Option Nat = `None",
+        "type Option T = #Some T | #None\n\
+         let some : Option Nat = #Some 1\n\
+         let none : Option Nat = #None",
     );
     assert_eq!(scheme(&mint, &out, "some"), "Option Nat");
     assert_eq!(scheme(&mint, &out, "none"), "Option Nat");
@@ -2459,8 +2431,8 @@ fn a_tag_fits_a_declaration_that_allows_its_case() {
     // And the annotation is what the definition means downstream, so a second
     // definition can take it as the declared type.
     let (mint, _, out) = inferred(
-        "type Option T = `Some T | `None\n\
-         let some : Option Nat = `Some 1\n\
+        "type Option T = #Some T | #None\n\
+         let some : Option Nat = #Some 1\n\
          let again : Option Nat = some",
     );
     assert_eq!(scheme(&mint, &out, "again"), "Option Nat");
@@ -2472,25 +2444,25 @@ fn a_tag_fits_a_declaration_that_allows_its_case() {
 #[test]
 fn a_case_a_sum_does_not_allow_is_reported_as_a_case() {
     let (_, _, out) = infer_src(
-        "type Flag = `On | `Off\n\
-         let bad : Flag = `Maybe",
+        "type Flag = #On | #Off\n\
+         let bad : Flag = #Maybe",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "extra-field");
     assert_eq!(
         out.errors[0].kind.to_string(),
-        "extra case ``Maybe`: the type ``On | `Off` lists every case it allows"
+        "extra case `#Maybe`: the type `#On | #Off` lists every case it allows"
     );
 
     // The other direction: a closed sum on the value's side, against a type
     // that requires a case it has not got.
     let (_, _, out) = infer_src(
-        "let f : (`A Nat | `B) -> Nat = fn x => 1\n\
-         let g : (`A Nat) -> Nat = fn y => f y",
+        "let f : (#A Nat | #B) -> Nat = fn x => 1\n\
+         let g : (#A Nat) -> Nat = fn y => f y",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "missing-field");
-    assert_eq!(out.errors[0].kind.to_string(), "no case ``B` on ``A Nat`");
+    assert_eq!(out.errors[0].kind.to_string(), "no case `#B` on `#A Nat`");
 }
 
 /// A struct and a sum are two types, however much their rows look alike. The
@@ -2498,17 +2470,17 @@ fn a_case_a_sum_does_not_allow_is_reported_as_a_case() {
 /// the ordinary mismatch it is.
 #[test]
 fn a_struct_and_a_sum_are_never_the_same_type() {
-    let (_, _, out) = infer_src("let bad : { a: Nat } = `a 1");
+    let (_, _, out) = infer_src("let bad : { a: Nat } = #a 1");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "type-mismatch");
 
     // And a sum carries no fields of its own, so a projection against one is
     // a missing *field* — the noun follows the row that went wrong, which is
     // the type's field row, not the cases the type prints as.
-    let (_, _, out) = infer_src("let f : (`A Nat) -> Nat = fn s => s.a");
+    let (_, _, out) = infer_src("let f : (#A Nat) -> Nat = fn s => s.a");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "missing-field");
-    assert_eq!(out.errors[0].kind.to_string(), "no field `a` on ``A Nat`");
+    assert_eq!(out.errors[0].kind.to_string(), "no field `a` on `#A Nat`");
 }
 
 /// The row machinery is one machinery, so a declaration takes the rest of a
@@ -2516,17 +2488,17 @@ fn a_struct_and_a_sum_are_never_the_same_type() {
 #[test]
 fn a_declaration_may_take_the_rest_of_a_sum() {
     let (mint, _, out) = inferred(
-        "type Fallible r = `Err Nat | ..r\n\
-         let ok : Fallible (`Ok Nat) = `Ok 1",
+        "type Fallible r = #Err Nat | ..r\n\
+         let ok : Fallible (#Ok Nat) = #Ok 1",
     );
-    assert_eq!(scheme(&mint, &out, "ok"), "Fallible (`Ok Nat)");
+    assert_eq!(scheme(&mint, &out, "ok"), "Fallible (#Ok Nat)");
 
     // What the tail may not name is a fact about the declaration, so a use
     // site repeating one of its cases is refused where the argument is
     // written — before anything unfolds.
     let (_, out, _) = infer_src(
-        "type Fallible r = `Err Nat | ..r\n\
-         let bad : Fallible (`Err Nat) = `Err 1",
+        "type Fallible r = #Err Nat | ..r\n\
+         let bad : Fallible (#Err Nat) = #Err 1",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -2541,8 +2513,8 @@ fn a_declaration_may_take_the_rest_of_a_sum() {
 #[test]
 fn the_solve_names_the_shape_it_took_apart() {
     let (mint, _, out) = inferred(
-        "type Flag = `On Nat | `Off Nat\n\
-         let v = `On 1\n\
+        "type Flag = #On Nat | #Off Nat\n\
+         let v = #On 1\n\
          let f : Flag = v",
     );
     let taken = steps(&mint, &out, "f");
@@ -2558,8 +2530,8 @@ fn the_solve_names_the_shape_it_took_apart() {
     // against a struct reads as it always has: the core step under a
     // [`Rule::Struct`] is silent whenever the two cores are unit.
     let (mint, _, out) = inferred(
-        "type Flag = `On | `Off\n\
-         let v = `On\n\
+        "type Flag = #On | #Off\n\
+         let v = #On\n\
          let g : Flag = v",
     );
     let carrying_unit = steps(&mint, &out, "g");
@@ -2579,8 +2551,8 @@ fn the_solve_names_the_shape_it_took_apart() {
 #[test]
 fn checking_pushes_a_sum_into_a_tag() {
     let (mint, _, out) = inferred(
-        "type Flag = `On Nat | `Off Nat\n\
-         let f : Flag = `On 1",
+        "type Flag = #On Nat | #Off Nat\n\
+         let f : Flag = #On 1",
     );
     assert_eq!(
         steps(&mint, &out, "f"),
@@ -2596,15 +2568,15 @@ fn checking_pushes_a_sum_into_a_tag() {
 /// every other case, and a `when` allows exactly one more.
 #[test]
 fn a_case_may_be_marked_optional() {
-    let (mint, _, out) = inferred("let m : `A (when a) Nat | `B where let a = `B");
-    assert_eq!(scheme(&mint, &out, "m"), "`A (when a) Nat | `B where let a");
+    let (mint, _, out) = inferred("let m : #A (when 'a) Nat | #B = #B");
+    assert_eq!(scheme(&mint, &out, "m"), "#A (when 'a) Nat | #B");
 
     // A presence is not skolemized — the clause and the store are what govern
     // one — so a definition that settles it is no complaint at all, and the
     // scheme says what the definition turned out to be.
-    let (mint, _, out) = inferred("let m : `A (when a) Nat | `B where let a = `A 1");
+    let (mint, _, out) = inferred("let m : #A (when 'a) Nat | #B = #A 1");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert_eq!(scheme(&mint, &out, "m"), "`A Nat | `B");
+    assert_eq!(scheme(&mint, &out, "m"), "#A Nat | #B");
 }
 
 /// A sum leads back to itself the way a struct does, and unfolding it stops at
@@ -2612,16 +2584,16 @@ fn a_case_may_be_marked_optional() {
 #[test]
 fn a_sum_may_name_itself() {
     let (mint, _, out) = inferred(
-        "type List a = `Nil | `Cons { head: a, tail: List a }\n\
-         let empty : List Nat = `Nil\n\
-         let one : List Nat = `Cons { head: 1, tail: empty }",
+        "type List a = #Nil | #Cons { head: a, tail: List a }\n\
+         let empty : List Nat = #Nil\n\
+         let one : List Nat = #Cons { head: 1, tail: empty }",
     );
     assert_eq!(scheme(&mint, &out, "empty"), "List Nat");
     assert_eq!(scheme(&mint, &out, "one"), "List Nat");
     let symbol = symbol_named(&mint, out.aliases.keys().copied(), "List");
     assert_eq!(
         out.aliases[&symbol].to_string(),
-        "`Nil | `Cons { head: a, tail: List a } where let a"
+        "#Nil | #Cons { head: 'a, tail: List 'a }"
     );
 }
 
@@ -2631,8 +2603,8 @@ fn a_sum_may_name_itself() {
 #[test]
 fn a_sum_tail_may_not_come_back_naming_its_own_case() {
     let (_, out, output) = infer_src(
-        "let h : (`A Nat | ..r) -> (| ..r) -> Nat where let r = fn a => fn b => 1\n\
-         let k = fn p => h p (`A 1)",
+        "let h : (#A Nat | ..'r) -> (| ..'r) -> Nat = fn a => fn b => 1\n\
+         let k = fn p => h p (#A 1)",
     );
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
@@ -2644,7 +2616,7 @@ fn a_sum_tail_may_not_come_back_naming_its_own_case() {
     assert_eq!(
         output.errors[0].kind.to_string(),
         "`..` covers only the cases a type does not already name, \
-         and here it would have to cover ``A`"
+         and here it would have to cover `#A`"
     );
 }
 
@@ -2662,7 +2634,7 @@ fn a_sum_tail_may_not_come_back_naming_its_own_case() {
 fn a_settled_presence_is_reported_as_the_field_it_is_about() {
     // The annotation demands the field; the row it is given no longer has it.
     let (_, _, output) = infer_src(
-        "let optional : { x when a: Nat, .. } -> Nat = fn p => 1\n\
+        "let optional : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
          let demands : { x: Nat } -> Nat = fn p => p.x\n\
          let f = fn r => { a: optional r, b: closed r, c: demands r }",
@@ -2680,7 +2652,7 @@ fn a_settled_presence_is_reported_as_the_field_it_is_about() {
     // And the other way round: the parameter settled the field away, so a
     // caller writing it is writing one the function does not take.
     let (_, _, output) = infer_src(
-        "let optional : { x when a: Nat, .. } -> Nat = fn p => 1\n\
+        "let optional : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
          let f = fn r => { a: optional r, b: closed r }\n\
          let v = f { x: 1 }",
@@ -2702,7 +2674,7 @@ fn a_settled_presence_is_reported_as_the_field_it_is_about() {
 #[test]
 fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
     inferred(
-        "let optional : { x when a: Nat, .. } -> Nat where let a = fn p => 1\n\
+        "let optional : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
          let f = fn r => { a: optional r, b: closed r, c: closed r }",
     );
@@ -2711,7 +2683,7 @@ fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
     // without going near the field's type: an absent field's type slot means
     // nothing, and constraining it would refuse rows that agree.
     inferred(
-        "let optional : { x when a: Nat, .. } -> Nat where let a = fn p => 1\n\
+        "let optional : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
          let f = fn r => { a: optional r, b: closed r, c: optional r }",
     );
@@ -2727,32 +2699,32 @@ fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
 #[test]
 fn a_field_settled_absent_is_no_repeat_for_a_tail_that_lacks_it() {
     inferred(
-        "let opt : { x when a: Nat, .. } -> Nat where let a = fn p => 1\n\
+        "let opt : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
-         let g : { x: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+         let g : { x: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn p q => { a: opt q, b: closed q, c: g p q }",
     );
 
     // The same row met the other way round — the lacking tail arriving on the
     // actual side — reaches the same check at the same binding.
     inferred(
-        "let opt : { x when a: Nat, .. } -> Nat where let a = fn p => 1\n\
+        "let opt : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
          let closed : {} -> Nat = fn p => 1\n\
-         let g : { ..r } -> { x: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+         let g : { ..'r } -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn p q => { a: opt q, b: closed q, c: g q p }",
     );
 }
 
 /// The sum's spelling of the test above: a case settled absent is not one of
 /// the cases a value can be, so a tail forbidden the case can still take the
-/// row. `q` can only be `` `B `` — `only` settled its optional `` `A `` away —
-/// and `g` asks `q` to be exactly the cases `p` allows beyond `` `A ``.
+/// row. `q` can only be `#B` — `only` settled its optional `#A` away —
+/// and `g` asks `q` to be exactly the cases `p` allows beyond `#A`.
 #[test]
 fn a_case_settled_absent_is_no_repeat_for_a_tail_that_lacks_it() {
     inferred(
-        "let opt : (`A (when a) Nat | ..) -> Nat where let a = fn p => 1\n\
-         let only : (`B Nat) -> Nat = fn p => 1\n\
-         let g : (`A Nat | ..r) -> (| ..r) -> Nat where let r = fn a => fn b => 1\n\
+        "let opt : (#A (when 'a) Nat | ..) -> Nat = fn p => 1\n\
+         let only : (#B Nat) -> Nat = fn p => 1\n\
+         let g : (#A Nat | ..'r) -> (| ..'r) -> Nat = fn a => fn b => 1\n\
          let h = fn p q => { a: opt q, b: only q, c: g p q }",
     );
 }
@@ -2767,8 +2739,8 @@ fn a_case_settled_absent_is_no_repeat_for_a_tail_that_lacks_it() {
 #[test]
 fn an_undecided_field_meeting_a_tail_that_lacks_it_settles_absent() {
     inferred(
-        "let opt : { x when a: Nat, .. } -> Nat where let a = fn p => 1\n\
-         let g : { x: Nat, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let opt : { x when 'a: Nat, .. } -> Nat = fn p => 1\n\
+         let g : { x: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn p q => { a: opt q, b: g p q }",
     );
 }
@@ -2787,7 +2759,7 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
     // against a struct with a field it does not name, and the abandoned core
     // takes the whole of it. One mistake, and inference adds nothing to it.
     let (mint, out, output) =
-        infer_src("let f : { x when a: Nat, .. } -> Nat where let a = fn p => f { y: nope p }");
+        infer_src("let f : { x when 'a: Nat, .. } -> Nat = fn p => f { y: nope p }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     let taken = steps(&mint, &output, "f");
@@ -2805,11 +2777,11 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
     );
 
     // A sum's tail is still a tail, and an abandoned one still absorbs where it
-    // stands: the annotation's `..r` is thrown away by the same bad
+    // stands: the annotation's `..'r` is thrown away by the same bad
     // application, and the closed sum it is then asked to be meets it there.
     let (mint, out, output) = infer_src(
-        "let g : Nat -> (`A Nat) -> Nat = fn a => fn b => 1\n\
-         let f : (`A Nat | ..) -> Nat = fn p => g (nope p) p",
+        "let g : Nat -> (#A Nat) -> Nat = fn a => fn b => 1\n\
+         let f : (#A Nat | ..) -> Nat = fn p => g (nope p) p",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -2843,11 +2815,10 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
 fn a_presence_against_itself_is_already_the_same_presence() {
     // A recursive call is monomorphic, so the parameter's row meets itself:
     // one `when` on both sides, and one tail on both sides.
-    let (mint, _, output) =
-        inferred("let f : { x when a: Nat, .. } -> Nat where let a = fn p => f p");
+    let (mint, _, output) = inferred("let f : { x when 'a: Nat, .. } -> Nat = fn p => f p");
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, ..'b } -> Nat"
     );
     assert_eq!(
         steps(&mint, &output, "f"),
@@ -2857,7 +2828,7 @@ fn a_presence_against_itself_is_already_the_same_presence() {
             "  same  ?0 ~ ?0 => no change",
             "  prim  Nat ~ Nat => no change",
             // The recursive call opens what `f` may perform — nothing, since
-            // the annotation carries no `!` — into the ambient the annotation
+            // the annotation carries no `+` — into the ambient the annotation
             // already closed.
             "performs  ∅ ~ ∅ => replaced by the goals below",
             "  bind  ?2 ~ ∅ => ?2 := ∅",
@@ -2876,9 +2847,9 @@ fn two_presences_that_already_agree_need_no_rule_of_their_own() {
     // itself through a tail it shares — so the field settled absent is named on
     // both sides of one goal, absent on both.
     let (mint, _, output) = inferred(
-        "let optional : { x when a: Nat, y: Nat, .. } -> Nat where let a = fn p => 1\n\
+        "let optional : { x when 'a: Nat, y: Nat, .. } -> Nat = fn p => 1\n\
          let closed : { y: Nat } -> Nat = fn p => 1\n\
-         let both : { y: Nat, ..s } -> { y: Nat, ..s } -> Nat where let s = fn p => fn q => 1\n\
+         let both : { y: Nat, ..'s } -> { y: Nat, ..'s } -> Nat = fn p => fn q => 1\n\
          let f = fn r => { a: optional r, b: closed r, c: both r r }",
     );
     assert_eq!(
@@ -2894,7 +2865,7 @@ fn two_presences_that_already_agree_need_no_rule_of_their_own() {
 
 /// A declaration whose parameter is its whole rest names nothing beside it, so
 /// there is no label an argument could repeat and nothing to forbid. The
-/// condition is recorded only where there is one.
+/// condition is recorded only where 'there is one.
 #[test]
 fn a_rest_that_stands_for_everything_forbids_nothing() {
     let (mint, _, output) = inferred("type Only r = { ..r }\nlet v : Only { x: Nat } = { x: 1 }");
@@ -2949,13 +2920,13 @@ fn an_assumption_matches_through_a_variable_the_two_sides_share() {
          type Nest a = { head: Tree a, tail: Nest a }\n\
          type Wood a = { value: a, kids: Grove a }\n\
          type Grove a = { head: Wood a, tail: Grove a }\n\
-         let peek : Tree { x when a: Nat } -> Nat where let a = fn t => 1\n\
-         let take : Wood { x when b: Nat } -> Nat where let b = fn w => 2\n\
+         let peek : Tree { x when 'a: Nat } -> Nat = fn t => 1\n\
+         let take : Wood { x when 'b: Nat } -> Nat = fn w => 2\n\
          let q = fn w => { a: peek w, b: take w }",
     );
     assert_eq!(
         scheme(&mint, &output, "q"),
-        "Tree { x when a: Nat } -> { a: Nat, b: Nat } where let a"
+        "Tree { x when 'a: Nat } -> { a: Nat, b: Nat }"
     );
 }
 
@@ -2972,25 +2943,22 @@ fn an_assumption_compares_arguments_of_every_shape() {
     let (mint, _, output) = inferred(
         "type A r = { next: B r, ..r }\n\
          type B r = { next: A r, ..r }\n\
-         let use : { ..s } -> A { ..s } -> B { ..s } -> Nat where let s = fn c => fn x => fn y => 1\n\
+         let use : { ..'s } -> A { ..'s } -> B { ..'s } -> Nat = fn c => fn x => fn y => 1\n\
          let n = fn z => fn w => use { j: w } z z",
     );
-    assert_eq!(
-        scheme(&mint, &output, "n"),
-        "A { j: a } -> a -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { j: 'a } -> 'a -> Nat");
 
     // An argument that is a sum, compared case by case.
     let (mint, _, output) = inferred(
         "type A a = { v: a, next: B a }\n\
          type B a = { v: a, next: A a }\n\
-         let f : A (`X | `Y) -> Nat = fn p => 1\n\
-         let g : B (`X | `Y) -> Nat = fn p => 1\n\
+         let f : A (#X | #Y) -> Nat = fn p => 1\n\
+         let g : B (#X | #Y) -> Nat = fn p => 1\n\
          let h = fn z => { a: f z, b: g z }",
     );
     assert_eq!(
         scheme(&mint, &output, "h"),
-        "A (`X | `Y) -> { a: Nat, b: Nat }"
+        "A (#X | #Y) -> { a: Nat, b: Nat }"
     );
 
     // Two rows still open, at the same tail: the same row, so the goal is the
@@ -2998,13 +2966,10 @@ fn an_assumption_compares_arguments_of_every_shape() {
     let (mint, _, output) = inferred(
         "type A r = { next: B r, ..r }\n\
          type B r = { next: A r, ..r }\n\
-         let use : A { p: Nat, ..s } -> B { p: Nat, ..s } -> Nat where let s = fn x => fn y => 1\n\
+         let use : A { p: Nat, ..'s } -> B { p: Nat, ..'s } -> Nat = fn x => fn y => 1\n\
          let n = fn z => use z z",
     );
-    assert_eq!(
-        scheme(&mint, &output, "n"),
-        "A { p: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { p: Nat, ..'a } -> Nat");
 
     // And two rows whose tails are not each other, which is the answer that has
     // to be no: the declarations name themselves at a closed argument as well
@@ -3013,13 +2978,10 @@ fn an_assumption_compares_arguments_of_every_shape() {
     let (mint, _, output) = inferred(
         "type A r = { next: B r, alt: B { p: Nat }, ..r }\n\
          type B r = { next: A r, alt: A { p: Nat }, ..r }\n\
-         let use : A { p: Nat, ..s } -> B { p: Nat, ..s } -> Nat where let s = fn x => fn y => 1\n\
+         let use : A { p: Nat, ..'s } -> B { p: Nat, ..'s } -> Nat = fn x => fn y => 1\n\
          let n = fn z => use z z",
     );
-    assert_eq!(
-        scheme(&mint, &output, "n"),
-        "A { p: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "n"), "A { p: Nat, ..'a } -> Nat");
 }
 
 /// One declaration against itself is the same declaration however it was
@@ -3042,22 +3004,19 @@ fn one_declaration_applied_to_something_is_not_settled_by_its_name() {
 #[test]
 fn two_rows_sharing_a_tail_and_naming_the_same_fields_agree() {
     let (mint, _, output) = inferred(
-        "let f : { x: Nat, ..r } -> { x: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let f : { x: Nat, ..'r } -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let g = fn p => f p p",
     );
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "g"), "{ x: Nat, ..'a } -> Nat");
 
     // One more field on one side and the pair is the cycle again: whatever the
     // shared tail absorbed from one row it would grow on the other.
     for src in [
-        "let f : { x: Nat, ..r } -> { x: Nat, y: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let f : { x: Nat, ..'r } -> { x: Nat, y: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let g = fn p => f p p",
         // Whichever side is the longer one: the extras are the same cycle from
         // either end.
-        "let f : { x: Nat, y: Nat, ..r } -> { x: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let f : { x: Nat, y: Nat, ..'r } -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let g = fn p => f p p",
     ] {
         let (_, _, output) = infer_src(src);
@@ -3093,7 +3052,7 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
         // insides look alike.
         "type Bush = { t: Tree { b: Nat } }\n\
          type Bush2 = { t: Tree2 { b: Nat } }\n\
-         let f : Tree (`a Nat) -> Tree2 (`a Nat) = fn x => x",
+         let f : Tree (#a Nat) -> Tree2 (#a Nat) = fn x => x",
         // An arrow, compared side by side rather than whole.
         "type Bush = { t: Tree (Nat -> Nat) }\n\
          type Bush2 = { t: Tree2 (Nat -> Nat) }\n\
@@ -3117,13 +3076,13 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
          type Bush = { t: Tree { a: Nat } }\n\
          type Tree2 x = { v: x, k: Bush2 }\n\
          type Bush2 = { t: Tree2 { a: Nat } }\n\
-         let g : Tree { a when a: Nat } -> Nat where let a = fn x => 1\n\
-         let h : Tree2 { a when b: Nat } -> Nat where let b = fn x => 2\n\
+         let g : Tree { a when 'a: Nat } -> Nat = fn x => 1\n\
+         let h : Tree2 { a when 'b: Nat } -> Nat = fn x => 2\n\
          let f = fn y => { p: g y, q: h y }",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "Tree { a when a: Nat } -> { p: Nat, q: Nat } where let a"
+        "Tree { a when 'a: Nat } -> { p: Nat, q: Nat }"
     );
 }
 
@@ -3132,7 +3091,7 @@ fn an_assumption_is_not_reused_at_an_argument_it_was_not_pushed_for() {
 #[test]
 fn a_definition_may_name_itself() {
     let (mint, _, output) = inferred("let loop = fn x => loop x");
-    assert_eq!(scheme(&mint, &output, "loop"), "a -> b where let a, b");
+    assert_eq!(scheme(&mint, &output, "loop"), "'a -> 'b");
 }
 
 /// And the use is monomorphic, which is what a recursive use inside its own
@@ -3141,15 +3100,15 @@ fn a_definition_may_name_itself() {
 #[test]
 fn a_recursive_use_is_monomorphic() {
     let (mint, _, output) = inferred("let self = fn x => self 1");
-    assert_eq!(scheme(&mint, &output, "self"), "Nat -> a where let a");
+    assert_eq!(scheme(&mint, &output, "self"), "Nat -> 'a");
 }
 
 /// Two definitions can name each other, and both are typed at once.
 #[test]
 fn a_mutual_pair_is_typed_together() {
     let (mint, _, output) = inferred("let even = fn n => odd n  let odd = fn n => even n");
-    assert_eq!(scheme(&mint, &output, "even"), "a -> b where let a, b");
-    assert_eq!(scheme(&mint, &output, "odd"), "a -> b where let a, b");
+    assert_eq!(scheme(&mint, &output, "even"), "'a -> 'b");
+    assert_eq!(scheme(&mint, &output, "odd"), "'a -> 'b");
 }
 
 /// The regression test for the whole design. Grouping is what keeps a
@@ -3159,7 +3118,7 @@ fn a_mutual_pair_is_typed_together() {
 #[test]
 fn a_definition_outside_a_group_stays_polymorphic() {
     let (mint, _, output) = inferred("let id = fn x => x  let a = id 1  let b = id { x: 1 }");
-    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "{ x: Nat }");
 }
@@ -3169,7 +3128,7 @@ fn a_definition_outside_a_group_stays_polymorphic() {
 #[test]
 fn a_forward_reference_instantiates_a_scheme() {
     let (mint, _, output) = inferred("let a = id 1  let b = id { x: 1 }  let id = fn x => x");
-    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
     assert_eq!(scheme(&mint, &output, "a"), "Nat");
     assert_eq!(scheme(&mint, &output, "b"), "{ x: Nat }");
 }
@@ -3232,11 +3191,11 @@ fn a_complaint_belongs_to_the_member_that_made_it() {
     // bookkeeping, and a number the reader cannot count to.
     assert_eq!(
         output.errors[0].kind.to_string(),
-        "no field `missing` on `{ a: c }`"
+        "no field `missing` on `{ a: 'c }`"
     );
     assert_eq!(
         output.errors[1].kind.to_string(),
-        "no field `missing` on `{ b: c }`"
+        "no field `missing` on `{ b: 'c }`"
     );
     assert!(
         output
@@ -3309,19 +3268,16 @@ fn fields_on_every_type_change_only_the_schemes_a_projection_reaches() {
          let fst : { x: Nat, y: Nat } -> Nat = fn p => p.x\n\
          let n = getx { x: 1, y: 2 }\n\
          let u = {}\n\
-         let opened : { small: Nat, ..extra } -> Nat where let extra = fn s => s.small\n",
+         let opened : { small: Nat, ..'extra } -> Nat = fn s => s.small\n",
     );
     // Unchanged: a bare variable still takes a whole type, fields and all.
-    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
     // Changed: the base is polymorphic in its core rather than fixed to a
     // struct, which is the whole of what the change buys.
-    assert_eq!(
-        scheme(&mint, &output, "getx"),
-        "{ x: a, ..b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
     assert_eq!(
         scheme(&mint, &output, "both"),
-        "{ x: a, y: b, ..c } -> { a: a, b: b } where let a, b, c"
+        "{ x: 'a, y: 'b, ..'c } -> { a: 'a, b: 'b }"
     );
     // Unchanged: the annotation pins the core to unit, so nothing prints with
     // a `with`.
@@ -3332,21 +3288,18 @@ fn fields_on_every_type_change_only_the_schemes_a_projection_reaches() {
     assert_eq!(scheme(&mint, &output, "u"), "{}");
     assert_eq!(
         scheme(&mint, &output, "opened"),
-        "{ small: Nat, ..a } -> Nat where let a"
+        "{ small: Nat, ..'a } -> Nat"
     );
 
     // A sum's own field row is empty and closed, so nothing about sums prints
     // with a `with` either — and a declaration taking a row is untouched.
     let (mint, _, output) = inferred(
-        "type Option T = `Some T | `None\n\
-         let some = `Some 1\n\
+        "type Option T = #Some T | #None\n\
+         let some = #Some 1\n\
          type Tagged r = { tag: Nat, ..r }\n\
          let tag : Tagged { note: Nat } -> Nat = fn t => t.tag\n",
     );
-    assert_eq!(
-        scheme(&mint, &output, "some"),
-        "`Some Nat | ..a where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "some"), "#Some Nat | ..'a");
     assert_eq!(scheme(&mint, &output, "tag"), "Tagged { note: Nat } -> Nat");
 }
 
@@ -3357,10 +3310,7 @@ fn fields_on_every_type_change_only_the_schemes_a_projection_reaches() {
 fn two_projections_on_one_binder_share_a_core_variable() {
     let (mint, _, output) = inferred("let both = fn p => { a: p.x, b: p.y }");
     let scheme = scheme(&mint, &output, "both");
-    assert_eq!(
-        scheme,
-        "{ x: a, y: b, ..c } -> { a: a, b: b } where let a, b, c"
-    );
+    assert_eq!(scheme, "{ x: 'a, y: 'b, ..'c } -> { a: 'a, b: 'b }");
     // One open end, not two: a second would print as its own `..`, and the
     // argument would read as two unrelated bases.
     assert_eq!(scheme.matches("..").count(), 1, "{scheme}");
@@ -3381,30 +3331,27 @@ fn two_projections_on_one_binder_share_a_core_variable() {
 /// Generalization numbers variables in plain first-occurrence order, reading a
 /// type's labels and then the core beneath them — which is the order they print
 /// in, since the core is what a `..` spells and a tail is written last. No
-/// special case for a core: the field's type of an accessor is `'a` because it
+/// special case for a core: the field's type of an accessor is `a` because it
 /// is the first variable a reader meets, and the base's core is `'b` because it
 /// is the second.
 #[test]
 fn variables_are_numbered_in_the_order_they_are_read() {
     let (mint, _, output) = inferred("let getx = fn p => p.x");
-    assert_eq!(
-        scheme(&mint, &output, "getx"),
-        "{ x: a, ..b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "getx"), "{ x: 'a, ..'b } -> 'a");
 
     // Presences keep their second pass, so a `when` never takes a letter another
     // variable would have had: `f`'s one letter is its core, and `g`'s are the
     // field's type and then the core it sits on.
     let (mint, _, output) = inferred(
-        "let f : { x when a: Nat, .. } -> Nat where let a = fn p => 1\nlet g = fn p => { got: p.y, more: p }",
+        "let f : { x when 'a: Nat, .. } -> Nat = fn p => 1\nlet g = fn p => { got: p.y, more: p }",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, ..'b } -> Nat"
     );
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "{ y: a, ..b } -> { got: a, more: { y: a, ..b } } where let a, b"
+        "{ y: 'a, ..'b } -> { got: 'a, more: { y: 'a, ..'b } }"
     );
 }
 
@@ -3416,7 +3363,7 @@ fn variables_are_numbered_in_the_order_they_are_read() {
 /// The refusal below is the core's, and it is now the only one a struct has:
 /// there is no tail variable left to put the condition on, so `Table::repeated`
 /// finds the label by reading the fields of whatever the core is being bound to.
-/// That is what makes `let bad : { ..r } -> { x: Nat, ..r }` a complaint about
+/// That is what makes `let bad : { ..'r } -> { x: Nat, ..'r }` a complaint about
 /// the annotation's own core rather than about a tail nobody wrote.
 #[test]
 fn a_projection_demands_a_core_that_may_not_name_the_field() {
@@ -3426,7 +3373,7 @@ fn a_projection_demands_a_core_that_may_not_name_the_field() {
     // also have. There is no fifth.
     assert_eq!(
         constraints(&mint, &output, "getx"),
-        ["equal: { x: ?3, ..?4 } ~ ?1", "equal: ?0 ~ ?1 -> ?3 ! ..?2"]
+        ["equal: { x: ?3, ..?4 } ~ ?1", "equal: ?0 ~ ?1 -> ?3 + ..?2"]
     );
 
     // The core may not come back naming the field, which is the condition a
@@ -3438,7 +3385,7 @@ fn a_projection_demands_a_core_that_may_not_name_the_field() {
     // rest it declared is rigid and takes nothing at all.
     let (_, _, output) = infer_src(
         "let getx = fn p => p.x\n\
-         let box : { ..r } -> { x: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+         let box : { ..'r } -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let bad = fn q => box q { x: getx q }",
     );
     assert!(
@@ -3477,8 +3424,8 @@ fn every_projection_complaint_underlines_the_field_it_read() {
         // The lambda's own effect row is no part of `a`'s type, so R23's
         // closing rule never reaches it and generalization names it as it
         // names every other leftover.
-        ("let a = (fn x => x).y", "no field `y` on `a -> a ! ..b`"),
-        ("let a = (`A 1).x", "no field `x` on ``A Nat | ..a`"),
+        ("let a = (fn x => x).y", "no field `y` on `'a -> 'a + ..'b`"),
+        ("let a = (#A 1).x", "no field `x` on `#A Nat | ..'a`"),
         ("let a = { y: 1 }.x", "no field `x` on `{ y: Nat }`"),
     ] {
         let (_, _, output) = infer_src(src);
@@ -3529,7 +3476,7 @@ fn a_row_and_a_presence_are_abandoned_in_their_own_sorts() {
     // The projection's field row fails against a `Nat`, which abandons the
     // field's type and closes the tail — and the presence that the annotation
     // left open is settled in the same decomposition.
-    let (mint, _, output) = infer_src("let bad : { y when a: Nat } = { y: 1 }.x");
+    let (mint, _, output) = infer_src("let bad : { y when 'a: Nat } = { y: 1 }.x");
     let recovered: Vec<String> = output
         .steps
         .iter()
@@ -3541,7 +3488,7 @@ fn a_row_and_a_presence_are_abandoned_in_their_own_sorts() {
 
     // A presence variable the solve never decided, abandoned by the failure
     // beside it.
-    let (_, _, output) = infer_src("let bad : { y when a: Nat, .. } -> Nat = fn p => p.y.q");
+    let (_, _, output) = infer_src("let bad : { y when 'a: Nat, .. } -> Nat = fn p => p.y.q");
     let sorts: Vec<String> = output
         .steps
         .iter()
@@ -3560,7 +3507,7 @@ fn a_row_and_a_presence_are_abandoned_in_their_own_sorts() {
 fn a_written_struct_lowers_to_unit_and_a_written_sum_to_a_sum_core() {
     let (mint, _, output) = inferred(
         "type Rec = { x: Nat }\n\
-         type Sum = `A Nat | `B\n",
+         type Sum = #A Nat | #B\n",
     );
     let rec = symbol_named(&mint, output.aliases.keys().copied(), "Rec");
     let body = output.aliases[&rec].body();
@@ -3585,32 +3532,32 @@ fn the_labels_of_two_types_are_decided_by_what_their_cores_allow() {
     // Two different core variables, extras only one way: the variable takes the
     // other side's core with the labels only that side named.
     let (mint, _, output) = inferred(
-        "let one : { x: Nat, ..r } -> Nat where let r = fn p => 1\n\
-         let two : { x: Nat, y: Nat, ..s } -> Nat where let s = fn p => 1\n\
+        "let one : { x: Nat, ..'r } -> Nat = fn p => 1\n\
+         let two : { x: Nat, y: Nat, ..'s } -> Nat = fn p => 1\n\
          let both = fn v => { a: one v, b: two v }",
     );
     assert_eq!(
         scheme(&mint, &output, "both"),
-        "{ x: Nat, y: Nat, ..a } -> { a: Nat, b: Nat } where let a"
+        "{ x: Nat, y: Nat, ..'a } -> { a: Nat, b: Nat }"
     );
 
     // Extras both ways: the two continue as one fresh core, so what comes out
     // names every field either side did.
     let (mint, _, output) = inferred(
-        "let one : { x: Nat, ..r } -> Nat where let r = fn p => 1\n\
-         let two : { y: Nat, ..s } -> Nat where let s = fn p => 1\n\
+        "let one : { x: Nat, ..'r } -> Nat = fn p => 1\n\
+         let two : { y: Nat, ..'s } -> Nat = fn p => 1\n\
          let both = fn v => { a: one v, b: two v }",
     );
     assert_eq!(
         scheme(&mint, &output, "both"),
-        "{ x: Nat, y: Nat, ..a } -> { a: Nat, b: Nat } where let a"
+        "{ x: Nat, y: Nat, ..'a } -> { a: Nat, b: Nat }"
     );
 
     // A variable against a core that allows nothing more: every label only the
     // variable's side names must be absent, and the variable takes the closed
     // core with the labels only *it* named.
     let (mint, _, output) = inferred(
-        "let one : { x: Nat, ..r } -> Nat where let r = fn p => 1\n\
+        "let one : { x: Nat, ..'r } -> Nat = fn p => 1\n\
          let two : { x: Nat, y: Nat } -> Nat = fn p => 1\n\
          let both = fn v => { a: one v, b: two v }",
     );
@@ -3628,7 +3575,7 @@ fn the_labels_of_two_types_are_decided_by_what_their_cores_allow() {
     // One variable on both sides, with extras either way: no finite type fits,
     // so it is the occurs check rather than a binding that grows forever.
     let (_, _, output) = infer_src(
-        "let g : { x: Nat, ..r } -> { y: Nat, ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let g : { x: Nat, ..'r } -> { y: Nat, ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn c => g c c",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
@@ -3636,11 +3583,8 @@ fn the_labels_of_two_types_are_decided_by_what_their_cores_allow() {
 
     // And the same variable with no extras either way is already the same
     // thing, which is what a recursive call asks.
-    let (mint, _, output) = inferred("let f : { x: Nat, ..r } -> Nat where let r = fn p => f p");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => f p");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
 }
 
 /// A struct's `..` handed a type that is not a struct is a type inference can
@@ -3694,27 +3638,27 @@ fn a_struct_tail_handed_a_known_type_unfolds_to_a_with() {
 fn a_sums_tail_is_decided_as_a_row() {
     // Two open sums naming the same cases: one tail takes the other.
     let (mint, _, output) = inferred(
-        "let f : (`A Nat | ..r) -> Nat where let r = fn p => 1\n\
-         let g : (`A Nat | ..s) -> Nat where let s = fn p => 1\n\
+        "let f : (#A Nat | ..'r) -> Nat = fn p => 1\n\
+         let g : (#A Nat | ..'s) -> Nat = fn p => 1\n\
          let h = fn v => { one: f v, two: g v }",
     );
     assert_eq!(
         scheme(&mint, &output, "h"),
-        "`A Nat | ..a -> { one: Nat, two: Nat } where let a"
+        "#A Nat | ..'a -> { one: Nat, two: Nat }"
     );
 
     // A recursive call instantiates what the annotation declared, so the tail
     // its own argument stands at takes the fresh copy — polymorphic recursion
     // over a declared rest, said in one step.
-    let (mint, _, output) = inferred("let f : (`A Nat | ..r) -> Nat where let r = fn p => f p");
+    let (mint, _, output) = inferred("let f : (#A Nat | ..'r) -> Nat = fn p => f p");
     let taken = steps(&mint, &output, "f");
     assert!(
-        taken.contains(&"  bind  ?0 ~ r => ?0 := r".to_string()),
+        taken.contains(&"  bind  ?0 ~ 'r => ?0 := 'r".to_string()),
         "{taken:#?}"
     );
 
     // Two tails that really are the same variable are already the same thing.
-    let (mint, _, output) = inferred("let f = fn p => match p with | `A x => f p | y => 1 end");
+    let (mint, _, output) = inferred("let f = fn p => match p with | #A x => f p | y => 1 end");
     let taken = steps(&mint, &output, "f");
     assert!(
         taken.iter().any(|step| step.contains("same  ?")),
@@ -3723,8 +3667,8 @@ fn a_sums_tail_is_decided_as_a_row() {
 
     // An abandoned tail on the expected side absorbs what it is asked to be.
     let (mint, out, output) = infer_src(
-        "let mk : Nat -> (`A Nat) = fn n => `A n\n\
-         let f : (`A Nat | ..) -> Nat = fn p => f (mk (nope p))",
+        "let mk : Nat -> (#A Nat) = fn n => #A n\n\
+         let f : (#A Nat | ..) -> Nat = fn p => f (mk (nope p))",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -3736,8 +3680,8 @@ fn a_sums_tail_is_decided_as_a_row() {
     // And an abandoned tail takes a case only the other side names, then
     // abandons it in turn rather than deciding anything with it.
     let (mint, out, output) = infer_src(
-        "let g : Nat -> (`A Nat | `B) -> Nat = fn a => fn b => 1\n\
-         let f : (`A Nat | ..) -> Nat = fn p => g (nope p) p",
+        "let g : Nat -> (#A Nat | #B) -> Nat = fn a => fn b => 1\n\
+         let f : (#A Nat | ..) -> Nat = fn p => g (nope p) p",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -3755,8 +3699,8 @@ fn a_sums_tail_is_decided_as_a_row() {
 #[test]
 fn an_abandoned_presence_absorbs_from_either_side() {
     let (mint, out, output) = infer_src(
-        "let mk : Nat -> (`A Nat) = fn n => `A n\n\
-         let f : (`A (when a) Nat | ..r) -> Nat where let a, r = fn p => f (mk (nope p))",
+        "let mk : Nat -> (#A Nat) = fn n => #A n\n\
+         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => f (mk (nope p))",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -3768,8 +3712,8 @@ fn an_abandoned_presence_absorbs_from_either_side() {
     );
 
     let (mint, out, output) = infer_src(
-        "let g : Nat -> (`A Nat) -> Nat = fn a => fn b => 1\n\
-         let f : (`A (when a) Nat | ..r) -> Nat where let a, r = fn p => g (nope p) p",
+        "let g : Nat -> (#A Nat) -> Nat = fn a => fn b => 1\n\
+         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => g (nope p) p",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -3787,48 +3731,38 @@ fn an_abandoned_presence_absorbs_from_either_side() {
 /// that decided it.
 #[test]
 fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
-    let (mint, _, output) = inferred("let f : (`A Nat | ..) -> Nat = fn p => 1");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "`A Nat | ..a -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : (#A Nat | ..) -> Nat = fn p => 1");
+    assert_eq!(scheme(&mint, &output, "f"), "#A Nat | ..'a -> Nat");
 
     // A hole the body names another case in is decided, and the scheme says so.
-    let (mint, _, output) = inferred("let f : (`A Nat | ..) -> Nat = fn p => f (`B 1)");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "`A Nat | `B Nat | ..a -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : (#A Nat | ..) -> Nat = fn p => f (#B 1)");
+    assert_eq!(scheme(&mint, &output, "f"), "#A Nat | #B Nat | ..'a -> Nat");
 
     // Declared, the tail is a promise instead — and a recursive use is a fresh
     // copy of it, so naming another case in one is polymorphic recursion rather
     // than a mistake.
-    let (mint, _, output) =
-        inferred("let f : (`A Nat | ..r) -> Nat where let r = fn p => f (`B 1)");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "`A Nat | ..a -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : (#A Nat | ..'r) -> Nat = fn p => f (#B 1)");
+    assert_eq!(scheme(&mint, &output, "f"), "#A Nat | ..'a -> Nat");
 
     // What the promise refuses is a case demanded of the argument itself: the
     // caller picks what else the sum allows, so no arm may test one.
     let (_, _, output) = infer_src(
-        "let f : (`A Nat | ..r) -> Nat where let r = \
-         fn p => match p with | `A x => 1 | `B y => 0 end",
+        "let f : (#A Nat | ..'r) -> Nat = \
+         fn p => match p with | #A x => 1 | #B y => 0 end",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "rigid-field");
     assert_eq!(
         output.errors[0].kind.to_string(),
-        "this reads a case ``B`, but `r` stands for whatever type the caller picks, \
+        "this reads a case `#B`, but `'r` stands for whatever type the caller picks, \
          so it may not have one"
     );
 
     // And the other way: a declared rest handed to something that allows
     // nothing more is a promise broken too.
     let (_, _, output) = infer_src(
-        "let g : (`A Nat) -> Nat = fn p => 1\n\
-         let f : (`A Nat | ..r) -> Nat where let r = fn p => g p",
+        "let g : (#A Nat) -> Nat = fn p => 1\n\
+         let f : (#A Nat | ..'r) -> Nat = fn p => g p",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "rigid-broken");
@@ -3840,8 +3774,8 @@ fn a_sums_open_tail_is_the_definitions_to_leave_alone() {
 #[test]
 fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
     let (_, out, output) = infer_src(
-        "type Or r = `A | ..r\n\
-         let f : Or (`B Nat | ..s) -> Nat where let s = fn p => 1",
+        "type Or r = #A | ..r\n\
+         let f : Or (#B Nat | ..'s) -> Nat = fn p => 1",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -3849,9 +3783,9 @@ fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
     // And the condition bites where the argument's own tail would have to take
     // the case the declaration already names.
     let (_, _, output) = infer_src(
-        "type Or r = `A | ..r\n\
-         let mk : (`A) -> Nat = fn p => 1\n\
-         let f : Or (`B Nat | ..s) -> Nat where let s = fn p => f p",
+        "type Or r = #A | ..r\n\
+         let mk : (#A) -> Nat = fn p => 1\n\
+         let f : Or (#B Nat | ..'s) -> Nat = fn p => f p",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
 }
@@ -3869,11 +3803,11 @@ fn a_sum_argument_carries_the_declarations_condition_into_its_own_tail() {
 fn an_assumption_compares_a_sum_argument_as_a_sum() {
     let (mint, _, output) = inferred(
         "type Tree a = { value: a, kids: Nest a }\n\
-         type Nest a = { head: Tree (`A Nat), other: Tree (`C Nat), tail: Nest a }\n\
+         type Nest a = { head: Tree (#A Nat), other: Tree (#C Nat), tail: Nest a }\n\
          type Wood a = { value: a, kids: Grove a }\n\
-         type Grove a = { head: Wood (`A Nat), other: Wood (`C Nat), tail: Grove a }\n\
-         let f : Tree (`A Nat | ..r) -> Nat where let r = fn t => 1\n\
-         let g : Wood (`A Nat | ..r) -> Nat where let r = fn w => 1\n\
+         type Grove a = { head: Wood (#A Nat), other: Wood (#C Nat), tail: Grove a }\n\
+         let f : Tree (#A Nat | ..'r) -> Nat = fn t => 1\n\
+         let g : Wood (#A Nat | ..'r) -> Nat = fn w => 1\n\
          let h = fn v => { one: f v, two: g v }",
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
@@ -3914,23 +3848,17 @@ fn a_nested_let_quantifies_only_what_it_owns() {
     // then dropped out of the let's range when `p`'s own variable is bound to a
     // type carrying it. So the argument and the result are one type.
     let (mint, _, output) = inferred("let projected = fn p => let q = p.x in q");
-    assert_eq!(
-        scheme(&mint, &output, "projected"),
-        "{ x: a, ..b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "projected"), "{ x: 'a, ..'b } -> 'a");
 
     // The same, without the projection in the way.
     let (mint, _, output) = inferred("let held = fn p => let q = p in q");
-    assert_eq!(scheme(&mint, &output, "held"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "held"), "'a -> 'a");
 
     // And both halves at once: `dup` generalizes, so it is used at two types,
     // while `p` — the lambda's — does not, so the two uses share it.
     let (mint, _, output) =
         inferred("let shared = fn p => let dup = fn x => x in { a: dup p, b: dup 1 }");
-    assert_eq!(
-        scheme(&mint, &output, "shared"),
-        "a -> { a: a, b: Nat } where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "shared"), "'a -> { a: 'a, b: Nat }");
 }
 
 /// Inside its own value the name is bound monomorphically, the same rule a
@@ -3940,7 +3868,7 @@ fn a_nested_let_quantifies_only_what_it_owns() {
 #[test]
 fn a_nested_let_names_itself_monomorphically() {
     let (mint, _, output) = inferred("let looping = let f = fn n => f n in f");
-    assert_eq!(scheme(&mint, &output, "looping"), "a -> b where let a, b");
+    assert_eq!(scheme(&mint, &output, "looping"), "'a -> 'b");
 }
 
 /// Every shape of nesting and every position a `let` can be written in, by the
@@ -3956,7 +3884,7 @@ fn nested_lets_nest_and_sit_wherever_an_expression_does() {
         (
             "let inside = fn p => let x = p.x in { first: x, second: x }",
             "inside",
-            "{ x: a, ..b } -> { first: a, second: a } where let a, b",
+            "{ x: 'a, ..'b } -> { first: 'a, second: 'a }",
         ),
         (
             "let in_field = { v: let n = 1 in n }",
@@ -4021,7 +3949,7 @@ fn a_nested_annotation_promises_what_it_declares() {
 
     // And a declared variable the value decides is refused at the expression
     // that decided it, exactly as a definition's own is.
-    let src = "let e = let f : a -> a where let a = fn x => 0 in f";
+    let src = "let e = let f : 'a -> 'a = fn x => 0 in f";
     let (_, _, output) = infer_src(src);
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert_eq!(output.errors[0].kind.code(), "rigid-broken");
@@ -4049,10 +3977,7 @@ fn every_nested_let_publishes_a_scheme() {
         locals,
         // `id`'s own effect row occurs once in its scheme and is closed, so a
         // nested binding reads exactly as a definition does.
-        [
-            ("id", "a -> a where let a".to_string()),
-            ("q", "a where let a".to_string())
-        ]
+        [("id", "'a -> 'a".to_string()), ("q", "'a".to_string())]
     );
 
     // The definitions' own map is untouched by any of it.
@@ -4064,7 +3989,7 @@ fn every_nested_let_publishes_a_scheme() {
     assert_eq!(named, ["a", "b"]);
 }
 
-/// Every term inside a nested `let` carries its resolved type when inference is
+/// Every term inside a nested `let` carries its resolved type when 'inference is
 /// done, the way every other subterm does — and the `Let` node's own type is
 /// its body's, which is what the expression evaluates to.
 #[test]
@@ -4082,7 +4007,7 @@ fn every_term_inside_a_nested_let_is_typed() {
         ]
     );
 
-    // And no solver variable survives anywhere in one, including the parts
+    // And no solver variable survives anywhere 'in one, including the parts
     // generalization never numbered.
     let (_, out, _) = infer_src("let a = fn p => let q = fn z => z in { held: p, made: q }");
     for decl in out.program.terms.values() {
@@ -4140,12 +4065,12 @@ fn a_nested_let_is_said_as_two_constraint_kinds() {
 fn a_local_leaves_every_sort_of_outer_variable_alone() {
     for (src, printed) in [
         (
-            "let f : (`A | ..) -> Nat = fn s => let q = s in 1",
-            "`A | ..a where let a",
+            "let f : (#A | ..) -> Nat = fn s => let q = s in 1",
+            "#A | ..'a",
         ),
         (
             "let f : { a when _: Nat } -> Nat = fn r => let q = r in 1",
-            "{ a when a: Nat } where let a",
+            "{ a when 'a: Nat }",
         ),
     ] {
         let (mint, _, output) = inferred(src);
@@ -4177,7 +4102,7 @@ fn a_published_scheme_keeps_its_presences_below_its_types() {
     let scheme = &output.locals[&symbol];
     // `b` is the argument `inner` quantifies of its own; `a` is the presence
     // the enclosing lambda's record left free, and `c` what that field holds.
-    assert_eq!(scheme.to_string(), "b -> { x when a: c } where let a, b, c");
+    assert_eq!(scheme.to_string(), "'b -> { x when 'a: 'c }");
     assert_eq!(scheme.presences(), 1);
     assert_eq!(scheme.count(), 3);
     for (at, sense) in positions(scheme.body()) {
@@ -4192,13 +4117,13 @@ fn a_published_scheme_keeps_its_presences_below_its_types() {
     // argument are positions like the core of an arrow.
     for (src, printed) in [
         (
-            "let k = let g : (`A Nat | ..r) -> Nat where let r = fn v => 1 in g",
-            "`A Nat | ..a -> Nat where let a",
+            "let k = let g : (#A Nat | ..'r) -> Nat = fn v => 1 in g",
+            "#A Nat | ..'a -> Nat",
         ),
         (
             "type Box A = { it: A }\n\
-             let k = let f : Box b -> b where let b = fn x => x.it in f",
-            "Box a -> a where let a",
+             let k = let f : Box 'b -> 'b = fn x => x.it in f",
+            "Box 'a -> 'a",
         ),
     ] {
         let (mint, _, output) = inferred(src);
@@ -4273,7 +4198,7 @@ fn a_written_absence_lowers_to_an_absent_presence() {
     assert!(matches!(field.ty.core, Core::Undecided), "{field:?}");
 
     // The sum counterpart, through the row inside the core.
-    let (mint, _, output) = inferred("let s : `Ok Nat | \\`Err | .. = `Ok 1");
+    let (mint, _, output) = inferred("let s : #Ok Nat | \\#Err | .. = #Ok 1");
     let symbol = symbol_named(&mint, output.schemes.keys().copied(), "s");
     let body = output.schemes[&symbol].body().clone();
     let Core::Sum(row) = &body.core else {
@@ -4316,11 +4241,11 @@ fn an_ascribed_absence_refuses_the_field_and_nothing_else() {
 #[test]
 fn an_ascribed_absence_refuses_the_case_and_nothing_else() {
     let (mint, _, output) =
-        inferred("type NoErr r = `Ok Nat | \\`Err | ..r\nlet ok : NoErr (`Warn Nat) = `Ok 1");
-    assert_eq!(scheme(&mint, &output, "ok"), "NoErr (`Warn Nat)");
+        inferred("type NoErr r = #Ok Nat | \\#Err | ..r\nlet ok : NoErr (#Warn Nat) = #Ok 1");
+    assert_eq!(scheme(&mint, &output, "ok"), "NoErr (#Warn Nat)");
 
     let (_, out, output) =
-        infer_src("type NoErr r = `Ok Nat | \\`Err | ..r\nlet bad : NoErr (`Warn Nat) = `Err 1");
+        infer_src("type NoErr r = #Ok Nat | \\#Err | ..r\nlet bad : NoErr (#Warn Nat) = #Err 1");
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert!(!output.errors.is_empty(), "the absent case was allowed");
     assert!(
@@ -4337,7 +4262,7 @@ fn an_ascribed_absence_refuses_the_case_and_nothing_else() {
     );
 }
 
-/// The shared-rest example: both `..r` are one rest, and it lacks `y`. The
+/// The shared-rest example: both `..'r` are one rest, and it lacks `y`. The
 /// definition types — the absence costs it nothing — and the condition
 /// survives instantiation, so a use that would put a `y` into the rest is
 /// refused.
@@ -4349,20 +4274,19 @@ fn a_shared_rest_lacks_the_absent_label() {
     // through a call, where the shared tail is a variable again: inside the
     // body that declared it, a rest is rigid and shares nothing.
     let (mint, _, output) = inferred(
-        "let g : { \\y, ..r } -> { ..r } -> Nat where let r = fn a => fn b => 1\n\
+        "let g : { \\y, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1\n\
          let h = fn c => g c c",
     );
-    assert_eq!(scheme(&mint, &output, "h"), "{ ..a } -> Nat where let a");
+    assert_eq!(scheme(&mint, &output, "h"), "{ ..'a } -> Nat");
 
-    let (mint, _, output) = inferred("let g : { \\y, ..r } -> { ..r } where let r = fn a => a");
+    let (mint, _, output) = inferred("let g : { \\y, ..'r } -> { ..'r } = fn a => a");
     // The from side keeps the absent `y` in its label map, so it prints in
     // braces with the absence dropped; the result is the bare rest, which has
     // always printed as its core alone.
-    assert_eq!(scheme(&mint, &output, "g"), "{ ..a } -> a where let a");
+    assert_eq!(scheme(&mint, &output, "g"), "{ ..'a } -> 'a");
 
-    let (_, out, output) = infer_src(
-        "let g : { \\y, ..r } -> { ..r } where let r = fn a => a\nlet bad = fn s => (g s).y",
-    );
+    let (_, out, output) =
+        infer_src("let g : { \\y, ..'r } -> { ..'r } = fn a => a\nlet bad = fn s => (g s).y");
     assert!(out.errors.is_empty(), "ir errors: {:#?}", out.errors);
     assert!(!output.errors.is_empty(), "the projection was allowed");
     assert!(
@@ -4380,10 +4304,10 @@ fn a_shared_rest_lacks_the_absent_label() {
 #[test]
 fn a_match_without_a_default_closes_the_sum() {
     let (mint, _, output) = inferred(
-        "type Option T = `Some T | `None\n\
-         let get = fn opt => match opt with | `Some x => x | `None => 0 end",
+        "type Option T = #Some T | #None\n\
+         let get = fn opt => match opt with | #Some x => x | #None => 0 end",
     );
-    assert_eq!(scheme(&mint, &output, "get"), "`Some Nat | `None -> Nat");
+    assert_eq!(scheme(&mint, &output, "get"), "#Some Nat | #None -> Nat");
 }
 
 /// With a default the row stays open — the rest a fresh tail lacking the
@@ -4393,22 +4317,19 @@ fn a_match_without_a_default_closes_the_sum() {
 fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
     let (mint, _, output) = inferred(
         "let fallback = fn r => 0\n\
-         let first = fn v => match v with | `Some x => x | rest => fallback rest end",
+         let first = fn v => match v with | #Some x => x | rest => fallback rest end",
     );
     // The scrutinee allows `Some` and whatever else; the binder's sum has
     // `Some` absent — not part of what the type says, so it prints as the
     // bare rest — over the same tail.
-    assert_eq!(
-        scheme(&mint, &output, "first"),
-        "`Some Nat | ..a -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "first"), "#Some Nat | ..'a -> Nat");
     let (mint, _, output) =
-        inferred("let rest_of = fn v => match v with | `Some x => x | rest => rest end");
+        inferred("let rest_of = fn v => match v with | #Some x => x | rest => rest end");
     // Binding the result to both the payload and the leftover sum ties them
     // together: what `Some` carries is the sum without `Some`.
     assert_eq!(
         scheme(&mint, &output, "rest_of"),
-        "`Some (| ..a) | ..a -> | ..a where let a"
+        "#Some (| ..'a) | ..'a -> | ..'a"
     );
 }
 
@@ -4420,21 +4341,21 @@ fn a_default_keeps_the_sum_open_and_is_typed_minus_the_handled_cases() {
 fn a_partially_handled_case_stays_present_for_the_catch_all() {
     let (mint, _, output) = inferred(
         "let keep = fn r => 0\n\
-         let f = fn e => match e with | `A `X x => 1 | r => keep r end",
+         let f = fn e => match e with | #A #X x => 1 | r => keep r end",
     );
     // `A` is still in the sum the binder sees: an `A`-tagged value whose
     // payload is not `X` reaches it.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`A (`X a | ..b) | ..c -> Nat where let a, b, c"
+        "#A (#X 'a | ..'b) | ..'c -> Nat"
     );
     let (mint, _, output) =
-        inferred("let g = fn e => match e with | `A `X x => `Nothing | r => r end");
+        inferred("let g = fn e => match e with | #A #X x => #Nothing | r => r end");
     // Handing the binder back out shows the same nuance from the result side:
     // the sum the match evaluates to still allows `A`.
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "`A (`X a | ..b) | `Nothing | ..c -> `Nothing | `A (`X a | ..b) | ..c where let a, b, c"
+        "#A (#X 'a | ..'b) | #Nothing | ..'c -> #Nothing | #A (#X 'a | ..'b) | ..'c"
     );
 }
 
@@ -4444,20 +4365,20 @@ fn a_partially_handled_case_stays_present_for_the_catch_all() {
 fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
     let (mint, _, output) = inferred(
         "let pick = fn l => match l with \
-         | `Cons { head: `Some x, tail: t } => x \
-         | `Cons { head: `None, tail: t } => 0 \
-         | `Nil => 0 \
+         | #Cons { head: #Some x, tail: t } => x \
+         | #Cons { head: #None, tail: t } => 0 \
+         | #Nil => 0 \
          end",
     );
     assert_eq!(
         scheme(&mint, &output, "pick"),
-        "`Cons { head: `Some Nat | `None, tail: a } | `Nil -> Nat where let a"
+        "#Cons { head: #Some Nat | #None, tail: 'a } | #Nil -> Nat"
     );
-    // The bare `` `None `` and `` `Nil `` both carry unit: supplying a
+    // The bare `#None` and `#Nil` both carry unit: supplying a
     // payload to one is the ordinary mismatch.
     let (_, _, output) = infer_src(
-        "let f = fn v => match v with | `None => 0 | r => 1 end\n\
-         let bad = f (`None 5)",
+        "let f = fn v => match v with | #None => 0 | r => 1 end\n\
+         let bad = f (#None 5)",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
@@ -4468,10 +4389,10 @@ fn payloads_flow_to_binders_and_a_bare_tag_means_unit() {
 #[test]
 fn a_natural_match_is_about_numbers() {
     let (mint, _, output) =
-        inferred("let describe = fn n => match n with | 0 => `Zero | 1 => `One | k => `Many end");
+        inferred("let describe = fn n => match n with | 0 => #Zero | 1 => #One | k => #Many end");
     assert_eq!(
         scheme(&mint, &output, "describe"),
-        "Nat -> `Zero | `One | `Many | ..a where let a"
+        "Nat -> #Zero | #One | #Many | ..'a"
     );
     let (mint, _, output) = inferred("let same = fn n => match n with | 0 => 1 | k => k end");
     assert_eq!(scheme(&mint, &output, "same"), "Nat -> Nat");
@@ -4485,11 +4406,11 @@ fn a_natural_match_is_about_numbers() {
 fn columns_type_as_unions_across_arms() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | { a: `A, b: `X, c: x } => 1 | { a: `A, b: `Y, c: y } => 2 end",
+         | { a: #A, b: #X, c: x } => 1 | { a: #A, b: #Y, c: y } => 2 end",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a: `A, b: `X | `Y, c: a } -> Nat where let a"
+        "{ a: #A, b: #X | #Y, c: 'a } -> Nat"
     );
 }
 
@@ -4505,7 +4426,7 @@ fn a_unit_pattern_demands_unit() {
 #[test]
 fn an_empty_match_eliminates_the_empty_sum() {
     let (mint, _, output) = inferred("let absurd = fn v => match v with end");
-    assert_eq!(scheme(&mint, &output, "absurd"), "| -> a where let a");
+    assert_eq!(scheme(&mint, &output, "absurd"), "| -> 'a");
 }
 
 /// Every arm's body — the default's included — unifies with the match's own
@@ -4513,9 +4434,9 @@ fn an_empty_match_eliminates_the_empty_sum() {
 #[test]
 fn arm_bodies_unify_with_the_match() {
     let (mint, _, output) = inferred("let sole = fn v => match v with w => w end");
-    assert_eq!(scheme(&mint, &output, "sole"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "sole"), "'a -> 'a");
 
-    let (_, _, output) = infer_src("let f = fn v => match v with | `A x => 0 | `B y => {} end");
+    let (_, _, output) = infer_src("let f = fn v => match v with | #A x => 0 | #B y => {} end");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
 }
@@ -4526,14 +4447,14 @@ fn arm_bodies_unify_with_the_match() {
 #[test]
 fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
     let (_, _, output) = infer_src(
-        "let f = fn opt => match opt with | `Some x => x end\n\
-         let bad = f `None",
+        "let f = fn opt => match opt with | #Some x => x end\n\
+         let bad = f #None",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     match &output.errors[0].kind {
         ErrorKind::ExtraField { shape, base, field } => {
             assert_eq!(*shape, Shape::Sum);
-            assert_eq!(base.to_string(), "`Some a");
+            assert_eq!(base.to_string(), "#Some 'a");
             assert_eq!(field, "None");
         }
         other => panic!("expected an extra case, got {other:?}"),
@@ -4547,7 +4468,7 @@ fn supplying_an_unhandled_case_is_a_use_site_mismatch() {
 fn an_error_in_an_arm_body_is_reported_once() {
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
-         let f = fn e => match e with | `A `X x => 1 | r => wants_nat {} end",
+         let f = fn e => match e with | #A #X x => 1 | r => wants_nat {} end",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
@@ -4571,12 +4492,12 @@ fn a_natural_match_without_a_default_still_types() {
 #[test]
 fn a_catch_all_keeps_nested_rows_open() {
     let (mint, _, output) = inferred(
-        "let f = fn e => match e with | `A `B `C 0 => 1 | `A `B r => 2 | q => 3 end\n\
-         let user = f (`A `Z)",
+        "let f = fn e => match e with | #A #B #C 0 => 1 | #A #B r => 2 | q => 3 end\n\
+         let user = f (#A #Z)",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`A (`B (`C Nat | ..a) | ..b) | ..c -> Nat where let a, b, c"
+        "#A (#B (#C Nat | ..'a) | ..'b) | ..'c -> Nat"
     );
 }
 
@@ -4586,12 +4507,12 @@ fn a_catch_all_keeps_nested_rows_open() {
 #[test]
 fn a_catch_all_keeps_struct_payload_rows_open() {
     let (mint, _, output) = inferred(
-        "let f = fn e => match e with | `P `A { x: `X } => 1 | `P `A w => 2 | q => 3 end\n\
-         let user = f (`P `Z)",
+        "let f = fn e => match e with | #P #A { x: #X } => 1 | #P #A w => 2 | q => 3 end\n\
+         let user = f (#P #Z)",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`P (`A { x when a: `X | ..b, ..c } | ..d) | ..e -> Nat where let a, b, c, d, e"
+        "#P (#A { x when 'a: #X | ..'b, ..'c } | ..'d) | ..'e -> Nat"
     );
 }
 
@@ -4601,8 +4522,8 @@ fn a_catch_all_keeps_struct_payload_rows_open() {
 #[test]
 fn an_overlapping_struct_arm_keeps_its_field_open() {
     let (mint, _, output) = inferred(
-        "let f = fn e => match e with | { a: `A, b: `X } => 1 | { a: `A, b: k } => 2 end\n\
-         let u = f { a: `A, b: `Z }",
+        "let f = fn e => match e with | { a: #A, b: #X } => 1 | { a: #A, b: k } => 2 end\n\
+         let u = f { a: #A, b: #Z }",
     );
     assert_eq!(scheme(&mint, &output, "u"), "Nat");
 
@@ -4610,7 +4531,7 @@ fn an_overlapping_struct_arm_keeps_its_field_open() {
     // reported exactly once.
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
-         let f = fn e => match e with | { a: `A, b: 0 } => 1 | { a: `A, b: k } => wants_nat {} end",
+         let f = fn e => match e with | { a: #A, b: 0 } => 1 | { a: #A, b: k } => wants_nat {} end",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
@@ -4624,37 +4545,37 @@ fn an_overlapping_struct_arm_keeps_its_field_open() {
 fn a_column_closes_over_every_listed_case() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 end",
+         | { a: #A, b: x } => 1 | { a: #B, b: 0 } => 2 | { a: #B, b: k } => 3 end",
     );
-    assert_eq!(scheme(&mint, &output, "f"), "{ a: `A | `B, b: Nat } -> Nat");
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: #A | #B, b: Nat } -> Nat");
 
     // Mirror ordering: the riding row lands past a different tag and the
     // column still closes over both.
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 end",
+         | { a: #A, b: 0 } => 1 | { a: #B, b: x } => 2 | { a: #A, b: k } => 3 end",
     );
-    assert_eq!(scheme(&mint, &output, "f"), "{ a: `A | `B, b: Nat } -> Nat");
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: #A | #B, b: Nat } -> Nat");
 
     // Nested in a tag's payload: the outer sum closes over the one tag, the
     // payload's column over both of its own.
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 end",
+         | #T { a: #A, b: x } => 1 | #T { a: #B, b: 0 } => 2 | #T { a: #B, b: k } => 3 end",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`T { a: `A | `B, b: Nat } -> Nat"
+        "#T { a: #A | #B, b: Nat } -> Nat"
     );
 
     // The same three shapes with a trailing catch-all still build clean.
     for src in [
         "let f = fn e => match e with \
-         | { a: `A, b: x } => 1 | { a: `B, b: 0 } => 2 | { a: `B, b: k } => 3 | w => 4 end",
+         | { a: #A, b: x } => 1 | { a: #B, b: 0 } => 2 | { a: #B, b: k } => 3 | w => 4 end",
         "let f = fn e => match e with \
-         | { a: `A, b: 0 } => 1 | { a: `B, b: x } => 2 | { a: `A, b: k } => 3 | w => 4 end",
+         | { a: #A, b: 0 } => 1 | { a: #B, b: x } => 2 | { a: #A, b: k } => 3 | w => 4 end",
         "let f = fn e => match e with \
-         | `T { a: `A, b: x } => 1 | `T { a: `B, b: 0 } => 2 | `T { a: `B, b: k } => 3 | w => 4 end",
+         | #T { a: #A, b: x } => 1 | #T { a: #B, b: 0 } => 2 | #T { a: #B, b: k } => 3 | w => 4 end",
     ] {
         let (_, out, output) = infer_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -4666,7 +4587,7 @@ fn a_column_closes_over_every_listed_case() {
     let (_, _, output) = infer_src(
         "let wants_nat : Nat -> Nat = fn n => n\n\
          let f = fn e => match e with \
-         | { a: `A, b: `X `Y } => 1 | { a: `A, b: k } => wants_nat {} end",
+         | { a: #A, b: #X #Y } => 1 | { a: #A, b: k } => wants_nat {} end",
     );
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
@@ -4679,13 +4600,13 @@ fn a_column_closes_over_every_listed_case() {
 fn a_sibling_tags_positions_stay_open_under_the_catch_all() {
     let (mint, _, output) = inferred(
         "let f = fn e => match e with \
-         | `A `B `C 0 => 1 | `A `B r => 2 | `D `E 0 => 4 | q => 5 end\n\
-         let user = f (`D `F)\n\
-         let deep = f (`D (`E 7))",
+         | #A #B #C 0 => 1 | #A #B r => 2 | #D #E 0 => 4 | q => 5 end\n\
+         let user = f (#D #F)\n\
+         let deep = f (#D (#E 7))",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`A (`B (`C Nat | ..a) | ..b) | `D (`E Nat | ..c) | ..d -> Nat where let a, b, c, d"
+        "#A (#B (#C Nat | ..'a) | ..'b) | #D (#E Nat | ..'c) | ..'d -> Nat"
     );
 }
 
@@ -4695,20 +4616,14 @@ fn a_sibling_tags_positions_stay_open_under_the_catch_all() {
 #[test]
 fn a_wildcard_fn_argument_still_has_a_domain() {
     let (mint, _, output) = inferred("let f = fn _ => 1");
-    assert_eq!(scheme(&mint, &output, "f"), "a -> Nat where let a");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> Nat");
 
     let (mint, _, output) = inferred("let const = fn x _ => x");
-    assert_eq!(
-        scheme(&mint, &output, "const"),
-        "a -> b -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "const"), "'a -> 'b -> 'a");
 
     let (mint, _, output) = inferred("let f = fn _ _ => 1  let g = fn _ x _ => x");
-    assert_eq!(scheme(&mint, &output, "f"), "a -> b -> Nat where let a, b");
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "a -> b -> c -> b where let a, b, c"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'b -> Nat");
+    assert_eq!(scheme(&mint, &output, "g"), "'a -> 'b -> 'c -> 'b");
 
     // Two discarded arguments are two domains: applying to two different
     // types is fine, which one shared binder would refuse.
@@ -4745,16 +4660,10 @@ fn a_discarded_value_is_still_typechecked() {
 #[test]
 fn a_wildcard_struct_leaf_still_demands_its_field() {
     let (mint, _, output) = inferred("let use_y = fn p => let {x: _, y} = p in y");
-    assert_eq!(
-        scheme(&mint, &output, "use_y"),
-        "{ x: a, y: b } -> b where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 
     let (mint, _, output) = inferred("let use_y = fn p => match p with {x: _, y} => y end");
-    assert_eq!(
-        scheme(&mint, &output, "use_y"),
-        "{ x: a, y: b } -> b where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "use_y"), "{ x: 'a, y: 'b } -> 'b");
 }
 
 /// R8: in a match, `_` types exactly as a named, unused catch-all does — the
@@ -4762,32 +4671,29 @@ fn a_wildcard_struct_leaf_still_demands_its_field() {
 /// binding for anything to constrain.
 #[test]
 fn a_wildcard_arm_types_as_a_named_catch_all() {
-    let with_wildcard = "type Option T = `Some T | `None\n\
-                         let get = fn opt => match opt with | `Some x => x | _ => 0 end";
-    let with_name = "type Option T = `Some T | `None\n\
-                     let get = fn opt => match opt with | `Some x => x | z => 0 end";
+    let with_wildcard = "type Option T = #Some T | #None\n\
+                         let get = fn opt => match opt with | #Some x => x | _ => 0 end";
+    let with_name = "type Option T = #Some T | #None\n\
+                     let get = fn opt => match opt with | #Some x => x | z => 0 end";
     let (mint, _, output) = inferred(with_wildcard);
     let wild = scheme(&mint, &output, "get");
     let (mint, _, output) = inferred(with_name);
     assert_eq!(wild, scheme(&mint, &output, "get"));
     // The root row stays open past the listed case, so `get` takes any
     // `Option Nat` — and more.
-    assert_eq!(wild, "`Some Nat | ..a -> Nat where let a");
+    assert_eq!(wild, "#Some Nat | ..'a -> Nat");
 
     let (mint, _, output) = inferred(
-        "type Option T = `Some T | `None\n\
-         let get : Option Nat -> Nat = fn opt => match opt with | `Some x => x | _ => 0 end",
+        "type Option T = #Some T | #None\n\
+         let get : Option Nat -> Nat = fn opt => match opt with | #Some x => x | _ => 0 end",
     );
     assert_eq!(scheme(&mint, &output, "get"), "Option Nat -> Nat");
 
-    // In a sub-position too: `` `Some _ `` demands the case and leaves its
+    // In a sub-position too: `#Some _` demands the case and leaves its
     // payload to the scrutinee.
     let (mint, _, output) =
-        inferred("let has = fn opt => match opt with | `Some _ => 1 | `None => 0 end");
-    assert_eq!(
-        scheme(&mint, &output, "has"),
-        "`Some a | `None -> Nat where let a"
-    );
+        inferred("let has = fn opt => match opt with | #Some _ => 1 | #None => 0 end");
+    assert_eq!(scheme(&mint, &output, "has"), "#Some 'a | #None -> Nat");
 }
 
 /// The motivating program of the exactness spec: exact arms over every
@@ -4803,7 +4709,7 @@ fn the_motivating_program_infers_optional_fields() {
     );
     assert_eq!(
         scheme(&mint, &output, "p"),
-        "{ a when a: c, b when b: d } -> {} where let a, b, c, d"
+        "{ a when 'a: 'c, b when 'b: 'd } -> {}"
     );
 }
 
@@ -4813,10 +4719,7 @@ fn the_motivating_program_infers_optional_fields() {
 #[test]
 fn an_exact_column_closes_the_row() {
     let (mint, _, output) = inferred("let f = fn v => match v with {a, b} => a end");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ a: a, b: b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, b: 'b } -> 'a");
 
     let (_, _, output) = infer_src(
         "let f = fn v => match v with {a, b} => a end\n\
@@ -4829,7 +4732,7 @@ fn an_exact_column_closes_the_row() {
     ));
 }
 
-/// R5's open half: a `..` entry — or a binder or wildcard anywhere in the
+/// R5's open half: a `..` entry — or a binder or wildcard anywhere 'in the
 /// column — keeps the demand open, so a value with more fields still fits.
 #[test]
 fn a_rest_or_binder_entry_opens_the_row() {
@@ -4837,10 +4740,7 @@ fn a_rest_or_binder_entry_opens_the_row() {
         "let f = fn v => match v with {a, ..} => a end\n\
          let ok = f { a: 1, b: 2 }",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ a: a, ..b } -> a where let a, b"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ a: 'a, ..'b } -> 'a");
     assert_eq!(scheme(&mint, &output, "ok"), "Nat");
 
     let (mint, _, output) = inferred(
@@ -4850,7 +4750,7 @@ fn a_rest_or_binder_entry_opens_the_row() {
     // The binder opens the row and un-pins the presence: `a` may be there.
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "{ a when a: Nat, ..b } -> Nat where let a, b"
+        "{ a when 'a: Nat, ..'b } -> Nat"
     );
 }
 
@@ -4862,7 +4762,7 @@ fn the_open_example_types_through_both_arms() {
     let (mint, _, output) = inferred("let f = fn v => match v with | {x, ..} => x | {} => 0 end");
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, ..'b } -> Nat"
     );
 }
 
@@ -4900,10 +4800,7 @@ fn unit_and_empty_braces_demand_the_same() {
     assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
 
     let (mint, _, output) = inferred("let g = fn v => match v with | {a} => a | () => 0 end");
-    assert_eq!(
-        scheme(&mint, &output, "g"),
-        "{ a when a: Nat } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "g"), "{ a when 'a: Nat } -> Nat");
 
     let (_, _, output) = infer_src("let {} = 5");
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
@@ -4918,7 +4815,7 @@ fn unit_and_empty_braces_demand_the_same() {
 /// mismatch is the only complaint anything makes about it.
 #[test]
 fn a_mixed_match_is_one_ordinary_mismatch() {
-    let (_, out, output) = infer_src("let f = fn e => match e with | 0 => 1 | `A x => 2 end");
+    let (_, out, output) = infer_src("let f = fn e => match e with | 0 => 1 | #A x => 2 end");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
     assert!(matches!(output.errors[0].kind, ErrorKind::Mismatch { .. }));
@@ -4936,7 +4833,7 @@ fn field_types_unify_across_arms() {
     // `b` — which is exactly the three subsets the three arms name.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ a when a: Nat, b when b: Nat } -> Nat where let a, b; a or not b"
+        "{ a when 'a: Nat, b when 'b: Nat } -> Nat where 'a or not 'b"
     );
 
     // Disagreeing across arms is the mismatch it sounds like.
@@ -4954,12 +4851,9 @@ fn field_types_unify_across_arms() {
 fn a_case_tested_by_numbers_stays_present_for_the_catch_all() {
     let (mint, _, output) = inferred(
         "let keep = fn r => 0\n\
-         let f = fn e => match e with | `A 1 => 1 | `A 2 => 2 | r => keep r end",
+         let f = fn e => match e with | #A 1 => 1 | #A 2 => 2 | r => keep r end",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "`A Nat | ..a -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "#A Nat | ..'a -> Nat");
 }
 
 /// A `{}` payload is the exact unit test it reads as, and the refinement
@@ -4967,8 +4861,8 @@ fn a_case_tested_by_numbers_stays_present_for_the_catch_all() {
 /// case, exactly as a binder payload would.
 #[test]
 fn an_empty_struct_payload_covers_its_case() {
-    let (mint, _, output) = inferred("let f = fn e => match e with | `A {} => 1 | r => 2 end");
-    assert_eq!(scheme(&mint, &output, "f"), "`A | ..a -> Nat where let a");
+    let (mint, _, output) = inferred("let f = fn e => match e with | #A {} => 1 | r => 2 end");
+    assert_eq!(scheme(&mint, &output, "f"), "#A | ..'a -> Nat");
 }
 
 /// The store as a program's batches read once inference is done: their origin
@@ -4994,20 +4888,20 @@ fn the_motivating_programs_infer_their_constraints() {
     let (mint, _, output) = inferred("let p = fn a => match a with | {x} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "p"),
-        "{ x when a: c, y when b: d } -> {} where let a, b, c, d; a != b"
+        "{ x when 'a: 'c, y when 'b: 'd } -> {} where 'a != 'b"
     );
 
     let (mint, _, output) = inferred("let q = fn v => match v with | {x, y} => {} | {} => {} end");
     assert_eq!(
         scheme(&mint, &output, "q"),
-        "{ x when a: c, y when b: d } -> {} where let a, b, c, d; a = b"
+        "{ x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b"
     );
 
     let (mint, _, output) =
         inferred("let r = fn v => match v with | {x, ..} => {} | {y, ..} => {} end");
     assert_eq!(
         scheme(&mint, &output, "r"),
-        "{ x when a: c, y when b: d, ..e } -> {} where let a, b, c, d, e; a or b"
+        "{ x when 'a: 'c, y when 'b: 'd, ..'e } -> {} where 'a or 'b"
     );
 }
 
@@ -5019,21 +4913,21 @@ fn a_nested_column_contributes_to_the_enclosing_disjunct() {
         inferred("let n = fn v => match v with | {x: {a}} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "n"),
-        "{ x when a: { a: c }, y when b: d } -> {} where let a, b, c, d; a != b"
+        "{ x when 'a: { a: 'c }, y when 'b: 'd } -> {} where 'a != 'b"
     );
     assert_eq!(store(&output).len(), 1, "{:#?}", output.store);
 }
 
 /// Sharing is name identity: two labels whose presence is one variable print
-/// with one name, and the scheme's alphabet is its own — `'a` and `a` in one
+/// with one name, and the scheme's alphabet is its own — `a` and `a` in one
 /// type are unrelated by construction.
 #[test]
 fn a_shared_presence_prints_one_name() {
     let (mint, _, output) =
-        inferred("let f : { x when a: Nat } -> { x when a: Nat } where let a = fn v => v");
+        inferred("let f : { x when 'a: Nat } -> { x when 'a: Nat } = fn v => v");
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat } -> { x when a: Nat } where let a"
+        "{ x when 'a: Nat } -> { x when 'a: Nat }"
     );
 }
 
@@ -5047,7 +4941,7 @@ fn an_entailed_presence_folds_back_at_generalization() {
          \x20 let {x, ..} = v in\n\
          \x20 match v with | {x} => {} | {y} => {} end",
     );
-    assert_eq!(scheme(&mint, &output, "h"), "{ x: a } -> {} where let a, b");
+    assert_eq!(scheme(&mint, &output, "h"), "{ x: 'a } -> {}");
 }
 
 /// A use of a constrained scheme conjoins its formula with fresh variables, so
@@ -5106,15 +5000,15 @@ fn each_use_is_constrained_on_its_own() {
 #[test]
 fn an_annotation_is_the_contract_for_its_presences() {
     let (mint, _, output) = inferred(
-        "let p2 : { x when a: Nat, y when b: Nat } -> {} where let a, b; a != b = fn v =>\n\
+        "let p2 : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn v =>\n\
          \x20 match v with | {x} => {} | {y} => {} end",
     );
     assert_eq!(
         scheme(&mint, &output, "p2"),
-        "{ x when a: Nat, y when b: Nat } -> {} where let a, b; a != b"
+        "{ x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b"
     );
 
-    let src = "let loose : { x when a: Nat, y when b: Nat } -> {} where let a, b; a or b = fn v =>\n\
+    let src = "let loose : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
                \x20 match v with | {x} => {} | {y} => {} end";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
@@ -5123,7 +5017,7 @@ fn an_annotation_is_the_contract_for_its_presences() {
     assert_eq!(error.kind.code(), "annotation-allows-more");
     assert_eq!(
         error.kind.to_string(),
-        "the annotation allows `a or b`, but the definition requires `a != b`"
+        "the annotation allows `'a or 'b`, but the definition requires `'a != 'b`"
     );
 }
 
@@ -5136,7 +5030,7 @@ fn an_annotation_is_the_contract_for_its_presences() {
 #[test]
 fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-               let f : { x when a: Nat, y when b: Nat } -> {} where let a, b; a or b = fn v => p v\n\
+               let f : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v => p v\n\
                let bad = f { x: 1, y: 2 }";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
@@ -5145,7 +5039,7 @@ fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
     assert_eq!(error.kind.code(), "annotation-allows-more");
     assert_eq!(
         error.kind.to_string(),
-        "the annotation allows `a or b`, but the definition requires `a != b`"
+        "the annotation allows `'a or 'b`, but the definition requires `'a != 'b`"
     );
     // At the annotation, which is the line to rewrite — not at the use, which
     // is doing what the clause said it could.
@@ -5155,11 +5049,11 @@ fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
     // what the definition publishes.
     let (mint, _, output) = inferred(
         "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
-         let f : { x when a: Nat, y when b: Nat } -> {} where let a, b; a != b = fn v => p v",
+         let f : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b = fn v => p v",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: Nat, y when b: Nat } -> {} where let a, b; a != b"
+        "{ x when 'a: Nat, y when 'b: Nat } -> {} where 'a != 'b"
     );
 }
 
@@ -5170,8 +5064,7 @@ fn a_clause_covers_what_the_body_needs_of_the_names_it_uses() {
 /// the match that breaks it than below it.
 #[test]
 fn a_clause_covers_what_its_whole_group_needs() {
-    let annotated =
-        "let f : { x when a: Nat, y when b: Nat } -> {} where let a, b; a or b = fn v => g v";
+    let annotated = "let f : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v => g v";
     let matching = "let g = fn v => match v with | {x} => {} | {y} => f v end";
     for src in [
         format!("{annotated}\n{matching}"),
@@ -5192,7 +5085,7 @@ fn a_clause_covers_what_its_whole_group_needs() {
         // its own however the group's variables were unified.
         assert_eq!(
             complaint.kind.to_string(),
-            "the annotation allows `a or b`, but the definition requires `a != b`"
+            "the annotation allows `'a or 'b`, but the definition requires `'a != 'b`"
         );
         // At the annotation, wherever in the group it was written.
         let at = src.find("{ x when").expect("the annotation");
@@ -5206,7 +5099,7 @@ fn a_clause_covers_what_its_whole_group_needs() {
 #[test]
 fn a_nested_annotation_is_the_contract_for_its_presences() {
     let src = "let k =\n\
-               \x20 let g : { x when a: Nat, y when b: Nat } -> {} where let a, b; a or b = fn v =>\n\
+               \x20 let g : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
                \x20   match v with | {x} => {} | {y} => {} end in\n\
                \x20 g { x: 1, y: 2 }";
     let (_, _, output) = infer_src(src);
@@ -5216,7 +5109,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
     assert_eq!(error.kind.code(), "annotation-allows-more");
     assert_eq!(
         error.kind.to_string(),
-        "the annotation allows `a or b`, but the definition requires `a != b`"
+        "the annotation allows `'a or 'b`, but the definition requires `'a != 'b`"
     );
     // The use satisfies `a or b`, so it is not what is wrong here.
     assert_eq!(error.span.start, 18);
@@ -5225,7 +5118,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
     // arms needed — is what the body of the `let` sees. So a use that violates
     // it is refused where it is written.
     let src = "let k =\n\
-               \x20 let g : { x when a: Nat, y when b: Nat, .. } -> {} where let a, b; a != b = fn v =>\n\
+               \x20 let g : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v =>\n\
                \x20   match v with | {x, ..} => {} | {y, ..} => {} end in\n\
                \x20 g { x: 1, y: 2 }";
     let (mint, _, output) = infer_src(src);
@@ -5242,7 +5135,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
         locals,
         [(
             "g",
-            "{ x when a: Nat, y when b: Nat, ..c } -> {} where let a, b, c; a != b".to_string()
+            "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> {} where 'a != 'b".to_string()
         )]
     );
 }
@@ -5255,7 +5148,7 @@ fn a_nested_annotation_is_the_contract_for_its_presences() {
 fn a_flipped_store_silences_a_nested_clause() {
     let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
                let bad = p {}\n\
-               let k = let g : { x when a: Nat } -> {} where let a; a = fn v => {} in g";
+               let k = let g : { x when 'a: Nat } -> {} where 'a = fn v => {} in g";
     let (mint, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -5266,10 +5159,7 @@ fn a_flipped_store_silences_a_nested_clause() {
         .iter()
         .map(|(symbol, scheme)| (mint.name(*symbol), scheme.to_string()))
         .collect();
-    assert_eq!(
-        locals,
-        [("g", "{ x when a: Nat } -> {} where let a".to_string())]
-    );
+    assert_eq!(locals, [("g", "{ x when 'a: Nat } -> {}".to_string())]);
 }
 
 /// A column that tests anything but presence keeps today's behaviour end to
@@ -5281,7 +5171,7 @@ fn a_non_qualifying_column_constrains_nothing() {
         infer_src("let m = fn v => match v with | {x: 1} => {} | {y} => {} end");
     assert_eq!(
         scheme(&mint, &output, "m"),
-        "{ x when a: Nat, y when b: c } -> {} where let a, b, c"
+        "{ x when 'a: Nat, y when 'b: 'c } -> {}"
     );
     assert!(store(&output).is_empty(), "{:#?}", output.store);
 
@@ -5299,7 +5189,7 @@ fn an_ordinary_program_requires_nothing() {
         "let id = fn x => x\n\
          let k = fn a => fn b => a\n\
          let f = fn p => p.x\n\
-         let g = fn v => match v with | `A n => n | `B => 0 end",
+         let g = fn v => match v with | #A n => n | #B => 0 end",
     );
     assert!(store(&output).is_empty(), "{:#?}", output.store);
     for scheme in output.schemes.values() {
@@ -5338,7 +5228,7 @@ fn the_first_flipping_batch_owns_the_error() {
 #[test]
 fn a_nested_annotation_carries_its_clause_too() {
     let (mint, _, output) =
-        inferred("let g = fn v => let h : { x when a: Nat } where let a; a = v in h");
+        inferred("let g = fn v => let h : { x when 'a: Nat } where 'a = v in h");
     assert_eq!(scheme(&mint, &output, "g"), "{ x: Nat } -> { x: Nat }");
     assert!(
         store(&output)
@@ -5354,12 +5244,8 @@ fn a_nested_annotation_carries_its_clause_too() {
 /// simply there and no clause left to print.
 #[test]
 fn a_clause_can_fold_a_presence_present() {
-    let (mint, _, output) =
-        inferred("let f : { x when a: Nat, .. } -> Nat where let a; a = fn v => 1");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : { x when 'a: Nat, .. } -> Nat where 'a = fn v => 1");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
     assert!(output.schemes.values().all(|s| s.formula().is_true()));
 }
 
@@ -5369,28 +5255,25 @@ fn a_clause_can_fold_a_presence_present() {
 #[test]
 fn every_clause_connective_lowers() {
     let (mint, _, output) = inferred(
-        "let f : { x when a: Nat, y when b: Nat, .. } -> Nat where let a, b; not a and b = fn v => 1\n\
-         let g : { x when a: Nat, y when b: Nat, .. } -> Nat where let a, b; a = b = fn v => 1\n\
-         let h : { x when a: Nat, y when b: Nat, .. } -> Nat where let a, b; a or b = fn v => 1\n\
+        "let f : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where not 'a and 'b = fn v => 1\n\
+         let g : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where 'a = 'b = fn v => 1\n\
+         let h : { x when 'a: Nat, y when 'b: Nat, .. } -> Nat where 'a or 'b = fn v => 1\n\
          let k : { x when _: Nat, .. } -> Nat = fn v => 1",
     );
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ y: Nat, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ y: Nat, ..'a } -> Nat");
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "{ x when a: Nat, y when b: Nat, ..c } -> Nat where let a, b, c; a = b"
+        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> Nat where 'a = 'b"
     );
     assert_eq!(
         scheme(&mint, &output, "h"),
-        "{ x when a: Nat, y when b: Nat, ..c } -> Nat where let a, b, c; a or b"
+        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> Nat where 'a or 'b"
     );
     // `when _` mints a presence like any other; what it does not do is give it
     // a name, so nothing constrains it and it generalizes on its own.
     assert_eq!(
         scheme(&mint, &output, "k"),
-        "{ x when a: Nat, ..b } -> Nat where let a, b"
+        "{ x when 'a: Nat, ..'b } -> Nat"
     );
 }
 
@@ -5399,8 +5282,7 @@ fn every_clause_connective_lowers() {
 /// have published says nothing rather than a clause nothing satisfies.
 #[test]
 fn an_annotation_its_definition_rules_out_is_refused() {
-    let src =
-        "let f : { x when a: Nat } -> Nat where let a; a = fn v => match v with | {} => 1 end";
+    let src = "let f : { x when 'a: Nat } -> Nat where 'a = fn v => match v with | {} => 1 end";
     let (mint, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -5409,7 +5291,7 @@ fn an_annotation_its_definition_rules_out_is_refused() {
     // Worded in the name the reader wrote, not the variable it lowered to.
     assert_eq!(
         error.kind.to_string(),
-        "nothing can satisfy `a`: what this definition does with the type has already ruled it out"
+        "nothing can satisfy `'a`: what this definition does with the type has already ruled it out"
     );
     assert!(output.schemes.values().all(|s| s.formula().is_true()));
     assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat");
@@ -5421,7 +5303,7 @@ fn an_annotation_its_definition_rules_out_is_refused() {
 /// blames the definition, and it is the only error the program gets.
 #[test]
 fn an_annotation_that_rules_itself_out_is_refused() {
-    let src = "let f : { x when a: Nat } -> {} where let a; a and not a = fn v => {}";
+    let src = "let f : { x when 'a: Nat } -> {} where 'a and not 'a = fn v => {}";
     let (mint, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -5430,19 +5312,16 @@ fn an_annotation_that_rules_itself_out_is_refused() {
     // At the annotation, which is the line the reader has to change.
     assert_eq!(
         error.span.start,
-        src.find("{ x when a").expect("the annotation")
+        src.find("{ x when 'a").expect("the annotation")
     );
     assert_eq!(
         error.kind.to_string(),
-        "nothing can satisfy `a and not a`: this clause rules out every value at once"
+        "nothing can satisfy `'a and not 'a`: this clause rules out every value at once"
     );
     // And nothing is published from it: a scheme carrying a clause with no
     // model would say the same wrong thing again at every use of the name.
     assert!(output.schemes.values().all(|s| s.formula().is_true()));
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x when a: Nat } -> {} where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "f"), "{ x when 'a: Nat } -> {}");
 }
 
 /// A use-site complaint quotes its formula in whatever labels the instantiated
@@ -5452,8 +5331,8 @@ fn an_annotation_that_rules_itself_out_is_refused() {
 fn a_use_site_reads_labels_through_the_whole_type() {
     let (_, _, output) = inferred(
         "type Box a = { it: a }\n\
-         let p : { x when a: Nat, y when b: Nat } -> Box (`A Nat | `B (when c)) where let a, b, c; a != b =\n\
-         \x20 fn v => { it: `A 1 }\n\
+         let p : { x when 'a: Nat, y when 'b: Nat } -> Box (#A Nat | #B (when 'c)) where 'a != 'b =\n\
+         \x20 fn v => { it: #A 1 }\n\
          let q = p { x: 1 }",
     );
     let labels: Vec<&str> = output
@@ -5499,7 +5378,7 @@ fn an_annotation_after_the_flip_is_not_checked() {
     let (mint, _, output) = infer_src(
         "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
          let bad = p {}\n\
-         let after : { x when a: Nat, y when b: Nat } -> {} where let a, b; a or b = fn v =>\n\
+         let after : { x when 'a: Nat, y when 'b: Nat } -> {} where 'a or 'b = fn v =>\n\
          \x20 match v with | {x} => {} | {y} => {} end",
     );
     // The use site's flip is the only complaint: the annotation below it would
@@ -5514,7 +5393,7 @@ fn an_annotation_after_the_flip_is_not_checked() {
     );
     assert_eq!(
         scheme(&mint, &output, "after"),
-        "{ x when a: Nat, y when b: Nat } -> {} where let a, b"
+        "{ x when 'a: Nat, y when 'b: Nat } -> {}"
     );
 }
 
@@ -5531,8 +5410,8 @@ fn a_scheme_requires_the_whole_component_it_reaches() {
     // require together rather than either alone.
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "{ x when a: d, y when b: e, z when c: f, ..g } -> { a: Nat, b: Nat } \
-         where let a, b, c, d, e, f, g; a and c or b"
+        "{ x when 'a: 'd, y when 'b: 'e, z when 'c: 'f, ..'g } -> { a: Nat, b: Nat } \
+         where 'a and 'c or 'b"
     );
 }
 
@@ -5547,8 +5426,8 @@ fn infer_codes(src: &str) -> Vec<&'static str> {
 }
 
 /// The three effect declarations every example in the spec is written against.
-const EFFECTS: &str = "effect Log = `write : Nat -> ()\n\
-                       effect IO = `print : Nat -> ()\n";
+const EFFECTS: &str = "effect Log = write : Nat -> ()\n\
+                       effect IO = print : Nat -> ()\n";
 
 /// R23's closing rule, over the four schemes the spec names. An effect row
 /// variable the solver learned nothing about sits on one arrow and no other, so
@@ -5562,22 +5441,22 @@ fn an_effect_variable_that_links_nothing_is_closed() {
          let apply = fn f x => f x\n\
          let id = fn x => x",
     );
-    assert_eq!(scheme(&mint, &output, "id"), "a -> a where let a");
+    assert_eq!(scheme(&mint, &output, "id"), "'a -> 'a");
     assert_eq!(
         scheme(&mint, &output, "apply"),
-        "(a -> b ! ..c) -> a -> b ! ..c where let a, b, c"
+        "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
     );
     assert_eq!(
         scheme(&mint, &output, "compose"),
-        "(a -> b ! ..c) -> (d -> a ! ..c) -> d -> b ! ..c where let a, b, c, d"
+        "('a -> 'b + ..'c) -> ('d -> 'a + ..'c) -> 'd -> 'b + ..'c"
     );
 
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ =>\n\
-         let _ = Log.`write 1 in\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ =>\n\
+         let _ = !Log.write 1 in\n\
          0"
     ));
-    assert_eq!(scheme(&mint, &output, "greet"), "{} -> Nat ! `Log");
+    assert_eq!(scheme(&mint, &output, "greet"), "{} -> Nat + !Log");
 }
 
 /// A handler discharges what its arms cover, and what its arms themselves
@@ -5586,21 +5465,21 @@ fn an_effect_variable_that_links_nothing_is_closed() {
 #[test]
 fn a_handler_discharges_what_its_arms_cover() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
          let quiet : () -> Nat = fn _ =>\n\
-           handle greet () with | Log.`write s => () | return x => x end\n\
-         let loud : () -> Nat ! `IO = fn _ =>\n\
-           handle greet () with | Log.`write s => IO.`print s end\n\
-         let run = fn g => handle g () with | Log.`write s => () end"
+           handle greet () with | !Log.write s => () | return x => x end\n\
+         let loud : () -> Nat + !IO = fn _ =>\n\
+           handle greet () with | !Log.write s => !IO.print s end\n\
+         let run = fn g => handle g () with | !Log.write s => () end"
     ));
     assert_eq!(scheme(&mint, &output, "quiet"), "{} -> Nat");
-    assert_eq!(scheme(&mint, &output, "loud"), "{} -> Nat ! `IO");
+    assert_eq!(scheme(&mint, &output, "loud"), "{} -> Nat + !IO");
     // Handling on behalf of a caller: the computation may perform `Log` and
     // whatever else the caller allows, and what is left over is the handler's
     // own row.
     assert_eq!(
         scheme(&mint, &output, "run"),
-        "({} -> a ! `Log | ..b) -> a ! ..b where let a, b"
+        "({} -> 'a + !Log + ..'b) -> 'a + ..'b"
     );
 }
 
@@ -5611,11 +5490,11 @@ fn a_handler_discharges_what_its_arms_cover() {
 #[test]
 fn an_arm_resumes_and_raise_aborts() {
     let (mint, _, output) = inferred(
-        "effect Fail = `oops : () -> Nat\n\
+        "effect Fail = oops : () -> Nat\n\
          let fallback : () -> Nat = fn _ =>\n\
-           handle Fail.`oops () with | Fail.`oops _ => 0 end\n\
+           handle !Fail.oops () with | !Fail.oops _ => 0 end\n\
          let recover : () -> Nat = fn _ =>\n\
-           handle Fail.`oops () with | Fail.`oops _ => raise 0 end",
+           handle !Fail.oops () with | !Fail.oops _ => raise 0 end",
     );
     assert_eq!(scheme(&mint, &output, "fallback"), "{} -> Nat");
     assert_eq!(scheme(&mint, &output, "recover"), "{} -> Nat");
@@ -5624,8 +5503,8 @@ fn an_arm_resumes_and_raise_aborts() {
     // unifies with the arm's body type wherever it lands.
     let (mint, _, output) = inferred(&format!(
         "{EFFECTS}let mixed = fn s =>\n\
-           handle Log.`write s with\n\
-             | Log.`write t => match t with | 0 => raise () | _ => () end\n\
+           handle !Log.write s with\n\
+             | !Log.write t => match t with | 0 => raise () | _ => () end\n\
            end"
     ));
     assert_eq!(scheme(&mint, &output, "mixed"), "Nat -> {}");
@@ -5641,46 +5520,83 @@ fn the_return_arm_decides_the_answer() {
         "{EFFECTS}let ret = fn _ => handle 1 with | return x => {{}} end\n\
          let same = fn _ => handle 1 with end"
     ));
-    assert_eq!(scheme(&mint, &output, "ret"), "a -> {} where let a");
-    assert_eq!(scheme(&mint, &output, "same"), "a -> Nat where let a");
+    assert_eq!(scheme(&mint, &output, "ret"), "'a -> {}");
+    assert_eq!(scheme(&mint, &output, "same"), "'a -> Nat");
 }
 
 /// An arm's body has to be what the operation gives back, whatever the handler
-/// answers: `` `write : Nat -> () `` makes the arm's body a `()`.
+/// answers: `write : Nat -> ()` makes the arm's body a `()`.
 #[test]
 fn an_arms_body_is_the_operations_result() {
     let codes = infer_codes(&format!(
-        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
-         let h = fn _ => handle p () with | Log.`write s => 1 end"
+        "{EFFECTS}let p : () -> Nat + !Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | !Log.write s => 1 end"
     ));
     assert_eq!(codes, ["type-mismatch"]);
 }
 
+/// A row of effects handed to a declaration as an argument is the row the
+/// declaration's `..` stands for: it is spliced in where the parameter sat, and
+/// what comes out is the arrow the reader would have written by hand.
+///
+/// The one place a row reaches inference without an arrow around it, so it is
+/// the one place a set of labels arrives as an argument and has to be read as
+/// the row it is.
+#[test]
+fn a_row_of_effects_may_be_handed_to_a_declaration() {
+    let (mint, _, output) = inferred(&format!(
+        "{EFFECTS}type Runner e = (Nat -> Nat + ..e) -> Nat\n\
+         let run : Runner (!Log) -> Nat = fn r => 1\n\
+         let both : Runner (!Log + !IO) -> Nat = fn r => 1"
+    ));
+    // The scheme keeps the declaration nominal, and a nominal argument prints
+    // as the bare set of labels it is: which of the three rows it will be
+    // spliced into is the parameter's to say, and a printed type carries no
+    // parameter along with it. Both spellings name the same set and both
+    // re-parse, which is what keeps a printed scheme source.
+    assert_eq!(scheme(&mint, &output, "run"), "Runner (#Log) -> Nat");
+    assert_eq!(scheme(&mint, &output, "both"), "Runner (#Log | #IO) -> Nat");
+
+    // Unfolded — which is what a complaint about the type shows — the row is
+    // the arrow's own effects, and reads as the effects it is.
+    let (_, _, output) = infer_src(&format!(
+        "{EFFECTS}type Runner e = (Nat -> Nat + ..e) -> Nat\n\
+         let bad : Runner (!Log) = 1"
+    ));
+    let [error] = &output.errors[..] else {
+        panic!("{:#?}", output.errors);
+    };
+    assert_eq!(
+        error.kind.to_string(),
+        "type mismatch: expected `(Nat -> Nat + !Log) -> Nat`, found `Nat`"
+    );
+}
+
 /// R12: applying a function opens its row into the ambient, which is what
 /// makes an effect row an upper bound rather than a demand on the caller. A
-/// closed `` `Log `` goes through wherever `` `Log `` is allowed, and the rest
+/// closed `!Log` goes through wherever `!Log` is allowed, and the rest
 /// of what the ambient allows stays the ambient's own.
 #[test]
 fn an_application_opens_the_callees_row() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
-         let both : () -> Nat ! `Log | `IO = fn _ =>\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
+         let both : () -> Nat + !Log + !IO = fn _ =>\n\
            let n = greet () in\n\
-           let _ = IO.`print n in\n\
+           let _ = !IO.print n in\n\
            n\n\
-         let just : () -> Nat ! `Log = fn _ => greet ()"
+         let just : () -> Nat + !Log = fn _ => greet ()"
     ));
-    assert_eq!(scheme(&mint, &output, "both"), "{} -> Nat ! `Log | `IO");
-    assert_eq!(scheme(&mint, &output, "just"), "{} -> Nat ! `Log");
+    assert_eq!(scheme(&mint, &output, "both"), "{} -> Nat + !Log + !IO");
+    assert_eq!(scheme(&mint, &output, "just"), "{} -> Nat + !Log");
 }
 
-/// R13: opening happens at application and nowhere else, so unifying two
+/// R13: opening happens at application and nowhere 'else, so unifying two
 /// arrows compares their rows as rows and an annotation still means what it
 /// says.
 #[test]
 fn an_annotation_is_not_opened() {
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log = fn x => x\n\
+        "{EFFECTS}let f : Nat -> Nat + !Log = fn x => x\n\
          let h : Nat -> Nat = f"
     ));
     let [error] = output.errors.as_slice() else {
@@ -5689,7 +5605,7 @@ fn an_annotation_is_not_opened() {
     assert_eq!(error.kind.code(), "extra-field");
     assert_eq!(
         error.kind.to_string(),
-        "extra effect ``Log`: the type `Nat -> Nat` lists every effect it allows"
+        "extra effect `!Log`: the type `Nat -> Nat` lists every effect it allows"
     );
 }
 
@@ -5699,7 +5615,7 @@ fn an_annotation_is_not_opened() {
 #[test]
 fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
          let n = greet ()"
     ));
     let [error] = output.errors.as_slice() else {
@@ -5708,11 +5624,11 @@ fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     assert_eq!(error.kind.code(), "unhandled-effect");
     assert_eq!(
         error.kind.to_string(),
-        "nothing can handle ``Log` here: a definition's value is computed outside every handler"
+        "nothing can handle `!Log` here: a definition's value is computed outside every handler"
     );
 
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
          let f : () -> Nat = fn _ => greet ()"
     ));
     let [error] = output.errors.as_slice() else {
@@ -5721,7 +5637,7 @@ fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
     assert_eq!(error.kind.code(), "effect-not-allowed");
     assert_eq!(
         error.kind.to_string(),
-        "this function performs ``Log`, which its type does not allow"
+        "this function performs `!Log`, which its type does not allow"
     );
 }
 
@@ -5732,7 +5648,7 @@ fn a_performed_effect_has_to_be_allowed_where_it_is_written() {
 fn re_performing_a_discharged_effect_is_refused() {
     let (_, _, output) = infer_src(&format!(
         "{EFFECTS}let mask = fn _ =>\n\
-           handle Log.`write 1 with | Log.`write s => Log.`write s end"
+           handle !Log.write 1 with | !Log.write s => !Log.write s end"
     ));
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors);
@@ -5753,29 +5669,27 @@ fn re_performing_a_discharged_effect_is_refused() {
 #[test]
 fn presence_written_on_an_effect_survives_into_the_scheme() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b\n\
+        "{EFFECTS}let f : Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b\n\
          \x20 = fn x => x"
     ));
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b"
+        "Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b"
     );
 }
 
-/// An annotation is the contract, and a declared `..e` is a rigid: it is
+/// An annotation is the contract, and a declared `..'e` is a rigid: it is
 /// quantified however few times it occurs — R23's closing rule counts solver
 /// variables and a rigid is none — and a body that performs into it is refused
 /// at the label it demanded, since the caller is who decides what `e` allows.
 #[test]
 fn an_annotations_effect_tail_is_the_readers() {
-    let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! ..e where let e = fn x => x"
-    ));
-    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..a where let a");
+    let (mint, _, output) = inferred(&format!("{EFFECTS}let f : Nat -> Nat + ..'e = fn x => x"));
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat + ..'a");
 
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
-         let f : () -> Nat ! ..e where let e = fn _ => greet ()"
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
+         let f : () -> Nat + ..'e = fn _ => greet ()"
     ));
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors);
@@ -5790,11 +5704,11 @@ fn an_annotations_effect_tail_is_the_readers() {
 #[test]
 fn a_handler_runs_under_a_declared_tail() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let greet : () -> Nat ! `Log = fn _ => let _ = Log.`write 1 in 0\n\
-         let f : () -> Nat ! ..e where let e = fn _ =>\n\
-         \x20 handle greet () with | Log.`write s => () | return x => x end"
+        "{EFFECTS}let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
+         let f : () -> Nat + ..'e = fn _ =>\n\
+         \x20 handle greet () with | !Log.write s => () | return x => x end"
     ));
-    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat ! ..a where let a");
+    assert_eq!(scheme(&mint, &output, "f"), "{} -> Nat + ..'a");
 }
 
 /// A body that closes a declared effect tail outright — aliasing a pure
@@ -5805,7 +5719,7 @@ fn a_handler_runs_under_a_declared_tail() {
 fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
     let (_, _, output) = infer_src(&format!(
         "{EFFECTS}let g = fn x => x\n\
-         let f : Nat -> Nat ! ..e where let e = g"
+         let f : Nat -> Nat + ..'e = g"
     ));
     let [error] = output.errors.as_slice() else {
         panic!("{:#?}", output.errors);
@@ -5813,7 +5727,7 @@ fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this decides what it may perform, but `e` stands for whatever effects the caller allows"
+        "this decides what it may perform, but `'e` stands for whatever effects the caller allows"
     );
 }
 
@@ -5825,17 +5739,11 @@ fn a_body_that_closes_a_declared_effect_tail_breaks_it() {
 #[test]
 fn a_mutually_recursive_pair_may_each_leave_effects_open() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let ping : Nat -> Nat ! ..e where let e = fn n => pong n\n\
-         let pong : Nat -> Nat ! ..e where let e = fn n => ping n"
+        "{EFFECTS}let ping : Nat -> Nat + ..'e = fn n => pong n\n\
+         let pong : Nat -> Nat + ..'e = fn n => ping n"
     ));
-    assert_eq!(
-        scheme(&mint, &output, "ping"),
-        "Nat -> Nat ! ..a where let a"
-    );
-    assert_eq!(
-        scheme(&mint, &output, "pong"),
-        "Nat -> Nat ! ..a where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "ping"), "Nat -> Nat + ..'a");
+    assert_eq!(scheme(&mint, &output, "pong"), "Nat -> Nat + ..'a");
 }
 
 /// A declared alias is a name for a set of effects, so a row naming one
@@ -5844,25 +5752,25 @@ fn a_mutually_recursive_pair_may_each_leave_effects_open() {
 #[test]
 fn an_effect_row_unifies_against_a_declared_alias() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}effect Console = `Log | `IO\n\
-         type Both = Nat -> Nat ! `Log | `IO\n\
-         let f : Nat -> Nat ! `Console = fn x => x\n\
+        "{EFFECTS}effect Console = !Log + !IO\n\
+         type Both = Nat -> Nat + !Log + !IO\n\
+         let f : Nat -> Nat + !Console = fn x => x\n\
          let g : Both = f"
     ));
-    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! `Log | `IO");
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat + !Log + !IO");
     assert_eq!(scheme(&mint, &output, "g"), "Both");
 }
 
 /// An effect written absent lowers to an absent presence, exactly as a struct's
-/// `\y` and a sum's `` \`B `` do: the `..` beside it may not stand for the
+/// `\y` and a sum's `\#B` do: the `..` beside it may not stand for the
 /// effect, and a label that is not there is no part of what the type says — so
 /// the scheme prints the tail alone.
 #[test]
 fn an_effect_written_absent_lowers_to_an_absent_presence() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e where let e = fn x => x"
+        "{EFFECTS}let f : Nat -> Nat + \\!IO + ..'e = fn x => x"
     ));
-    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat ! ..a where let a");
+    assert_eq!(scheme(&mint, &output, "f"), "Nat -> Nat + ..'a");
     let symbol = symbol_named(&mint, output.schemes.keys().copied(), "f");
     let body = output.schemes[&symbol].body().clone();
     let Core::Arrow(_, _, effects) = &body.core else {
@@ -5873,8 +5781,8 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
 
     // And the condition it records is what refuses the tail standing for it.
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! \\`IO | ..e where let e = fn x => x\n\
-         let g : Nat -> Nat ! `IO = f"
+        "{EFFECTS}let f : Nat -> Nat + \\!IO + ..'e = fn x => x\n\
+         let g : Nat -> Nat + !IO = f"
     ));
     assert!(!output.errors.is_empty(), "{:#?}", output.errors);
 }
@@ -5885,9 +5793,9 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
 #[test]
 fn a_use_site_quotes_an_effect_presence_by_its_label() {
     let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) | `IO (when b) where let a, b; a != b\n\
+        "{EFFECTS}let f : Nat -> Nat + !Log (when 'a) + !IO (when 'b) where 'a != 'b\n\
          \x20 = fn x => x\n\
-         let g : Nat -> Nat ! `Log | `IO = f"
+         let g : Nat -> Nat + !Log + !IO = f"
     ));
     let quoted: Vec<String> = output
         .errors
@@ -5909,7 +5817,7 @@ fn a_use_site_quotes_an_effect_presence_by_its_label() {
 #[test]
 fn a_performed_effect_that_may_not_be_there_is_not_refused() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) where let a = fn x => x\n\
+        "{EFFECTS}let f : Nat -> Nat + !Log (when 'a) = fn x => x\n\
          let g : Nat -> Nat = fn n => f n"
     ));
     assert_eq!(scheme(&mint, &output, "g"), "Nat -> Nat");
@@ -5921,15 +5829,15 @@ fn a_performed_effect_that_may_not_be_there_is_not_refused() {
 #[test]
 fn two_effect_rows_with_extras_both_ways_share_a_fresh_tail() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let p : (Nat -> Nat ! `Log | ..r) -> Nat where let r = fn f => 1\n\
-         let q : (Nat -> Nat ! `IO | ..r) -> Nat where let r = fn f => 1\n\
+        "{EFFECTS}let p : (Nat -> Nat + !Log + ..'r) -> Nat = fn f => 1\n\
+         let q : (Nat -> Nat + !IO + ..'r) -> Nat = fn f => 1\n\
          let h = fn v => {{ one: p v, two: q v }}"
     ));
     // The argument has to allow both, and the one tail the two now share
     // links nothing else in the scheme, so R23 closes it.
     assert_eq!(
         scheme(&mint, &output, "h"),
-        "(Nat -> Nat ! `Log | `IO) -> { one: Nat, two: Nat }"
+        "(Nat -> Nat + !Log + !IO) -> { one: Nat, two: Nat }"
     );
 }
 
@@ -5938,9 +5846,7 @@ fn two_effect_rows_with_extras_both_ways_share_a_fresh_tail() {
 /// which is precisely what it is reporting.
 #[test]
 fn an_abandoned_effect_presence_prints_as_a_question() {
-    let (_, _, output) = infer_src(&format!(
-        "{EFFECTS}let f : Nat -> Nat ! `Log (when a) where let a = 1"
-    ));
+    let (_, _, output) = infer_src(&format!("{EFFECTS}let f : Nat -> Nat + !Log (when 'a) = 1"));
     let quoted: Vec<String> = output
         .errors
         .iter()
@@ -5948,7 +5854,7 @@ fn an_abandoned_effect_presence_prints_as_a_question() {
         .collect();
     assert_eq!(
         quoted,
-        ["type mismatch: expected `Nat -> Nat ! `Log?`, found `Nat`"],
+        ["type mismatch: expected `Nat -> Nat + !Log?`, found `Nat`"],
         "{:#?}",
         output.errors
     );
@@ -5988,14 +5894,14 @@ fn a_nested_let_leaves_an_outer_binders_effects_alone() {
     let (mint, _, output) = inferred("let a = fn p => let q = fn z => p z in q");
     assert_eq!(
         scheme(&mint, &output, "a"),
-        "(a -> b ! ..c) -> a -> b ! ..c where let a, b, c"
+        "('a -> 'b + ..'c) -> 'a -> 'b + ..'c"
     );
     let locals: Vec<String> = output
         .locals
         .values()
         .map(|scheme| scheme.to_string())
         .collect();
-    assert_eq!(locals, ["a -> b ! ..c where let a, b, c"]);
+    assert_eq!(locals, ["'a -> 'b + ..'c"]);
 }
 
 /// A `raise` lowering already refused still has a type: its value is walked
@@ -6010,8 +5916,11 @@ fn a_refused_raise_still_walks_its_value() {
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     // Nothing constrains what `raise` gives back, which is the typing it has
     // in ML — and the value under it is a `Nat` all the same.
-    assert_eq!(scheme(&mint, &output, "a"), "a where let a");
-    assert_eq!(body_types(&term_decl(&mint, &out, "a").value), ["a", "Nat"]);
+    assert_eq!(scheme(&mint, &output, "a"), "'a");
+    assert_eq!(
+        body_types(&term_decl(&mint, &out, "a").value),
+        ["'a", "Nat"]
+    );
 }
 
 /// R10: an operation is an ordinary value of its declared signature, with the
@@ -6021,15 +5930,15 @@ fn a_refused_raise_still_walks_its_value() {
 #[test]
 fn an_operation_is_a_value_of_its_declared_signature() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let held : Nat -> () ! `Log = Log.`write\n\
-         let done : () -> () ! `Log = fn _ => Log.`write 1"
+        "{EFFECTS}let held : Nat -> () + !Log = !Log.write\n\
+         let done : () -> () + !Log = fn _ => !Log.write 1"
     ));
-    assert_eq!(scheme(&mint, &output, "held"), "Nat -> {} ! `Log");
-    assert_eq!(scheme(&mint, &output, "done"), "{} -> {} ! `Log");
+    assert_eq!(scheme(&mint, &output, "held"), "Nat -> {} + !Log");
+    assert_eq!(scheme(&mint, &output, "done"), "{} -> {} + !Log");
 
     // Referring to one performs nothing: a definition's value is computed
     // outside every handler, and naming an operation there is fine.
-    let (_, _, output) = infer_src(&format!("{EFFECTS}let held = Log.`write"));
+    let (_, _, output) = infer_src(&format!("{EFFECTS}let held = !Log.write"));
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
 }
 
@@ -6038,16 +5947,16 @@ fn an_operation_is_a_value_of_its_declared_signature() {
 #[test]
 fn an_arm_binds_its_binder_at_what_the_operation_takes() {
     let (mint, _, output) = inferred(&format!(
-        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
-         let h : () -> Nat ! `IO = fn _ =>\n\
-           handle p () with | Log.`write s => IO.`print s end"
+        "{EFFECTS}let p : () -> Nat + !Log = fn _ => 0\n\
+         let h : () -> Nat + !IO = fn _ =>\n\
+           handle p () with | !Log.write s => !IO.print s end"
     ));
-    assert_eq!(scheme(&mint, &output, "h"), "{} -> Nat ! `IO");
+    assert_eq!(scheme(&mint, &output, "h"), "{} -> Nat + !IO");
 
     // And a binder used at anything else is the mismatch it is.
     let codes = infer_codes(&format!(
-        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
-         let h = fn _ => handle p () with | Log.`write s => s.x end"
+        "{EFFECTS}let p : () -> Nat + !Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | !Log.write s => s.x end"
     ));
     assert_eq!(codes, ["missing-field"]);
 }
@@ -6059,8 +5968,8 @@ fn an_arm_binds_its_binder_at_what_the_operation_takes() {
 #[test]
 fn a_raise_under_a_function_answers_no_arm() {
     let (mint, out, output) = infer_src(&format!(
-        "{EFFECTS}let p : () -> Nat ! `Log = fn _ => 0\n\
-         let h = fn _ => handle p () with | Log.`write s => {{ g: fn _ => raise 0 }} end"
+        "{EFFECTS}let p : () -> Nat + !Log = fn _ => 0\n\
+         let h = fn _ => handle p () with | !Log.write s => {{ g: fn _ => raise 0 }} end"
     ));
     assert_eq!(
         out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
@@ -6076,7 +5985,7 @@ fn a_raise_under_a_function_answers_no_arm() {
             .collect::<Vec<_>>(),
         ["extra-field"]
     );
-    assert_eq!(scheme(&mint, &output, "h"), "a -> Nat where let a");
+    assert_eq!(scheme(&mint, &output, "h"), "'a -> Nat");
 }
 
 /// Every example the specification writes out, pinned by the scheme it
@@ -6087,53 +5996,45 @@ fn a_raise_under_a_function_answers_no_arm() {
 fn the_written_examples_publish_what_they_say() {
     for (src, name, published) in [
         // Annotating the identity function, which was unwritable before.
-        (
-            "let id : a -> a where let a = fn x => x",
-            "id",
-            "a -> a where let a",
-        ),
+        ("let id : 'a -> 'a = fn x => x", "id", "'a -> 'a"),
         // Two holes, inferred equal — the footgun the feature removes.
-        (
-            "let id : {..} -> {..} = fn a => a",
-            "id",
-            "a -> a where let a",
-        ),
+        ("let id : {..} -> {..} = fn a => a", "id", "'a -> 'a"),
         // The same promise made rigidly, and kept.
         (
-            "let id : { ..r } -> { ..r } where let r = fn a => a",
+            "let id : { ..'r } -> { ..'r } = fn a => a",
             "id",
-            "a -> a where let a",
+            "'a -> 'a",
         ),
         // A hole where a promise would be wrong: the bare `..` is the
         // definition's to decide, so reading a field through it is no
         // complaint.
         (
-            "let fst : { x: a, .. } -> a where let a = fn p => p.x",
+            "let fst : { x: 'a, .. } -> 'a = fn p => p.x",
             "fst",
-            "{ x: a, ..b } -> a where let a, b",
+            "{ x: 'a, ..'b } -> 'a",
         ),
         // Subsumption: a body more general than the annotation checks fine,
         // and the annotation is what is published.
         ("let f : Nat -> Nat = fn x => x", "f", "Nat -> Nat"),
         // A hole in a type position.
-        ("let k : _ -> Nat = fn x => 0", "k", "a -> Nat where let a"),
+        ("let k : _ -> Nat = fn x => 0", "k", "'a -> Nat"),
         // A statement list, mixed sorts, any order.
         (
-            "let both : { x when a: c, y when b: d } -> {} where let a, b; a = b; let c, d\n\
+            "let both : { x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b\n\
              \x20 = fn v => match v with\n\
              \x20   | {x, y} => {}\n\
              \x20   | {} => {}\n\
              \x20 end",
             "both",
-            "{ x when a: c, y when b: d } -> {} where let a, b, c, d; a = b",
+            "{ x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b",
         ),
         // Polymorphic recursion over a declared rest: the recursive use
         // instantiates `r` freshly, so a closed `Nest` is no conflict.
         (
             "type Nest = { kids: Nest }\n\
-             let depth : { kids: Nest, ..r } -> Nat where let r = fn n => depth n.kids",
+             let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids",
             "depth",
-            "{ kids: Nest, ..a } -> Nat where let a",
+            "{ kids: Nest, ..'a } -> Nat",
         ),
     ] {
         let (mint, _, output) = inferred(src);
@@ -6158,7 +6059,7 @@ fn a_specializing_annotation_is_what_a_use_sees() {
 #[test]
 fn the_written_examples_are_refused_where_they_go_wrong() {
     // A declared rest asked for a field.
-    let src = "let bad : { ..r } -> { ..r } where let r = fn a => { x: a.x }";
+    let src = "let bad : { ..'r } -> { ..'r } = fn a => { x: a.x }";
     let (_, _, output) = infer_src(src);
     let read = output
         .errors
@@ -6167,13 +6068,13 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
         .unwrap_or_else(|| panic!("{:#?}", output.errors));
     assert_eq!(
         read.kind.to_string(),
-        "this reads a field `x`, but `r` stands for whatever type the caller picks, \
+        "this reads a field `x`, but `'r` stands for whatever type the caller picks, \
          so it may not have one"
     );
     assert_eq!(read.span.start, src.rfind('x').expect("the field"));
 
     // A declared type made into a `Nat`.
-    let src = "let g : a -> a where let a = fn x => 0";
+    let src = "let g : 'a -> 'a = fn x => 0";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -6181,24 +6082,24 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `Nat`, but `a` stands for whatever type the caller picks"
+        "this is `Nat`, but `'a` stands for whatever type the caller picks"
     );
     assert_eq!(error.span.start, src.rfind('0').expect("the body"));
 
     // Two distinct declared types made into one.
-    let src = "let h : a -> b where let a, b = fn x => x";
+    let src = "let h : 'a -> 'b = fn x => x";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };
     assert_eq!(
         error.kind.to_string(),
-        "this is `a`, but `b` stands for whatever type the caller picks"
+        "this is `'a`, but `'b` stands for whatever type the caller picks"
     );
 
     // And a declared variable reaching a type outside its own annotation.
     let src = "let bad = fn x =>\n\
-               \x20 let g : a -> a where let a = x in\n\
+               \x20 let g : 'a -> 'a = x in\n\
                \x20 0";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
@@ -6207,17 +6108,17 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
     assert_eq!(error.kind.code(), "rigid-escapes");
     assert_eq!(
         error.kind.to_string(),
-        "`a` stands for whatever the caller picks, so it can't be part of a type \
+        "`\'a` stands for whatever the caller picks, so it can't be part of a type \
          outside the annotation that declared it"
     );
-    assert_eq!(error.span.start, src.rfind("let a").expect("the name") + 4);
+    assert_eq!(error.span.start, src.find("'a").expect("the first use"));
 
     // Said once, however many schemes it reaches: two bindings taking the same
     // value both publish a type holding it, and a reader sent to the same line
     // twice learns nothing the second time.
     let (_, _, output) = infer_src(
         "let bad = fn x =>\n\
-         \x20 let g : a -> a where let a = x in\n\
+         \x20 let g : 'a -> 'a = x in\n\
          \x20 let h = x in\n\
          \x20 0",
     );
@@ -6231,8 +6132,8 @@ fn the_written_examples_are_refused_where_they_go_wrong() {
 #[test]
 fn a_rigid_meets_only_itself() {
     // The same variable twice is already the same thing.
-    let (mint, _, output) = inferred("let f : a -> a where let a = fn x => x");
-    assert_eq!(scheme(&mint, &output, "f"), "a -> a where let a");
+    let (mint, _, output) = inferred("let f : 'a -> 'a = fn x => x");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'a");
 
     // Every other core, one at a time. `found` is what the body turned out to
     // be, which is what the reader is shown.
@@ -6243,9 +6144,9 @@ fn a_rigid_meets_only_itself() {
         // A lambda's own variables were abandoned by the failure, so what is
         // named is the arrow and not what it would have been solved to.
         ("fn y => y", "? -> ?"),
-        ("`A 1", "`A Nat | .."),
+        ("#A 1", "#A Nat | .."),
     ] {
-        let src = format!("let f : a -> a where let a = fn x => {body}");
+        let src = format!("let f : 'a -> 'a = fn x => {body}");
         let (_, _, output) = infer_src(&src);
         let [error] = output.errors.as_slice() else {
             panic!("{src}: expected one error: {:#?}", output.errors);
@@ -6266,20 +6167,20 @@ fn a_rigid_meets_only_itself() {
     let (_, _, output) = infer_src(
         "type Endo = Nat -> Nat\n\
          let e : Endo = fn n => n\n\
-         let f : a -> a where let a = fn x => e",
+         let f : 'a -> 'a = fn x => e",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };
     assert_eq!(
         error.kind.to_string(),
-        "this is `Endo`, but `a` stands for whatever type the caller picks"
+        "this is `Endo`, but `'a` stands for whatever type the caller picks"
     );
 
     // And an unbound variable takes the rigid, as it would take any type: that
     // is what makes a lambda argument checked against one work at all.
-    let (mint, _, output) = inferred("let f : a -> a where let a = fn x => x");
-    assert_eq!(scheme(&mint, &output, "f"), "a -> a where let a");
+    let (mint, _, output) = inferred("let f : 'a -> 'a = fn x => x");
+    assert_eq!(scheme(&mint, &output, "f"), "'a -> 'a");
 }
 
 /// A label demanded of a declared variable is refused outright, whichever of
@@ -6288,7 +6189,7 @@ fn a_rigid_meets_only_itself() {
 #[test]
 fn a_label_demanded_of_a_rigid_is_refused() {
     // A whole type, read for a field.
-    let (_, _, output) = infer_src("let f : a -> Nat where let a = fn x => x.y");
+    let (_, _, output) = infer_src("let f : 'a -> Nat = fn x => x.y");
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };
@@ -6300,30 +6201,27 @@ fn a_label_demanded_of_a_rigid_is_refused() {
     );
 
     // A struct's rest, read for a field its row does not name.
-    let (_, _, output) = infer_src("let f : { x: Nat, ..r } -> Nat where let r = fn p => p.y");
+    let (_, _, output) = infer_src("let f : { x: Nat, ..'r } -> Nat = fn p => p.y");
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };
     assert_eq!(error.kind.code(), "rigid-field");
 
     // A field the row *does* name is no demand on the rest at all.
-    let (mint, _, output) = inferred("let f : { x: Nat, ..r } -> Nat where let r = fn p => p.x");
-    assert_eq!(
-        scheme(&mint, &output, "f"),
-        "{ x: Nat, ..a } -> Nat where let a"
-    );
+    let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => p.x");
+    assert_eq!(scheme(&mint, &output, "f"), "{ x: Nat, ..'a } -> Nat");
 
     // And a sum's rest, tested for a case its row does not name.
     let (_, _, output) = infer_src(
-        "let f : (`A Nat | ..r) -> Nat where let r = \
-         fn p => match p with | `A x => 1 | `B y => 0 end",
+        "let f : (#A Nat | ..'r) -> Nat = \
+         fn p => match p with | #A x => 1 | #B y => 0 end",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };
     assert_eq!(error.kind.code(), "rigid-field");
     assert!(
-        error.kind.to_string().starts_with("this reads a case ``B`"),
+        error.kind.to_string().starts_with("this reads a case `#B`"),
         "{}",
         error.kind
     );
@@ -6339,11 +6237,11 @@ fn a_recursive_use_instantiates_what_was_declared() {
     // copy, so handing it a closed record is no conflict.
     let (mint, _, output) = inferred(
         "type Nest = { kids: Nest }\n\
-         let depth : { kids: Nest, ..r } -> Nat where let r = fn n => depth n.kids",
+         let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids",
     );
     assert_eq!(
         scheme(&mint, &output, "depth"),
-        "{ kids: Nest, ..a } -> Nat where let a"
+        "{ kids: Nest, ..'a } -> Nat"
     );
 
     // Monomorphic in what was left to inference: one hole, shared across every
@@ -6364,17 +6262,17 @@ fn a_recursive_use_instantiates_what_was_declared() {
 #[test]
 fn a_nested_annotation_declares_its_own_variables() {
     // Accepted, and published as what it declared.
-    let (mint, _, output) = inferred("let e = let id : a -> a where let a = fn x => x in id 1");
+    let (mint, _, output) = inferred("let e = let id : 'a -> 'a = fn x => x in id 1");
     assert_eq!(scheme(&mint, &output, "e"), "Nat");
     let local = output
         .locals
         .values()
         .next()
         .expect("the binding published a scheme");
-    assert_eq!(local.to_string(), "a -> a where let a");
+    assert_eq!(local.to_string(), "'a -> 'a");
 
     // Refused where the value decides one.
-    let src = "let e = let f : a -> Nat where let a = fn x => x.y in 0";
+    let src = "let e = let f : 'a -> Nat = fn x => x.y in 0";
     let (_, _, output) = infer_src(src);
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -6386,13 +6284,10 @@ fn a_nested_annotation_declares_its_own_variables() {
     let (mint, _, output) = inferred(
         "type Nest = { kids: Nest }\n\
          let e = fn v =>\n\
-         \x20 let depth : { kids: Nest, ..r } -> Nat where let r = fn n => depth n.kids in\n\
+         \x20 let depth : { kids: Nest, ..'r } -> Nat = fn n => depth n.kids in\n\
          \x20 depth v",
     );
-    assert_eq!(
-        scheme(&mint, &output, "e"),
-        "{ kids: Nest, ..a } -> Nat where let a"
-    );
+    assert_eq!(scheme(&mint, &output, "e"), "{ kids: Nest, ..'a } -> Nat");
 }
 
 /// A sum's rest goes by the core rule's arms, said about cases: a declared rest
@@ -6401,19 +6296,18 @@ fn a_nested_annotation_declares_its_own_variables() {
 #[test]
 fn a_declared_sum_rest_is_equal_to_itself_and_to_nothing_else() {
     // The same rest on both sides of an arrow is one promise kept.
-    let (mint, _, output) =
-        inferred("let f : (`A Nat | ..r) -> (`A Nat | ..r) where let r = fn p => p");
+    let (mint, _, output) = inferred("let f : (#A Nat | ..'r) -> (#A Nat | ..'r) = fn p => p");
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "`A Nat | ..a -> `A Nat | ..a where let a"
+        "#A Nat | ..'a -> #A Nat | ..'a"
     );
 
     // And it is refused against a sum that allows nothing more, whichever side
     // of the goal the promise sits on. Here it is the expected one: the
     // argument written at `k` is what the annotation says `k` takes.
     let (_, _, output) = infer_src(
-        "let closed : `A Nat = `A 1\n\
-         let f : ((`A Nat | ..r) -> Nat) -> Nat where let r = fn k => k closed",
+        "let closed : #A Nat = #A 1\n\
+         let f : ((#A Nat | ..'r) -> Nat) -> Nat = fn k => k closed",
     );
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
@@ -6421,7 +6315,7 @@ fn a_declared_sum_rest_is_equal_to_itself_and_to_nothing_else() {
     assert_eq!(error.kind.code(), "rigid-broken");
     assert_eq!(
         error.kind.to_string(),
-        "this is `|`, but `r` stands for whatever type the caller picks"
+        "this is `|`, but `'r` stands for whatever type the caller picks"
     );
 }
 
@@ -6434,28 +6328,27 @@ fn a_variable_tail_takes_a_declared_rest() {
     // A struct's rest, where the two rows name the same fields and the tails
     // are what is left to agree.
     let (mint, _, output) = inferred(
-        "let f : ({ x: Nat, ..r } -> Nat) -> { x: Nat, .. } -> Nat where let r = \
+        "let f : ({ x: Nat, ..'r } -> Nat) -> { x: Nat, .. } -> Nat = \
          fn k => fn v => k v",
     );
     assert_eq!(
         scheme(&mint, &output, "f"),
-        "({ x: Nat, ..a } -> Nat) -> { x: Nat, ..a } -> Nat where let a"
+        "({ x: Nat, ..'a } -> Nat) -> { x: Nat, ..'a } -> Nat"
     );
 
     // And a sum's, which is the same rule about cases.
     let (mint, _, output) = inferred(
-        "let g : ((`A Nat | ..r) -> Nat) -> (`A Nat | ..) -> Nat where let r = \
+        "let g : ((#A Nat | ..'r) -> Nat) -> (#A Nat | ..) -> Nat = \
          fn k => fn v => k v",
     );
     assert_eq!(
         scheme(&mint, &output, "g"),
-        "(`A Nat | ..a -> Nat) -> `A Nat | ..a -> Nat where let a"
+        "(#A Nat | ..'a -> Nat) -> #A Nat | ..'a -> Nat"
     );
 
     // Two declared rests are two promises, and one is no more the other than
     // a closed row is.
-    let (_, _, output) =
-        infer_src("let h : (`A Nat | ..r) -> (`A Nat | ..s) where let r, s = fn p => p");
+    let (_, _, output) = infer_src("let h : (#A Nat | ..'r) -> (#A Nat | ..'s) = fn p => p");
     let [error] = output.errors.as_slice() else {
         panic!("expected one error: {:#?}", output.errors);
     };

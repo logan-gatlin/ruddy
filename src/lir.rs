@@ -523,7 +523,7 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
 /// folded in, the outer copy of a label winning.
 ///
 /// A declared sum handed a row at its parameter arrives this way — unfolding
-/// `Fallible (``Ok Nat)` splices the argument's cases in behind a tail — so the
+/// `Fallible (#Ok Nat)` splices the argument's cases in behind a tail — so the
 /// dispatch that reads the row sees one flat set of cases either way.
 fn flat(row: &Row) -> Row {
     let mut labels = row.labels.clone();
@@ -1721,7 +1721,7 @@ impl Lower<'_> {
     /// and the payload, reads the operation out of the record and calls it.
     ///
     /// Its own evidence parameter is what puts the effect in the wrapper's arrow
-    /// row, exactly as the inferred type `From -> To ! ``E`` says it should be.
+    /// row, exactly as the inferred type `From -> To + !E` says it should be.
     fn operation_value(&mut self, term: &Term, op: &str, body: &mut Body) -> Temp {
         let (from, to, _) = self.arrow(&term.ty);
         let evidence = self.fresh(Rep::Struct);

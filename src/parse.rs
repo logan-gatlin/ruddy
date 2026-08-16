@@ -41,8 +41,8 @@ pub enum StmtKind {
         /// already refuses the `..` beside them for the same reason.
         body: Annotation,
     },
-    /// `` effect Log = `write : Nat -> () | `flush : () -> () `` — an effect
-    /// and the operations it declares — or `` effect Console = `Log | `IO ``,
+    /// `effect Log = write : Nat -> () | flush : () -> ()` — an effect and
+    /// the operations it declares — or `effect Console = !Log + !IO`,
     /// a name standing for the effects it lists.
     ///
     /// One node for the two forms, because the parser judges nothing: which of
@@ -61,22 +61,23 @@ pub enum StmtKind {
     },
 }
 
-/// One case of an `effect` declaration: an operation and its signature, or a
-/// bare tag naming another effect.
+/// One case of an `effect` declaration: an operation and its signature, or an
+/// effect named for this one to stand for.
 ///
-/// Told apart by the `:` and by nothing else, which is what makes the two forms
-/// of the declaration a question about its cases rather than about a keyword.
+/// Told apart by the sigil and by nothing else, which is what makes the two
+/// forms of the declaration a question about its cases rather than about a
+/// keyword.
 #[derive(Debug, Clone)]
 pub enum EffectCase {
-    /// `` `write : Nat -> () `` — an operation, with the signature performing
-    /// it has. Whether that signature is the plain closed arrow R3 requires is
+    /// `write : Nat -> ()` — an operation, with the signature performing it
+    /// has. Whether that signature is the plain closed arrow R3 requires is
     /// lowering's to say.
     ///
     /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a signature
     /// is a whole written type, and inlining one here would grow every case of
     /// every declaration to the size of the ones that have one.
     Operation { signature: Box<Type> },
-    /// `` `Log `` — a bare tag naming an effect this one stands for.
+    /// `!Log` — an effect this one stands for.
     Alias,
 }
 
@@ -126,9 +127,9 @@ pub enum ExprKind {
         arms: Vec<Arm>,
     },
     Struct(IndexMap<TrackedString, Expr>),
-    /// `` `Some 1 `` — one case of a sum, with what it carries.
+    /// `#Some 1` — one case of a sum, with what it carries.
     ///
-    /// The payload is optional because `` `None `` is how a case that carries
+    /// The payload is optional because `#None` is how a case that carries
     /// nothing is written, and there is nothing there to parse. What it means
     /// is unit — see [`ir::TermKind::Tag`](crate::ir::TermKind::Tag) — but
     /// nothing was written, so nothing is recorded, and a printed tree reads
@@ -159,12 +160,12 @@ pub enum ExprKind {
     /// to be part of. Whether an arm encloses it is lowering's to say; see
     /// [`ir::ErrorKind::RaiseOutsideArm`](crate::ir::ErrorKind).
     Raise(Box<Expr>),
-    /// `` Log.`write `` — one operation of an effect, as an ordinary value.
+    /// `!Log.write` — one operation of an effect, as an ordinary value.
     ///
-    /// Always qualified, which is what tells it from a projection: a `.`
-    /// followed by a tag is this, and a `.` followed by a name is a
-    /// [`Project`](ExprKind::Project). There is no `do` and no perform form —
-    /// an operation is a value, and performing one is applying it.
+    /// Always qualified, which is what tells it from a projection: the `!Log`
+    /// in front is a value of nothing, so there is no record here to read a
+    /// field off. There is no `do` and no perform form — an operation is a
+    /// value, and performing one is applying it.
     Operation {
         effect: TrackedString,
         op: TrackedString,
@@ -200,7 +201,7 @@ pub struct HandlerArm {
 /// What one handler arm answers.
 #[derive(Debug, Clone)]
 pub enum ArmHead {
-    /// `` Log.`write s => ... `` — one operation, whose declared signature is
+    /// `!Log.write s => ...` — one operation, whose declared signature is
     /// the arm's own.
     Operation {
         effect: TrackedString,
@@ -259,11 +260,11 @@ pub enum PatternKind {
         /// The span is the `..`'s own, for the debugger to point at.
         rest: Option<Span>,
     },
-    /// `` `Name [<pattern>] `` — one case of a sum. The payload pattern is
+    /// `#Name [<pattern>]` — one case of a sum. The payload pattern is
     /// taken greedily, exactly as [`Parser::tag_expr`] takes a payload, so
-    /// `` `A `B x `` is `` `A `` carrying `` (`B x) ``. Written bare, the case
+    /// `#A #B x` is `#A` carrying `(#B x)`. Written bare, the case
     /// is constrained to carry unit and binds nothing — the convention
-    /// `` `None `` follows as an expression.
+    /// `#None` follows as an expression.
     Tag {
         name: TrackedString,
         payload: Option<Box<Pattern>>,
@@ -280,7 +281,7 @@ pub enum TypeKind {
         /// open. `None` means the type lists every field it allows.
         tail: Option<Tail>,
     },
-    /// `` `Some T | `None `` — a sum type, as the cases it allows.
+    /// `#Some T | #None` — a sum type, as the cases it allows.
     ///
     /// The same shape as a struct, and the same [`Tail`]: a `..` says what is
     /// known about the cases not written out, and its absence says the type
@@ -295,10 +296,10 @@ pub enum TypeKind {
     Arrow {
         from: Box<Type>,
         to: Box<Type>,
-        /// The `! <effects>` clause, when one was written.
+        /// The `+ <effects>` clause, when one was written.
         ///
         /// `None` is a bare `A -> B`, which is pure — the empty *closed* row —
-        /// and `Some` of a row with nothing in it is `A -> B ! |`, the same
+        /// and `Some` of a row with nothing in it is `A -> B + |`, the same
         /// type written out. The two are kept apart here and nowhere else: what
         /// a reader wrote is what this tree says, and both lower to the same
         /// row.
@@ -322,9 +323,40 @@ pub enum TypeKind {
     Ident {
         name: TrackedString,
     },
+    /// `'a` — a variable of the annotation this type is written in.
+    ///
+    /// Its own node rather than an [`Ident`](TypeKind::Ident), because the
+    /// sigil has already told them apart: a bare name resolves to something
+    /// declared elsewhere — a parameter, a declared type, a primitive — and
+    /// this one resolves to nothing at all. It is introduced by being written,
+    /// and what it stands for is whatever the uses beside it need.
+    Variable {
+        name: TrackedString,
+    },
+    /// `!Log + !IO` — a row of effects written where a type goes.
+    ///
+    /// Not a type, and it is not pretending to be one: the one position that
+    /// takes it is an argument at a parameter a declaration uses as its
+    /// effects, which is the position a sum's row is written at too. Lowering
+    /// is where that is said — see
+    /// [`ir::ErrorKind::EffectsOutsideRow`](crate::ir::ErrorKind) — because the
+    /// parser cannot know which parameters a declaration uses that way.
+    ///
+    /// Written as an arrow's row is, minus the `+` that hangs one off an arrow:
+    /// the labels, the `+`s between them, a `\` on any written absent, and the
+    /// `..` tail last. Its span is the row's own.
+    ///
+    /// A row of nothing but a tail is written `..r`, with no labels in front of
+    /// it. That is the one form with no effect in it at all, and it is how a
+    /// rest is handed on by itself.
+    ///
+    /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a row is
+    /// among the largest things this enum can hold and the rarest, so inlining
+    /// one would grow every written type to the size of the few that are one.
+    Effects(Box<EffectRow>),
     /// `_` — a type position left for inference to decide.
     ///
-    /// The one thing a `where let` variable is not: a hole binds nothing, may
+    /// The one thing a variable is not: a hole binds nothing, may
     /// not be referred to, and needs no declaration, so writing one is saying
     /// "infer this" rather than promising anything about it. That is what buys
     /// back the brevity a declared variable costs — see
@@ -355,8 +387,8 @@ pub enum TypeField {
 /// One case of a sum type: what it carries and the `when` clause it may wear,
 /// or the `\` that says the case is not there at all.
 ///
-/// A `when` is not what a `..` tail says. `` `A (when a) Nat | `B `` allows `A`
-/// or not and nothing else beyond `B`; `` `B | ..r `` allows anything at all
+/// A `when` is not what a `..` tail says. `#A (when a) Nat | #B` allows `A`
+/// or not and nothing else beyond `B`; `#B | ..r` allows anything at all
 /// beyond `B`. Neither can be written as the other, which is why both are here.
 ///
 /// `payload` is `None` for a case written bare. That means unit — the same
@@ -364,28 +396,29 @@ pub enum TypeField {
 /// that printing the tree gives back the source it was parsed from.
 #[derive(Debug, Clone)]
 pub enum SumCase {
-    /// `` `Name [(when a)] [T] `` — a case a value may be, carrying this when
+    /// `#Name [(when a)] [T]` — a case a value may be, carrying this when
     /// it is.
     Written {
         when: Option<Box<When>>,
         payload: Option<Type>,
     },
-    /// `` \`Name `` — the case is definitely absent. No payload and no `when`,
+    /// `\#Name` — the case is definitely absent. No payload and no `when`,
     /// exactly as [`TypeField::Absent`]: the map key's span covers the whole
-    /// `` \`Name ``.
+    /// `\#Name`.
     Absent,
 }
 
 /// The effect row an arrow carries: the effects it names, and what is known
 /// about the ones it does not.
 ///
-/// A sum's row read a third way, down to the syntax — tags, `|`, an optional
-/// `..` tail, `when` clauses and the `\` of an effect written absent — with one
-/// thing left out: an effect label carries nothing, so there is no payload here
-/// for one to carry. That is the whole of the difference, and it is why this is
-/// its own node rather than a [`TypeKind::Sum`] in a third position.
+/// A sum's row read a third way, down to the syntax — labels, `|`, an optional
+/// `..` tail, `when` clauses and the `\` of an effect written absent — with two
+/// things different: a label wears the `!` rather than the `#`, and it carries
+/// nothing, so there is no payload here for one to hold. That is the whole of
+/// it, and it is why this is its own node rather than a [`TypeKind::Sum`] in a
+/// third position.
 ///
-/// The span covers the `!` and the row after it, which is what a complaint
+/// The span covers the `+` and the row after it, which is what a complaint
 /// about the row underlines.
 #[derive(Debug, Clone)]
 pub struct EffectRow {
@@ -400,10 +433,10 @@ pub struct EffectRow {
 /// [`SumCase`]'s twin minus the payload; see [`EffectRow`].
 #[derive(Debug, Clone)]
 pub enum EffectLabel {
-    /// `` `Log ``, or `` `Log (when a) `` — an effect the arrow may perform.
+    /// `!Log`, or `!Log (when a)` — an effect the arrow may perform.
     Written { when: Option<Box<When>> },
-    /// `` \`Log `` — the effect is definitely not performed: the `..` beside it
-    /// may not stand for it. The map key's span covers the whole `` \`Log ``.
+    /// `\!Log` — the effect is definitely not performed: the `..` beside it
+    /// may not stand for it. The map key's span covers the whole `\!Log`.
     Absent,
 }
 
@@ -452,34 +485,20 @@ pub enum ClauseKind {
     NotEqual(Box<Clause>, Box<Clause>),
 }
 
-/// One statement of a `where` clause. Statements are separated by `;`, may
-/// appear in any order and may be interleaved; several declaration statements
-/// accumulate their names, and several constraint statements are conjoined in
-/// written order.
-pub type ClauseStmt = Tracked<ClauseStmtKind>;
-
-#[derive(Debug, Clone)]
-pub enum ClauseStmtKind {
-    /// `let a, b` — the variables this annotation declares. A declaration
-    /// statement never contains an `=`, which is what makes
-    /// `let id : a -> a where let a = fn x => x` need no speculation to read.
-    Let(Vec<TrackedString>),
-    /// The boolean expression grammar the `where` clause has always had.
-    Constraint(Clause),
-}
-
-/// The `where` clause of an annotation: a `;`-separated list of statements.
+/// The `where` clause of an annotation: a `;`-separated list of constraints,
+/// conjoined in written order.
+///
+/// Constraints and nothing else. A variable needs no declaring — `'a` says what
+/// it is where it is used — so what is left here is what a formula was always
+/// for: what this definition requires of the presences its labels wear.
 ///
 /// A wrapper rather than a bare `Vec`, so that the whole clause has a span of
 /// its own — the one an annotation merges into itself, and the one a complaint
-/// about the clause as a whole points at. Each statement keeps a span too,
-/// which is what lets a declaration statement written in a `type` declaration
-/// be refused where it stands rather than by a complaint about everything
-/// beside it.
+/// about the clause as a whole points at.
 #[derive(Debug, Clone)]
 pub struct Where {
     pub span: Span,
-    pub stmts: Vec<ClauseStmt>,
+    pub clauses: Vec<Clause>,
 }
 
 /// A written type and the `where` clause that may follow it: what a definition
@@ -488,7 +507,7 @@ pub struct Where {
 /// A wrapper rather than a node of [`TypeKind`], because a `where` is not a
 /// type: it ends one, once, at the outside. Nesting one would let a field's
 /// type carry a clause naming presences from another part of the annotation —
-/// and would be a higher-rank language than this one, since a `where let`
+/// and would be a higher-rank language than this one, since a variable
 /// variable is quantified at the annotation's outermost level and nowhere else.
 #[derive(Debug, Clone)]
 pub struct Annotation {
@@ -498,12 +517,39 @@ pub struct Annotation {
 }
 
 /// The `..` tail of a struct type: what is said about the fields not named.
-/// Anonymous (`..`) when the rest may be anything; named (`..r`) when two
-/// tails in one annotation are to stand for the same rest.
+/// Anonymous (`..`) when the rest may be anything; named when two tails are to
+/// stand for the same rest.
 #[derive(Debug, Clone)]
 pub struct Tail {
     pub span: Span,
-    pub name: Option<TrackedString>,
+    pub of: Rest,
+}
+
+/// What a tail stands for, as written.
+///
+/// The sigil decides which of the two named forms it is, and nothing else does:
+/// a declaration's parameter is bound in its header and written bare, and a
+/// variable is introduced by being written and wears its `'`. Keeping them
+/// apart here is what lets lowering resolve one and mint the other without
+/// asking what kind of thing it is in.
+#[derive(Debug, Clone)]
+pub enum Rest {
+    /// `..` — anything at all, named by nothing and shared with no other tail.
+    Anything,
+    /// `..e` — the parameter of the declaration this type is the body of.
+    Param(TrackedString),
+    /// `..'r` — a variable of the annotation this type is written in.
+    Variable(TrackedString),
+}
+
+impl Rest {
+    /// Where the name was written, or `None` for the `..` that names nothing.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Rest::Anything => None,
+            Rest::Param(name) | Rest::Variable(name) => Some(name.span),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -682,6 +728,43 @@ impl Parser {
         }
     }
 
+    /// What a `..` stands for: the parameter or variable named after it, or
+    /// nothing at all. Read wherever a tail is, so that the three tails of the
+    /// three shapes agree on what may follow the dots by construction.
+    fn rest_name(&mut self) -> Rest {
+        match self.peek().map(|tok| &tok.tracked) {
+            Some(Kind::Identifier(_)) => Rest::Param(self.ident().expect("just peeked a name")),
+            Some(Kind::Variable(_)) => {
+                Rest::Variable(self.variable().expect("just peeked a variable"))
+            }
+            _ => Rest::Anything,
+        }
+    }
+
+    /// Consume the next token if it is a variable, and hand back the name it
+    /// carries without the `'`. [`tag`](Self::tag)'s twin about the third
+    /// sigil, and silent on anything else for the same reason.
+    fn variable(&mut self) -> Option<TrackedString> {
+        let name = match self.peek() {
+            Some(tok) => match &tok.tracked {
+                Kind::Variable(name) => Some(tok.span.track(name.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        if name.is_some() {
+            self.advance();
+        }
+        name
+    }
+
+    /// Whether the next token is a name. What an effect declaration's case list
+    /// asks before reading an operation: the list ending and a name coming next
+    /// are two different answers, and only one of them is an error.
+    fn at_ident(&self) -> bool {
+        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::Identifier(_)))
+    }
+
     fn ident(&mut self) -> Option<TrackedString> {
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
@@ -700,7 +783,7 @@ impl Parser {
     }
 
     /// Consume the next token if it is a tag, and hand back the name it
-    /// carries without the backtick. Silent on anything else, unlike
+    /// carries without the `#`. Silent on anything else, unlike
     /// [`ident`](Self::ident): both callers have somewhere else to go — the
     /// case list ends, and the expression is not a tag — so there is nothing
     /// here to complain about.
@@ -708,6 +791,23 @@ impl Parser {
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
                 Kind::Tag(name) => Some(tok.span.track(name.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        if name.is_some() {
+            self.advance();
+        }
+        name
+    }
+
+    /// [`tag`](Self::tag) about the other sigil: the next token if it is an
+    /// effect, without the `!`. Silent on anything else for the same reason —
+    /// a row ends where its labels stop, and the caller has somewhere to go.
+    fn effect(&mut self) -> Option<TrackedString> {
+        let name = match self.peek() {
+            Some(tok) => match &tok.tracked {
+                Kind::EffectLabel(name) => Some(tok.span.track(name.clone())),
                 _ => None,
             },
             None => None,
@@ -727,14 +827,22 @@ impl Parser {
         }
     }
 
-    /// `` effect <name> = [|] <case> ('|' <case>)* ``, where a case is a tag
-    /// with an optional `: <signature>` after it.
+    /// `effect <name> = [|] <case> ('|' <case>)*`, where a case is an operation
+    /// — a bare name and the `: <signature>` that says what performing it does
+    /// — or `!Other`, an effect this one names.
+    ///
+    /// The two are told apart by the sigil and by nothing else, which is what
+    /// the `!` buys: an operation is declared here, so it is a name, and an
+    /// effect is named from elsewhere, so it wears the mark that says so.
+    /// Whether a declaration may mix them is not decided here — the parser
+    /// records the cases and lowering refuses the mixture; see
+    /// [`ir::ErrorKind::MixedEffectForm`](crate::ir::ErrorKind).
     ///
     /// The same `|` convention a sum type keeps: the leading bar is optional,
-    /// `|` alone is the empty effect, and a bar *between* cases promises
-    /// another one, so nothing after one is reported at the bar. Which of the
-    /// two forms a declaration is, is not decided here — the parser records the
-    /// cases and lowering reads the `:`s.
+    /// `|` alone is the empty effect, and a mark *between* cases promises
+    /// another one, so nothing after one is reported at the mark. An alias
+    /// takes the `+` an effect row writes as well, since a declaration naming
+    /// effects is the union of them that a row is.
     fn effect_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `effect`");
         if self.at_wildcard() {
@@ -750,26 +858,47 @@ impl Parser {
         // is the empty effect and promises nothing.
         let mut separator = None;
         loop {
-            let Some(op) = self.tag() else {
-                if let Some(bar) = separator {
-                    self.error(bar, ErrorKind::Unexpected);
-                }
-                break;
-            };
-            span = span.merge(op.span);
-            let case = match self.eat_if(&Kind::Colon) {
-                Some(_) => {
+            // An effect named here is an alias case, whole; anything else has
+            // to be an operation, which is a name and the signature it must
+            // carry. A bare name with no `:` after it is the missing signature
+            // it looks like, reported where the `:` should have been.
+            let (name, case) = match self.effect() {
+                Some(name) => (name, EffectCase::Alias),
+                None if self.at_ident() => {
+                    let op = self.ident().expect("just peeked a name");
+                    self.eat(&Kind::Colon)?;
                     let signature = self.type_expr()?;
                     span = span.merge(signature.span);
-                    EffectCase::Operation {
-                        signature: Box::new(signature),
-                    }
+                    (
+                        op,
+                        EffectCase::Operation {
+                            signature: Box::new(signature),
+                        },
+                    )
                 }
-                None => EffectCase::Alias,
+                None => {
+                    if let Some(bar) = separator {
+                        self.error(bar, ErrorKind::Unexpected);
+                    }
+                    break;
+                }
             };
-            cases.insert(op, case);
-            match self.eat_if(&Kind::Pipe) {
-                Some(pipe) => separator = Some(pipe.span),
+            span = span.merge(name.span);
+            // An alias may be unioned onto the last with the `+` an effect row
+            // writes — the two say the same thing, and this is the one form of
+            // the declaration that is a union of effects. An operation's
+            // separator is the `|` alone: its signature is a type, and a `+`
+            // after one is that type's own effect row.
+            let aliasing = matches!(case, EffectCase::Alias);
+            cases.insert(name, case);
+            let mark = match aliasing {
+                true => self
+                    .eat_if(&Kind::Plus)
+                    .or_else(|| self.eat_if(&Kind::Pipe)),
+                false => self.eat_if(&Kind::Pipe),
+            };
+            match mark {
+                Some(mark) => separator = Some(mark.span),
                 None => break,
             }
         }
@@ -849,6 +978,7 @@ impl Parser {
                 Kind::Identifier(_)
                     | Kind::Natural(_)
                     | Kind::Tag(_)
+                    | Kind::EffectLabel(_)
                     | Kind::Fn
                     | Kind::LeftBrace
                     | Kind::LeftParen
@@ -872,10 +1002,13 @@ impl Parser {
         Some(func)
     }
 
-    /// `<atom>.<field>*` — postfix projection, left-associative, or the
-    /// `` Eff.`op `` an operation reference is. It sits under
+    /// `<atom>.<field>*` — postfix projection, left-associative. It sits under
     /// application rather than beside it so that `f p.x` reads as `f (p.x)`,
     /// which is what reaching into a record before passing it along looks like.
+    ///
+    /// Every `.` here reads a field. An operation is not one of them: it is
+    /// [`operation_expr`](Self::operation_expr), read from atom position
+    /// because the `!Log` that heads it can begin nothing else.
     ///
     /// A `..` here is refused rather than left for whoever comes next. It is
     /// one token, not two dots — the lexer decides that — and there is nothing
@@ -892,20 +1025,6 @@ impl Parser {
             }
             if self.eat_if(&Kind::Dot).is_none() {
                 return Some(base);
-            }
-            // A `.` followed by a tag is an operation reference rather than a
-            // projection — a struct has no field with a backtick in its name —
-            // and the head has to be the name of an effect, since nothing else
-            // declares operations. Anything else on the left is reported at the
-            // tag, which is the token that decided the reading.
-            if matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Tag(_))) {
-                let ExprKind::Ident { name: effect } = base.tracked else {
-                    return self.unexpected();
-                };
-                let op = self.tag().expect("just peeked a tag");
-                let span = effect.span.merge(op.span);
-                base = span.track(ExprKind::Operation { effect, op });
-                continue;
             }
             // `x._` reads a field named nothing: the complaint is the
             // wildcard's, worded for the projection it sits in.
@@ -944,6 +1063,7 @@ impl Parser {
             Kind::LeftBrace => self.struct_expr(),
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
+            Kind::EffectLabel(_) => self.operation_expr(),
             Kind::Identifier(name) => {
                 let name = span.track(name.clone());
                 self.advance();
@@ -989,21 +1109,21 @@ impl Parser {
         Some(span.track(ExprKind::Struct(fields)))
     }
 
-    /// `` `Some <atom> `` — one case of a sum, with what it carries.
+    /// `#Some <atom>` — one case of a sum, with what it carries.
     ///
     /// The payload is one atom, taken greedily, which is what makes a tag bind
-    /// tighter than application: `` f `A 1 `` is `f` applied to `` `A 1 ``
-    /// rather than `` f `A `` applied to `1`. A tag carries one thing, so
+    /// tighter than application: `f #A 1` is `f` applied to `#A 1`
+    /// rather than `f #A` applied to `1`. A tag carries one thing, so
     /// there is nothing for the second reading to mean, and the greedy one is
     /// what a reader writing a constructor expects.
     ///
     /// Through [`projection`](Self::projection) rather than
-    /// [`atom`](Self::atom), so that `` `Some p.x `` carries the field rather
+    /// [`atom`](Self::atom), so that `#Some p.x` carries the field rather
     /// than the record it was read off.
     ///
     /// A case carrying nothing is written with nothing after it, and means
     /// unit. That is not decided here: this records what was written, and
-    /// lowering is where `` `None `` and `` `None () `` meet — the same
+    /// lowering is where `#None` and `#None ()` meet — the same
     /// division `()` and `{}` already keep.
     fn tag_expr(&mut self) -> Option<Expr> {
         let name = self.tag().expect("the caller peeked a tag");
@@ -1018,6 +1138,29 @@ impl Parser {
             name,
             payload: payload.map(Box::new),
         }))
+    }
+
+    /// `!Log.write` — one operation of an effect, as an ordinary value.
+    ///
+    /// An atom rather than a projection, which is what the `!` buys. An effect
+    /// is a value of nothing, so `!Log` heads this and nothing else, and the
+    /// operation after the `.` can be a plain name without ever being read as a
+    /// field: there is no record on the left for it to be read off.
+    ///
+    /// The `.` is required. An effect on its own is not a value — there is
+    /// nothing it could evaluate to — so `let x = !Log` is refused here rather
+    /// than lowered into a complaint about a term the reader never wrote.
+    fn operation_expr(&mut self) -> Option<Expr> {
+        let effect = self.effect().expect("the caller peeked an effect");
+        self.eat(&Kind::Dot)?;
+        // `!Log._` names an operation nothing: the complaint is the wildcard's,
+        // worded for the projection it most nearly is.
+        if self.at_wildcard() {
+            return self.wildcard(Place::Projection);
+        }
+        let op = self.ident()?;
+        let span = effect.span.merge(op.span);
+        Some(span.track(ExprKind::Operation { effect, op }))
     }
 
     /// `( <expr> )` — grouping only. The parentheses override application's
@@ -1115,7 +1258,7 @@ impl Parser {
     }
 
     /// `handle <expr> with [|] <arm> (| <arm>)* end`, where an arm is
-    /// `` Eff.`op <binder> => <expr> `` or `return <binder> => <expr>`.
+    /// `!Eff.op <binder> => <expr>` or `return <binder> => <expr>`.
     ///
     /// The `match` shape exactly: the handled expression ends at the `with` of
     /// its own accord, the leading `|` is optional, a `|` between arms promises
@@ -1156,11 +1299,11 @@ impl Parser {
                 ArmHead::Return { span: kw.span }
             }
             false => {
-                let effect = self.ident()?;
-                self.eat(&Kind::Dot)?;
-                let Some(op) = self.tag() else {
+                let Some(effect) = self.effect() else {
                     return self.unexpected();
                 };
+                self.eat(&Kind::Dot)?;
+                let op = self.ident()?;
                 ArmHead::Operation { effect, op }
             }
         };
@@ -1228,7 +1371,7 @@ impl Parser {
         match &tok.tracked {
             // The payload is taken greedily, like a tag expression's: a tag
             // carries one thing, and the recursion through `pattern` is what
-            // makes `` `A `B x `` come out as `` `A `` carrying `` (`B x) ``.
+            // makes `#A #B x` come out as `#A` carrying `(#B x)`.
             Kind::Tag(_) => {
                 let name = self.tag().expect("the caller peeked a tag");
                 let payload = match self.at_pattern() {
@@ -1408,21 +1551,20 @@ impl Parser {
     /// another statement, and whatever follows it is reported where it was
     /// written.
     fn where_clause(&mut self, kw: Span, defined: bool) -> Option<Where> {
-        let mut stmts = Vec::new();
+        let mut clauses = Vec::new();
         let mut span = kw;
         loop {
-            let stmt = self.clause_stmt(defined)?;
-            span = span.merge(stmt.span);
-            stmts.push(stmt);
+            let clause = self.clause_stmt(defined)?;
+            span = span.merge(clause.span);
+            clauses.push(clause);
             if self.eat_if(&Kind::Semicolon).is_none() {
                 break;
             }
         }
-        Some(Where { span, stmts })
+        Some(Where { span, clauses })
     }
 
-    /// One statement of a `where` clause: `let <name> (, <name>)*`, or the
-    /// boolean expression grammar.
+    /// One statement of a `where` clause: the boolean expression grammar.
     ///
     /// The speculative read that tells a comparison's `=` from the definition's
     /// own applies to the last statement alone, since only the last can be
@@ -1432,28 +1574,18 @@ impl Parser {
     /// what was read is what was meant. Anything else is put back — cursor and
     /// complaints alike — and read again the way an annotation's last statement
     /// has always been read.
-    fn clause_stmt(&mut self, defined: bool) -> Option<ClauseStmt> {
-        if let Some(kw) = self.eat_if(&Kind::Let) {
-            let mut names = vec![self.ident()?];
-            while self.eat_if(&Kind::Comma).is_some() {
-                names.push(self.ident()?);
-            }
-            let last = names.last().expect("a declaration statement names one");
-            let span = kw.span.merge(last.span);
-            return Some(span.track(ClauseStmtKind::Let(names)));
-        }
+    fn clause_stmt(&mut self, defined: bool) -> Option<Clause> {
         if defined {
             let mark = (self.pos, self.errors.len());
             if let Some(clause) = self.clause(false)
                 && matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Semicolon))
             {
-                return Some(clause.span.track(ClauseStmtKind::Constraint(clause)));
+                return Some(clause);
             }
             self.pos = mark.0;
             self.errors.truncate(mark.1);
         }
-        let clause = self.clause(defined)?;
-        Some(clause.span.track(ClauseStmtKind::Constraint(clause)))
+        self.clause(defined)
     }
 
     /// `<or> [('='|'!=') <or>]` — the loosest level of a `where` clause, and
@@ -1563,7 +1695,12 @@ impl Parser {
         if self.at_wildcard() {
             return self.wildcard(Place::Type);
         }
-        let name = self.ident()?;
+        // A formula is written about presences, and a presence is a variable:
+        // a bare name here would be a type, which a formula has nothing to say
+        // about.
+        let Some(name) = self.variable() else {
+            return self.unexpected();
+        };
         Some(name.span.track(ClauseKind::Name(name.tracked)))
     }
 
@@ -1592,7 +1729,11 @@ impl Parser {
                 None
             }
             false => {
-                let name = self.ident()?;
+                // A presence is a variable and nothing else: no declaration
+                // binds one, and no parameter may stand for one.
+                let Some(name) = self.variable() else {
+                    return self.unexpected();
+                };
                 span = span.merge(name.span);
                 Some(name)
             }
@@ -1604,21 +1745,21 @@ impl Parser {
         Some(When { span, name })
     }
 
-    /// `<sum> [-> <type> [! <effects>]]` — the arrow is right-associative, so
+    /// `<sum> [-> <type> [+ <effects>]]` — the arrow is right-associative, so
     /// `A -> B -> C` is `A -> (B -> C)`, and everything else binds tighter, so
     /// `Pair Nat Nat -> Nat` is `(Pair Nat Nat) -> Nat` and
-    /// `` `A Nat | `B -> Nat `` is a function from the sum rather than a sum
+    /// `#A Nat | #B -> Nat` is a function from the sum rather than a sum
     /// whose last case carries an arrow.
     ///
-    /// The `!` clause binds to the arrow parsed at *this* level, which the
-    /// right-associative recursion makes the innermost one: `A -> B -> C ! E`
+    /// The `+` clause binds to the arrow parsed at *this* level, which the
+    /// right-associative recursion makes the innermost one: `A -> B -> C + E`
     /// is read by the inner call, which has just built `B -> C`, so the effects
-    /// land there. `A -> (B -> C) ! E` puts them on the outer arrow, because
+    /// land there. `A -> (B -> C) + E` puts them on the outer arrow, because
     /// the parenthesized result comes back through
     /// [`type_atom`](Self::type_atom) and the inner call never builds an arrow
-    /// at all. There is no spelling of `(A -> B) ! E`.
+    /// at all. There is no spelling of `(A -> B) + E`.
     ///
-    /// A `!` where no arrow was parsed has nothing to attach to and is reported
+    /// A `+` where no arrow was parsed has nothing to attach to and is reported
     /// where it was written, rather than being left for whatever the type was
     /// being read for to complain about a token further on.
     fn type_expr(&mut self) -> Option<Type> {
@@ -1627,19 +1768,19 @@ impl Parser {
 
     /// [`type_expr`](Self::type_expr)'s recursion. `outermost` says whether
     /// there is still an arrow waiting to be built around this one: only the
-    /// call that has none can report a `!` as attaching to nothing, since every
-    /// other call returns a `!` to the caller that is about to build the arrow
+    /// call that has none can report a `+` as attaching to nothing, since every
+    /// other call returns a `+` to the caller that is about to build the arrow
     /// it belongs to.
     fn arrow(&mut self, outermost: bool) -> Option<Type> {
         let from = self.type_sum()?;
         if self.eat_if(&Kind::Arrow).is_none() {
-            if outermost && self.at_bang() {
+            if outermost && self.at_plus() {
                 return self.unexpected();
             }
             return Some(from);
         }
         let to = self.arrow(false)?;
-        let effects = match self.at_bang() {
+        let effects = match self.at_plus() {
             true => Some(Box::new(self.effect_row()?)),
             false => None,
         };
@@ -1653,52 +1794,109 @@ impl Parser {
         }))
     }
 
-    /// Whether the next token is the `!` that introduces an effect row.
-    fn at_bang(&self) -> bool {
-        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::Bang))
+    /// Whether the next token is the `+` that introduces an effect row.
+    fn at_plus(&self) -> bool {
+        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::Plus))
     }
 
-    /// `` ! [|] `Eff [(when a)] ('|' ...)* ['|' ..[name]] `` — the effects an
-    /// arrow may perform, in the syntax a sum's cases are written in.
+    /// `+ !Eff [(when a)] ('+' ...)* ['+' ..[name]]` — the effects an arrow may
+    /// perform, each added to the last.
     ///
-    /// The same shape as [`type_sum`](Self::type_sum) and the same conventions:
-    /// the leading `|` is optional, `!` followed by `|` alone is the empty row,
-    /// a `\` marks an effect as definitely not performed, and the `..` tail
-    /// comes last. What is missing is the payload — an effect carries nothing —
-    /// so a case here is a tag and the clause it may wear, and nothing else.
+    /// One mark for the whole row: the `+` that hangs it off the arrow is the
+    /// `+` that unions the next effect onto it, so `A -> B + !Log + !IO` reads
+    /// as the arrow plus what calling it may do. A sum writes `|` because its
+    /// cases are alternatives — a value is one of them — and an arrow's effects
+    /// are not: calling it may perform every one.
+    ///
+    /// A `\` marks an effect as definitely not performed and the `..` tail comes
+    /// last, both as a sum's own row writes them. What is missing is the payload
+    /// — an effect carries nothing — so a label here is an effect and the clause
+    /// it may wear, and nothing else.
+    ///
+    /// `+ |` is the empty row, and the one place a `|` is written here: it is
+    /// the empty sum's spelling read about effects, and nothing may follow it.
+    /// A bare `A -> B` is the same type with no row written at all.
     fn effect_row(&mut self) -> Option<EffectRow> {
-        let bang = self.eat(&Kind::Bang).expect("the caller peeked `!`");
-        let mut span = bang.span;
+        let plus = self.eat(&Kind::Plus).expect("the caller peeked `+`");
+        let row = self.effect_labels(plus.span, true)?;
+        // A `+` promises effects. In front of nothing at all it is the
+        // unexpected token it looks like — the row that allows nothing is
+        // written `+ |`, and a bare `A -> B` is the same type again — so the
+        // mark is reported where it was written rather than left to whatever
+        // was going to be read next.
+        if row.span == plus.span {
+            self.error(plus.span, ErrorKind::Unexpected);
+            return None;
+        }
+        Some(row)
+    }
+
+    /// Whether a row begins here: a label, the `\` of one written absent, or the
+    /// `..` of a row that is nothing but its rest. Two tokens for the second,
+    /// since a `\` heads a sum's absent case as well and only what follows it
+    /// says which row is being written.
+    ///
+    /// A leading `..` is a row of no labels, which is the same row whichever
+    /// shape it is read as: `..r` names a rest and nothing else, so there is
+    /// nothing in it for a shape to disagree about. It is read here so that a
+    /// rest can be handed to a declaration on its own — `LogFn (..r)` — the way
+    /// one with labels beside it already could be.
+    fn at_effects(&self) -> bool {
+        match self.peek().map(|tok| &tok.tracked) {
+            Some(Kind::EffectLabel(_) | Kind::DotDot) => true,
+            Some(Kind::Backslash) => matches!(
+                self.toks.get(self.pos + 1).map(|tok| &tok.tracked),
+                Some(Kind::EffectLabel(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// The labels of one effect row, with `span` covering whatever the caller
+    /// has already read — the `+` of an arrow's row, or nothing at all for the
+    /// bare row a type argument may be.
+    ///
+    /// `empty` says whether `|` may be written here for the row that allows
+    /// nothing. An arrow's row takes it; a bare one does not, because a row
+    /// written where a type goes is written for the labels in it, and there is
+    /// no argument to be made for handing a parameter the row with none.
+    fn effect_labels(&mut self, at: Span, empty: bool) -> Option<EffectRow> {
+        let mut span = at;
         let mut effects = IndexMap::new();
         let mut tail = None;
-        self.eat_if(&Kind::Pipe);
+        // `+ |` is the empty row written out, and nothing follows it: what
+        // would be unioned onto a row that allows nothing is the row itself.
+        if empty && let Some(bar) = self.eat_if(&Kind::Pipe) {
+            return Some(EffectRow {
+                span: span.merge(bar.span),
+                effects,
+                tail,
+            });
+        }
+        // The `+` that unioned the last label onto the row, once one has been
+        // read: it promises another, so nothing after one is reported at it.
         let mut separator = None;
         loop {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
-                let name = match self.peek().map(|t| &t.tracked) {
-                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
-                    _ => None,
-                };
-                let at = name
-                    .as_ref()
-                    .map_or(dots.span, |name| dots.span.merge(name.span));
+                let of = self.rest_name();
+                let at = of.span().map_or(dots.span, |name| dots.span.merge(name));
                 span = span.merge(at);
-                tail = Some(Tail { span: at, name });
+                tail = Some(Tail { span: at, of });
                 break;
             }
             if let Some(slash) = self.eat_if(&Kind::Backslash) {
-                // A `\` promises an effect, so anything but a tag after it is
+                // A `\` promises an effect, so anything else after it is
                 // reported — the rule the sum's own absent case keeps.
-                let Some(name) = self.tag() else {
+                let Some(name) = self.effect() else {
                     return self.unexpected();
                 };
                 span = span.merge(name.span);
                 let key = slash.span.merge(name.span).track(name.tracked);
                 effects.insert(key, EffectLabel::Absent);
             } else {
-                let Some(name) = self.tag() else {
-                    if let Some(bar) = separator {
-                        self.error(bar, ErrorKind::Unexpected);
+                let Some(name) = self.effect() else {
+                    if let Some(mark) = separator {
+                        self.error(mark, ErrorKind::Unexpected);
                     }
                     break;
                 };
@@ -1715,8 +1913,8 @@ impl Parser {
                 };
                 effects.insert(name, EffectLabel::Written { when });
             }
-            match self.eat_if(&Kind::Pipe) {
-                Some(pipe) => separator = Some(pipe.span),
+            match self.eat_if(&Kind::Plus) {
+                Some(plus) => separator = Some(plus.span),
                 None => break,
             }
         }
@@ -1740,6 +1938,14 @@ impl Parser {
     /// not written out rather than the fields, and it comes last for the same
     /// reason: what it covers has no place among the cases that are named.
     fn type_sum(&mut self) -> Option<Type> {
+        // A row of effects is written where a type goes at one position and is
+        // spelled like a sum at every turn, so it is read here: the sigil on
+        // the first label is the whole of what tells the two apart.
+        if self.at_effects() {
+            let at = self.peek().expect("a row begins next").span;
+            let row = self.effect_labels(at, false)?;
+            return Some(row.span.track(TypeKind::Effects(Box::new(row))));
+        }
         let bar = self.eat_if(&Kind::Pipe);
         if bar.is_none()
             && !matches!(
@@ -1764,20 +1970,15 @@ impl Parser {
         let mut separator = None;
         loop {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
-                let name = match self.peek().map(|t| &t.tracked) {
-                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
-                    _ => None,
-                };
-                let at = name
-                    .as_ref()
-                    .map_or(dots.span, |name| dots.span.merge(name.span));
+                let of = self.rest_name();
+                let at = of.span().map_or(dots.span, |name| dots.span.merge(name));
                 span = span.merge(at);
-                tail = Some(Tail { span: at, name });
+                tail = Some(Tail { span: at, of });
                 break;
             }
             if let Some(slash) = self.eat_if(&Kind::Backslash) {
                 // A `\` promises a case, so anything but a tag after it is
-                // reported — the case keeps its backtick, spelled the same
+                // reported — the case keeps its `#`, spelled the same
                 // way present or absent. No payload and no `when` either;
                 // whatever follows but a `|` is somebody else's token to
                 // refuse, exactly as it is after a written case's payload.
@@ -1785,7 +1986,7 @@ impl Parser {
                     return self.unexpected();
                 };
                 span = span.merge(name.span);
-                // The key's span is the whole `` \`Name ``, for the reason a
+                // The key's span is the whole `\#Name`, for the reason a
                 // struct's absent field's is.
                 let key = slash.span.merge(name.span).track(name.tracked);
                 cases.insert(key, SumCase::Absent);
@@ -1821,8 +2022,8 @@ impl Parser {
                 // What a case carries is one atom, which is the same rule
                 // [`tag_expr`](Self::tag_expr) keeps for a term: a tag carries
                 // one thing, and anything with a space in it takes parentheses.
-                // So `` `Some Pair A B `` is not a case with three payloads,
-                // and `` `A Nat -> Nat `` is a function from the sum rather
+                // So `#Some Pair A B` is not a case with three payloads,
+                // and `#A Nat -> Nat` is a function from the sum rather
                 // than a case carrying an arrow.
                 let payload = match self.at_type_atom() {
                     true => {
@@ -1889,7 +2090,11 @@ impl Parser {
             self.peek(),
             Some(tok) if matches!(
                 tok.tracked,
-                Kind::Identifier(_) | Kind::LeftBrace | Kind::LeftParen | Kind::Underscore
+                Kind::Identifier(_)
+                    | Kind::Variable(_)
+                    | Kind::LeftBrace
+                    | Kind::LeftParen
+                    | Kind::Underscore
             )
         )
     }
@@ -1915,6 +2120,11 @@ impl Parser {
                 let name = span.track(name.clone());
                 self.advance();
                 Some(span.track(TypeKind::Ident { name }))
+            }
+            Kind::Variable(name) => {
+                let name = span.track(name.clone());
+                self.advance();
+                Some(span.track(TypeKind::Variable { name }))
             }
             // `_` in a type is the hole: a position left for inference to
             // decide, which binds nothing and can be written as often as one
@@ -1949,14 +2159,9 @@ impl Parser {
             Some(Kind::RightBrace) | None
         ) {
             if let Some(dots) = self.eat_if(&Kind::DotDot) {
-                let name = match self.peek().map(|t| &t.tracked) {
-                    Some(Kind::Identifier(_)) => Some(self.ident().expect("just peeked a name")),
-                    _ => None,
-                };
-                let span = name
-                    .as_ref()
-                    .map_or(dots.span, |name| dots.span.merge(name.span));
-                tail = Some(Tail { span, name });
+                let of = self.rest_name();
+                let span = of.span().map_or(dots.span, |name| dots.span.merge(name));
+                tail = Some(Tail { span, of });
                 break;
             }
             if let Some(slash) = self.eat_if(&Kind::Backslash) {

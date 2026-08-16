@@ -123,7 +123,7 @@ pub enum ErrorKind {
     /// starves.
     MisplacedCatchAll,
     /// An arm no value of the *solved* scrutinee type can reach past the arms
-    /// above it — a second bare `` `A `` after `` `A x ``, a duplicate
+    /// above it — a second bare `#A` after `#A x`, a duplicate
     /// literal, or a `{}` under a type that proves a field present.
     UnreachableArm,
     /// A match that leaves values unhandled, with a concrete example of one

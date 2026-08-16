@@ -133,7 +133,7 @@ pub struct Node {
     /// is nothing at that span the user wrote the name at.
     pub owner: Option<u32>,
     /// A group id for rows that name the same thing but have no `Symbol` to be
-    /// grouped by — a `where let` variable and its uses, which are scoped to
+    /// grouped by — a variable and its uses, which are scoped to
     /// one annotation and reach no name table. The page paints every row of the
     /// focused row's group the way it paints a symbol's, and paints no editor
     /// range for them, since the group is the stage's own reading rather than

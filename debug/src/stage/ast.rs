@@ -4,9 +4,8 @@
 //! the rendered source can never drift apart: they are the same printer.
 
 use ruddy::parse::{
-    Annotation, ArgKind, ArmHead, Clause, ClauseKind, ClauseStmtKind, EffectCase, EffectLabel,
-    EffectRow, Expr, ExprKind, Pattern, PatternKind, Stmt, StmtKind, SumCase, Type, TypeField,
-    TypeKind, When,
+    Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
+    ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind, When,
 };
 
 use crate::{
@@ -90,13 +89,13 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
                 let row = match case {
                     EffectCase::Operation { signature } => Node::new(
                         ids.next(),
-                        format!("`{}:", op.tracked),
+                        format!("{}:", op.tracked),
                         print::ast::ty(&signature.tracked).to_string(),
                     )
                     .at(op.span)
                     .child(type_node(ids, signature)),
                     EffectCase::Alias => {
-                        Node::new(ids.next(), "Names", format!("`{}", op.tracked)).at(op.span)
+                        Node::new(ids.next(), "Names", format!("!{}", op.tracked)).at(op.span)
                     }
                 };
                 effect_node = effect_node.child(row);
@@ -217,7 +216,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             for arm in arms {
                 let (label, at) = match &arm.head {
                     ArmHead::Operation { effect, op } => (
-                        format!("{}.`{}", effect.tracked, op.tracked),
+                        format!("!{}.{}", effect.tracked, op.tracked),
                         effect.span.merge(op.span),
                     ),
                     ArmHead::Return { span } => ("return".to_string(), *span),
@@ -334,56 +333,46 @@ fn when_text(when: &Option<Box<When>>) -> String {
     match when {
         None => String::new(),
         Some(when) => match &when.name {
-            Some(name) => format!(" when {}", name.tracked),
+            Some(name) => format!(" when '{}", name.tracked),
             None => " when _".to_string(),
         },
     }
 }
 
 /// One written ascription: the type, and — when one was written — the `where`
-/// clause beside it, as a row of its own with one child per statement.
+/// clause beside it, as a row of its own with one child per constraint.
 ///
 /// The clause is a sibling of the type rather than a child, because that is
-/// what it is: it declares the variables the type uses and constrains the
-/// presences its `when`s wear, and burying it under the type would say it was
-/// part of one. Each statement gets a row so the `;`s a reader wrote are the
-/// rows they see, and a `let` statement's names each get one under that, so a
-/// use in the type cross-highlights against the declaration it resolves to.
+/// what it is: it constrains the presences the type's `when`s wear, and burying
+/// it under the type would say it was part of one. Each constraint gets a row
+/// so the `;`s a reader wrote are the rows they see.
 fn annotation_node(ids: &mut Ids, annotation: &Annotation) -> Node {
     let node = type_node(ids, &annotation.ty);
     let Some(clause) = &annotation.clause else {
         return node;
     };
-    let stmts: Vec<Node> = clause
-        .stmts
+    let constraints: Vec<Node> = clause
+        .clauses
         .iter()
-        .map(|stmt| {
-            let text = print::ast::clause_stmt(&stmt.tracked).to_string();
-            let row = Node::new(ids.next(), "", text).at(stmt.span);
-            match &stmt.tracked {
-                ClauseStmtKind::Let(names) => Node {
-                    label: "Let".into(),
-                    ..row
-                }
-                .children(
-                    names
-                        .iter()
-                        .map(|name| {
-                            Node::new(ids.next(), "Variable", name.tracked.clone()).at(name.span)
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                ClauseStmtKind::Constraint(clause) => Node {
-                    label: "Constraint".into(),
-                    ..row
-                }
-                .children(clause_kids(ids, clause)),
-            }
+        .map(|constraint| {
+            Node::new(ids.next(), "Constraint", clause_text(constraint))
+                .at(constraint.span)
+                .children(clause_kids(ids, constraint))
         })
         .collect();
     let text = print::ast::where_clause(clause).to_string();
     let row = Node::new(ids.next(), "Where", text).at(clause.span);
-    node.child(row.children(stmts))
+    node.child(row.children(constraints))
+}
+
+/// The `..` and whatever it names, as the row it stands for is written: a
+/// parameter bare, a variable with its sigil.
+fn rest_text(of: &Rest) -> String {
+    match of {
+        Rest::Anything => "..".to_string(),
+        Rest::Param(name) => format!("..{}", name.tracked),
+        Rest::Variable(name) => format!("..'{}", name.tracked),
+    }
 }
 
 /// One clause as the source it was written from — through the shared printer,
@@ -412,8 +401,9 @@ fn clause_kids(ids: &mut Ids, clause: &Clause) -> Vec<Node> {
         .collect()
 }
 
-/// The `! <effects>` clause an arrow carries, as a row of its own: one child
-/// per effect it names, and the `..` tail beside them.
+/// The `+ <effects>` clause an arrow carries — or the row an argument may be —
+/// as a row of its own: one child per effect it names, and the `..` tail beside
+/// them.
 fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
     let mut kids: Vec<Node> = effects
         .effects
@@ -423,21 +413,20 @@ fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
                 let mark = when_text(when);
                 Node::new(
                     ids.next(),
-                    format!("`{}{mark}", name.tracked),
+                    format!("!{}{mark}", name.tracked),
                     String::new(),
                 )
                 .at(name.span)
             }
             // The absent effect is a leaf wearing the `\`, spanning the whole
-            // `` \`Name `` — the struct's absent field again.
+            // `\!Name` — the struct's absent field again.
             EffectLabel::Absent => {
-                Node::new(ids.next(), format!("\\`{}", name.tracked), String::new()).at(name.span)
+                Node::new(ids.next(), format!("\\!{}", name.tracked), String::new()).at(name.span)
             }
         })
         .collect();
     if let Some(tail) = &effects.tail {
-        let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
-        kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+        kids.push(Node::new(ids.next(), "Rest", rest_text(&tail.of)).at(tail.span));
     }
     Node::new(ids.next(), "Effects", String::new())
         .at(effects.span)
@@ -447,6 +436,9 @@ fn effects_node(ids: &mut Ids, effects: &EffectRow) -> Node {
 fn type_node(ids: &mut Ids, ty: &Type) -> Node {
     let node = Node::new(ids.next(), "", print::ast::ty(&ty.tracked).to_string()).at(ty.span);
     match &ty.tracked {
+        // A row written where a type goes, shown as the row it is: the same
+        // node an arrow's own row gets, so the two read alike on the page.
+        TypeKind::Effects(effects) => effects_node(ids, effects),
         TypeKind::Struct { fields, tail } => {
             let mut kids: Vec<Node> = fields
                 .iter()
@@ -472,8 +464,7 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
             // The tail is a row of its own: it stands for the fields not
             // named, so it is shown beside them rather than folded into one.
             if let Some(tail) = tail {
-                let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
-                kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+                kids.push(Node::new(ids.next(), "Rest", rest_text(&tail.of)).at(tail.span));
             }
             Node {
                 label: "Struct".into(),
@@ -492,7 +483,7 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                         let text = payload
                             .as_ref()
                             .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());
-                        let node = Node::new(ids.next(), format!("`{}{mark}", name.tracked), text)
+                        let node = Node::new(ids.next(), format!("#{}{mark}", name.tracked), text)
                             .at(name.span);
                         match payload {
                             Some(payload) => node.child(type_node(ids, payload)),
@@ -500,16 +491,15 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                         }
                     }
                     // The struct's absent field again: a leaf wearing the `\`,
-                    // spanning the whole `` \`Name ``.
+                    // spanning the whole `\#Name`.
                     SumCase::Absent => {
-                        Node::new(ids.next(), format!("\\`{}", name.tracked), String::new())
+                        Node::new(ids.next(), format!("\\#{}", name.tracked), String::new())
                             .at(name.span)
                     }
                 })
                 .collect();
             if let Some(tail) = tail {
-                let name = tail.name.as_ref().map_or("", |name| name.tracked.as_str());
-                kids.push(Node::new(ids.next(), "Rest", format!("..{name}")).at(tail.span));
+                kids.push(Node::new(ids.next(), "Rest", rest_text(&tail.of)).at(tail.span));
             }
             Node {
                 label: "Sum".into(),
@@ -544,6 +534,13 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
         ),
         TypeKind::Ident { name } => Node {
             label: "Ident".into(),
+            ..node
+        }
+        .at(name.span),
+        // A variable of the annotation around it: a leaf, spanned at the whole
+        // `'a` — the sigil is part of the lexeme a reader selects.
+        TypeKind::Variable { name } => Node {
+            label: "Variable".into(),
             ..node
         }
         .at(name.span),

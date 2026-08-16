@@ -105,6 +105,10 @@ fn lexes_the_two_dots_apart() {
         kinds("..r")[..],
         [Kind::DotDot, Kind::Identifier(_)]
     ));
+    assert!(matches!(
+        kinds("..'r")[..],
+        [Kind::DotDot, Kind::Variable(_)]
+    ));
 
     let out = lex("{ a: A, .. }", FileID::GENERATED);
     let dots = &out.tokens[5];
@@ -125,15 +129,14 @@ fn lexes_the_statement_separator() {
         [Kind::Semicolon, Kind::Semicolon]
     ));
     assert!(matches!(
-        kinds("where let a; a = b")[..],
+        &kinds("where 'a = 'b; 'c")[..],
         [
             Kind::Identifier(_),
-            Kind::Let,
-            Kind::Identifier(_),
-            Kind::Semicolon,
-            Kind::Identifier(_),
+            Kind::Variable(_),
             Kind::Equal,
-            Kind::Identifier(_),
+            Kind::Variable(_),
+            Kind::Semicolon,
+            Kind::Variable(_),
         ]
     ));
 
@@ -144,8 +147,8 @@ fn lexes_the_statement_separator() {
     assert_eq!(semi.span.width, 1);
 }
 
-/// `!=` is one token, the way `->` is: a lone `!` begins nothing, so the only
-/// thing it can be is the head of this.
+/// `!=` is one token, the way `->` is: the longer lexeme wins, so a `!` in
+/// front of an `=` is this rather than an effect beside an assignment.
 #[test]
 fn lexes_the_comparison() {
     assert!(matches!(
@@ -154,18 +157,59 @@ fn lexes_the_comparison() {
     ));
 }
 
-/// A lone `!` is the effect row's own token, and `!=` is still the comparison:
-/// the longer lexeme wins, the way `..` beats two dots, so `a !=b` is one
-/// comparison rather than a row mark beside an assignment.
+/// A `!` in front of a name is an effect, and `!=` is still the comparison: the
+/// longer lexeme wins, the way `..` beats two dots, so `a !=b` is one comparison
+/// rather than an effect beside an assignment.
+///
+/// A `!` in front of anything else begins nothing, so it is the lex error a lone
+/// `#` is — the row it used to introduce is written `+` now.
 #[test]
-fn a_lone_bang_is_the_effect_mark() {
-    assert!(matches!(kinds("a ! b")[..], [_, Kind::Bang, _]));
+fn a_sigilled_name_is_an_effect() {
+    assert!(matches!(&kinds("!Log")[..], [Kind::EffectLabel(name)] if name == "Log"));
     assert!(matches!(
-        kinds("Nat -> Nat!`Log")[..],
-        [_, _, _, Kind::Bang, _]
+        &kinds("Nat -> Nat+!Log")[..],
+        [_, _, _, Kind::Plus, Kind::EffectLabel(name)] if name == "Log"
     ));
     assert!(matches!(kinds("a !=b")[..], [_, Kind::NotEqual, _]));
-    assert!(errors("a ! b").is_empty());
+    assert!(errors("!Log").is_empty());
+
+    let out = errors("a ! b");
+    assert_eq!(out.len(), 1, "errors: {out:#?}");
+    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(out[0].span.width, 1);
+}
+
+/// A `'` in front of a name is a variable of the annotation it is written in,
+/// and in front of anything else it begins nothing: the lex error a lone `#`
+/// is, for the reason a lone `#` is one.
+#[test]
+fn lexes_a_variable() {
+    assert!(matches!(&kinds("'a")[..], [Kind::Variable(name)] if name == "a"));
+    assert!(matches!(&kinds("'rest")[..], [Kind::Variable(name)] if name == "rest"));
+    assert!(matches!(&kinds("'_x")[..], [Kind::Variable(name)] if name == "_x"));
+    assert_eq!(kinds("'a")[0].to_string(), "'a");
+    assert!(errors("'a").is_empty());
+
+    // The whole of what was consumed is underlined, as it is for a tag.
+    for (src, width) in [("'", 1), ("' ", 1), ("'1", 2), ("'1abc", 5)] {
+        let out = errors(src);
+        assert_eq!(out.len(), 1, "{src}: {out:#?}");
+        assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");
+        assert_eq!(out[0].span.start, 0, "{src}");
+        assert_eq!(out[0].span.width, width, "{src}");
+    }
+}
+
+/// The `+` that hangs a row off an arrow is one byte and its own token, and it
+/// is the only thing the character is: there is no addition to tell it from.
+#[test]
+fn lexes_the_effect_mark() {
+    assert!(matches!(kinds("+")[..], [Kind::Plus]));
+    assert!(matches!(
+        kinds("Nat -> Nat + ..'e")[..],
+        [_, _, _, Kind::Plus, Kind::DotDot, Kind::Variable(_)]
+    ));
+    assert!(errors("+").is_empty());
 }
 
 /// The `?` that used to mark an optional field is gone from the language, so
@@ -206,38 +250,38 @@ fn an_unrecognized_character_is_still_its_own_error() {
 
 #[test]
 fn lexes_a_tag_as_one_token() {
-    assert!(matches!(&kinds("`Some")[..], [Kind::Tag(name)] if name == "Some"));
-    // The backtick is not part of the name, so a tag and an identifier of the
-    // same spelling carry the same string.
-    assert!(matches!(&kinds("`x1")[..], [Kind::Tag(name)] if name == "x1"));
-    assert!(matches!(&kinds("`_a")[..], [Kind::Tag(name)] if name == "_a"));
+    assert!(matches!(&kinds("#Some")[..], [Kind::Tag(name)] if name == "Some"));
+    // The `#` is not part of the name, so a tag and an identifier of the same
+    // spelling carry the same string.
+    assert!(matches!(&kinds("#x1")[..], [Kind::Tag(name)] if name == "x1"));
+    assert!(matches!(&kinds("#_a")[..], [Kind::Tag(name)] if name == "_a"));
 }
 
 #[test]
 fn a_tag_is_spanned_and_printed_as_written() {
-    let out = lex("let v = `Some 1", FileID::GENERATED);
+    let out = lex("let v = #Some 1", FileID::GENERATED);
     let tag = &out.tokens[3];
-    // The span covers the backtick as well as the name: it is one lexeme, and
-    // a reader selecting the case should get all of it.
+    // The span covers the `#` as well as the name: it is one lexeme, and a
+    // reader selecting the case should get all of it.
     assert_eq!(tag.span.start, 8);
     assert_eq!(tag.span.width, 5);
-    // And printing writes the backtick back on, so the stream re-lexes to
-    // itself rather than to an identifier.
-    assert_eq!(tag.tracked.to_string(), "`Some");
+    // And printing writes the `#` back on, so the stream re-lexes to itself
+    // rather than to an identifier.
+    assert_eq!(tag.tracked.to_string(), "#Some");
 }
 
 #[test]
-fn a_backtick_that_begins_no_name_is_unrecognized() {
+fn a_sigil_that_begins_no_name_is_unrecognized() {
     // The `-` precedent: a character that begins nothing on its own is
     // reported where it was written rather than swallowing what follows.
     //
     // What it did swallow, it underlines. The name runs over the characters an
-    // identifier continues with, so `` `1abc `` is one bad tag rather than a
-    // backtick beside something else, and the span is the whole of it — the
+    // identifier continues with, so `#1abc` is one bad tag rather than a `#`
+    // beside something else, and the span is the whole of it — the
     // rule the malformed natural below already keeps. A span narrower than the
     // lexeme points at a character the reader cannot act on and leaves the rest
     // of the mistake unmarked.
-    for (src, width) in [("`", 1), ("` ", 1), ("`|", 1), ("`1", 2), ("`1abc", 5)] {
+    for (src, width) in [("#", 1), ("# ", 1), ("#|", 1), ("#1", 2), ("#1abc", 5)] {
         let out = errors(src);
         assert_eq!(out.len(), 1, "{src}: {out:#?}");
         assert_eq!(out[0].kind, ErrorKind::Unrecognized, "{src}");
@@ -261,9 +305,9 @@ fn lexes_the_backslash() {
         &kinds("\\ y")[..],
         [Kind::Backslash, Kind::Identifier(name)] if name == "y"
     ));
-    // A case keeps its backtick, so `` \`B `` is the mark and then a tag.
+    // A case keeps its `#`, so `\#B` is the mark and then a tag.
     assert!(matches!(
-        &kinds("\\`B")[..],
+        &kinds("\\#B")[..],
         [Kind::Backslash, Kind::Tag(name)] if name == "B"
     ));
 
@@ -279,7 +323,7 @@ fn lexes_the_backslash() {
 #[test]
 fn lexes_the_case_separator() {
     assert!(matches!(
-        &kinds("`A | `B")[..],
+        &kinds("#A | #B")[..],
         [Kind::Tag(_), Kind::Pipe, Kind::Tag(_)]
     ));
     // The empty sum is one token and no name at all.
@@ -328,13 +372,13 @@ fn words_of_underscores_are_still_names() {
     }
 }
 
-/// The tag `` `_ `` is untouched: a tag's name runs over identifier
+/// The tag `#_` is untouched: a tag's name runs over identifier
 /// characters, and the keyword rule never sees it.
 #[test]
 fn the_underscore_tag_is_still_a_tag() {
-    assert!(matches!(&kinds("`_")[..], [Kind::Tag(name)] if name == "_"));
+    assert!(matches!(&kinds("#_")[..], [Kind::Tag(name)] if name == "_"));
     assert!(matches!(
-        &kinds("`_ _")[..],
+        &kinds("#_ _")[..],
         [Kind::Tag(name), Kind::Underscore] if name == "_"
     ));
 }
@@ -364,7 +408,7 @@ fn the_effect_keywords_are_reserved() {
 }
 
 /// `return` is not one of them. It heads a handler arm and is an ordinary name
-/// everywhere else, so the lexer hands it over as the identifier it is and the
+/// everywhere 'else, so the lexer hands it over as the identifier it is and the
 /// one position that reads it recognizes it by spelling — the rule `when` and
 /// `where` already keep.
 #[test]

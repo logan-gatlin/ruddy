@@ -97,7 +97,7 @@ pub struct Ambient {
 
 /// One entry of a match's column at one position: the sub-pattern an arm wrote
 /// there, or the unit a bare tag's payload demands without anything having
-/// been written — `` `None `` is `` `None () `` to the types, and only to the
+/// been written — `#None` is `#None ()` to the types, and only to the
 /// types. Each entry remembers which arm it came from, because a binder's view
 /// is refined against the arms *above its own*; see [`Constrain::position`].
 enum Col<'a> {
@@ -593,7 +593,7 @@ impl Constrain<'_> {
     ///
     /// R16, and the whole of it. A handler introduces no row of its own: like
     /// every other term form it is checked *at* an ambient, and what it does is
-    /// hand its body `` D | ..A `` — the ambient extended with the effects it
+    /// hand its body `D | ..A` — the ambient extended with the effects it
     /// discharges, each present. That the ambient must *lack* those is the
     /// existing lacks condition, said here, and it is what refuses an arm
     /// re-performing the effect its own handler discharges.
@@ -714,9 +714,9 @@ impl Constrain<'_> {
     /// case is fully handled iff those arms alone leave it no unhandled
     /// values, which is the same analysis the lowering checks run
     /// ([`ir::Matrix::handled`]). That is what gives the classic catch-all
-    /// after `` `Some x `` its sum-without-`Some`, and it degrades correctly:
-    /// after `` `A `X ``, a later catch-all still sees `` `A `` present,
-    /// because `` `A `` values with other payloads reach it.
+    /// after `#Some x` its sum-without-`Some`, and it degrades correctly:
+    /// after `#A #X`, a later catch-all still sees `#A` present,
+    /// because `#A` values with other payloads reach it.
     fn position(
         &mut self,
         columns: &Columns,
