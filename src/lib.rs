@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod inference;
 pub mod ir;
 pub mod lir;

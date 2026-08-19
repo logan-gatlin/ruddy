@@ -3,22 +3,66 @@
 use std::collections::HashMap;
 
 use ruddy_debug::{
-    snapshot::{compile, guard, install_hook},
+    snapshot::{ROOT, compile, guard, install_hook},
     stage::REGISTRY,
-    wire::{BundleSpec, CompileRequest, Node, Snapshot, Stage, Status, View},
+    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
 
-fn snapshot(source: &str) -> Snapshot {
+/// The header every snippet is compiled under: a bundle's root file must open
+/// with one, so a snippet that did not write its own would be told so. Every
+/// span in the snippet therefore sits this many bytes further in.
+const HEADER: &str = "bundle demo 0.1.0\n";
+
+/// A bundle of three files, one per shape a module's body can come from: an
+/// inline module, a module beside its parent, and a module inside the directory
+/// its parent's name spells.
+const NESTED: &[(&str, &str)] = &[
+    (
+        ROOT,
+        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2\n",
+    ),
+    ("Math.hc", "module Vec\nlet double = fn x => x\n"),
+    ("Math/Vec.hc", "let zero = 0\n"),
+];
+
+/// One snippet, compiled as the whole of a bundle's root file.
+fn snapshot(snippet: &str) -> Snapshot {
+    bundle(&[(ROOT, &compiled(snippet))])
+}
+
+/// What a snippet is compiled as, for the tests that check a span against the
+/// bytes it covers: the same text the compiler read, header and all.
+fn compiled(snippet: &str) -> String {
+    format!("{HEADER}{snippet}")
+}
+
+/// A whole bundle, each file exactly as written — the request the page posts,
+/// with nothing added to it.
+fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
-            source: source.to_string(),
+            files: files
+                .iter()
+                .map(|(path, source)| FileSpec {
+                    path: (*path).to_string(),
+                    source: (*source).to_string(),
+                })
+                .collect(),
             revision: 3,
-            bundle: BundleSpec::default(),
         },
         1,
     )
+}
+
+/// Where a range written in a snippet's own offsets ends up on the wire: in the
+/// root file, [`HEADER`] bytes further in than the snippet spells it.
+fn at(range: [usize; 2]) -> Option<Loc> {
+    Some(Loc {
+        file: 0,
+        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
+    })
 }
 
 fn nodes(stage: &Stage) -> Vec<&Node> {
@@ -35,7 +79,7 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 
 #[test]
 fn every_stage_reports_on_the_demo() {
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();
     assert_eq!(
         ids,
@@ -97,23 +141,38 @@ fn every_stage_reports_on_the_demo() {
 }
 
 /// A span hygiene check on the compiler, not on the debugger: every offset
-/// a stage hands out has to be a real position in the source it came from.
+/// a stage hands out has to be a real position in the file it came from.
 /// Bad `merge` arithmetic shows up here rather than as a mangled highlight.
 #[test]
 fn every_span_lies_inside_the_source() {
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
+    // The demo is one file, and a `Loc` naming a file the snapshot does not
+    // list is nowhere the reader could be shown — so the index is checked
+    // against the list before the range is checked against the file.
+    let files: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(files, [ROOT]);
+    assert_eq!(snapshot.files[0].len, DEMO.len());
+
     for stage in &snapshot.stages {
         for node in nodes(stage) {
-            let Some([start, end]) = node.span else {
+            let Some(Loc {
+                file,
+                range: [start, end],
+            }) = node.span
+            else {
                 continue;
             };
+            let info = snapshot
+                .files
+                .get(file as usize)
+                .unwrap_or_else(|| panic!("{}: {} names file {file}", stage.id, node.label));
             assert!(
-                start <= end && end <= DEMO.len(),
+                start <= end && end <= info.len,
                 "{}: {} {:?} has span {start}..{end} in {} bytes",
                 stage.id,
                 node.label,
                 node.text,
-                DEMO.len()
+                info.len
             );
             assert!(
                 DEMO.get(start..end).is_some(),
@@ -124,8 +183,13 @@ fn every_span_lies_inside_the_source() {
         }
     }
     for diagnostic in &snapshot.diagnostics {
-        if let Some([start, end]) = diagnostic.span {
-            assert!(DEMO.get(start..end).is_some(), "{}", diagnostic.code);
+        if let Some(at) = diagnostic.span {
+            assert_eq!(at.file, 0, "{}", diagnostic.code);
+            assert!(
+                DEMO.get(at.range[0]..at.range[1]).is_some(),
+                "{}",
+                diagnostic.code
+            );
         }
     }
 }
@@ -139,7 +203,7 @@ fn every_span_lies_inside_the_source() {
 /// without the span has `Node::owner` for it.
 #[test]
 fn a_node_naming_a_symbol_is_spanned_at_the_name() {
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
     let symbols = snapshot
         .stages
         .iter()
@@ -156,7 +220,14 @@ fn a_node_naming_a_symbol_is_spanned_at_the_name() {
     let mut checked = 0;
     for stage in &snapshot.stages {
         for node in nodes(stage) {
-            let (Some(index), Some([start, end])) = (node.symbol, node.span) else {
+            let (
+                Some(index),
+                Some(Loc {
+                    range: [start, end],
+                    ..
+                }),
+            ) = (node.symbol, node.span)
+            else {
                 continue;
             };
             let name = names
@@ -198,7 +269,7 @@ fn a_node_naming_a_symbol_is_spanned_at_the_name() {
 
 #[test]
 fn diagnostics_are_reported_in_source_order() {
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
     let codes: Vec<_> = snapshot
         .diagnostics
         .iter()
@@ -207,10 +278,17 @@ fn diagnostics_are_reported_in_source_order() {
     assert!(codes.contains(&"undefined-term"), "{codes:?}");
     assert!(codes.contains(&"unrecognized-character"), "{codes:?}");
 
+    // Where the reader would look for them: the file first, then the offset
+    // inside it, since a bundle's diagnostics come from more than one file.
     let offsets: Vec<_> = snapshot
         .diagnostics
         .iter()
-        .map(|diagnostic| diagnostic.span.map(|span| span[0]).unwrap_or(0))
+        .map(|diagnostic| {
+            diagnostic
+                .span
+                .map(|at| (at.file, at.range[0]))
+                .unwrap_or((0, 0))
+        })
         .collect();
     assert!(
         offsets.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -236,19 +314,24 @@ fn a_natural_reaches_every_stage() {
             .iter()
             .find(|stage| stage.id == id)
             .expect("the stage is registered");
+        // By what it says rather than by being the first of its kind: the
+        // header's version parts are naturals too, and they are written above
+        // every snippet.
         let node = nodes(stage)
             .into_iter()
-            .find(|node| node.label == "Natural")
+            .find(|node| node.label == "Natural" && node.text == "42")
             .unwrap_or_else(|| panic!("{id} rendered no natural"));
 
-        assert_eq!(node.text, "42", "{id}");
-        assert_eq!(node.span, Some([8, 10]), "{id}");
+        assert_eq!(node.span, at([8, 10]), "{id}");
         // A literal names nothing, so no panel may point it at a symbol.
         assert_eq!(node.symbol, None, "{id}");
     }
 
     let tokens = nodes(&snapshot.stages[0]);
-    let literal = tokens.iter().find(|node| node.label == "Natural").unwrap();
+    let literal = tokens
+        .iter()
+        .find(|node| node.label == "Natural" && node.text == "42")
+        .expect("the tokens tab renders the literal");
     let class = literal
         .fields
         .iter()
@@ -301,7 +384,8 @@ fn the_surface_prerequisites_reach_every_stage() {
     // place the two trees are meant to differ.
     assert_eq!(labelled("ir", "Prim"), ["Nat", "Nat", "Nat"]);
     assert_eq!(labelled("tokens", "Arrow"), ["->"]);
-    assert_eq!(labelled("tokens", "Dot"), ["."]);
+    // The two the header's version is written with, and then the projection's.
+    assert_eq!(labelled("tokens", "Dot"), [".", ".", "."]);
 }
 
 /// The row forms — a `when`-named presence, and a named tail — checked through
@@ -336,9 +420,13 @@ fn rows_reach_every_stage() {
     assert_eq!(labelled("tokens", "DotDot"), [".."]);
     // `when` lexes as the ordinary identifier it is — contextual, not
     // reserved — which is what keeps a term or a label of that name writable.
+    // The `demo` in front of them is the header's own name, which is an
+    // identifier like any other.
     assert_eq!(
         labelled("tokens", "Identifier"),
-        ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
+        [
+            "demo", "f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"
+        ]
     );
 
     for id in ["ast", "ir"] {
@@ -460,7 +548,7 @@ fn a_duplicate_carries_the_definition_it_repeats() {
         .find(|diagnostic| diagnostic.code == "duplicate-term")
         .expect("the repeat is reported");
     assert_eq!(duplicate.related.len(), 1);
-    assert_eq!(duplicate.related[0].span, Some([4, 5]));
+    assert_eq!(duplicate.related[0].span, at([4, 5]));
     assert_eq!(duplicate.related[0].message, "first defined here");
 }
 
@@ -480,7 +568,7 @@ fn a_mixed_tail_carries_the_use_it_clashes_with() {
     // thing the reader can change, and is what the second use points back to.
     let first = source.find("..'r").expect("the first tail") + 2;
     assert_eq!(mixed.related.len(), 1);
-    assert_eq!(mixed.related[0].span, Some([first, first + 2]));
+    assert_eq!(mixed.related[0].span, at([first, first + 2]));
     // Worded as a use rather than as a definition: nothing here was defined
     // twice.
     assert_eq!(mixed.related[0].message, "first used here");
@@ -822,10 +910,10 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(diagnostic.code, "rigid-field");
     // Spanned at the projection, which is the expression that broke it.
     let read = source.rfind('x').expect("the field");
-    assert_eq!(diagnostic.span, Some([read, read + 1]));
+    assert_eq!(diagnostic.span, at([read, read + 1]));
     let declared = source.find("'a").expect("the first use");
     assert_eq!(diagnostic.related.len(), 1);
-    assert_eq!(diagnostic.related[0].span, Some([declared, declared + 2]));
+    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
     assert_eq!(diagnostic.related[0].message, "declared here");
 
     let flat = snapshot("let n = 1\nlet bad = n.x\n");
@@ -885,7 +973,9 @@ fn symbols_round_trip_through_the_mangler() {
         .iter()
         .find(|stage| stage.id == "symbols")
         .expect("the symbols stage is registered");
-    assert_eq!(symbols.summary, "3 symbols");
+    // The counts a bundle made worth reporting: how many files the symbols were
+    // declared across, and how many of them are modules.
+    assert_eq!(symbols.summary, "3 symbols · 1 file · 0 modules");
     for node in nodes(symbols) {
         let demangle = node
             .fields
@@ -935,7 +1025,7 @@ fn a_panic_becomes_a_result() {
 
 #[test]
 fn a_snapshot_survives_the_wire() {
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
     let json = serde_json::to_string(&snapshot).expect("serializes");
     let back: serde_json::Value = serde_json::from_str(&json).expect("parses");
 
@@ -948,8 +1038,22 @@ fn a_snapshot_survives_the_wire() {
     );
     assert_eq!(back["stages"][0]["view"], "list");
     assert_eq!(back["stages"][1]["view"], "tree");
-    assert!(back["line_starts"].as_array().expect("line starts").len() > 1);
-    assert_eq!(back["source_len"], DEMO.len());
+    // The file strip and everything a `Loc` is read against: one entry per file
+    // the loader read, each carrying what the page turns an offset into a line
+    // and a column with.
+    let files = back["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], ROOT);
+    assert_eq!(files[0]["len"], DEMO.len());
+    assert!(
+        files[0]["line_starts"]
+            .as_array()
+            .expect("line starts")
+            .len()
+            > 1
+    );
+    // And the identity the root file declared, for the chip.
+    assert_eq!(back["bundle"], "demo@0.1.0");
     // Underscored fields are the page's, and have to survive too: the
     // editor's colouring is built from them.
     assert!(json.contains("_class"));
@@ -977,28 +1081,34 @@ fn a_snapshot_survives_the_wire() {
     assert!(json.contains("\"owner\""));
 }
 
+/// A bundle whose root file declares itself and nothing else is a program with
+/// nothing in it, not a program with something wrong with it.
 #[test]
 fn an_empty_buffer_is_not_an_error() {
     let snapshot = snapshot("");
-    assert!(snapshot.diagnostics.is_empty());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
     assert!(snapshot.panic.is_none());
-    assert_eq!(snapshot.line_starts, vec![0]);
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].len, HEADER.len());
+    assert_eq!(snapshot.files[0].line_starts, vec![0, HEADER.len()]);
 }
 
+/// A header the reader is halfway through typing is not a reason to stop
+/// compiling: the identity is reported as the mistake it is, the mint falls back
+/// to one of its own, and every later phase still runs.
 #[test]
 fn a_bad_bundle_is_reported_rather_than_fatal() {
-    let snapshot = compile(
-        &CompileRequest {
-            source: "let x = ()".to_string(),
-            revision: 0,
-            bundle: BundleSpec {
-                name: "not a name".to_string(),
-                version: "1.0.0".to_string(),
-            },
-        },
-        1,
-    );
-    assert_eq!(snapshot.diagnostics[0].code, "bad-bundle");
+    // A name the lexer reads as an ordinary identifier and `Bundle::new`
+    // refuses: an identifier may open with `_` and a bundle name may not.
+    let snapshot = bundle(&[(ROOT, "bundle _x 0.1.0\nlet x = ()")]);
+    assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
+    // And the chip has nothing to show, because nothing was declared it could
+    // be shown from.
+    assert_eq!(snapshot.bundle, None);
     // The fallback bundle still lowers the program.
     let ir = snapshot
         .stages
@@ -1006,6 +1116,142 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
         .find(|stage| stage.id == "ir")
         .expect("ir stage");
     assert_eq!(ir.nodes.len(), 1);
+}
+
+/// The file list is the index every `Loc` on the wire points into, so it has to
+/// be the files the *loader* read rather than the files the request carried:
+/// root first, then depth-first through the modules, which is also the order the
+/// page shows its file strip in.
+#[test]
+fn a_bundle_lists_every_file_the_loader_read() {
+    let snapshot = bundle(NESTED);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let files: Vec<(&str, usize)> = snapshot
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.len))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            (ROOT, NESTED[0].1.len()),
+            ("Math.hc", NESTED[1].1.len()),
+            ("Math/Vec.hc", NESTED[2].1.len()),
+        ]
+    );
+    // Each with what the page turns an offset in it into a line and a column.
+    assert_eq!(snapshot.files[2].line_starts, vec![0, 13]);
+
+    // And the chip reads what the root file's header declared, which is the
+    // only place a bundle is named at all.
+    assert_eq!(snapshot.bundle.as_deref(), Some("demo@0.1.0"));
+}
+
+/// A range means nothing without the file it is a range in. A node written in a
+/// module file has to name that file, and so does a complaint about one —
+/// otherwise the page reveals the right offset of the wrong file, which is
+/// worse than revealing nothing.
+#[test]
+fn a_span_from_a_module_file_names_that_file() {
+    let snapshot = bundle(&[
+        (ROOT, "bundle demo 0.1.0\nmodule Math\n"),
+        ("Math.hc", "let double = nope\n"),
+    ]);
+
+    // Every token of a file's row is a span in that file, which is the whole of
+    // what the index has to get right.
+    let tokens = stage_named(&snapshot, "tokens");
+    assert_eq!(tokens.nodes.len(), 2);
+    for (index, file) in tokens.nodes.iter().enumerate() {
+        for token in &file.children {
+            let at = token.span.expect("a token was written somewhere");
+            assert_eq!(at.file, index as u32, "{} {:?}", token.label, token.text);
+        }
+    }
+
+    // And the name the module file could not resolve is reported in the module
+    // file, at the offsets that file spells it with rather than the root's.
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "undefined-term");
+    assert_eq!(
+        diagnostic.span,
+        Some(Loc {
+            file: 1,
+            range: [13, 17]
+        })
+    );
+}
+
+/// The loader's own complaints reach the strip like every other phase's, worded
+/// by `ruddy::ui` and coded the same way the driver codes them — and pointed at
+/// the declaration that named the file, which is the one place the reader can
+/// fix it.
+#[test]
+fn a_missing_module_file_reaches_the_strip() {
+    let root = "bundle demo 0.1.0\nmodule Math\nlet four = 4\n";
+    let snapshot = bundle(&[(ROOT, root)]);
+
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.stage, "bundle");
+    assert_eq!(diagnostic.code, "module-file-missing");
+    // At the name, which is what the file's path was spelled from.
+    let at = root.find("Math").expect("the declaration");
+    assert_eq!(
+        diagnostic.span,
+        Some(Loc {
+            file: 0,
+            range: [at, at + "Math".len()]
+        })
+    );
+
+    // And the rest of the bundle is still compiled: one missing file may not
+    // hide every other complaint, or every other answer.
+    let ir = stage_named(&snapshot, "ir");
+    assert!(!ir.nodes.is_empty(), "{ir:#?}");
+}
+
+/// A document is a bundle, and a bundle starts somewhere. Only the debugger
+/// knows the page was meant to have put a root file in the request — the loader
+/// reads a file that is not there as an empty one — so the debugger is what says
+/// so, rather than leaving the reader with a blank page and no reason for it.
+#[test]
+fn a_request_without_a_root_file_is_told_so() {
+    let snapshot = bundle(&[("Math.hc", "let double = fn x => x\n")]);
+    let codes: Vec<&str> = snapshot
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect();
+    assert!(codes.contains(&"missing-root-file"), "{codes:?}");
+    let missing = snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "missing-root-file")
+        .expect("the complaint is there");
+    assert_eq!(missing.stage, "bundle");
+    assert_eq!(
+        missing.message,
+        "a document needs a `main.hc`; it is the bundle's root file"
+    );
+    // Nowhere to point at: there is no file for the missing one to be missing
+    // from.
+    assert_eq!(missing.span, None);
+
+    // The root the loader read in its place is the empty one it invented, so
+    // the file strip has one tab and the orphan module file is not in it.
+    let files: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(files, [ROOT]);
+    assert_eq!(snapshot.bundle, None);
+    assert!(snapshot.panic.is_none());
 }
 
 /// The `Solve` tab is a timeline the page walks with a cursor, building its two
@@ -1095,7 +1341,7 @@ fn a_solver_step_declares_what_it_added_to_the_state() {
 #[test]
 fn only_the_stages_that_own_a_phase_report_a_time() {
     let clean = snapshot("let f = fn a => a\n");
-    let snapshot = snapshot(DEMO);
+    let snapshot = bundle(&[(ROOT, DEMO)]);
     let ids = |timed: bool| -> Vec<&str> {
         snapshot
             .stages
@@ -1179,7 +1425,7 @@ fn a_count_of_one_is_said_in_the_singular() {
     assert_eq!(summary("constraints"), "1 constraint");
     assert_eq!(summary("solve"), "1 step");
     assert_eq!(summary("types"), "1 scheme");
-    assert_eq!(summary("symbols"), "1 symbol");
+    assert_eq!(summary("symbols"), "1 symbol · 1 file · 0 modules");
     assert_eq!(summary("ir"), "0 effects · 0 types · 1 term · 1 group");
 }
 
@@ -1225,7 +1471,7 @@ fn the_ir_tab_shows_a_declarations_parameters() {
         .find(|stage| stage.id == "ir")
         .expect("the ir stage");
 
-    let params: Vec<(&str, Option<[usize; 2]>)> = nodes(stage)
+    let params: Vec<(&str, Option<Loc>)> = nodes(stage)
         .iter()
         .filter(|node| node.label == "Param")
         .map(|node| (node.text.as_str(), node.span))
@@ -1235,8 +1481,8 @@ fn the_ir_tab_shows_a_declarations_parameters() {
     assert_eq!(
         params,
         [
-            ("'a", Some([11, 13])),
-            ("..'r (struct) without x", Some([31, 33]))
+            ("'a", at([11, 13])),
+            ("..'r (struct) without x", at([31, 33]))
         ]
     );
 
@@ -1271,9 +1517,9 @@ fn a_duplicate_parameter_carries_the_name_it_repeats() {
         .iter()
         .find(|diagnostic| diagnostic.code == "duplicate-parameter")
         .expect("the repeat is reported");
-    assert_eq!(duplicate.span, Some([13, 15]));
+    assert_eq!(duplicate.span, at([13, 15]));
     assert_eq!(duplicate.related.len(), 1);
-    assert_eq!(duplicate.related[0].span, Some([10, 12]));
+    assert_eq!(duplicate.related[0].span, at([10, 12]));
 }
 
 /// The IR tab shows an application as its head and its arguments, and the head
@@ -1724,14 +1970,19 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
         "{labels:?}"
     );
 
-    // Every span the two tabs hand out is a real position in this source.
+    // Every span the two tabs hand out is a real position in this source — in
+    // the file it was written in, which for a snippet is the one the header
+    // sits at the top of.
+    let text = compiled(source);
     for id in ["ast", "ir"] {
         for node in nodes(stage(id)) {
-            if let Some([start, end]) = node.span {
+            if let Some(at) = node.span {
+                assert_eq!(at.file, 0, "{id}: {}", node.label);
                 assert!(
-                    source.get(start..end).is_some(),
-                    "{id}: {} at {start}..{end}",
-                    node.label
+                    text.get(at.range[0]..at.range[1]).is_some(),
+                    "{id}: {} at {:?}",
+                    node.label,
+                    at.range
                 );
             }
         }
@@ -1833,14 +2084,17 @@ fn a_wildcard_reaches_every_stage() {
         .map(|node| node.label.as_str())
         .collect();
     assert!(symbols.contains(&"%discard"), "{symbols:?}");
+    let text = compiled(source);
     for stage in &snapshot.stages {
         for node in nodes(stage) {
-            if let Some([start, end]) = node.span {
+            if let Some(at) = node.span {
+                assert_eq!(at.file, 0, "{}: {}", stage.id, node.label);
                 assert!(
-                    source.get(start..end).is_some(),
-                    "{}: {} at {start}..{end}",
+                    text.get(at.range[0]..at.range[1]).is_some(),
+                    "{}: {} at {:?}",
                     stage.id,
-                    node.label
+                    node.label,
+                    at.range
                 );
             }
         }
@@ -1866,8 +2120,8 @@ fn a_misplaced_wildcard_reaches_the_strip() {
         "{}",
         diagnostic.message
     );
-    let at = source.find('_').expect("the `_`");
-    assert_eq!(diagnostic.span, Some([at, at + 1]));
+    let wildcard = source.find('_').expect("the `_`");
+    assert_eq!(diagnostic.span, at([wildcard, wildcard + 1]));
 }
 
 /// A source using effects reaches every stage: the declarations get rows, the

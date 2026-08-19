@@ -60,6 +60,9 @@ export function createEditor(root, app) {
   }
 
   app.on("snapshot", rebuild);
+  // Another file of the same bundle: the snapshot still holds, and what it
+  // says about this file is what the layer has to show now.
+  app.on("file", rebuild);
   app.on("highlight", onHighlight);
 
   function sync() {
@@ -138,11 +141,16 @@ export function createEditor(root, app) {
   /// the compiler actually thinks; everything in between is extrapolation.
   function rebuild() {
     const ranges = [];
-    for (const node of app.stage("tokens")?.nodes ?? []) {
-      if (node.span) ranges.push(range(node.span, className(node)));
+    // The tokens stage groups its rows by file — one row per file, that file's
+    // tokens under it — so the stream this buffer holds is one level down, and
+    // the streams of the bundle's other files are not this buffer's to paint.
+    for (const file of app.stage("tokens")?.nodes ?? []) {
+      for (const node of file.children ?? []) {
+        if (app.here(node.span)) ranges.push(range(node.span, className(node)));
+      }
     }
     for (const diagnostic of app.state.snapshot?.diagnostics ?? []) {
-      if (diagnostic.span) ranges.push(range(diagnostic.span, "diag"));
+      if (app.here(diagnostic.span)) ranges.push(range(diagnostic.span, "diag"));
     }
     ranges.sort((a, b) => a.from - b.from);
     base = ranges;
@@ -228,18 +236,22 @@ export function createEditor(root, app) {
     for (const mark of [selection, hover]) {
       if (!mark) continue;
       const cls = mark === selection ? "sel" : "hov";
-      if (mark.span) ranges.push(range(mark.span, cls));
+      if (app.here(mark.span)) ranges.push(range(mark.span, cls));
       for (const related of mark.related ?? []) {
-        if (related.span) ranges.push(range(related.span, "rel"));
+        if (app.here(related.span)) ranges.push(range(related.span, "rel"));
       }
     }
 
+    // A symbol's occurrences are spread across the bundle; the ones in the file
+    // on screen are the ones there is anything to paint for.
     const symbol = selection?.symbol ?? hover?.symbol;
     if (symbol != null) {
       if (symbolSpans.key !== symbol) {
         symbolSpans = { key: symbol, spans: app.spansOfSymbol(symbol) };
       }
-      for (const span of symbolSpans.spans) ranges.push(range(span, "sym"));
+      for (const span of symbolSpans.spans) {
+        if (app.here(span)) ranges.push(range(span, "sym"));
+      }
     }
     return ranges.sort((a, b) => a.from - b.from);
   }
@@ -247,7 +259,7 @@ export function createEditor(root, app) {
   function markBadLines() {
     const bad = new Set();
     for (const diagnostic of app.state.snapshot?.diagnostics ?? []) {
-      if (diagnostic.span) bad.add(app.lineCol(diagnostic.span[0]).line);
+      if (app.here(diagnostic.span)) bad.add(app.lineCol(diagnostic.span.range[0]).line);
     }
     for (let line = 0; line < gutter.children.length; line++) {
       gutter.children[line].classList.toggle("bad", bad.has(line + 1));
@@ -269,8 +281,10 @@ export function createEditor(root, app) {
     app.emit("caret", app.charToByte(area.selectionStart));
   }
 
+  /// A span of the file on screen, in the buffer's own units. Which file it is
+  /// in is the caller's to have checked — see `app.here`.
   function range(span, cls) {
-    return { from: app.byteToChar(span[0]), to: app.byteToChar(span[1]), cls };
+    return { from: app.byteToChar(span.range[0]), to: app.byteToChar(span.range[1]), cls };
   }
 
   function lineOf(pos) {
@@ -285,9 +299,13 @@ export function createEditor(root, app) {
 
   /// Scroll `span` into view without touching focus or the caret — a panel
   /// click should show you the source, not take the cursor away from it.
+  ///
+  /// A span of a file that is not on screen is nothing to scroll to: the caller
+  /// switches files first, and one that could not is asking about a file this
+  /// bundle no longer has.
   function reveal(span) {
-    if (!span) return;
-    const line = app.lineCol(span[0]).line - 1;
+    if (!app.here(span)) return;
+    const line = app.lineCol(span.range[0]).line - 1;
     const height = lineHeight();
     const top = line * height;
     const view = area.clientHeight;
@@ -305,17 +323,36 @@ export function createEditor(root, app) {
   return {
     focus: () => area.focus(),
     value: () => area.value,
-    setValue(next) {
-      if (area.value === next) return;
-      area.value = next;
-      // A different document: nothing known about the old one applies.
-      text = next;
-      starts = lineStarts(next);
-      base = [];
-      dirty = true;
-      rebuildLines([]);
+    /// Put a file in the buffer, at `where` the reader last left it. The two
+    /// are one call because they are one event: a file arriving on screen
+    /// arrives somewhere, and restoring the caret after a repaint that reset it
+    /// is a frame of the wrong position.
+    setValue(next, where = null) {
+      if (area.value !== next) {
+        area.value = next;
+        // A different file: nothing known about the old one applies.
+        text = next;
+        starts = lineStarts(next);
+        base = [];
+        dirty = true;
+        rebuildLines([]);
+      }
+      if (where) {
+        const caret = Math.min(where.caret, next.length);
+        area.setSelectionRange(caret, caret);
+        area.scrollTop = where.top;
+        area.scrollLeft = where.left;
+        sync();
+      }
       moveHere();
     },
+    /// Where the reader is in the file on screen, for putting them back when
+    /// they return to it.
+    where: () => ({
+      caret: area.selectionStart,
+      top: area.scrollTop,
+      left: area.scrollLeft,
+    }),
     reveal,
   };
 }

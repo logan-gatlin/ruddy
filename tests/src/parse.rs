@@ -2,6 +2,7 @@
 
 use ruddy::{
     parse::{ErrorKind, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse},
+    symbol::Version,
     token::lex,
     tracking::FileID,
 };
@@ -1778,4 +1779,253 @@ fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
     assert_eq!(out.errors[0].span.start, source.len());
+}
+
+/// The header a bundle's root file opens with. Read wherever it is written —
+/// which file must have one is [`ruddy::bundle`]'s to say — and never mistaken
+/// for a statement, so the rest of the file parses exactly as it did before.
+#[test]
+fn the_bundle_header_is_read_before_any_statement() {
+    let source = "bundle demo 0.1.0\nlet x = 1\n";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let header = out.header.expect("the file opened with one");
+    assert_eq!(header.name.tracked, "demo");
+    assert_eq!(header.version.tracked, Version::new(0, 1, 0));
+    // The whole header: the keyword through the last version part.
+    assert_eq!(header.span.start, 0);
+    assert_eq!(header.span.end(), "bundle demo 0.1.0".len());
+    assert_eq!(out.stmts.len(), 1);
+}
+
+/// A file with no header simply has none. Requiring one in the root and
+/// refusing it everywhere else needs to know which file this is, and only the
+/// loader does.
+#[test]
+fn a_file_with_no_header_parses_without_one() {
+    let out = parse(lex("let x = 1", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(out.header.is_none());
+    assert_eq!(out.stmts.len(), 1);
+}
+
+/// A version has three parts. Two is the unexpected token it looks like,
+/// reported where the third would have gone, and the file after it is still
+/// read — the recovery every malformed statement gets.
+#[test]
+fn a_version_with_two_parts_is_unexpected() {
+    let source = "bundle demo 0.1\nlet x = 1";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert_eq!(
+        out.errors[0].span.start,
+        source.find("let").expect("the let")
+    );
+    assert!(out.header.is_none());
+    assert_eq!(out.stmts.len(), 1);
+}
+
+/// A header that runs out of input, and one whose name is not a name. Each is
+/// reported where the missing piece would have gone, and the parser recovers to
+/// the next statement rather than reading the rest of the file as a version.
+#[test]
+fn a_malformed_header_is_reported_and_recovers() {
+    for source in [
+        "bundle demo",
+        "bundle demo 0.",
+        // A version part that is not a literal at all.
+        "bundle demo x.1.0",
+        "bundle 0.1.0",
+        "bundle",
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{source:?} parsed");
+        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source:?}");
+        assert!(out.header.is_none(), "{source:?}");
+    }
+}
+
+/// A part that does not fit in the `u64` a version holds is refused where it
+/// was written. There is nothing else the digits could have been meant as.
+#[test]
+fn a_version_part_too_large_is_unexpected() {
+    let source = format!("bundle demo 0.{}.0", u128::from(u64::MAX) + 1);
+    let out = parse(lex(&source, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    assert_eq!(out.errors[0].span.start, "bundle demo 0.".len());
+}
+
+/// Both module forms, and the nesting that makes a bundle a tree. A body of
+/// `None` is the file module, which the loader fills in; an empty body is a
+/// module written inline with nothing in it, which is legal and is not the
+/// same thing.
+#[test]
+fn both_module_forms_parse() {
+    let out = parse(lex("module A", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let StmtKind::Module { name, body } = &out.stmts[0].tracked else {
+        panic!("expected a module: {:#?}", out.stmts);
+    };
+    assert_eq!(name.tracked, "A");
+    assert!(body.is_none());
+
+    let out = parse(lex("module A = end", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let StmtKind::Module {
+        body: Some(body), ..
+    } = &out.stmts[0].tracked
+    else {
+        panic!("expected an inline module: {:#?}", out.stmts);
+    };
+    assert!(body.is_empty());
+}
+
+/// A module's body is a statement list, in any order and any number, and a
+/// module is one of the things that may be in it.
+#[test]
+fn a_module_body_holds_every_kind_of_statement() {
+    let source = "module A = type T = Nat effect E = | let x = 1 module B = let y = 2 end end";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let StmtKind::Module {
+        body: Some(body), ..
+    } = &out.stmts[0].tracked
+    else {
+        panic!("expected an inline module: {:#?}", out.stmts);
+    };
+    assert_eq!(body.len(), 4);
+    assert!(matches!(body[0].tracked, StmtKind::Type { .. }));
+    assert!(matches!(body[1].tracked, StmtKind::Effect { .. }));
+    assert!(matches!(body[2].tracked, StmtKind::Let { .. }));
+    let StmtKind::Module {
+        body: Some(inner), ..
+    } = &body[3].tracked
+    else {
+        panic!("expected a nested module: {:#?}", body);
+    };
+    assert_eq!(inner.len(), 1);
+}
+
+/// Paths of one, two and three segments, in the two positions R6 allows, with
+/// a bare name still being a path with no segments at all.
+#[test]
+fn paths_parse_in_expression_and_type_positions() {
+    assert_eq!(parse_one("let a = x"), "let a = x");
+    assert_eq!(parse_one("let a = Math::double"), "let a = Math::double");
+    assert_eq!(
+        parse_one("let a = Math::Vec::zero"),
+        "let a = Math::Vec::zero"
+    );
+    assert_eq!(
+        parse_one("let a : Math::Pair = z"),
+        "let a : Math::Pair = z"
+    );
+    assert_eq!(
+        parse_one("let a : Math::Vec::Pair Nat Nat = z"),
+        "let a : Math::Vec::Pair Nat Nat = z"
+    );
+    assert_eq!(
+        parse_one("type T = Math::Pair Nat Nat"),
+        "type T = Math::Pair Nat Nat"
+    );
+}
+
+/// `::` binds tighter than application and than projection, which is what makes
+/// `Math::mk 1 2` an application of `Math::mk` rather than of `Math`.
+#[test]
+fn a_path_binds_tighter_than_application_and_projection() {
+    assert_eq!(parse_one("let made = M::mk 1 2"), "let made = M::mk 1 2");
+    assert_eq!(parse_one("let got = M::p.x"), "let got = M::p.x");
+    assert_eq!(parse_one("let got = M::p.x.y"), "let got = M::p.x.y");
+}
+
+/// The path qualifies the whole sigilled label, in every position R7 names: a
+/// row, an alias case, an operation expression and a handler arm's head.
+#[test]
+fn an_effect_path_qualifies_the_whole_label() {
+    assert_eq!(
+        parse_one("let f : () -> Nat + Sys::!Log = g"),
+        "let f : () -> Nat + Sys::!Log = g"
+    );
+    assert_eq!(
+        parse_one("let f : () -> Nat + Sys::!Log + !Local = g"),
+        "let f : () -> Nat + Sys::!Log + !Local = g"
+    );
+    assert_eq!(
+        parse_one("effect Console = Sys::!Log + !IO"),
+        "effect Console = Sys::!Log + !IO"
+    );
+    assert_eq!(
+        parse_one("let a = Sys::!Log.write 1"),
+        "let a = Sys::!Log.write 1"
+    );
+    assert_eq!(
+        parse_one("let a = handle e with | Sys::!Log.write s => s end"),
+        "let a = handle e with | Sys::!Log.write s => s end"
+    );
+    // The `\` of a label written absent takes the path too.
+    assert_eq!(
+        parse_one("let f : () -> Nat + \\Sys::!Log + ..'r = g"),
+        "let f : () -> Nat + \\Sys::!Log + ..'r = g"
+    );
+}
+
+/// A run of names leading somewhere other than a label is not a label: the row
+/// reader puts the cursor back and the type reader takes it as the application
+/// it is.
+#[test]
+fn a_path_that_is_not_an_effect_is_read_as_a_type() {
+    assert_eq!(
+        parse_one("let f : Math::Pair Nat Nat -> Nat = g"),
+        "let f : Math::Pair Nat Nat -> Nat = g"
+    );
+}
+
+/// R8: a path is not legal where a declaration binds a name or where a pattern
+/// takes one apart. Each is the unexpected `::` it looks like.
+#[test]
+fn a_path_is_refused_where_a_name_is_bound() {
+    for source in [
+        "let A::x = 1",
+        "module A::B = end",
+        "type A::T = Nat",
+        "effect A::E = |",
+        "let f = fn A::x => x",
+        "let a = match e with A::x => 1 end",
+    ] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(
+            !out.errors.is_empty(),
+            "{source:?} parsed: {:#?}",
+            out.stmts
+        );
+        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source:?}");
+    }
+    // At the `::` itself for the two the error table names.
+    for source in ["let A::x = 1", "module A::B = end"] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert_eq!(
+            out.errors[0].span.start,
+            source.find("::").expect("the separator"),
+            "{source:?}"
+        );
+    }
+}
+
+/// An inline module that runs out of input is reported where the `end` should
+/// have gone, and a malformed statement inside one recovers to the `end` rather
+/// than eating the rest of the file.
+#[test]
+fn a_module_body_recovers_at_its_end() {
+    let out = parse(lex("module A = let x = 1", FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+
+    let source = "module A = with end let after = 1";
+    let out = parse(lex(source, FileID::GENERATED).tokens);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 2, "{:#?}", out.stmts);
+    assert!(matches!(out.stmts[1].tracked, StmtKind::Let { .. }));
 }

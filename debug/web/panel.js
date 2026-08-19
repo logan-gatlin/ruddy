@@ -203,7 +203,12 @@ function createPane(root, app, index) {
       origin: `pane${index}`,
       stage: stage?.id,
       node: Number(row.dataset.node),
-      span: start === "" ? null : [Number(start), Number(row.dataset.end)],
+      // A span names the file it is in as well as the range: selecting this row
+      // is what takes the editor to that file.
+      span:
+        start === ""
+          ? null
+          : { file: Number(row.dataset.file), range: [Number(start), Number(row.dataset.end)] },
       symbol: row.dataset.symbol === "" ? null : Number(row.dataset.symbol),
       link: link === "" ? null : Number(link),
     };
@@ -339,7 +344,9 @@ function createPane(root, app, index) {
         return (
           `<div class="row step-row ${where}${starts}${one.error ? " bad" : ""}" data-at="${i}" ` +
           `data-node="${one.id}" data-kids="0" data-key="" ` +
-          `data-start="${one.span ? one.span[0] : ""}" data-end="${one.span ? one.span[1] : ""}" ` +
+          `data-file="${one.span ? one.span.file : ""}" ` +
+          `data-start="${one.span ? one.span.range[0] : ""}" ` +
+          `data-end="${one.span ? one.span.range[1] : ""}" ` +
           `data-symbol="${symbolOf(one) ?? ""}">` +
           // The rule name is a fixed column and does not indent: eleven names
           // read as a column only if they all start in the same place. What
@@ -517,16 +524,18 @@ function createPane(root, app, index) {
     const link = focus?.link ?? null;
 
     // A caret in the editor selects the deepest row covering it; a click in
-    // another panel selects the row that came from the same source text.
+    // another panel selects the row that came from the same source text. The
+    // file is part of "the same": two files of a bundle both have a byte 40.
     let deepest = null;
     if (focus && focus.origin !== `pane${index}` && focus.span) {
-      const [from, to] = focus.span;
+      const { file, range } = focus.span;
+      const [from, to] = range;
       for (const row of visible) {
         const span = row.node.span;
-        if (!span || span[0] > from || span[1] < to) continue;
-        if (!deepest || span[1] - span[0] <= deepest.node.span[1] - deepest.node.span[0]) {
-          deepest = row;
-        }
+        if (!span || span.file !== file || span.range[0] > from || span.range[1] < to) continue;
+        const width = span.range[1] - span.range[0];
+        const best = deepest && deepest.node.span.range[1] - deepest.node.span.range[0];
+        if (!deepest || width <= best) deepest = row;
       }
     }
 
@@ -729,8 +738,9 @@ function rowHtml(row, columns, app, badges, pattern) {
 
   return (
     `<div class="${classes.join(" ")}" data-key="${row.key}" data-node="${node.id}" ` +
-    `data-kids="${kids ? 1 : 0}" data-start="${node.span ? node.span[0] : ""}" ` +
-    `data-end="${node.span ? node.span[1] : ""}" data-symbol="${symbolOf(node) ?? ""}" ` +
+    `data-kids="${kids ? 1 : 0}" data-file="${node.span ? node.span.file : ""}" ` +
+    `data-start="${node.span ? node.span.range[0] : ""}" ` +
+    `data-end="${node.span ? node.span.range[1] : ""}" data-symbol="${symbolOf(node) ?? ""}" ` +
     `data-link="${node.link ?? ""}" ` +
     `style="padding-left:${8 + depth * INDENT}px">` +
     `<span class="twisty${kids ? "" : " leaf"}">${twisty}</span>` +

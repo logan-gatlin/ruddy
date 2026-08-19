@@ -818,3 +818,72 @@ fn printed_scheme(source: &str) -> String {
     let (symbol, _) = built.program.terms.last().expect("a definition");
     inferred.schemes[symbol].to_string()
 }
+
+/// Both module forms and a path, rendered back as the source they were parsed
+/// from — and re-parsed, since a printed tree that does not read back is a tree
+/// the AST tab is lying about.
+#[test]
+fn the_ast_printer_round_trips_modules_and_paths() {
+    for source in [
+        "module A",
+        "module A = end",
+        "module A = let x = 1 end",
+        "module A = module B = let x = 1 end let y = B::x end",
+        "let a = Math::double 2",
+        "let a = Math::Vec::zero",
+        "let a = Math::mk 1 2",
+        "let a = Math::p.x",
+        "let a : Math::Pair Nat Nat = z",
+        "let a = Sys::!Log.write 1",
+        "let a = handle e with | Sys::!Log.write s => s end",
+        "let f : () -> Nat + Sys::!Log = g",
+        "let f : () -> Nat + \\Sys::!Log + ..'r = g",
+        "effect Console = Sys::!Log + !IO",
+    ] {
+        assert_eq!(reprinted(source), source);
+    }
+}
+
+/// The header is not a statement, so it is not in the tree the printer walks —
+/// but the AST tab shows it, and what it shows is the line the reader wrote.
+#[test]
+fn the_header_reads_back_as_the_line_it_was_written_as() {
+    let mut files = FileManager::new();
+    let source = "bundle demo 0.1.0\nlet x = 1";
+    let file = files.register_new_file("main.hc".to_string(), source.to_string());
+    let parsed = parse::parse(token::lex(source, file).tokens);
+    let header = parsed.header.expect("the file opened with one");
+
+    assert_eq!(
+        format!("bundle {} {}", header.name.tracked, header.version.tracked),
+        "bundle demo 0.1.0"
+    );
+}
+
+/// Print one source through the AST printer and read the result back, so a
+/// printed tree that needs a bracket it did not write is caught here rather
+/// than by a reader pasting it into a file.
+fn reprinted(source: &str) -> String {
+    let printed = printed_ast(source);
+    assert_eq!(
+        printed_ast(&printed),
+        printed,
+        "printing {source:?} did not round-trip"
+    );
+    printed
+}
+
+fn printed_ast(source: &str) -> String {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".to_string(), source.to_string());
+    let lexed = token::lex(source, file);
+    assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{source}: {:#?}", parsed.errors);
+    parsed
+        .stmts
+        .iter()
+        .map(|stmt| print::ast::stmt(&stmt.tracked).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}

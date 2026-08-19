@@ -1,0 +1,240 @@
+================================================================================
+A bundle's root file opens with its name and version
+================================================================================
+
+bundle demo 0.1.0
+
+let id = fn x => x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (bundle_declaration
+    (identifier)
+    (bundle_version
+      (natural)
+      (natural)
+      (natural)))
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (identifier))))
+
+================================================================================
+A module written inline, and the empty one
+================================================================================
+
+module Math =
+  type Pair = { first: Nat }
+  let double = fn x => x
+end
+
+module Empty = end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (module_definition
+    (identifier)
+    (type_definition
+      (identifier)
+      (annotation
+        (struct_type
+          (struct_type_field
+            (identifier)
+            (identifier)))))
+    (let_definition
+      (identifier)
+      (function
+        (identifier)
+        (identifier))))
+  (module_definition
+    (identifier)))
+
+================================================================================
+A module whose body is another file
+================================================================================
+
+module Math
+
+let four = Math::double 2
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (module_definition
+    (identifier))
+  (let_definition
+    (identifier)
+    (application
+      (path
+        (identifier)
+        (identifier))
+      (natural))))
+
+================================================================================
+Modules nest, and a sibling is reached by naming the way in
+================================================================================
+
+module A =
+  module B =
+    let x = 1
+  end
+  let y = B::x
+end
+
+let z = A::B::x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (module_definition
+    (identifier)
+    (module_definition
+      (identifier)
+      (let_definition
+        (identifier)
+        (natural)))
+    (let_definition
+      (identifier)
+      (path
+        (identifier)
+        (identifier))))
+  (let_definition
+    (identifier)
+    (path
+      (identifier)
+      (identifier)
+      (identifier))))
+
+================================================================================
+A path is an atom, so application and projection close over it
+================================================================================
+
+let made = M::mk 1 2
+
+let got = M::p.x
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (application
+        (path
+          (identifier)
+          (identifier))
+        (natural))
+      (natural)))
+  (let_definition
+    (identifier)
+    (projection
+      (path
+        (identifier)
+        (identifier))
+      (identifier))))
+
+================================================================================
+A path in a type position, and at the head of an application
+================================================================================
+
+let p : Math::Pair Nat Nat = q
+
+let f : Math::Nat -> Vec::Nat = g
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (type_application
+        (path
+          (identifier)
+          (identifier))
+        (identifier)
+        (identifier)))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (path
+          (identifier)
+          (identifier))
+        (path
+          (identifier)
+          (identifier))))
+    (identifier)))
+
+================================================================================
+An effect under a path, in a row and as an alias
+================================================================================
+
+effect Console = Sys::!Log + !IO
+
+let greet : () -> Nat + Sys::!Log + \Sys::!IO = f
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    (identifier)
+    (effect_alias
+      (effect_path
+        (identifier)
+        (effect_label)))
+    (effect_alias
+      (effect_label)))
+  (let_definition
+    (identifier)
+    (annotation
+      (function_type
+        (unit)
+        (identifier)
+        (effect_row
+          (effect_case
+            (effect_path
+              (identifier)
+              (effect_label)))
+          (absent_effect
+            (effect_path
+              (identifier)
+              (effect_label))))))
+    (identifier)))
+
+================================================================================
+An operation under a path, performed and then handled
+================================================================================
+
+let quiet = handle Sys::!Log.write 1 with
+  | Sys::!Log.write s => ()
+  | return x => x
+end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (handle_expression
+      (application
+        (operation
+          (effect_path
+            (identifier)
+            (effect_label))
+          (identifier))
+        (natural))
+      (handler_arm
+        (operation
+          (effect_path
+            (identifier)
+            (effect_label))
+          (identifier))
+        (identifier)
+        (unit))
+      (handler_arm
+        (identifier)
+        (identifier)))))

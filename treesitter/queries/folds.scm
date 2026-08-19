@@ -9,4 +9,5 @@
   (struct_pattern)
   (struct_type)
   (effect_definition)
+  (module_definition)
 ] @fold

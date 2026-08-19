@@ -26,6 +26,10 @@
           {
             "type": "effect_label",
             "named": true
+          },
+          {
+            "type": "effect_path",
+            "named": true
           }
         ]
       }
@@ -86,6 +90,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "struct_type",
             "named": true
           },
@@ -135,6 +143,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -188,6 +200,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -205,6 +221,47 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "bundle_declaration",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "version": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "bundle_version",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "bundle_version",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "natural",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -371,6 +428,10 @@
         {
           "type": "effect_label",
           "named": true
+        },
+        {
+          "type": "effect_path",
+          "named": true
         }
       ]
     }
@@ -385,6 +446,10 @@
         "types": [
           {
             "type": "effect_label",
+            "named": true
+          },
+          {
+            "type": "effect_path",
             "named": true
           }
         ]
@@ -429,6 +494,32 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "effect_path",
+    "named": true,
+    "fields": {
+      "module": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "effect_label",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -522,6 +613,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -594,6 +689,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "struct_type",
             "named": true
           },
@@ -637,6 +736,10 @@
           },
           {
             "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -705,6 +808,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -800,6 +907,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -884,6 +995,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -999,6 +1114,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1105,6 +1224,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1170,6 +1293,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -1275,6 +1402,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1309,6 +1440,44 @@
     }
   },
   {
+    "type": "module_definition",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "effect_definition",
+          "named": true
+        },
+        {
+          "type": "let_definition",
+          "named": true
+        },
+        {
+          "type": "module_definition",
+          "named": true
+        },
+        {
+          "type": "type_definition",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "operation",
     "named": true,
     "fields": {
@@ -1318,6 +1487,10 @@
         "types": [
           {
             "type": "effect_label",
+            "named": true
+          },
+          {
+            "type": "effect_path",
             "named": true
           }
         ]
@@ -1370,6 +1543,10 @@
           },
           {
             "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -1476,6 +1653,10 @@
           "named": true
         },
         {
+          "type": "path",
+          "named": true
+        },
+        {
           "type": "projection",
           "named": true
         },
@@ -1566,6 +1747,10 @@
           "named": true
         },
         {
+          "type": "path",
+          "named": true
+        },
+        {
           "type": "struct_type",
           "named": true
         },
@@ -1604,6 +1789,32 @@
     }
   },
   {
+    "type": "path",
+    "named": true,
+    "fields": {
+      "module": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "projection",
     "named": true,
     "fields": {
@@ -1633,6 +1844,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -1710,6 +1925,10 @@
           "named": true
         },
         {
+          "type": "path",
+          "named": true
+        },
+        {
           "type": "projection",
           "named": true
         },
@@ -1763,11 +1982,19 @@
       "required": false,
       "types": [
         {
+          "type": "bundle_declaration",
+          "named": true
+        },
+        {
           "type": "effect_definition",
           "named": true
         },
         {
           "type": "let_definition",
+          "named": true
+        },
+        {
+          "type": "module_definition",
           "named": true
         },
         {
@@ -1844,6 +2071,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -2001,6 +2232,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "struct_type",
             "named": true
           },
@@ -2062,6 +2297,10 @@
           },
           {
             "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -2149,6 +2388,10 @@
           },
           {
             "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -2242,6 +2485,10 @@
             "named": true
           },
           {
+            "type": "path",
+            "named": true
+          },
+          {
             "type": "struct_type",
             "named": true
           },
@@ -2269,6 +2516,10 @@
           },
           {
             "type": "parenthesized_type",
+            "named": true
+          },
+          {
+            "type": "path",
             "named": true
           },
           {
@@ -2425,6 +2676,10 @@
     "named": false
   },
   {
+    "type": "::",
+    "named": false
+  },
+  {
     "type": ";",
     "named": false
   },
@@ -2446,6 +2701,10 @@
   },
   {
     "type": "and",
+    "named": false
+  },
+  {
+    "type": "bundle",
     "named": false
   },
   {
@@ -2482,6 +2741,10 @@
   },
   {
     "type": "match",
+    "named": false
+  },
+  {
+    "type": "module",
     "named": false
   },
   {

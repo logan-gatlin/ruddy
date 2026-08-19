@@ -66,6 +66,8 @@ module.exports = grammar({
       'effect',
       'handle',
       'raise',
+      'bundle',
+      'module',
     ],
   },
 
@@ -81,7 +83,26 @@ module.exports = grammar({
   ],
 
   rules: {
-    source_file: $ => repeat($._statement),
+    // A bundle's root file opens with its header; every other file in the
+    // bundle is statements and nothing else. Which file this is, is not the
+    // grammar's to know, so the header is optional here and required — or
+    // refused — by `bundle::load`.
+    source_file: $ => seq(optional($.bundle_declaration), repeat($._statement)),
+
+    /**
+     * `bundle demo 0.1.0` — the name and version the whole program is minted
+     * under, written before any statement and only once.
+     */
+    bundle_declaration: $ => seq(
+      'bundle',
+      field('name', $.identifier),
+      field('version', $.bundle_version),
+    ),
+
+    // `0.1.0`. Three naturals and two dots rather than a literal of its own,
+    // exactly as `token::lex` hands them over: a version needs no lexer rule,
+    // and prerelease versions are simply unwritable this way.
+    bundle_version: $ => seq($.natural, '.', $.natural, '.', $.natural),
 
     // ── Statements ────────────────────────────────────────────────────────
 
@@ -89,6 +110,23 @@ module.exports = grammar({
       $.let_definition,
       $.type_definition,
       $.effect_definition,
+      $.module_definition,
+    ),
+
+    /**
+     * `module A = <stmts> end`, or `module A` for a module whose body is
+     * another file.
+     *
+     * One rule for the two forms, told apart by whether a body was written:
+     * the bare form names a file to read, and the body it stands for is
+     * spliced in long before anything downstream can tell the difference. The
+     * body may be empty — `module A = end` declares a module with nothing in
+     * it and is legal.
+     */
+    module_definition: $ => seq(
+      'module',
+      field('name', $.identifier),
+      optional(seq('=', repeat($._statement), 'end')),
     ),
 
     /** `let <pattern> [: <annotation>] = <expr>` */
@@ -140,8 +178,37 @@ module.exports = grammar({
       field('signature', $._type),
     ),
 
-    /** `!Log` — an effect this declaration stands for. */
-    effect_alias: $ => $.effect_label,
+    /** `!Log`, or `Sys::!Log` — an effect this declaration stands for. */
+    effect_alias: $ => choice($.effect_label, $.effect_path),
+
+    // ── Paths ─────────────────────────────────────────────────────────────
+
+    // The `Math::` segments in front of a name, outermost first. One rule for
+    // both kinds of path, so that reading a prefix commits to neither:
+    // `Sys::Inner::!Log` and `Sys::Inner::zero` are the same up to the sigil,
+    // and a parser that guessed at the first `::` would have to take the guess
+    // back at the last one.
+    _module_prefix: $ => repeat1(seq(field('module', $.identifier), '::')),
+
+    /**
+     * `Math::double`, `Math::Vec::zero` — a name and the modules it is reached
+     * through.
+     *
+     * Only the qualified form is a node: a bare name is an [`identifier`] and
+     * stays one, so every position that takes a path writes the choice out.
+     * `::` binds tighter than application and than projection, which needs no
+     * precedence to say — a path is an atom, so `Math::mk 1 2` applies
+     * `Math::mk` and `Math::p.x` projects `x` out of `Math::p`.
+     */
+    path: $ => seq($._module_prefix, field('name', $.identifier)),
+
+    /**
+     * `Sys::!Log` — the same, for the sigilled label of an effect.
+     *
+     * The segments come before the `!`: the path qualifies the whole label,
+     * not the name inside it.
+     */
+    effect_path: $ => seq($._module_prefix, field('name', $.effect_label)),
 
     // ── Expressions ───────────────────────────────────────────────────────
 
@@ -199,6 +266,7 @@ module.exports = grammar({
 
     _atom: $ => choice(
       $.identifier,
+      $.path,
       $.natural,
       $.unit,
       $.struct_expression,
@@ -296,9 +364,12 @@ module.exports = grammar({
       optional(field('payload', $._argument)),
     )),
 
-    /** `!Log.write` — one operation of an effect, as an ordinary value. */
+    /**
+     * `!Log.write`, or `Sys::!Log.write` — one operation of an effect, as an
+     * ordinary value.
+     */
     operation: $ => seq(
-      field('effect', $.effect_label),
+      field('effect', choice($.effect_label, $.effect_path)),
       '.',
       field('name', $.identifier),
     ),
@@ -425,12 +496,15 @@ module.exports = grammar({
 
     /** `!Log`, or `!Log (when 'a)` — an effect the arrow may perform. */
     effect_case: $ => seq(
-      field('name', $.effect_label),
+      field('name', choice($.effect_label, $.effect_path)),
       optional(field('when', $.parenthesized_when)),
     ),
 
     /** `\!Log` — the effect is definitely not performed. */
-    absent_effect: $ => seq('\\', field('name', $.effect_label)),
+    absent_effect: $ => seq(
+      '\\',
+      field('name', choice($.effect_label, $.effect_path)),
+    ),
 
     /** `Pair Nat Nat` — a type applied to arguments, gathered flat. */
     _type_application: $ => choice($.type_application, $._type_atom),
@@ -442,6 +516,7 @@ module.exports = grammar({
 
     _type_atom: $ => choice(
       $.identifier,
+      $.path,
       $.type_variable,
       $.hole,
       $.unit,

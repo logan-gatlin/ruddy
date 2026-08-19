@@ -27,12 +27,23 @@ pub enum Kind {
     /// head: a `raise` may sit anywhere an expression may, so there is no one
     /// position that could read it and leave the word a name everywhere else.
     Raise,
+    /// `bundle`, opening the header the root file of a bundle begins with.
+    Bundle,
+    /// `module`, opening a module declaration — inline with an `=` and a body,
+    /// or bare for a module whose body is another file.
+    Module,
     Equal,
     FatArrow,
     /// `->`, the function type arrow. Distinct from [`FatArrow`](Kind::FatArrow),
     /// which introduces a lambda body.
     Arrow,
     Colon,
+    /// `::`, separating the module segments of a path from each other and from
+    /// the name at the end of it. One token rather than two
+    /// [`Colon`](Kind::Colon)s, the way [`DotDot`](Kind::DotDot) is one: the
+    /// longer lexeme wins, so a `:` followed by a `:` is this and never an
+    /// ascription beside another.
+    ColonColon,
     Comma,
     /// `;`, separating the statements of a `where` clause. Nothing else in the
     /// language writes one — a definition ends where the next `let` or `type`
@@ -173,9 +184,17 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     });
                 }
             }
+            // `::` separates a path's segments; a lone `:` ascribes. The longer
+            // lexeme wins, so `A::x` is a path rather than an ascription of an
+            // ascription — the rule `..` and `=>` already keep.
             ':' => {
-                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Colon));
                 chars.next();
+                if let Some(&(_, ':')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::ColonColon));
+                } else {
+                    tokens.push(file_id.span(start, 1).track(Kind::Colon));
+                }
             }
             ',' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Comma));
@@ -290,6 +309,8 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "effect" => Kind::Effect,
                     "handle" => Kind::Handle,
                     "raise" => Kind::Raise,
+                    "bundle" => Kind::Bundle,
+                    "module" => Kind::Module,
                     // `return` is deliberately absent: it heads a handler arm
                     // and is an ordinary name everywhere else, so the parser
                     // recognizes it by spelling at the one position that reads

@@ -21,9 +21,12 @@
 //! not the node, that implements [`Grouped`]; [`lir`] writes plain functions
 //! instead, having no grouping rules to share.
 
-pub use ruddy::ui::{
-    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_effects, write_let,
-    write_match, write_project, write_row, write_struct, write_sum, write_tag,
+pub use ruddy::{
+    types::Shape,
+    ui::{
+        Entry, Grouped, Mark, Prec, label, write_applied, write_apply, write_arrow, write_effects,
+        write_let, write_match, write_project, write_row, write_struct, write_sum, write_tag,
+    },
 };
 
 pub mod ast;

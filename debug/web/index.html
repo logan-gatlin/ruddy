@@ -19,11 +19,12 @@
         <span class="caret">▾</span>
       </button>
 
-      <label class="chip bundle" title="Bundle identity — an input to symbol mangling">
-        <input id="bundle-name" size="6" spellcheck="false" />
-        <span class="at">@</span>
-        <input id="bundle-version" size="5" spellcheck="false" />
-      </label>
+      <span
+        id="bundle"
+        class="chip bundle"
+        title="The identity the root file's `bundle` header declared — write it there"
+        >…</span
+      >
 
       <span id="timings" class="timings"></span>
 
@@ -35,7 +36,10 @@
     </header>
 
     <main id="workbench">
-      <section id="editor-pane"></section>
+      <section id="editor-pane">
+        <div id="files" class="files"></div>
+        <div id="editor-host"></div>
+      </section>
       <div id="drag" title="Drag to resize"></div>
       <section id="panes"></section>
     </main>

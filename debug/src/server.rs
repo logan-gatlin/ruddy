@@ -232,11 +232,16 @@ fn document(
                 Ok(body) => body,
                 Err(err) => return fail(413, &err),
             };
-            let source = match serde_json::from_str::<DocBody>(&body) {
-                Ok(body) => body.source,
+            let files = match serde_json::from_str::<DocBody>(&body) {
+                Ok(body) => body.files,
                 Err(err) => return fail(400, &format!("bad request: {err}")),
             };
-            match docs::write(&state.cfg.scratch, name, &source) {
+            // Every path is checked before anything is written, so a request
+            // with one bad path leaves the document exactly as it was.
+            if !files.iter().all(|file| docs::valid_file_path(&file.path)) {
+                return fail(400, "invalid file path");
+            }
+            match docs::write(&state.cfg.scratch, name, &files) {
                 Ok(modified_ms) => json(&serde_json::json!({ "modified_ms": modified_ms })),
                 Err(err) => fail(500, &err.to_string()),
             }

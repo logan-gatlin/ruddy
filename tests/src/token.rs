@@ -415,3 +415,56 @@ fn the_effect_keywords_are_reserved() {
 fn return_is_an_ordinary_identifier() {
     assert!(matches!(&kinds("return")[..], [Kind::Identifier(name)] if name == "return"));
 }
+
+/// `::` is one token, the way `..` and `=>` are: the longer lexeme wins, so a
+/// path's separator can never be read as an ascription of an ascription.
+#[test]
+fn a_double_colon_is_one_token() {
+    assert!(matches!(kinds("::")[..], [Kind::ColonColon]));
+    assert!(matches!(
+        &kinds("Math::double")[..],
+        [Kind::Identifier(a), Kind::ColonColon, Kind::Identifier(b)]
+            if a == "Math" && b == "double"
+    ));
+    // Spanned as the two characters it is, so a complaint about a path's
+    // separator underlines the whole of it.
+    let out = lex("a::b", FileID::GENERATED);
+    assert_eq!(out.tokens[1].span.start, 1);
+    assert_eq!(out.tokens[1].span.width, 2);
+    assert_eq!(out.tokens[1].tracked.to_string(), "::");
+}
+
+/// Two colons with a space between them are two ascriptions. The rule is about
+/// the lexeme rather than about the characters, so nothing here reads across
+/// whitespace.
+#[test]
+fn colons_written_apart_stay_two_colons() {
+    assert!(matches!(kinds(": :")[..], [Kind::Colon, Kind::Colon]));
+    assert!(matches!(kinds(":")[..], [Kind::Colon]));
+}
+
+/// The two words the module grammar reserves, and the rule that keeps `modules`
+/// and `bundles` ordinary names — the one `matches` already relies on.
+#[test]
+fn the_module_keywords_are_reserved() {
+    assert!(matches!(kinds("bundle")[..], [Kind::Bundle]));
+    assert!(matches!(kinds("module")[..], [Kind::Module]));
+    assert!(matches!(&kinds("bundles")[..], [Kind::Identifier(name)] if name == "bundles"));
+    assert!(matches!(&kinds("modules")[..], [Kind::Identifier(name)] if name == "modules"));
+}
+
+/// A header needs no literal of its own: `0.1.0` is already three naturals with
+/// dots between them, which is why a prerelease is simply unwritable.
+#[test]
+fn a_version_lexes_as_naturals_and_dots() {
+    assert!(matches!(
+        kinds("0.1.0")[..],
+        [
+            Kind::Natural(0),
+            Kind::Dot,
+            Kind::Natural(1),
+            Kind::Dot,
+            Kind::Natural(0)
+        ]
+    ));
+}

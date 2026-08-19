@@ -492,3 +492,51 @@ fn a_fingerprint_collision_is_told_apart_from_a_repeat() {
     bundles.register(app.clone()).unwrap();
     assert_eq!(bundles.register(again), Err(Clash::Duplicate));
 }
+
+/// A symbol two modules deep mangles with an `M` component apiece and demangles
+/// back to the components it was made from. Modules were in the mangling scheme
+/// from the start; this is the first thing that puts one there, so it is worth
+/// pinning that the round trip survives them.
+#[test]
+fn a_symbol_two_modules_deep_round_trips() {
+    let mut m = mint();
+    let a = m.module(None, "A").expect("fresh");
+    let b = m.module(Some(a), "B").expect("fresh");
+    let x = m.global(Some(b), Namespace::Terms, "x").expect("fresh");
+
+    let mangled = m.mangle(x);
+    assert_eq!(mangled, format!("{APP_PREFIX}M1AM1BV1x"));
+
+    let demangled = demangle(&mangled).expect("round trips");
+    assert_eq!(demangled.bundle, *m.bundle());
+    let components: Vec<_> = demangled
+        .path
+        .iter()
+        .map(|component| (component.namespace, component.name.as_str()))
+        .collect();
+    assert_eq!(
+        components,
+        [
+            (Namespace::Modules, "A"),
+            (Namespace::Modules, "B"),
+            (Namespace::Terms, "x"),
+        ]
+    );
+}
+
+/// And its path reads as the source spells it: the bundle, then every enclosing
+/// module, then the name. This is what a diagnostic shows, so it is checked
+/// beside the mangling rather than left to the debugger to notice.
+#[test]
+fn a_path_names_every_enclosing_module() {
+    let mut m = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
+    let a = m.module(None, "A").expect("fresh");
+    let b = m.module(Some(a), "B").expect("fresh");
+    let x = m.global(Some(b), Namespace::Terms, "x").expect("fresh");
+
+    assert_eq!(m.path(x).to_string(), "demo::A::B::x");
+    // A local inside one is shown a segment further in, under the marker, the
+    // way a local at the top level is.
+    let local = m.local(Some(b), Namespace::Terms, "y");
+    assert_eq!(m.path(local).to_string(), "demo::A::B::_::y");
+}
