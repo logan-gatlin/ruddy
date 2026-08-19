@@ -1879,7 +1879,7 @@ impl Lower<'_> {
         applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
-        let name = self.mint.name(effect.tracked).to_string();
+        let name = self.program.effect_ids[&effect.tracked].row_key();
         let record = self.evidence_of(&name);
         let held = self.emit(
             body,
@@ -1991,7 +1991,7 @@ impl Lower<'_> {
         let held_tag = self.top().raise_tag.replace(tag);
         let mut records: Vec<(String, Temp)> = Vec::new();
         for effect in &handler.discharges {
-            let name = self.mint.name(effect.tracked).to_string();
+            let name = self.program.effect_ids[&effect.tracked].row_key();
             let mut entries: IndexMap<String, Temp> = IndexMap::new();
             let arms: Vec<&HandlerArm> = handler
                 .arms

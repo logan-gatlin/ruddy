@@ -47,6 +47,9 @@ pub struct Constrain<'a> {
     /// before the first definition is walked and mentioning no variable, so
     /// reading it is not reading the table.
     pub operations: &'a Operations,
+    /// Structural row identity for each source-resolved effect declaration.
+    /// Symbols remain the operation-table keys; rows use this map instead.
+    pub effect_ids: &'a IndexMap<Symbol, crate::types::EffectId>,
     /// The effects the place being walked allows, and whether a `fn` encloses
     /// it.
     ///
@@ -422,7 +425,7 @@ impl Constrain<'_> {
                 let (from, to) = &self.operations[&(effect.tracked, op.tracked.clone())];
                 let does = Row {
                     labels: [(
-                        self.mint.name(effect.tracked).to_string(),
+                        self.effect_ids[&effect.tracked].row_key(),
                         RowField::present(Rc::new(Ty::unit())),
                     )]
                     .into_iter()
@@ -613,7 +616,7 @@ impl Constrain<'_> {
             .iter()
             .map(|effect| {
                 (
-                    self.mint.name(effect.tracked).to_string(),
+                    self.effect_ids[&effect.tracked].row_key(),
                     RowField::present(Rc::new(Ty::unit())),
                 )
             })

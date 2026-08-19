@@ -1076,6 +1076,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 out: Vec::new(),
                 annotated: Vec::new(),
                 operations: &operations,
+                effect_ids: &program.effect_ids,
                 // A definition's value is computed where no handler can reach
                 // it, so it is walked at the empty closed row and outside every
                 // function — which is what makes performing an effect at the
@@ -3620,7 +3621,7 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
                 ty: Rc::new(Ty::default()),
             },
         };
-        labels.insert(name.clone(), lowered);
+        labels.insert(name.row_key(), lowered);
     }
     row(table, tails, labels, &effects.tail)
 }

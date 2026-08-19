@@ -24,6 +24,50 @@ pub enum Prim {
 
 pub type TyVar = u32;
 
+/// The semantic identity of an effect label.
+///
+/// Effect names resolve nominally, but effect rows do not: two declarations
+/// with the same leaf name and the same normalized operation interface are one
+/// label. The interface is deliberately opaque here; lowering builds it from
+/// the operation signatures after declared types have been normalized.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EffectId {
+    /// An effect row while the IR builder is still collecting declarations.
+    /// No semantic phase may receive one of these.
+    Pending(Symbol),
+    Structural {
+        name: String,
+        interface: String,
+    },
+}
+
+impl EffectId {
+    pub fn pending(symbol: Symbol) -> Self {
+        Self::Pending(symbol)
+    }
+
+    pub fn structural(name: String, interface: String) -> Self {
+        Self::Structural { name, interface }
+    }
+
+    /// The stable semantic row key. The separator cannot occur in an
+    /// identifier, and keeps incompatible same-named effects distinct without
+    /// leaking their interface into printed types.
+    pub fn row_key(&self) -> String {
+        match self {
+            Self::Structural { name, interface } => format!("{name}\u{1f}{interface}"),
+            Self::Pending(_) => panic!("effect row reached inference before structuralization"),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Structural { name, .. } => name,
+            Self::Pending(_) => "<unresolved effect>",
+        }
+    }
+}
+
 /// Which of the two sets of labels a rule is being read about.
 ///
 /// A set of labels, each either there or not, plus something saying what is

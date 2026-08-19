@@ -211,7 +211,7 @@ pub enum Entry<K, V> {
 /// still has to be able to say about a presence a failure abandoned. Everything
 /// else a presence can be has a name, and prints as the `when` clause that
 /// names it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Mark {
     /// `?` — the undecided-presence failure artifact. Nothing parses it, so a
     /// type wearing one does not read back, and that is exactly what it is
@@ -994,13 +994,18 @@ pub fn label(shape: Shape, name: &str) -> String {
     match shape {
         Shape::Struct => name.to_string(),
         Shape::Sum => format!("#{name}"),
-        // Effect labels are keyed internally by their full module path, so
-        // distinguish same-named effects while still putting the sigil at the
-        // path's final label: `A::!Log`, not `!A::Log`.
-        Shape::Effect => match name.rsplit_once("::") {
-            Some((modules, effect)) => format!("{modules}::!{effect}"),
-            None => format!("!{name}"),
-        },
+        // Structural effect keys carry an opaque interface after this
+        // separator. Source paths never participate in row identity, and the
+        // interface is deliberately not user-facing: coalesced effects render
+        // as the one bare name they share. Keep the old path spelling for the
+        // diagnostic helper's explicitly path-shaped input.
+        Shape::Effect => {
+            let name = name.split('\u{1f}').next().unwrap_or(name);
+            match name.rsplit_once("::") {
+                Some((modules, effect)) => format!("{modules}::!{effect}"),
+                None => format!("!{name}"),
+            }
+        }
     }
 }
 
@@ -1311,11 +1316,24 @@ fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row, shape: Shape) -> fmt::Resu
     // See R18.
     match shape {
         Shape::Effect => {
-            let effects: Vec<Entry<&str, ()>> = marked
+            let effects: Vec<Entry<String, ()>> = marked
                 .map(|(name, mark, _)| Entry::Written {
-                    name: name.as_str(),
+                    name: name.split('\u{1f}').next().unwrap_or(name).to_string(),
                     mark,
                     holds: (),
+                })
+                .collect();
+            let effects: Vec<Entry<&str, ()>> = effects
+                .iter()
+                .map(|entry| match entry {
+                    Entry::Written { name, mark, .. } => Entry::Written {
+                        name: name.as_str(),
+                        mark: mark.clone(),
+                        holds: (),
+                    },
+                    Entry::Absent { name } => Entry::Absent {
+                        name: name.as_str(),
+                    },
                 })
                 .collect();
             write_effects(f, &effects, tail)
@@ -1565,7 +1583,7 @@ impl Named<'_> {
         self.labels
             .iter()
             .find(|(_, decides)| *decides == presence)
-            .map(|(label, _)| label.clone())
+            .map(|(label, _)| label.split('\u{1f}').next().unwrap_or(label).to_string())
             .unwrap_or_else(|| atom.to_string())
     }
 }
@@ -2330,7 +2348,7 @@ pub fn write_tag<V: Grouped>(
     mark: Option<&Mark>,
     payload: Option<V>,
 ) -> fmt::Result {
-    write!(f, "#{name}")?;
+    write!(f, "#{}", name.split('\u{1f}').next().unwrap_or(name))?;
     // A case has no colon to end a bare clause, so its `when` takes
     // parentheses — one token of lookahead would otherwise not tell
     // `#A (when a)` from `#A when` carrying a type called `when`.

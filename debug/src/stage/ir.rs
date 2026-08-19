@@ -439,11 +439,18 @@ fn effects_node(
         .map(|(name, label)| {
             let text = match label {
                 EffectLabel::Written { when, .. } => {
-                    format!("{}{}", print::label(Shape::Effect, name), when_text(when))
+                    format!(
+                        "{}{}",
+                        print::label(Shape::Effect, name.name()),
+                        when_text(when)
+                    )
                 }
-                EffectLabel::Absent { .. } => format!("\\{}", print::label(Shape::Effect, name)),
+                EffectLabel::Absent { .. } => {
+                    format!("\\{}", print::label(Shape::Effect, name.name()))
+                }
             };
-            let row = Node::new(ids.next(), text, String::new()).at(named(label.name_span(), name));
+            let row = Node::new(ids.next(), text, String::new())
+                .at(named(label.name_span(), name.name()));
             // A label an alias put here is *about* the effect without being an
             // occurrence of its name — the name on the page is the alias's —
             // so it takes the association without the span claim.

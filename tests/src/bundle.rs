@@ -12,8 +12,10 @@ use std::{collections::HashMap, path::PathBuf};
 
 use ruddy::{
     bundle::{self, Disk, ErrorKind, Files, Output},
+    inference,
+    ir::{self, TypeKind},
     parse::StmtKind,
-    symbol::Version,
+    symbol::{Mint, Version},
     tracking::{FileID, FileManager},
 };
 
@@ -144,6 +146,42 @@ fn a_nested_bundle_splices_every_file_into_one_tree() {
     assert_eq!(out.stmts[0].span.file_id, ids[0]);
     assert_eq!(math[0].span.file_id, ids[1]);
     assert_eq!(body(math, "Vec")[0].span.file_id, ids[2]);
+}
+
+/// File-backed modules are ordinary modules to the compiler too: equivalent
+/// effects declared in two files coalesce, and an operation from either one
+/// satisfies the other's row annotation.
+#[test]
+fn file_modules_share_structural_effects() {
+    let out = load(&[
+        (
+            "main.hc",
+            "bundle demo 0.1.0\nmodule Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n",
+        ),
+        ("Foo.hc", "effect Log = write : Nat -> ()\n"),
+        ("Bar.hc", "effect Log = write : Nat -> ()\n"),
+    ])
+    .1;
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut mint = Mint::new(out.bundle.clone().expect("bundle identity"));
+    let mut lowered = ir::build(&mut mint, out.stmts);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let inferred = inference::infer(&mint, &mut lowered.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let cross = lowered
+        .program
+        .terms
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "cross")
+        .map(|(_, decl)| decl)
+        .expect("cross declaration");
+    let TypeKind::Arrow { effects, .. } =
+        &cross.annotation.as_ref().expect("annotation").ty.tracked
+    else {
+        panic!("cross has an arrow annotation");
+    };
+    assert_eq!(effects.effects.len(), 1);
+    assert_eq!(effects.effects.keys().next().expect("effect").name(), "Log");
 }
 
 /// The second spelling. `A/module.hc` and `A.hc` are the same module written

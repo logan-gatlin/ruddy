@@ -5483,6 +5483,24 @@ fn a_handler_discharges_what_its_arms_cover() {
     );
 }
 
+/// Equal operation interfaces, rather than declaration paths, identify effects.
+/// Either declaration may perform it and either one may name the handler that
+/// discharges it.
+#[test]
+fn same_interface_effects_are_interchangeable_across_modules() {
+    let src = "module Foo =\n  effect Log = write : Nat -> ()\nend\n\
+               module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+               let foo : Nat -> {} + Foo::!Log = fn n => let _ = Foo::!Log.write n in {}\n\
+               let bar : Nat -> {} + Bar::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
+               let cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
+               let quiet = fn n => handle Foo::!Log.write n with | Bar::!Log.write _ => {} end";
+    let (mint, _ir, output) = inferred(src);
+    assert_eq!(scheme(&mint, &output, "foo"), "Nat -> {} + !Log");
+    assert_eq!(scheme(&mint, &output, "bar"), "Nat -> {} + !Log");
+    assert_eq!(scheme(&mint, &output, "cross"), "Nat -> {} + !Log");
+    assert_eq!(scheme(&mint, &output, "quiet"), "Nat -> {}");
+}
+
 /// An arm's value *is* the operation's result, so an arm resumes with it — and
 /// `raise` aborts to the handler instead. Both halves of an arm's type come off
 /// the declaration and `Ans` appears in neither, which is why the two read the
@@ -5776,7 +5794,11 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
     let Core::Arrow(_, _, effects) = &body.core else {
         panic!("expected an arrow, got {body:?}");
     };
-    let label = &effects.labels["IO"];
+    let label = effects
+        .labels
+        .iter()
+        .find_map(|(name, label)| (name.split('\u{1f}').next() == Some("IO")).then_some(label))
+        .expect("an IO effect label");
     assert!(matches!(label.presence, Presence::Absent), "{label:?}");
 
     // And the condition it records is what refuses the tail standing for it.

@@ -10,7 +10,7 @@ use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{ParamKind, Prim, Sense, Shape, Ty},
+    types::{EffectId, ParamKind, Prim, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,10 @@ pub struct Program {
     /// The effects declared, in the order they were written, each with the
     /// operations it declares or the effects it stands for.
     pub effects: IndexMap<Symbol, Decl<Effect>>,
+    /// The structural identity of each operation-declaring effect. Source
+    /// symbols remain on labels for resolution and navigation; this map is
+    /// what gives rows their module-independent semantic identity.
+    pub effect_ids: IndexMap<Symbol, EffectId>,
     /// The definitions split into the smallest sets that have to be typed
     /// together, earliest first. See [`Group`] and [`grouping`].
     pub groups: Vec<Group>,
@@ -560,7 +564,7 @@ pub enum SumCase {
 pub struct EffectRow {
     pub span: Span,
     pub written: bool,
-    pub effects: IndexMap<String, EffectLabel>,
+    pub effects: IndexMap<EffectId, EffectLabel>,
     pub tail: Option<Tail>,
 }
 
@@ -1698,6 +1702,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         terms: IndexMap::new(),
         types: IndexMap::new(),
         effects: IndexMap::new(),
+        effect_ids: IndexMap::new(),
         groups: Vec::new(),
     };
     // The whole tree flattened before anything is declared: every module is
@@ -1842,6 +1847,10 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         decl.value = span.track(TypeKind::Error);
         b.error(at, ErrorKind::GrowingRecursion);
     }
+    // Type declarations are complete, so their effect rows can now be keyed
+    // by normalized operation interfaces before parameter-kind analysis reads
+    // their lacks sets. Terms are re-keyed after they are lowered below.
+    structuralize_effects(&mut program, b.mint, &mut b.errors);
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
     // there, so no one body decides its own.
@@ -2022,6 +2031,14 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             },
         );
     }
+    // Terms were lowered after the type declarations above; give their rows
+    // the identities already computed before inference sees them.
+    for decl in program.terms.values_mut() {
+        if let Some(annotation) = &mut decl.annotation {
+            rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
+        }
+        rekey_term(&mut decl.value, &program.effect_ids, &mut b.errors);
+    }
     // Which definitions have to be typed together, read off the values as they
     // finally stand — so a refused loop is a group of one naming nobody rather
     // than the group its erased value used to describe.
@@ -2058,9 +2075,461 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     }
 }
 
-/// The identity of an effect as a row label. Unlike a struct field or sum
-/// case, an effect lives in a module namespace, so its leaf spelling alone is
-/// not enough: `A::!Log` and `B::!Log` are distinct labels.
+/// Assign structural identities to effects and replace the provisional source
+/// symbols in every lowered effect row. Symbols remain on each label for
+/// operation lookup and editor navigation; the key is only row semantics.
+fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Error>) {
+    let ids: IndexMap<Symbol, EffectId> = program
+        .effects
+        .iter()
+        .filter_map(|(symbol, decl)| match &decl.value {
+            Effect::Operations(operations) => {
+                let mut interface: Vec<_> = operations
+                    .iter()
+                    .map(|(name, op)| {
+                        let mut types_seen = HashSet::new();
+                        let mut effects_seen = HashSet::new();
+                        format!(
+                            "{name}:{}->{}",
+                            canonical_type(
+                                &op.from,
+                                &program.types,
+                                &program.effects,
+                                mint,
+                                &[],
+                                &mut types_seen,
+                                &mut effects_seen,
+                            ),
+                            canonical_type(
+                                &op.to,
+                                &program.types,
+                                &program.effects,
+                                mint,
+                                &[],
+                                &mut types_seen,
+                                &mut effects_seen,
+                            )
+                        )
+                    })
+                    .collect();
+                interface.sort();
+                Some((
+                    *symbol,
+                    EffectId::structural(mint.name(*symbol).to_string(), interface.join("|")),
+                ))
+            }
+            Effect::Alias(_) => None,
+        })
+        .collect();
+    program.effect_ids = ids.clone();
+    for decl in program.effects.values_mut() {
+        match &mut decl.value {
+            Effect::Operations(operations) => {
+                for operation in operations.values_mut() {
+                    rekey_type(&mut operation.from, &ids, errors);
+                    rekey_type(&mut operation.to, &ids, errors);
+                }
+            }
+            Effect::Alias(named) => {
+                let mut seen = HashSet::new();
+                for item in named.values() {
+                    if let Some(id) = ids.get(&item.symbol)
+                        && !seen.insert(id.clone())
+                    {
+                        errors.push(Error {
+                            span: item.name_span,
+                            kind: ErrorKind::DuplicateCase,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for decl in program.types.values_mut() {
+        rekey_type(&mut decl.value, &ids, errors);
+    }
+    for decl in program.terms.values_mut() {
+        if let Some(annotation) = &mut decl.annotation {
+            rekey_type(&mut annotation.ty, &ids, errors);
+        }
+        rekey_term(&mut decl.value, &ids, errors);
+    }
+}
+
+/// An operation signature's structural spelling. The operation rule currently
+/// rejects effect rows and open tails, but this walk deliberately preserves
+/// them: recovery still gives an erroneous signature a semantic identity, and
+/// a future relaxation of that rule must not silently make effectful arrows
+/// compare as pure ones. Recursive types and effects are represented by their
+/// module-less name at the back edge, so equivalent dependency cycles do not
+/// acquire a module path by accident.
+fn canonical_type(
+    ty: &Type,
+    types: &IndexMap<Symbol, Decl<Type>>,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+    mint: &Mint,
+    args: &[Type],
+    types_seen: &mut HashSet<Symbol>,
+    effects_seen: &mut HashSet<Symbol>,
+) -> String {
+    match &ty.tracked {
+        TypeKind::Struct { fields, .. } => {
+            let mut fields: Vec<_> = fields
+                .iter()
+                .map(|(name, field)| match field {
+                    TypeField::Written { value, .. } => {
+                        format!(
+                            "{name}:{}",
+                            canonical_type(
+                                value,
+                                types,
+                                effects,
+                                mint,
+                                args,
+                                types_seen,
+                                effects_seen
+                            )
+                        )
+                    }
+                    TypeField::Absent { .. } => format!("\\{name}"),
+                })
+                .collect();
+            fields.sort();
+            format!("{{{}}}", fields.join(","))
+        }
+        TypeKind::Sum { cases, .. } => {
+            let mut cases: Vec<_> = cases
+                .iter()
+                .map(|(name, case)| match case {
+                    SumCase::Written { payload, .. } => format!(
+                        "#{name}:{}",
+                        payload
+                            .as_ref()
+                            .map(|ty| canonical_type(
+                                ty,
+                                types,
+                                effects,
+                                mint,
+                                args,
+                                types_seen,
+                                effects_seen
+                            ))
+                            .unwrap_or_else(|| "{}".to_string())
+                    ),
+                    SumCase::Absent { .. } => format!("\\#{name}"),
+                })
+                .collect();
+            cases.sort();
+            format!("[{}]", cases.join("|"))
+        }
+        TypeKind::Arrow {
+            from,
+            to,
+            effects: row,
+        } => format!(
+            "({}->{}+{})",
+            canonical_type(from, types, effects, mint, args, types_seen, effects_seen),
+            canonical_type(to, types, effects, mint, args, types_seen, effects_seen),
+            canonical_effect_row(row, types, effects, mint, types_seen, effects_seen)
+        ),
+        TypeKind::Ident(symbol) => {
+            canonical_named(*symbol, &[], types, effects, mint, types_seen, effects_seen)
+        }
+        TypeKind::Apply {
+            head,
+            args: applied,
+            ..
+        } => canonical_named(
+            *head,
+            applied,
+            types,
+            effects,
+            mint,
+            types_seen,
+            effects_seen,
+        ),
+        TypeKind::Param { index, .. } => args
+            .get(*index as usize)
+            .map(|arg| canonical_type(arg, types, effects, mint, args, types_seen, effects_seen))
+            .unwrap_or_else(|| format!("'{}", index)),
+        TypeKind::Prim(prim) => format!("{prim:?}"),
+        TypeKind::Effects(row) => format!(
+            "effects({})",
+            canonical_effect_row(row, types, effects, mint, types_seen, effects_seen)
+        ),
+        TypeKind::Var(name) => format!("'{name}"),
+        TypeKind::Hole | TypeKind::Error => "?".to_string(),
+    }
+}
+
+fn canonical_named(
+    symbol: Symbol,
+    args: &[Type],
+    types: &IndexMap<Symbol, Decl<Type>>,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+    mint: &Mint,
+    types_seen: &mut HashSet<Symbol>,
+    effects_seen: &mut HashSet<Symbol>,
+) -> String {
+    if !types_seen.insert(symbol) {
+        return "rec".to_string();
+    }
+    let result = types.get(&symbol).map_or_else(
+        || "?".to_string(),
+        |decl| {
+            canonical_type(
+                &decl.value,
+                types,
+                effects,
+                mint,
+                args,
+                types_seen,
+                effects_seen,
+            )
+        },
+    );
+    types_seen.remove(&symbol);
+    result
+}
+
+/// The structural meaning of an effect row inside an operation signature.
+/// Label order has no meaning; presence and tail do, and a label reaches the
+/// full interface of the effect it names rather than its declaration path.
+fn canonical_effect_row(
+    row: &EffectRow,
+    types: &IndexMap<Symbol, Decl<Type>>,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+    mint: &Mint,
+    types_seen: &mut HashSet<Symbol>,
+    effects_seen: &mut HashSet<Symbol>,
+) -> String {
+    let mut labels: Vec<_> = row
+        .effects
+        .values()
+        .map(|label| {
+            let effect = canonical_effect(
+                label.symbol(),
+                types,
+                effects,
+                mint,
+                types_seen,
+                effects_seen,
+            );
+            match label {
+                EffectLabel::Written { when, .. } => format!(
+                    "+{effect}{}",
+                    when.as_ref()
+                        .map_or_else(String::new, |when| match &when.name {
+                            Some(name) => format!(" when {name}"),
+                            None => " when _".to_string(),
+                        })
+                ),
+                EffectLabel::Absent { .. } => format!("\\{effect}"),
+            }
+        })
+        .collect();
+    labels.sort();
+    let tail = match row.tail.as_ref().map(|tail| &tail.of) {
+        None => "closed".to_string(),
+        Some(Row::Anything) => "anything".to_string(),
+        Some(Row::Named(name)) => format!("'{name}"),
+        Some(Row::Param { index, .. }) => format!("'#{index}"),
+    };
+    format!("{};{tail}", labels.join(","))
+}
+
+/// One effect's module-independent interface, descending through effect rows.
+/// A back edge names only the effect's leaf name, so cycles terminate without
+/// making module identity part of structural equality.
+fn canonical_effect(
+    symbol: Symbol,
+    types: &IndexMap<Symbol, Decl<Type>>,
+    effects: &IndexMap<Symbol, Decl<Effect>>,
+    mint: &Mint,
+    types_seen: &mut HashSet<Symbol>,
+    effects_seen: &mut HashSet<Symbol>,
+) -> String {
+    if !effects_seen.insert(symbol) {
+        return format!("!{}<rec>", mint.name(symbol));
+    }
+    let interface = match effects.get(&symbol).map(|decl| &decl.value) {
+        Some(Effect::Operations(operations)) => {
+            let mut operations: Vec<_> = operations
+                .iter()
+                .map(|(name, operation)| {
+                    format!(
+                        "{name}:{}->{}",
+                        canonical_type(
+                            &operation.from,
+                            types,
+                            effects,
+                            mint,
+                            &[],
+                            types_seen,
+                            effects_seen,
+                        ),
+                        canonical_type(
+                            &operation.to,
+                            types,
+                            effects,
+                            mint,
+                            &[],
+                            types_seen,
+                            effects_seen,
+                        )
+                    )
+                })
+                .collect();
+            operations.sort();
+            operations.join("|")
+        }
+        // Aliases have already expanded out of ordinary rows. Keeping this
+        // branch total makes malformed recovery rows deterministic too.
+        Some(Effect::Alias(named)) => {
+            let mut named: Vec<_> = named
+                .values()
+                .map(|named| {
+                    canonical_effect(named.symbol, types, effects, mint, types_seen, effects_seen)
+                })
+                .collect();
+            named.sort();
+            named.join("+")
+        }
+        None => "?".to_string(),
+    };
+    effects_seen.remove(&symbol);
+    format!("!{}<{interface}>", mint.name(symbol))
+}
+
+fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
+    let old = std::mem::take(&mut row.effects);
+    for (_, label) in old {
+        let Some(id) = ids.get(&label.symbol()) else {
+            continue;
+        }; // aliases never survive expansion
+        if row.effects.contains_key(id) {
+            errors.push(Error {
+                span: label.name_span(),
+                kind: ErrorKind::DuplicateCase,
+            });
+        } else {
+            row.effects.insert(id.clone(), label);
+        }
+    }
+}
+
+fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
+    match &mut ty.tracked {
+        TypeKind::Struct { fields, .. } => {
+            for field in fields.values_mut() {
+                if let TypeField::Written { value, .. } = field {
+                    rekey_type(value, ids, errors);
+                }
+            }
+        }
+        TypeKind::Sum { cases, .. } => {
+            for case in cases.values_mut() {
+                if let SumCase::Written {
+                    payload: Some(payload),
+                    ..
+                } = case
+                {
+                    rekey_type(payload, ids, errors);
+                }
+            }
+        }
+        TypeKind::Arrow { from, to, effects } => {
+            rekey_type(from, ids, errors);
+            rekey_type(to, ids, errors);
+            rekey_row(effects, ids, errors);
+        }
+        TypeKind::Apply { args, .. } => {
+            for arg in args {
+                rekey_type(arg, ids, errors);
+            }
+        }
+        TypeKind::Effects(effects) => rekey_row(effects, ids, errors),
+        TypeKind::Ident(_)
+        | TypeKind::Param { .. }
+        | TypeKind::Prim(_)
+        | TypeKind::Var(_)
+        | TypeKind::Hole
+        | TypeKind::Error => {}
+    }
+}
+
+fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
+    match &mut term.kind {
+        TermKind::Apply { func, arg } => {
+            rekey_term(func, ids, errors);
+            rekey_term(arg, ids, errors);
+        }
+        TermKind::Fn { body, .. } | TermKind::Raise(body) => rekey_term(body, ids, errors),
+        TermKind::Let {
+            annotation,
+            value,
+            body,
+            ..
+        } => {
+            if let Some(annotation) = annotation {
+                rekey_type(&mut annotation.ty, ids, errors);
+            }
+            rekey_term(value, ids, errors);
+            rekey_term(body, ids, errors);
+        }
+        TermKind::Struct(fields) => {
+            for field in fields.values_mut() {
+                rekey_term(&mut field.value, ids, errors);
+            }
+        }
+        TermKind::Tag {
+            payload: Some(payload),
+            ..
+        } => rekey_term(payload, ids, errors),
+        TermKind::Project { base, .. } => rekey_term(base, ids, errors),
+        TermKind::Match { scrutinee, arms } => {
+            rekey_term(scrutinee, ids, errors);
+            for (_, body) in arms {
+                rekey_term(body, ids, errors);
+            }
+        }
+        TermKind::Handle { body, handler } => {
+            rekey_term(body, ids, errors);
+            for arm in &mut handler.arms {
+                rekey_term(&mut arm.body, ids, errors);
+            }
+            if let Some(ret) = &mut handler.ret {
+                rekey_term(&mut ret.body, ids, errors);
+            }
+            // Structural effect identity makes arms for equivalent effects
+            // duplicate implementations of the same operation, just as two
+            // arms naming one source effect are.
+            let mut seen = HashSet::new();
+            for arm in &handler.arms {
+                let Some(effect) = ids.get(&arm.effect.tracked) else {
+                    continue;
+                };
+                if !seen.insert((effect.clone(), arm.op.tracked.clone())) {
+                    errors.push(Error {
+                        span: arm.op.span,
+                        kind: ErrorKind::DuplicateArm {
+                            effect: effect.name().to_string(),
+                            op: arm.op.tracked.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        TermKind::Tag { payload: None, .. }
+        | TermKind::Operation { .. }
+        | TermKind::Ident(_)
+        | TermKind::Natural(_)
+        | TermKind::Error => {}
+    }
+}
+
+/// The old nominal spelling used only while aliases are expanded during IR
+/// construction. It is never allowed into a semantic row.
 fn effect_key(mint: &Mint, symbol: Symbol) -> String {
     let mut names = vec![mint.name(symbol).to_string()];
     let mut parent = mint.parent(symbol);
@@ -3237,7 +3706,7 @@ fn says_effects(effects: &EffectRow, out: &mut impl FnMut(Fact)) {
         ..
     }) = effects.tail
     {
-        let lacks = effects.effects.keys().cloned().collect();
+        let lacks = effects.effects.keys().map(EffectId::row_key).collect();
         out(Fact::Says(index, ParamKind::Effects { lacks }));
     }
 }
@@ -3457,7 +3926,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                                 false => Some(ErrorKind::NotARow {
                                     sense: kind.sense(),
                                 }),
-                                true => cases_named(arg).find(|name| lacks.contains(*name)).map(
+                                true => cases_named(arg).find(|name| lacks.contains(name)).map(
                                     |field| ErrorKind::RepeatedRowField {
                                         shape,
                                         field: field.clone(),
@@ -3656,12 +4125,12 @@ fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
 /// what it stands for is supplied at every use of *its* declaration, and already
 /// carries this condition — and an erased argument absorbed a complaint already
 /// made.
-fn cases_named(ty: &Type) -> impl Iterator<Item = &String> {
-    let cases: Box<dyn Iterator<Item = &String>> = match &ty.tracked {
-        TypeKind::Sum { cases, .. } => Box::new(cases.keys()),
+fn cases_named(ty: &Type) -> impl Iterator<Item = String> + '_ {
+    let cases: Box<dyn Iterator<Item = String> + '_> = match &ty.tracked {
+        TypeKind::Sum { cases, .. } => Box::new(cases.keys().cloned()),
         // A row's labels are the effects it names, which is the same question
         // asked of the row a sum writes.
-        TypeKind::Effects(effects) => Box::new(effects.effects.keys()),
+        TypeKind::Effects(effects) => Box::new(effects.effects.keys().map(EffectId::row_key)),
         _ => Box::new(std::iter::empty()),
     };
     cases
@@ -5629,18 +6098,18 @@ impl Builder<'_> {
                 ..EffectRow::default()
             });
         };
-        if place == Place::Operation {
+        // Keep an impure operation signature intact for structural identity
+        // and recovery, even though the language still reports it. Its row
+        // distinguishes invalid interfaces in every later phase.
+        let impure_operation = place == Place::Operation;
+        if impure_operation {
             self.error(written.span, ErrorKind::ImpureOperation);
-            return Some(EffectRow {
-                span: written.span,
-                ..EffectRow::default()
-            });
         }
         // Every label, expanded: a name declaring operations stands for itself,
         // and an alias for the effects it reaches. So no alias survives into
         // what a definition is checked against, and a printed type shows the
         // effects rather than the name.
-        let mut effects: IndexMap<String, EffectLabel> = IndexMap::new();
+        let mut effects: IndexMap<EffectId, EffectLabel> = IndexMap::new();
         for (name, label) in written.effects {
             let at = name.span();
             let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
@@ -5653,14 +6122,22 @@ impl Builder<'_> {
                 parse::EffectLabel::Written { when } => self.when(when.clone(), place),
                 parse::EffectLabel::Absent => None,
             };
-            let expanded: Vec<(String, Symbol)> = self
+            let mut expanded: Vec<(String, Symbol)> = self
                 .expanded
                 .get(&symbol)
                 .into_iter()
                 .flatten()
                 .map(|(name, symbol)| (name.clone(), *symbol))
                 .collect();
-            for (label_name, label_symbol) in expanded {
+            // Effect declarations are themselves lowered before the alias
+            // expansion table is complete. Keep a direct reference in that
+            // recovery-only window so an operation signature's identity still
+            // sees the effect row it wrote; aliases are expanded once ordinary
+            // types and terms are lowered later.
+            if expanded.is_empty() {
+                expanded.push((self.mint.name(symbol).to_string(), symbol));
+            }
+            for (_label_name, label_symbol) in expanded {
                 // Whether the reader wrote *this* effect's name here, or an
                 // alias standing for it among others.
                 let expanded = label_symbol != symbol;
@@ -5677,17 +6154,26 @@ impl Builder<'_> {
                         expanded,
                     },
                 };
-                if effects.contains_key(&label_name) {
+                let label_key = EffectId::pending(label_symbol);
+                if effects.contains_key(&label_key) {
                     self.error(at, ErrorKind::DuplicateCase);
                     continue;
                 }
-                effects.insert(label_name, lowered);
+                effects.insert(label_key, lowered);
             }
         }
         let tail = match self.tail(written.tail, place, Shape::Effect) {
             Ok(tail) => tail,
             Err(()) => return None,
         };
+        if impure_operation {
+            return Some(EffectRow {
+                span: written.span,
+                written: true,
+                effects,
+                tail,
+            });
+        }
         // The same two checks a struct and a sum make, in the effect reading:
         // a position that holds for every definition may leave nothing open,
         // and a `\` needs a `..` beside it to speak about.
@@ -5695,10 +6181,15 @@ impl Builder<'_> {
             .values()
             .filter_map(|label| Some(label.when()?.span));
         let closed = self.closed(place, Shape::Effect, marks, &tail);
-        let absences = effects.iter().filter_map(|(name, label)| match label {
-            EffectLabel::Absent { name_span, .. } => Some((name.clone(), *name_span)),
-            EffectLabel::Written { .. } => None,
-        });
+        let absences: Vec<_> = effects
+            .values()
+            .filter_map(|label| match label {
+                EffectLabel::Absent {
+                    name_span, symbol, ..
+                } => Some((self.mint.name(*symbol).to_string(), *name_span)),
+                EffectLabel::Written { .. } => None,
+            })
+            .collect();
         let tailed = self.tailed(Shape::Effect, absences, &tail);
         match closed && tailed {
             true => Some(EffectRow {

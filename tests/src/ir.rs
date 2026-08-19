@@ -3567,7 +3567,11 @@ fn annotation_effects(mint: &Mint, out: &Output, name: &str) -> Vec<String> {
     else {
         panic!("expected an arrow");
     };
-    effects.effects.keys().cloned().collect()
+    effects
+        .effects
+        .keys()
+        .map(|effect| effect.name().to_string())
+        .collect()
 }
 
 /// A bare `A -> B` carries the empty closed row, which is what pure means; the
@@ -3741,6 +3745,19 @@ fn a_handler_takes_each_arm_once() {
     assert_eq!(error.kind.code(), "duplicate-arm");
     assert_eq!(error.kind.to_string(), "duplicate arm for `!Log.write`");
 
+    // Source paths resolve operations, but equivalent interfaces are one
+    // effect in rows, so their operation arms must not choose competing
+    // implementations for the same evidence entry.
+    let structural = "module Foo =\n  effect Log = write : Nat -> ()\nend\n\
+                      module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+                      let h = fn n => handle Foo::!Log.write n with | Foo::!Log.write _ => () | Bar::!Log.write _ => () end";
+    let (_, out) = build_src(structural);
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.code(), "duplicate-arm");
+    assert_eq!(error.kind.to_string(), "duplicate arm for `!Log.write`");
+
     let (mint, out) = build_src(&format!(
         "{base}let h = fn _ => handle p () with | return a => a | return b => b end"
     ));
@@ -3840,7 +3857,14 @@ fn a_declaration_may_write_and_take_effects() {
     else {
         panic!("expected an arrow");
     };
-    assert_eq!(effects.effects.keys().collect::<Vec<_>>(), ["Log"]);
+    assert_eq!(
+        effects
+            .effects
+            .keys()
+            .map(|effect| effect.name())
+            .collect::<Vec<_>>(),
+        ["Log"]
+    );
 
     let runner = &out.program.types[&type_symbol(&mint, &out, "Runner")];
     assert_eq!(runner.params.len(), 1);
@@ -3957,8 +3981,57 @@ fn an_effect_row_names_each_effect_once() {
     assert_eq!(codes_of(src), ["duplicate-case"]);
 }
 
-/// Effects are module-qualified labels, not just their leaf spellings. Two
-/// modules may each declare `!Log`, and an alias or effect row may name both.
+/// Structural identities coalesce same-named, same-interface declarations,
+/// including aliases in their operation signatures; a row or alias cannot name
+/// that one semantic effect twice.
+#[test]
+fn structural_effect_duplicates_are_rejected() {
+    let src = "type Payload = Nat\n\
+               module Foo =\n  effect Log = write : Payload -> ()\nend\n\
+               module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+               effect Both = Foo::!Log + Bar::!Log\n\
+               let f : Nat -> Nat + Foo::!Log + Bar::!Log = fn n => n";
+    let (_, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-case", "duplicate-case"]
+    );
+}
+
+/// Effect rows inside an operation's input/output signature participate in
+/// identity too. Their dependencies are compared structurally, not by the
+/// source module that declared them.
+#[test]
+fn effectful_operation_signatures_compare_their_dependencies_structurally() {
+    let src = "module Foo =\n  effect IO = run : () -> ()\n  effect Log = call : (() -> Nat + !IO) -> ()\nend\n\
+               module Bar =\n  effect IO = run : () -> ()\n  effect Log = call : (() -> Nat + !IO) -> ()\nend\n\
+               module Other =\n  effect Other = run : () -> ()\nend\n\
+               module Quux =\n  effect Log = call : (() -> Nat + Other::!Other) -> ()\nend";
+    let (mint, out) = build_src(src);
+    // Impure operation signatures remain rejected, but their recovered
+    // interfaces must still be complete enough to distinguish effects.
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation))
+    );
+    let logs: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Log")
+        .map(|(_, id)| id)
+        .collect();
+    assert_eq!(logs.len(), 3);
+    assert_eq!(logs[0], logs[1]);
+    assert_ne!(logs[0], logs[2]);
+}
+
+/// Same-named effects with incompatible interfaces remain distinct even when
+/// their declarations live in different modules.
 #[test]
 fn same_named_effects_in_different_modules_do_not_collide() {
     let src = "module A =\n  effect Log = write : Nat -> ()\nend\n\

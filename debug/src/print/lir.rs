@@ -198,6 +198,12 @@ fn block(output: &Output, block: &Block, indent: usize, out: &mut String) {
     );
 }
 
+/// Hide the internal structural interface when an effect label reaches LIR
+/// evidence. Ordinary field names never contain this separator.
+fn effect_name(name: &str) -> &str {
+    name.split('\u{1f}').next().unwrap_or(name)
+}
+
 /// What one instruction does, with its operands.
 fn operation(output: &Output, op: &Op) -> String {
     match op {
@@ -206,7 +212,7 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Struct(fields) => {
             let entries: Vec<String> = fields
                 .iter()
-                .map(|(name, temp)| format!("{name}: %{temp}"))
+                .map(|(name, temp)| format!("{}: %{temp}", effect_name(name)))
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
         }
@@ -214,7 +220,7 @@ fn operation(output: &Output, op: &Op) -> String {
             let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();
             format!("merge {}", laid.join(", "))
         }
-        Op::Project { base, field } => format!("project %{base}, {field:?}"),
+        Op::Project { base, field } => format!("project %{base}, {:?}", effect_name(field)),
         Op::Tag {
             name,
             payload: None,
@@ -246,9 +252,14 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Catch { tag, .. } => format!("catch %{tag}:"),
         Op::SwitchTag { on, .. } => format!("switch_tag %{on}:"),
         Op::SwitchNat { on, .. } => format!("switch_nat %{on}:"),
-        Op::SwitchPresence { on, field, .. } => format!("switch_presence %{on}, {field:?}:"),
+        Op::SwitchPresence { on, field, .. } => {
+            format!("switch_presence %{on}, {:?}:", effect_name(field))
+        }
         Op::SwitchRest { on, fields, .. } => {
-            let names: Vec<String> = fields.iter().map(|name| format!("{name:?}")).collect();
+            let names: Vec<String> = fields
+                .iter()
+                .map(|name| format!("{:?}", effect_name(name)))
+                .collect();
             format!("switch_rest %{on}, [{}]:", names.join(", "))
         }
     }

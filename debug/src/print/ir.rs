@@ -567,11 +567,13 @@ impl Show<'_, TypeKind> {
             .iter()
             .map(|(name, label)| match label {
                 EffectLabel::Written { when, .. } => Entry::Written {
-                    name: name.clone(),
+                    name: name.name().to_string(),
                     mark: mark(when),
                     holds: (),
                 },
-                EffectLabel::Absent { .. } => Entry::Absent { name: name.clone() },
+                EffectLabel::Absent { .. } => Entry::Absent {
+                    name: name.name().to_string(),
+                },
             })
             .collect();
         let tail = row.tail.as_ref().map(|tail| match &tail.of {
