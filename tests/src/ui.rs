@@ -2648,3 +2648,11 @@ fn the_module_tokens_print_as_they_were_written() {
     assert_eq!(TokenKind::Module.to_string(), "module");
     assert_eq!(TokenKind::ColonColon.to_string(), "::");
 }
+
+/// Effects are internally keyed by their full module path, but diagnostics and
+/// printers must preserve the sigil's source position before the final name.
+#[test]
+fn a_qualified_effect_label_keeps_its_sigil_on_the_effect() {
+    assert_eq!(ui::label(Shape::Effect, "Log"), "!Log");
+    assert_eq!(ui::label(Shape::Effect, "Math::Log"), "Math::!Log");
+}

@@ -266,6 +266,19 @@ impl Loader<'_> {
     fn body(&mut self, at: Span, path: &[String]) -> Vec<Stmt> {
         let beside = format!("{}.{EXTENSION}", path.join("/"));
         let inside = format!("{}/{DIRECTORY_FILE}.{EXTENSION}", path.join("/"));
+        // A repeated file-module declaration is already an error in lowering,
+        // but its body must not be spliced a second time: the repeated copy
+        // would turn every declaration in the file into a spurious duplicate.
+        // A logical module has exactly these two possible paths, so a loaded
+        // candidate can only be this same module reached earlier.
+        if self
+            .out
+            .loaded
+            .iter()
+            .any(|file| file.path == beside || file.path == inside)
+        {
+            return Vec::new();
+        }
         match (
             self.fs.read(&beside).is_some(),
             self.fs.read(&inside).is_some(),

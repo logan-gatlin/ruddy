@@ -3957,6 +3957,23 @@ fn an_effect_row_names_each_effect_once() {
     assert_eq!(codes_of(src), ["duplicate-case"]);
 }
 
+/// Effects are module-qualified labels, not just their leaf spellings. Two
+/// modules may each declare `!Log`, and an alias or effect row may name both.
+#[test]
+fn same_named_effects_in_different_modules_do_not_collide() {
+    let src = "module A =\n  effect Log = write : Nat -> ()\nend\n\
+               module B =\n  effect Log = flush : () -> ()\nend\n\
+               effect Both = A::!Log + B::!Log\n\
+               let f : Nat -> Nat + A::!Log + B::!Log = fn x => x";
+    let (_, out) = build_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let (mint, out) = built(src);
+    let Effect::Alias(named) = effect_of(&mint, &out, "Both") else {
+        panic!("expected an alias");
+    };
+    assert_eq!(named.len(), 2);
+}
+
 /// An alias's cases are effect names and are resolved like any other: one that
 /// names nothing is undefined, and one named twice is a duplicate. Both are
 /// dropped where they stood, so the declaration still stands for whatever else

@@ -2058,6 +2058,20 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     }
 }
 
+/// The identity of an effect as a row label. Unlike a struct field or sum
+/// case, an effect lives in a module namespace, so its leaf spelling alone is
+/// not enough: `A::!Log` and `B::!Log` are distinct labels.
+fn effect_key(mint: &Mint, symbol: Symbol) -> String {
+    let mut names = vec![mint.name(symbol).to_string()];
+    let mut parent = mint.parent(symbol);
+    while let Some(module) = parent {
+        names.push(mint.name(module.symbol()).to_string());
+        parent = mint.parent(module.symbol());
+    }
+    names.reverse();
+    names.join("::")
+}
+
 /// What each declared effect stands for, as the concrete effects it names.
 ///
 /// An effect that declares operations stands for itself. An alias stands for
@@ -2085,9 +2099,9 @@ fn expansions(
         .iter()
         .map(|(symbol, decl)| {
             let stands = match &decl.value {
-                Effect::Operations(_) => [(mint.name(*symbol).to_string(), *symbol)]
-                    .into_iter()
-                    .collect(),
+                Effect::Operations(_) => {
+                    [(effect_key(mint, *symbol), *symbol)].into_iter().collect()
+                }
                 Effect::Alias(_) => IndexMap::new(),
             };
             (*symbol, stands)
@@ -4458,10 +4472,10 @@ impl Builder<'_> {
                     let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                         continue;
                     };
-                    // Keyed by the name the effect was declared under rather
-                    // than by the path that reached it, so two spellings of one
-                    // effect are one case.
-                    let label = self.mint.name(symbol).to_string();
+                    // Keyed by the effect's full module path, so two spellings
+                    // of one effect are one case but `A::!Log` and `B::!Log`
+                    // remain distinct.
+                    let label = effect_key(self.mint, symbol);
                     if names.contains_key(&label) {
                         self.error(at, ErrorKind::DuplicateCase);
                         continue;

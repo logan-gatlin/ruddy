@@ -994,7 +994,13 @@ pub fn label(shape: Shape, name: &str) -> String {
     match shape {
         Shape::Struct => name.to_string(),
         Shape::Sum => format!("#{name}"),
-        Shape::Effect => format!("!{name}"),
+        // Effect labels are keyed internally by their full module path, so
+        // distinguish same-named effects while still putting the sigil at the
+        // path's final label: `A::!Log`, not `!A::Log`.
+        Shape::Effect => match name.rsplit_once("::") {
+            Some((modules, effect)) => format!("{modules}::!{effect}"),
+            None => format!("!{name}"),
+        },
     }
 }
 
@@ -2278,7 +2284,7 @@ pub fn write_effects(
         first = false;
         match effect {
             Entry::Written { name, mark, .. } => {
-                write!(f, "!{name}")?;
+                f.write_str(&label(Shape::Effect, name))?;
                 match mark {
                     // The `?` no syntax reads, kept for the presence a failure
                     // abandoned — the reason [`Mark::Undecided`] survives.
@@ -2289,7 +2295,7 @@ pub fn write_effects(
                     None => {}
                 }
             }
-            Entry::Absent { name } => write!(f, "\\!{name}")?,
+            Entry::Absent { name } => write!(f, "\\{}", label(Shape::Effect, name))?,
         }
     }
     match tail {

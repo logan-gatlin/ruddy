@@ -212,6 +212,32 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
     assert_eq!(names(&out.stmts), ["module Gone", "let x"]);
 }
 
+/// Repeating a file module is one module error, not a second import of that
+/// module's source. Otherwise every definition in the file would be reported
+/// as a duplicate even though it was written only once.
+#[test]
+fn a_repeated_file_module_does_not_splice_its_body_twice() {
+    let out = load(&[
+        ("main.hc", "bundle demo 0.1.0\nmodule Math\nmodule Math\n"),
+        ("Math.hc", "let double = fn x => x\n"),
+    ])
+    .1;
+
+    assert_eq!(paths(&out), ["main.hc", "Math.hc"]);
+    let mut mint = ruddy::symbol::Mint::new(out.bundle.clone().expect("valid header"));
+    let built = ruddy::ir::build(&mut mint, out.stmts);
+    assert_eq!(
+        built
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-module"],
+        "{:#?}",
+        built.errors,
+    );
+}
+
 /// Two files for one module is refused rather than resolved. Which of them was
 /// meant is not the compiler's to guess, so it says what to delete and leaves
 /// the module empty.

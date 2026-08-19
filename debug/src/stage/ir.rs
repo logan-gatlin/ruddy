@@ -12,7 +12,7 @@ use ruddy::{
     },
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Sense},
+    types::{Core, Sense, Shape},
 };
 
 use crate::{
@@ -166,7 +166,7 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                 .iter()
                 .map(|(name, aliased)| {
                     with_symbol(
-                        Node::new(ids.next(), "Names", format!("!{name}"))
+                        Node::new(ids.next(), "Names", print::label(Shape::Effect, name))
                             .at(named(aliased.name_span, name)),
                         cx,
                         mint,
@@ -438,8 +438,10 @@ fn effects_node(
         .iter()
         .map(|(name, label)| {
             let text = match label {
-                EffectLabel::Written { when, .. } => format!("!{name}{}", when_text(when)),
-                EffectLabel::Absent { .. } => format!("\\!{name}"),
+                EffectLabel::Written { when, .. } => {
+                    format!("{}{}", print::label(Shape::Effect, name), when_text(when))
+                }
+                EffectLabel::Absent { .. } => format!("\\{}", print::label(Shape::Effect, name)),
             };
             let row = Node::new(ids.next(), text, String::new()).at(named(label.name_span(), name));
             // A label an alias put here is *about* the effect without being an

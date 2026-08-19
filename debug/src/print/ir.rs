@@ -18,8 +18,9 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, write_applied, write_apply, write_arrow, write_effects, write_let,
-    write_match, write_project, write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow,
+    write_effects, write_let, write_match, write_project, write_row, write_struct, write_sum,
+    write_tag,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -133,8 +134,8 @@ impl fmt::Display for Show<'_, Program> {
                 Effect::Alias(named) => {
                     for (at, name) in named.keys().enumerate() {
                         match at {
-                            0 => write!(f, " !{name}")?,
-                            _ => write!(f, " + !{name}")?,
+                            0 => write!(f, " {}", label(Shape::Effect, name))?,
+                            _ => write!(f, " + {}", label(Shape::Effect, name))?,
                         }
                     }
                 }
