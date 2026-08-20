@@ -39,7 +39,7 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub enum Effect {
     /// `effect Log = write : Nat -> ()` — the operations, by name, in the
-    /// order they were written. Empty for the empty effect, `effect Nil = |`,
+    /// order they were written. Empty for the empty effect, `effect Nil`,
     /// which declares nothing.
     Operations(IndexMap<String, Operation>),
     /// `effect Console = !Log + !IO` — the effects this name stands for.
@@ -4976,11 +4976,11 @@ impl Builder<'_> {
     /// where the majority is not the point, so a mixed declaration is read as
     /// whichever form its *first* case is and every case of the other form is
     /// dropped, leaving one complaint and a declaration that still stands for
-    /// something. The empty declaration, #effect Nil = |`, has no first case
-    /// and declares nothing.
+    /// something. The empty declaration, `effect Nil`, has no first case and
+    /// declares nothing.
     fn effect(&mut self, cases: Cases) -> Effect {
-        // The empty declaration takes the operation form: `effect Nil = |` is
-        // an effect a row may name that declares nothing, rather than a name
+        // The empty declaration takes the operation form: `effect Nil` is an
+        // effect a row may name that declares nothing, rather than a name
         // standing for no effects at all.
         let aliasing = matches!(cases.values().next(), Some(parse::EffectCase::Alias));
         let mut mixed = false;

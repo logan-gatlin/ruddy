@@ -3531,7 +3531,7 @@ fn an_effect_declares_its_operations() {
         TypeKind::Struct { ref fields, tail: None } if fields.is_empty()
     ));
 
-    let (mint, out) = built("effect Nil = |");
+    let (mint, out) = built("effect Nil");
     let Effect::Operations(operations) = effect_of(&mint, &out, "Nil") else {
         panic!("the empty effect declares operations, of which it has none");
     };
@@ -3635,7 +3635,7 @@ fn an_effect_declaration_is_held_to_its_form() {
     );
     // A repeated effect name is a duplicate like any other, in its own
     // namespace.
-    let out = build_src("effect Log = |\neffect Log = |").1;
+    let out = build_src("effect Log\neffect Log").1;
     assert_eq!(out.errors[0].kind.code(), "duplicate-effect");
     assert!(matches!(
         out.errors[0].kind,
@@ -4885,7 +4885,7 @@ fn hoisting_reaches_a_module_declared_below_its_use() {
 /// and an effect at once without any of them colliding.
 #[test]
 fn a_module_a_type_a_term_and_an_effect_may_share_a_name() {
-    let (mint, out) = built("module P = end\ntype P = { x: Nat }\nlet P = 1n\neffect P = |");
+    let (mint, out) = built("module P = end\ntype P = { x: Nat }\nlet P = 1n\neffect P");
     assert!(out.program.types.keys().any(|s| mint.name(*s) == "P"));
     assert!(out.program.terms.keys().any(|s| mint.name(*s) == "P"));
     assert!(out.program.effects.keys().any(|s| mint.name(*s) == "P"));

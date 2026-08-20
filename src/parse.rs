@@ -95,8 +95,8 @@ pub enum StmtKind {
     /// effect stands for the same thing wherever it is written.
     Effect {
         name: TrackedString,
-        /// The cases, in the order they were written. Empty for the empty
-        /// effect, `effect Nil = |`, which declares nothing and is legal.
+        /// The cases, in the order they were written. Empty for an empty
+        /// effect, `effect Nil`, which declares nothing and is legal.
         ///
         /// Keyed by [`Path`] because an alias names an effect from elsewhere,
         /// and elsewhere may be another module: `effect Console = Sys::!Log`.
@@ -1122,7 +1122,7 @@ impl Parser {
         )
     }
 
-    /// `effect <name> = [|] <case> ('|' <case>)*`, where a case is an operation
+    /// `effect <name> [= [|] <case> ('|' <case>)*]`, where a case is an operation
     /// — a bare name and the `: <signature>` that says what performing it does
     /// — or `!Other`, an effect this one names.
     ///
@@ -1133,24 +1133,29 @@ impl Parser {
     /// records the cases and lowering refuses the mixture; see
     /// [`ir::ErrorKind::MixedEffectForm`](crate::ir::ErrorKind).
     ///
-    /// The same `|` convention a sum type keeps: the leading bar is optional,
-    /// `|` alone is the empty effect, and a mark *between* cases promises
-    /// another one, so nothing after one is reported at the mark. An alias
-    /// takes the `+` an effect row writes as well, since a declaration naming
-    /// effects is the union of them that a row is.
+    /// The same `|` convention a sum type keeps: the leading bar is optional
+    /// when there are cases, and a mark *between* cases promises another one,
+    /// so nothing after one is reported at the mark. No cases means no `=`:
+    /// `effect Nil` is the empty effect. An alias takes the `+` an effect row
+    /// writes as well, since a declaration naming effects is the union of them
+    /// that a row is.
     fn effect_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `effect`");
         if self.at_wildcard() {
             return self.wildcard(Place::Type);
         }
         let name = self.ident()?;
-        self.eat(&Kind::Equal)?;
         let mut cases = IndexMap::new();
         let mut span = kw.span.merge(name.span);
-        self.eat_if(&Kind::Pipe);
+        let Some(equal) = self.eat_if(&Kind::Equal) else {
+            return Some(span.track(StmtKind::Effect { name, cases }));
+        };
+        // A leading bar is allowed only before a case. Unlike the separator
+        // below, it does not promise a case by itself, but `effect Nil = |` is
+        // no longer the spelling of the empty effect, so diagnose that bar.
+        let leading = self.eat_if(&Kind::Pipe);
         // The `|` that separated the last case from what comes next, once one
-        // has been read. The leading bar is not one of these: `effect Nil = |`
-        // is the empty effect and promises nothing.
+        // has been read.
         let mut separator = None;
         loop {
             // An effect named here is an alias case, whole; anything else has
@@ -1174,8 +1179,11 @@ impl Parser {
                     )
                 }
                 None => {
-                    if let Some(bar) = separator {
+                    if let Some(bar) = separator.or(leading.map(|bar| bar.span)) {
                         self.error(bar, ErrorKind::Unexpected);
+                    } else {
+                        // An `=` starts a case list, so it needs a case.
+                        self.error(equal.span, ErrorKind::Unexpected);
                     }
                     break;
                 }

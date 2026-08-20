@@ -161,16 +161,18 @@ module.exports = grammar({
     ),
 
     /**
-     * `effect <name> = [|] <case> ('|' <case>)*`, where a case is an operation
-     * and its signature or an effect this one stands for. Aliases may also be
-     * joined with the `+` an effect row writes; operations may not.
+     * `effect <name> [= [|] <case> ('|' <case>)*]`, where a case is an
+     * operation and its signature or an effect this one stands for. With no
+     * assignment, the effect is empty. Aliases may also be joined with the `+`
+     * an effect row writes; operations may not.
      */
     effect_definition: $ => seq(
       'effect',
       field('name', $.identifier),
-      '=',
-      optional('|'),
-      optional($._effect_cases),
+      optional(seq(
+        '=',
+        choice($._effect_cases, seq('|', $._effect_cases)),
+      )),
     ),
 
     _effect_cases: $ => choice(

@@ -117,10 +117,11 @@ impl fmt::Display for Show<'_, Program> {
                 f.write_str("\n")?;
             }
             first = false;
-            write!(f, "effect {} =", self.mint.name(*symbol))?;
+            write!(f, "effect {}", self.mint.name(*symbol))?;
             match &decl.value {
-                Effect::Operations(operations) if operations.is_empty() => f.write_str(" |")?,
+                Effect::Operations(operations) if operations.is_empty() => {}
                 Effect::Operations(operations) => {
+                    f.write_str(" =")?;
                     for (name, operation) in operations {
                         write!(
                             f,
@@ -130,8 +131,9 @@ impl fmt::Display for Show<'_, Program> {
                         )?;
                     }
                 }
-                Effect::Alias(named) if named.is_empty() => f.write_str(" |")?,
+                Effect::Alias(named) if named.is_empty() => {}
                 Effect::Alias(named) => {
+                    f.write_str(" =")?;
                     for (at, name) in named.keys().enumerate() {
                         match at {
                             0 => write!(f, " {}", label(Shape::Effect, name))?,

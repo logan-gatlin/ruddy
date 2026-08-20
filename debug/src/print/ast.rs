@@ -128,14 +128,15 @@ impl fmt::Display for Ast<'_, StmtKind> {
             }
             // The `|` is written before every operation, first included: the
             // grammar makes the leading one optional, so the printed form
-            // re-parses, and the empty effect is `effect Nil = |` with the one
-            // bar and nothing after it. An alias list writes its `+`s between
-            // its effects instead, which is where a row writes them.
+            // re-parses. An empty effect has no `=` or cases. An alias list
+            // writes its `+`s between its effects instead, which is where a
+            // row writes them.
             StmtKind::Effect { name, cases } => {
-                write!(f, "effect {} =", name.tracked)?;
+                write!(f, "effect {}", name.tracked)?;
                 if cases.is_empty() {
-                    return f.write_str(" |");
+                    return Ok(());
                 }
+                f.write_str(" =")?;
                 for (at, (name, case)) in cases.iter().enumerate() {
                     match case {
                         // An operation is a name and the signature it declares,

@@ -1535,8 +1535,13 @@ fn effect_declarations() {
         parse_one("effect Console = | !Log"),
         "effect Console = !Log"
     );
-    // The empty effect declares nothing and is written with the bar alone.
-    assert_eq!(parse_one("effect Nil = |"), "effect Nil = |");
+    // The empty effect has neither an assignment nor cases.
+    assert_eq!(parse_one("effect Nil"), "effect Nil");
+    for source in ["effect Nil = |", "effect Nil ="] {
+        let out = parse(lex(source, FileID::GENERATED).tokens);
+        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    }
     // A mix of the two forms parses; refusing it is lowering's. Each case
     // prints with the mark its own form writes, which is what re-parses.
     assert_eq!(
@@ -1546,7 +1551,7 @@ fn effect_declarations() {
 }
 
 /// A mark between cases promises another one, so nothing after it is reported
-/// at the mark — the rule a sum type keeps. The leading bar promises nothing.
+/// at the mark — the rule a sum type keeps. A leading bar needs a case too.
 #[test]
 fn an_effect_case_list_ends_at_a_bar_that_promised_one() {
     let out = parse(lex("effect E = !a + ", FileID::GENERATED).tokens);
@@ -1915,7 +1920,7 @@ fn both_module_forms_parse() {
 /// module is one of the things that may be in it.
 #[test]
 fn a_module_body_holds_every_kind_of_statement() {
-    let source = "module A = type T = Nat effect E = | let x = 1 module B = let y = 2n end end";
+    let source = "module A = type T = Nat effect E let x = 1 module B = let y = 2n end end";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let StmtKind::Module {
@@ -2023,7 +2028,7 @@ fn a_path_is_refused_where_a_name_is_bound() {
         "let A::x = 1n",
         "module A::B = end",
         "type A::T = Nat",
-        "effect A::E = |",
+        "effect A::E",
         "let f = fn A::x => x",
         "let a = match e with A::x => 1n end",
     ] {

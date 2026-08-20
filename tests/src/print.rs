@@ -636,7 +636,7 @@ fn both_trees_render_the_effect_forms() {
     for source in [
         "effect Log = | write : Nat -> {}",
         "effect Log = | write : Nat -> {} | flush : {} -> {}",
-        "effect Nil = |",
+        "effect Nil",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
         "effect Log = | write : Nat -> {}\n\
