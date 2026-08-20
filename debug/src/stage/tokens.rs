@@ -96,6 +96,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Identifier(_) => "Identifier",
         Kind::Underscore => "Underscore",
         Kind::Natural(_) => "Natural",
+        Kind::Integer(_) => "Integer",
+        Kind::Real(_) => "Real",
     }
 }
 
@@ -111,7 +113,7 @@ pub fn label(kind: &Kind) -> &'static str {
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
-        Kind::Natural(_) => "number",
+        Kind::Natural(_) | Kind::Integer(_) | Kind::Real(_) => "number",
         Kind::Tag(_) => "tag",
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",

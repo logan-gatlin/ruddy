@@ -204,6 +204,8 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -314,6 +316,10 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
         Core::Sum(cases) => names_in_row(cases, out),
         Core::Unit
         | Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
         | Core::Var(_)
         | Core::Bound(_)
         | Core::Rigid { .. }

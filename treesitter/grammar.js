@@ -102,7 +102,7 @@ module.exports = grammar({
     // `0.1.0`. Three naturals and two dots rather than a literal of its own,
     // exactly as `token::lex` hands them over: a version needs no lexer rule,
     // and prerelease versions are simply unwritable this way.
-    bundle_version: $ => seq($.natural, '.', $.natural, '.', $.natural),
+    bundle_version: $ => seq(alias($.version_number, $.natural), '.', alias($.version_number, $.natural), '.', alias($.version_number, $.natural)),
 
     // ── Statements ────────────────────────────────────────────────────────
 
@@ -615,15 +615,14 @@ module.exports = grammar({
     type_variable: _ => new RegExp(VARIABLE.source, 'u'),
 
     /**
-     * A natural number literal.
-     *
-     * Runs over the characters an identifier continues with, not just digits,
-     * exactly as `token::lex` reads one: `1x` is a single broken literal
-     * rather than a `1` beside an `x`. Whether the digits are digits — and
-     * whether they fit in the `u128` the compiler holds them in — is the
-     * lexer's to say, so both `1x` and a number too large parse here and are
-     * refused there.
+     * A numeric literal: suffixless reals (including decimals), or 64-bit
+     * integers and naturals marked with `i` and `n`. The broad trailing word
+     * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
-    natural: _ => new RegExp(/[0-9][\p{Alphabetic}\p{N}_]*/.source, 'u'),
+    natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+
+    // Bundle versions use bare integer components, so their dots can never be
+    // consumed as a real literal's decimal point.
+    version_number: _ => token(prec(1, /[0-9]+/)),
   },
 });

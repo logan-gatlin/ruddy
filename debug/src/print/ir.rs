@@ -195,6 +195,8 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Struct(_)
             | TermKind::Ident(_)
             | TermKind::Natural(_)
+            | TermKind::Integer(_)
+            | TermKind::Real(_)
             | TermKind::Error => Prec::Atom,
         }
     }
@@ -229,7 +231,7 @@ impl fmt::Display for Show<'_, PatternKind> {
             // The `_` as written: it names no symbol, so there is nothing for
             // the mint to spell.
             PatternKind::Wildcard => f.write_str("_"),
-            PatternKind::Natural(value) => write!(f, "{value}"),
+            PatternKind::Natural(value) => write!(f, "{value}n"),
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -282,7 +284,9 @@ impl fmt::Display for Show<'_, TermKind> {
         match self.node {
             TermKind::Error => f.write_str("<error>"),
             TermKind::Ident(symbol) => f.write_str(self.mint.name(*symbol)),
-            TermKind::Natural(value) => write!(f, "{value}"),
+            TermKind::Natural(value) => write!(f, "{value}n"),
+            TermKind::Integer(value) => write!(f, "{value}i"),
+            TermKind::Real(value) => write!(f, "{value}"),
             TermKind::Apply { func, arg } => {
                 write_apply(f, &self.show(&**func), &self.show(&**arg))
             }

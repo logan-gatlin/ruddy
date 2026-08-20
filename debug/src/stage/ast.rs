@@ -364,6 +364,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "Natural".into(),
             ..node
         },
+        ExprKind::Integer(_) => Node {
+            label: "Integer".into(),
+            ..node
+        },
+        ExprKind::Real(_) => Node {
+            label: "Real".into(),
+            ..node
+        },
         ExprKind::Unit => Node {
             label: "Unit".into(),
             ..node

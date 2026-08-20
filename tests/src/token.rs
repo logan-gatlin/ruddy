@@ -26,24 +26,25 @@ fn errors(src: &str) -> Vec<Error> {
 }
 
 #[test]
-fn lexes_natural_literals() {
-    assert!(matches!(kinds("0")[..], [Kind::Natural(0)]));
-    assert!(matches!(kinds("42")[..], [Kind::Natural(42)]));
-    // Leading zeros are not a second spelling of a different number.
-    assert!(matches!(kinds("007")[..], [Kind::Natural(7)]));
+fn lexes_numeric_literals() {
+    assert!(matches!(kinds("0")[..], [Kind::Real(value)] if value == 0.0));
+    assert!(matches!(kinds("42")[..], [Kind::Real(value)] if value == 42.0));
+    assert!(matches!(kinds("1.25")[..], [Kind::Real(value)] if value == 1.25));
+    assert!(matches!(kinds("42i")[..], [Kind::Integer(42)]));
+    assert!(matches!(kinds("42n")[..], [Kind::Natural(42)]));
     assert!(matches!(
-        kinds(&u128::MAX.to_string())[..],
-        [Kind::Natural(u128::MAX)]
+        kinds(&format!("{}n", u64::MAX))[..],
+        [Kind::Natural(u64::MAX)]
     ));
 }
 
 #[test]
 fn a_natural_is_spanned_and_printed_as_written() {
-    let out = lex("let n = 4096", FileID::GENERATED);
+    let out = lex("let n = 4096n", FileID::GENERATED);
     let last = out.tokens.last().expect("the literal was lexed");
     assert_eq!(last.span.start, 8);
-    assert_eq!(last.span.width, 4);
-    assert_eq!(last.tracked.to_string(), "4096");
+    assert_eq!(last.span.width, 5);
+    assert_eq!(last.tracked.to_string(), "4096n");
 }
 
 #[test]
@@ -69,7 +70,7 @@ fn a_literal_running_into_a_name_is_one_broken_literal() {
 
 #[test]
 fn a_literal_too_large_to_hold_is_rejected() {
-    let over = format!("{}0", u128::MAX);
+    let over = format!("{}0n", u64::MAX);
     let out = errors(&over);
     assert_eq!(out.len(), 1, "errors: {out:#?}");
     assert_eq!(out[0].kind, ErrorKind::NaturalTooLarge);
@@ -259,7 +260,7 @@ fn lexes_a_tag_as_one_token() {
 
 #[test]
 fn a_tag_is_spanned_and_printed_as_written() {
-    let out = lex("let v = #Some 1", FileID::GENERATED);
+    let out = lex("let v = #Some 1n", FileID::GENERATED);
     let tag = &out.tokens[3];
     // The span covers the `#` as well as the name: it is one lexeme, and a
     // reader selecting the case should get all of it.
@@ -348,12 +349,12 @@ fn match_lexes_as_a_keyword() {
 fn a_lone_underscore_lexes_as_the_wildcard() {
     assert!(matches!(kinds("_")[..], [Kind::Underscore]));
     assert!(matches!(
-        kinds("let _ = 1")[..],
+        kinds("let _ = 1n")[..],
         [Kind::Let, Kind::Underscore, Kind::Equal, Kind::Natural(1)]
     ));
 
     // Spanned at the one byte it is, and printed back as it.
-    let out = lex("let _ = 1", FileID::GENERATED);
+    let out = lex("let _ = 1n", FileID::GENERATED);
     let wild = &out.tokens[1];
     assert_eq!(wild.span.start, 4);
     assert_eq!(wild.span.width, 1);
@@ -458,13 +459,32 @@ fn the_module_keywords_are_reserved() {
 #[test]
 fn a_version_lexes_as_naturals_and_dots() {
     assert!(matches!(
-        kinds("0.1.0")[..],
+        kinds("bundle demo 0.1.0")[..],
         [
+            Kind::Bundle,
+            Kind::Identifier(_),
             Kind::Natural(0),
             Kind::Dot,
             Kind::Natural(1),
             Kind::Dot,
             Kind::Natural(0)
         ]
+    ));
+}
+
+#[test]
+fn a_version_component_keeps_all_u64_bits() {
+    let source = format!("bundle demo {}.0.0", u64::MAX);
+    assert!(matches!(
+        kinds(&source)[..],
+        [
+            Kind::Bundle,
+            Kind::Identifier(_),
+            Kind::Natural(value),
+            Kind::Dot,
+            Kind::Natural(0),
+            Kind::Dot,
+            Kind::Natural(0)
+        ] if value == u64::MAX
     ));
 }

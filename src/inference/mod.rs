@@ -1600,6 +1600,10 @@ impl Table {
         match (a, b) {
             (Core::Unit, Core::Unit)
             | (Core::Nat, Core::Nat)
+            | (Core::Int, Core::Int)
+            | (Core::Real, Core::Real)
+            | (Core::String, Core::String)
+            | (Core::Boolean, Core::Boolean)
             | (Core::Undecided, Core::Undecided) => true,
             (Core::Var(x), Core::Var(y)) => x == y,
             // A quantified variable is not written out, on purpose: nothing
@@ -1776,7 +1780,15 @@ impl Table {
                     self.mentions_ty(arg, found);
                 }
             }
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
         }
         self.mentions_labels(&ty.fields, found);
     }
@@ -1899,6 +1911,10 @@ impl Table {
             }
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Var(_)
             | Core::Bound(_)
             | Core::Rigid { .. }
@@ -2230,6 +2246,10 @@ impl Table {
             }
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Var(_)
             | Core::Bound(_)
             | Core::Rigid { .. }
@@ -2328,6 +2348,10 @@ impl Table {
             }
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Var(_)
             | Core::Bound(_)
             | Core::Rigid { .. }
@@ -2426,7 +2450,15 @@ impl Table {
                     self.rigids_in(arg, found);
                 }
             }
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Var(_)
+            | Core::Bound(_)
+            | Core::Undecided => {}
         }
     }
 
@@ -2593,6 +2625,10 @@ impl Table {
             }
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Var(_)
             | Core::Bound(_)
             | Core::Rigid { .. }
@@ -2786,7 +2822,14 @@ impl Table {
                     self.quantify_walk(arg, subst, level, presences);
                 }
             }
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Bound(_)
+            | Core::Undecided => {}
         }
     }
 
@@ -2890,7 +2933,14 @@ impl Table {
                 name: name.clone(),
                 args: args.iter().map(|arg| self.zonk(arg, subst)).collect(),
             },
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Undecided => ty.core.clone(),
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Bound(_)
+            | Core::Undecided => ty.core.clone(),
         };
         Rc::new(Ty { core, fields })
     }
@@ -3017,6 +3067,8 @@ impl Table {
             TermKind::Operation { .. }
             | TermKind::Ident(_)
             | TermKind::Natural(_)
+            | TermKind::Integer(_)
+            | TermKind::Real(_)
             | TermKind::Error => {}
         }
     }
@@ -3155,9 +3207,15 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
         // A variable is one an enclosing binder still owns, and a rigid is
         // numbered by the zonk that follows this: neither is a position in the
         // space being made room in.
-        Core::Unit | Core::Nat | Core::Var(_) | Core::Rigid { .. } | Core::Undecided => {
-            ty.core.clone()
-        }
+        Core::Unit
+        | Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
+        | Core::Var(_)
+        | Core::Rigid { .. }
+        | Core::Undecided => ty.core.clone(),
     };
     Rc::new(Ty { core, fields })
 }
@@ -3388,7 +3446,15 @@ fn close_rigids(ty: &Rc<Ty>, at: &HashMap<u32, u32>) -> Rc<Ty> {
             name: name.clone(),
             args: args.iter().map(|arg| close_rigids(arg, at)).collect(),
         },
-        Core::Unit | Core::Nat | Core::Var(_) | Core::Bound(_) | Core::Undecided => ty.core.clone(),
+        Core::Unit
+        | Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
+        | Core::Var(_)
+        | Core::Bound(_)
+        | Core::Undecided => ty.core.clone(),
     };
     Rc::new(Ty { core, fields })
 }
@@ -3791,9 +3857,15 @@ impl Ty {
             // A rigid is a leaf and is never opened: what a scheme quantified is
             // a [`Core::Bound`], and a rigid is what an annotation's own
             // variable stands for while its body is being checked.
-            Core::Unit | Core::Nat | Core::Var(_) | Core::Rigid { .. } | Core::Undecided => {
-                self.core.clone()
-            }
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Var(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => self.core.clone(),
         };
         Rc::new(Ty { core, fields })
     }

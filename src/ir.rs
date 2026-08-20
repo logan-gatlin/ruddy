@@ -255,9 +255,11 @@ pub enum TermKind {
         op: TrackedString,
     },
     Ident(Symbol),
-    /// A natural number literal. It carries no symbol: a literal names nothing,
-    /// so there is nothing for the mint to hand out.
-    Natural(u128),
+    /// Numeric literals carry no symbol: a literal names nothing, so there is
+    /// nothing for the mint to hand out.
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
@@ -341,7 +343,7 @@ pub enum PatternKind {
         name: TrackedString,
         payload: Option<Box<Pattern>>,
     },
-    Natural(u128),
+    Natural(u64),
     Unit,
 }
 
@@ -1067,7 +1069,7 @@ pub enum Refuter {
     /// A tag pattern: a value here might not be this case.
     Case(String),
     /// A natural literal: a value here might be some other number.
-    Number(u128),
+    Number(u64),
 }
 
 /// A concrete example of a value a match leaves unhandled, in the shape of the
@@ -1079,7 +1081,7 @@ pub enum Witness {
     /// more instructive than another.
     Any,
     /// This number.
-    Natural(u128),
+    Natural(u64),
     /// This case. `None` says any payload serves — rendered bare, the way a
     /// case carrying unit is written.
     Tag {
@@ -1524,7 +1526,7 @@ pub(crate) struct Matrix {
 #[derive(Debug, Default)]
 struct Tests {
     tags: IndexSet<String>,
-    naturals: IndexSet<u128>,
+    naturals: IndexSet<u64>,
 }
 
 /// One cell of the matrix the usefulness walk works on: a [`Pattern`] with
@@ -1544,7 +1546,7 @@ enum Mat {
         name: String,
         payload: Box<Mat>,
     },
-    Natural(u128),
+    Natural(u64),
     /// A struct pattern with at least one field. `{}` tests nothing and
     /// arrives as [`Mat::Wild`] instead, so a struct cell always has a field
     /// for the widening step to find.
@@ -2524,6 +2526,8 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
         | TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2850,6 +2854,8 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2905,6 +2911,8 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2966,7 +2974,7 @@ impl Chain<'_> {
             | TermKind::Handle { .. }
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
-            | TermKind::Natural(_)
+            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_)
             | TermKind::Error => Stands::Shape,
         }
     }
@@ -3346,7 +3354,7 @@ fn specialize_tag(rows: &[Vec<Mat>], name: &str) -> Vec<Vec<Mat>> {
 
 /// [`specialize_tag`] about a number, which carries nothing: the column is
 /// consumed rather than replaced.
-fn specialize_natural(rows: &[Vec<Mat>], value: u128) -> Vec<Vec<Mat>> {
+fn specialize_natural(rows: &[Vec<Mat>], value: u64) -> Vec<Vec<Mat>> {
     rows.iter()
         .filter_map(|row| match &row[0] {
             Mat::Natural(natural) if *natural == value => Some(row[1..].to_vec()),
@@ -3549,7 +3557,11 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
         TermKind::Raise(value) => references(value, out),
         // An operation names an effect, which is no definition and so no node
         // of the graph a group is read off.
-        TermKind::Operation { .. } | TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Operation { .. }
+        | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -4094,6 +4106,8 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -5478,6 +5492,8 @@ impl Builder<'_> {
                 None => TermKind::Error.with_span(span),
             },
             ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
+            ExprKind::Integer(value) => TermKind::Integer(value).with_span(span),
+            ExprKind::Real(value) => TermKind::Real(value).with_span(span),
             ExprKind::Apply { func, arg } => {
                 let func = self.term(*func);
                 let arg = self.term(*arg);

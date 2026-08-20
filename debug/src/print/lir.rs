@@ -80,7 +80,7 @@ pub fn instruction(output: &Output, instr: &Instr) -> String {
 /// The opcode alone, which is what a row of the tab is labelled with.
 pub fn opcode(op: &Op) -> &'static str {
     match op {
-        Op::Const(_) => "const",
+        Op::Const(_) | Op::ConstInt(_) | Op::ConstReal(_) => "const",
         Op::Struct(_) => "struct",
         Op::Merge(_) => "merge",
         Op::Project { .. } => "project",
@@ -102,6 +102,10 @@ pub fn opcode(op: &Op) -> &'static str {
 pub fn rep(rep: Rep) -> &'static str {
     match rep {
         Rep::Nat => "nat",
+        Rep::Int => "int64",
+        Rep::Real => "real64",
+        Rep::String => "string",
+        Rep::Boolean => "boolean",
         Rep::Unit => "unit",
         Rep::Struct => "struct",
         Rep::Sum => "sum",
@@ -207,7 +211,9 @@ fn effect_name(name: &str) -> &str {
 /// What one instruction does, with its operands.
 fn operation(output: &Output, op: &Op) -> String {
     match op {
-        Op::Const(value) => format!("const {value}"),
+        Op::Const(value) => format!("const {value}n"),
+        Op::ConstInt(value) => format!("const {value}i"),
+        Op::ConstReal(value) => format!("const {value}"),
         Op::Struct(fields) if fields.is_empty() => "struct {}".to_string(),
         Op::Struct(fields) => {
             let entries: Vec<String> = fields

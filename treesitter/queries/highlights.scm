@@ -39,9 +39,9 @@
 
 (type_definition name: (identifier) @type.definition)
 
-; The one primitive there is; see `types::Prim::ALL`.
+; The primitive types; see `types::Prim::ALL`.
 ((identifier) @type.builtin
-  (#eq? @type.builtin "Nat"))
+  (#any-of? @type.builtin "Nat" "Int" "Real" "String" "Boolean"))
 
 ; `'a` — a declaration's parameter, a variable of the annotation it is written
 ; in, and the presences a `where` clause is written about. One capture for all

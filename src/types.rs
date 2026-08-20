@@ -7,8 +7,8 @@ use crate::symbol::Symbol;
 /// A type built into the language rather than declared in it.
 ///
 /// A primitive names nothing the mint could hand out — the same reason
-/// [`TermKind::Natural`](crate::ir::TermKind::Natural) carries no symbol — so it
-/// is a value here rather than a seeded declaration. Shared by the syntactic
+/// numeric literals carry no symbol — so it is a value here rather than a
+/// seeded declaration. Shared by the syntactic
 /// [`ir::TypeKind`](crate::ir::TypeKind) and the semantic type language, so the
 /// two can never disagree about which primitives exist.
 ///
@@ -18,8 +18,16 @@ use crate::symbol::Symbol;
 /// it means the compiler answers in `{}` where the user wrote `()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
-    /// The type of a natural literal.
+    /// The type of unsigned 64-bit integer literals.
     Nat,
+    /// The type of signed 64-bit integers.
+    Int,
+    /// The type of 64-bit floating-point numbers.
+    Real,
+    /// The type of UTF-8 text.
+    String,
+    /// The type with the values true and false.
+    Boolean,
 }
 
 pub type TyVar = u32;
@@ -293,6 +301,10 @@ pub enum Core {
     /// there is one type here and one spelling for it.
     Unit,
     Nat,
+    Int,
+    Real,
+    String,
+    Boolean,
     /// `A -> B + E` — what it takes, what it gives back, and the effects
     /// calling it may perform.
     ///
@@ -676,6 +688,10 @@ impl From<Prim> for Core {
     fn from(value: Prim) -> Self {
         match value {
             Prim::Nat => Core::Nat,
+            Prim::Int => Core::Int,
+            Prim::Real => Core::Real,
+            Prim::String => Core::String,
+            Prim::Boolean => Core::Boolean,
         }
     }
 }
@@ -982,7 +998,13 @@ impl Presence {
 impl Prim {
     /// Every primitive there is. The one place a new one has to be listed, so
     /// that [`from_name`](Self::from_name) can never fall behind the enum.
-    pub const ALL: &'static [Prim] = &[Prim::Nat];
+    pub const ALL: &'static [Prim] = &[
+        Prim::Nat,
+        Prim::Int,
+        Prim::Real,
+        Prim::String,
+        Prim::Boolean,
+    ];
 
     /// The spelling that denotes this primitive in source. Injective, and
     /// inverted by [`from_name`](Self::from_name), which is what keeps a
@@ -990,6 +1012,10 @@ impl Prim {
     pub const fn name(self) -> &'static str {
         match self {
             Prim::Nat => "Nat",
+            Prim::Int => "Int",
+            Prim::Real => "Real",
+            Prim::String => "String",
+            Prim::Boolean => "Boolean",
         }
     }
 

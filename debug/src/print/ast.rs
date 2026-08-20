@@ -78,6 +78,8 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Struct(_)
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
+            | ExprKind::Integer(_)
+            | ExprKind::Real(_)
             | ExprKind::Unit => Prec::Atom,
         }
     }
@@ -338,7 +340,9 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write!(f, "{}.{}", labelled(effect), op.tracked)
             }
             ExprKind::Ident { name } => write!(f, "{name}"),
-            ExprKind::Natural(value) => write!(f, "{value}"),
+            ExprKind::Natural(value) => write!(f, "{value}n"),
+            ExprKind::Integer(value) => write!(f, "{value}i"),
+            ExprKind::Real(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
         }
     }

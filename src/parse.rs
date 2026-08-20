@@ -234,7 +234,9 @@ pub enum ExprKind {
     Ident {
         name: Path,
     },
-    Natural(u128),
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
     Unit,
 }
 
@@ -304,7 +306,7 @@ pub enum PatternKind {
     /// too often.
     Wildcard,
     /// A natural literal: matches exactly that number.
-    Natural(u128),
+    Natural(u64),
     /// `()`: matches unit, binds nothing.
     Unit,
     /// `{ f, g: <pattern>, ... }` — reach into a struct's fields. A bare field
@@ -961,7 +963,10 @@ impl Parser {
     fn version_part(&mut self) -> Option<(u64, Span)> {
         let read = match self.peek() {
             Some(tok) => match tok.tracked {
-                Kind::Natural(value) => u64::try_from(value).ok().map(|part| (part, tok.span)),
+                Kind::Natural(value) => Some((value, tok.span)),
+                Kind::Real(value) if value.fract() == 0.0 => u64::try_from(value as u128)
+                    .ok()
+                    .map(|part| (part, tok.span)),
                 _ => return self.unexpected(),
             },
             None => return self.unexpected(),
@@ -1341,6 +1346,14 @@ impl Parser {
             &Kind::Natural(value) => {
                 self.advance();
                 Some(span.track(ExprKind::Natural(value)))
+            }
+            &Kind::Integer(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Integer(value)))
+            }
+            &Kind::Real(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Real(value)))
             }
             // Nothing here begins an expression
             _ => self.unexpected(),

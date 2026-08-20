@@ -210,6 +210,14 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Natural".into(),
             ..node
         },
+        TermKind::Integer(_) => Node {
+            label: "Integer".into(),
+            ..node
+        },
+        TermKind::Real(_) => Node {
+            label: "Real".into(),
+            ..node
+        },
         TermKind::Apply { func, arg } => Node {
             label: "Apply".into(),
             ..node

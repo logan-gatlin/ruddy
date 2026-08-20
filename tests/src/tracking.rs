@@ -18,7 +18,7 @@ fn a_span_with_nowhere_to_point_points_at_generated_code() {
 
 #[test]
 fn merging_covers_both_spans_whichever_order_they_arrive_in() {
-    let file = FileManager::new().register_new_file("a.hc".into(), "let x = 1".into());
+    let file = FileManager::new().register_new_file("a.hc".into(), "let x = 1n".into());
     let first = file.span(0, 3);
     let second = file.span(6, 3);
 
@@ -61,13 +61,13 @@ fn a_new_file_manager_already_knows_the_generated_file() {
 #[test]
 fn registering_hands_back_an_id_that_reads_the_file_again() {
     let mut files = FileManager::new();
-    let first = files.register_new_file("a.hc".into(), "let a = 1".into());
-    let second = files.register_new_file("b.hc".into(), "let b = 2".into());
+    let first = files.register_new_file("a.hc".into(), "let a = 1n".into());
+    let second = files.register_new_file("b.hc".into(), "let b = 2n".into());
 
     assert_ne!(first, second);
     assert!(!first.is_generated() && !second.is_generated());
     assert_eq!(files.get_file(first).path, "a.hc");
-    assert_eq!(files.get_file(second).content, "let b = 2");
+    assert_eq!(files.get_file(second).content, "let b = 2n");
 }
 
 #[test]

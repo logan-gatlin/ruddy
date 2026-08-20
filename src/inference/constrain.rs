@@ -219,6 +219,8 @@ impl Constrain<'_> {
             // diagnostic lowering already reported stays the only one.
             TermKind::Error => Rc::new(Ty::default()),
             TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
+            TermKind::Integer(_) => Rc::new(Ty::plain(Core::Int)),
+            TermKind::Real(_) => Rc::new(Ty::plain(Core::Real)),
             TermKind::Ident(symbol) => {
                 let symbol = *symbol;
                 self.lookup(span, symbol)

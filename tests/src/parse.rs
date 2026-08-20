@@ -117,13 +117,13 @@ fn a_label_may_be_called_when() {
 #[test]
 fn the_clause_keywords_are_contextual() {
     for src in [
-        "let when = 1",
-        "let where = 1",
-        "let or = 1",
-        "let and = 1",
-        "let not = 1",
+        "let when = 1n",
+        "let where = 1n",
+        "let or = 1n",
+        "let and = 1n",
+        "let not = 1n",
         "let x = fn when => when",
-        "let x = { when: 1, where: 2, or: 3, and: 4, not: 5 }",
+        "let x = { when: 1n, where: 2n, or: 3n, and: 4n, not: 5n }",
         "let x : { when: A, where: B, or: C, and: D, not: E } = y",
     ] {
         assert_eq!(parse_one(src), src);
@@ -153,7 +153,7 @@ fn a_sum_case_parenthesizes_its_presence() {
 fn a_when_clause_must_name_something() {
     for (src, at) in [
         ("let x : { a when: A } = y", ": A } = y"),
-        ("let x : { a when 1: A } = y", "1: A } = y"),
+        ("let x : { a when 1n: A } = y", "1n: A } = y"),
         ("let x : #A (when 'a Nat = y", "Nat = y"),
         // Unparenthesized in a sum, the `when` is read as the payload type it
         // looks like and the variable after it is nobody's token.
@@ -282,9 +282,9 @@ fn a_trailing_separator_is_unexpected() {
 #[test]
 fn a_type_hole_parses_as_a_type() {
     for src in [
-        "let k : _ -> Nat = fn x => 0",
+        "let k : _ -> Nat = fn x => 0n",
         "let k : _ -> _ = fn x => x",
-        "let k : { x: _, y: _ } -> Nat = fn p => 0",
+        "let k : { x: _, y: _ } -> Nat = fn p => 0n",
         "let k : #Some _ | #None = nothing",
         "let k : List _ = nil",
     ] {
@@ -292,7 +292,7 @@ fn a_type_hole_parses_as_a_type() {
     }
 
     // And it is the node it says it is, rather than a name spelled `_`.
-    let out = parse(lex("let k : _ = 1", FileID::GENERATED).tokens);
+    let out = parse(lex("let k : _ = 1n", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let StmtKind::Let { ty, .. } = &out.stmts[0].tracked else {
         panic!("expected a definition");
@@ -484,16 +484,16 @@ fn parens_group_lambdas() {
 
 #[test]
 fn naturals_are_atoms() {
-    assert_eq!(parse_one("let n = 0"), "let n = 0");
+    assert_eq!(parse_one("let n = 0n"), "let n = 0n");
     // An atom, so it takes part in application on either side and never
     // needs parentheses of its own.
-    assert_eq!(parse_one("let a = f 1 2"), "let a = f 1 2");
-    assert_eq!(parse_one("let b = 1 f"), "let b = 1 f");
-    assert_eq!(parse_one("let c = f (g 3)"), "let c = f (g 3)");
-    assert_eq!(parse_one("let d = fn x => 7"), "let d = fn x => 7");
+    assert_eq!(parse_one("let a = f 1n 2n"), "let a = f 1n 2n");
+    assert_eq!(parse_one("let b = 1n f"), "let b = 1n f");
+    assert_eq!(parse_one("let c = f (g 3n)"), "let c = f (g 3n)");
+    assert_eq!(parse_one("let d = fn x => 7n"), "let d = fn x => 7n");
     assert_eq!(
-        parse_one("let e = { width: 3, height: 4 }"),
-        "let e = { width: 3, height: 4 }"
+        parse_one("let e = { width: 3n, height: 4n }"),
+        "let e = { width: 3n, height: 4n }"
     );
 }
 
@@ -501,7 +501,7 @@ fn naturals_are_atoms() {
 fn naturals_are_terms_only() {
     // There is no type-level natural, so a literal in type position is the
     // unexpected token it looks like rather than a silently accepted one.
-    let out = parse(lex("type T = 42", FileID::GENERATED).tokens);
+    let out = parse(lex("type T = 42n", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 }
 
@@ -591,7 +591,7 @@ fn a_dot_dot_cannot_follow_an_expression() {
         "let a = p..x",
         "let a = p...'x",
         "let a = p..",
-        "let a = 1 ..'x",
+        "let a = 1n ..'x",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without error");
@@ -777,8 +777,8 @@ fn a_sum_with_no_cases_is_a_bare_bar() {
 #[test]
 fn a_bar_promising_a_case_that_never_comes_is_reported() {
     for (src, at) in [
-        ("let x : #A Nat | = 1", 15),
-        ("let x : #A Nat | | #B = 1", 15),
+        ("let x : #A Nat | = 1n", 15),
+        ("let x : #A Nat | | #B = 1n", 15),
         ("type T = #A | ", 12),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
@@ -840,13 +840,13 @@ fn a_sum_case_may_be_written_absent() {
 fn an_absent_label_is_bare() {
     // The tail of each source is where the complaint lands.
     for (src, from) in [
-        ("let x : { \\y: Nat, .. } = 1", ": Nat, .. } = 1"),
-        ("let x : { \\y when a, .. } = 1", "when a, .. } = 1"),
-        ("let x : \\#B (when 'a) | .. = 1", "(when 'a) | .. = 1"),
-        ("let x : #A | \\#B Nat | .. = 1", "Nat | .. = 1"),
-        ("let x : { \\, .. } = 1", ", .. } = 1"),
+        ("let x : { \\y: Nat, .. } = 1n", ": Nat, .. } = 1n"),
+        ("let x : { \\y when a, .. } = 1n", "when a, .. } = 1n"),
+        ("let x : \\#B (when 'a) | .. = 1n", "(when 'a) | .. = 1n"),
+        ("let x : #A | \\#B Nat | .. = 1n", "Nat | .. = 1n"),
+        ("let x : { \\, .. } = 1n", ", .. } = 1n"),
         // In a type, what follows a `\` must be a tag or a field name.
-        ("let x : \\= 1", "= 1"),
+        ("let x : \\= 1n", "= 1n"),
         // In an expression, the `\` itself begins nothing.
         ("let x = \\y", "\\y"),
     ] {
@@ -895,9 +895,9 @@ fn a_case_carries_one_atom() {
 /// there is nothing the other reading could mean.
 #[test]
 fn a_tag_binds_tighter_than_application() {
-    assert_eq!(parse_one("let v = #Some 1"), "let v = #Some 1");
+    assert_eq!(parse_one("let v = #Some 1n"), "let v = #Some 1n");
     assert_eq!(parse_one("let v = #None"), "let v = #None");
-    assert_eq!(parse_one("let v = f #A 1"), "let v = f (#A 1)");
+    assert_eq!(parse_one("let v = f #A 1n"), "let v = f (#A 1n)");
     // Which is why a bare tag written as an argument comes back in
     // parentheses: nothing follows it here, but the printer decides one node
     // at a time, and a second argument after it would be read as the payload
@@ -905,8 +905,8 @@ fn a_tag_binds_tighter_than_application() {
     assert_eq!(parse_one("let v = f #A"), "let v = f (#A)");
     // The same rule at the head of an application, where 'leaving them off
     // would turn the argument into a payload and print the tree above.
-    assert_eq!(parse_one("let v = f (#A) 1"), "let v = f (#A) 1");
-    assert_eq!(parse_one("let v = (#A) 1"), "let v = (#A) 1");
+    assert_eq!(parse_one("let v = f (#A) 1n"), "let v = f (#A) 1n");
+    assert_eq!(parse_one("let v = (#A) 1n"), "let v = (#A) 1n");
     // The payload is a projection, so the field is carried rather than the
     // record it was read off.
     assert_eq!(parse_one("let v = #Some p.x"), "let v = #Some p.x");
@@ -948,23 +948,23 @@ fn a_sum_and_a_struct_nest_without_help() {
 fn every_position_that_can_fail_reports_before_it_does() {
     for src in [
         // A definition's own name, and the two halves of an ascription.
-        "let = 1",
-        "let x : = 1",
+        "let = 1n",
+        "let x : = 1n",
         "let x : Nat",
         // An application's argument: the token begins an atom, and the atom
         // still does not parse.
         "let v = f {",
         // Inside a struct term: the label, the colon, the value, the brace.
-        "let v = { 1: 2 }",
-        "let v = { x 2 }",
+        "let v = { 1n: 2n }",
+        "let v = { x 2n }",
         "let v = { x: }",
-        "let v = { x: 1",
+        "let v = { x: 1n",
         // A case's payload, which is an atom taken greedily.
         "let v = #A {",
         // Parentheses, around an expression that is not one and around one
         // that is never closed.
         "let v = (let)",
-        "let v = (1",
+        "let v = (1n",
         // A function's arrow and its body.
         "let f = fn x y",
         "let f = fn x =>",
@@ -972,7 +972,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         // argument, a field's label, a field's type, and the parentheses.
         "type X = #A {",
         "type X = Box {",
-        "type X = { 1: Nat }",
+        "type X = { 1n: Nat }",
         "type X = { a: }",
         "type X = (let)",
         "type X = (Nat",
@@ -993,12 +993,12 @@ fn every_position_that_can_fail_reports_before_it_does() {
 #[test]
 fn a_let_is_an_expression() {
     assert_eq!(
-        parse_one("let a = let x = 1 in x"),
-        "let a = let x = 1 in x"
+        parse_one("let a = let x = 1n in x"),
+        "let a = let x = 1n in x"
     );
     assert_eq!(
-        parse_one("let a = let x : Nat = 1 in x"),
-        "let a = let x : Nat = 1 in x"
+        parse_one("let a = let x : Nat = 1n in x"),
+        "let a = let x : Nat = 1n in x"
     );
     assert_eq!(
         parse_one("let a = let f : { x: Nat } -> Nat = fn p => p.x in f"),
@@ -1035,19 +1035,19 @@ fn a_let_starts_an_expression_wherever_an_atom_does() {
         ),
         // A struct field's value.
         (
-            "let a = { v: let n = 1 in n }",
-            "let a = { v: let n = 1 in n }",
+            "let a = { v: let n = 1n in n }",
+            "let a = { v: let n = 1n in n }",
         ),
         // A parenthesized expression.
-        ("let a = (let n = 1 in n)", "let a = let n = 1 in n"),
+        ("let a = (let n = 1n in n)", "let a = let n = 1n in n"),
         // Another let's value, and another let's body.
         (
-            "let a = let x = let y = 1 in y in x",
-            "let a = let x = let y = 1 in y in x",
+            "let a = let x = let y = 1n in y in x",
+            "let a = let x = let y = 1n in y in x",
         ),
         (
-            "let a = let x = 1 in let y = x in y",
-            "let a = let x = 1 in let y = x in y",
+            "let a = let x = 1n in let y = x in y",
+            "let a = let x = 1n in let y = x in y",
         ),
     ] {
         assert_eq!(parse_one(src), printed, "{src}");
@@ -1060,18 +1060,18 @@ fn a_let_starts_an_expression_wherever_an_atom_does() {
 /// `f (let x = 1 in x)` the way to pass one.
 #[test]
 fn a_let_is_not_an_application_argument() {
-    let out = parse(lex("let a = 1 let b = 2", FileID::GENERATED).tokens);
+    let out = parse(lex("let a = 1 let b = 2n", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
     assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
 
     assert_eq!(
-        parse_one("let a = f (let x = 1 in x)"),
-        "let a = f (let x = 1 in x)"
+        parse_one("let a = f (let x = 1n in x)"),
+        "let a = f (let x = 1n in x)"
     );
 
     // Without them the application ends at `f`, the `let` is read as a new
     // definition, and its `in` is the token nothing can use.
-    let src = "let a = f let x = 1 in x";
+    let src = "let a = f let x = 1n in x";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.stmts.len(), 2, "stmts: {:#?}", out.stmts);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
@@ -1090,13 +1090,13 @@ fn a_let_expression_reports_where_it_fails() {
     // which is the token the position had no reading for.
     for (src, from) in [
         // The name, the ascribed type, and the `=`.
-        ("let a = let = 1 in x", "= 1 in x"),
-        ("let a = let x : = 1 in x", "= 1 in x"),
-        ("let a = let x 1 in x", "1 in x"),
+        ("let a = let = 1n in x", "= 1n in x"),
+        ("let a = let x : = 1n in x", "= 1n in x"),
+        ("let a = let x 1n in x", "1n in x"),
         // The value, the `in` the body follows, and the body itself.
         ("let a = let x = in x", "in x"),
-        ("let a = let x = 1 } x", "} x"),
-        ("let a = let x = 1 in }", "}"),
+        ("let a = let x = 1n } x", "} x"),
+        ("let a = let x = 1n in }", "}"),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -1106,14 +1106,14 @@ fn a_let_expression_reports_where_it_fails() {
     }
 
     // A `let` with no `in` at all runs out of input, and is reported there.
-    let src = "let a = let x = 1";
+    let src = "let a = let x = 1n";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, src.len());
     assert_eq!(out.errors[0].span.width, 0);
 
     // And recovery resumes at the next statement rather than swallowing it.
-    let out = parse(lex("let a = let x = 1  let b = 2", FileID::GENERATED).tokens);
+    let out = parse(lex("let a = let x = 1n  let b = 2n", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
 }
@@ -1124,8 +1124,8 @@ fn a_let_expression_reports_where_it_fails() {
 #[test]
 fn parses_match_expressions() {
     assert_eq!(
-        parse_one("let a = match x with #Some y => y | #None => 0 end"),
-        "let a = match x with | #Some y => y | #None => 0 end"
+        parse_one("let a = match x with #Some y => y | #None => 0n end"),
+        "let a = match x with | #Some y => y | #None => 0n end"
     );
     // The leading bar is optional and not recorded: both spellings are one
     // tree.
@@ -1166,8 +1166,8 @@ fn a_match_is_not_an_application_argument() {
         "let a = f (match x with | w => w end)"
     );
     assert_eq!(
-        parse_one("let a = match x with | w => w end 1"),
-        "let a = match x with | w => w end 1"
+        parse_one("let a = match x with | w => w end 1n"),
+        "let a = match x with | w => w end 1n"
     );
     let src = "let a = f match x with | w => w end";
     let out = parse(lex(src, FileID::GENERATED).tokens);
@@ -1190,8 +1190,8 @@ fn parses_every_kind_of_pattern() {
             "let a = match x with | { p, q: r } => r end",
         ),
         (
-            "let a = match x with {} => 1 end",
-            "let a = match x with | {} => 1 end",
+            "let a = match x with {} => 1n end",
+            "let a = match x with | {} => 1n end",
         ),
         // A trailing comma among the fields is allowed, as in a struct
         // expression.
@@ -1213,12 +1213,12 @@ fn parses_every_kind_of_pattern() {
             "let a = match x with | #A (#B y) => y end",
         ),
         (
-            "let a = match x with 0 => 1 | k => k end",
-            "let a = match x with | 0 => 1 | k => k end",
+            "let a = match x with 0n => 1n | k => k end",
+            "let a = match x with | 0n => 1n | k => k end",
         ),
         (
-            "let a = match x with () => 1 end",
-            "let a = match x with | () => 1 end",
+            "let a = match x with () => 1n end",
+            "let a = match x with | () => 1n end",
         ),
         // Grouping parentheses around a pattern are discarded, as around an
         // expression.
@@ -1251,7 +1251,7 @@ fn parses_pattern_lets() {
     // The parser records what was written and judges nothing: a refutable
     // pattern on a `let` parses, and refusing it is lowering's rule.
     assert_eq!(parse_one("let #Some x = opt"), "let #Some x = opt");
-    assert_eq!(parse_one("let 0 = n"), "let 0 = n");
+    assert_eq!(parse_one("let 0n = n"), "let 0n = n");
 }
 
 /// Every way a match can fail to parse, reported at the token that had no
@@ -1261,17 +1261,17 @@ fn parses_pattern_lets() {
 fn a_match_reports_where_it_fails() {
     for (src, from) in [
         // An arm needs a pattern, and `=>` does not begin one.
-        ("let a = match x with => 1 end", "=> 1 end"),
+        ("let a = match x with => 1n end", "=> 1n end"),
         // A `|` between arms promises another one; `end` is where the promise
         // breaks.
-        ("let a = match x with #A y => 1 | end", "end"),
+        ("let a = match x with #A y => 1n | end", "end"),
         // An arm without a body: `|` begins no expression.
         (
-            "let a = match x with #A y => | #B z => 2 end",
-            "| #B z => 2 end",
+            "let a = match x with #A y => | #B z => 2n end",
+            "| #B z => 2n end",
         ),
         // `match` is a keyword now, so it no longer names anything.
-        ("let match = 1", "match = 1"),
+        ("let match = 1n", "match = 1n"),
         // Patterns on function arguments do not exist.
         ("let f = fn {x} => x", "{x} => x"),
     ] {
@@ -1282,7 +1282,7 @@ fn a_match_reports_where_it_fails() {
     }
 
     // A match with no `end` runs out of input, and is reported there.
-    let src = "let a = match x with #A y => 1";
+    let src = "let a = match x with #A y => 1n";
     let out = parse(lex(src, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].span.start, src.len());
@@ -1307,8 +1307,8 @@ fn a_pattern_at_the_end_of_input_is_reported_there() {
 #[test]
 fn a_bare_tag_payload_is_bracketed() {
     assert_eq!(
-        parse_one("let a = match x with #A #B => 1 end"),
-        "let a = match x with | #A (#B) => 1 end"
+        parse_one("let a = match x with #A #B => 1n end"),
+        "let a = match x with | #A (#B) => 1n end"
     );
 }
 
@@ -1320,12 +1320,12 @@ fn a_wildcard_parses_in_every_pattern_position() {
     for (src, printed) in [
         // A whole arm, and grouping parentheses discarded around one.
         (
-            "let a = match x with _ => 1 end",
-            "let a = match x with | _ => 1 end",
+            "let a = match x with _ => 1n end",
+            "let a = match x with | _ => 1n end",
         ),
         (
-            "let a = match x with (_) => 1 end",
-            "let a = match x with | _ => 1 end",
+            "let a = match x with (_) => 1n end",
+            "let a = match x with | _ => 1n end",
         ),
         // A struct pattern's sub-pattern, beside a pun and a named binder.
         (
@@ -1334,18 +1334,18 @@ fn a_wildcard_parses_in_every_pattern_position() {
         ),
         // A tag's payload, taken greedily like any other.
         (
-            "let a = match x with #Some _ => 1 | #None => 0 end",
-            "let a = match x with | #Some _ => 1 | #None => 0 end",
+            "let a = match x with #Some _ => 1n | #None => 0n end",
+            "let a = match x with | #Some _ => 1n | #None => 0n end",
         ),
         // The pattern of a `let`, statement and expression.
-        ("let _ = f 1", "let _ = f 1"),
-        ("let _ : Nat = g 3", "let _ : Nat = g 3"),
-        ("let a = let _ = f 1 in 2", "let a = let _ = f 1 in 2"),
+        ("let _ = f 1n", "let _ = f 1n"),
+        ("let _ : Nat = g 3n", "let _ : Nat = g 3n"),
+        ("let a = let _ = f 1n in 2n", "let a = let _ = f 1n in 2n"),
         // Nested, and repeated: two `_` in one pattern parse — whether that
         // binds anything twice is not a question, since it binds nothing.
         (
-            "let a = match x with #Pair { a: _, b: _ } => 1 | _ => 2 end",
-            "let a = match x with | #Pair { a: _, b: _ } => 1 | _ => 2 end",
+            "let a = match x with #Pair { a: _, b: _ } => 1n | _ => 2n end",
+            "let a = match x with | #Pair { a: _, b: _ } => 1n | _ => 2n end",
         ),
     ] {
         assert_eq!(parse_one(src), printed, "{src}");
@@ -1356,8 +1356,8 @@ fn a_wildcard_parses_in_every_pattern_position() {
 /// any mix of `_` with names. The printed form re-parses to the same tree.
 #[test]
 fn a_fn_argument_may_be_a_wildcard() {
-    assert_eq!(parse_one("let f = fn _ => 1"), "let f = fn _ => 1");
-    assert_eq!(parse_one("let f = fn _ _ => 1"), "let f = fn _ _ => 1");
+    assert_eq!(parse_one("let f = fn _ => 1n"), "let f = fn _ => 1n");
+    assert_eq!(parse_one("let f = fn _ _ => 1n"), "let f = fn _ _ => 1n");
     assert_eq!(parse_one("let f = fn _ x _ => x"), "let f = fn _ x _ => x");
     assert_eq!(
         parse_one("let const = fn x _ => x"),
@@ -1376,10 +1376,10 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         ("let x = _", Place::Value),
         ("let y = f _", Place::Value),
         // A field's name, in a struct expression and a struct pattern.
-        ("let v = {_: 1}", Place::Field),
-        ("let a = match x with { _: 1 } => 0 end", Place::Field),
+        ("let v = {_: 1n}", Place::Field),
+        ("let a = match x with { _: 1n } => 0n end", Place::Field),
         // The pun: a field bound to its own name, which `_` is not.
-        ("let a = match x with {_} => 0 end", Place::Pun),
+        ("let a = match x with {_} => 0n end", Place::Pun),
         // A projection, and the operation that most nearly is one: `!Log._`
         // names nothing to perform the way `x._` names no field.
         ("let p = x._", Place::Projection),
@@ -1390,7 +1390,10 @@ fn a_misplaced_wildcard_gets_its_own_complaint() {
         ("type T _ = Nat", Place::Type),
         // And a name in a `where` clause's formula, which is written about a
         // presence a `when` gave a name to.
-        ("let f : { x when 'a: Nat } where _ = { x: 1 }", Place::Type),
+        (
+            "let f : { x when 'a: Nat } where _ = { x: 1n }",
+            Place::Type,
+        ),
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -1423,8 +1426,8 @@ fn a_struct_pattern_may_end_with_a_rest() {
         "let f = fn v => match v with | { a, .. } => a end"
     );
     assert_eq!(
-        parse_one("let f = fn v => match v with | { .. } => 1 end"),
-        "let f = fn v => match v with | { .. } => 1 end"
+        parse_one("let f = fn v => match v with | { .. } => 1n end"),
+        "let f = fn v => match v with | { .. } => 1n end"
     );
     // On a `let`, in both forms, and beside a renamed field.
     assert_eq!(parse_one("let {x, ..} = p"), "let { x, .. } = p");
@@ -1627,7 +1630,7 @@ fn a_row_of_effects_is_written_as_an_argument() {
         "let f : Fallible (\\#Ok) -> Nat = g"
     );
     // A `\` in front of neither is the unexpected token it looks like.
-    let out = parse(lex("let f : Runner (\\1) -> Nat = g", FileID::GENERATED).tokens);
+    let out = parse(lex("let f : Runner (\\1n) -> Nat = g", FileID::GENERATED).tokens);
     assert!(!out.errors.is_empty(), "{:#?}", out.errors);
 }
 
@@ -1637,7 +1640,7 @@ fn a_row_of_effects_is_written_as_an_argument() {
 /// whole of what it is still there for.
 #[test]
 fn a_row_with_no_arrow_is_a_parse_error() {
-    for source in ["let x : Nat + !Log = 1", "type T = Nat + !Log"] {
+    for source in ["let x : Nat + !Log = 1n", "type T = Nat + !Log"] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
         assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source}");
@@ -1662,7 +1665,7 @@ fn handle_expressions() {
         "let a = handle f x y with | !Log.write s => () end",
         // And a handler is self-delimiting — the `end` closes it — so it may
         // head an application with no parentheses, exactly as a match does.
-        "let a = handle e with end 1",
+        "let a = handle e with end 1n",
     ] {
         assert_eq!(parse_one(source), source);
     }
@@ -1677,11 +1680,11 @@ fn handle_expressions() {
 /// `fn` body's rule — so nothing after it is applied to what it gives back.
 #[test]
 fn raise_expressions() {
-    assert_eq!(parse_one("let a = raise 1"), "let a = raise 1");
+    assert_eq!(parse_one("let a = raise 1n"), "let a = raise 1n");
     assert_eq!(parse_one("let a = raise f x"), "let a = raise f x");
     assert_eq!(
-        parse_one("let a = handle e with | !Log.write s => raise 0 end"),
-        "let a = handle e with | !Log.write s => raise 0 end"
+        parse_one("let a = handle e with | !Log.write s => raise 0n end"),
+        "let a = handle e with | !Log.write s => raise 0n end"
     );
 }
 
@@ -1693,7 +1696,7 @@ fn an_operation_is_told_from_a_projection_by_the_sigil() {
     assert_eq!(parse_one("let a = !Log.write"), "let a = !Log.write");
     assert_eq!(parse_one("let a = base.field"), "let a = base.field");
     // An operation is a value like any other, so it applies and is applied.
-    assert_eq!(parse_one("let a = !Log.write 1"), "let a = !Log.write 1");
+    assert_eq!(parse_one("let a = !Log.write 1n"), "let a = !Log.write 1n");
     assert_eq!(parse_one("let a = f !Log.write"), "let a = f !Log.write");
     // A projection off a case is still a projection: the sigil that heads it
     // says which row the label belongs to, so neither reading is in doubt. The
@@ -1738,7 +1741,7 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
         // an operation, and only the sigil says which effect's.
         ("let a = handle e with | Log.write s => () end", "Log"),
         // A binder is a name or `_`, as a `fn` header's argument is.
-        ("let a = handle e with | !Log.write 1 => () end", "1"),
+        ("let a = handle e with | !Log.write 1n => () end", "1"),
         // The operation an arm answers is a name, and so is the one a
         // reference reads: the `.` promises one either way.
         ("let a = !Log.1", "1"),
@@ -1786,7 +1789,7 @@ fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
 /// for a statement, so the rest of the file parses exactly as it did before.
 #[test]
 fn the_bundle_header_is_read_before_any_statement() {
-    let source = "bundle demo 0.1.0\nlet x = 1\n";
+    let source = "bundle demo 0.1.0\nlet x = 1n\n";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let header = out.header.expect("the file opened with one");
@@ -1803,7 +1806,7 @@ fn the_bundle_header_is_read_before_any_statement() {
 /// loader does.
 #[test]
 fn a_file_with_no_header_parses_without_one() {
-    let out = parse(lex("let x = 1", FileID::GENERATED).tokens);
+    let out = parse(lex("let x = 1n", FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert!(out.header.is_none());
     assert_eq!(out.stmts.len(), 1);
@@ -1814,7 +1817,7 @@ fn a_file_with_no_header_parses_without_one() {
 /// read — the recovery every malformed statement gets.
 #[test]
 fn a_version_with_two_parts_is_unexpected() {
-    let source = "bundle demo 0.1\nlet x = 1";
+    let source = "bundle demo 0.1\nlet x = 1n";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
@@ -1846,15 +1849,15 @@ fn a_malformed_header_is_reported_and_recovers() {
     }
 }
 
-/// A part that does not fit in the `u64` a version holds is refused where it
-/// was written. There is nothing else the digits could have been meant as.
+/// A part beyond the 64-bit numeric literal range leaves no token for the
+/// parser, which then reports the following punctuation.
 #[test]
 fn a_version_part_too_large_is_unexpected() {
     let source = format!("bundle demo 0.{}.0", u128::from(u64::MAX) + 1);
     let out = parse(lex(&source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
-    assert_eq!(out.errors[0].span.start, "bundle demo 0.".len());
+    assert_eq!(out.errors[0].span.start, source.rfind('.').unwrap());
 }
 
 /// Both module forms, and the nesting that makes a bundle a tree. A body of
@@ -1886,7 +1889,7 @@ fn both_module_forms_parse() {
 /// module is one of the things that may be in it.
 #[test]
 fn a_module_body_holds_every_kind_of_statement() {
-    let source = "module A = type T = Nat effect E = | let x = 1 module B = let y = 2 end end";
+    let source = "module A = type T = Nat effect E = | let x = 1 module B = let y = 2n end end";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let StmtKind::Module {
@@ -1936,7 +1939,10 @@ fn paths_parse_in_expression_and_type_positions() {
 /// `Math::mk 1 2` an application of `Math::mk` rather than of `Math`.
 #[test]
 fn a_path_binds_tighter_than_application_and_projection() {
-    assert_eq!(parse_one("let made = M::mk 1 2"), "let made = M::mk 1 2");
+    assert_eq!(
+        parse_one("let made = M::mk 1n 2n"),
+        "let made = M::mk 1n 2n"
+    );
     assert_eq!(parse_one("let got = M::p.x"), "let got = M::p.x");
     assert_eq!(parse_one("let got = M::p.x.y"), "let got = M::p.x.y");
 }
@@ -1958,8 +1964,8 @@ fn an_effect_path_qualifies_the_whole_label() {
         "effect Console = Sys::!Log + !IO"
     );
     assert_eq!(
-        parse_one("let a = Sys::!Log.write 1"),
-        "let a = Sys::!Log.write 1"
+        parse_one("let a = Sys::!Log.write 1n"),
+        "let a = Sys::!Log.write 1n"
     );
     assert_eq!(
         parse_one("let a = handle e with | Sys::!Log.write s => s end"),
@@ -1988,12 +1994,12 @@ fn a_path_that_is_not_an_effect_is_read_as_a_type() {
 #[test]
 fn a_path_is_refused_where_a_name_is_bound() {
     for source in [
-        "let A::x = 1",
+        "let A::x = 1n",
         "module A::B = end",
         "type A::T = Nat",
         "effect A::E = |",
         "let f = fn A::x => x",
-        "let a = match e with A::x => 1 end",
+        "let a = match e with A::x => 1n end",
     ] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert!(
@@ -2004,7 +2010,7 @@ fn a_path_is_refused_where_a_name_is_bound() {
         assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source:?}");
     }
     // At the `::` itself for the two the error table names.
-    for source in ["let A::x = 1", "module A::B = end"] {
+    for source in ["let A::x = 1n", "module A::B = end"] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
         assert_eq!(
             out.errors[0].span.start,
@@ -2019,11 +2025,11 @@ fn a_path_is_refused_where_a_name_is_bound() {
 /// than eating the rest of the file.
 #[test]
 fn a_module_body_recovers_at_its_end() {
-    let out = parse(lex("module A = let x = 1", FileID::GENERATED).tokens);
+    let out = parse(lex("module A = let x = 1n", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
 
-    let source = "module A = with end let after = 1";
+    let source = "module A = with end let after = 1n";
     let out = parse(lex(source, FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 2, "{:#?}", out.stmts);

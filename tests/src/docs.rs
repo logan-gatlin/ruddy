@@ -89,7 +89,7 @@ fn a_document_round_trips_through_the_disk() {
     let files = [
         file("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
         file("Math.hc", "module Vec\nlet double = fn x => x\n"),
-        file("Math/Vec.hc", "let zero = 0\n"),
+        file("Math/Vec.hc", "let zero = 0n\n"),
     ];
     write(&root, "demo", &files).expect("the document is written");
 
@@ -105,7 +105,7 @@ fn a_document_round_trips_through_the_disk() {
         [
             ("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
             ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-            ("Math/Vec.hc", "let zero = 0\n"),
+            ("Math/Vec.hc", "let zero = 0n\n"),
         ]
     );
     assert!(doc.modified_ms > 0);

@@ -304,7 +304,9 @@ impl fmt::Display for Kind {
             Kind::RightParen => f.write_str(")"),
             Kind::Identifier(name) => f.write_str(name),
             Kind::Underscore => f.write_str("_"),
-            Kind::Natural(value) => write!(f, "{value}"),
+            Kind::Natural(value) => write!(f, "{value}n"),
+            Kind::Integer(value) => write!(f, "{value}i"),
+            Kind::Real(value) => write!(f, "{value}"),
         }
     }
 }
@@ -380,7 +382,7 @@ impl fmt::Display for parse::PatternKind {
         match self {
             parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
             parse::PatternKind::Wildcard => f.write_str("_"),
-            parse::PatternKind::Natural(value) => write!(f, "{value}"),
+            parse::PatternKind::Natural(value) => write!(f, "{value}n"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -446,7 +448,7 @@ impl fmt::Display for ir::Witness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ir::Witness::Any => f.write_str("anything"),
-            ir::Witness::Natural(value) => write!(f, "{value}"),
+            ir::Witness::Natural(value) => write!(f, "{value}n"),
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
             // pun-style — under exactness the presence *is* the information,
@@ -1094,6 +1096,10 @@ impl Grouped for Core {
             // are behind it. Unit is one too: its braces close it.
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Named { .. }
             | Core::Var(_)
             | Core::Bound(_)
@@ -1178,7 +1184,14 @@ fn core_tail(core: &Core) -> Option<Option<String>> {
         // the same rest.
         Core::Rigid { name, .. } => Some(Some(format!("'{name}"))),
         Core::Undecided => Some(Some(String::new())),
-        Core::Nat | Core::Arrow(..) | Core::Sum(_) | Core::Named { .. } => None,
+        Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
+        | Core::Arrow(..)
+        | Core::Sum(_)
+        | Core::Named { .. } => None,
     }
 }
 
@@ -1192,6 +1205,10 @@ impl fmt::Display for Core {
             // [`Core::Unit`].
             Core::Unit => write_fields(f, &IndexMap::new(), None),
             Core::Nat => f.write_str(Prim::Nat.name()),
+            Core::Int => f.write_str(Prim::Int.name()),
+            Core::Real => f.write_str(Prim::Real.name()),
+            Core::String => f.write_str(Prim::String.name()),
+            Core::Boolean => f.write_str(Prim::Boolean.name()),
             Core::Arrow(from, to, effects) => {
                 let row = effects_of(effects);
                 write_arrow(f, &**from, &**to, row.as_ref().map(shown))
