@@ -17,8 +17,9 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow, write_let,
-    write_match, write_project, write_row, write_struct, write_sum, write_tag,
+    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow,
+    write_binary, write_let, write_match, write_pipeline, write_project, write_row, write_struct,
+    write_sum, write_tag, write_unary,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -59,6 +60,13 @@ impl Grouped for Ast<'_, ExprKind> {
             // The body runs as far right as it can, so anything appended after
             // a `raise` would be read as part of what it carries.
             ExprKind::Raise(_) => Prec::Lambda,
+            ExprKind::Pipe { .. } => Prec::Pipeline,
+            ExprKind::Binary {
+                op: ruddy::parse::BinaryOp::Add | ruddy::parse::BinaryOp::Sub,
+                ..
+            } => Prec::Addition,
+            ExprKind::Binary { .. } => Prec::Multiplication,
+            ExprKind::Unary { .. } => Prec::Unary,
             // A tag carrying something groups as the application it reads as:
             // anything appended to `#A x` would be read as applying the
             // case rather than as a second argument to it. Carrying nothing it
@@ -78,6 +86,8 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Struct(_)
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
+            | ExprKind::Integer(_)
+            | ExprKind::Real(_)
             | ExprKind::Unit => Prec::Atom,
         }
     }
@@ -284,6 +294,19 @@ fn clause_at(f: &mut fmt::Formatter<'_>, clause: &ClauseKind, level: u8) -> fmt:
 impl fmt::Display for Ast<'_, ExprKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            ExprKind::Pipe { value, function } => {
+                write_pipeline(f, &Ast(&value.tracked), &Ast(&function.tracked))
+            }
+            ExprKind::Unary { value, .. } => write_unary(f, "-", &Ast(&value.tracked)),
+            ExprKind::Binary { op, left, right } => {
+                let (symbol, prec) = match op {
+                    ruddy::parse::BinaryOp::Add => ("+", Prec::Addition),
+                    ruddy::parse::BinaryOp::Sub => ("-", Prec::Addition),
+                    ruddy::parse::BinaryOp::Mul => ("*", Prec::Multiplication),
+                    ruddy::parse::BinaryOp::Div => ("/", Prec::Multiplication),
+                };
+                write_binary(f, &Ast(&left.tracked), symbol, &Ast(&right.tracked), prec)
+            }
             ExprKind::Apply { func, arg } => {
                 write_apply(f, &Ast(&func.tracked), &Ast(&arg.tracked))
             }
@@ -338,7 +361,9 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 write!(f, "{}.{}", labelled(effect), op.tracked)
             }
             ExprKind::Ident { name } => write!(f, "{name}"),
-            ExprKind::Natural(value) => write!(f, "{value}"),
+            ExprKind::Natural(value) => write!(f, "{value}n"),
+            ExprKind::Integer(value) => write!(f, "{value}i"),
+            ExprKind::Real(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
         }
     }

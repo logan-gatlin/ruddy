@@ -203,20 +203,20 @@ fn displays_structs_and_unit() {
 
 #[test]
 fn displays_naturals() {
-    assert_eq!(display_program("let n = 0"), "let n = 0");
+    assert_eq!(display_program("let n = 0n"), "let n = 0n");
     assert_eq!(
-        display_program("let p = fn f => f 1 (f 2 3)"),
-        "let p = fn f => f 1 (f 2 3)"
+        display_program("let p = fn f => f 1n (f 2n 3n)"),
+        "let p = fn f => f 1n (f 2n 3n)"
     );
     assert_eq!(
-        display_program("let s = { width: 3, height: 4 }"),
-        "let s = { width: 3, height: 4 }"
+        display_program("let s = { width: 3n, height: 4n }"),
+        "let s = { width: 3n, height: 4n }"
     );
 }
 
 #[test]
 fn a_natural_lowers_to_its_value_and_span() {
-    let (mint, out) = built("let n = 4096");
+    let (mint, out) = built("let n = 4096n");
 
     let TermKind::Natural(value) = term_value(&mint, &out, "n") else {
         panic!("expected a natural");
@@ -225,18 +225,18 @@ fn a_natural_lowers_to_its_value_and_span() {
 
     let span = out.program.terms[&term_symbol(&mint, &out, "n")].value.span;
     assert_eq!(span.start, 8);
-    assert_eq!(span.width, 4);
+    assert_eq!(span.width, 5);
 }
 
 #[test]
 fn a_natural_names_nothing() {
     // A literal is not a name, so lowering one mints no symbol and looks
     // none up: only the `let` itself is minted...
-    let (mint, _) = built("let n = 7");
+    let (mint, _) = built("let n = 7n");
     assert_eq!(mint.symbols().count(), 1);
 
     // ...and an undefined name beside a literal is still the one error.
-    let (_, out) = build_src("let m = f 7");
+    let (_, out) = build_src("let m = f 7n");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
 }
 
@@ -888,11 +888,11 @@ fn a_type_takes_the_arguments_it_declares() {
 fn a_head_that_cannot_be_applied_is_still_lowered() {
     // The same complaint the reader would get without the arguments, plus the
     // one about the arguments.
-    let (_, out) = build_src("let f : { x: Bogus } Nat = 1");
+    let (_, out) = build_src("let f : { x: Bogus } Nat = 1n");
     let codes: Vec<&str> = out.errors.iter().map(|error| error.kind.code()).collect();
     assert_eq!(codes, ["not-a-type-constructor", "undefined-type"]);
 
-    let (_, out) = build_src("let f : { x: Bogus } = 1");
+    let (_, out) = build_src("let f : { x: Bogus } = 1n");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "undefined-type");
 
@@ -915,9 +915,9 @@ fn a_head_that_cannot_be_applied_is_still_lowered() {
 #[test]
 fn errors_are_reported_in_source_order() {
     for src in [
-        "type W 'r = { x: Nat, ..'r }\nlet a : W Nat -> Nat = fn v => 1\nlet b = nosuchname",
-        "type W 'r = { x: Nat, ..'r }\nlet a = nosuchname\nlet b : W Nat -> Nat = fn v => 1",
-        "let f : { x: Bogus } Nat = 1",
+        "type W 'r = { x: Nat, ..'r }\nlet a : W Nat -> Nat = fn v => 1n\nlet b = nosuchname",
+        "type W 'r = { x: Nat, ..'r }\nlet a = nosuchname\nlet b : W Nat -> Nat = fn v => 1n",
+        "let f : { x: Bogus } Nat = 1n",
         "type Bad 'a = { x: 'a, ..'a }\nlet c = alsomissing",
         "type L 'a = { next: L { x: 'a } }\nlet d = missing",
     ] {
@@ -968,7 +968,7 @@ fn only_a_declared_type_can_be_applied() {
 /// *are* about the name.
 #[test]
 fn a_wrong_argument_count_underlines_the_whole_application() {
-    let src = "type Pair 'a 'b = { f: 'a, s: 'b }  let p: Pair Nat Nat Nat = 1";
+    let src = "type Pair 'a 'b = { f: 'a, s: 'b }  let p: Pair Nat Nat Nat = 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::Arity { .. }));
@@ -1034,7 +1034,7 @@ fn a_declaration_binds_each_parameter_once() {
 /// that was written asked for an argument no body could name.
 #[test]
 fn a_repeated_parameter_is_not_counted_twice() {
-    let (mint, out) = build_src("type P 'A 'A = { x: 'A }  let v : P Nat = { x: 1 }");
+    let (mint, out) = build_src("type P 'A 'A = { x: 'A }  let v : P Nat = { x: 1n }");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
@@ -1361,9 +1361,9 @@ fn a_mixed_parameter_names_the_declaration_that_mixed_it() {
 #[test]
 fn a_mixed_parameter_absorbs_its_own_use_sites() {
     let src = "type Bad 'a = { x: (#A | ..'a), y: 'a }\n\
-               let f: Bad Nat = { x: #A, y: 1 }\n\
+               let f: Bad Nat = { x: #A, y: 1n }\n\
                let g: Bad Nat -> Nat = fn v => v.y\n\
-               let h: Bad Nat -> Nat = fn v => 1";
+               let h: Bad Nat -> Nat = fn v => 1n";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -1423,9 +1423,9 @@ fn a_mixed_parameter_is_reported_once_along_a_chain() {
 #[test]
 fn only_a_row_may_be_written_where_a_row_goes() {
     for src in [
-        "type Or 'r = #A | ..'r  let f : Or Nat -> Nat = fn p => 1",
-        "type Or 'r = #A | ..'r  let f : Or (Nat -> Nat) -> Nat = fn p => 1",
-        "type Or 'r = #A | ..'r  let f : Or { y: Nat } -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  let f : Or Nat -> Nat = fn p => 1n",
+        "type Or 'r = #A | ..'r  let f : Or (Nat -> Nat) -> Nat = fn p => 1n",
+        "type Or 'r = #A | ..'r  let f : Or { y: Nat } -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  type Bad = Or Nat",
     ] {
         let (_, out) = build_src(src);
@@ -1440,8 +1440,8 @@ fn only_a_row_may_be_written_where_a_row_goes() {
 
     // A sum is one, and so is another sum's row parameter handed straight on.
     for src in [
-        "type Or 'r = #A | ..'r  let f : Or (#B Nat) -> Nat = fn p => 1",
-        "type Or 'r = #A | ..'r  let f : Or (|) -> Nat = fn p => 1",
+        "type Or 'r = #A | ..'r  let f : Or (#B Nat) -> Nat = fn p => 1n",
+        "type Or 'r = #A | ..'r  let f : Or (|) -> Nat = fn p => 1n",
         "type Or 'r = #A | ..'r  type Pass 's = Or 's",
     ] {
         let (_, out) = build_src(src);
@@ -1635,7 +1635,7 @@ fn lowers_a_sum_type() {
 /// nothing about it can fail to resolve.
 #[test]
 fn lowers_a_tag() {
-    let (mint, out) = built("let v = #Some 1  let n = #None");
+    let (mint, out) = built("let v = #Some 1n  let n = #None");
     let TermKind::Tag { name, payload } = term_value(&mint, &out, "v") else {
         panic!("expected a tag");
     };
@@ -1796,7 +1796,7 @@ fn a_sum_makes_a_type_recursive_rather_than_circular() {
 /// anywhere 'telling the reader why.
 #[test]
 fn one_tail_name_is_one_shape_of_rest() {
-    let src = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1";
+    let src = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
@@ -1829,7 +1829,7 @@ fn one_tail_name_is_one_shape_of_rest() {
     // Either order: the row that absorbs is the second one written, whichever
     // shape that is.
     let (_, out) =
-        build_src("let f : (#A Nat | ..'r) -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1");
+        build_src("let f : (#A Nat | ..'r) -> { x: Nat, ..'r } -> Nat = fn a => fn b => 1n");
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(
         matches!(
@@ -1845,16 +1845,16 @@ fn one_tail_name_is_one_shape_of_rest() {
     );
 
     // Two tails of one shape are what naming one is *for*, and stay one rest.
-    let (_, out) = build_src("let f : { x: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1");
+    let (_, out) = build_src("let f : { x: Nat, ..'r } -> { ..'r } -> Nat = fn a => fn b => 1n");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let (_, out) = build_src("let f : (#A Nat | ..'r) -> (| ..'r) -> Nat = fn a => fn b => 1");
+    let (_, out) = build_src("let f : (#A Nat | ..'r) -> (| ..'r) -> Nat = fn a => fn b => 1n");
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     // And the scope is one written type, so two annotations may each use `r`
     // for a rest of their own.
     let (_, out) = build_src(
-        "let f : { x: Nat, ..'r } -> Nat = fn a => 1\n\
-         let g : (#A Nat | ..'r) -> Nat = fn b => 2",
+        "let f : { x: Nat, ..'r } -> Nat = fn a => 1n\n\
+         let g : (#A Nat | ..'r) -> Nat = fn b => 2n",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }
@@ -1864,7 +1864,7 @@ fn one_tail_name_is_one_shape_of_rest() {
 /// declaration and everything that mentions it means that one.
 #[test]
 fn duplicate_type_declarations_keep_the_first() {
-    let (mint, out) = build_src("type T = Nat  type T = { x: Nat }  let v : T = 1");
+    let (mint, out) = build_src("type T = Nat  type T = { x: Nat }  let v : T = 1n");
 
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(
@@ -2010,8 +2010,8 @@ fn a_definition_reaching_a_shape_is_not_circular() {
         "let s = { a: s }",
         "let t = #Some t",
         "let p = q.field  let q = p",
-        "let u = u 1",
-        "let z = 1  let y = z",
+        "let u = u 1n",
+        "let z = 1n  let y = z",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -2025,7 +2025,7 @@ fn a_definition_reaching_a_shape_is_not_circular() {
 /// A file of definitions that name nobody is a group apiece, in source order.
 #[test]
 fn independent_definitions_are_a_group_each() {
-    let (mint, out) = built("let a = 1  let b = 2  let c = 3");
+    let (mint, out) = built("let a = 1n  let b = 2n  let c = 3n");
 
     assert_eq!(groups(&mint, &out), [vec!["a"], vec!["b"], vec!["c"]]);
     assert!(out.program.groups.iter().all(|group| !group.recursive));
@@ -2056,17 +2056,17 @@ fn a_mutual_pair_is_one_group() {
 /// solved first — including when it is written below.
 #[test]
 fn a_dependency_comes_before_what_names_it() {
-    let (mint, out) = built("let id = fn x => x  let a = id 1");
+    let (mint, out) = built("let id = fn x => x  let a = id 1n");
     assert_eq!(groups(&mint, &out), [vec!["id"], vec!["a"]]);
 
-    let (mint, out) = built("let a = id 1  let id = fn x => x");
+    let (mint, out) = built("let a = id 1n  let id = fn x => x");
     assert_eq!(groups(&mint, &out), [vec!["id"], vec!["a"]]);
 
     // The exact vector, and not merely the pairwise order: a hash-ordered
     // grouping passes every "this is before that" assertion and still hands
     // inference a different order every run.
     let (mint, out) =
-        built("let top = mid 1  let mid = fn n => bot n  let bot = fn n => n  let lone = 0");
+        built("let top = mid 1n  let mid = fn n => bot n  let bot = fn n => n  let lone = 0n");
     // `lone` names nobody and nobody names it, so it sits after the three that
     // have to come in that order — its own name being the last of the four
     // written.
@@ -2080,7 +2080,7 @@ fn a_dependency_comes_before_what_names_it() {
 /// off the values as they finally stand rather than as they were written.
 #[test]
 fn a_refused_loop_is_a_group_of_one() {
-    let (mint, out) = build_src("let a = b  let b = a  let c = 1");
+    let (mint, out) = build_src("let a = b  let b = a  let c = 1n");
 
     assert_eq!(groups(&mint, &out), [vec!["a"], vec!["b"], vec!["c"]]);
     assert!(out.program.groups.iter().all(|group| !group.recursive));
@@ -2256,7 +2256,7 @@ fn a_nested_let_binds_its_name_for_the_value_and_the_body() {
 /// visible after the expression it was written in.
 #[test]
 fn a_nested_let_releases_its_name_after_the_body() {
-    let src = "let leaked = let n = 1 in n\nlet after = n";
+    let src = "let leaked = let n = 1n in n\nlet after = n";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2275,7 +2275,7 @@ fn a_nested_let_releases_its_name_after_the_body() {
 /// second definition.
 #[test]
 fn a_nested_let_shadows_without_complaint() {
-    let (mint, out) = built("let n = 1\nlet a = let n = { v: 2 } in n");
+    let (mint, out) = built("let n = 1n\nlet a = let n = { v: 2n } in n");
     let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
         panic!("expected a let");
     };
@@ -2283,7 +2283,7 @@ fn a_nested_let_shadows_without_complaint() {
     assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == name.tracked));
     assert_ne!(name.tracked, term_symbol(&mint, &out, "n"));
 
-    let (_, out) = build_src("let n = 1  let n = 2");
+    let (_, out) = build_src("let n = 1n  let n = 2n");
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::Duplicate { .. }));
 }
@@ -2293,7 +2293,7 @@ fn a_nested_let_shadows_without_complaint() {
 /// written, and naming it is an unresolved name like any other.
 #[test]
 fn two_nested_lets_cannot_name_each_other() {
-    let src = "let e = let a = b in let b = 1 in a";
+    let src = "let e = let a = b in let b = 1n in a";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2370,9 +2370,9 @@ fn a_loop_through_two_nested_lets_reports_both() {
 fn a_nested_let_reaching_a_shape_is_not_circular() {
     for src in [
         "let e = let f = fn n => f n in f",
-        "let e = let x = 1 in let y = x in y",
+        "let e = let x = 1n in let y = x in y",
         "let e = fn p => let q = p in q",
-        "let a = let x = 1 in x  let b = a",
+        "let a = let x = 1n in x  let b = a",
     ] {
         let (_, out) = build_src(src);
         assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -2384,7 +2384,7 @@ fn a_nested_let_reaching_a_shape_is_not_circular() {
 /// would be a `RepeatedRowField` never reported.
 #[test]
 fn a_nested_annotation_reaches_the_row_argument_check() {
-    let src = "type WithX 'r = { x: Nat, ..'r }\nlet e = let n : WithX { x: Nat } = 1 in n";
+    let src = "type WithX 'r = { x: Nat, ..'r }\nlet e = let n : WithX { x: Nat } = 1n in n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2410,7 +2410,7 @@ fn grouping_sees_through_a_nested_let() {
     assert!(out.program.groups[0].recursive);
 
     // And a definition whose nested binding names nobody is a group of one.
-    let (mint, out) = built("let a = let x = 1 in x");
+    let (mint, out) = built("let a = let x = 1n in x");
     assert_eq!(groups(&mint, &out), [vec!["a"]]);
     assert!(!out.program.groups[0].recursive);
 }
@@ -2420,17 +2420,17 @@ fn grouping_sees_through_a_nested_let() {
 #[test]
 fn displays_nested_lets() {
     assert_eq!(
-        display_program("let a = let x = 1 in x"),
-        "let a = let x = 1 in x"
+        display_program("let a = let x = 1n in x"),
+        "let a = let x = 1n in x"
     );
     assert_eq!(
-        display_program("let a = let x : Nat = 1 in x"),
-        "let a = let x : Nat = 1 in x"
+        display_program("let a = let x : Nat = 1n in x"),
+        "let a = let x : Nat = 1n in x"
     );
     // A `let` in argument position wears the parentheses that make it one.
     assert_eq!(
-        display_program("let f = fn x => x  let a = f (let x = 1 in x)"),
-        "let f = fn x => x\nlet a = f (let x = 1 in x)"
+        display_program("let f = fn x => x  let a = f (let x = 1n in x)"),
+        "let f = fn x => x\nlet a = f (let x = 1n in x)"
     );
 }
 
@@ -2460,7 +2460,7 @@ fn lowers_absent_labels_in_written_position() {
 
     // The sum counterpart: the case keeps its `#`, and the span keeps
     // the `\` in front of it.
-    let src = "let x : #Ok Nat | \\#Err | .. = #Ok 1";
+    let src = "let x : #Ok Nat | \\#Err | .. = #Ok 1n";
     let (mint, out) = built(src);
     let annotation = out.program.terms[&term_symbol(&mint, &out, "x")]
         .annotation
@@ -2483,7 +2483,7 @@ fn lowers_absent_labels_in_written_position() {
 /// already says that. Reported at the `\name`, and the composite absorbs.
 #[test]
 fn an_absent_label_needs_a_tail() {
-    let src = "let x : { a: Nat, \\y } = 1";
+    let src = "let x : { a: Nat, \\y } = 1n";
     let (mint, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2504,7 +2504,7 @@ fn an_absent_label_needs_a_tail() {
         "the struct absorbs: {annotation:#?}"
     );
 
-    let src = "let x : #A | \\#B = 1";
+    let src = "let x : #A | \\#B = 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2522,7 +2522,7 @@ fn an_absent_label_needs_a_tail() {
 
     // Every absence in the row is its own report, the way every `when` in a
     // declared type is: each is a mark the reader can act on.
-    let (_, out) = build_src("let x : { \\y, \\z } = 1");
+    let (_, out) = build_src("let x : { \\y, \\z } = 1n");
     assert_eq!(out.errors.len(), 2, "errors: {:#?}", out.errors);
 
     // A declaration's tail must name a parameter (the existing rule), so a
@@ -2550,9 +2550,9 @@ fn an_absent_label_needs_a_tail() {
 #[test]
 fn a_label_named_present_and_absent_is_a_duplicate() {
     for (src, second) in [
-        ("let x : { x: Nat, \\x, .. } = 1", "\\x"),
-        ("let x : { \\x, x: Nat, .. } = 1", "x: Nat"),
-        ("let x : { \\x, \\x, .. } = 1", "\\x"),
+        ("let x : { x: Nat, \\x, .. } = 1n", "\\x"),
+        ("let x : { \\x, x: Nat, .. } = 1n", "x: Nat"),
+        ("let x : { \\x, \\x, .. } = 1n", "\\x"),
     ] {
         let (_, out) = build_src(src);
         assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
@@ -2568,7 +2568,7 @@ fn a_label_named_present_and_absent_is_a_duplicate() {
         );
     }
 
-    let src = "let x : #A | \\#A | .. = 1";
+    let src = "let x : #A | \\#A | .. = 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
@@ -2598,7 +2598,7 @@ fn an_absent_label_joins_a_parameters_lacks() {
 /// names.
 #[test]
 fn an_argument_may_not_name_an_absent_label() {
-    let src = "type T 'r = { x: Nat, \\y, ..'r }\nlet v : T { y: Nat } = { x: 1, y: 2 }";
+    let src = "type T 'r = { x: Nat, \\y, ..'r }\nlet v : T { y: Nat } = { x: 1n, y: 2n }";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2613,7 +2613,7 @@ fn an_argument_may_not_name_an_absent_label() {
         src.find("{ y: Nat }").expect("the argument")
     );
 
-    let src = "type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Err Nat) = #Ok 1";
+    let src = "type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Err Nat) = #Ok 1n";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
     assert!(matches!(
@@ -2626,7 +2626,7 @@ fn an_argument_may_not_name_an_absent_label() {
 
     // An argument that names none of them is welcome.
     let (_, out) =
-        build_src("type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Warn Nat) = #Ok 1");
+        build_src("type NoErr 'r = #Ok Nat | \\#Err | ..'r\nlet x : NoErr (#Warn Nat) = #Ok 1n");
     assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
 }
 
@@ -2689,9 +2689,12 @@ fn lowered(src: &str) -> String {
 /// recursively.
 #[test]
 fn an_identifier_let_lowers_unchanged() {
-    assert_eq!(lowered("let x = 1"), "let x = 1");
+    assert_eq!(lowered("let x = 1n"), "let x = 1n");
     assert_eq!(lowered("let f = fn n => f n"), "let f = fn n => f n");
-    assert_eq!(lowered("let a = let x = 1 in x"), "let a = let x = 1 in x");
+    assert_eq!(
+        lowered("let a = let x = 1n in x"),
+        "let a = let x = 1n in x"
+    );
 }
 
 /// R6's statement half: `let {x, y} = e` is a fresh definition holding `e`,
@@ -2701,15 +2704,15 @@ fn an_identifier_let_lowers_unchanged() {
 #[test]
 fn a_struct_let_statement_makes_a_definition_per_field() {
     assert_eq!(
-        lowered("let {x, y} = { x: 1, y: 2 }"),
-        "let %struct : { x: _, y: _ } = { x: 1, y: 2 }\nlet x = %struct.x\nlet y = %struct.y"
+        lowered("let {x, y} = { x: 1n, y: 2n }"),
+        "let %struct : { x: _, y: _ } = { x: 1n, y: 2n }\nlet x = %struct.x\nlet y = %struct.y"
     );
     // Renaming and annotation: the written annotation is the contract on the
     // whole value, so it holds the value on a binding of its own, and the
     // exact demand rides on the temporary the projections read.
     assert_eq!(
-        lowered("let {x: a} : { x: Nat } = { x: 1 }"),
-        "let %value : { x: Nat } = { x: 1 }\nlet %struct : { x: _ } = %value\nlet a = %struct.x"
+        lowered("let {x: a} : { x: Nat } = { x: 1n }"),
+        "let %value : { x: Nat } = { x: 1n }\nlet %struct : { x: _ } = %value\nlet a = %struct.x"
     );
     // `let {} = e` is the unit pattern by another spelling: exactly no
     // fields.
@@ -2717,19 +2720,19 @@ fn a_struct_let_statement_makes_a_definition_per_field() {
     // With the `..` there is no demand beyond the projections': the pattern
     // is open, and the temporary is bare.
     assert_eq!(
-        lowered("let {x, ..} = { x: 1, y: 2 }"),
-        "let %struct = { x: 1, y: 2 }\nlet x = %struct.x"
+        lowered("let {x, ..} = { x: 1n, y: 2n }"),
+        "let %struct = { x: 1n, y: 2n }\nlet x = %struct.x"
     );
     // Nesting chains through intermediate temporaries, still in field order,
     // each exact level with a demand of its own.
     assert_eq!(
-        lowered("let {pos: {x, y}, tag: t} = p  let p = { pos: { x: 1, y: 2 }, tag: 3 }"),
+        lowered("let {pos: {x, y}, tag: t} = p  let p = { pos: { x: 1n, y: 2n }, tag: 3n }"),
         "let %struct : { pos: _, tag: _ } = p\n\
          let %struct : { x: _, y: _ } = %struct.pos\n\
          let x = %struct.x\n\
          let y = %struct.y\n\
          let t = %struct.tag\n\
-         let p = { pos: { x: 1, y: 2 }, tag: 3 }"
+         let p = { pos: { x: 1n, y: 2n }, tag: 3n }"
     );
 }
 
@@ -2751,8 +2754,8 @@ fn a_struct_let_expression_chains_through_a_temporary() {
     // A written annotation holds the whole value on a binding of its own, and
     // the exact demand rides on the temporary the projections read.
     assert_eq!(
-        lowered("let a = let {x} : { x: Nat } = { x: 1 } in x"),
-        "let a = let %value : { x: Nat } = { x: 1 } in \
+        lowered("let a = let {x} : { x: Nat } = { x: 1n } in x"),
+        "let a = let %value : { x: Nat } = { x: 1n } in \
          let %struct : { x: _ } = %value in let x = %struct.x in x"
     );
     // The spec's own nested example.
@@ -2766,8 +2769,8 @@ fn a_struct_let_expression_chains_through_a_temporary() {
     );
     // `()` constrains the value to unit through an annotated fresh binding.
     assert_eq!(
-        lowered("let u = let () = {} in 1"),
-        "let u = let %unit : {} = {} in 1"
+        lowered("let u = let () = {} in 1n"),
+        "let u = let %unit : {} = {} in 1n"
     );
 }
 
@@ -2778,21 +2781,21 @@ fn a_struct_let_expression_chains_through_a_temporary() {
 /// a type assertion.
 #[test]
 fn a_wildcard_let_statement_defines_a_hidden_fresh_name() {
-    assert_eq!(lowered("let _ = 1"), "let %discard = 1");
+    assert_eq!(lowered("let _ = 1n"), "let %discard = 1n");
     // The headline: two of them, plus a third asserting a type — no
     // duplicate-definition error anywhere.
     assert_eq!(
-        lowered("let _ = f 1  let _ = f 2  let _ : Nat = f 3  let f = fn x => x"),
-        "let %discard = f 1\nlet %discard = f 2\nlet %discard : Nat = f 3\nlet f = fn x => x"
+        lowered("let _ = f 1n  let _ = f 2n  let _ : Nat = f 3n  let f = fn x => x"),
+        "let %discard = f 1n\nlet %discard = f 2n\nlet %discard : Nat = f 3n\nlet f = fn x => x"
     );
     // Nor a collision with a named definition of any spelling.
     assert_eq!(
-        lowered("let x = 1  let _ = 2  let x2 = 3"),
-        "let x = 1\nlet %discard = 2\nlet x2 = 3"
+        lowered("let x = 1n  let _ = 2n  let x2 = 3n"),
+        "let x = 1n\nlet %discard = 2n\nlet x2 = 3n"
     );
 
     // The hidden definitions are distinct symbols, each holding its own value.
-    let (mint, out) = built("let _ = 1  let _ = 2");
+    let (mint, out) = built("let _ = 1n  let _ = 2n");
     let discards: Vec<Symbol> = out
         .program
         .terms
@@ -2810,18 +2813,18 @@ fn a_wildcard_let_statement_defines_a_hidden_fresh_name() {
 #[test]
 fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
     assert_eq!(
-        lowered("let a = let _ = f 1 in 2  let f = fn x => x"),
-        "let a = let %discard = f 1 in 2\nlet f = fn x => x"
+        lowered("let a = let _ = f 1n in 2n  let f = fn x => x"),
+        "let a = let %discard = f 1n in 2n\nlet f = fn x => x"
     );
     // The annotation stays the contract on the value.
     assert_eq!(
-        lowered("let a = let _ : Nat = 1 in 2"),
-        "let a = let %discard : Nat = 1 in 2"
+        lowered("let a = let _ : Nat = 1n in 2n"),
+        "let a = let %discard : Nat = 1n in 2n"
     );
 
     // The fresh symbol is bound into no scope: the body's `2` aside, nothing
     // references it, and the tree says so.
-    let (mint, out) = built("let a = let _ = 1 in 2");
+    let (mint, out) = built("let a = let _ = 1n in 2n");
     let TermKind::Let { name, body, .. } = term_value(&mint, &out, "a") else {
         panic!("a lowers to a let");
     };
@@ -2835,6 +2838,11 @@ fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
 fn references_of(term: &Term, out: &mut Vec<Symbol>) {
     match &term.kind {
         TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Unary { value, .. } => references_of(value, out),
+        TermKind::Binary { left, right, .. } => {
+            references_of(left, out);
+            references_of(right, out);
+        }
         TermKind::Apply { func, arg } => {
             references_of(func, out);
             references_of(arg, out);
@@ -2872,7 +2880,7 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
                 references_of(body, out);
             }
         }
-        TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::Error => {}
     }
 }
 
@@ -2882,8 +2890,8 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
 #[test]
 fn a_wildcard_struct_leaf_keeps_the_projection() {
     assert_eq!(
-        lowered("let {x: _, y} = { x: 1, y: 2 }"),
-        "let %struct : { x: _, y: _ } = { x: 1, y: 2 }\n\
+        lowered("let {x: _, y} = { x: 1n, y: 2n }"),
+        "let %struct : { x: _, y: _ } = { x: 1n, y: 2n }\n\
          let %discard = %struct.x\nlet y = %struct.y"
     );
     assert_eq!(
@@ -2899,8 +2907,8 @@ fn a_wildcard_struct_leaf_keeps_the_projection() {
 #[test]
 fn a_wildcard_is_exempt_from_the_duplicate_binder_check() {
     assert_eq!(
-        lowered("let f = fn e => match e with | #Pair { a: _, b: _ } => 1 | _ => 2 end"),
-        "let f = fn e => match e with | #Pair { a: _, b: _ } => 1 | _ => 2 end"
+        lowered("let f = fn e => match e with | #Pair { a: _, b: _ } => 1n | _ => 2n end"),
+        "let f = fn e => match e with | #Pair { a: _, b: _ } => 1n | _ => 2n end"
     );
     assert_eq!(
         lowered("let f = fn e => match e with { a: _, b: x } => x end"),
@@ -2918,7 +2926,7 @@ fn a_wildcard_is_exempt_from_the_duplicate_binder_check() {
 /// arguments mix with names.
 #[test]
 fn a_wildcard_fn_argument_binds_a_symbol_nothing_references() {
-    let (mint, out) = built("let f = fn _ => 1");
+    let (mint, out) = built("let f = fn _ => 1n");
     let TermKind::Fn { arg, body } = term_value(&mint, &out, "f") else {
         panic!("f is a function");
     };
@@ -2952,7 +2960,7 @@ fn a_wildcard_fn_argument_binds_a_symbol_nothing_references() {
 /// with the unchanged wording.
 #[test]
 fn a_wildcard_does_not_make_a_refutable_binding_calm() {
-    let src = "let #Some _ = opt  let opt = #Some 1";
+    let src = "let #Some _ = opt  let opt = #Some 1n";
     let (_, errors) = lowered_with_errors(src);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
@@ -2960,7 +2968,7 @@ fn a_wildcard_does_not_make_a_refutable_binding_calm() {
         format!("binding-can-fail@{}", src.find("#Some").expect("the tag"))
     );
 
-    let src = "let a = let #Some _ = opt in 1  let opt = #Some 1";
+    let src = "let a = let #Some _ = opt in 1n  let opt = #Some 1n";
     let (_, errors) = lowered_with_errors(src);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(errors[0].starts_with("binding-can-fail@"), "{errors:#?}");
@@ -2972,17 +2980,17 @@ fn a_wildcard_does_not_make_a_refutable_binding_calm() {
 #[test]
 fn a_wildcard_arm_lowers_wherever_it_was_written() {
     assert_eq!(
-        lowered("let f = fn n => match n with _ => 1 | 0 => 2 end"),
-        "let f = fn n => match n with | _ => 1 | 0 => 2 end"
+        lowered("let f = fn n => match n with _ => 1n | 0n => 2n end"),
+        "let f = fn n => match n with | _ => 1n | 0n => 2n end"
     );
     assert_eq!(
-        lowered("let f = fn e => match e with _ => 1 | _ => 2 end"),
-        "let f = fn e => match e with | _ => 1 | _ => 2 end"
+        lowered("let f = fn e => match e with _ => 1n | _ => 2n end"),
+        "let f = fn e => match e with | _ => 1n | _ => 2n end"
     );
     // Last, it is what a named catch-all is: an ordinary final arm.
     assert_eq!(
-        lowered("let f = fn n => match n with 0 => 1 | _ => 2 end"),
-        "let f = fn n => match n with | 0 => 1 | _ => 2 end"
+        lowered("let f = fn n => match n with 0n => 1n | _ => 2n end"),
+        "let f = fn n => match n with | 0n => 1n | _ => 2n end"
     );
 }
 
@@ -2992,8 +3000,8 @@ fn a_wildcard_arm_lowers_wherever_it_was_written() {
 #[test]
 fn a_match_lowers_to_one_matrix_node() {
     assert_eq!(
-        lowered("let get = fn opt => match opt with | #Some x => x | #None => 0 end"),
-        "let get = fn opt => match opt with | #Some x => x | #None => 0 end"
+        lowered("let get = fn opt => match opt with | #Some x => x | #None => 0n end"),
+        "let get = fn opt => match opt with | #Some x => x | #None => 0n end"
     );
     // A pun arrives expanded — field "x" carrying x's own symbol — and
     // nothing else changes shape.
@@ -3009,9 +3017,9 @@ fn a_match_lowers_to_one_matrix_node() {
 #[test]
 fn no_tree_artifacts_exist() {
     for src in [
-        "let f = fn e => match e with | #A #X x => 1 | r => 2 end",
-        "let f = fn e => match e with | { a: #A, b: #B } => 1 | r => 2 end",
-        "let f = fn e => match e with | #A 0 => 1 | #A #X => 2 | r => 3 end",
+        "let f = fn e => match e with | #A #X x => 1n | r => 2n end",
+        "let f = fn e => match e with | { a: #A, b: #B } => 1n | r => 2n end",
+        "let f = fn e => match e with | #A 0n => 1n | #A #X => 2n | r => 3n end",
     ] {
         let (printed, _) = lowered_with_errors(src);
         for artifact in ["%scrut", "%join", "%fall", "%case"] {
@@ -3027,15 +3035,15 @@ fn no_tree_artifacts_exist() {
 fn nested_arms_stay_written() {
     let src = "let pick = fn l => match l with \
                | #Cons { head: #Some x, tail: t } => x \
-               | #Cons { head: #None, tail: t } => 0 \
-               | #Nil => 0 \
+               | #Cons { head: #None, tail: t } => 0n \
+               | #Nil => 0n \
                end";
     assert_eq!(
         lowered(src),
         "let pick = fn l => match l with \
          | #Cons { head: #Some x, tail: t } => x \
-         | #Cons { head: #None, tail: t } => 0 \
-         | #Nil => 0 \
+         | #Cons { head: #None, tail: t } => 0n \
+         | #Nil => 0n \
          end"
     );
 
@@ -3081,14 +3089,14 @@ fn a_sole_catch_all_keeps_its_shape() {
         "let f = fn v => match v with | { x: x } => x end"
     );
     assert_eq!(
-        lowered("let f = fn v => match v with () => 1 end"),
-        "let f = fn v => match v with | () => 1 end"
+        lowered("let f = fn v => match v with () => 1n end"),
+        "let f = fn v => match v with | () => 1n end"
     );
     // `{}` reaches into nothing: it binds nothing, tests nothing, and is as
     // much a catch-all as a bare name.
     assert_eq!(
-        lowered("let f = fn v => match v with {} => 1 end"),
-        "let f = fn v => match v with | {} => 1 end"
+        lowered("let f = fn v => match v with {} => 1n end"),
+        "let f = fn v => match v with | {} => 1n end"
     );
 }
 
@@ -3116,8 +3124,8 @@ fn a_catch_all_is_an_ordinary_last_arm() {
 #[test]
 fn natural_arms_lower_flat() {
     assert_eq!(
-        lowered("let d = fn n => match n with | 0 => #Zero | 1 => #One | k => #Many end"),
-        "let d = fn n => match n with | 0 => #Zero | 1 => #One | k => #Many end"
+        lowered("let d = fn n => match n with | 0n => #Zero | 1n => #One | k => #Many end"),
+        "let d = fn n => match n with | 0n => #Zero | 1n => #One | k => #Many end"
     );
 }
 
@@ -3143,7 +3151,7 @@ fn a_match_is_a_shape_for_the_circularity_walk() {
 #[test]
 fn grouping_sees_references_inside_arm_bodies() {
     let (mint, out) = built(
-        "let a = fn v => match v with | #Go x => b x | r => 0 end\n\
+        "let a = fn v => match v with | #Go x => b x | r => 0n end\n\
          let b = fn x => a x",
     );
     assert_eq!(groups(&mint, &out), [vec!["a", "b"]]);
@@ -3158,23 +3166,23 @@ fn a_refutable_let_is_refused_and_its_names_still_bind() {
     // The statement form: the value keeps its definition, the names become
     // error-valued ones — so `x` resolves in `use` and nothing cascades.
     let (printed, errors) =
-        lowered_with_errors("let opt = #Some 1  let #Some x = opt  let use = x");
-    assert_eq!(errors, ["binding-can-fail@23"], "{errors:#?}");
+        lowered_with_errors("let opt = #Some 1n  let #Some x = opt  let use = x");
+    assert_eq!(errors, ["binding-can-fail@24"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let opt = #Some 1\nlet %value = opt\nlet x = <error>\nlet use = x"
+        "let opt = #Some 1n\nlet %value = opt\nlet x = <error>\nlet use = x"
     );
 
     // The expression form, and the number as the refuter: the complaint
     // points at the `0`.
-    let (printed, errors) = lowered_with_errors("let a = let {a: 0} = { a: 1 } in 2");
+    let (printed, errors) = lowered_with_errors("let a = let {a: 0n} = { a: 1n } in 2n");
     assert_eq!(errors, ["binding-can-fail@16"], "{errors:#?}");
-    assert_eq!(printed, "let a = let %value = { a: 1 } in 2");
-    let (printed, errors) = lowered_with_errors("let a = let #Some x = #Some 1 in x");
+    assert_eq!(printed, "let a = let %value = { a: 1n } in 2n");
+    let (printed, errors) = lowered_with_errors("let a = let #Some x = #Some 1n in x");
     assert_eq!(errors, ["binding-can-fail@12"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let a = let %value = #Some 1 in let x = <error> in x"
+        "let a = let %value = #Some 1n in let x = <error> in x"
     );
 }
 
@@ -3188,30 +3196,30 @@ fn a_refutable_let_is_refused_and_its_names_still_bind() {
 fn every_arm_is_lowered_and_kept() {
     // A shadowed arm survives with its body.
     assert_eq!(
-        lowered("let f = fn e => match e with | #A x => 1 | #A y => 2 end"),
-        "let f = fn e => match e with | #A x => 1 | #A y => 2 end"
+        lowered("let f = fn e => match e with | #A x => 1n | #A y => 2n end"),
+        "let f = fn e => match e with | #A x => 1n | #A y => 2n end"
     );
     // A misplaced catch-all starves nothing here: the arms after it stay.
     assert_eq!(
-        lowered("let f = fn e => match e with | r => 1 | #A x => 2 end"),
-        "let f = fn e => match e with | r => 1 | #A x => 2 end"
+        lowered("let f = fn e => match e with | r => 1n | #A x => 2n end"),
+        "let f = fn e => match e with | r => 1n | #A x => 2n end"
     );
     // A natural match with no final arm keeps its shape and raises nothing.
     assert_eq!(
-        lowered("let f = fn n => match n with | 0 => 1 end"),
-        "let f = fn n => match n with | 0 => 1 end"
+        lowered("let f = fn n => match n with | 0n => 1n end"),
+        "let f = fn n => match n with | 0n => 1n end"
     );
     // A mixed match is not lowering's to refuse any more: the solver's
     // ordinary mismatch is the only complaint such a program gets.
     assert_eq!(
-        lowered("let f = fn e => match e with | 0 => 1 | #A x => 2 | k => 3 end"),
-        "let f = fn e => match e with | 0 => 1 | #A x => 2 | k => 3 end"
+        lowered("let f = fn e => match e with | 0n => 1n | #A x => 2n | k => 3n end"),
+        "let f = fn e => match e with | 0n => 1n | #A x => 2n | k => 3n end"
     );
     // A name inside a kept arm's body still resolves — or fails to, which is
     // still lowering's own complaint.
     let (_, errors) =
-        lowered_with_errors("let f = fn e => match e with | #A x => 1 | #A y => oops end");
-    assert_eq!(errors, ["undefined-term@51"], "{errors:#?}");
+        lowered_with_errors("let f = fn e => match e with | #A x => 1n | #A y => oops end");
+    assert_eq!(errors, ["undefined-term@52"], "{errors:#?}");
 }
 
 /// The column unions that broke revision 1 lower clean: positions are typed
@@ -3222,13 +3230,13 @@ fn every_arm_is_lowered_and_kept() {
 fn overlapping_arms_are_clean() {
     lowered(
         "let f = fn e => match e with \
-         | { a: #A, b: #X, c: x } => 1 | { a: #A, b: #Y, c: y } => 2 end",
+         | { a: #A, b: #X, c: x } => 1n | { a: #A, b: #Y, c: y } => 2n end",
     );
     lowered(
         "let f = fn e => match e with \
-         | { a: #A, b: x } => 1 | { a: #B, b: 0 } => 2 | { a: #B, b: k } => 3 end",
+         | { a: #A, b: x } => 1n | { a: #B, b: 0n } => 2n | { a: #B, b: k } => 3n end",
     );
-    lowered("let f = fn e => match e with | #A #X x => 1 | #A w => 2 | r => 3 end");
+    lowered("let f = fn e => match e with | #A #X x => 1n | #A w => 2n | r => 3n end");
 }
 
 /// The `..` survives normalization: exactness is read off the rest marker by
@@ -3237,12 +3245,12 @@ fn overlapping_arms_are_clean() {
 #[test]
 fn a_rest_marker_survives_normalization() {
     assert_eq!(
-        lowered("let f = fn v => match v with {x, ..} => x | {} => 0 end"),
-        "let f = fn v => match v with | { x: x, .. } => x | {} => 0 end"
+        lowered("let f = fn v => match v with {x, ..} => x | {} => 0n end"),
+        "let f = fn v => match v with | { x: x, .. } => x | {} => 0n end"
     );
     assert_eq!(
-        lowered("let f = fn v => match v with {..} => 1 end"),
-        "let f = fn v => match v with | { .. } => 1 end"
+        lowered("let f = fn v => match v with {..} => 1n end"),
+        "let f = fn v => match v with | { .. } => 1n end"
     );
     let (mint, out) = built("let f = fn v => match v with {x, ..} => x end");
     let TermKind::Fn { body, .. } = term_value(&mint, &out, "f") else {
@@ -3262,7 +3270,7 @@ fn a_rest_marker_survives_normalization() {
 /// nesting; two different arms may of course bind the same name.
 #[test]
 fn a_pattern_binding_a_name_twice_is_refused() {
-    let (_, errors) = lowered_with_errors("let f = fn e => match e with | {x, x} => 1 end");
+    let (_, errors) = lowered_with_errors("let f = fn e => match e with | {x, x} => 1n end");
     assert_eq!(errors, ["duplicate-binding@35"], "{errors:#?}");
 
     let (_, errors) = lowered_with_errors("let f = fn e => match e with | {a: x, b: x} => x end");
@@ -3316,22 +3324,22 @@ fn pattern_let_corners() {
         "let %value : {} = {}\nlet %unit : {} = %value"
     );
     assert_eq!(
-        lowered("let u = let () : {} = {} in 1"),
-        "let u = let %value : {} = {} in let %unit : {} = %value in 1"
+        lowered("let u = let () : {} = {} in 1n"),
+        "let u = let %value : {} = {} in let %unit : {} = %value in 1n"
     );
 
     // A statement pattern repeating a name: the repeat is the pattern's own
     // complaint, not a second definition, and the walk stays total — the
     // repeat binds its stand-in to an error value.
-    let (printed, errors) = lowered_with_errors("let {x, x} = { x: 1 }");
+    let (printed, errors) = lowered_with_errors("let {x, x} = { x: 1n }");
     assert_eq!(errors, ["duplicate-binding@8"], "{errors:#?}");
     assert_eq!(
         printed,
-        "let %struct : { x: _ } = { x: 1 }\nlet x = %struct.x\nlet x = <error>"
+        "let %struct : { x: _ } = { x: 1n }\nlet x = %struct.x\nlet x = <error>"
     );
 
     // A refutable statement pattern with a number: the complaint quotes it.
-    let (_, errors) = lowered_with_errors("let {a: 0} = { a: 1 }");
+    let (_, errors) = lowered_with_errors("let {a: 0n} = { a: 1n }");
     assert_eq!(errors, ["binding-can-fail@8"], "{errors:#?}");
 
     // A bare tag on a statement `let` is refused the same way, binding
@@ -3353,7 +3361,8 @@ fn pattern_let_corners() {
 /// would be a different one.
 #[test]
 fn an_annotation_keeps_its_clause() {
-    let (mint, out) = built("let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1 }");
+    let (mint, out) =
+        built("let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n }");
     let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
         .annotation
         .as_ref()
@@ -3384,7 +3393,7 @@ fn an_annotation_keeps_its_clause() {
 /// presence is minted like any other and no clause can be about it.
 #[test]
 fn the_anonymous_presence_binds_no_name() {
-    let (mint, out) = built("let f : { x when _: Nat } = { x: 1 }");
+    let (mint, out) = built("let f : { x when _: Nat } = { x: 1n }");
     let annotation = out.program.terms[&term_symbol(&mint, &out, "f")]
         .annotation
         .as_ref()
@@ -3400,7 +3409,7 @@ fn the_anonymous_presence_binds_no_name() {
     };
     assert!(when.name.is_none());
 
-    let (_, out) = build_src("let f : { x when _: Nat } where 'x = { x: 1 }");
+    let (_, out) = build_src("let f : { x when _: Nat } where 'x = { x: 1n }");
     assert_eq!(
         out.errors
             .iter()
@@ -3415,7 +3424,7 @@ fn the_anonymous_presence_binds_no_name() {
 /// written and the clause absorbs whole.
 #[test]
 fn a_clause_may_not_name_what_the_type_does_not_bind() {
-    let src = "let f : { x when 'a: Nat } where 'c = { x: 1 }";
+    let src = "let f : { x when 'a: Nat } where 'c = { x: 1n }";
     let (mint, out) = build_src(src);
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);
@@ -3438,15 +3447,15 @@ fn a_clause_may_not_name_what_the_type_does_not_bind() {
     // unbound presences reports both — and the clause still absorbs whole,
     // through every connective one can be written with.
     for (src, count) in [
-        ("let f : { x when 'a: Nat } where 'c or 'd = { x: 1 }", 2),
-        ("let f : { x when 'a: Nat } where 'c and 'd = { x: 1 }", 2),
-        ("let f : { x when 'a: Nat } where 'c = 'd = { x: 1 }", 2),
-        ("let f : { x when 'a: Nat } where 'c != 'd = { x: 1 }", 2),
-        ("let f : { x when 'a: Nat } where not 'c = { x: 1 }", 1),
-        ("let f : { x when 'a: Nat } where 'a or 'c = { x: 1 }", 1),
-        ("let f : { x when 'a: Nat } where 'a and 'c = { x: 1 }", 1),
-        ("let f : { x when 'a: Nat } where 'a = 'c = { x: 1 }", 1),
-        ("let f : { x when 'a: Nat } where 'a != 'c = { x: 1 }", 1),
+        ("let f : { x when 'a: Nat } where 'c or 'd = { x: 1n }", 2),
+        ("let f : { x when 'a: Nat } where 'c and 'd = { x: 1n }", 2),
+        ("let f : { x when 'a: Nat } where 'c = 'd = { x: 1n }", 2),
+        ("let f : { x when 'a: Nat } where 'c != 'd = { x: 1n }", 2),
+        ("let f : { x when 'a: Nat } where not 'c = { x: 1n }", 1),
+        ("let f : { x when 'a: Nat } where 'a or 'c = { x: 1n }", 1),
+        ("let f : { x when 'a: Nat } where 'a and 'c = { x: 1n }", 1),
+        ("let f : { x when 'a: Nat } where 'a = 'c = { x: 1n }", 1),
+        ("let f : { x when 'a: Nat } where 'a != 'c = { x: 1n }", 1),
     ] {
         let (mint, out) = build_src(src);
         assert_eq!(out.errors.len(), count, "{src}: {:#?}", out.errors);
@@ -3659,7 +3668,7 @@ fn an_operation_reference_resolves_through_its_effect() {
     let base = "effect Log = write : Nat -> ()\n\
                 effect IO = print : Nat -> ()\n\
                 effect Console = !Log + !IO\n";
-    let (mint, out) = built(&format!("{base}let g = fn _ => !Log.write 1"));
+    let (mint, out) = built(&format!("{base}let g = fn _ => !Log.write 1n"));
     let mut node = term_value(&mint, &out, "g");
     while let TermKind::Fn { body, .. } = node {
         node = &body.kind;
@@ -3674,15 +3683,15 @@ fn an_operation_reference_resolves_through_its_effect() {
     assert_eq!(op.tracked, "write");
 
     assert_eq!(
-        codes_of(&format!("{base}let g = fn _ => !Lg.write 1")),
+        codes_of(&format!("{base}let g = fn _ => !Lg.write 1n")),
         ["undefined-effect"]
     );
     assert_eq!(
-        codes_of(&format!("{base}let g = fn _ => !Log.writ 1")),
+        codes_of(&format!("{base}let g = fn _ => !Log.writ 1n")),
         ["unknown-operation"]
     );
     assert_eq!(
-        codes_of(&format!("{base}let g = fn _ => !Console.write 1")),
+        codes_of(&format!("{base}let g = fn _ => !Console.write 1n")),
         ["operation-on-alias"]
     );
 }
@@ -3693,7 +3702,7 @@ fn an_operation_reference_resolves_through_its_effect() {
 #[test]
 fn a_handler_must_cover_every_effect_it_names() {
     let base = "effect Log = write : Nat -> () | flush : () -> ()\n\
-                let p : () -> Nat + !Log = fn _ => 0\n";
+                let p : () -> Nat + !Log = fn _ => 0n\n";
     let (mint, out) = built(&format!(
         "{base}let h = fn _ => handle p () with | !Log.write s => () | !Log.flush u => () end"
     ));
@@ -3735,7 +3744,7 @@ fn a_handler_must_cover_every_effect_it_names() {
 /// anything else is: at the repeat, with the first the one that stands.
 #[test]
 fn a_handler_takes_each_arm_once() {
-    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0\n";
+    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0n\n";
     let (_, out) = build_src(&format!(
         "{base}let h = fn _ => handle p () with | !Log.write s => () | !Log.write t => () end"
     ));
@@ -3781,43 +3790,46 @@ fn a_handler_takes_each_arm_once() {
 /// `fn` between the two is a closure that could outlive the handler.
 #[test]
 fn raise_belongs_to_the_arm_around_it() {
-    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0\n";
+    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0n\n";
     let arm =
         |body: &str| format!("{base}let h = fn _ => handle p () with | !Log.write s => {body} end");
     // No arm anywhere.
     assert_eq!(
-        codes_of(&format!("{base}let a = raise 1")),
+        codes_of(&format!("{base}let a = raise 1n")),
         ["raise-outside-arm"]
     );
     assert_eq!(
-        codes_of(&format!("{base}let a = fn _ => raise 1")),
+        codes_of(&format!("{base}let a = fn _ => raise 1n")),
         ["raise-outside-arm"]
     );
     // The handled expression of a handler with no arm above it is the ordinary
     // "no enclosing arm" case.
     assert_eq!(
-        codes_of(&format!("{base}let a = fn _ => handle raise 1 with end")),
+        codes_of(&format!("{base}let a = fn _ => handle raise 1n with end")),
         ["raise-outside-arm"]
     );
 
     // A `fn` between the `raise` and its arm — including one applied on the
     // spot, since what matters is that a closure was written at all.
     assert_eq!(
-        codes_of(&arm("{ g: fn _ => raise 0 }")),
+        codes_of(&arm("{ g: fn _ => raise 0n }")),
         ["raise-in-function"]
     );
-    assert_eq!(codes_of(&arm("(fn _ => raise 0) 1")), ["raise-in-function"]);
+    assert_eq!(
+        codes_of(&arm("(fn _ => raise 0n) 1n")),
+        ["raise-in-function"]
+    );
 
     // And every position an expression may sit in, none of which needs a rule.
     for body in [
-        "raise 0",
-        "let a = raise 0 in ()",
-        "f (raise 0)",
-        "{ g: raise 0 }",
-        "match s with | 0 => raise 0 | _ => () end",
+        "raise 0n",
+        "let a = raise 0n in ()",
+        "f (raise 0n)",
+        "{ g: raise 0n }",
+        "match s with | 0n => raise 0n | _ => () end",
         // A nested `handle`'s *body* keeps the outer arm: the outer handler is
         // still on the stack while the inner one runs.
-        "handle raise 0 with end",
+        "handle raise 0n with end",
     ] {
         let src = format!(
             "{base}let f = fn x => x\nlet h = fn _ => handle p () with | !Log.write s => {body} end"
@@ -4094,7 +4106,7 @@ fn a_row_may_only_name_declared_effects() {
 fn an_arm_that_does_not_resolve_covers_nothing() {
     let (mint, out) = build_src(
         "effect Log = write : Nat -> ()\n\
-         let p : () -> Nat + !Log = fn _ => 0\n\
+         let p : () -> Nat + !Log = fn _ => 0n\n\
          let h = fn _ => handle p () with | !Log.writ s => () end",
     );
     assert_eq!(
@@ -4199,7 +4211,7 @@ fn an_effect_tail_makes_an_argument_grow() {
 fn return_is_a_name_everywhere_but_an_arms_head() {
     let (mint, out) = built(
         "effect Log = write : Nat -> ()\n\
-         let return = 1\n\
+         let return = 1n\n\
          let p : () -> Nat + !Log = fn _ => return\n\
          let h = fn _ => handle p () with | !Log.write s => () | return x => x end",
     );
@@ -4226,7 +4238,7 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
     let base = "effect Log = write : Nat -> ()\n\
                 type Runner 'e = (Nat -> Nat + !Log + ..'e) -> Nat\n";
     // Something a row cannot hold.
-    let (_, out) = build_src(&format!("{base}let f : Runner Nat -> Nat = fn r => 1"));
+    let (_, out) = build_src(&format!("{base}let f : Runner Nat -> Nat = fn r => 1n"));
     let [error] = &out.errors[..] else {
         panic!("{:#?}", out.errors);
     };
@@ -4244,7 +4256,7 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
 
     // And a row naming what the declaration already names: the `..` covers
     // only what its own row leaves out.
-    let (_, out) = build_src(&format!("{base}let f : Runner (!Log) -> Nat = fn r => 1"));
+    let (_, out) = build_src(&format!("{base}let f : Runner (!Log) -> Nat = fn r => 1n"));
     let [error] = &out.errors[..] else {
         panic!("{:#?}", out.errors);
     };
@@ -4270,7 +4282,7 @@ fn a_row_of_effects_may_be_an_argument() {
                 type Runner 'e = (Nat -> Nat + ..'e) -> Nat\n";
 
     // One effect, written back as the row it is.
-    let (mint, out) = build_src(&format!("{base}let f : Runner (!Log) -> Nat = fn r => 1"));
+    let (mint, out) = build_src(&format!("{base}let f : Runner (!Log) -> Nat = fn r => 1n"));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let printed = print::ir::program(&out.program, &mint).to_string();
     assert!(
@@ -4280,7 +4292,7 @@ fn a_row_of_effects_may_be_an_argument() {
 
     // An alias expands where it is written, as it does on an arrow.
     let (mint, out) = build_src(&format!(
-        "{base}let g : Runner (!Console) -> Nat = fn r => 1"
+        "{base}let g : Runner (!Console) -> Nat = fn r => 1n"
     ));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let printed = print::ir::program(&out.program, &mint).to_string();
@@ -4291,13 +4303,13 @@ fn a_row_of_effects_may_be_an_argument() {
 
     // A row of several, one of them written absent, and a tail beside them.
     let (_, out) = build_src(&format!(
-        "{base}let h : Runner (!Log + \\!IO + ..'r) -> Nat = fn q => 1"
+        "{base}let h : Runner (!Log + \\!IO + ..'r) -> Nat = fn q => 1n"
     ));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
 
     // And the names in one are effects: an undefined one is reported where it
     // was written, the way a row on an arrow reports it.
-    let (_, out) = build_src(&format!("{base}let i : Runner (!Nope) -> Nat = fn r => 1"));
+    let (_, out) = build_src(&format!("{base}let i : Runner (!Nope) -> Nat = fn r => 1n"));
     let [error] = &out.errors[..] else {
         panic!("{:#?}", out.errors);
     };
@@ -4307,7 +4319,7 @@ fn a_row_of_effects_may_be_an_argument() {
     // to the declaration by itself. Every other spelling names an effect
     // beside it, and there is nothing to name here.
     let (mint, out) = build_src(&format!(
-        "{base}let rest : Runner (..'r) -> Nat = fn q => 1"
+        "{base}let rest : Runner (..'r) -> Nat = fn q => 1n"
     ));
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let printed = print::ir::program(&out.program, &mint).to_string();
@@ -4378,10 +4390,10 @@ fn a_row_of_effects_may_be_an_argument() {
 fn a_row_of_effects_is_refused_where_a_type_goes() {
     let base = "effect Log = write : Nat -> ()\n";
     for source in [
-        "let x : !Log = 1",
-        "let x : { f: !Log } = { f: 1 }",
+        "let x : !Log = 1n",
+        "let x : { f: !Log } = { f: 1n }",
         "type T = !Log",
-        "let x : !Log -> Nat = fn v => 1",
+        "let x : !Log -> Nat = fn v => 1n",
     ] {
         let (_, out) = build_src(&format!("{base}{source}"));
         assert!(
@@ -4394,7 +4406,7 @@ fn a_row_of_effects_is_refused_where_a_type_goes() {
     }
 
     // The row is read for its own complaints before it is refused.
-    let (_, out) = build_src(&format!("{base}let x : !Nope = 1"));
+    let (_, out) = build_src(&format!("{base}let x : !Nope = 1n"));
     let codes: Vec<&str> = out.errors.iter().map(|e| e.kind.code()).collect();
     assert_eq!(codes, ["undefined-effect", "effects-outside-row"]);
 }
@@ -4407,7 +4419,7 @@ fn a_row_of_effects_is_refused_where_a_type_goes() {
 #[test]
 fn a_bare_name_resolves_in_one_order() {
     // A declared type, which is what a bare name has always been.
-    let (mint, out) = built("type T = Nat  let f : T -> Nat = fn x => 0");
+    let (mint, out) = built("type T = Nat  let f : T -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
     let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
         panic!("expected an arrow");
@@ -4416,7 +4428,7 @@ fn a_bare_name_resolves_in_one_order() {
 
     // The same spelling with a sigil is a variable, and the two sit side by
     // side: nothing a variable is spelled like can shadow it or be shadowed.
-    let (mint, out) = built("type T = Nat  let f : 'T -> T = fn x => 0");
+    let (mint, out) = built("type T = Nat  let f : 'T -> T = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
     let TypeKind::Arrow { from, to, .. } = &annotation.ty.tracked else {
         panic!("expected an arrow");
@@ -4425,7 +4437,7 @@ fn a_bare_name_resolves_in_one_order() {
     assert!(matches!(to.tracked, TypeKind::Ident(_)));
 
     // And the built-in goes the same way.
-    let (mint, out) = built("let f : 'Nat -> Nat = fn x => 0");
+    let (mint, out) = built("let f : 'Nat -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "f");
     let TypeKind::Arrow { from, to, .. } = &annotation.ty.tracked else {
         panic!("expected an arrow");
@@ -4474,8 +4486,8 @@ fn an_undeclared_name_is_undefined_wherever_it_is_used() {
     // and the parser never builds one.
     for src in [
         "let bad : { x: Nat, ..r } -> Nat = fn p => p.x",
-        "let bad : (#A Nat | ..r) -> Nat = fn p => 0",
-        "let bad : { x when a: Nat } -> Nat = fn p => 0",
+        "let bad : (#A Nat | ..r) -> Nat = fn p => 0n",
+        "let bad : { x when a: Nat } -> Nat = fn p => 0n",
     ] {
         let out = ruddy::parse::parse(ruddy::token::lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src}: {:#?}", out.errors);
@@ -4491,9 +4503,9 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
     for (src, sense) in [
         ("let f : 'a -> 'a = fn x => x", Sense::Type),
         ("let f : { x: Nat, ..'a } -> Nat = fn p => p.x", Sense::Type),
-        ("let f : (#A Nat | ..'a) -> Nat = fn p => 0", Sense::Cases),
+        ("let f : (#A Nat | ..'a) -> Nat = fn p => 0n", Sense::Cases),
         (
-            "let f : { x when 'a: Nat } -> Nat = fn p => 0",
+            "let f : { x when 'a: Nat } -> Nat = fn p => 0n",
             Sense::Presence,
         ),
     ] {
@@ -4550,12 +4562,12 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
 fn a_declared_variable_used_at_two_sorts_is_refused() {
     for (src, first, second) in [
         (
-            "let f : { x: Nat, ..'a } -> (#A Nat | ..'a) -> Nat = fn p => fn q => 0",
+            "let f : { x: Nat, ..'a } -> (#A Nat | ..'a) -> Nat = fn p => fn q => 0n",
             Sense::Type,
             Sense::Cases,
         ),
         (
-            "let f : (#A Nat | ..'a) -> { x: Nat, ..'a } -> Nat = fn p => fn q => 0",
+            "let f : (#A Nat | ..'a) -> { x: Nat, ..'a } -> Nat = fn p => fn q => 0n",
             Sense::Cases,
             Sense::Type,
         ),
@@ -4656,9 +4668,9 @@ fn a_variable_is_minted_by_its_first_use() {
 fn a_formula_names_only_what_a_when_wears() {
     for src in [
         // Declared, and never worn by a label.
-        "let f : { x when 'a: Nat } -> Nat where 'a = 'b = fn p => 0",
+        "let f : { x when 'a: Nat } -> Nat where 'a = 'b = fn p => 0n",
         // Not declared at all, which the reader fixes the same way.
-        "let f : { x when 'a: Nat } -> Nat where 'a = 'b = fn p => 0",
+        "let f : { x when 'a: Nat } -> Nat where 'a = 'b = fn p => 0n",
     ] {
         let (_, out) = build_src(src);
         let complaints: Vec<&ErrorKind> = out
@@ -4730,7 +4742,7 @@ fn a_declaration_may_declare_nothing_in_its_where() {
 #[test]
 fn several_constraint_statements_are_conjoined() {
     let (mint, out) =
-        built("let f : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a; 'b = fn p => 0");
+        built("let f : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a; 'b = fn p => 0n");
     let annotation = annotation_of(&mint, &out, "f");
     let clause = annotation.clause.as_ref().expect("the clause");
     assert_eq!(
@@ -4745,7 +4757,7 @@ fn several_constraint_statements_are_conjoined() {
 /// first one said again.
 #[test]
 fn a_declared_variable_may_not_be_applied() {
-    let src = "let f : 'a Nat -> Nat = fn x => 0";
+    let src = "let f : 'a Nat -> Nat = fn x => 0n";
     let (_, out) = build_src(src);
     let [error] = out.errors.as_slice() else {
         panic!("expected one error: {:#?}", out.errors);
@@ -4776,7 +4788,7 @@ fn a_declaration_may_not_hold_a_hole() {
     assert!(matches!(value.tracked, TypeKind::Error));
 
     // An annotation is where a hole belongs, and it lowers to one.
-    let (mint, out) = built("let k : _ -> Nat = fn x => 0");
+    let (mint, out) = built("let k : _ -> Nat = fn x => 0n");
     let annotation = annotation_of(&mint, &out, "k");
     let TypeKind::Arrow { from, .. } = &annotation.ty.tracked else {
         panic!("expected an arrow");
@@ -4790,7 +4802,7 @@ fn a_declaration_may_not_hold_a_hole() {
 /// something in them.
 #[test]
 fn a_symbol_is_minted_under_the_module_it_was_declared_in() {
-    let (mint, out) = built("module A =\n  module B =\n    let x = 1\n  end\nend");
+    let (mint, out) = built("module A =\n  module B =\n    let x = 1n\n  end\nend");
     let x = term_symbol(&mint, &out, "x");
     assert_eq!(mint.path(x).to_string(), "test::A::B::x");
 
@@ -4809,9 +4821,9 @@ fn a_symbol_is_minted_under_the_module_it_was_declared_in() {
 /// own definition shadows the root's.
 #[test]
 fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
-    let src = "let top = 1\n\
+    let src = "let top = 1n\n\
                module A =\n  let x = top\n  module B =\n    let y = x\n  end\nend\n\
-               module C =\n  let top = 2\n  let z = top\n  let w = A::x\nend";
+               module C =\n  let top = 2n\n  let z = top\n  let w = A::x\nend";
     let (mint, out) = built(src);
 
     // `A::x` reaches the root's `top`, since `A` declares none of its own.
@@ -4842,7 +4854,7 @@ fn an_unqualified_name_walks_outward_and_the_inner_one_wins() {
 /// undefined term it is, because the walk goes outward and never sideways.
 #[test]
 fn a_sibling_module_is_reached_only_by_a_path() {
-    let src = "module A =\n  let x = 1\nend\nmodule C =\n  let w = x\nend";
+    let src = "module A =\n  let x = 1n\nend\nmodule C =\n  let w = x\nend";
     let (_, out) = build_src(src);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
@@ -4859,7 +4871,7 @@ fn a_sibling_module_is_reached_only_by_a_path() {
 #[test]
 fn hoisting_reaches_a_module_declared_below_its_use() {
     let (mint, out) =
-        built("let four = Math::double 2\nmodule Math =\n  let double = fn x => x\nend");
+        built("let four = Math::double 2n\nmodule Math =\n  let double = fn x => x\nend");
     let TermKind::Apply { func, .. } = term_value(&mint, &out, "four") else {
         panic!("expected an application");
     };
@@ -4873,7 +4885,7 @@ fn hoisting_reaches_a_module_declared_below_its_use() {
 /// and an effect at once without any of them colliding.
 #[test]
 fn a_module_a_type_a_term_and_an_effect_may_share_a_name() {
-    let (mint, out) = built("module P = end\ntype P = { x: Nat }\nlet P = 1\neffect P = |");
+    let (mint, out) = built("module P = end\ntype P = { x: Nat }\nlet P = 1n\neffect P = |");
     assert!(out.program.types.keys().any(|s| mint.name(*s) == "P"));
     assert!(out.program.terms.keys().any(|s| mint.name(*s) == "P"));
     assert!(out.program.effects.keys().any(|s| mint.name(*s) == "P"));
@@ -4997,7 +5009,7 @@ fn an_undefined_final_name_is_reported_in_its_own_namespace() {
             "Missing",
         ),
         (
-            "module M = end\nlet f : () -> Nat + M::!Log = fn _ => 0",
+            "module M = end\nlet f : () -> Nat + M::!Log = fn _ => 0n",
             Namespace::Effects,
             // A label's span wears its sigil, the way every other label's does.
             "!Log",
@@ -5044,8 +5056,8 @@ fn a_middle_segment_naming_no_module_is_reported_once() {
 fn paths_resolve_in_every_position() {
     let src = "module Math =\n  type Pair 'a 'b = { first: 'a, second: 'b }\nend\n\
                module Sys =\n  effect Log = write : Nat -> ()\nend\n\
-               let p : Math::Pair Nat Nat = { first: 1, second: 2 }\n\
-               let greet : () -> Nat + Sys::!Log = fn _ => let _ = Sys::!Log.write 1 in 0\n\
+               let p : Math::Pair Nat Nat = { first: 1n, second: 2n }\n\
+               let greet : () -> Nat + Sys::!Log = fn _ => let _ = Sys::!Log.write 1n in 0n\n\
                let quiet : () -> Nat = fn _ =>\n\
                  handle greet () with | Sys::!Log.write s => () | return x => x end";
     let (mint, out) = built(src);

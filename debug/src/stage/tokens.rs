@@ -83,9 +83,13 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Dot => "Dot",
         Kind::DotDot => "DotDot",
         Kind::Plus => "Plus",
+        Kind::Minus => "Minus",
+        Kind::Star => "Star",
+        Kind::Slash => "Slash",
         Kind::NotEqual => "NotEqual",
         Kind::Backslash => "Backslash",
         Kind::Pipe => "Pipe",
+        Kind::PipeForward => "PipeForward",
         Kind::Tag(_) => "Tag",
         Kind::EffectLabel(_) => "EffectLabel",
         Kind::Variable(_) => "Variable",
@@ -96,6 +100,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Identifier(_) => "Identifier",
         Kind::Underscore => "Underscore",
         Kind::Natural(_) => "Natural",
+        Kind::Integer(_) => "Integer",
+        Kind::Real(_) => "Real",
     }
 }
 
@@ -111,7 +117,7 @@ pub fn label(kind: &Kind) -> &'static str {
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
-        Kind::Natural(_) => "number",
+        Kind::Natural(_) | Kind::Integer(_) | Kind::Real(_) => "number",
         Kind::Tag(_) => "tag",
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",

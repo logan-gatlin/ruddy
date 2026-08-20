@@ -777,7 +777,11 @@ impl Solve<'_> {
                 self.assign(span, goal, var, Assigned::Ty(Rc::new(Ty::plain(core))));
                 true
             }
-            (Core::Nat, Core::Nat) => {
+            (Core::Nat, Core::Nat)
+            | (Core::Int, Core::Int)
+            | (Core::Real, Core::Real)
+            | (Core::String, Core::String)
+            | (Core::Boolean, Core::Boolean) => {
                 self.step(span, Rule::Prim, goal, Effect::None);
                 true
             }
@@ -1733,7 +1737,15 @@ impl Solve<'_> {
                     self.recover_ty(span, arg);
                 }
             }
-            Core::Unit | Core::Nat | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided => {}
+            Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
         }
         let fields = ty.fields.clone();
         self.recover_labels(span, &fields);

@@ -56,24 +56,39 @@
       "type": "SEQ",
       "members": [
         {
-          "type": "SYMBOL",
-          "name": "natural"
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "version_number"
+          },
+          "named": true,
+          "value": "natural"
         },
         {
           "type": "STRING",
           "value": "."
         },
         {
-          "type": "SYMBOL",
-          "name": "natural"
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "version_number"
+          },
+          "named": true,
+          "value": "natural"
         },
         {
           "type": "STRING",
           "value": "."
         },
         {
-          "type": "SYMBOL",
-          "name": "natural"
+          "type": "ALIAS",
+          "content": {
+            "type": "SYMBOL",
+            "name": "version_number"
+          },
+          "named": true,
+          "value": "natural"
         }
       ]
     },
@@ -465,9 +480,177 @@
         },
         {
           "type": "SYMBOL",
+          "name": "pipeline"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "binary_expression"
+        }
+      ]
+    },
+    "pipeline": {
+      "type": "PREC_LEFT",
+      "value": 1,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "value",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "pipeline"
+                },
+                {
+                  "type": "SYMBOL",
+                  "name": "binary_expression"
+                }
+              ]
+            }
+          },
+          {
+            "type": "STRING",
+            "value": "|>"
+          },
+          {
+            "type": "FIELD",
+            "name": "function",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          }
+        ]
+      }
+    },
+    "binary_expression": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "addition"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "multiplication"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "unary_expression"
+        },
+        {
+          "type": "SYMBOL",
           "name": "_application_expression"
         }
       ]
+    },
+    "addition": {
+      "type": "PREC_LEFT",
+      "value": 2,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "left",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "operator",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "+"
+                },
+                {
+                  "type": "STRING",
+                  "value": "-"
+                }
+              ]
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "right",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          }
+        ]
+      }
+    },
+    "multiplication": {
+      "type": "PREC_LEFT",
+      "value": 3,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "FIELD",
+            "name": "left",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "operator",
+            "content": {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "*"
+                },
+                {
+                  "type": "STRING",
+                  "value": "/"
+                }
+              ]
+            }
+          },
+          {
+            "type": "FIELD",
+            "name": "right",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          }
+        ]
+      }
+    },
+    "unary_expression": {
+      "type": "PREC",
+      "value": 4,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "-"
+          },
+          {
+            "type": "FIELD",
+            "name": "value",
+            "content": {
+              "type": "SYMBOL",
+              "name": "binary_expression"
+            }
+          }
+        ]
+      }
     },
     "_application_expression": {
       "type": "CHOICE",
@@ -505,7 +688,7 @@
     },
     "application": {
       "type": "PREC_LEFT",
-      "value": 1,
+      "value": 5,
       "content": {
         "type": "SEQ",
         "members": [
@@ -552,7 +735,7 @@
     },
     "_atom_projection": {
       "type": "PREC_LEFT",
-      "value": 3,
+      "value": 7,
       "content": {
         "type": "SEQ",
         "members": [
@@ -632,7 +815,7 @@
     },
     "projection": {
       "type": "PREC_LEFT",
-      "value": 3,
+      "value": 7,
       "content": {
         "type": "SEQ",
         "members": [
@@ -1124,7 +1307,7 @@
     },
     "tag_expression": {
       "type": "PREC_RIGHT",
-      "value": 2,
+      "value": 6,
       "content": {
         "type": "SEQ",
         "members": [
@@ -1355,7 +1538,7 @@
     },
     "tag_pattern": {
       "type": "PREC_RIGHT",
-      "value": 2,
+      "value": 6,
       "content": {
         "type": "SEQ",
         "members": [
@@ -2355,8 +2538,19 @@
     },
     "natural": {
       "type": "PATTERN",
-      "value": "[0-9][\\p{Alphabetic}\\p{N}_]*",
+      "value": "[0-9]+(?:\\.[0-9]+)?[\\p{Alphabetic}\\p{N}_]*",
       "flags": "u"
+    },
+    "version_number": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "[0-9]+"
+        }
+      }
     }
   },
   "extras": [
@@ -2373,7 +2567,9 @@
   ],
   "precedences": [],
   "externals": [],
-  "inline": [],
+  "inline": [
+    "binary_expression"
+  ],
   "supertypes": [],
   "reserved": {
     "global": [

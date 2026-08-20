@@ -21,10 +21,10 @@ const HEADER: &str = "bundle demo 0.1.0\n";
 const NESTED: &[(&str, &str)] = &[
     (
         ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2\n",
+        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
     ),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-    ("Math/Vec.hc", "let zero = 0\n"),
+    ("Math/Vec.hc", "let zero = 0n\n"),
 ];
 
 /// One snippet, compiled as the whole of a bundle's root file.
@@ -301,7 +301,7 @@ fn diagnostics_are_reported_in_source_order() {
 /// drives.
 #[test]
 fn a_natural_reaches_every_stage() {
-    let snapshot = snapshot("let n = 42\n");
+    let snapshot = snapshot("let n = 42n\n");
     assert!(
         snapshot.diagnostics.is_empty(),
         "{:#?}",
@@ -319,10 +319,10 @@ fn a_natural_reaches_every_stage() {
         // every snippet.
         let node = nodes(stage)
             .into_iter()
-            .find(|node| node.label == "Natural" && node.text == "42")
+            .find(|node| node.label == "Natural" && node.text == "42n")
             .unwrap_or_else(|| panic!("{id} rendered no natural"));
 
-        assert_eq!(node.span, at([8, 10]), "{id}");
+        assert_eq!(node.span, at([8, 11]), "{id}");
         // A literal names nothing, so no panel may point it at a symbol.
         assert_eq!(node.symbol, None, "{id}");
     }
@@ -330,7 +330,7 @@ fn a_natural_reaches_every_stage() {
     let tokens = nodes(&snapshot.stages[0]);
     let literal = tokens
         .iter()
-        .find(|node| node.label == "Natural" && node.text == "42")
+        .find(|node| node.label == "Natural" && node.text == "42n")
         .expect("the tokens tab renders the literal");
     let class = literal
         .fields
@@ -532,7 +532,7 @@ fn a_bad_literal_is_a_diagnostic_of_its_own() {
         ["unexpected-token", "malformed-natural"]
     );
     assert_eq!(
-        codes(&format!("let n = {}0\n", u128::MAX)),
+        codes(&format!("let n = {}0n\n", u64::MAX)),
         ["unexpected-token", "natural-too-large"]
     );
 }
@@ -557,7 +557,7 @@ fn a_duplicate_carries_the_definition_it_repeats() {
 /// highlights that one too rather than leaving the reader to find it.
 #[test]
 fn a_mixed_tail_carries_the_use_it_clashes_with() {
-    let source = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1\n";
+    let source = "let f : { x: Nat, ..'r } -> (#A Nat | ..'r) -> Nat = fn a => fn b => 1n\n";
     let snapshot = snapshot(source);
     let mixed = snapshot
         .diagnostics
@@ -625,7 +625,7 @@ fn inferred_types_reach_the_panels() {
 /// across every shape a term can take.
 #[test]
 fn every_term_row_in_the_ir_wears_its_type() {
-    let snapshot = snapshot("let f : { x: Nat } -> Nat = fn p => p.x\nlet n = f { x: 1 }\n");
+    let snapshot = snapshot("let f : { x: Nat } -> Nat = fn p => p.x\nlet n = f { x: 1n }\n");
     assert!(
         snapshot.diagnostics.is_empty(),
         "{:#?}",
@@ -674,8 +674,8 @@ fn every_term_row_in_the_ir_wears_its_type() {
     // arrow is where it comes from.
     assert_eq!(badge("Arg", "p"), "{ x: Nat }");
     assert_eq!(badge("Project", "p.x"), "Nat");
-    assert_eq!(badge("Apply", "f { x: 1 }"), "Nat");
-    assert_eq!(badge("Natural", "1"), "Nat");
+    assert_eq!(badge("Apply", "f { x: 1n }"), "Nat");
+    assert_eq!(badge("Natural", "1n"), "Nat");
 }
 
 /// A declared type is shown as what it stands for, one step deep, and says
@@ -823,7 +823,7 @@ fn an_argument_wears_its_type_through_a_declared_type() {
     // And a sum's tail reads in cases, because it is the row of a sum. Spelled
     // in braces it would show a reader a case list as if it were fields.
     assert_eq!(
-        badge("type G 'r = (#Err Nat | ..'r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1\n"),
+        badge("type G 'r = (#Err Nat | ..'r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1n\n"),
         "#Err Nat | ..#Ok Nat"
     );
 }
@@ -859,8 +859,8 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     // promised it: what the lacks condition rules on is the *fresh* rest a use
     // of the published scheme gets.
     let repeated = snapshot(
-        "let h : { ..'r } -> { x: { y: Nat, ..'r } } -> Nat = fn a => fn b => 1\n\
-         let z = h { y: {} } { x: { y: 1 } }\n",
+        "let h : { ..'r } -> { x: { y: Nat, ..'r } } -> Nat = fn a => fn b => 1n\n\
+         let z = h { y: {} } { x: { y: 1n } }\n",
     );
     let [diagnostic] = repeated.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", repeated.diagnostics);
@@ -916,7 +916,7 @@ fn a_row_error_reaches_the_strip_and_the_solve_tab() {
     assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
     assert_eq!(diagnostic.related[0].message, "declared here");
 
-    let flat = snapshot("let n = 1\nlet bad = n.x\n");
+    let flat = snapshot("let n = 1n\nlet bad = n.x\n");
     let [diagnostic] = flat.diagnostics.as_slice() else {
         panic!("expected one error: {:#?}", flat.diagnostics);
     };
@@ -1145,7 +1145,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
         ]
     );
     // Each with what the page turns an offset in it into a line and a column.
-    assert_eq!(snapshot.files[2].line_starts, vec![0, 13]);
+    assert_eq!(snapshot.files[2].line_starts, vec![0, 14]);
 
     // And the chip reads what the root file's header declared, which is the
     // only place a bundle is named at all.
@@ -1195,7 +1195,7 @@ fn a_span_from_a_module_file_names_that_file() {
 /// fix it.
 #[test]
 fn a_missing_module_file_reaches_the_strip() {
-    let root = "bundle demo 0.1.0\nmodule Math\nlet four = 4\n";
+    let root = "bundle demo 0.1.0\nmodule Math\nlet four = 4n\n";
     let snapshot = bundle(&[(ROOT, root)]);
 
     let [diagnostic] = snapshot.diagnostics.as_slice() else {
@@ -1412,7 +1412,7 @@ fn a_raw_dump_carries_only_its_own_tab() {
 /// subject is getting the details right.
 #[test]
 fn a_count_of_one_is_said_in_the_singular() {
-    let snapshot = snapshot("let a : Nat = 1\n");
+    let snapshot = snapshot("let a : Nat = 1n\n");
     let summary = |id: &str| {
         snapshot
             .stages
@@ -1624,7 +1624,7 @@ fn a_type_parameter_is_a_symbol_like_any_other() {
 /// the definition ends with.
 #[test]
 fn sums_reach_every_stage() {
-    let source = "type Fallible 'r = #Err Nat | ..'r\nlet e : Fallible (#Ok Nat) = #Err 1\n";
+    let source = "type Fallible 'r = #Err Nat | ..'r\nlet e : Fallible (#Ok Nat) = #Err 1n\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1674,7 +1674,7 @@ fn sums_reach_every_stage() {
         assert_eq!(labelled(id, "Rest"), ["..'r"], "{id}");
         // And the tag in the term is a node that names no symbol, the way a
         // field name is.
-        assert_eq!(labelled(id, "Tag"), ["#Err 1"], "{id}");
+        assert_eq!(labelled(id, "Tag"), ["#Err 1n"], "{id}");
     }
 
     // The Types tab says which shape the parameter stands for, since the
@@ -1783,7 +1783,7 @@ fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
 /// binds was generalized to.
 #[test]
 fn a_nested_let_reaches_every_stage() {
-    let source = "let a = let id : Nat -> Nat = fn x => x in id 1\n";
+    let source = "let a = let id : Nat -> Nat = fn x => x in id 1n\n";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1810,7 +1810,10 @@ fn a_nested_let_reaches_every_stage() {
             .into_iter()
             .find(|node| node.label == "Let id")
             .unwrap_or_else(|| panic!("{id} renders no nested let"));
-        assert_eq!(node.text, "let id : Nat -> Nat = fn x => x in id 1", "{id}");
+        assert_eq!(
+            node.text, "let id : Nat -> Nat = fn x => x in id 1n",
+            "{id}"
+        );
         // The written type is a child, between the name and the value where it
         // was written.
         let labels: Vec<&str> = node
@@ -1858,7 +1861,7 @@ fn a_nested_let_reaches_every_stage() {
 fn every_stage_reports_on_explicit_absence() {
     let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
                   type NoErr 'r = #Ok Nat | \\#Err | ..'r\n\
-                  let ok : NoErr (#Warn Nat) = #Ok 1\n";
+                  let ok : NoErr (#Warn Nat) = #Ok 1n\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     assert!(
@@ -1919,7 +1922,7 @@ fn every_stage_reports_on_explicit_absence() {
 /// desugar and the normalization.
 #[test]
 fn a_match_and_a_pattern_let_reach_every_stage() {
-    let source = "let {x, y} = { x: 1, y: 2 }\n\
+    let source = "let {x, y} = { x: 1n, y: 2n }\n\
                   let f = fn e => match e with | #A #X a => x | { g: #G p } => p | r => y end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
@@ -2012,10 +2015,10 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
 /// have. No new tab.
 #[test]
 fn a_wildcard_reaches_every_stage() {
-    let source = "let _ = 1\n\
+    let source = "let _ = 1n\n\
                   let const = fn x _ => x\n\
                   let use_y = fn p => let { x: _, y } = p in y\n\
-                  let f = fn e => match e with | #Some _ => 1 | _ => 0 end\n";
+                  let f = fn e => match e with | #Some _ => 1n | _ => 0n end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     assert!(
@@ -2134,12 +2137,12 @@ fn every_stage_reports_on_a_source_using_effects() {
                   effect Console = !Log + !IO\n\
                   type Logger = Nat -> Nat + !Log\n\
                   type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e\n\
-                  let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1 in 0\n\
+                  let greet : () -> Nat + !Log = fn _ => let _ = !Log.write 1n in 0n\n\
                   let quiet : () -> Nat = fn _ =>\n\
                     handle greet () with | !Log.write s => () | return x => x end\n\
                   let loud : () -> Nat + !IO = fn _ =>\n\
                     handle greet () with | !Log.write s => !IO.print s end\n\
-                  let choose = fn v => match v with | #A x => x | _ => 0 end\n";
+                  let choose = fn v => match v with | #A x => x | _ => 0n end\n";
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {

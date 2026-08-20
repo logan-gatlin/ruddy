@@ -19,10 +19,10 @@ const HEADER: &str = "bundle demo 0.1.0\n";
 const NESTED: &[(&str, &str)] = &[
     (
         ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2\n",
+        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
     ),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-    ("Math/Vec.hc", "let zero = 0\n"),
+    ("Math/Vec.hc", "let zero = 0n\n"),
 ];
 
 /// The page finds a stage's variables by the pattern the stage declares, and by
@@ -230,7 +230,7 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     // type is the match row's text, and the match stays exhaustive.
     let nodes = tab(
         "patterns",
-        "let f = fn n => match n with | x => 1 | 2 => 3 | 4 => 5 end",
+        "let f = fn n => match n with | x => 1n | 2n => 3n | 4n => 5n end",
     );
     assert_eq!(nodes.len(), 1, "{nodes:#?}");
     let rows: Vec<(&str, &str)> = nodes[0]
@@ -245,8 +245,8 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
         [
             ("scrutinee", "Nat"),
             ("reachable", "x"),
-            ("starved", "2"),
-            ("starved", "4"),
+            ("starved", "2n"),
+            ("starved", "4n"),
             ("coverage", "exhaustive"),
         ],
         "{nodes:#?}"
@@ -256,7 +256,7 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     // error it reports.
     let nodes = tab(
         "patterns",
-        "let bad = match {x: 1, y: 2} with {x} => {} | {y} => {} end",
+        "let bad = match {x: 1n, y: 2n} with {x} => {} | {y} => {} end",
     );
     let coverage = nodes[0]
         .children
@@ -269,7 +269,7 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     // An unreachable arm is marked as the error its row reports.
     let nodes = tab(
         "patterns",
-        "let f = fn e => match e with | #A x => 1 | #A y => 2 end",
+        "let f = fn e => match e with | #A x => 1n | #A y => 2n end",
     );
     let unreachable = nodes[0]
         .children
@@ -283,7 +283,7 @@ fn the_patterns_tab_renders_verdicts_and_coverage() {
     // for the coverage.
     let nodes = tab(
         "patterns",
-        "let f = fn e => match e with | 1 => 2 | #A => 3 end",
+        "let f = fn e => match e with | 1n => 2n | #A => 3n end",
     );
     let verdicts: Vec<&str> = nodes[0]
         .children
@@ -389,7 +389,10 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     );
 
     // An annotation's own clause is a batch of its own.
-    let nodes = tab("presence", "let f : { x when 'a: Nat } where 'a = { x: 1 }");
+    let nodes = tab(
+        "presence",
+        "let f : { x when 'a: Nat } where 'a = { x: 1n }",
+    );
     assert!(
         nodes.iter().any(|node| node.label == "annotation"),
         "{nodes:#?}"
@@ -403,9 +406,9 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         "presence",
         "let outer = fn z =>\n  \
            let g = fn v =>\n    \
-             let w = match v with | {x} => 0 | {y} => 0 end in\n    \
-             match v with | {x: 1} => 1 | {x: n} => 2 | {y} => 3 end in\n  \
-           0",
+             let w = match v with | {x} => 0n | {y} => 0n end in\n    \
+             match v with | {x: 1n} => 1n | {x: n} => 2n | {y} => 3n end in\n  \
+           0n",
     );
     let outer = nodes
         .iter()
@@ -531,7 +534,7 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
 /// annotation reaches no symbol table. Two variables are two groups.
 #[test]
 fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
-    let tree = tab("ir", "let f : { x: 'c, ..'b } -> Nat = fn p => 0");
+    let tree = tab("ir", "let f : { x: 'c, ..'b } -> Nat = fn p => 0n");
     let rows = flatten(&tree);
     let link = |label: &str, text: &str| {
         rows.iter()
@@ -581,7 +584,7 @@ fn the_type_tabs_show_the_new_spelling() {
 
     // And the rule that refuses one is a step like any other, red and carrying
     // the same words the strip does.
-    let tree = tab("solve", "let g : 'a -> 'a = fn x => 0");
+    let tree = tab("solve", "let g : 'a -> 'a = fn x => 0n");
     let rows = flatten(&tree);
     let refused = rows
         .iter()
@@ -608,7 +611,7 @@ fn the_type_tabs_show_the_new_spelling() {
 fn the_lir_tab_renders_the_listing_as_a_tree() {
     let nodes = tab(
         "lir",
-        "let f = fn a => match a with | #A n => n | b => 0 end",
+        "let f = fn a => match a with | #A n => n | b => 0n end",
     );
     let roots: Vec<(&str, &str)> = nodes
         .iter()
@@ -662,7 +665,7 @@ fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
         "effect Log = write : Nat -> ()\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
-         let use = fn w => handle piped logger 1 with | !Log.write s => {} end\n",
+         let use = fn w => handle piped logger 1n with | !Log.write s => {} end\n",
     );
     let rows = flatten(&nodes);
     let row = |text: &str| {
@@ -824,7 +827,7 @@ fn the_ast_tab_groups_its_rows_by_file() {
 
     // A module written inline is the other half of the rule: its statements
     // were written in this file, so this file's row is where they go.
-    let nodes = tab("ast", "module A =\n  let x = 1\nend\n");
+    let nodes = tab("ast", "module A =\n  let x = 1n\nend\n");
     let inline = &nodes[0].children[1];
     assert_eq!(inline.label, "Module");
     let kids: Vec<&str> = inline

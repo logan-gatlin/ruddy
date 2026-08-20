@@ -114,10 +114,10 @@ fn a_nested_bundle_splices_every_file_into_one_tree() {
     let (manager, out) = load(&[
         (
             "main.hc",
-            "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2\n",
+            "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
         ),
         ("Math.hc", "module Vec\nlet double = fn x => x\n"),
-        ("Math/Vec.hc", "let zero = 0\n"),
+        ("Math/Vec.hc", "let zero = 0n\n"),
     ]);
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -211,10 +211,10 @@ fn a_file_module_inside_an_inline_module_is_looked_for_under_it() {
             "main.hc",
             "bundle demo 0.1.0\nmodule A =\n  module B\nend\n",
         ),
-        ("A/B.hc", "let x = 1\n"),
+        ("A/B.hc", "let x = 1n\n"),
         // Beside the root, where it must *not* be found: a loader that dropped
         // the enclosing module from the path would read this one and pass.
-        ("B.hc", "let wrong = 1\n"),
+        ("B.hc", "let wrong = 1n\n"),
     ])
     .1;
 
@@ -230,7 +230,7 @@ fn a_file_module_inside_an_inline_module_is_looked_for_under_it() {
 /// complaint in the program.
 #[test]
 fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
-    let out = one("bundle demo 0.1.0\nmodule Gone\nlet x = 1\n");
+    let out = one("bundle demo 0.1.0\nmodule Gone\nlet x = 1n\n");
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(
@@ -241,7 +241,7 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
         }
     );
     // At the declaration, which is the name the reader wrote.
-    let source = "bundle demo 0.1.0\nmodule Gone\nlet x = 1\n";
+    let source = "bundle demo 0.1.0\nmodule Gone\nlet x = 1n\n";
     let at = source.find("Gone").expect("the module is declared");
     assert_eq!(out.errors[0].span.start, at);
     // An empty body rather than none, so nothing downstream has to know the
@@ -282,9 +282,9 @@ fn a_repeated_file_module_does_not_splice_its_body_twice() {
 #[test]
 fn a_module_with_two_files_is_reported_and_neither_is_read() {
     let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule Math\nlet x = 1\n"),
-        ("Math.hc", "let beside = 1\n"),
-        ("Math/module.hc", "let inside = 1\n"),
+        ("main.hc", "bundle demo 0.1.0\nmodule Math\nlet x = 1n\n"),
+        ("Math.hc", "let beside = 1n\n"),
+        ("Math/module.hc", "let inside = 1n\n"),
     ])
     .1;
 
@@ -328,7 +328,7 @@ fn a_header_outside_the_root_is_reported_at_the_header() {
 /// fallback so every later phase still produces output.
 #[test]
 fn a_root_with_no_header_is_reported_at_the_start_of_the_file() {
-    let out = one("let x = 1\n");
+    let out = one("let x = 1n\n");
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::MissingBundleDeclaration);
@@ -346,7 +346,7 @@ fn a_root_with_no_header_is_reported_at_the_start_of_the_file() {
 fn a_header_the_mint_refuses_is_reported_and_leaves_no_identity() {
     // A leading `_` is a perfectly good identifier and not a bundle name: only
     // a letter may start one. Refused by `Bundle::new`, not by the lexer.
-    let out = one("bundle _demo 0.1.0\nlet x = 1\n");
+    let out = one("bundle _demo 0.1.0\nlet x = 1n\n");
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::BadBundleIdentity);
@@ -364,7 +364,7 @@ fn each_file_carries_its_own_lex_and_parse_errors() {
     let out = load(&[
         ("main.hc", "bundle demo 0.1.0\nmodule A\nmodule B\n"),
         ("A.hc", "let x = @\n"),
-        ("B.hc", "let = 1\n"),
+        ("B.hc", "let = 1n\n"),
     ])
     .1;
 

@@ -4,7 +4,7 @@
 //! right shape for inference and diagnostics, the wrong shape for code
 //! generation. This phase flattens that tree into a list of top-level functions
 //! and globals: every nested expression becomes a temp assignment, every type
-//! collapses to one of six machine [`Rep`]resentations, every `match` becomes a
+//! collapses to a machine [`Rep`]resentation, every `match` becomes a
 //! decision tree of tests, every `fn` becomes a lifted function with an explicit
 //! capture list, and every effect becomes either an ordinary call through
 //! passed-down evidence or a tagged [`End::Throw`].
@@ -114,8 +114,27 @@ pub struct Instr {
 /// What one instruction does.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// A natural literal.
-    Const(u128),
+    /// Numeric literals.
+    Const(u64),
+    ConstInt(i64),
+    ConstReal(f64),
+    Neg(Temp),
+    Add {
+        left: Temp,
+        right: Temp,
+    },
+    Sub {
+        left: Temp,
+        right: Temp,
+    },
+    Mul {
+        left: Temp,
+        right: Temp,
+    },
+    Div {
+        left: Temp,
+        right: Temp,
+    },
     /// A struct literal. Empty is the unit value.
     Struct(IndexMap<String, Temp>),
     /// One record carrying every field of each of these, laid over one another
@@ -126,25 +145,43 @@ pub enum Op {
     /// fewer than two operands: laying one record over nothing is that record.
     Merge(Vec<Temp>),
     /// Read one field of a struct.
-    Project { base: Temp, field: String },
+    Project {
+        base: Temp,
+        field: String,
+    },
     /// One case of a sum. A bare case carries no payload temp.
-    Tag { name: String, payload: Option<Temp> },
+    Tag {
+        name: String,
+        payload: Option<Temp>,
+    },
     /// Extract a sum case's payload. Emitted by match lowering alone.
     Payload(Temp),
     /// Pair a function with the current values of its captures.
-    Closure { func: FuncId, captures: Vec<Temp> },
+    Closure {
+        func: FuncId,
+        captures: Vec<Temp>,
+    },
     /// A call. `args` holds each level's evidence records ahead of that level's
     /// visible argument; an indirect call has exactly one visible argument.
-    Call { callee: Callee, args: Vec<Temp> },
+    Call {
+        callee: Callee,
+        args: Vec<Temp>,
+    },
     /// Read a top-level definition's value.
-    Global { symbol: Symbol, name: String },
+    Global {
+        symbol: Symbol,
+        name: String,
+    },
     /// Mint a fresh handler identity, once per dynamic evaluation of a `handle`.
     NewTag,
     /// Run a block, catching only the throws carrying `tag` — a throw with any
     /// other tag keeps unwinding, which is what makes nested and recursive
     /// handlers of one effect correct. A caught value becomes this instruction's
     /// temp directly, bypassing the `return` arm.
-    Catch { tag: Temp, body: Box<Block> },
+    Catch {
+        tag: Temp,
+        body: Box<Block>,
+    },
     /// Dispatch on a sum value's case. `fallback` is present only where some arm
     /// accepts cases the listed ones do not cover.
     SwitchTag {
@@ -196,7 +233,7 @@ pub struct TagCase {
 /// One case of a [`Op::SwitchNat`].
 #[derive(Debug, Clone)]
 pub struct NatCase {
-    pub value: u128,
+    pub value: u64,
     pub block: Block,
 }
 
@@ -228,7 +265,14 @@ pub enum End {
 /// so everything a scheme quantified is [`Rep::Any`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rep {
+    /// An unsigned 64-bit integer.
     Nat,
+    /// A signed 64-bit integer.
+    Int,
+    /// A 64-bit floating-point number.
+    Real,
+    String,
+    Boolean,
     /// The value with nothing in it: the empty struct.
     Unit,
     Struct,
@@ -360,7 +404,7 @@ struct Apply<'a> {
 enum Cell {
     /// Accepts everything, binding the name it carries when it has one.
     Wild(Option<Symbol>),
-    Nat(u128),
+    Nat(u64),
     Tag {
         name: String,
         payload: Box<Cell>,
@@ -947,6 +991,10 @@ impl Lower<'_> {
         let ty = unfold(&self.inference.aliases, ty);
         match &ty.core {
             Core::Nat => Rep::Nat,
+            Core::Int => Rep::Int,
+            Core::Real => Rep::Real,
+            Core::String => Rep::String,
+            Core::Boolean => Rep::Boolean,
             Core::Arrow(..) => Rep::Fn,
             Core::Sum(_) => Rep::Sum,
             // A core carrying fields is a struct, and one carrying none is the
@@ -1551,6 +1599,23 @@ impl Lower<'_> {
         let rep = self.rep(&term.ty);
         match &term.kind {
             TermKind::Natural(value) => self.emit(body, span, rep, Op::Const(*value)),
+            TermKind::Integer(value) => self.emit(body, span, rep, Op::ConstInt(*value)),
+            TermKind::Real(value) => self.emit(body, span, rep, Op::ConstReal(*value)),
+            TermKind::Unary { value, .. } => {
+                let value = self.term(value, body);
+                self.emit(body, span, rep, Op::Neg(value))
+            }
+            TermKind::Binary { op, left, right } => {
+                let left = self.term(left, body);
+                let right = self.term(right, body);
+                let op = match op {
+                    crate::ir::BinaryOp::Add => Op::Add { left, right },
+                    crate::ir::BinaryOp::Sub => Op::Sub { left, right },
+                    crate::ir::BinaryOp::Mul => Op::Mul { left, right },
+                    crate::ir::BinaryOp::Div => Op::Div { left, right },
+                };
+                self.emit(body, span, rep, op)
+            }
             // A container honestly contains values shaped by its own type:
             // each member is fitted from the shape it holds to the shape the
             // container's type gives it going in, and the container records
@@ -2212,7 +2277,7 @@ impl Lower<'_> {
 
     /// A natural position: one case per number written, and the rest.
     fn switch_nat(&mut self, temp: Temp, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
-        let mut listed: Vec<u128> = Vec::new();
+        let mut listed: Vec<u64> = Vec::new();
         for line in &matrix.lines {
             if let Cell::Nat(value) = &line.cells[0]
                 && !listed.contains(value)
@@ -2220,7 +2285,7 @@ impl Lower<'_> {
                 listed.push(*value);
             }
         }
-        let narrow = |value: Option<u128>| -> Matrix {
+        let narrow = |value: Option<u64>| -> Matrix {
             matrix
                 .kept(|line| match (&line.cells[0], value) {
                     (Cell::Nat(written), Some(value)) => *written == value,

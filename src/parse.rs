@@ -141,8 +141,35 @@ pub enum EffectCase {
 
 pub type Expr = Tracked<ExprKind>;
 
+#[derive(Debug, Clone, Copy)]
+pub enum UnaryOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExprKind {
+    /// `value |> function` — an application written in data-flow order.
+    Pipe {
+        value: Box<Expr>,
+        function: Box<Expr>,
+    },
+    Unary {
+        op: UnaryOp,
+        value: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Apply {
         func: Box<Expr>,
         arg: Box<Expr>,
@@ -234,7 +261,9 @@ pub enum ExprKind {
     Ident {
         name: Path,
     },
-    Natural(u128),
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
     Unit,
 }
 
@@ -304,7 +333,7 @@ pub enum PatternKind {
     /// too often.
     Wildcard,
     /// A natural literal: matches exactly that number.
-    Natural(u128),
+    Natural(u64),
     /// `()`: matches unit, binds nothing.
     Unit,
     /// `{ f, g: <pattern>, ... }` — reach into a struct's fields. A bare field
@@ -961,7 +990,10 @@ impl Parser {
     fn version_part(&mut self) -> Option<(u64, Span)> {
         let read = match self.peek() {
             Some(tok) => match tok.tracked {
-                Kind::Natural(value) => u64::try_from(value).ok().map(|part| (part, tok.span)),
+                Kind::Natural(value) => Some((value, tok.span)),
+                Kind::Real(value) if value.fract() == 0.0 => u64::try_from(value as u128)
+                    .ok()
+                    .map(|part| (part, tok.span)),
                 _ => return self.unexpected(),
             },
             None => return self.unexpected(),
@@ -1239,6 +1271,8 @@ impl Parser {
                 tok.tracked,
                 Kind::Identifier(_)
                     | Kind::Natural(_)
+                    | Kind::Integer(_)
+                    | Kind::Real(_)
                     | Kind::Tag(_)
                     | Kind::EffectLabel(_)
                     | Kind::Fn
@@ -1249,9 +1283,72 @@ impl Parser {
         )
     }
 
-    /// Application binds tighter than nothing and is left-associative, ML-style:
-    /// `f x y` parses as `(f x) y`.
+    /// The pipeline is the loosest expression operator and associates left:
+    /// `x |> f |> g` is `g (f x)`.
     fn expr(&mut self) -> Option<Expr> {
+        let mut value = self.addition()?;
+        while self.eat_if(&Kind::PipeForward).is_some() {
+            let function = self.addition()?;
+            let span = value.span.merge(function.span);
+            value = span.track(ExprKind::Pipe {
+                value: Box::new(value),
+                function: Box::new(function),
+            });
+        }
+        Some(value)
+    }
+
+    /// Real addition and subtraction, left-associative and looser than multiplication.
+    fn addition(&mut self) -> Option<Expr> {
+        self.binary(
+            Self::product,
+            &[(Kind::Plus, BinaryOp::Add), (Kind::Minus, BinaryOp::Sub)],
+        )
+    }
+
+    fn product(&mut self) -> Option<Expr> {
+        self.binary(
+            Self::unary,
+            &[(Kind::Star, BinaryOp::Mul), (Kind::Slash, BinaryOp::Div)],
+        )
+    }
+
+    fn binary(
+        &mut self,
+        operand: fn(&mut Self) -> Option<Expr>,
+        operators: &[(Kind, BinaryOp)],
+    ) -> Option<Expr> {
+        let mut left = operand(self)?;
+        loop {
+            let Some((_, op)) = operators.iter().find(|(kind, _)| self.at(kind)) else {
+                return Some(left);
+            };
+            self.advance();
+            let right = operand(self)?;
+            let span = left.span.merge(right.span);
+            left = span.track(ExprKind::Binary {
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
+    }
+
+    fn unary(&mut self) -> Option<Expr> {
+        match self.eat_if(&Kind::Minus) {
+            Some(minus) => {
+                let value = self.unary()?;
+                Some(minus.span.merge(value.span).track(ExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    value: Box::new(value),
+                }))
+            }
+            None => self.application(),
+        }
+    }
+
+    /// Application binds tighter than numeric operators and is left-associative.
+    fn application(&mut self) -> Option<Expr> {
         let mut func = self.projection()?;
         while self.at_expr_atom() {
             let arg = self.projection()?;
@@ -1341,6 +1438,14 @@ impl Parser {
             &Kind::Natural(value) => {
                 self.advance();
                 Some(span.track(ExprKind::Natural(value)))
+            }
+            &Kind::Integer(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Integer(value)))
+            }
+            &Kind::Real(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Real(value)))
             }
             // Nothing here begins an expression
             _ => self.unexpected(),

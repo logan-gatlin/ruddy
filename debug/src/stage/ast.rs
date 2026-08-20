@@ -217,6 +217,29 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
 fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
     let node = Node::new(ids.next(), "", print::ast::expr(&expr.tracked).to_string()).at(expr.span);
     match &expr.tracked {
+        ExprKind::Pipe { value, function } => Node {
+            label: "Pipe".into(),
+            ..node
+        }
+        .child(expr_node(ids, value))
+        .child(expr_node(ids, function)),
+        ExprKind::Unary { value, .. } => Node {
+            label: "Neg".into(),
+            ..node
+        }
+        .child(expr_node(ids, value)),
+        ExprKind::Binary { op, left, right } => Node {
+            label: match op {
+                ruddy::parse::BinaryOp::Add => "Add",
+                ruddy::parse::BinaryOp::Sub => "Sub",
+                ruddy::parse::BinaryOp::Mul => "Mul",
+                ruddy::parse::BinaryOp::Div => "Div",
+            }
+            .into(),
+            ..node
+        }
+        .child(expr_node(ids, left))
+        .child(expr_node(ids, right)),
         ExprKind::Apply { func, arg } => Node {
             label: "Apply".into(),
             ..node
@@ -362,6 +385,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .at(name.span()),
         ExprKind::Natural(_) => Node {
             label: "Natural".into(),
+            ..node
+        },
+        ExprKind::Integer(_) => Node {
+            label: "Integer".into(),
+            ..node
+        },
+        ExprKind::Real(_) => Node {
+            label: "Real".into(),
             ..node
         },
         ExprKind::Unit => Node {

@@ -502,7 +502,7 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
 /// predict — which would be the rules under test standing in as their own
 /// expectation.
 fn round_trip(prelude: &str, printed: &str) -> String {
-    let source = format!("{prelude}let f : {{ v: {printed} }} -> Nat = fn r => 1\n");
+    let source = format!("{prelude}let f : {{ v: {printed} }} -> Nat = fn r => 1n\n");
     let lexed = token::lex(&source, FileID::GENERATED);
     assert!(lexed.errors.is_empty(), "{source}: {:#?}", lexed.errors);
     let parsed = parse::parse(lexed.tokens);
@@ -830,7 +830,7 @@ fn an_absence_in_a_closed_type_quotes_the_label_as_written() {
 #[test]
 fn a_written_absence_is_not_printed() {
     let source = "let f : { x: Nat, \\y, .. } -> Nat = fn a => a.x\n\
-                  let s : #Ok Nat | \\#Err | .. = #Ok 1\n";
+                  let s : #Ok Nat | \\#Err | .. = #Ok 1n\n";
     let lexed = token::lex(source, FileID::GENERATED);
     assert!(lexed.errors.is_empty(), "{:#?}", lexed.errors);
     let parsed = parse::parse(lexed.tokens);
@@ -1182,10 +1182,10 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // the printers write for one comes back too.
     let source = "type Pair 'a 'b = { first: 'a, second: 'b }\n\
                   let f = fn g => fn p => g p.first\n\
-                  let h = let n : Nat = 1 in n\n\
-                  let v : { first: Nat, second: Nat } = { first: 1, second: 2 }\n\
+                  let h = let n : Nat = 1n in n\n\
+                  let v : { first: Nat, second: Nat } = { first: 1n, second: 2n }\n\
                   type Gap 'r = { first: Nat, \\hole, ..'r }\n\
-                  let w : #Ok Nat | \\#Err | .. = #Ok 1";
+                  let w : #Ok Nat | \\#Err | .. = #Ok 1n";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut program_mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid"));
@@ -1202,7 +1202,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // written row can take, so a refusal at any of its writes comes back
     // whichever form is being written.
     let source = "let x : { first: Nat, opt when 'b: Nat, \\hole, .. } \
-                  -> (|) -> (| ..'r) -> (#Ok Nat | #Err (when 'a) | \\#B | ..) -> (#A | #B) = 1";
+                  -> (|) -> (| ..'r) -> (#Ok Nat | #Err (when 'a) | \\#B | ..) -> (#A | #B) = 1n";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     every_failure_is_reported(
@@ -2064,7 +2064,7 @@ fn the_pattern_complaints_say_what_was_written() {
 /// position nothing constrains as "anything".
 #[test]
 fn a_witness_renders_in_source_syntax() {
-    assert_eq!(ir::Witness::Natural(2).to_string(), "2");
+    assert_eq!(ir::Witness::Natural(2).to_string(), "2n");
     assert_eq!(ir::Witness::Any.to_string(), "anything");
     assert_eq!(
         ir::Witness::Tag {
@@ -2072,7 +2072,7 @@ fn a_witness_renders_in_source_syntax() {
             payload: Some(Box::new(ir::Witness::Natural(1))),
         }
         .to_string(),
-        "#A 1"
+        "#A 1n"
     );
     // A payload that is itself a tag — bare or carrying — or prose, is
     // bracketed: the example has to read back as the one value it is.
@@ -2085,7 +2085,7 @@ fn a_witness_renders_in_source_syntax() {
             })),
         }
         .to_string(),
-        "#A (#X 1)"
+        "#A (#X 1n)"
     );
     assert_eq!(
         ir::Witness::Tag {
@@ -2147,7 +2147,7 @@ fn a_witness_renders_in_source_syntax() {
             .collect(),
         )
         .to_string(),
-        "{ a, b: 1 }"
+        "{ a, b: 1n }"
     );
     // And the value with no fields at all is still the empty braces.
     assert_eq!(ir::Witness::Struct(Default::default()).to_string(), "{}");

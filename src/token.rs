@@ -59,12 +59,14 @@ pub enum Kind {
     /// token: the longer lexeme wins, so a `!` followed by an `=` is this and
     /// never an [`Effect`](Kind::Effect) beside an assignment.
     NotEqual,
-    /// `+`, introducing the effect row an arrow carries: `A -> B + !Log`.
-    ///
-    /// The whole of what it is for. There is no addition and no other use of
-    /// the character, so a `+` anywhere else is the unexpected token it looks
-    /// like.
+    /// `+`, joining an effect row or adding two real numbers.
     Plus,
+    /// `-`, an arrow's head or real-number subtraction and negation.
+    Minus,
+    /// `*`, multiplying two real numbers.
+    Star,
+    /// `/`, dividing two real numbers.
+    Slash,
     /// `\`, marking a struct type's field — or a sum type's case — as one that
     /// is definitely *not* there: the `..` beside it may not stand for the
     /// label. A bare punctuation token, so `\ y` lexes the same as `\y` — the
@@ -73,6 +75,8 @@ pub enum Kind {
     /// `|`, separating the cases of a sum type. Also the whole of the empty
     /// sum, which is the one type written with nothing but punctuation.
     Pipe,
+    /// `|>`, feeding its left value to the function on its right.
+    PipeForward,
     LeftBrace,
     RightBrace,
     LeftParen,
@@ -119,10 +123,12 @@ pub enum Kind {
     /// one declaration, which is what makes a declaration statement
     /// unnecessary.
     Variable(String),
-    /// A natural number literal. Bounded by `u128` rather than unbounded like
-    /// the naturals themselves; a literal that does not fit is rejected by the
-    /// lexer instead of silently wrapping.
-    Natural(u128),
+    /// An unsigned 64-bit natural literal, written with an `n` suffix.
+    Natural(u64),
+    /// A signed 64-bit integer literal, written with an `i` suffix.
+    Integer(i64),
+    /// A 64-bit floating-point literal. The suffixless spelling is real.
+    Real(f64),
 }
 
 #[derive(Debug, Clone)]
@@ -169,19 +175,14 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
                 }
             }
-            // `-` begins nothing on its own — there is no subtraction and no
-            // negative literal — so the only thing it can be is the head of an
-            // arrow, and a lone one is reported where it was written.
+            // `->` wins over the standalone minus.
             '-' => {
                 chars.next();
                 if let Some(&(_, '>')) = chars.peek() {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::Arrow));
                 } else {
-                    errors.push(Error {
-                        span: file_id.span(start, 1),
-                        kind: ErrorKind::Unrecognized,
-                    });
+                    tokens.push(file_id.span(start, 1).track(Kind::Minus));
                 }
             }
             // `::` separates a path's segments; a lone `:` ascribes. The longer
@@ -242,15 +243,26 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     Err(kind) => errors.push(Error { span, kind }),
                 }
             }
-            // The one thing a `+` is: the mark that hangs an effect row off an
-            // arrow. There is no addition, so nothing else can be meant by one.
             '+' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Plus));
                 chars.next();
             }
-            '|' => {
-                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+            '*' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Star));
                 chars.next();
+            }
+            '/' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Slash));
+                chars.next();
+            }
+            '|' => {
+                chars.next();
+                if let Some(&(_, '>')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::PipeForward));
+                } else {
+                    tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+                }
             }
             // Never a lex error, unlike `-` and the `#`: what may follow a
             // `\` is the parser's business.
@@ -320,15 +332,27 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 };
                 tokens.push(span.track(kind));
             }
-            // A natural literal runs over the characters an identifier
-            // continues with, not just digits, so that `1x` is one malformed
-            // literal here rather than a `1` beside an `x` for the parser to
-            // make sense of.
+            // A numeric literal is a real by default. An `i` or `n` suffix
+            // selects a signed integer or natural respectively. A decimal
+            // point belongs to the literal only when a digit follows it, so
+            // `1.x` remains a projection.
             c if c.is_ascii_digit() => {
-                let digits = word(&mut chars);
-                let span = file_id.span(start, digits.len());
-                match natural(&digits) {
-                    Ok(value) => tokens.push(span.track(Kind::Natural(value))),
+                let version_part = in_version(&tokens);
+                let literal = number(&mut chars, !version_part);
+                let span = file_id.span(start, literal.len());
+                let kind = if version_part {
+                    // A bundle version is spelled with bare integer components.
+                    // Do not first turn one into an f64: values near `u64::MAX`
+                    // cannot make that round trip without changing value.
+                    literal
+                        .parse()
+                        .map(Kind::Natural)
+                        .map_err(|_| ErrorKind::NaturalTooLarge)
+                } else {
+                    numeric(&literal)
+                };
+                match kind {
+                    Ok(kind) => tokens.push(span.track(kind)),
                     Err(kind) => errors.push(Error { span, kind }),
                 }
             }
@@ -372,6 +396,24 @@ fn sigilled(
     }
 }
 
+/// Whether the next digits are one of the three bare components of the root
+/// bundle's version. Versions deliberately retain exact integer spelling even
+/// though ordinary suffixless numbers are reals.
+fn in_version(tokens: &[Tracked<Kind>]) -> bool {
+    match tokens {
+        [first, second] => {
+            matches!(first.tracked, Kind::Bundle) && matches!(second.tracked, Kind::Identifier(_))
+        }
+        [first, second, component, dot] | [first, second, _, _, component, dot] => {
+            matches!(first.tracked, Kind::Bundle)
+                && matches!(second.tracked, Kind::Identifier(_))
+                && matches!(component.tracked, Kind::Natural(_))
+                && matches!(dot.tracked, Kind::Dot)
+        }
+        _ => false,
+    }
+}
+
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
     let mut word = String::new();
     while let Some(&(_, c)) = chars.peek() {
@@ -385,13 +427,87 @@ fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
     word
 }
 
-/// Read a word that started with a digit as a natural number. Non-ASCII digits
-/// are rejected along with everything else that is not `0..=9`: they are
-/// alphanumeric, so they reach here, and accepting them would make two
-/// spellings of one number.
-fn natural(digits: &str) -> Result<u128, ErrorKind> {
-    if !digits.chars().all(|c| c.is_ascii_digit()) {
+/// Consume one numeric literal, including its optional fractional part and
+/// type suffix. Any identifier character attached to it stays part of the
+/// literal so `1thing` is one useful lexical error rather than two terms.
+fn number(chars: &mut Peekable<CharIndices<'_>>, allow_decimal: bool) -> String {
+    let mut literal = String::new();
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_ascii_digit() {
+            literal.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let decimal = if allow_decimal
+        && matches!(chars.peek(), Some(&(_, '.')))
+        && matches!(chars.clone().nth(1), Some((_, c)) if c.is_ascii_digit())
+    {
+        // A second dot after the fractional digits makes this a bundle version
+        // component, not a decimal: `0.1.0` is three numeric tokens.
+        let mut look = chars.clone();
+        look.next();
+        while matches!(look.peek(), Some(&(_, c)) if c.is_ascii_digit()) {
+            look.next();
+        }
+        !matches!(look.peek(), Some(&(_, '.')))
+    } else {
+        false
+    };
+    if decimal {
+        literal.push('.');
+        chars.next();
+        while let Some(&(_, c)) = chars.peek() {
+            if c.is_ascii_digit() {
+                literal.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            literal.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    literal
+}
+
+fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
+    let (digits, suffix) = match literal.strip_suffix('i') {
+        Some(digits) => (digits, Some('i')),
+        None => match literal.strip_suffix('n') {
+            Some(digits) => (digits, Some('n')),
+            None => (literal, None),
+        },
+    };
+    if digits.is_empty()
+        || !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+        || digits.bytes().filter(|&c| c == b'.').count() > 1
+        || suffix.is_some_and(|_| digits.contains('.'))
+    {
         return Err(ErrorKind::MalformedNatural);
     }
-    digits.parse().map_err(|_| ErrorKind::NaturalTooLarge)
+    match suffix {
+        Some('n') => digits
+            .parse()
+            .map(Kind::Natural)
+            .map_err(|_| ErrorKind::NaturalTooLarge),
+        Some('i') => digits
+            .parse()
+            .map(Kind::Integer)
+            .map_err(|_| ErrorKind::NaturalTooLarge),
+        None => digits
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Kind::Real)
+            .ok_or(ErrorKind::NaturalTooLarge),
+        _ => unreachable!(),
+    }
 }

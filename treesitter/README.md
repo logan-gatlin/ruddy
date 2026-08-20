@@ -62,7 +62,7 @@ The grammar is faithful about what parses — the reserved words, the contextual
 ones, the associativities, and the two-token lookaheads all match `parse.rs` —
 with these exceptions, none of which a correct program can tell apart:
 
-- **Malformed literals parse.** `12abc` and a number too large for `u128` are
+- **Malformed literals parse.** `12abc` and a number too large for `u64` are
   one `natural` node each. The lexer reads them as one lexeme too, and then
   refuses them; a grammar has nowhere to say "this literal is broken".
 - **What lowering refuses is not the grammar's business.** A hole in a

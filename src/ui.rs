@@ -119,6 +119,14 @@ pub enum Prec {
     /// `fn a => body` — the body extends as far right as it can, so a lambda
     /// needs parentheses anywhere anything may follow it.
     Lambda,
+    /// `value |> function`.
+    Pipeline,
+    /// `left + right`.
+    Addition,
+    /// `left * right`.
+    Multiplication,
+    /// `-value`.
+    Unary,
     /// `from -> to`.
     Arrow,
     /// `#A Nat | #B` — a sum extends rightward by case, so it needs
@@ -256,7 +264,7 @@ impl fmt::Display for token::ErrorKind {
             token::ErrorKind::MalformedNatural => "malformed natural number",
             // The bound is worth naming: it is the one limit here that a
             // person can do arithmetic against.
-            token::ErrorKind::NaturalTooLarge => "natural number too large to fit in 128 bits",
+            token::ErrorKind::NaturalTooLarge => "natural number too large to fit in 64 bits",
         })
     }
 }
@@ -290,8 +298,12 @@ impl fmt::Display for Kind {
             Kind::DotDot => f.write_str(".."),
             Kind::NotEqual => f.write_str("!="),
             Kind::Plus => f.write_str("+"),
+            Kind::Minus => f.write_str("-"),
+            Kind::Star => f.write_str("*"),
+            Kind::Slash => f.write_str("/"),
             Kind::Backslash => f.write_str("\\"),
             Kind::Pipe => f.write_str("|"),
+            Kind::PipeForward => f.write_str("|>"),
             // The sigil is written back on: it is how the token was spelled,
             // and either of these printing as a bare name would re-lex as an
             // identifier.
@@ -304,7 +316,9 @@ impl fmt::Display for Kind {
             Kind::RightParen => f.write_str(")"),
             Kind::Identifier(name) => f.write_str(name),
             Kind::Underscore => f.write_str("_"),
-            Kind::Natural(value) => write!(f, "{value}"),
+            Kind::Natural(value) => write!(f, "{value}n"),
+            Kind::Integer(value) => write!(f, "{value}i"),
+            Kind::Real(value) => write!(f, "{value}"),
         }
     }
 }
@@ -380,7 +394,7 @@ impl fmt::Display for parse::PatternKind {
         match self {
             parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
             parse::PatternKind::Wildcard => f.write_str("_"),
-            parse::PatternKind::Natural(value) => write!(f, "{value}"),
+            parse::PatternKind::Natural(value) => write!(f, "{value}n"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -446,7 +460,7 @@ impl fmt::Display for ir::Witness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ir::Witness::Any => f.write_str("anything"),
-            ir::Witness::Natural(value) => write!(f, "{value}"),
+            ir::Witness::Natural(value) => write!(f, "{value}n"),
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
             // pun-style — under exactness the presence *is* the information,
@@ -1094,6 +1108,10 @@ impl Grouped for Core {
             // are behind it. Unit is one too: its braces close it.
             Core::Unit
             | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
             | Core::Named { .. }
             | Core::Var(_)
             | Core::Bound(_)
@@ -1178,7 +1196,14 @@ fn core_tail(core: &Core) -> Option<Option<String>> {
         // the same rest.
         Core::Rigid { name, .. } => Some(Some(format!("'{name}"))),
         Core::Undecided => Some(Some(String::new())),
-        Core::Nat | Core::Arrow(..) | Core::Sum(_) | Core::Named { .. } => None,
+        Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
+        | Core::Arrow(..)
+        | Core::Sum(_)
+        | Core::Named { .. } => None,
     }
 }
 
@@ -1192,6 +1217,10 @@ impl fmt::Display for Core {
             // [`Core::Unit`].
             Core::Unit => write_fields(f, &IndexMap::new(), None),
             Core::Nat => f.write_str(Prim::Nat.name()),
+            Core::Int => f.write_str(Prim::Int.name()),
+            Core::Real => f.write_str(Prim::Real.name()),
+            Core::String => f.write_str(Prim::String.name()),
+            Core::Boolean => f.write_str(Prim::Boolean.name()),
             Core::Arrow(from, to, effects) => {
                 let row = effects_of(effects);
                 write_arrow(f, &**from, &**to, row.as_ref().map(shown))
@@ -2085,6 +2114,36 @@ impl fmt::Display for Origin {
 /// Render `func arg`. A lambda on the left would swallow the argument into its
 /// own body, and anything that keeps consuming to its right would swallow
 /// whatever follows the argument.
+/// Render `value |> function`.
+pub fn write_pipeline(
+    f: &mut fmt::Formatter<'_>,
+    value: &impl Grouped,
+    function: &impl Grouped,
+) -> fmt::Result {
+    write_grouped(f, value.prec() < Prec::Pipeline, value)?;
+    f.write_str(" |> ")?;
+    write_grouped(f, function.prec() <= Prec::Pipeline, function)
+}
+
+/// Render a unary numeric operator.
+pub fn write_unary(f: &mut fmt::Formatter<'_>, op: &str, value: &impl Grouped) -> fmt::Result {
+    f.write_str(op)?;
+    write_grouped(f, value.prec() < Prec::Unary, value)
+}
+
+/// Render a left-associative numeric binary operator.
+pub fn write_binary(
+    f: &mut fmt::Formatter<'_>,
+    left: &impl Grouped,
+    op: &str,
+    right: &impl Grouped,
+    prec: Prec,
+) -> fmt::Result {
+    write_grouped(f, left.prec() < prec, left)?;
+    write!(f, " {op} ")?;
+    write_grouped(f, right.prec() <= prec, right)
+}
+
 pub fn write_apply(
     f: &mut fmt::Formatter<'_>,
     func: &impl Grouped,

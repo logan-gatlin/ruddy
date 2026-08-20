@@ -53,22 +53,39 @@ fn section(source: &str, header: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn pipeline_lowers_as_an_application() {
+    let printed = listing("let f = fn x => x\nlet value = 1 |> f");
+    assert!(
+        printed.contains("call f"),
+        "pipeline did not call f:\n{printed}"
+    );
+}
+
+#[test]
+fn real_number_operators_lower_to_native_instructions() {
+    let printed = listing("let value = -1 + 2 - 3 * 4 / 5");
+    for op in ["neg", "add", "sub", "mul", "div"] {
+        assert!(printed.contains(op), "{op} missing from:\n{printed}");
+    }
+}
+
 /// Every nested expression becomes one temp assignment, in the order the source
 /// evaluates it: the value of a `let` before its body, a struct's fields as
 /// written, a projection's base before the read.
 #[test]
 fn a_nested_expression_flattens_in_source_order() {
     let printed = section(
-        "let f = let p : { a: Nat } = { a: 1 } in #Some { b: p.a, c: 2 }",
+        "let f = let p : { a: Nat } = { a: 1n } in #Some { b: p.a, c: 2n }",
         "global f",
     );
     assert_eq!(
         printed,
         "global f:\n\
-         \x20 %0: nat = const 1\n\
+         \x20 %0: nat = const 1n\n\
          \x20 %1: struct = struct { a: %0 }\n\
          \x20 %2: nat = project %1, \"a\"\n\
-         \x20 %3: nat = const 2\n\
+         \x20 %3: nat = const 2n\n\
          \x20 %4: struct = struct { b: %2, c: %3 }\n\
          \x20 %5: sum = tag #Some, %4\n\
          \x20 ret %5"
@@ -81,8 +98,8 @@ fn a_nested_expression_flattens_in_source_order() {
 #[test]
 fn a_binding_emits_no_instruction_of_its_own() {
     assert_eq!(
-        section("let f = let p : Nat = 1 in p", "global f"),
-        "global f:\n  %0: nat = const 1\n  ret %0"
+        section("let f = let p : Nat = 1n in p", "global f"),
+        "global f:\n  %0: nat = const 1n\n  ret %0"
     );
 }
 
@@ -91,30 +108,38 @@ fn a_binding_emits_no_instruction_of_its_own() {
 fn a_shadowed_name_is_put_back_afterwards() {
     assert_eq!(
         section(
-            "let f = let p = 1 in { one: let p = 2 in p, two: p }",
+            "let f = let p = 1n in { one: let p = 2n in p, two: p }",
             "global f"
         ),
         "global f:\n\
-         \x20 %0: nat = const 1\n\
-         \x20 %1: nat = const 2\n\
+         \x20 %0: nat = const 1n\n\
+         \x20 %1: nat = const 2n\n\
          \x20 %2: struct = struct { one: %1, two: %0 }\n\
          \x20 ret %2"
     );
 }
 
-/// One case per representation. `nat`, `sum` and `fn` come off the core; the
-/// empty struct is `unit` and a struct with fields is `struct`; and anything a
-/// scheme quantified is `any`, since monomorphization is deferred.
+/// One case per representation. The primitive representations come off the
+/// core; the empty struct is `unit` and a struct with fields is `struct`; and
+/// anything a scheme quantified is `any`, since monomorphization is deferred.
 #[test]
 fn every_representation_comes_off_the_solved_type() {
-    let source = "let n = 1\nlet u = {}\nlet s = { x: 1 }\nlet c = #A\nlet i = fn x => x";
-    assert!(section(source, "global n").contains("%0: nat = const 1"));
+    let source = "let n = 1n\nlet u = {}\nlet s = { x: 1n }\nlet c = #A\nlet i = fn x => x\n\
+                  let int : Int -> Int = fn x => x\n\
+                  let real : Real -> Real = fn x => x\n\
+                  let string : String -> String = fn x => x\n\
+                  let boolean : Boolean -> Boolean = fn x => x";
+    assert!(section(source, "global n").contains("%0: nat = const 1n"));
     assert!(section(source, "global u").contains(": unit = struct {}"));
     assert!(section(source, "global s").contains(": struct = struct { x:"));
     assert!(section(source, "global c").contains(": sum = tag #A"));
     assert!(section(source, "global i").contains(": fn = closure i#1"));
     // The polymorphic identity's argument is held as anything at all.
     assert!(section(source, "fn i(").starts_with("fn i(%5: any):"));
+    assert!(section(source, "fn int(").contains(": int64):"));
+    assert!(section(source, "fn real(").contains(": real64):"));
+    assert!(section(source, "fn string(").contains(": string):"));
+    assert!(section(source, "fn boolean(").contains(": boolean):"));
 }
 
 /// A `fn` lifts to a top-level function whose parameters are its captures and
@@ -144,7 +169,7 @@ fn a_lambda_that_closes_over_nothing_captures_nothing() {
 /// inside the function that names it, so nothing is captured for it.
 #[test]
 fn a_top_level_name_is_read_rather_than_captured() {
-    let source = "let c = 1\nlet r = fn w => { f: fn x => c }";
+    let source = "let c = 1n\nlet r = fn w => { f: fn x => c }";
     assert_eq!(
         section(source, "fn r#2"),
         "fn r#2(%2: any):\n  %3: nat = global c\n  ret %3"
@@ -156,12 +181,12 @@ fn a_top_level_name_is_read_rather_than_captured() {
 /// uncurried function, not two unary calls.
 #[test]
 fn a_full_application_is_one_direct_call() {
-    let source = "let add = fn a => fn b => a\nlet main = add 1 2";
+    let source = "let add = fn a => fn b => a\nlet main = add 1n 2n";
     assert_eq!(
         section(source, "global main"),
         "global main:\n\
-         \x20 %8: nat = const 1\n\
-         \x20 %9: nat = const 2\n\
+         \x20 %8: nat = const 1n\n\
+         \x20 %9: nat = const 2n\n\
          \x20 %10: nat = call add, %8, %9\n\
          \x20 ret %10"
     );
@@ -175,10 +200,10 @@ fn a_full_application_is_one_direct_call() {
 /// wrapper that takes the next one.
 #[test]
 fn a_partial_application_is_a_wrapper_closure() {
-    let source = "let two = fn a => fn b => a\nlet part = two 1";
+    let source = "let two = fn a => fn b => a\nlet part = two 1n";
     assert_eq!(
         section(source, "global part"),
-        "global part:\n  %8: nat = const 1\n  %9: fn = closure two#2, [%8]\n  ret %9"
+        "global part:\n  %8: nat = const 1n\n  %9: fn = closure two#2, [%8]\n  ret %9"
     );
     // The wrapper it names takes what was captured and then the argument left,
     // and hands the lot to the uncurried function.
@@ -212,14 +237,14 @@ fn a_known_function_used_as_a_value_is_its_global() {
 /// call, and what is left is applied to the result one at a time.
 #[test]
 fn an_over_application_calls_direct_and_then_indirectly() {
-    let source = "let id = fn x => x\nlet two = fn a => fn b => a\nlet over = two id 1 2";
+    let source = "let id = fn x => x\nlet two = fn a => fn b => a\nlet over = two id 1n 2n";
     assert_eq!(
         section(source, "global over"),
         "global over:\n\
          \x20 %12: fn = global id\n\
-         \x20 %13: nat = const 1\n\
+         \x20 %13: nat = const 1n\n\
          \x20 %14: fn = call two, %12, %13\n\
-         \x20 %15: nat = const 2\n\
+         \x20 %15: nat = const 2n\n\
          \x20 %16: nat = call %14, %15\n\
          \x20 ret %16"
     );
@@ -240,7 +265,7 @@ fn an_unknown_callee_stays_unary() {
 /// one — which is the order a backend initializes them in.
 #[test]
 fn globals_are_emitted_in_group_order() {
-    let output = lowered("let a = 1\nlet b = a\nlet c = 2");
+    let output = lowered("let a = 1n\nlet b = a\nlet c = 2n");
     let names: Vec<&str> = output
         .globals
         .iter()
@@ -270,8 +295,8 @@ fn mutual_recursion_calls_direct() {
 #[test]
 fn a_plain_value_global_is_its_own_initializer() {
     assert_eq!(
-        section("let v = { x: 1 }", "global v"),
-        "global v:\n  %0: nat = const 1\n  %1: struct = struct { x: %0 }\n  ret %1"
+        section("let v = { x: 1n }", "global v"),
+        "global v:\n  %0: nat = const 1n\n  %1: struct = struct { x: %0 }\n  ret %1"
     );
 }
 
@@ -282,7 +307,7 @@ fn a_plain_value_global_is_its_own_initializer() {
 fn a_match_tests_each_position_once() {
     assert_eq!(
         section(
-            "let pick = fn v => match v with | #Some 0 => 100 | #Some n => n | #None => 0 end",
+            "let pick = fn v => match v with | #Some 0n => 100n | #Some n => n | #None => 0n end",
             "fn pick("
         ),
         "fn pick(%0: sum):\n\
@@ -291,13 +316,13 @@ fn a_match_tests_each_position_once() {
          \x20     %1: nat = payload %0\n\
          \x20     %3: nat = switch_nat %1:\n\
          \x20       0 =>\n\
-         \x20         %2: nat = const 100\n\
+         \x20         %2: nat = const 100n\n\
          \x20         yield %2\n\
          \x20       else =>\n\
          \x20         yield %1\n\
          \x20     yield %3\n\
          \x20   #None =>\n\
-         \x20     %4: nat = const 0\n\
+         \x20     %4: nat = const 0n\n\
          \x20     yield %4\n\
          \x20 ret %5"
     );
@@ -310,14 +335,14 @@ fn a_match_tests_each_position_once() {
 fn a_tag_dispatch_has_an_else_only_where_something_is_left_over() {
     assert!(
         section(
-            "let f = fn v => match v with | #A x => x | b => 0 end",
+            "let f = fn v => match v with | #A x => x | b => 0n end",
             "fn f("
         )
         .contains("else =>")
     );
     assert!(
         !section(
-            "let f = fn v => match v with | #A x => x | #B => 0 end",
+            "let f = fn v => match v with | #A x => x | #B => 0n end",
             "fn f("
         )
         .contains("else =>")
@@ -353,17 +378,17 @@ fn an_optional_field_becomes_a_presence_test() {
 fn an_exact_pattern_over_an_open_type_tests_the_rest() {
     assert_eq!(
         section(
-            "let f = fn s => match s with | {x} => 1 | {x, ..} => 2 end",
+            "let f = fn s => match s with | {x} => 1n | {x, ..} => 2n end",
             "fn f("
         ),
         "fn f(%0: any):\n\
          \x20 %1: any = project %0, \"x\"\n\
          \x20 %4: nat = switch_rest %0, [\"x\"]:\n\
          \x20   none =>\n\
-         \x20     %2: nat = const 1\n\
+         \x20     %2: nat = const 1n\n\
          \x20     yield %2\n\
          \x20   some =>\n\
-         \x20     %3: nat = const 2\n\
+         \x20     %3: nat = const 2n\n\
          \x20     yield %3\n\
          \x20 ret %4"
     );
@@ -374,8 +399,8 @@ fn an_exact_pattern_over_an_open_type_tests_the_rest() {
 #[test]
 fn a_wildcard_match_tests_nothing() {
     assert_eq!(
-        section("let w = fn v => match v with | _ => 1 end", "fn w("),
-        "fn w(%0: any):\n  %1: nat = const 1\n  ret %1"
+        section("let w = fn v => match v with | _ => 1n end", "fn w("),
+        "fn w(%0: any):\n  %1: nat = const 1n\n  ret %1"
     );
 }
 
@@ -385,13 +410,13 @@ fn a_wildcard_match_tests_nothing() {
 fn a_binder_arm_binds_the_scrutinee_temp() {
     assert_eq!(
         section(
-            "let f = fn n => match n with | 0 => 1 | m => m end",
+            "let f = fn n => match n with | 0n => 1n | m => m end",
             "fn f("
         ),
         "fn f(%0: nat):\n\
          \x20 %2: nat = switch_nat %0:\n\
          \x20   0 =>\n\
-         \x20     %1: nat = const 1\n\
+         \x20     %1: nat = const 1n\n\
          \x20     yield %1\n\
          \x20   else =>\n\
          \x20     yield %0\n\
@@ -435,7 +460,7 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
         section(
             "effect Log = write : Nat -> ()\n\
              let shout = fn x => !Log.write x\n\
-             let main = fn w => handle shout 5 with | !Log.write n => {} end",
+             let main = fn w => handle shout 5n with | !Log.write n => {} end",
             "fn main("
         ),
         "fn main(%8: any):\n\
@@ -443,7 +468,7 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
          \x20 %12: fn = closure main#2, []\n\
          \x20 %13: struct = struct { write: %12 }\n\
          \x20 %16: unit = catch %9:\n\
-         \x20   %14: nat = const 5\n\
+         \x20   %14: nat = const 5n\n\
          \x20   %15: unit = call shout, %13, %14\n\
          \x20   yield %15\n\
          \x20 ret %16"
@@ -456,10 +481,10 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
 fn a_return_arm_is_applied_on_the_normal_path() {
     let printed = section(
         "effect Log = write : Nat -> ()\n\
-         let main = fn w => handle 1 with | !Log.write n => {} | return r => { got: r } end",
+         let main = fn w => handle 1n with | !Log.write n => {} | return r => { got: r } end",
         "fn main(",
     );
-    assert!(printed.contains("%6: nat = const 1"), "{printed}");
+    assert!(printed.contains("%6: nat = const 1n"), "{printed}");
     assert!(printed.contains("struct { got: %6 }"), "{printed}");
 }
 
@@ -470,10 +495,10 @@ fn a_return_arm_is_applied_on_the_normal_path() {
 fn a_raise_throws_to_the_tag_its_arm_captured() {
     let source = "effect Fail = oops : () -> Nat\n\
          let recover = fn w =>\n\
-           handle !Fail.oops () with | !Fail.oops z => raise 0 | return r => r end";
+           handle !Fail.oops () with | !Fail.oops z => raise 0n | return r => r end";
     assert_eq!(
         section(source, "fn recover#2"),
-        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0\n  throw %4, %3"
+        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0n\n  throw %4, %3"
     );
     // The arm captures the very tag the `catch` beside it was minted with.
     let recover = section(source, "fn recover(");
@@ -489,7 +514,7 @@ fn nested_handlers_of_one_effect_shadow_and_stay_apart() {
     let printed = section(
         "effect Log = write : Nat -> ()\n\
          let nest = fn w =>\n\
-           handle (handle !Log.write 1 with | !Log.write a => {} end)\n\
+           handle (handle !Log.write 1n with | !Log.write a => {} end)\n\
            with | !Log.write b => {} end",
         "fn nest(",
     );
@@ -531,7 +556,7 @@ fn a_bundle_is_built_where_none_can_be_forwarded() {
     let source = "effect Log = write : Nat -> ()\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => n\n\
-         let use = fn w => handle piped logger 1 with | !Log.write s => {} end";
+         let use = fn w => handle piped logger 1n with | !Log.write s => {} end";
     let printed = section(source, "fn use(");
     assert!(
         printed.contains("%22: struct = struct { write: %21 }"),
@@ -567,7 +592,7 @@ fn a_function_receives_the_evidence_it_projects() {
     let source = "effect Log = write : Nat -> ()\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
-         let use = fn w => handle piped logger 1 with | !Log.write s => {} end";
+         let use = fn w => handle piped logger 1n with | !Log.write s => {} end";
     // The record `logger` reads is its first parameter, and the wrapper that
     // stands for `logger` as a value passes its own first parameter straight on.
     assert!(
@@ -604,7 +629,7 @@ fn a_function_receives_the_evidence_it_projects() {
 fn an_operation_used_as_a_value_gets_a_wrapper() {
     let source = "effect Log = write : Nat -> ()\n\
          let op = !Log.write\n\
-         let go = fn w => handle op 1 with | !Log.write n => {} end";
+         let go = fn w => handle op 1n with | !Log.write n => {} end";
     assert_eq!(
         section(source, "fn op#1"),
         "fn op#1(%0: struct, %1: nat):\n\
@@ -627,14 +652,14 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
     assert_eq!(
         section(
             "effect Log = write : Nat -> ()\n\
-             let both = fn g => let z = !Log.write 1 in g 2",
+             let both = fn g => let z = !Log.write 1n in g 2n",
             "fn both("
         ),
         "fn both(%0: struct, %1: struct, %2: fn):\n\
          \x20 %3: fn = project %0, \"write\"\n\
-         \x20 %4: nat = const 1\n\
+         \x20 %4: nat = const 1n\n\
          \x20 %5: unit = call %3, %4\n\
-         \x20 %6: nat = const 2\n\
+         \x20 %6: nat = const 2n\n\
          \x20 %7: any = call %2, %0, %1, %6\n\
          \x20 ret %7"
     );
@@ -647,7 +672,7 @@ fn a_definite_effect_and_an_open_rest_are_both_passed() {
 #[test]
 fn the_listing_is_the_canonical_format() {
     assert_eq!(
-        listing("let add = fn a => fn b => a\nlet main = add 1 2"),
+        listing("let add = fn a => fn b => a\nlet main = add 1n 2n"),
         "fn add(%0: any, %1: any):\n\
          \x20 ret %0\n\
          \n\
@@ -664,8 +689,8 @@ fn the_listing_is_the_canonical_format() {
          \x20 ret %7\n\
          \n\
          global main:\n\
-         \x20 %8: nat = const 1\n\
-         \x20 %9: nat = const 2\n\
+         \x20 %8: nat = const 1n\n\
+         \x20 %9: nat = const 2n\n\
          \x20 %10: nat = call add, %8, %9\n\
          \x20 ret %10\n"
     );
@@ -710,8 +735,8 @@ fn a_declared_sums_cases_are_flattened_before_dispatch() {
 #[test]
 fn a_unit_pattern_tests_nothing() {
     assert_eq!(
-        section("let u = fn v => match v with | () => 1 end", "fn u("),
-        "fn u(%0: unit):\n  %1: nat = const 1\n  ret %1"
+        section("let u = fn v => match v with | () => 1n end", "fn u("),
+        "fn u(%0: unit):\n  %1: nat = const 1n\n  ret %1"
     );
 }
 
@@ -733,14 +758,14 @@ fn a_value_captured_twice_is_one_parameter() {
 fn an_open_pattern_says_nothing_about_a_field_it_omits() {
     assert_eq!(
         section(
-            "let f = fn s => match s with | {x, ..} => 1 | {y} => 2 | _ => 3 end",
+            "let f = fn s => match s with | {x, ..} => 1n | {y} => 2n | _ => 3n end",
             "fn f("
         ),
         "fn f(%0: any):\n\
          \x20 %9: nat = switch_presence %0, \"x\":\n\
          \x20   present =>\n\
          \x20     %1: any = project %0, \"x\"\n\
-         \x20     %2: nat = const 1\n\
+         \x20     %2: nat = const 1n\n\
          \x20     yield %2\n\
          \x20   absent =>\n\
          \x20     %8: nat = switch_presence %0, \"y\":\n\
@@ -748,14 +773,14 @@ fn an_open_pattern_says_nothing_about_a_field_it_omits() {
          \x20         %3: any = project %0, \"y\"\n\
          \x20         %6: nat = switch_rest %0, [\"x\", \"y\"]:\n\
          \x20           none =>\n\
-         \x20             %4: nat = const 2\n\
+         \x20             %4: nat = const 2n\n\
          \x20             yield %4\n\
          \x20           some =>\n\
-         \x20             %5: nat = const 3\n\
+         \x20             %5: nat = const 3n\n\
          \x20             yield %5\n\
          \x20         yield %6\n\
          \x20       absent =>\n\
-         \x20         %7: nat = const 3\n\
+         \x20         %7: nat = const 3n\n\
          \x20         yield %7\n\
          \x20     yield %8\n\
          \x20 ret %9"
@@ -781,16 +806,16 @@ fn a_field_no_arm_asks_about_is_never_read() {
 fn a_field_every_arm_ignores_is_tested_but_not_read() {
     assert_eq!(
         section(
-            "let f = fn s => match s with | {x: _, y: _} => 1 | {x: _} => 2 end",
+            "let f = fn s => match s with | {x: _, y: _} => 1n | {x: _} => 2n end",
             "fn f("
         ),
         "fn f(%0: struct):\n\
          \x20 %3: nat = switch_presence %0, \"y\":\n\
          \x20   present =>\n\
-         \x20     %1: nat = const 1\n\
+         \x20     %1: nat = const 1n\n\
          \x20     yield %1\n\
          \x20   absent =>\n\
-         \x20     %2: nat = const 2\n\
+         \x20     %2: nat = const 2n\n\
          \x20     yield %2\n\
          \x20 ret %3"
     );
@@ -802,7 +827,7 @@ fn a_field_every_arm_ignores_is_tested_but_not_read() {
 fn an_operation_returning_a_function_keeps_applying() {
     let printed = section(
         "effect Mk = mk : Nat -> (Nat -> Nat)\n\
-         let go = fn w => handle !Mk.mk 1 2 with | !Mk.mk n => fn z => z end",
+         let go = fn w => handle !Mk.mk 1n 2n with | !Mk.mk n => fn z => z end",
         "fn go(",
     );
     assert!(printed.contains("%7: fn = project %6, \"mk\""), "{printed}");
@@ -816,7 +841,10 @@ fn an_operation_returning_a_function_keeps_applying() {
 #[test]
 fn a_nested_binding_takes_a_bundle_of_its_own() {
     assert_eq!(
-        section("let outer = fn z => let g = fn h => h z in 0", "fn outer#2"),
+        section(
+            "let outer = fn z => let g = fn h => h z in 0n",
+            "fn outer#2"
+        ),
         "fn outer#2(%3: any, %1: struct, %2: fn):\n  %4: any = call %2, %1, %3\n  ret %4"
     );
 }
@@ -829,14 +857,14 @@ fn a_nested_binding_takes_a_bundle_of_its_own() {
 #[test]
 fn every_temp_is_defined_once_in_the_whole_listing() {
     for source in [
-        "let three = fn a => fn b => fn c => a\nlet p = three 1",
+        "let three = fn a => fn b => fn c => a\nlet p = three 1n",
         "effect Log = write : Nat -> ()\n\
          let shout = fn x => fn y => !Log.write x\n\
-         let go = fn w => handle shout 1 with | !Log.write n => {} end",
+         let go = fn w => handle shout 1n with | !Log.write n => {} end",
         "effect Log = write : Nat -> ()\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
-         let use = fn w => handle piped logger 1 with | !Log.write s => {} end",
+         let use = fn w => handle piped logger 1n with | !Log.write s => {} end",
     ] {
         let printed = listing(source);
         let defined = definitions(&printed);
@@ -885,7 +913,7 @@ fn definitions(printed: &str) -> Vec<String> {
 #[test]
 fn evidence_of_the_same_shape_is_handed_straight_over() {
     let source = "effect Log = write : Nat -> ()\n\
-         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1\n\
+         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let noisy = fn n => let z = !Log.write n in n\n\
          let same = fn w => handle takes noisy with | !Log.write s => {} end";
     let printed = section(source, "fn same(");
@@ -907,13 +935,13 @@ fn evidence_of_the_same_shape_is_handed_straight_over() {
 /// which is `go`'s own bundle.
 #[test]
 fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
-    let source = "let id = fn x => x\nlet idv = id\nlet go = fn f => (idv f) 1";
+    let source = "let id = fn x => x\nlet idv = id\nlet go = fn f => (idv f) 1n";
     assert_eq!(
         section(source, "fn go("),
         "fn go(%5: struct, %6: fn):\n\
          \x20 %7: fn = global idv\n\
          \x20 %8: fn = call %7, %6\n\
-         \x20 %9: nat = const 1\n\
+         \x20 %9: nat = const 1n\n\
          \x20 %10: any = call %8, %5, %9\n\
          \x20 ret %10"
     );
@@ -926,7 +954,7 @@ fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
 #[test]
 fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
     let source = "effect Log = write : Nat -> ()\n\
-         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1\n\
+         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let openish : Nat -> Nat + !Log + ..'r = fn n => let z = !Log.write n in n\n\
          let packed = fn w => handle takes openish with | !Log.write s => {} end";
     assert_eq!(
@@ -972,7 +1000,7 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
          let hof2 : ((Nat -> Nat + ..'r) -> Nat + ..'r) -> Nat + ..'r =\n\
            fn k => k (fn m => m)\n\
          let both : (Nat -> Nat + !Log + ..'s) -> Nat + !Log + ..'s =\n\
-           fn g => let z = !Log.write 1 in g 2\n\
+           fn g => let z = !Log.write 1n in g 2n\n\
          let fwd : {} -> Nat + !Log + ..'t = fn w => hof2 both";
     assert!(
         section(source, "fn both(").starts_with("fn both(%10: struct, %11: struct, %12: fn):"),
@@ -1011,8 +1039,8 @@ fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
     let source = "effect Log = write : Nat -> ()\n\
          let two : Nat -> Nat -> Nat + !Log + ..'s =\n\
            fn a => fn b => let z = !Log.write a in b\n\
-         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1\n\
-         let go = fn w => handle takes (two 1) with | !Log.write s => {} end";
+         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
+         let go = fn w => handle takes (two 1n) with | !Log.write s => {} end";
     // The wrapper the partial application becomes takes a record and a bundle.
     assert!(
         section(source, "fn two#2")
@@ -1044,8 +1072,8 @@ fn a_full_application_stands_for_what_it_came_to() {
     let source = "effect Log = write : Nat -> ()\n\
          let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let pick : Nat -> Nat -> (Nat -> Nat + !Log) = fn a => fn b => noisy\n\
-         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1\n\
-         let go = fn w => handle takes (pick 1 2) with | !Log.write s => {} end";
+         let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
+         let go = fn w => handle takes (pick 1n 2n) with | !Log.write s => {} end";
     assert_eq!(
         section(source, "fn go("),
         "fn go(%25: any):\n\
@@ -1053,8 +1081,8 @@ fn a_full_application_stands_for_what_it_came_to() {
          \x20 %29: fn = closure go#2, []\n\
          \x20 %30: struct = struct { write: %29 }\n\
          \x20 %35: nat = catch %26:\n\
-         \x20   %31: nat = const 1\n\
-         \x20   %32: nat = const 2\n\
+         \x20   %31: nat = const 1n\n\
+         \x20   %32: nat = const 2n\n\
          \x20   %33: fn = call pick, %31, %32\n\
          \x20   %34: nat = call takes, %30, %33\n\
          \x20   yield %34\n\
@@ -1071,7 +1099,7 @@ fn a_definition_read_through_a_binding_arrives_callable() {
     let source = "effect A = a : Nat -> ()\n\
          effect B = b : Nat -> ()\n\
          let poly : Nat -> Nat + ..'e = fn n => n\n\
-         let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1\n\
+         let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1n\n\
          let go = fn w => handle handle\n\
            (let h : Nat -> Nat + !A + !B = poly in run h)\n\
            with | !A.a s => {} end with | !B.b s => {} end";
@@ -1101,7 +1129,7 @@ fn a_definition_read_through_a_binding_arrives_callable() {
     assert_eq!(
         section(source, "fn run("),
         "fn run(%6: struct, %7: struct, %8: fn):\n\
-         \x20 %9: nat = const 1\n\
+         \x20 %9: nat = const 1n\n\
          \x20 %10: nat = call %8, %6, %7, %9\n\
          \x20 ret %10"
     );
@@ -1116,7 +1144,7 @@ fn a_definition_returned_from_a_function_arrives_callable() {
          effect B = b : Nat -> ()\n\
          let poly : Nat -> Nat + ..'e = fn n => n\n\
          let get : {} -> (Nat -> Nat + !A + !B) = fn u => poly\n\
-         let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1\n\
+         let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1n\n\
          let go = fn w => handle handle run (get {})\n\
            with | !A.a s => {} end with | !B.b s => {} end";
     assert_eq!(
@@ -1136,7 +1164,7 @@ fn a_definition_returned_from_a_function_arrives_callable() {
     assert_eq!(
         section(source, "fn run("),
         "fn run(%18: struct, %19: struct, %20: fn):\n\
-         \x20 %21: nat = const 1\n\
+         \x20 %21: nat = const 1n\n\
          \x20 %22: nat = call %20, %18, %19, %21\n\
          \x20 ret %22"
     );
@@ -1156,7 +1184,7 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
     let source = "effect A = a : Nat -> ()\n\
          effect B = b : Nat -> ()\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
-         let app = fn g => g 1\n\
+         let app = fn g => g 1n\n\
          let direct = fn w => handle handle app both\n\
            with | !A.a s => {} end with | !B.b s => {} end\n\
          let bound = fn w => handle handle (let h = app in h both)\n\
@@ -1215,13 +1243,13 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
     let source = "effect Log = write : Nat -> ()\n\
          let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let pure = fn n => n\n\
-         let go = fn w => handle (let h = fn g => g 1 in { a: h noisy, b: h pure })\n\
+         let go = fn w => handle (let h = fn g => g 1n in { a: h noisy, b: h pure })\n\
            with | !Log.write s => {} end";
     // The lifted `h` takes a bundle and its argument: two parameters.
     assert_eq!(
         section(source, "fn go#3"),
         "fn go#3(%18: struct, %19: fn):\n\
-         \x20 %20: nat = const 1\n\
+         \x20 %20: nat = const 1n\n\
          \x20 %21: any = call %19, %18, %20\n\
          \x20 ret %21"
     );
@@ -1261,7 +1289,7 @@ fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
     let source = "effect A = a : Nat -> ()\n\
          effect B = b : Nat -> ()\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
-         let app = fn g => g 1\n\
+         let app = fn g => g 1n\n\
          let pick = fn u => app\n\
          let late = fn w => handle handle (pick {}) both\n\
            with | !A.a s => {} end with | !B.b s => {} end";
@@ -1298,7 +1326,7 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
          let s = { f: fn g => fn n => g n }\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
            let a = !Log.write n in let b = !Fail.oops n in n\n\
-         let go = fn w => handle handle s.f both 1\n\
+         let go = fn w => handle handle s.f both 1n\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
     // The function lifted out of the field takes a bundle and its argument,
     // and calls its own argument with that same bundle: two parameters after
@@ -1349,7 +1377,7 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
            let a = !Log.write n in let b = !Fail.oops n in n\n\
          let go = fn w => handle handle\n\
-           (match wrap with | #F h => h both 1 | _ => 0 end)\n\
+           (match wrap with | #F h => h both 1n | _ => 0n end)\n\
            with | !Log.write x => {} end with | !Fail.oops y => {} end";
     let go = section(source, "fn go(");
     assert!(go.contains("%32: fn = payload %31"), "{go}");
@@ -1377,7 +1405,7 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
     let source = "effect A = a : Nat -> ()\n\
          effect B = b : Nat -> ()\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
-         let app = fn g => g 1\n\
+         let app = fn g => g 1n\n\
          let pick = fn u => app\n\
          let go = fn c => handle handle\n\
            ((match c with | #L => pick {} | _ => pick {} end) both)\n\
@@ -1406,7 +1434,7 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
 fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
     let source = "effect Log = write : Nat -> ()\n\
          let s : { f: Nat -> Nat + !Log } = { f: fn n => let z = !Log.write n in n }\n\
-         let go = fn w => handle s.f 1 with | !Log.write x => {} end";
+         let go = fn w => handle s.f 1n with | !Log.write x => {} end";
     assert_eq!(
         section(source, "global s"),
         "global s:\n\
@@ -1423,7 +1451,7 @@ fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
          \x20 %16: nat = catch %7:\n\
          \x20   %12: struct = global s\n\
          \x20   %13: fn = project %12, \"f\"\n\
-         \x20   %14: nat = const 1\n\
+         \x20   %14: nat = const 1n\n\
          \x20   %15: nat = call %13, %11, %14\n\
          \x20   yield %15\n\
          \x20 ret %16"
@@ -1450,7 +1478,7 @@ fn a_payload_no_type_pinned_down_goes_in_as_it_stands() {
 fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
     assert_eq!(
         section(
-            "let w = #F 1\nlet f = fn v => match w with | #F x => x | #G 0 => 7 | _ => 0 end",
+            "let w = #F 1n\nlet f = fn v => match w with | #F x => x | #G 0n => 7n | _ => 0n end",
             "fn f("
         ),
         "fn f(%2: any):\n\
@@ -1463,14 +1491,14 @@ fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
          \x20     %5: nat = payload %3\n\
          \x20     %8: nat = switch_nat %5:\n\
          \x20       0 =>\n\
-         \x20         %6: nat = const 7\n\
+         \x20         %6: nat = const 7n\n\
          \x20         yield %6\n\
          \x20       else =>\n\
-         \x20         %7: nat = const 0\n\
+         \x20         %7: nat = const 0n\n\
          \x20         yield %7\n\
          \x20     yield %8\n\
          \x20   else =>\n\
-         \x20     %9: nat = const 0\n\
+         \x20     %9: nat = const 0n\n\
          \x20     yield %9\n\
          \x20 ret %10"
     );
@@ -1581,11 +1609,11 @@ fn nothing_after_a_raise_is_emitted() {
             "effect Fail = oops : () -> Nat\n\
              let recover = fn w =>\n\
                handle !Fail.oops () with\n\
-               | !Fail.oops z => let q = raise 0 in raise 1\n\
+               | !Fail.oops z => let q = raise 0n in raise 1n\n\
                | return r => r end",
             "fn recover#2"
         ),
-        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0\n  throw %4, %3"
+        "fn recover#2(%4: any, %2: unit):\n  %3: nat = const 0n\n  throw %4, %3"
     );
 }
 
@@ -1595,10 +1623,10 @@ fn nothing_after_a_raise_is_emitted() {
 #[test]
 fn a_callee_written_inline_is_called_indirectly() {
     assert_eq!(
-        section("let main = (fn n => n) 1", "global main"),
+        section("let main = (fn n => n) 1n", "global main"),
         "global main:\n\
          \x20 %1: fn = closure main#1, []\n\
-         \x20 %2: nat = const 1\n\
+         \x20 %2: nat = const 1n\n\
          \x20 %3: nat = call %1, %2\n\
          \x20 ret %3"
     );
@@ -1609,8 +1637,8 @@ fn a_callee_written_inline_is_called_indirectly() {
 #[test]
 fn a_sum_no_arm_tests_is_not_dispatched_on() {
     assert_eq!(
-        section("let f = fn w => match #A with | y => 0 end", "fn f("),
-        "fn f(%0: any):\n  %1: sum = tag #A\n  %2: nat = const 0\n  ret %2"
+        section("let f = fn w => match #A with | y => 0n end", "fn f("),
+        "fn f(%0: any):\n  %1: sum = tag #A\n  %2: nat = const 0n\n  ret %2"
     );
 }
 
@@ -1620,7 +1648,7 @@ fn a_sum_no_arm_tests_is_not_dispatched_on() {
 #[test]
 fn a_number_written_twice_in_one_column_is_one_case() {
     let printed = section(
-        "let f = fn s => match s with | {a: 0, b: 0} => 1 | {a: 0, b: 1} => 2 | _ => 3 end",
+        "let f = fn s => match s with | {a: 0n, b: 0n} => 1n | {a: 0n, b: 1n} => 2n | _ => 3n end",
         "fn f(",
     );
     assert_eq!(printed.matches("switch_nat %1:").count(), 1, "{printed}");
@@ -1668,7 +1696,7 @@ fn a_name_that_did_not_resolve_is_refused() {
 #[test]
 #[should_panic(expected = "LIR runs only on programs with no errors")]
 fn a_callee_that_is_not_a_function_is_refused() {
-    forced("let f = 1 2");
+    forced("let f = 1n 2n");
 }
 
 /// Lowering a source the earlier phases did complain about, which is what the
@@ -1691,12 +1719,12 @@ fn forced(source: &str) -> lir::Output {
 #[test]
 fn a_function_an_indirect_call_returns_is_called_in_turn() {
     assert_eq!(
-        section("let main = (fn a => fn b => a) 1 2", "global main"),
+        section("let main = (fn a => fn b => a) 1n 2n", "global main"),
         "global main:\n\
          \x20 %4: fn = closure main#2, []\n\
-         \x20 %5: nat = const 1\n\
+         \x20 %5: nat = const 1n\n\
          \x20 %6: fn = call %4, %5\n\
-         \x20 %7: nat = const 2\n\
+         \x20 %7: nat = const 2n\n\
          \x20 %8: nat = call %6, %7\n\
          \x20 ret %8"
     );

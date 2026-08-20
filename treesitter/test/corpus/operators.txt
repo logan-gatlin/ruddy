@@ -1,0 +1,40 @@
+================================================================================
+Real-number arithmetic respects precedence
+================================================================================
+
+let value = -1 + 2 * 3 - 4 / 5
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (addition
+      (addition
+        (unary_expression
+          (natural))
+        (multiplication
+          (natural)
+          (natural)))
+      (multiplication
+        (natural)
+        (natural)))))
+
+================================================================================
+Pipeline is left-associative and looser than arithmetic
+================================================================================
+
+let value = 1 + 2 |> f |> g
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (pipeline
+      (pipeline
+        (addition
+          (natural)
+          (natural))
+        (identifier))
+      (identifier))))

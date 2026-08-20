@@ -156,6 +156,15 @@ pub struct Term {
 
 #[derive(Debug, Clone)]
 pub enum TermKind {
+    Unary {
+        op: UnaryOp,
+        value: Box<Term>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Term>,
+        right: Box<Term>,
+    },
     Apply {
         func: Box<Term>,
         arg: Box<Term>,
@@ -255,12 +264,27 @@ pub enum TermKind {
         op: TrackedString,
     },
     Ident(Symbol),
-    /// A natural number literal. It carries no symbol: a literal names nothing,
-    /// so there is nothing for the mint to hand out.
-    Natural(u128),
+    /// Numeric literals carry no symbol: a literal names nothing, so there is
+    /// nothing for the mint to hand out.
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnaryOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// The arms of one `handle`, and the effects they discharge between them.
@@ -341,7 +365,7 @@ pub enum PatternKind {
         name: TrackedString,
         payload: Option<Box<Pattern>>,
     },
-    Natural(u128),
+    Natural(u64),
     Unit,
 }
 
@@ -1067,7 +1091,7 @@ pub enum Refuter {
     /// A tag pattern: a value here might not be this case.
     Case(String),
     /// A natural literal: a value here might be some other number.
-    Number(u128),
+    Number(u64),
 }
 
 /// A concrete example of a value a match leaves unhandled, in the shape of the
@@ -1079,7 +1103,7 @@ pub enum Witness {
     /// more instructive than another.
     Any,
     /// This number.
-    Natural(u128),
+    Natural(u64),
     /// This case. `None` says any payload serves — rendered bare, the way a
     /// case carrying unit is written.
     Tag {
@@ -1524,7 +1548,7 @@ pub(crate) struct Matrix {
 #[derive(Debug, Default)]
 struct Tests {
     tags: IndexSet<String>,
-    naturals: IndexSet<u128>,
+    naturals: IndexSet<u64>,
 }
 
 /// One cell of the matrix the usefulness walk works on: a [`Pattern`] with
@@ -1544,7 +1568,7 @@ enum Mat {
         name: String,
         payload: Box<Mat>,
     },
-    Natural(u128),
+    Natural(u64),
     /// A struct pattern with at least one field. `{}` tests nothing and
     /// arrives as [`Mat::Wild`] instead, so a struct cell always has a field
     /// for the widening step to find.
@@ -2460,6 +2484,11 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
 
 fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     match &mut term.kind {
+        TermKind::Unary { value, .. } => rekey_term(value, ids, errors),
+        TermKind::Binary { left, right, .. } => {
+            rekey_term(left, ids, errors);
+            rekey_term(right, ids, errors);
+        }
         TermKind::Apply { func, arg } => {
             rekey_term(func, ids, errors);
             rekey_term(arg, ids, errors);
@@ -2524,6 +2553,8 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
         | TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2813,6 +2844,11 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
             }
             erase_circular(body, looping, out);
         }
+        TermKind::Unary { value, .. } => erase_circular(value, looping, out),
+        TermKind::Binary { left, right, .. } => {
+            erase_circular(left, looping, out);
+            erase_circular(right, looping, out);
+        }
         TermKind::Apply { func, arg } => {
             erase_circular(func, looping, out);
             erase_circular(arg, looping, out);
@@ -2850,6 +2886,8 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2864,6 +2902,11 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
             out.insert(name.tracked, value);
             nested(value, out);
             nested(body, out);
+        }
+        TermKind::Unary { value, .. } => nested(value, out),
+        TermKind::Binary { left, right, .. } => {
+            nested(left, out);
+            nested(right, out);
         }
         TermKind::Apply { func, arg } => {
             nested(func, out);
@@ -2905,6 +2948,8 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -2953,7 +2998,9 @@ impl Chain<'_> {
             // arm: `let x = match x with ... end` asks something of `x` the
             // way a projection does, so the loop through it still describes a
             // value and is inference's to judge.
-            TermKind::Apply { .. }
+            TermKind::Unary { .. }
+            | TermKind::Binary { .. }
+            | TermKind::Apply { .. }
             | TermKind::Fn { .. }
             | TermKind::Struct(_)
             | TermKind::Tag { .. }
@@ -2966,7 +3013,7 @@ impl Chain<'_> {
             | TermKind::Handle { .. }
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
-            | TermKind::Natural(_)
+            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_)
             | TermKind::Error => Stands::Shape,
         }
     }
@@ -3346,7 +3393,7 @@ fn specialize_tag(rows: &[Vec<Mat>], name: &str) -> Vec<Vec<Mat>> {
 
 /// [`specialize_tag`] about a number, which carries nothing: the column is
 /// consumed rather than replaced.
-fn specialize_natural(rows: &[Vec<Mat>], value: u128) -> Vec<Vec<Mat>> {
+fn specialize_natural(rows: &[Vec<Mat>], value: u64) -> Vec<Vec<Mat>> {
     rows.iter()
         .filter_map(|row| match &row[0] {
             Mat::Natural(natural) if *natural == value => Some(row[1..].to_vec()),
@@ -3504,6 +3551,11 @@ fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
 fn references(term: &Term, out: &mut Vec<Symbol>) {
     match &term.kind {
         TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Unary { value, .. } => references(value, out),
+        TermKind::Binary { left, right, .. } => {
+            references(left, out);
+            references(right, out);
+        }
         TermKind::Apply { func, arg } => {
             references(func, out);
             references(arg, out);
@@ -3549,7 +3601,11 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
         TermKind::Raise(value) => references(value, out),
         // An operation names an effect, which is no definition and so no node
         // of the graph a group is read off.
-        TermKind::Operation { .. } | TermKind::Natural(_) | TermKind::Error => {}
+        TermKind::Operation { .. }
+        | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
+        | TermKind::Error => {}
     }
 }
 
@@ -4059,6 +4115,11 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
             annotations(value, out);
             annotations(body, out);
         }
+        TermKind::Unary { value, .. } => annotations(value, out),
+        TermKind::Binary { left, right, .. } => {
+            annotations(left, out);
+            annotations(right, out);
+        }
         TermKind::Apply { func, arg } => {
             annotations(func, out);
             annotations(arg, out);
@@ -4094,6 +4155,8 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -5478,6 +5541,35 @@ impl Builder<'_> {
                 None => TermKind::Error.with_span(span),
             },
             ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
+            ExprKind::Integer(value) => TermKind::Integer(value).with_span(span),
+            ExprKind::Real(value) => TermKind::Real(value).with_span(span),
+            ExprKind::Unary { op, value } => TermKind::Unary {
+                op: match op {
+                    parse::UnaryOp::Neg => UnaryOp::Neg,
+                },
+                value: Box::new(self.term(*value)),
+            }
+            .with_span(span),
+            ExprKind::Binary { op, left, right } => TermKind::Binary {
+                op: match op {
+                    parse::BinaryOp::Add => BinaryOp::Add,
+                    parse::BinaryOp::Sub => BinaryOp::Sub,
+                    parse::BinaryOp::Mul => BinaryOp::Mul,
+                    parse::BinaryOp::Div => BinaryOp::Div,
+                },
+                left: Box::new(self.term(*left)),
+                right: Box::new(self.term(*right)),
+            }
+            .with_span(span),
+            ExprKind::Pipe { value, function } => {
+                let func = self.term(*function);
+                let arg = self.term(*value);
+                TermKind::Apply {
+                    func: Box::new(func),
+                    arg: Box::new(arg),
+                }
+                .with_span(span)
+            }
             ExprKind::Apply { func, arg } => {
                 let func = self.term(*func);
                 let arg = self.term(*arg);

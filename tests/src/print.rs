@@ -43,9 +43,9 @@ fn printed(source: &str) -> (String, String) {
 #[test]
 fn both_trees_render_a_struct_the_same_way() {
     for source in [
-        "let s = { x: 1, y: 2 }",
-        "let n = { p: { q: 3 } }",
-        "let v : { a: Nat } = { a: 1 }",
+        "let s = { x: 1n, y: 2n }",
+        "let n = { p: { q: 3n } }",
+        "let v : { a: Nat } = { a: 1n }",
         "let f = fn r => { wrapped: r.x }",
         // Open rows and named presences: the `..` tail, named or not, and the
         // `when` clause are one rendering rule too.
@@ -160,7 +160,7 @@ fn types_of(source: &str) -> (String, String) {
 #[test]
 fn a_type_reads_the_same_whichever_printer_reached_it() {
     for (source, expected) in [
-        ("let a : Nat = 1", "Nat"),
+        ("let a : Nat = 1n", "Nat"),
         ("let b : Nat -> Nat = fn x => x", "Nat -> Nat"),
         // Right-associative, so the left side is the only one that ever needs
         // parentheses — and the right side must not acquire any.
@@ -169,7 +169,7 @@ fn a_type_reads_the_same_whichever_printer_reached_it() {
             "(Nat -> Nat) -> Nat -> Nat",
         ),
         (
-            "let d : { x: Nat, y: Nat -> Nat } = { x: 1, y: fn n => n }",
+            "let d : { x: Nat, y: Nat -> Nat } = { x: 1n, y: fn n => n }",
             "{ x: Nat, y: Nat -> Nat }",
         ),
         ("let e : {} = {}", "{}"),
@@ -261,15 +261,15 @@ fn both_trees_render_an_application_the_same_way() {
 fn both_trees_render_a_sum_the_same_way() {
     for source in [
         "type Option 'T = #Some 'T | #None",
-        "let v = #Some 1",
+        "let v = #Some 1n",
         "let n = #None",
         "let f = fn x => #Wrap x",
-        "let p = fn f => #Some (f 1)",
+        "let p = fn f => #Some (f 1n)",
         // A case whose presence a `when` names, and a tail: the two ways a sum
         // is left open, both of which only an annotation may write.
         "let o : #A (when 'a) Nat | #B = #B",
-        "let t : #A Nat | .. = #A 1",
-        "let r : #A Nat | ..'s = #A 1",
+        "let t : #A Nat | .. = #A 1n",
+        "let r : #A Nat | ..'s = #A 1n",
         // The two forms that write no case, and so print the leading bar the
         // rest of them do not.
         "type Void = |",
@@ -290,15 +290,15 @@ fn both_trees_render_a_sum_the_same_way() {
 #[test]
 fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
     for source in [
-        "let f = fn a => a\nlet v = f (#A) 1",
+        "let f = fn a => a\nlet v = f (#A) 1n",
         "let f = fn a => a\nlet v = f (#A)",
-        "let f = fn a => a\nlet v = (#A) 1",
+        "let f = fn a => a\nlet v = (#A) 1n",
         // As a payload, where the same argument applies: the inner tag would
         // take the `1` the outer one is applied to.
-        "let f = fn a => a\nlet v = #Some (#A) 1",
+        "let f = fn a => a\nlet v = #Some (#A) 1n",
         // Carrying something it groups as the application it reads as, and
         // takes no parentheses at the head of one.
-        "let v = #Some 1 2",
+        "let v = #Some 1n 2n",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, ir, "{source}");
@@ -333,7 +333,7 @@ fn recursion_and_forward_references_round_trip() {
     for source in [
         "let f = fn n => f n",
         "let even = fn n => odd n\nlet odd = fn n => even n",
-        "let a = id 1\nlet id = fn x => x",
+        "let a = id 1n\nlet id = fn x => x",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
@@ -355,12 +355,12 @@ fn recursion_and_forward_references_round_trip() {
 #[test]
 fn a_match_and_its_patterns_round_trip() {
     for source in [
-        "let f = fn v => match v with | #Some x => x | #None => 0 end",
-        "let f = fn v => match v with | 0 => 1 | 1 => 2 | k => k end",
-        "let f = fn v => match v with | () => 1 end",
-        "let f = fn v => match v with | {} => 1 end",
-        "let f = fn v => match v with | { a: #A, b: { c: x } } => x | r => 0 end",
-        "let f = fn v => match v with | #A (#X x) => x | #A w => 0 | r => 1 end",
+        "let f = fn v => match v with | #Some x => x | #None => 0n end",
+        "let f = fn v => match v with | 0n => 1n | 1n => 2n | k => k end",
+        "let f = fn v => match v with | () => 1n end",
+        "let f = fn v => match v with | {} => 1n end",
+        "let f = fn v => match v with | { a: #A, b: { c: x } } => x | r => 0n end",
+        "let f = fn v => match v with | #A (#X x) => x | #A w => 0n | r => 1n end",
         "let f = fn v => match v with end",
         "let f = fn v => (match v with | w => w end).x",
     ] {
@@ -394,14 +394,14 @@ fn a_match_and_its_patterns_round_trip() {
 #[test]
 fn a_nested_let_round_trips() {
     for source in [
-        "let a = let x = 1 in x",
-        "let a = let x : Nat = 1 in x",
-        "let a = let x = 1 in let y = { v: x } in y",
-        "let a = let x = let y = 1 in y in x",
+        "let a = let x = 1n in x",
+        "let a = let x : Nat = 1n in x",
+        "let a = let x = 1n in let y = { v: x } in y",
+        "let a = let x = let y = 1n in y in x",
         "let a = fn p => let x = p.v in x",
-        "let a = { v: let n = 1 in n }",
-        "let f = fn x => x\nlet a = f (let n = 1 in n)",
-        "let a = (let f = fn x => x in f) 1",
+        "let a = { v: let n = 1n in n }",
+        "let f = fn x => x\nlet a = f (let n = 1n in n)",
+        "let a = (let f = fn x => x in f) 1n",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
@@ -418,10 +418,10 @@ fn a_nested_let_round_trips() {
 #[test]
 fn a_wildcard_pattern_round_trips() {
     for source in [
-        "let f = fn v => match v with | #Some x => x | _ => 0 end",
-        "let f = fn v => match v with | #Some _ => 1 | #None => 0 end",
+        "let f = fn v => match v with | #Some x => x | _ => 0n end",
+        "let f = fn v => match v with | #Some _ => 1n | #None => 0n end",
         "let f = fn v => match v with | { a: _, b: x } => x end",
-        "let f = fn v => match v with | #Pair { a: _, b: _ } => 1 | _ => 2 end",
+        "let f = fn v => match v with | #Pair { a: _, b: _ } => 1n | _ => 2n end",
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, source, "{source}");
@@ -452,9 +452,9 @@ fn a_wildcard_fn_argument_prints_as_written_and_as_lowered() {
     assert_eq!(ir, "let const = fn x => fn %discard => x");
 
     // The hidden definitions of a discarded `let` read the same way.
-    let (ast, ir) = printed("let _ : Nat = 1");
-    assert_eq!(ast, "let _ : Nat = 1");
-    assert_eq!(ir, "let %discard : Nat = 1");
+    let (ast, ir) = printed("let _ : Nat = 1n");
+    assert_eq!(ast, "let _ : Nat = 1n");
+    assert_eq!(ir, "let %discard : Nat = 1n");
 }
 
 /// The `..` that makes a struct pattern open renders in both trees — as
@@ -462,21 +462,21 @@ fn a_wildcard_fn_argument_prints_as_written_and_as_lowered() {
 /// braces, after the trailing comma, so the printed form re-parses.
 #[test]
 fn both_trees_render_a_pattern_rest() {
-    let (ast, ir) = printed("let f = fn v => match v with | { x, .. } => x | {} => 0 end");
+    let (ast, ir) = printed("let f = fn v => match v with | { x, .. } => x | {} => 0n end");
     assert_eq!(
         ast,
-        "let f = fn v => match v with | { x, .. } => x | {} => 0 end"
+        "let f = fn v => match v with | { x, .. } => x | {} => 0n end"
     );
     // The pun expands in the IR, and the `..` stays put.
     assert_eq!(
         ir,
-        "let f = fn v => match v with | { x: x, .. } => x | {} => 0 end"
+        "let f = fn v => match v with | { x: x, .. } => x | {} => 0n end"
     );
 
     // Bare, the open pattern is nothing but its `..`.
-    let (ast, ir) = printed("let g = fn v => match v with | { .. } => 1 end");
-    assert_eq!(ast, "let g = fn v => match v with | { .. } => 1 end");
-    assert_eq!(ir, "let g = fn v => match v with | { .. } => 1 end");
+    let (ast, ir) = printed("let g = fn v => match v with | { .. } => 1n end");
+    assert_eq!(ast, "let g = fn v => match v with | { .. } => 1n end");
+    assert_eq!(ir, "let g = fn v => match v with | { .. } => 1n end");
 }
 
 /// A `where` clause is part of a written ascription, so both trees render it —
@@ -485,13 +485,13 @@ fn both_trees_render_a_pattern_rest() {
 #[test]
 fn both_trees_render_a_where_clause_the_same_way() {
     for source in [
-        "let f : { x when 'a: Nat } where 'a = { x: 1 }",
-        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1 }",
-        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a = 'b = { x: 1 }",
-        "let f : { x when 'a: Nat, y when 'b: Nat } where not ('a and 'b) = { x: 1 }",
-        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a or 'b = { x: 1 }",
+        "let f : { x when 'a: Nat } where 'a = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a != 'b = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a = 'b = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where not ('a and 'b) = { x: 1n }",
+        "let f : { x when 'a: Nat, y when 'b: Nat } where 'a or 'b = { x: 1n }",
         // The anonymous presence is spelled back as the `_` it was written as.
-        "let f : { x when _: Nat } = { x: 1 }",
+        "let f : { x when _: Nat } = { x: 1n }",
         // And a sum's clause takes the parentheses the grammar needs.
         "let f : #A (when 'a) Nat | #B (when 'b) = #B",
     ] {
@@ -827,14 +827,14 @@ fn the_ast_printer_round_trips_modules_and_paths() {
     for source in [
         "module A",
         "module A = end",
-        "module A = let x = 1 end",
-        "module A = module B = let x = 1 end let y = B::x end",
-        "let a = Math::double 2",
+        "module A = let x = 1n end",
+        "module A = module B = let x = 1n end let y = B::x end",
+        "let a = Math::double 2n",
         "let a = Math::Vec::zero",
-        "let a = Math::mk 1 2",
+        "let a = Math::mk 1n 2n",
         "let a = Math::p.x",
         "let a : Math::Pair Nat Nat = z",
-        "let a = Sys::!Log.write 1",
+        "let a = Sys::!Log.write 1n",
         "let a = handle e with | Sys::!Log.write s => s end",
         "let f : () -> Nat + Sys::!Log = g",
         "let f : () -> Nat + \\Sys::!Log + ..'r = g",
@@ -849,7 +849,7 @@ fn the_ast_printer_round_trips_modules_and_paths() {
 #[test]
 fn the_header_reads_back_as_the_line_it_was_written_as() {
     let mut files = FileManager::new();
-    let source = "bundle demo 0.1.0\nlet x = 1";
+    let source = "bundle demo 0.1.0\nlet x = 1n";
     let file = files.register_new_file("main.hc".to_string(), source.to_string());
     let parsed = parse::parse(token::lex(source, file).tokens);
     let header = parsed.header.expect("the file opened with one");

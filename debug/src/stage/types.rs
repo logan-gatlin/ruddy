@@ -165,6 +165,11 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
             walk_locals(value, out);
             walk_locals(body, out);
         }
+        TermKind::Unary { value, .. } => walk_locals(value, out),
+        TermKind::Binary { left, right, .. } => {
+            walk_locals(left, out);
+            walk_locals(right, out);
+        }
         TermKind::Apply { func, arg } => {
             walk_locals(func, out);
             walk_locals(arg, out);
@@ -204,6 +209,8 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -314,6 +321,10 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
         Core::Sum(cases) => names_in_row(cases, out),
         Core::Unit
         | Core::Nat
+        | Core::Int
+        | Core::Real
+        | Core::String
+        | Core::Boolean
         | Core::Var(_)
         | Core::Bound(_)
         | Core::Rigid { .. }

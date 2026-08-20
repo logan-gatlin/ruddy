@@ -219,6 +219,19 @@ impl Constrain<'_> {
             // diagnostic lowering already reported stays the only one.
             TermKind::Error => Rc::new(Ty::default()),
             TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
+            TermKind::Integer(_) => Rc::new(Ty::plain(Core::Int)),
+            TermKind::Real(_) => Rc::new(Ty::plain(Core::Real)),
+            TermKind::Unary { value, .. } => {
+                let real = Rc::new(Ty::plain(Core::Real));
+                self.check_term(value, &real);
+                real
+            }
+            TermKind::Binary { left, right, .. } => {
+                let real = Rc::new(Ty::plain(Core::Real));
+                self.check_term(left, &real);
+                self.check_term(right, &real);
+                real
+            }
             TermKind::Ident(symbol) => {
                 let symbol = *symbol;
                 self.lookup(span, symbol)

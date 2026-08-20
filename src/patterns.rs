@@ -145,7 +145,7 @@ pub enum ErrorKind {
 enum Cell {
     /// Accepts everything: a binder or a wildcard.
     Wild,
-    Natural(u128),
+    Natural(u64),
     /// A case, with what it carries — a bare tag's payload is the unit it
     /// demands, which is [`Cell::Struct`] with no fields, exact.
     Tag {
@@ -300,6 +300,11 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
                 walk(check, body, out);
             }
         }
+        TermKind::Unary { value, .. } => walk(check, value, out),
+        TermKind::Binary { left, right, .. } => {
+            walk(check, left, out);
+            walk(check, right, out);
+        }
         TermKind::Apply { func, arg } => {
             walk(check, func, out);
             walk(check, arg, out);
@@ -336,6 +341,8 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
         | TermKind::Error => {}
     }
 }
@@ -1161,7 +1168,7 @@ impl Check<'_> {
         q: &[Cell],
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
-        let narrow = |value: u128| -> Vec<Vec<Cell>> {
+        let narrow = |value: u64| -> Vec<Vec<Cell>> {
             rows.iter()
                 .filter_map(|row| match &row[0] {
                     Cell::Natural(natural) if *natural == value => Some(wild_row(row)),
@@ -1182,7 +1189,7 @@ impl Check<'_> {
             // A wildcard — nothing else tests a `Nat` position — asks the
             // universe: each listed number, and then one that is not.
             _ => {
-                let listed: IndexSet<u128> = rows
+                let listed: IndexSet<u64> = rows
                     .iter()
                     .filter_map(|row| match &row[0] {
                         Cell::Natural(value) => Some(*value),

@@ -26,12 +26,16 @@ const VARIABLE = /'[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 const PREC = {
   // `f x y` groups to the left, and stops in front of anything that begins no
   // argument.
-  application: 1,
+  pipeline: 1,
+  addition: 2,
+  multiplication: 3,
+  unary: 4,
+  application: 5,
   // A tag takes its payload before an application takes another argument, so
   // `f #A 1` is `f` applied to `#A 1`.
-  tag: 2,
+  tag: 6,
   // `f p.x` reaches into the record before passing it along.
-  projection: 3,
+  projection: 7,
 };
 
 /**
@@ -73,6 +77,9 @@ module.exports = grammar({
 
   extras: _ => [/\s/],
 
+  // This is a precedence-only choice, not a syntax node in the tree.
+  inline: $ => [$.binary_expression],
+
   conflicts: $ => [
     // `where 'a = 'b = v` compares two presences and then defines `v`;
     // `where 'a = v` is the clause `'a` and then the definition's own `=`.
@@ -102,7 +109,7 @@ module.exports = grammar({
     // `0.1.0`. Three naturals and two dots rather than a literal of its own,
     // exactly as `token::lex` hands them over: a version needs no lexer rule,
     // and prerelease versions are simply unwritable this way.
-    bundle_version: $ => seq($.natural, '.', $.natural, '.', $.natural),
+    bundle_version: $ => seq(alias($.version_number, $.natural), '.', alias($.version_number, $.natural), '.', alias($.version_number, $.natural)),
 
     // ── Statements ────────────────────────────────────────────────────────
 
@@ -216,8 +223,36 @@ module.exports = grammar({
       $.function,
       $.let_expression,
       $.raise_expression,
+      $.pipeline,
+      $.binary_expression,
+    ),
+
+    pipeline: $ => prec.left(PREC.pipeline, seq(
+      field('value', choice($.pipeline, $.binary_expression)),
+      '|>',
+      field('function', $.binary_expression),
+    )),
+
+    binary_expression: $ => choice(
+      $.addition,
+      $.multiplication,
+      $.unary_expression,
       $._application_expression,
     ),
+
+    addition: $ => prec.left(PREC.addition, seq(
+      field('left', $.binary_expression),
+      field('operator', choice('+', '-')),
+      field('right', $.binary_expression),
+    )),
+
+    multiplication: $ => prec.left(PREC.multiplication, seq(
+      field('left', $.binary_expression),
+      field('operator', choice('*', '/')),
+      field('right', $.binary_expression),
+    )),
+
+    unary_expression: $ => prec(PREC.unary, seq('-', field('value', $.binary_expression))),
 
     _application_expression: $ => choice(
       $.application,
@@ -615,15 +650,14 @@ module.exports = grammar({
     type_variable: _ => new RegExp(VARIABLE.source, 'u'),
 
     /**
-     * A natural number literal.
-     *
-     * Runs over the characters an identifier continues with, not just digits,
-     * exactly as `token::lex` reads one: `1x` is a single broken literal
-     * rather than a `1` beside an `x`. Whether the digits are digits — and
-     * whether they fit in the `u128` the compiler holds them in — is the
-     * lexer's to say, so both `1x` and a number too large parse here and are
-     * refused there.
+     * A numeric literal: suffixless reals (including decimals), or 64-bit
+     * integers and naturals marked with `i` and `n`. The broad trailing word
+     * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
-    natural: _ => new RegExp(/[0-9][\p{Alphabetic}\p{N}_]*/.source, 'u'),
+    natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+
+    // Bundle versions use bare integer components, so their dots can never be
+    // consumed as a real literal's decimal point.
+    version_number: _ => token(prec(1, /[0-9]+/)),
   },
 });

@@ -25,6 +25,16 @@ fn distinct_primitives_are_spelled_differently() {
     // spelling would make one of them unreachable through `from_name`.
     let names: std::collections::HashSet<_> = Prim::ALL.iter().map(|prim| prim.name()).collect();
     assert_eq!(names.len(), Prim::ALL.len());
+    assert_eq!(Prim::ALL.len(), 5);
+    assert_eq!(Prim::Int.name(), "Int");
+    assert_eq!(Prim::Real.name(), "Real");
+    assert_eq!(Prim::String.name(), "String");
+    assert_eq!(Prim::Boolean.name(), "Boolean");
+    assert!(matches!(Core::from(Prim::Nat), Core::Nat));
+    assert!(matches!(Core::from(Prim::Int), Core::Int));
+    assert!(matches!(Core::from(Prim::Real), Core::Real));
+    assert!(matches!(Core::from(Prim::String), Core::String));
+    assert!(matches!(Core::from(Prim::Boolean), Core::Boolean));
 }
 
 /// Unit is one type with one spelling. A second way to build it would be a
