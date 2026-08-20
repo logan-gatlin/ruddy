@@ -74,7 +74,28 @@ fn a_literal_too_large_to_hold_is_rejected() {
     let out = errors(&over);
     assert_eq!(out.len(), 1, "errors: {out:#?}");
     assert_eq!(out[0].kind, ErrorKind::NaturalTooLarge);
+    assert_eq!(
+        out[0].kind.to_string(),
+        "natural number too large to fit in 64 bits"
+    );
     assert_eq!(out[0].span.width, over.len());
+}
+
+#[test]
+fn lexes_real_number_operators() {
+    assert!(matches!(
+        kinds("-1 + 2 * 3 / 4")[..],
+        [
+            Kind::Minus,
+            Kind::Real(_),
+            Kind::Plus,
+            Kind::Real(_),
+            Kind::Star,
+            Kind::Real(_),
+            Kind::Slash,
+            Kind::Real(_)
+        ]
+    ));
 }
 
 #[test]
@@ -230,16 +251,11 @@ fn the_question_mark_is_no_longer_a_token() {
 }
 
 #[test]
-fn a_lone_minus_is_unrecognized() {
-    // Nothing else in the grammar starts with `-`, so the head of a
-    // half-written arrow is reported at the `-` itself.
-    let out = errors("A - B");
-    assert_eq!(out.len(), 1, "errors: {out:#?}");
-    assert_eq!(out[0].kind, ErrorKind::Unrecognized);
-    assert_eq!(out[0].span.start, 2);
-    assert_eq!(out[0].span.width, 1);
-    // The names on either side are still lexed.
-    assert_eq!(lex("A - B", FileID::GENERATED).tokens.len(), 2);
+fn a_lone_minus_is_a_token() {
+    assert!(matches!(
+        tokens_of("A - B")[..],
+        [Kind::Identifier(_), Kind::Minus, Kind::Identifier(_)]
+    ));
 }
 
 #[test]
@@ -319,6 +335,14 @@ fn lexes_the_backslash() {
     assert_eq!(slash.span.width, 1);
     // Printing writes the `\` back, so the stream re-lexes to itself.
     assert_eq!(slash.tracked.to_string(), "\\");
+}
+
+#[test]
+fn lexes_the_pipeline_as_one_token() {
+    assert!(matches!(
+        kinds("x |> f")[..],
+        [Kind::Identifier(_), Kind::PipeForward, Kind::Identifier(_)]
+    ));
 }
 
 #[test]

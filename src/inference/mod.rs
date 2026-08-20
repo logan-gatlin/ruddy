@@ -3028,6 +3028,11 @@ impl Table {
     fn zonk_term(&self, term: &mut Term, subst: &mut Subst) {
         term.ty = self.close(&term.ty, subst);
         match &mut term.kind {
+            TermKind::Unary { value, .. } => self.zonk_term(value, subst),
+            TermKind::Binary { left, right, .. } => {
+                self.zonk_term(left, subst);
+                self.zonk_term(right, subst);
+            }
             TermKind::Apply { func, arg } => {
                 self.zonk_term(func, subst);
                 self.zonk_term(arg, subst);

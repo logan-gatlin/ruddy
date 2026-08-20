@@ -2838,6 +2838,11 @@ fn a_wildcard_let_expression_binds_a_hidden_fresh_name() {
 fn references_of(term: &Term, out: &mut Vec<Symbol>) {
     match &term.kind {
         TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Unary { value, .. } => references_of(value, out),
+        TermKind::Binary { left, right, .. } => {
+            references_of(left, out);
+            references_of(right, out);
+        }
         TermKind::Apply { func, arg } => {
             references_of(func, out);
             references_of(arg, out);

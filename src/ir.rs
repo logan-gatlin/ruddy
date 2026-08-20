@@ -156,6 +156,15 @@ pub struct Term {
 
 #[derive(Debug, Clone)]
 pub enum TermKind {
+    Unary {
+        op: UnaryOp,
+        value: Box<Term>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Term>,
+        right: Box<Term>,
+    },
     Apply {
         func: Box<Term>,
         arg: Box<Term>,
@@ -263,6 +272,19 @@ pub enum TermKind {
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnaryOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// The arms of one `handle`, and the effects they discharge between them.
@@ -2462,6 +2484,11 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
 
 fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     match &mut term.kind {
+        TermKind::Unary { value, .. } => rekey_term(value, ids, errors),
+        TermKind::Binary { left, right, .. } => {
+            rekey_term(left, ids, errors);
+            rekey_term(right, ids, errors);
+        }
         TermKind::Apply { func, arg } => {
             rekey_term(func, ids, errors);
             rekey_term(arg, ids, errors);
@@ -2817,6 +2844,11 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
             }
             erase_circular(body, looping, out);
         }
+        TermKind::Unary { value, .. } => erase_circular(value, looping, out),
+        TermKind::Binary { left, right, .. } => {
+            erase_circular(left, looping, out);
+            erase_circular(right, looping, out);
+        }
         TermKind::Apply { func, arg } => {
             erase_circular(func, looping, out);
             erase_circular(arg, looping, out);
@@ -2870,6 +2902,11 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
             out.insert(name.tracked, value);
             nested(value, out);
             nested(body, out);
+        }
+        TermKind::Unary { value, .. } => nested(value, out),
+        TermKind::Binary { left, right, .. } => {
+            nested(left, out);
+            nested(right, out);
         }
         TermKind::Apply { func, arg } => {
             nested(func, out);
@@ -2961,7 +2998,9 @@ impl Chain<'_> {
             // arm: `let x = match x with ... end` asks something of `x` the
             // way a projection does, so the loop through it still describes a
             // value and is inference's to judge.
-            TermKind::Apply { .. }
+            TermKind::Unary { .. }
+            | TermKind::Binary { .. }
+            | TermKind::Apply { .. }
             | TermKind::Fn { .. }
             | TermKind::Struct(_)
             | TermKind::Tag { .. }
@@ -3512,6 +3551,11 @@ fn grouping(terms: &IndexMap<Symbol, Decl<Term>>) -> Vec<Group> {
 fn references(term: &Term, out: &mut Vec<Symbol>) {
     match &term.kind {
         TermKind::Ident(symbol) => out.push(*symbol),
+        TermKind::Unary { value, .. } => references(value, out),
+        TermKind::Binary { left, right, .. } => {
+            references(left, out);
+            references(right, out);
+        }
         TermKind::Apply { func, arg } => {
             references(func, out);
             references(arg, out);
@@ -4070,6 +4114,11 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
             }
             annotations(value, out);
             annotations(body, out);
+        }
+        TermKind::Unary { value, .. } => annotations(value, out),
+        TermKind::Binary { left, right, .. } => {
+            annotations(left, out);
+            annotations(right, out);
         }
         TermKind::Apply { func, arg } => {
             annotations(func, out);
@@ -5494,6 +5543,33 @@ impl Builder<'_> {
             ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
             ExprKind::Integer(value) => TermKind::Integer(value).with_span(span),
             ExprKind::Real(value) => TermKind::Real(value).with_span(span),
+            ExprKind::Unary { op, value } => TermKind::Unary {
+                op: match op {
+                    parse::UnaryOp::Neg => UnaryOp::Neg,
+                },
+                value: Box::new(self.term(*value)),
+            }
+            .with_span(span),
+            ExprKind::Binary { op, left, right } => TermKind::Binary {
+                op: match op {
+                    parse::BinaryOp::Add => BinaryOp::Add,
+                    parse::BinaryOp::Sub => BinaryOp::Sub,
+                    parse::BinaryOp::Mul => BinaryOp::Mul,
+                    parse::BinaryOp::Div => BinaryOp::Div,
+                },
+                left: Box::new(self.term(*left)),
+                right: Box::new(self.term(*right)),
+            }
+            .with_span(span),
+            ExprKind::Pipe { value, function } => {
+                let func = self.term(*function);
+                let arg = self.term(*value);
+                TermKind::Apply {
+                    func: Box::new(func),
+                    arg: Box::new(arg),
+                }
+                .with_span(span)
+            }
             ExprKind::Apply { func, arg } => {
                 let func = self.term(*func);
                 let arg = self.term(*arg);

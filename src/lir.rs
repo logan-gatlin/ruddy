@@ -118,6 +118,23 @@ pub enum Op {
     Const(u64),
     ConstInt(i64),
     ConstReal(f64),
+    Neg(Temp),
+    Add {
+        left: Temp,
+        right: Temp,
+    },
+    Sub {
+        left: Temp,
+        right: Temp,
+    },
+    Mul {
+        left: Temp,
+        right: Temp,
+    },
+    Div {
+        left: Temp,
+        right: Temp,
+    },
     /// A struct literal. Empty is the unit value.
     Struct(IndexMap<String, Temp>),
     /// One record carrying every field of each of these, laid over one another
@@ -1584,6 +1601,21 @@ impl Lower<'_> {
             TermKind::Natural(value) => self.emit(body, span, rep, Op::Const(*value)),
             TermKind::Integer(value) => self.emit(body, span, rep, Op::ConstInt(*value)),
             TermKind::Real(value) => self.emit(body, span, rep, Op::ConstReal(*value)),
+            TermKind::Unary { value, .. } => {
+                let value = self.term(value, body);
+                self.emit(body, span, rep, Op::Neg(value))
+            }
+            TermKind::Binary { op, left, right } => {
+                let left = self.term(left, body);
+                let right = self.term(right, body);
+                let op = match op {
+                    crate::ir::BinaryOp::Add => Op::Add { left, right },
+                    crate::ir::BinaryOp::Sub => Op::Sub { left, right },
+                    crate::ir::BinaryOp::Mul => Op::Mul { left, right },
+                    crate::ir::BinaryOp::Div => Op::Div { left, right },
+                };
+                self.emit(body, span, rep, op)
+            }
             // A container honestly contains values shaped by its own type:
             // each member is fitted from the shape it holds to the shape the
             // container's type gives it going in, and the container records

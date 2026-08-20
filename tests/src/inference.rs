@@ -45,6 +45,31 @@ fn inferred(src: &str) -> (Mint, ir::Output, inference::Output) {
 }
 
 #[test]
+fn integer_and_natural_literals_are_function_arguments() {
+    let (mint, _, output) = inferred(
+        "let nat : Nat -> Nat = fn x => x\n\
+         let int : Int -> Int = fn x => x\n\
+         let natural = nat 1n\n\
+         let integer = int 2i",
+    );
+    assert_eq!(scheme(&mint, &output, "natural"), "Nat");
+    assert_eq!(scheme(&mint, &output, "integer"), "Int");
+}
+
+#[test]
+fn real_number_operators_accept_only_reals() {
+    let (mint, _, output) = inferred("let value = -1 + 2 - 3 * 4 / 5");
+    assert_eq!(scheme(&mint, &output, "value"), "Real");
+
+    let (_, _, output) = infer_src("let bad = 1i + 2");
+    assert_eq!(output.errors.len(), 1);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Real`, found `Int`"
+    );
+}
+
+#[test]
 fn every_primitive_is_a_distinct_type() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\
@@ -136,6 +161,11 @@ fn term_decl<'a>(mint: &Mint, out: &'a ir::Output, name: &str) -> &'a Decl<Term>
 fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
     let mut out = vec![term.ty.clone()];
     match &term.kind {
+        TermKind::Unary { value, .. } => out.extend(body_tys(value)),
+        TermKind::Binary { left, right, .. } => {
+            out.extend(body_tys(left));
+            out.extend(body_tys(right));
+        }
         TermKind::Apply { func, arg } => {
             out.extend(body_tys(func));
             out.extend(body_tys(arg));

@@ -52,6 +52,158 @@
     }
   },
   {
+    "type": "addition",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "operator": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "+",
+            "named": false
+          },
+          {
+            "type": "-",
+            "named": false
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "annotation",
     "named": true,
     "fields": {
@@ -577,6 +729,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -601,6 +757,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -617,6 +777,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -630,6 +794,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -775,6 +943,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -799,6 +971,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -815,6 +991,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -828,6 +1008,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -871,6 +1055,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -895,6 +1083,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -911,6 +1103,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -924,6 +1120,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -962,6 +1162,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -986,6 +1190,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -1002,6 +1210,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1015,6 +1227,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -1078,6 +1294,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -1102,6 +1322,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -1118,6 +1342,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1131,6 +1359,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -1188,6 +1420,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -1212,6 +1448,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -1228,6 +1468,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1241,6 +1485,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -1260,6 +1508,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -1284,6 +1536,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -1300,6 +1556,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1313,6 +1573,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -1366,6 +1630,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -1390,6 +1658,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -1406,6 +1678,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -1419,6 +1695,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -1475,6 +1755,158 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "multiplication",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "operator": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "*",
+            "named": false
+          },
+          {
+            "type": "/",
+            "named": false
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -1617,6 +2049,10 @@
       "required": true,
       "types": [
         {
+          "type": "addition",
+          "named": true
+        },
+        {
           "type": "application",
           "named": true
         },
@@ -1641,6 +2077,10 @@
           "named": true
         },
         {
+          "type": "multiplication",
+          "named": true
+        },
+        {
           "type": "natural",
           "named": true
         },
@@ -1657,6 +2097,10 @@
           "named": true
         },
         {
+          "type": "pipeline",
+          "named": true
+        },
+        {
           "type": "projection",
           "named": true
         },
@@ -1670,6 +2114,10 @@
         },
         {
           "type": "tag_expression",
+          "named": true
+        },
+        {
+          "type": "unary_expression",
           "named": true
         },
         {
@@ -1815,6 +2263,148 @@
     }
   },
   {
+    "type": "pipeline",
+    "named": true,
+    "fields": {
+      "function": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "pipeline",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "projection",
     "named": true,
     "fields": {
@@ -1889,6 +2479,10 @@
       "required": true,
       "types": [
         {
+          "type": "addition",
+          "named": true
+        },
+        {
           "type": "application",
           "named": true
         },
@@ -1913,6 +2507,10 @@
           "named": true
         },
         {
+          "type": "multiplication",
+          "named": true
+        },
+        {
           "type": "natural",
           "named": true
         },
@@ -1929,6 +2527,10 @@
           "named": true
         },
         {
+          "type": "pipeline",
+          "named": true
+        },
+        {
           "type": "projection",
           "named": true
         },
@@ -1942,6 +2544,10 @@
         },
         {
           "type": "tag_expression",
+          "named": true
+        },
+        {
+          "type": "unary_expression",
           "named": true
         },
         {
@@ -2038,6 +2644,10 @@
         "required": true,
         "types": [
           {
+            "type": "addition",
+            "named": true
+          },
+          {
             "type": "application",
             "named": true
           },
@@ -2062,6 +2672,10 @@
             "named": true
           },
           {
+            "type": "multiplication",
+            "named": true
+          },
+          {
             "type": "natural",
             "named": true
           },
@@ -2078,6 +2692,10 @@
             "named": true
           },
           {
+            "type": "pipeline",
+            "named": true
+          },
+          {
             "type": "projection",
             "named": true
           },
@@ -2091,6 +2709,10 @@
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -2575,6 +3197,78 @@
     }
   },
   {
+    "type": "unary_expression",
+    "named": true,
+    "fields": {
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "unit",
     "named": true,
     "fields": {}
@@ -2652,11 +3346,19 @@
     "named": false
   },
   {
+    "type": "*",
+    "named": false
+  },
+  {
     "type": "+",
     "named": false
   },
   {
     "type": ",",
+    "named": false
+  },
+  {
+    "type": "-",
     "named": false
   },
   {
@@ -2669,6 +3371,10 @@
   },
   {
     "type": "..",
+    "named": false
+  },
+  {
+    "type": "/",
     "named": false
   },
   {
@@ -2797,6 +3503,10 @@
   },
   {
     "type": "|",
+    "named": false
+  },
+  {
+    "type": "|>",
     "named": false
   },
   {

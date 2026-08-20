@@ -165,6 +165,11 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
             walk_locals(value, out);
             walk_locals(body, out);
         }
+        TermKind::Unary { value, .. } => walk_locals(value, out),
+        TermKind::Binary { left, right, .. } => {
+            walk_locals(left, out);
+            walk_locals(right, out);
+        }
         TermKind::Apply { func, arg } => {
             walk_locals(func, out);
             walk_locals(arg, out);

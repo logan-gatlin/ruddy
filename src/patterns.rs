@@ -300,6 +300,11 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
                 walk(check, body, out);
             }
         }
+        TermKind::Unary { value, .. } => walk(check, value, out),
+        TermKind::Binary { left, right, .. } => {
+            walk(check, left, out);
+            walk(check, right, out);
+        }
         TermKind::Apply { func, arg } => {
             walk(check, func, out);
             walk(check, arg, out);

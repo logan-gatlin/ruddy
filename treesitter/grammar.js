@@ -26,12 +26,16 @@ const VARIABLE = /'[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*/;
 const PREC = {
   // `f x y` groups to the left, and stops in front of anything that begins no
   // argument.
-  application: 1,
+  pipeline: 1,
+  addition: 2,
+  multiplication: 3,
+  unary: 4,
+  application: 5,
   // A tag takes its payload before an application takes another argument, so
   // `f #A 1` is `f` applied to `#A 1`.
-  tag: 2,
+  tag: 6,
   // `f p.x` reaches into the record before passing it along.
-  projection: 3,
+  projection: 7,
 };
 
 /**
@@ -72,6 +76,9 @@ module.exports = grammar({
   },
 
   extras: _ => [/\s/],
+
+  // This is a precedence-only choice, not a syntax node in the tree.
+  inline: $ => [$.binary_expression],
 
   conflicts: $ => [
     // `where 'a = 'b = v` compares two presences and then defines `v`;
@@ -216,8 +223,36 @@ module.exports = grammar({
       $.function,
       $.let_expression,
       $.raise_expression,
+      $.pipeline,
+      $.binary_expression,
+    ),
+
+    pipeline: $ => prec.left(PREC.pipeline, seq(
+      field('value', choice($.pipeline, $.binary_expression)),
+      '|>',
+      field('function', $.binary_expression),
+    )),
+
+    binary_expression: $ => choice(
+      $.addition,
+      $.multiplication,
+      $.unary_expression,
       $._application_expression,
     ),
+
+    addition: $ => prec.left(PREC.addition, seq(
+      field('left', $.binary_expression),
+      field('operator', choice('+', '-')),
+      field('right', $.binary_expression),
+    )),
+
+    multiplication: $ => prec.left(PREC.multiplication, seq(
+      field('left', $.binary_expression),
+      field('operator', choice('*', '/')),
+      field('right', $.binary_expression),
+    )),
+
+    unary_expression: $ => prec(PREC.unary, seq('-', field('value', $.binary_expression))),
 
     _application_expression: $ => choice(
       $.application,

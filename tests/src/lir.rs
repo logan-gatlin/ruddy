@@ -53,6 +53,23 @@ fn section(source: &str, header: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn pipeline_lowers_as_an_application() {
+    let printed = listing("let f = fn x => x\nlet value = 1 |> f");
+    assert!(
+        printed.contains("call f"),
+        "pipeline did not call f:\n{printed}"
+    );
+}
+
+#[test]
+fn real_number_operators_lower_to_native_instructions() {
+    let printed = listing("let value = -1 + 2 - 3 * 4 / 5");
+    for op in ["neg", "add", "sub", "mul", "div"] {
+        assert!(printed.contains(op), "{op} missing from:\n{printed}");
+    }
+}
+
 /// Every nested expression becomes one temp assignment, in the order the source
 /// evaluates it: the value of a `let` before its body, a struct's fields as
 /// written, a projection's base before the read.

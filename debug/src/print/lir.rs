@@ -81,6 +81,11 @@ pub fn instruction(output: &Output, instr: &Instr) -> String {
 pub fn opcode(op: &Op) -> &'static str {
     match op {
         Op::Const(_) | Op::ConstInt(_) | Op::ConstReal(_) => "const",
+        Op::Neg(_) => "neg",
+        Op::Add { .. } => "add",
+        Op::Sub { .. } => "sub",
+        Op::Mul { .. } => "mul",
+        Op::Div { .. } => "div",
         Op::Struct(_) => "struct",
         Op::Merge(_) => "merge",
         Op::Project { .. } => "project",
@@ -214,6 +219,11 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Const(value) => format!("const {value}n"),
         Op::ConstInt(value) => format!("const {value}i"),
         Op::ConstReal(value) => format!("const {value}"),
+        Op::Neg(value) => format!("neg %{value}"),
+        Op::Add { left, right } => format!("add %{left}, %{right}"),
+        Op::Sub { left, right } => format!("sub %{left}, %{right}"),
+        Op::Mul { left, right } => format!("mul %{left}, %{right}"),
+        Op::Div { left, right } => format!("div %{left}, %{right}"),
         Op::Struct(fields) if fields.is_empty() => "struct {}".to_string(),
         Op::Struct(fields) => {
             let entries: Vec<String> = fields

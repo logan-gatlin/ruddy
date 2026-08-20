@@ -48,6 +48,27 @@ fn parse_print(src: &str) -> String {
 }
 
 #[test]
+fn pipeline_is_left_associative_and_looser_than_arithmetic() {
+    assert_eq!(
+        parse_one("let value = 1 + 2 |> f |> g"),
+        "let value = 1 + 2 |> f |> g"
+    );
+    assert_eq!(
+        parse_one("let value = 1 |> fn x => x"),
+        "let value = 1 |> (fn x => x)"
+    );
+}
+
+#[test]
+fn real_number_operators_have_the_usual_precedence() {
+    assert_eq!(
+        parse_one("let value = -1 + 2 * 3 - 4 / 5"),
+        "let value = -1 + 2 * 3 - 4 / 5"
+    );
+    assert_eq!(parse_one("let value = -(1 + 2)"), "let value = -(1 + 2)");
+}
+
+#[test]
 fn application_is_left_associative() {
     assert_eq!(parse_one("let a = f x y"), "let a = f x y");
 }
@@ -400,6 +421,11 @@ fn functions() {
     assert_eq!(
         parse_one("let m = map fn x => x"),
         "let m = map (fn x => x)"
+    );
+    // Every numeric literal can be passed as an argument, not only a natural.
+    assert_eq!(
+        parse_one("let values = f 1n 2i 3"),
+        "let values = f 1n 2i 3"
     );
 }
 

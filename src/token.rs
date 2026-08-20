@@ -59,12 +59,14 @@ pub enum Kind {
     /// token: the longer lexeme wins, so a `!` followed by an `=` is this and
     /// never an [`Effect`](Kind::Effect) beside an assignment.
     NotEqual,
-    /// `+`, introducing the effect row an arrow carries: `A -> B + !Log`.
-    ///
-    /// The whole of what it is for. There is no addition and no other use of
-    /// the character, so a `+` anywhere else is the unexpected token it looks
-    /// like.
+    /// `+`, joining an effect row or adding two real numbers.
     Plus,
+    /// `-`, an arrow's head or real-number subtraction and negation.
+    Minus,
+    /// `*`, multiplying two real numbers.
+    Star,
+    /// `/`, dividing two real numbers.
+    Slash,
     /// `\`, marking a struct type's field — or a sum type's case — as one that
     /// is definitely *not* there: the `..` beside it may not stand for the
     /// label. A bare punctuation token, so `\ y` lexes the same as `\y` — the
@@ -73,6 +75,8 @@ pub enum Kind {
     /// `|`, separating the cases of a sum type. Also the whole of the empty
     /// sum, which is the one type written with nothing but punctuation.
     Pipe,
+    /// `|>`, feeding its left value to the function on its right.
+    PipeForward,
     LeftBrace,
     RightBrace,
     LeftParen,
@@ -171,19 +175,14 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     tokens.push(file_id.span(start, 1).track(Kind::Equal));
                 }
             }
-            // `-` begins nothing on its own — there is no subtraction and no
-            // negative literal — so the only thing it can be is the head of an
-            // arrow, and a lone one is reported where it was written.
+            // `->` wins over the standalone minus.
             '-' => {
                 chars.next();
                 if let Some(&(_, '>')) = chars.peek() {
                     chars.next();
                     tokens.push(file_id.span(start, 2).track(Kind::Arrow));
                 } else {
-                    errors.push(Error {
-                        span: file_id.span(start, 1),
-                        kind: ErrorKind::Unrecognized,
-                    });
+                    tokens.push(file_id.span(start, 1).track(Kind::Minus));
                 }
             }
             // `::` separates a path's segments; a lone `:` ascribes. The longer
@@ -244,15 +243,26 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     Err(kind) => errors.push(Error { span, kind }),
                 }
             }
-            // The one thing a `+` is: the mark that hangs an effect row off an
-            // arrow. There is no addition, so nothing else can be meant by one.
             '+' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Plus));
                 chars.next();
             }
-            '|' => {
-                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+            '*' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Star));
                 chars.next();
+            }
+            '/' => {
+                tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Slash));
+                chars.next();
+            }
+            '|' => {
+                chars.next();
+                if let Some(&(_, '>')) = chars.peek() {
+                    chars.next();
+                    tokens.push(file_id.span(start, 2).track(Kind::PipeForward));
+                } else {
+                    tokens.push(file_id.span(start, c.len_utf8()).track(Kind::Pipe));
+                }
             }
             // Never a lex error, unlike `-` and the `#`: what may follow a
             // `\` is the parser's business.

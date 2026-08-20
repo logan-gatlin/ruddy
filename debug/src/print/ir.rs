@@ -19,8 +19,8 @@ use ruddy::{
 
 use crate::print::{
     Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow,
-    write_effects, write_let, write_match, write_project, write_row, write_struct, write_sum,
-    write_tag,
+    write_binary, write_effects, write_let, write_match, write_project, write_row, write_struct,
+    write_sum, write_tag, write_unary,
 };
 
 /// Pairs a node with the mint that can name its symbols. Printing an IR node
@@ -181,6 +181,12 @@ impl Grouped for Show<'_, TermKind> {
             // the same syntax.
             TermKind::Match { .. } | TermKind::Handle { .. } => Prec::Apply,
             TermKind::Raise(_) => Prec::Lambda,
+            TermKind::Binary {
+                op: ruddy::ir::BinaryOp::Add | ruddy::ir::BinaryOp::Sub,
+                ..
+            } => Prec::Addition,
+            TermKind::Binary { .. } => Prec::Multiplication,
+            TermKind::Unary { .. } => Prec::Unary,
             // A tag carrying something groups as the application it reads as;
             // carrying nothing it groups below one, because the argument would
             // be read as the payload it has not got. The parse tree's printer
@@ -287,6 +293,16 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Natural(value) => write!(f, "{value}n"),
             TermKind::Integer(value) => write!(f, "{value}i"),
             TermKind::Real(value) => write!(f, "{value}"),
+            TermKind::Unary { value, .. } => write_unary(f, "-", &self.show(&**value)),
+            TermKind::Binary { op, left, right } => {
+                let (symbol, prec) = match op {
+                    ruddy::ir::BinaryOp::Add => ("+", Prec::Addition),
+                    ruddy::ir::BinaryOp::Sub => ("-", Prec::Addition),
+                    ruddy::ir::BinaryOp::Mul => ("*", Prec::Multiplication),
+                    ruddy::ir::BinaryOp::Div => ("/", Prec::Multiplication),
+                };
+                write_binary(f, &self.show(&**left), symbol, &self.show(&**right), prec)
+            }
             TermKind::Apply { func, arg } => {
                 write_apply(f, &self.show(&**func), &self.show(&**arg))
             }

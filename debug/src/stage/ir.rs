@@ -218,6 +218,23 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Real".into(),
             ..node
         },
+        TermKind::Unary { value, .. } => Node {
+            label: "Neg".into(),
+            ..node
+        }
+        .child(term_node(ids, cx, mint, value, trace)),
+        TermKind::Binary { op, left, right } => Node {
+            label: match op {
+                ruddy::ir::BinaryOp::Add => "Add",
+                ruddy::ir::BinaryOp::Sub => "Sub",
+                ruddy::ir::BinaryOp::Mul => "Mul",
+                ruddy::ir::BinaryOp::Div => "Div",
+            }
+            .into(),
+            ..node
+        }
+        .child(term_node(ids, cx, mint, left, trace))
+        .child(term_node(ids, cx, mint, right, trace)),
         TermKind::Apply { func, arg } => Node {
             label: "Apply".into(),
             ..node
