@@ -53,10 +53,6 @@ dev:
 debug *args:
     cargo run -p ruddy-debug -- --port {{port}} {{args}}
 
-# Compile demo.hc with the CLI compiler.
-demo:
-    cargo run --quiet
-
 # Regenerate the tree-sitter parser and run its corpus tests.
 grammar *args:
     #!/usr/bin/env bash
@@ -131,10 +127,10 @@ test:
 build:
     cargo build --workspace
 
-# Line and branch coverage for the compiler library: runs every test, skips the
-# CLI. Branch coverage is a nightly-only rustc feature, hence `+nightly`.
+# Line and branch coverage for the compiler library. Branch coverage is a
+# nightly-only rustc feature, hence `+nightly`.
 cov *args:
-    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/|/src/main\.rs' {{args}}
+    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

@@ -6,7 +6,7 @@ edition = "2024"
 autotests = false
 
 [workspace]
-members = ["debug", "tests"]
+members = ["cli", "debug", "tests"]
 
 [dependencies]
 indexmap = "2"
