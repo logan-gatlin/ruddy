@@ -68,6 +68,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -101,6 +105,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -148,6 +156,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -181,6 +193,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -278,6 +294,10 @@
         "required": true,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -306,6 +326,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -325,6 +349,10 @@
         "types": [
           {
             "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
             "named": true
           },
           {
@@ -360,11 +388,518 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
           {
             "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "boolean",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "boolean_and",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "boolean_or",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "boolean_xor",
+    "named": true,
+    "fields": {
+      "left": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "unit",
+            "named": true
+          }
+        ]
+      },
+      "right": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "addition",
+            "named": true
+          },
+          {
+            "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "handle_expression",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "match_expression",
+            "named": true
+          },
+          {
+            "type": "multiplication",
+            "named": true
+          },
+          {
+            "type": "natural",
+            "named": true
+          },
+          {
+            "type": "operation",
+            "named": true
+          },
+          {
+            "type": "parenthesized_expression",
+            "named": true
+          },
+          {
+            "type": "path",
+            "named": true
+          },
+          {
+            "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "struct_expression",
+            "named": true
+          },
+          {
+            "type": "tag_expression",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
             "named": true
           },
           {
@@ -737,6 +1272,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -786,6 +1337,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -951,6 +1506,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1000,6 +1571,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1063,6 +1638,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1112,6 +1703,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1170,6 +1765,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1222,6 +1833,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -1244,6 +1859,10 @@
         "required": true,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -1253,6 +1872,10 @@
           },
           {
             "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1302,6 +1925,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1354,6 +1993,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -1376,6 +2019,10 @@
         "required": true,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -1385,6 +2032,10 @@
           },
           {
             "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1428,6 +2079,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1477,6 +2144,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1516,6 +2187,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1568,6 +2255,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -1590,6 +2281,10 @@
         "required": true,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -1599,6 +2294,10 @@
           },
           {
             "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1638,6 +2337,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -1687,6 +2402,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1774,6 +2493,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -1807,6 +2530,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -1854,6 +2581,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -1887,6 +2618,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -2057,6 +2792,22 @@
           "named": true
         },
         {
+          "type": "boolean",
+          "named": true
+        },
+        {
+          "type": "boolean_and",
+          "named": true
+        },
+        {
+          "type": "boolean_or",
+          "named": true
+        },
+        {
+          "type": "boolean_xor",
+          "named": true
+        },
+        {
           "type": "function",
           "named": true
         },
@@ -2109,6 +2860,10 @@
           "named": true
         },
         {
+          "type": "string",
+          "named": true
+        },
+        {
           "type": "struct_expression",
           "named": true
         },
@@ -2136,6 +2891,10 @@
       "required": true,
       "types": [
         {
+          "type": "boolean",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
@@ -2145,6 +2904,10 @@
         },
         {
           "type": "parenthesized_pattern",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         },
         {
@@ -2279,6 +3042,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -2315,6 +3094,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -2342,6 +3125,22 @@
           },
           {
             "type": "application",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
             "named": true
           },
           {
@@ -2385,6 +3184,10 @@
             "named": true
           },
           {
+            "type": "string",
+            "named": true
+          },
+          {
             "type": "struct_expression",
             "named": true
           },
@@ -2412,6 +3215,10 @@
         "multiple": false,
         "required": true,
         "types": [
+          {
+            "type": "boolean",
+            "named": true
+          },
           {
             "type": "handle_expression",
             "named": true
@@ -2442,6 +3249,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -2484,6 +3295,22 @@
         },
         {
           "type": "application",
+          "named": true
+        },
+        {
+          "type": "boolean",
+          "named": true
+        },
+        {
+          "type": "boolean_and",
+          "named": true
+        },
+        {
+          "type": "boolean_or",
+          "named": true
+        },
+        {
+          "type": "boolean_xor",
           "named": true
         },
         {
@@ -2536,6 +3363,10 @@
         },
         {
           "type": "raise_expression",
+          "named": true
+        },
+        {
+          "type": "string",
           "named": true
         },
         {
@@ -2652,6 +3483,22 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "boolean_and",
+            "named": true
+          },
+          {
+            "type": "boolean_or",
+            "named": true
+          },
+          {
+            "type": "boolean_xor",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -2701,6 +3548,10 @@
           },
           {
             "type": "raise_expression",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -2761,6 +3612,10 @@
         "required": false,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -2770,6 +3625,10 @@
           },
           {
             "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -2993,6 +3852,10 @@
         "required": false,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "function",
             "named": true
           },
@@ -3018,6 +3881,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -3055,6 +3922,10 @@
         "required": false,
         "types": [
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
@@ -3064,6 +3935,10 @@
           },
           {
             "type": "parenthesized_pattern",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -3213,6 +4088,10 @@
             "named": true
           },
           {
+            "type": "boolean",
+            "named": true
+          },
+          {
             "type": "handle_expression",
             "named": true
           },
@@ -3246,6 +4125,10 @@
           },
           {
             "type": "projection",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           },
           {
@@ -3426,6 +4309,10 @@
     "named": false
   },
   {
+    "type": "false",
+    "named": false
+  },
+  {
     "type": "fn",
     "named": false
   },
@@ -3474,8 +4361,16 @@
     "named": false
   },
   {
+    "type": "string",
+    "named": true
+  },
+  {
     "type": "tag",
     "named": true
+  },
+  {
+    "type": "true",
+    "named": false
   },
   {
     "type": "type",
@@ -3495,6 +4390,10 @@
   },
   {
     "type": "with",
+    "named": false
+  },
+  {
+    "type": "xor",
     "named": false
   },
   {

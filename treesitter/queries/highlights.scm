@@ -98,6 +98,8 @@
 ; ── literals ─────────────────────────────────────────────────────────────────
 
 (natural) @number
+(string) @string
+(boolean) @boolean
 
 ; ── keywords ─────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,10 @@
 ; that reads it, and the anonymous node only exists where it was read as one.
 (when_clause "when" @keyword)
 (where_clause "where" @keyword)
+(boolean_or "or" @keyword.operator)
+(boolean_xor "xor" @keyword.operator)
+(boolean_and "and" @keyword.operator)
+(unary_expression "not" @keyword.operator)
 (clause_or "or" @keyword.operator)
 (clause_and "and" @keyword.operator)
 (clause_not "not" @keyword.operator)
@@ -139,6 +145,9 @@
   "->"
   "!="
   "+"
+  "-"
+  "*"
+  "/"
   "|"
   "\\"
   ".."

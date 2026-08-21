@@ -26,7 +26,7 @@ use indexmap::IndexMap;
 
 use crate::{
     inference::{self, unfold},
-    ir::{Handler, HandlerArm, Pattern, PatternKind, Program, Term, TermKind},
+    ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{Core, Presence, Rest, Row, Ty},
@@ -114,11 +114,22 @@ pub struct Instr {
 /// What one instruction does.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// Numeric literals.
-    Const(u64),
-    ConstInt(i64),
-    ConstReal(f64),
+    /// A primitive literal.
+    Const(Literal),
     Neg(Temp),
+    Not(Temp),
+    And {
+        left: Temp,
+        right: Temp,
+    },
+    Or {
+        left: Temp,
+        right: Temp,
+    },
+    Xor {
+        left: Temp,
+        right: Temp,
+    },
     Add {
         left: Temp,
         right: Temp,
@@ -189,12 +200,13 @@ pub enum Op {
         cases: Vec<TagCase>,
         fallback: Option<Box<Block>>,
     },
-    /// Dispatch on a natural. The fallback is always there: the naturals are
-    /// infinite and the match is exhaustive, so some arm takes the rest.
-    SwitchNat {
+    /// Dispatch on a primitive value. The fallback is absent only when the
+    /// listed Boolean cases cover both possible values; every other primitive
+    /// type has values beyond its listed literals.
+    SwitchPrim {
         on: Temp,
-        cases: Vec<NatCase>,
-        fallback: Box<Block>,
+        cases: Vec<PrimCase>,
+        fallback: Option<Box<Block>>,
     },
     /// Dispatch on whether a struct value has a field, where the solved type
     /// leaves that field's presence undecided at runtime.
@@ -230,10 +242,10 @@ pub struct TagCase {
     pub block: Block,
 }
 
-/// One case of a [`Op::SwitchNat`].
+/// One case of a [`Op::SwitchPrim`].
 #[derive(Debug, Clone)]
-pub struct NatCase {
-    pub value: u64,
+pub struct PrimCase {
+    pub value: Literal,
     pub block: Block,
 }
 
@@ -404,7 +416,7 @@ struct Apply<'a> {
 enum Cell {
     /// Accepts everything, binding the name it carries when it has one.
     Wild(Option<Symbol>),
-    Nat(u64),
+    Prim(Literal),
     Tag {
         name: String,
         payload: Box<Cell>,
@@ -667,7 +679,11 @@ fn cell(pattern: &Pattern) -> Cell {
     match &pattern.tracked {
         PatternKind::Bind(name) => Cell::Wild(Some(name.tracked)),
         PatternKind::Wildcard => Cell::Wild(None),
-        PatternKind::Natural(value) => Cell::Nat(*value),
+        PatternKind::Natural(value) => Cell::Prim(Literal::Natural(*value)),
+        PatternKind::Integer(value) => Cell::Prim(Literal::Integer(*value)),
+        PatternKind::Real(value) => Cell::Prim(Literal::Real(*value)),
+        PatternKind::String(value) => Cell::Prim(Literal::String(value.clone())),
+        PatternKind::Boolean(value) => Cell::Prim(Literal::Boolean(*value)),
         PatternKind::Unit => Cell::Struct {
             fields: Vec::new(),
             exact: true,
@@ -1598,12 +1614,26 @@ impl Lower<'_> {
         let span = term.span;
         let rep = self.rep(&term.ty);
         match &term.kind {
-            TermKind::Natural(value) => self.emit(body, span, rep, Op::Const(*value)),
-            TermKind::Integer(value) => self.emit(body, span, rep, Op::ConstInt(*value)),
-            TermKind::Real(value) => self.emit(body, span, rep, Op::ConstReal(*value)),
-            TermKind::Unary { value, .. } => {
+            TermKind::Natural(value) => {
+                self.emit(body, span, rep, Op::Const(Literal::Natural(*value)))
+            }
+            TermKind::Integer(value) => {
+                self.emit(body, span, rep, Op::Const(Literal::Integer(*value)))
+            }
+            TermKind::Real(value) => self.emit(body, span, rep, Op::Const(Literal::Real(*value))),
+            TermKind::String(value) => {
+                self.emit(body, span, rep, Op::Const(Literal::String(value.clone())))
+            }
+            TermKind::Boolean(value) => {
+                self.emit(body, span, rep, Op::Const(Literal::Boolean(*value)))
+            }
+            TermKind::Unary { op, value } => {
                 let value = self.term(value, body);
-                self.emit(body, span, rep, Op::Neg(value))
+                let op = match op {
+                    crate::ir::UnaryOp::Neg => Op::Neg(value),
+                    crate::ir::UnaryOp::Not => Op::Not(value),
+                };
+                self.emit(body, span, rep, op)
             }
             TermKind::Binary { op, left, right } => {
                 let left = self.term(left, body);
@@ -1613,6 +1643,9 @@ impl Lower<'_> {
                     crate::ir::BinaryOp::Sub => Op::Sub { left, right },
                     crate::ir::BinaryOp::Mul => Op::Mul { left, right },
                     crate::ir::BinaryOp::Div => Op::Div { left, right },
+                    crate::ir::BinaryOp::And => Op::And { left, right },
+                    crate::ir::BinaryOp::Or => Op::Or { left, right },
+                    crate::ir::BinaryOp::Xor => Op::Xor { left, right },
                 };
                 self.emit(body, span, rep, op)
             }
@@ -2254,16 +2287,18 @@ impl Lower<'_> {
         {
             return self.widen(col.temp, &ty, matrix, tree, body);
         }
-        let numbers = matrix
+        let primitives = matrix
             .lines
             .iter()
-            .any(|line| matches!(line.cells[0], Cell::Nat(_)));
+            .any(|line| matches!(line.cells[0], Cell::Prim(_)));
         let tags = matrix
             .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
         match &ty.core {
-            Core::Nat if numbers => self.switch_nat(col.temp, matrix, tree, body),
+            Core::Nat | Core::Int | Core::Real | Core::String | Core::Boolean if primitives => {
+                self.switch_prim(col.temp, matrix, tree, body)
+            }
             Core::Sum(row) if tags => {
                 let row = flat(row);
                 self.switch_tag(col.temp, &row, matrix, tree, body)
@@ -2275,45 +2310,61 @@ impl Lower<'_> {
         }
     }
 
-    /// A natural position: one case per number written, and the rest.
-    fn switch_nat(&mut self, temp: Temp, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
-        let mut listed: Vec<u64> = Vec::new();
+    /// A primitive position: one case per literal written, and the rest. Only
+    /// Boolean has a finite universe, so only a switch listing both `false`
+    /// and `true` can omit its fallback.
+    fn switch_prim(&mut self, temp: Temp, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
+        let mut listed: Vec<Literal> = Vec::new();
         for line in &matrix.lines {
-            if let Cell::Nat(value) = &line.cells[0]
+            if let Cell::Prim(value) = &line.cells[0]
                 && !listed.contains(value)
             {
-                listed.push(*value);
+                listed.push(value.clone());
             }
         }
-        let narrow = |value: Option<u64>| -> Matrix {
+        let narrow = |value: Option<&Literal>| -> Matrix {
             matrix
                 .kept(|line| match (&line.cells[0], value) {
-                    (Cell::Nat(written), Some(value)) => *written == value,
+                    (Cell::Prim(written), Some(value)) => written == value,
                     (Cell::Wild(_), _) => true,
                     _ => false,
                 })
                 .consumed(temp)
         };
-        let cases: Vec<NatCase> = listed
+        let cases: Vec<PrimCase> = listed
             .iter()
             .map(|value| {
-                let kept = narrow(Some(*value));
-                NatCase {
-                    value: *value,
+                let kept = narrow(Some(value));
+                PrimCase {
+                    value: value.clone(),
                     block: self.child(tree.span, |low, inner| low.tree(kept, tree, inner)),
                 }
             })
             .collect();
-        let kept = narrow(None);
-        let fallback = self.child(tree.span, |low, inner| low.tree(kept, tree, inner));
+        let wilds = narrow(None);
+        let boolean_complete =
+            listed.contains(&Literal::Boolean(false)) && listed.contains(&Literal::Boolean(true));
+        let fallback = if boolean_complete {
+            // The wildcard rows remain in each listed case for tests in later
+            // columns, but there is no Boolean value left for a default arm.
+            None
+        } else {
+            assert!(
+                !wilds.lines.is_empty(),
+                "the pattern checks proved the match exhaustive"
+            );
+            Some(Box::new(
+                self.child(tree.span, |low, inner| low.tree(wilds, tree, inner)),
+            ))
+        };
         self.emit(
             body,
             tree.span,
             tree.rep,
-            Op::SwitchNat {
+            Op::SwitchPrim {
                 on: temp,
                 cases,
-                fallback: Box::new(fallback),
+                fallback,
             },
         )
     }

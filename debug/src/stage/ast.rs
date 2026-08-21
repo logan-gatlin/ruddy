@@ -223,8 +223,12 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         }
         .child(expr_node(ids, value))
         .child(expr_node(ids, function)),
-        ExprKind::Unary { value, .. } => Node {
-            label: "Neg".into(),
+        ExprKind::Unary { op, value } => Node {
+            label: match op {
+                ruddy::parse::UnaryOp::Neg => "Neg",
+                ruddy::parse::UnaryOp::Not => "Not",
+            }
+            .into(),
             ..node
         }
         .child(expr_node(ids, value)),
@@ -234,6 +238,9 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
                 ruddy::parse::BinaryOp::Sub => "Sub",
                 ruddy::parse::BinaryOp::Mul => "Mul",
                 ruddy::parse::BinaryOp::Div => "Div",
+                ruddy::parse::BinaryOp::And => "And",
+                ruddy::parse::BinaryOp::Or => "Or",
+                ruddy::parse::BinaryOp::Xor => "Xor",
             }
             .into(),
             ..node
@@ -395,6 +402,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             label: "Real".into(),
             ..node
         },
+        ExprKind::String(_) => Node {
+            label: "String".into(),
+            ..node
+        },
+        ExprKind::Boolean(_) => Node {
+            label: "Boolean".into(),
+            ..node
+        },
         ExprKind::Unit => Node {
             label: "Unit".into(),
             ..node
@@ -406,7 +421,12 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
 /// `Display`, the same rule the expression nodes keep. A pun is a leaf wearing
 /// the field's name; a renamed field holds its sub-pattern.
 fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
-    let node = Node::new(ids.next(), "", pattern.tracked.to_string()).at(pattern.span);
+    let node = Node::new(
+        ids.next(),
+        "",
+        print::ast::pattern(&pattern.tracked).to_string(),
+    )
+    .at(pattern.span);
     match &pattern.tracked {
         PatternKind::Ident { name } => Node {
             label: "Bind".into(),
@@ -421,6 +441,22 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
         },
         PatternKind::Natural(_) => Node {
             label: "Natural".into(),
+            ..node
+        },
+        PatternKind::Integer(_) => Node {
+            label: "Integer".into(),
+            ..node
+        },
+        PatternKind::Real(_) => Node {
+            label: "Real".into(),
+            ..node
+        },
+        PatternKind::String(_) => Node {
+            label: "String".into(),
+            ..node
+        },
+        PatternKind::Boolean(_) => Node {
+            label: "Boolean".into(),
             ..node
         },
         PatternKind::Unit => Node {

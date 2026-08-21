@@ -21,6 +21,26 @@ let value = -1 + 2 * 3 - 4 / 5
         (natural)))))
 
 ================================================================================
+Boolean operators respect precedence
+================================================================================
+
+let value = not true and false xor true or false
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (boolean_or
+      (boolean_xor
+        (boolean_and
+          (unary_expression
+            (boolean))
+          (boolean))
+        (boolean))
+      (boolean))))
+
+================================================================================
 Pipeline is left-associative and looser than arithmetic
 ================================================================================
 

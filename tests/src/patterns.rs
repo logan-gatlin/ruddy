@@ -961,3 +961,51 @@ fn a_non_qualifying_column_with_no_constraints_reads_as_before() {
     );
     assert_eq!(witness_of(&checks), "{ x: 1n, y }");
 }
+
+// Primitive scalar matching shares the pattern decision matrix.
+#[test]
+fn expressions_and_patterns_cover_every_primitive() {
+    for literal in ["1n", "1i", "1.5", "\"text\"", "true"] {
+        let source =
+            format!("let f = fn x => match x with | {literal} => {literal} | _ => {literal} end");
+        let (built, inferred, checked) = checked(&source);
+        assert!(built.errors.is_empty(), "{literal}: {:#?}", built.errors);
+        assert!(
+            inferred.errors.is_empty(),
+            "{literal}: {:#?}",
+            inferred.errors
+        );
+        assert!(
+            checked.errors.is_empty(),
+            "{literal}: {:#?}",
+            checked.errors
+        );
+    }
+}
+
+#[test]
+fn booleans_are_exhaustive_without_a_wildcard() {
+    let (built, inferred, checked) =
+        checked("let f = fn x => match x with | true => 1n | false => 0n end");
+    assert!(built.errors.is_empty());
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
+}
+
+#[test]
+fn other_primitive_literal_sets_need_a_wildcard() {
+    for literal in ["1n", "1i", "1.5", "\"text\""] {
+        let (_, inferred, checked) = checked(&format!(
+            "let f = fn x => match x with | {literal} => 0n end"
+        ));
+        assert!(
+            inferred.errors.is_empty(),
+            "{literal}: {:#?}",
+            inferred.errors
+        );
+        assert!(
+            !checked.errors.is_empty(),
+            "{literal} was incorrectly exhaustive"
+        );
+    }
+}

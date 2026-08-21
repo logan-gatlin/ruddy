@@ -70,6 +70,14 @@ fn real_number_operators_lower_to_native_instructions() {
     }
 }
 
+#[test]
+fn boolean_operators_lower_to_native_instructions() {
+    let printed = listing("let value = not true and false xor true or false");
+    for op in ["not", "and", "xor", "or"] {
+        assert!(printed.contains(op), "{op} missing from:\n{printed}");
+    }
+}
+
 /// Every nested expression becomes one temp assignment, in the order the source
 /// evaluates it: the value of a `let` before its body, a struct's fields as
 /// written, a projection's base before the read.
@@ -314,8 +322,8 @@ fn a_match_tests_each_position_once() {
          \x20 %5: nat = switch_tag %0:\n\
          \x20   #Some =>\n\
          \x20     %1: nat = payload %0\n\
-         \x20     %3: nat = switch_nat %1:\n\
-         \x20       0 =>\n\
+         \x20     %3: nat = switch_prim %1:\n\
+         \x20       0n =>\n\
          \x20         %2: nat = const 100n\n\
          \x20         yield %2\n\
          \x20       else =>\n\
@@ -414,14 +422,35 @@ fn a_binder_arm_binds_the_scrutinee_temp() {
             "fn f("
         ),
         "fn f(%0: nat):\n\
-         \x20 %2: nat = switch_nat %0:\n\
-         \x20   0 =>\n\
+         \x20 %2: nat = switch_prim %0:\n\
+         \x20   0n =>\n\
          \x20     %1: nat = const 1n\n\
          \x20     yield %1\n\
          \x20   else =>\n\
          \x20     yield %0\n\
          \x20 ret %2"
     );
+}
+
+/// Every scalar literal uses the one primitive dispatch, retaining its source
+/// spelling in the case so a backend can compare the value at its own
+/// representation.
+#[test]
+fn every_primitive_pattern_uses_switch_prim() {
+    for (literal, case) in [
+        ("1n", "1n =>"),
+        ("1i", "1i =>"),
+        ("1.5", "1.5 =>"),
+        ("\"text\"", "\"text\" =>"),
+        ("true", "true =>"),
+    ] {
+        let printed = section(
+            &format!("let f = fn x => match x with | {literal} => {literal} | _ => {literal} end"),
+            "fn f(",
+        );
+        assert!(printed.contains("switch_prim"), "{printed}");
+        assert!(printed.contains(case), "{printed}");
+    }
 }
 
 /// A match with no arms constrained its scrutinee to the empty sum: a dispatch
@@ -1489,8 +1518,8 @@ fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
          \x20     yield %4\n\
          \x20   #G =>\n\
          \x20     %5: nat = payload %3\n\
-         \x20     %8: nat = switch_nat %5:\n\
-         \x20       0 =>\n\
+         \x20     %8: nat = switch_prim %5:\n\
+         \x20       0n =>\n\
          \x20         %6: nat = const 7n\n\
          \x20         yield %6\n\
          \x20       else =>\n\
@@ -1651,9 +1680,12 @@ fn a_number_written_twice_in_one_column_is_one_case() {
         "let f = fn s => match s with | {a: 0n, b: 0n} => 1n | {a: 0n, b: 1n} => 2n | _ => 3n end",
         "fn f(",
     );
-    assert_eq!(printed.matches("switch_nat %1:").count(), 1, "{printed}");
+    assert_eq!(printed.matches("switch_prim %1:").count(), 1, "{printed}");
     assert_eq!(
-        printed.lines().filter(|line| line.trim() == "0 =>").count(),
+        printed
+            .lines()
+            .filter(|line| line.trim() == "0n =>")
+            .count(),
         2,
         "{printed}"
     );

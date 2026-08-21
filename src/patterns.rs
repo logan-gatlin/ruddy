@@ -40,11 +40,11 @@
 
 use std::rc::Rc;
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 
 use crate::{
     inference::{self, Coverage as Covers, Origin, Store, sat, unfold},
-    ir::{Pattern, PatternKind, Program, Term, TermKind, Witness},
+    ir::{Literal, Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
     tracking::Span,
     types::{Atom, Core, Formula, Presence, Rest, Row, Scheme, Ty},
@@ -145,13 +145,12 @@ pub enum ErrorKind {
 enum Cell {
     /// Accepts everything: a binder or a wildcard.
     Wild,
-    Natural(u64),
+    /// An exact scalar literal. Its variant carries its primitive type as
+    /// well as its value, and `Literal` gives reals representation equality.
+    Literal(Literal),
     /// A case, with what it carries — a bare tag's payload is the unit it
     /// demands, which is [`Cell::Struct`] with no fields, exact.
-    Tag {
-        name: String,
-        payload: Box<Cell>,
-    },
+    Tag { name: String, payload: Box<Cell> },
     /// A struct pattern. Exact without the `..`: every field the type names
     /// beyond the mentioned ones must be absent. Open with it: the mentioned
     /// fields must be there, and the rest is anybody's.
@@ -343,6 +342,8 @@ fn walk(check: &Check, term: &Term, out: &mut Output) {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -368,7 +369,11 @@ fn catch_all(pattern: &Pattern) -> bool {
 fn cell(pattern: &Pattern) -> Cell {
     match &pattern.tracked {
         PatternKind::Bind(_) | PatternKind::Wildcard => Cell::Wild,
-        PatternKind::Natural(value) => Cell::Natural(*value),
+        PatternKind::Natural(value) => Cell::Literal(Literal::Natural(*value)),
+        PatternKind::Integer(value) => Cell::Literal(Literal::Integer(*value)),
+        PatternKind::Real(value) => Cell::Literal(Literal::Real(*value)),
+        PatternKind::String(value) => Cell::Literal(Literal::String(value.clone())),
+        PatternKind::Boolean(value) => Cell::Literal(Literal::Boolean(*value)),
         // `()` and `{}` are one pattern: the exact struct naming no fields.
         PatternKind::Unit => Cell::Struct {
             fields: Vec::new(),
@@ -777,8 +782,9 @@ impl Check<'_> {
     }
 
     /// Whether one arm's tests all land on positions the solved type has an
-    /// answer for. Anything else — a number where the type is not `Nat`, a
-    /// case the row never acquired or settled, a position or presence left
+    /// answer for. Anything else — a scalar literal whose primitive type does
+    /// not agree with the solved type, a case the row never acquired or
+    /// settled, a position or presence left
     /// undecided — means the typing failed, and the checks stand aside.
     ///
     /// The two shapes read a settled absence differently, because inference
@@ -791,7 +797,14 @@ impl Check<'_> {
     fn compatible(&self, ty: &Rc<Ty>, cell: &Cell) -> bool {
         let ty = self.shape(ty);
         match cell {
-            Cell::Natural(_) => matches!(ty.core, Core::Nat),
+            Cell::Literal(literal) => matches!(
+                (literal, &ty.core),
+                (Literal::Natural(_), Core::Nat)
+                    | (Literal::Integer(_), Core::Int)
+                    | (Literal::Real(_), Core::Real)
+                    | (Literal::String(_), Core::String)
+                    | (Literal::Boolean(_), Core::Boolean)
+            ),
             Cell::Tag { name, payload } => match &ty.core {
                 Core::Sum(row) => {
                     let row = flat(row);
@@ -1132,9 +1145,9 @@ impl Check<'_> {
         }
     }
 
-    /// One position's core, the fields already peeled off: numbers when it is
-    /// `Nat`, cases when it is a sum, and nothing testable otherwise — a core
-    /// the arms cannot reach into is covered by the wildcards that got here.
+    /// One position's core, the fields already peeled off: scalar literals,
+    /// cases when it is a sum, and nothing testable otherwise — a core the
+    /// arms cannot reach into is covered by the wildcards that got here.
     fn core(
         &self,
         rows: &[Vec<Cell>],
@@ -1144,7 +1157,9 @@ impl Check<'_> {
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         match &ty.core {
-            Core::Nat => self.naturals(rows, later, q, walk),
+            Core::Nat | Core::Int | Core::Real | Core::String | Core::Boolean => {
+                self.scalars(rows, &ty.core, later, q, walk)
+            }
             Core::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
@@ -1158,67 +1173,107 @@ impl Check<'_> {
         }
     }
 
-    /// A `Nat` core: the listed numbers each in turn, and then some number
-    /// not listed — the numbers never run out, so a column of them is covered
-    /// only by a wildcard.
-    fn naturals(
+    /// A scalar primitive core. Boolean has precisely two values, so its two
+    /// exact patterns cover it. The other scalar types deliberately keep the
+    /// literal-pattern rule `Nat` had: no finite list of literals is total, so
+    /// a wildcard is needed to accept the value outside that list.
+    fn scalars(
         &self,
         rows: &[Vec<Cell>],
+        core: &Core,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
-        let narrow = |value: u64| -> Vec<Vec<Cell>> {
+        let narrow = |value: &Literal| -> Vec<Vec<Cell>> {
             rows.iter()
                 .filter_map(|row| match &row[0] {
-                    Cell::Natural(natural) if *natural == value => Some(wild_row(row)),
+                    Cell::Literal(literal) if literal == value => Some(wild_row(row)),
                     Cell::Wild => Some(wild_row(row)),
                     _ => None,
                 })
                 .collect()
         };
+        let ask = |value: &Literal| -> Option<Vec<Option<Witness>>> {
+            let wits = self.useful(&narrow(value), later, &q[1..], walk)?;
+            let witness = match value {
+                Literal::Natural(value) => Witness::Natural(*value),
+                _ => Witness::Literal(value.clone()),
+            };
+            Some(std::iter::once(Some(witness)).chain(wits).collect())
+        };
         match &q[0] {
-            Cell::Natural(value) => {
-                let wits = self.useful(&narrow(*value), later, &q[1..], walk)?;
-                Some(
-                    std::iter::once(Some(Witness::Natural(*value)))
-                        .chain(wits)
-                        .collect(),
-                )
-            }
-            // A wildcard — nothing else tests a `Nat` position — asks the
-            // universe: each listed number, and then one that is not.
+            Cell::Literal(value) => ask(value),
+            // A wildcard asks every literal explicitly named above first;
+            // an uncovered one is the most useful witness where we can print
+            // it (a natural), and proves usefulness for every primitive.
             _ => {
-                let listed: IndexSet<u64> = rows
+                let listed: Vec<&Literal> = rows
                     .iter()
                     .filter_map(|row| match &row[0] {
-                        Cell::Natural(value) => Some(*value),
+                        Cell::Literal(value) => Some(value),
                         _ => None,
                     })
                     .collect();
                 for value in &listed {
-                    if let Some(wits) = self.useful(&narrow(*value), later, &q[1..], walk) {
-                        return Some(
-                            std::iter::once(Some(Witness::Natural(*value)))
-                                .chain(wits)
-                                .collect(),
-                        );
+                    if let Some(wits) = ask(value) {
+                        return Some(wits);
                     }
                 }
-                let unlisted = (0..)
-                    .find(|value| !listed.contains(value))
-                    .expect("a finite set of naturals leaves one out");
+
+                if matches!(core, Core::Boolean) {
+                    // There are no values other than true and false. They
+                    // were each considered above if written, but ask both so
+                    // an empty matrix has the same finite universe.
+                    for value in [Literal::Boolean(false), Literal::Boolean(true)] {
+                        if let Some(wits) = ask(&value) {
+                            return Some(wits);
+                        }
+                    }
+                    return None;
+                }
+
+                // The value outside every listed literal is accepted only by
+                // a wildcard. For naturals choose a printable one, preserving
+                // the numbers-specific diagnostic; the other scalar witness
+                // remains the generic `Any` described above.
                 let rows: Vec<Vec<Cell>> = rows
                     .iter()
                     .filter(|row| matches!(&row[0], Cell::Wild))
                     .map(|row| wild_row(row))
                     .collect();
                 let wits = self.useful(&rows, later, &q[1..], walk)?;
-                Some(
-                    std::iter::once(Some(Witness::Natural(unlisted)))
-                        .chain(wits)
-                        .collect(),
-                )
+                let witness = match core {
+                    Core::Nat => {
+                        let unlisted = (0..)
+                            .find(|value| {
+                                !listed.iter().any(|literal| {
+                                    matches!(literal, Literal::Natural(found) if found == value)
+                                })
+                            })
+                            .expect("a finite set of naturals leaves one out");
+                        Witness::Natural(unlisted)
+                    }
+                    Core::Int => Witness::Literal(Literal::Integer(
+                        (0..)
+                            .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::Integer(found) if found == value)))
+                            .expect("a finite set of integers leaves one out"),
+                    )),
+                    Core::Real => Witness::Literal(Literal::Real(
+                        (0..)
+                            .map(|value| value as f64)
+                            .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::Real(found) if found.to_bits() == value.to_bits())))
+                            .expect("a finite set of reals leaves one out"),
+                    )),
+                    Core::String => Witness::Literal(Literal::String(
+                        (0..)
+                            .map(|size| "\0".repeat(size))
+                            .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::String(found) if found == value)))
+                            .expect("a finite set of strings leaves one out"),
+                    )),
+                    _ => unreachable!("scalars is called only for scalar primitive cores"),
+                };
+                Some(std::iter::once(Some(witness)).chain(wits).collect())
             }
         }
     }

@@ -69,6 +69,18 @@ fn real_number_operators_have_the_usual_precedence() {
 }
 
 #[test]
+fn boolean_operators_have_the_usual_precedence() {
+    assert_eq!(
+        parse_one("let value = not true and false xor true or false"),
+        "let value = not true and false xor true or false"
+    );
+    assert_eq!(
+        parse_one("let value = not (true or false)"),
+        "let value = not (true or false)"
+    );
+}
+
+#[test]
 fn application_is_left_associative() {
     assert_eq!(parse_one("let a = f x y"), "let a = f x y");
 }
@@ -133,19 +145,16 @@ fn a_label_may_be_called_when() {
     );
 }
 
-/// The contextual keywords are ordinary identifiers everywhere 'but the type
-/// positions that read them, so terms and labels of those names still work.
+/// `when`, `where`, and `return` are contextual, but Boolean operators are
+/// reserved wherever an expression may appear.
 #[test]
-fn the_clause_keywords_are_contextual() {
+fn only_non_operator_clause_keywords_are_contextual() {
     for src in [
         "let when = 1n",
         "let where = 1n",
-        "let or = 1n",
-        "let and = 1n",
-        "let not = 1n",
         "let x = fn when => when",
-        "let x = { when: 1n, where: 2n, or: 3n, and: 4n, not: 5n }",
-        "let x : { when: A, where: B, or: C, and: D, not: E } = y",
+        "let x = { when: 1n, where: 2n }",
+        "let x : { when: A, where: B } = y",
     ] {
         assert_eq!(parse_one(src), src);
     }

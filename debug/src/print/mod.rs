@@ -30,6 +30,27 @@ pub use ruddy::{
     },
 };
 
+/// Quote a source string using the escape sequences the lexer accepts.
+///
+/// Rust's debug formatter can use escapes such as `\\u{...}` that Ruddy does
+/// not parse, so keep the source printers' strings round-trippable ourselves.
+pub(crate) fn string(value: &str) -> String {
+    let mut written = String::with_capacity(value.len() + 2);
+    written.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => written.push_str("\\\""),
+            '\\' => written.push_str("\\\\"),
+            '\n' => written.push_str("\\n"),
+            '\r' => written.push_str("\\r"),
+            '\t' => written.push_str("\\t"),
+            character => written.push(character),
+        }
+    }
+    written.push('"');
+    written
+}
+
 pub mod ast;
 pub mod ir;
 pub mod lir;

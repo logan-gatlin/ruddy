@@ -18,7 +18,7 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow,
+    Entry, Grouped, Mark, Prec, Shape, label, string, write_applied, write_apply, write_arrow,
     write_binary, write_effects, write_let, write_match, write_project, write_row, write_struct,
     write_sum, write_tag, write_unary,
 };
@@ -184,6 +184,18 @@ impl Grouped for Show<'_, TermKind> {
             TermKind::Match { .. } | TermKind::Handle { .. } => Prec::Apply,
             TermKind::Raise(_) => Prec::Lambda,
             TermKind::Binary {
+                op: ruddy::ir::BinaryOp::Or,
+                ..
+            } => Prec::Or,
+            TermKind::Binary {
+                op: ruddy::ir::BinaryOp::Xor,
+                ..
+            } => Prec::Xor,
+            TermKind::Binary {
+                op: ruddy::ir::BinaryOp::And,
+                ..
+            } => Prec::And,
+            TermKind::Binary {
                 op: ruddy::ir::BinaryOp::Add | ruddy::ir::BinaryOp::Sub,
                 ..
             } => Prec::Addition,
@@ -205,6 +217,8 @@ impl Grouped for Show<'_, TermKind> {
             | TermKind::Natural(_)
             | TermKind::Integer(_)
             | TermKind::Real(_)
+            | TermKind::String(_)
+            | TermKind::Boolean(_)
             | TermKind::Error => Prec::Atom,
         }
     }
@@ -222,6 +236,10 @@ impl Grouped for Show<'_, PatternKind> {
             PatternKind::Bind(_)
             | PatternKind::Wildcard
             | PatternKind::Natural(_)
+            | PatternKind::Integer(_)
+            | PatternKind::Real(_)
+            | PatternKind::String(_)
+            | PatternKind::Boolean(_)
             | PatternKind::Unit
             | PatternKind::Struct { .. } => Prec::Atom,
         }
@@ -240,6 +258,10 @@ impl fmt::Display for Show<'_, PatternKind> {
             // the mint to spell.
             PatternKind::Wildcard => f.write_str("_"),
             PatternKind::Natural(value) => write!(f, "{value}n"),
+            PatternKind::Integer(value) => write!(f, "{value}i"),
+            PatternKind::Real(value) => write!(f, "{value}"),
+            PatternKind::String(value) => f.write_str(&string(value)),
+            PatternKind::Boolean(value) => write!(f, "{value}"),
             PatternKind::Unit => f.write_str("()"),
             PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -295,13 +317,25 @@ impl fmt::Display for Show<'_, TermKind> {
             TermKind::Natural(value) => write!(f, "{value}n"),
             TermKind::Integer(value) => write!(f, "{value}i"),
             TermKind::Real(value) => write!(f, "{value}"),
-            TermKind::Unary { value, .. } => write_unary(f, "-", &self.show(&**value)),
+            TermKind::String(value) => f.write_str(&string(value)),
+            TermKind::Boolean(value) => write!(f, "{value}"),
+            TermKind::Unary { op, value } => write_unary(
+                f,
+                match op {
+                    ruddy::ir::UnaryOp::Neg => "-",
+                    ruddy::ir::UnaryOp::Not => "not ",
+                },
+                &self.show(&**value),
+            ),
             TermKind::Binary { op, left, right } => {
                 let (symbol, prec) = match op {
                     ruddy::ir::BinaryOp::Add => ("+", Prec::Addition),
                     ruddy::ir::BinaryOp::Sub => ("-", Prec::Addition),
                     ruddy::ir::BinaryOp::Mul => ("*", Prec::Multiplication),
                     ruddy::ir::BinaryOp::Div => ("/", Prec::Multiplication),
+                    ruddy::ir::BinaryOp::And => ("and", Prec::And),
+                    ruddy::ir::BinaryOp::Or => ("or", Prec::Or),
+                    ruddy::ir::BinaryOp::Xor => ("xor", Prec::Xor),
                 };
                 write_binary(f, &self.show(&**left), symbol, &self.show(&**right), prec)
             }

@@ -3074,6 +3074,8 @@ impl Table {
             | TermKind::Natural(_)
             | TermKind::Integer(_)
             | TermKind::Real(_)
+            | TermKind::String(_)
+            | TermKind::Boolean(_)
             | TermKind::Error => {}
         }
     }

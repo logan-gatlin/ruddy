@@ -99,6 +99,23 @@ fn lexes_real_number_operators() {
 }
 
 #[test]
+fn lexes_boolean_operators() {
+    assert!(matches!(
+        kinds("not true and false or true xor false")[..],
+        [
+            Kind::Not,
+            Kind::Boolean(true),
+            Kind::And,
+            Kind::Boolean(false),
+            Kind::Or,
+            Kind::Boolean(true),
+            Kind::Xor,
+            Kind::Boolean(false),
+        ]
+    ));
+}
+
+#[test]
 fn lexes_the_two_arrows_apart() {
     assert!(matches!(kinds("->")[..], [Kind::Arrow]));
     assert!(matches!(kinds("=>")[..], [Kind::FatArrow]));

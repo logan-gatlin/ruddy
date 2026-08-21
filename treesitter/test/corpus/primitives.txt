@@ -1,0 +1,36 @@
+================================================================================
+Primitive literals are expressions and patterns
+================================================================================
+
+let f = fn x => match x with
+  | 1i => 1i
+  | 1.5 => 1.5
+  | "text" => "text"
+  | true => false
+  | _ => true
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (match_expression
+        (identifier)
+        (match_arm
+          (natural)
+          (natural))
+        (match_arm
+          (natural)
+          (natural))
+        (match_arm
+          (string)
+          (string))
+        (match_arm
+          (boolean)
+          (boolean))
+        (match_arm
+          (wildcard)
+          (boolean))))))

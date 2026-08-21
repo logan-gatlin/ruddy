@@ -121,6 +121,12 @@ pub enum Prec {
     Lambda,
     /// `value |> function`.
     Pipeline,
+    /// `left or right`.
+    Or,
+    /// `left xor right`.
+    Xor,
+    /// `left and right`.
+    And,
     /// `left + right`.
     Addition,
     /// `left * right`.
@@ -253,6 +259,7 @@ impl token::ErrorKind {
             token::ErrorKind::Unrecognized => "unrecognized-character",
             token::ErrorKind::MalformedNatural => "malformed-natural",
             token::ErrorKind::NaturalTooLarge => "natural-too-large",
+            token::ErrorKind::MalformedString => "malformed-string",
         }
     }
 }
@@ -265,6 +272,7 @@ impl fmt::Display for token::ErrorKind {
             // The bound is worth naming: it is the one limit here that a
             // person can do arithmetic against.
             token::ErrorKind::NaturalTooLarge => "natural number too large to fit in 64 bits",
+            token::ErrorKind::MalformedString => "malformed string literal",
         })
     }
 }
@@ -285,6 +293,10 @@ impl fmt::Display for Kind {
             Kind::Effect => f.write_str("effect"),
             Kind::Handle => f.write_str("handle"),
             Kind::Raise => f.write_str("raise"),
+            Kind::And => f.write_str("and"),
+            Kind::Or => f.write_str("or"),
+            Kind::Xor => f.write_str("xor"),
+            Kind::Not => f.write_str("not"),
             Kind::Bundle => f.write_str("bundle"),
             Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
@@ -319,6 +331,8 @@ impl fmt::Display for Kind {
             Kind::Natural(value) => write!(f, "{value}n"),
             Kind::Integer(value) => write!(f, "{value}i"),
             Kind::Real(value) => write!(f, "{value}"),
+            Kind::String(value) => write!(f, "{value:?}"),
+            Kind::Boolean(value) => write!(f, "{value}"),
         }
     }
 }
@@ -379,6 +393,10 @@ impl Grouped for parse::PatternKind {
             parse::PatternKind::Ident { .. }
             | parse::PatternKind::Wildcard
             | parse::PatternKind::Natural(_)
+            | parse::PatternKind::Integer(_)
+            | parse::PatternKind::Real(_)
+            | parse::PatternKind::String(_)
+            | parse::PatternKind::Boolean(_)
             | parse::PatternKind::Unit
             | parse::PatternKind::Struct { .. } => Prec::Atom,
         }
@@ -395,6 +413,10 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Ident { name } => f.write_str(&name.tracked),
             parse::PatternKind::Wildcard => f.write_str("_"),
             parse::PatternKind::Natural(value) => write!(f, "{value}n"),
+            parse::PatternKind::Integer(value) => write!(f, "{value}i"),
+            parse::PatternKind::Real(value) => write!(f, "{value}"),
+            parse::PatternKind::String(value) => write!(f, "{value:?}"),
+            parse::PatternKind::Boolean(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tag { name, payload } => write_tag(
                 f,
@@ -445,7 +467,9 @@ impl Grouped for ir::Witness {
                 payload: Some(_), ..
             } => Prec::Apply,
             ir::Witness::Tag { payload: None, .. } => Prec::Tag,
-            ir::Witness::Natural(_) | ir::Witness::Struct(_) => Prec::Atom,
+            ir::Witness::Natural(_) | ir::Witness::Literal(_) | ir::Witness::Struct(_) => {
+                Prec::Atom
+            }
             ir::Witness::Any | ir::Witness::Other(_) => Prec::Lambda,
         }
     }
@@ -461,6 +485,13 @@ impl fmt::Display for ir::Witness {
         match self {
             ir::Witness::Any => f.write_str("anything"),
             ir::Witness::Natural(value) => write!(f, "{value}n"),
+            ir::Witness::Literal(value) => match value {
+                ir::Literal::Natural(value) => write!(f, "{value}n"),
+                ir::Literal::Integer(value) => write!(f, "{value}i"),
+                ir::Literal::Real(value) => write!(f, "{value}"),
+                ir::Literal::String(value) => write!(f, "{value:?}"),
+                ir::Literal::Boolean(value) => write!(f, "{value}"),
+            },
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
             // A field held to be present with any value at all prints
             // pun-style — under exactness the presence *is* the information,
@@ -758,9 +789,13 @@ impl fmt::Display for ir::ErrorKind {
                     "this binding has to accept every value, but a value here might not be `{}`",
                     label(Shape::Sum, name),
                 ),
-                ir::Refuter::Number(value) => write!(
+                ir::Refuter::Literal(ir::Literal::Natural(value)) => write!(
                     f,
                     "this binding has to accept every value, but the number `{value}` makes it able to fail",
+                ),
+                ir::Refuter::Literal(value) => write!(
+                    f,
+                    "this binding has to accept every value, but `{value:?}` makes it able to fail",
                 ),
             },
             ir::ErrorKind::DuplicateBinding { name } => {

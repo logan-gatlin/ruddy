@@ -27,10 +27,13 @@ const PREC = {
   // `f x y` groups to the left, and stops in front of anything that begins no
   // argument.
   pipeline: 1,
-  addition: 2,
-  multiplication: 3,
-  unary: 4,
-  application: 5,
+  booleanOr: 2,
+  booleanXor: 3,
+  booleanAnd: 4,
+  addition: 5,
+  multiplication: 6,
+  unary: 7,
+  application: 8,
   // A tag takes its payload before an application takes another argument, so
   // `f #A 1` is `f` applied to `#A 1`.
   tag: 6,
@@ -55,9 +58,9 @@ module.exports = grammar({
   word: $ => $.identifier,
 
   // The words `token::lex` reserves: no position reads one of these as a name.
-  // `when`, `where`, `or`, `and`, `not` and `return` are deliberately absent —
-  // they are contextual, read by spelling at the few positions that want them
-  // and ordinary identifiers everywhere else.
+  // `when`, `where`, and `return` are deliberately absent — they are contextual,
+  // read by spelling at the few positions that want them and ordinary identifiers
+  // everywhere else.
   reserved: {
     global: _ => [
       'let',
@@ -70,15 +73,26 @@ module.exports = grammar({
       'effect',
       'handle',
       'raise',
+      'and',
+      'or',
+      'xor',
+      'not',
       'bundle',
       'module',
+      'true',
+      'false',
     ],
   },
 
   extras: _ => [/\s/],
 
   // This is a precedence-only choice, not a syntax node in the tree.
-  inline: $ => [$.binary_expression],
+  inline: $ => [
+    $.binary_expression,
+    $._boolean_or,
+    $._boolean_xor,
+    $._boolean_and,
+  ],
 
   conflicts: $ => [
     // `where 'a = 'b = v` compares two presences and then defines `v`;
@@ -226,13 +240,34 @@ module.exports = grammar({
       $.let_expression,
       $.raise_expression,
       $.pipeline,
-      $.binary_expression,
+      $._boolean_or,
     ),
 
     pipeline: $ => prec.left(PREC.pipeline, seq(
-      field('value', choice($.pipeline, $.binary_expression)),
+      field('value', choice($.pipeline, $._boolean_or)),
       '|>',
-      field('function', $.binary_expression),
+      field('function', $._boolean_or),
+    )),
+
+    _boolean_or: $ => choice($.boolean_or, $._boolean_xor),
+    boolean_or: $ => prec.left(PREC.booleanOr, seq(
+      field('left', $._boolean_or),
+      'or',
+      field('right', $._boolean_xor),
+    )),
+
+    _boolean_xor: $ => choice($.boolean_xor, $._boolean_and),
+    boolean_xor: $ => prec.left(PREC.booleanXor, seq(
+      field('left', $._boolean_xor),
+      'xor',
+      field('right', $._boolean_and),
+    )),
+
+    _boolean_and: $ => choice($.boolean_and, $.binary_expression),
+    boolean_and: $ => prec.left(PREC.booleanAnd, seq(
+      field('left', $._boolean_and),
+      'and',
+      field('right', $.binary_expression),
     )),
 
     binary_expression: $ => choice(
@@ -254,7 +289,10 @@ module.exports = grammar({
       field('right', $.binary_expression),
     )),
 
-    unary_expression: $ => prec(PREC.unary, seq('-', field('value', $.binary_expression))),
+    unary_expression: $ => prec(PREC.unary, seq(
+      choice('-', 'not'),
+      field('value', $.binary_expression),
+    )),
 
     _application_expression: $ => choice(
       $.application,
@@ -305,6 +343,8 @@ module.exports = grammar({
       $.identifier,
       $.path,
       $.natural,
+      $.string,
+      $.boolean,
       $.unit,
       $.struct_expression,
       $.tag_expression,
@@ -419,6 +459,8 @@ module.exports = grammar({
       $.identifier,
       $.wildcard,
       $.natural,
+      $.string,
+      $.boolean,
       $.unit,
       $.struct_pattern,
       $.tag_pattern,
@@ -657,6 +699,12 @@ module.exports = grammar({
      * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
     natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+
+    /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
+    string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),
+
+    /** The two boolean literals, reserved by token::lex. */
+    boolean: _ => choice('true', 'false'),
 
     // Bundle versions use bare integer components, so their dots can never be
     // consumed as a real literal's decimal point.

@@ -144,6 +144,7 @@ pub type Expr = Tracked<ExprKind>;
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +153,9 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    And,
+    Or,
+    Xor,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +268,8 @@ pub enum ExprKind {
     Natural(u64),
     Integer(i64),
     Real(f64),
+    String(String),
+    Boolean(bool),
     Unit,
 }
 
@@ -327,13 +333,19 @@ pub type Pattern = Tracked<PatternKind>;
 #[derive(Debug, Clone)]
 pub enum PatternKind {
     /// A bare name: binds the whole value, matches anything.
-    Ident { name: TrackedString },
+    Ident {
+        name: TrackedString,
+    },
     /// `_`: matches anything and binds nothing. What a name does minus the
     /// name, so it can never collide with a binder and can never be repeated
     /// too often.
     Wildcard,
-    /// A natural literal: matches exactly that number.
+    /// A primitive literal: matches exactly that value.
     Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
     /// `()`: matches unit, binds nothing.
     Unit,
     /// `{ f, g: <pattern>, ... }` — reach into a struct's fields. A bare field
@@ -1281,6 +1293,8 @@ impl Parser {
                     | Kind::Natural(_)
                     | Kind::Integer(_)
                     | Kind::Real(_)
+                    | Kind::String(_)
+                    | Kind::Boolean(_)
                     | Kind::Tag(_)
                     | Kind::EffectLabel(_)
                     | Kind::Fn
@@ -1294,9 +1308,9 @@ impl Parser {
     /// The pipeline is the loosest expression operator and associates left:
     /// `x |> f |> g` is `g (f x)`.
     fn expr(&mut self) -> Option<Expr> {
-        let mut value = self.addition()?;
+        let mut value = self.boolean_or()?;
         while self.eat_if(&Kind::PipeForward).is_some() {
-            let function = self.addition()?;
+            let function = self.boolean_or()?;
             let span = value.span.merge(function.span);
             value = span.track(ExprKind::Pipe {
                 value: Box::new(value),
@@ -1304,6 +1318,20 @@ impl Parser {
             });
         }
         Some(value)
+    }
+
+    /// Boolean disjunction is the loosest Boolean operator, followed by xor
+    /// and conjunction. All three associate left.
+    fn boolean_or(&mut self) -> Option<Expr> {
+        self.binary(Self::boolean_xor, &[(Kind::Or, BinaryOp::Or)])
+    }
+
+    fn boolean_xor(&mut self) -> Option<Expr> {
+        self.binary(Self::boolean_and, &[(Kind::Xor, BinaryOp::Xor)])
+    }
+
+    fn boolean_and(&mut self) -> Option<Expr> {
+        self.binary(Self::addition, &[(Kind::And, BinaryOp::And)])
     }
 
     /// Real addition and subtraction, left-associative and looser than multiplication.
@@ -1343,16 +1371,17 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Option<Expr> {
-        match self.eat_if(&Kind::Minus) {
-            Some(minus) => {
-                let value = self.unary()?;
-                Some(minus.span.merge(value.span).track(ExprKind::Unary {
-                    op: UnaryOp::Neg,
-                    value: Box::new(value),
-                }))
-            }
-            None => self.application(),
-        }
+        let op = match self.peek().map(|token| &token.tracked) {
+            Some(Kind::Minus) => UnaryOp::Neg,
+            Some(Kind::Not) => UnaryOp::Not,
+            _ => return self.application(),
+        };
+        let start = self.advance().expect("just peeked a unary operator").span;
+        let value = self.unary()?;
+        Some(start.merge(value.span).track(ExprKind::Unary {
+            op,
+            value: Box::new(value),
+        }))
     }
 
     /// Application binds tighter than numeric operators and is left-associative.
@@ -1431,6 +1460,15 @@ impl Parser {
             Kind::LeftParen => self.paren_expr(),
             Kind::Tag(_) => self.tag_expr(),
             Kind::EffectLabel(_) => self.operation_expr(),
+            Kind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                Some(span.track(ExprKind::String(value)))
+            }
+            &Kind::Boolean(value) => {
+                self.advance();
+                Some(span.track(ExprKind::Boolean(value)))
+            }
             // A name, or a path ending in one — and, since `::` binds tighter
             // than everything, a path ending in an effect label is an operation
             // rather than a name: `Sys::!Log.write` is read here, where a bare
@@ -1736,6 +1774,10 @@ impl Parser {
                 tok.tracked,
                 Kind::Identifier(_)
                     | Kind::Natural(_)
+                    | Kind::Integer(_)
+                    | Kind::Real(_)
+                    | Kind::String(_)
+                    | Kind::Boolean(_)
                     | Kind::Tag(_)
                     | Kind::LeftBrace
                     | Kind::LeftParen
@@ -1783,6 +1825,23 @@ impl Parser {
             &Kind::Natural(value) => {
                 self.advance();
                 Some(span.track(PatternKind::Natural(value)))
+            }
+            &Kind::Integer(value) => {
+                self.advance();
+                Some(span.track(PatternKind::Integer(value)))
+            }
+            &Kind::Real(value) => {
+                self.advance();
+                Some(span.track(PatternKind::Real(value)))
+            }
+            Kind::String(value) => {
+                let value = value.clone();
+                self.advance();
+                Some(span.track(PatternKind::String(value)))
+            }
+            &Kind::Boolean(value) => {
+                self.advance();
+                Some(span.track(PatternKind::Boolean(value)))
             }
             Kind::LeftBrace => self.struct_pattern(),
             Kind::LeftParen => self.paren_pattern(),
@@ -2035,7 +2094,7 @@ impl Parser {
     /// `<and> (or <and>)*`, left-associative.
     fn clause_or(&mut self) -> Option<Clause> {
         let mut left = self.clause_and()?;
-        while self.eat_keyword("or").is_some() {
+        while self.eat_if(&Kind::Or).is_some() {
             let right = self.clause_and()?;
             let span = left.span.merge(right.span);
             left = span.track(ClauseKind::Or(Box::new(left), Box::new(right)));
@@ -2046,7 +2105,7 @@ impl Parser {
     /// `<not> (and <not>)*`, left-associative.
     fn clause_and(&mut self) -> Option<Clause> {
         let mut left = self.clause_not()?;
-        while self.eat_keyword("and").is_some() {
+        while self.eat_if(&Kind::And).is_some() {
             let right = self.clause_not()?;
             let span = left.span.merge(right.span);
             left = span.track(ClauseKind::And(Box::new(left), Box::new(right)));
@@ -2056,7 +2115,7 @@ impl Parser {
 
     /// `not <not>`, or an atom. Unary and stacking, so `not not a` reads.
     fn clause_not(&mut self) -> Option<Clause> {
-        let Some(kw) = self.eat_keyword("not") else {
+        let Some(kw) = self.eat_if(&Kind::Not) else {
             return self.clause_atom();
         };
         let inner = self.clause_not()?;

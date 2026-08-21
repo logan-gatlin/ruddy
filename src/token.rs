@@ -27,6 +27,12 @@ pub enum Kind {
     /// head: a `raise` may sit anywhere an expression may, so there is no one
     /// position that could read it and leave the word a name everywhere else.
     Raise,
+    /// Boolean operators. Unlike the `where` clause's contextual words, these
+    /// are reserved because they may appear wherever an expression does.
+    And,
+    Or,
+    Xor,
+    Not,
     /// `bundle`, opening the header the root file of a bundle begins with.
     Bundle,
     /// `module`, opening a module declaration — inline with an `=` and a body,
@@ -129,6 +135,11 @@ pub enum Kind {
     Integer(i64),
     /// A 64-bit floating-point literal. The suffixless spelling is real.
     Real(f64),
+    /// UTF-8 text between double quotes. Escape sequences are decoded here so
+    /// every later phase compares values rather than source spellings.
+    String(String),
+    /// One of the two boolean values.
+    Boolean(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +158,8 @@ pub enum ErrorKind {
     MalformedNatural,
     /// A natural literal too large for [`Kind::Natural`] to hold.
     NaturalTooLarge,
+    /// A quoted string did not close or used an unsupported escape.
+    MalformedString,
 }
 
 pub struct Output {
@@ -287,6 +300,14 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     Err(kind) => errors.push(Error { span, kind }),
                 }
             }
+            '"' => {
+                let (value, width) = string(&mut chars);
+                let span = file_id.span(start, width);
+                match value {
+                    Ok(value) => tokens.push(span.track(Kind::String(value))),
+                    Err(kind) => errors.push(Error { span, kind }),
+                }
+            }
             '{' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftBrace));
                 chars.next();
@@ -321,8 +342,14 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "effect" => Kind::Effect,
                     "handle" => Kind::Handle,
                     "raise" => Kind::Raise,
+                    "and" => Kind::And,
+                    "or" => Kind::Or,
+                    "xor" => Kind::Xor,
+                    "not" => Kind::Not,
                     "bundle" => Kind::Bundle,
                     "module" => Kind::Module,
+                    "true" => Kind::Boolean(true),
+                    "false" => Kind::Boolean(false),
                     // `return` is deliberately absent: it heads a handler arm
                     // and is an ordinary name everywhere else, so the parser
                     // recognizes it by spelling at the one position that reads
@@ -412,6 +439,36 @@ fn in_version(tokens: &[Tracked<Kind>]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Read a double-quoted string, accepting the standard compact escapes.
+fn string(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, usize) {
+    let (_, quote) = chars.next().expect("the caller peeked the opening quote");
+    debug_assert_eq!(quote, '"');
+    let mut value = String::new();
+    let mut width = 1;
+    while let Some((_, c)) = chars.next() {
+        width += c.len_utf8();
+        match c {
+            '"' => return (Ok(value), width),
+            '\\' => {
+                let Some((_, escaped)) = chars.next() else {
+                    return (Err(ErrorKind::MalformedString), width);
+                };
+                width += escaped.len_utf8();
+                match escaped {
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    _ => return (Err(ErrorKind::MalformedString), width),
+                }
+            }
+            _ => value.push(c),
+        }
+    }
+    (Err(ErrorKind::MalformedString), width)
 }
 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {

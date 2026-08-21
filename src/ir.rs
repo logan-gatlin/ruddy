@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    hash::Hash,
+    hash::{Hash, Hasher},
     rc::Rc,
 };
 
@@ -269,6 +269,8 @@ pub enum TermKind {
     Natural(u64),
     Integer(i64),
     Real(f64),
+    String(String),
+    Boolean(bool),
     /// A name that did not resolve. Lowering stays total so that one typo
     /// produces one error rather than a cascade from a dropped definition.
     Error,
@@ -277,6 +279,7 @@ pub enum TermKind {
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +288,9 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    And,
+    Or,
+    Xor,
 }
 
 /// The arms of one `handle`, and the effects they discharge between them.
@@ -338,6 +344,47 @@ pub struct ReturnArm {
 pub type Pattern = Tracked<PatternKind>;
 
 // spans carried per node as the IR's other types do
+/// One scalar value that can be written both as an expression and a pattern.
+/// Real equality is by representation so the compiler and eventual backends
+/// agree even for signed zero.
+#[derive(Debug, Clone)]
+pub enum Literal {
+    Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
+}
+
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Natural(a), Self::Natural(b)) => a == b,
+            (Self::Integer(a), Self::Integer(b)) => a == b,
+            (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for Literal {}
+
+impl Hash for Literal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Natural(value) => value.hash(state),
+            Self::Integer(value) => value.hash(state),
+            // Equality compares a real's representation, including the sign
+            // of zero, so hashing must do the same.
+            Self::Real(value) => value.to_bits().hash(state),
+            Self::String(value) => value.hash(state),
+            Self::Boolean(value) => value.hash(state),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PatternKind {
     /// An identifier: binds the whole value at this position.
@@ -366,6 +413,10 @@ pub enum PatternKind {
         payload: Option<Box<Pattern>>,
     },
     Natural(u64),
+    Integer(i64),
+    Real(f64),
+    String(String),
+    Boolean(bool),
     Unit,
 }
 
@@ -966,8 +1017,8 @@ pub enum ErrorKind {
     EndlessFields,
     /// A pattern that can fail, written on a `let` — `let #Some x = opt`. A
     /// binding has no arms to fall through to, so it has to accept every
-    /// value, and a tag or a number anywhere in the pattern is a value it
-    /// would not.
+    /// value, and a tag or primitive literal anywhere in the pattern is a
+    /// value it would not.
     ///
     /// Lowering stays total: every name the pattern would have bound is still
     /// bound, to [`TermKind::Error`] values, so downstream uses resolve and
@@ -1083,15 +1134,16 @@ pub enum ErrorKind {
     RaiseInFunction,
 }
 
-/// What made a binding's pattern able to fail: the first tag or number found
+/// What made a binding's pattern able to fail: the first tag or literal found
 /// in it, carried so the complaint can quote what the reader wrote. See
 /// [`ErrorKind::RefutableBinding`].
 #[derive(Debug, Clone)]
 pub enum Refuter {
     /// A tag pattern: a value here might not be this case.
     Case(String),
-    /// A natural literal: a value here might be some other number.
-    Number(u64),
+    /// A primitive literal: a value here might be a different value of this
+    /// primitive type.
+    Literal(Literal),
 }
 
 /// A concrete example of a value a match leaves unhandled, in the shape of the
@@ -1104,6 +1156,8 @@ pub enum Witness {
     Any,
     /// This number.
     Natural(u64),
+    /// This non-natural primitive value.
+    Literal(Literal),
     /// This case. `None` says any payload serves — rendered bare, the way a
     /// case carrying unit is written.
     Tag {
@@ -1519,11 +1573,12 @@ pub(crate) enum Step {
 }
 
 /// What one match's written arms say, position by position: the tags and
-/// numbers tested at each, and where the arms stop testing. The universes the
-/// matrix checks draw values from — usefulness in the sense of Maranget (JFP
-/// 2007), with each tag position's universe being its listed cases when no arm
-/// is irrefutable there, its listed cases plus "anything else" when one is,
-/// and the numbers always infinite.
+/// primitive literals tested at each, and where the arms stop testing. The
+/// universes the matrix checks draw values from — usefulness in the sense of
+/// Maranget (JFP 2007), with each tag position's universe being its listed
+/// cases when no arm is irrefutable there, its listed cases plus "anything
+/// else" when one is, Boolean's universe being `false` and `true`, and every
+/// other primitive's universe being infinite.
 ///
 /// Syntactic throughout: built from the normalized patterns and consulting no
 /// types. What inference reads: whether a position's row stays open
@@ -1533,7 +1588,8 @@ pub(crate) enum Step {
 /// [`patterns`](crate::patterns), which reads the solved types this analysis
 /// shaped — one implementation of the closure rule, read from two ends.
 pub(crate) struct Matrix {
-    /// The tags and numbers tested at each position, over every arm.
+    /// The tags and primitive literals tested at each position, over every
+    /// arm.
     tests: HashMap<Vec<Step>, Tests>,
     /// Every position an identifier pattern sits at. A position is open —
     /// its universe holds "anything else" — exactly when one of these is a
@@ -1548,7 +1604,7 @@ pub(crate) struct Matrix {
 #[derive(Debug, Default)]
 struct Tests {
     tags: IndexSet<String>,
-    naturals: IndexSet<u64>,
+    literals: IndexSet<Literal>,
 }
 
 /// One cell of the matrix the usefulness walk works on: a [`Pattern`] with
@@ -1568,7 +1624,7 @@ enum Mat {
         name: String,
         payload: Box<Mat>,
     },
-    Natural(u64),
+    Literal(Literal),
     /// A struct pattern with at least one field. `{}` tests nothing and
     /// arrives as [`Mat::Wild`] instead, so a struct cell always has a field
     /// for the widening step to find.
@@ -2555,6 +2611,8 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -2888,6 +2946,8 @@ fn erase_circular(term: &mut Term, looping: &IndexSet<Symbol>, out: &mut Vec<Spa
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -2950,6 +3010,8 @@ fn nested<'a>(term: &'a Term, out: &mut HashMap<Symbol, &'a Term>) {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -3013,24 +3075,42 @@ impl Chain<'_> {
             | TermKind::Handle { .. }
             | TermKind::Raise(_)
             | TermKind::Operation { .. }
-            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_)
+            | TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::String(_) | TermKind::Boolean(_)
             | TermKind::Error => Stands::Shape,
         }
     }
 }
 
-/// The first tag or number in a normalized pattern — what a complaint about a
-/// binding that can fail quotes, and where it points. `None` exactly for an
-/// irrefutable pattern, which is the syntactic rule of R3: a pattern is
-/// refutable iff it contains a tag or a natural anywhere inside it.
+/// The first tag or primitive literal in a normalized pattern — what a
+/// complaint about a binding that can fail quotes, and where it points. `None`
+/// exactly for an irrefutable pattern, which is the syntactic rule of R3: a
+/// pattern is refutable iff it contains a tag or literal anywhere inside it.
 fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
     match &pattern.tracked {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
         PatternKind::Tag { name, .. } => Some((name.span, Refuter::Case(name.tracked.clone()))),
-        PatternKind::Natural(value) => Some((pattern.span, Refuter::Number(*value))),
         PatternKind::Struct { fields, .. } => {
             fields.values().find_map(|field| refuter(&field.value))
         }
+        kind => literal(kind).map(|value| (pattern.span, Refuter::Literal(value))),
+    }
+}
+
+/// The scalar value a primitive pattern tests, if this is one. Keeping this
+/// translation in one place makes every consumer use the same representation
+/// equality for real literals.
+fn literal(pattern: &PatternKind) -> Option<Literal> {
+    match pattern {
+        PatternKind::Natural(value) => Some(Literal::Natural(*value)),
+        PatternKind::Integer(value) => Some(Literal::Integer(*value)),
+        PatternKind::Real(value) => Some(Literal::Real(*value)),
+        PatternKind::String(value) => Some(Literal::String(value.clone())),
+        PatternKind::Boolean(value) => Some(Literal::Boolean(*value)),
+        PatternKind::Bind(_)
+        | PatternKind::Wildcard
+        | PatternKind::Struct { .. }
+        | PatternKind::Tag { .. }
+        | PatternKind::Unit => None,
     }
 }
 
@@ -3059,7 +3139,12 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
                 rest: *rest,
             })
         }
-        PatternKind::Tag { .. } | PatternKind::Natural(_) => None,
+        PatternKind::Tag { .. }
+        | PatternKind::Natural(_)
+        | PatternKind::Integer(_)
+        | PatternKind::Real(_)
+        | PatternKind::String(_)
+        | PatternKind::Boolean(_) => None,
     }
 }
 
@@ -3069,7 +3154,13 @@ fn calm(pattern: &Pattern) -> Option<Calm> {
 fn pattern_binders(pattern: &Pattern, out: &mut Vec<Tracked<Symbol>>) {
     match &pattern.tracked {
         PatternKind::Bind(name) => out.push(*name),
-        PatternKind::Wildcard | PatternKind::Unit | PatternKind::Natural(_) => {}
+        PatternKind::Wildcard
+        | PatternKind::Unit
+        | PatternKind::Natural(_)
+        | PatternKind::Integer(_)
+        | PatternKind::Real(_)
+        | PatternKind::String(_)
+        | PatternKind::Boolean(_) => {}
         PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
                 pattern_binders(payload, out);
@@ -3151,7 +3242,6 @@ fn demand(ty: Type) -> Annotation {
 fn mat(pattern: &Pattern) -> Mat {
     match &pattern.tracked {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => Mat::Wild,
-        PatternKind::Natural(value) => Mat::Natural(*value),
         PatternKind::Tag { name, payload } => Mat::Tag {
             name: name.tracked.clone(),
             payload: Box::new(payload.as_deref().map(mat).unwrap_or(Mat::Wild)),
@@ -3163,6 +3253,7 @@ fn mat(pattern: &Pattern) -> Mat {
                 .map(|(name, field)| (name.clone(), mat(&field.value)))
                 .collect(),
         ),
+        pattern => Mat::Literal(literal(pattern).expect("only primitive patterns remain")),
     }
 }
 
@@ -3197,13 +3288,6 @@ impl Matrix {
         match &pattern.tracked {
             PatternKind::Bind(_) | PatternKind::Wildcard => self.binds.push(path.clone()),
             PatternKind::Unit => {}
-            PatternKind::Natural(value) => {
-                self.tests
-                    .entry(path.clone())
-                    .or_default()
-                    .naturals
-                    .insert(*value);
-            }
             PatternKind::Tag { name, payload } => {
                 self.tests
                     .entry(path.clone())
@@ -3222,6 +3306,13 @@ impl Matrix {
                     self.collect(&field.value, path);
                     path.pop();
                 }
+            }
+            pattern => {
+                self.tests
+                    .entry(path.clone())
+                    .or_default()
+                    .literals
+                    .insert(literal(pattern).expect("only primitive patterns remain"));
             }
         }
     }
@@ -3263,7 +3354,7 @@ impl Matrix {
         };
         // A column with a struct pattern in it is widened first: one column
         // per field any of its structs names, plus the position itself for the
-        // tags and numbers, so the rest of the walk only ever sees flat cells.
+        // tags and literals, so the rest of the walk only ever sees flat cells.
         // A struct reaches into its fields and says nothing about the core, so
         // it widens to a wildcard beside its fields; everything else says
         // nothing about the fields and widens to wildcards beside itself.
@@ -3323,14 +3414,15 @@ impl Matrix {
                 self.useful(&rows, &cols, &q)
             }
             // q accepts everything here — [`handled`](Self::handled)'s forced
-            // rows are tags and structs down to a wildcard, so no natural
+            // rows are tags and structs down to a wildcard, so no literal
             // ever arrives at the head of one, and the widening above took
             // every column holding a struct — so it is useful if any value of
-            // the position's universe escapes the rows: each listed case in
-            // turn, each listed number and then some other number — the
-            // numbers never run out — and "anything else" when the position
-            // is open.
-            _ => {
+            // the position's universe escapes the rows. Tags draw from their
+            // listed cases; scalar literals draw from their listed values and,
+            // except for booleans, an unlisted value; and an open tag position
+            // also has an "anything else" value.
+            Mat::Literal(value) => self.useful(&specialize_literal(rows, value), later, &q[1..]),
+            Mat::Wild => {
                 let empty = Tests::default();
                 let tests = self.tests.get(pos).unwrap_or(&empty);
                 if !tests.tags.is_empty() {
@@ -3342,20 +3434,38 @@ impl Matrix {
                             .collect();
                         self.useful(&rows, &cols, &q)
                     }) || (self.open(pos) && self.useful(&defaults(rows), later, &q[1..]))
-                } else if !tests.naturals.is_empty() {
-                    // The numbers never run out, so the escape past the listed
-                    // ones needs no openness question.
-                    tests
-                        .naturals
+                } else if !tests.literals.is_empty() {
+                    if tests
+                        .literals
                         .iter()
-                        .any(|value| self.useful(&specialize_natural(rows, *value), later, &q[1..]))
-                        || self.useful(&defaults(rows), later, &q[1..])
+                        .all(|literal| matches!(literal, Literal::Boolean(_)))
+                    {
+                        // Boolean is the one finite scalar universe. Asking
+                        // both values — not merely the values written in an
+                        // arm — is what makes `false | true` total and a
+                        // single boolean literal partial.
+                        [false, true].into_iter().any(|value| {
+                            self.useful(
+                                &specialize_literal(rows, &Literal::Boolean(value)),
+                                later,
+                                &q[1..],
+                            )
+                        })
+                    } else {
+                        // Every other primitive has values beyond a finite
+                        // list of literal patterns.
+                        tests.literals.iter().any(|value| {
+                            self.useful(&specialize_literal(rows, value), later, &q[1..])
+                        }) || self.useful(&defaults(rows), later, &q[1..])
+                    }
                 } else {
                     // Nothing tests the position at all, so every cell in the
                     // column is a wildcard and any value serves.
                     self.useful(&defaults(rows), later, &q[1..])
                 }
             }
+            // Every struct was widened into its core and field columns above.
+            Mat::Struct(_) => unreachable!("struct patterns are widened before usefulness"),
         }
     }
 
@@ -3391,12 +3501,12 @@ fn specialize_tag(rows: &[Vec<Mat>], name: &str) -> Vec<Vec<Mat>> {
         .collect()
 }
 
-/// [`specialize_tag`] about a number, which carries nothing: the column is
-/// consumed rather than replaced.
-fn specialize_natural(rows: &[Vec<Mat>], value: u64) -> Vec<Vec<Mat>> {
+/// [`specialize_tag`] about a primitive literal, which carries nothing: the
+/// column is consumed rather than replaced.
+fn specialize_literal(rows: &[Vec<Mat>], value: &Literal) -> Vec<Vec<Mat>> {
     rows.iter()
         .filter_map(|row| match &row[0] {
-            Mat::Natural(natural) if *natural == value => Some(row[1..].to_vec()),
+            Mat::Literal(literal) if literal == value => Some(row[1..].to_vec()),
             Mat::Wild => Some(row[1..].to_vec()),
             _ => None,
         })
@@ -3434,6 +3544,10 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
         // nothing for a duplicate check, anywhere, to ever meet.
         parse::PatternKind::Wildcard
         | parse::PatternKind::Natural(_)
+        | parse::PatternKind::Integer(_)
+        | parse::PatternKind::Real(_)
+        | parse::PatternKind::String(_)
+        | parse::PatternKind::Boolean(_)
         | parse::PatternKind::Unit => {}
         parse::PatternKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
@@ -3605,6 +3719,8 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -4157,6 +4273,8 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }
@@ -5543,9 +5661,12 @@ impl Builder<'_> {
             ExprKind::Natural(value) => TermKind::Natural(value).with_span(span),
             ExprKind::Integer(value) => TermKind::Integer(value).with_span(span),
             ExprKind::Real(value) => TermKind::Real(value).with_span(span),
+            ExprKind::String(value) => TermKind::String(value).with_span(span),
+            ExprKind::Boolean(value) => TermKind::Boolean(value).with_span(span),
             ExprKind::Unary { op, value } => TermKind::Unary {
                 op: match op {
                     parse::UnaryOp::Neg => UnaryOp::Neg,
+                    parse::UnaryOp::Not => UnaryOp::Not,
                 },
                 value: Box::new(self.term(*value)),
             }
@@ -5556,6 +5677,9 @@ impl Builder<'_> {
                     parse::BinaryOp::Sub => BinaryOp::Sub,
                     parse::BinaryOp::Mul => BinaryOp::Mul,
                     parse::BinaryOp::Div => BinaryOp::Div,
+                    parse::BinaryOp::And => BinaryOp::And,
+                    parse::BinaryOp::Or => BinaryOp::Or,
+                    parse::BinaryOp::Xor => BinaryOp::Xor,
                 },
                 left: Box::new(self.term(*left)),
                 right: Box::new(self.term(*right)),
@@ -6414,6 +6538,10 @@ impl Builder<'_> {
             // stays out of the duplicate-binder check.
             parse::PatternKind::Wildcard => span.track(PatternKind::Wildcard),
             parse::PatternKind::Natural(value) => span.track(PatternKind::Natural(value)),
+            parse::PatternKind::Integer(value) => span.track(PatternKind::Integer(value)),
+            parse::PatternKind::Real(value) => span.track(PatternKind::Real(value)),
+            parse::PatternKind::String(value) => span.track(PatternKind::String(value)),
+            parse::PatternKind::Boolean(value) => span.track(PatternKind::Boolean(value)),
             parse::PatternKind::Unit => span.track(PatternKind::Unit),
             // A bare tag keeps its `None`: what it constrains the payload to —
             // unit — is said where the type is built rather than written into

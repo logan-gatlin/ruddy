@@ -6,6 +6,7 @@
 use ruddy::token::Kind;
 
 use crate::{
+    print,
     stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
@@ -31,7 +32,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 format!("{} · {}", file.path, plural(file.tokens.len(), "token")),
             )
             .children(file.tokens.iter().map(|token| {
-                Node::new(ids.next(), label(&token.tracked), token.tracked.to_string())
+                Node::new(ids.next(), label(&token.tracked), text(&token.tracked))
                     .at(token.span)
                     .field(
                         "bytes",
@@ -57,6 +58,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     }
 }
 
+/// The source spelling of a token. Strings use the debugger's source writer,
+/// not Rust's debug syntax, so their escapes re-parse.
+fn text(kind: &Kind) -> String {
+    match kind {
+        Kind::String(value) => print::string(value),
+        _ => kind.to_string(),
+    }
+}
+
 /// The variant name, which is what the panel groups and filters on. Kept
 /// separate from `Display`, which renders the token's spelling instead.
 pub fn label(kind: &Kind) -> &'static str {
@@ -71,6 +81,10 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Effect => "Effect",
         Kind::Handle => "Handle",
         Kind::Raise => "Raise",
+        Kind::And => "And",
+        Kind::Or => "Or",
+        Kind::Xor => "Xor",
+        Kind::Not => "Not",
         Kind::Bundle => "Bundle",
         Kind::Module => "Module",
         Kind::Equal => "Equal",
@@ -102,6 +116,8 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Natural(_) => "Natural",
         Kind::Integer(_) => "Integer",
         Kind::Real(_) => "Real",
+        Kind::String(_) => "String",
+        Kind::Boolean(_) => "Boolean",
     }
 }
 
@@ -118,6 +134,8 @@ pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
         Kind::Natural(_) | Kind::Integer(_) | Kind::Real(_) => "number",
+        Kind::String(_) => "string",
+        Kind::Boolean(_) => "boolean",
         Kind::Tag(_) => "tag",
         Kind::EffectLabel(_) => "effect",
         Kind::Variable(_) => "variable",

@@ -70,6 +70,21 @@ fn real_number_operators_accept_only_reals() {
 }
 
 #[test]
+fn boolean_operators_accept_only_booleans() {
+    let (mint, _, output) = inferred("let value = not true and false xor true or false");
+    assert_eq!(scheme(&mint, &output, "value"), "Boolean");
+
+    for source in ["let bad = not 1", "let bad = true and 1"] {
+        let (_, _, output) = infer_src(source);
+        assert_eq!(output.errors.len(), 1, "{source}: {:#?}", output.errors);
+        assert_eq!(
+            output.errors[0].kind.to_string(),
+            "type mismatch: expected `Boolean`, found `Real`"
+        );
+    }
+}
+
+#[test]
 fn every_primitive_is_a_distinct_type() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\
@@ -207,6 +222,8 @@ fn body_tys(term: &Term) -> Vec<Rc<Ty>> {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
     out

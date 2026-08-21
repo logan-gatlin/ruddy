@@ -221,16 +221,34 @@ impl Constrain<'_> {
             TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
             TermKind::Integer(_) => Rc::new(Ty::plain(Core::Int)),
             TermKind::Real(_) => Rc::new(Ty::plain(Core::Real)),
-            TermKind::Unary { value, .. } => {
-                let real = Rc::new(Ty::plain(Core::Real));
-                self.check_term(value, &real);
-                real
-            }
-            TermKind::Binary { left, right, .. } => {
-                let real = Rc::new(Ty::plain(Core::Real));
-                self.check_term(left, &real);
-                self.check_term(right, &real);
-                real
+            TermKind::String(_) => Rc::new(Ty::plain(Core::String)),
+            TermKind::Boolean(_) => Rc::new(Ty::plain(Core::Boolean)),
+            TermKind::Unary { op, value } => match op {
+                crate::ir::UnaryOp::Neg => {
+                    let real = Rc::new(Ty::plain(Core::Real));
+                    self.check_term(value, &real);
+                    real
+                }
+                crate::ir::UnaryOp::Not => {
+                    let boolean = Rc::new(Ty::plain(Core::Boolean));
+                    self.check_term(value, &boolean);
+                    boolean
+                }
+            },
+            TermKind::Binary { op, left, right } => {
+                let core = match op {
+                    crate::ir::BinaryOp::Add
+                    | crate::ir::BinaryOp::Sub
+                    | crate::ir::BinaryOp::Mul
+                    | crate::ir::BinaryOp::Div => Core::Real,
+                    crate::ir::BinaryOp::And
+                    | crate::ir::BinaryOp::Or
+                    | crate::ir::BinaryOp::Xor => Core::Boolean,
+                };
+                let ty = Rc::new(Ty::plain(core));
+                self.check_term(left, &ty);
+                self.check_term(right, &ty);
+                ty
             }
             TermKind::Ident(symbol) => {
                 let symbol = *symbol;
@@ -740,7 +758,7 @@ impl Constrain<'_> {
         entries: &[(usize, Col)],
     ) -> (Rc<Ty>, Cover) {
         let mut binds: Vec<(usize, Tracked<Symbol>)> = Vec::new();
-        let mut naturals = false;
+        let mut primitives: Vec<Core> = Vec::new();
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         // Whether the column qualifies for coverage-to-constraint conversion:
@@ -777,11 +795,11 @@ impl Constrain<'_> {
                         structs = true;
                         exacts = true;
                     }
-                    ir::PatternKind::Natural(_) => {
-                        naturals = true;
-                        exact = false;
-                        qualifies = false;
-                    }
+                    ir::PatternKind::Natural(_) => primitives.push(Core::Nat),
+                    ir::PatternKind::Integer(_) => primitives.push(Core::Int),
+                    ir::PatternKind::Real(_) => primitives.push(Core::Real),
+                    ir::PatternKind::String(_) => primitives.push(Core::String),
+                    ir::PatternKind::Boolean(_) => primitives.push(Core::Boolean),
                     ir::PatternKind::Tag { name, payload } => {
                         let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
                         tags.entry(name.tracked.as_str())
@@ -860,8 +878,10 @@ impl Constrain<'_> {
             listed = Some((labels, rest));
             demands.push(ty);
         }
-        if naturals {
-            demands.push(Rc::new(Ty::plain(Core::Nat)));
+        if !primitives.is_empty() {
+            exact = false;
+            qualifies = false;
+            demands.extend(primitives.into_iter().map(|core| Rc::new(Ty::plain(core))));
         }
         if structs {
             // The column-union rule for fields. A field is certainly there

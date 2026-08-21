@@ -2880,7 +2880,12 @@ fn references_of(term: &Term, out: &mut Vec<Symbol>) {
                 references_of(body, out);
             }
         }
-        TermKind::Natural(_) | TermKind::Integer(_) | TermKind::Real(_) | TermKind::Error => {}
+        TermKind::Natural(_)
+        | TermKind::Integer(_)
+        | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
+        | TermKind::Error => {}
     }
 }
 

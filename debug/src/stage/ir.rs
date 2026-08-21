@@ -218,8 +218,20 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             label: "Real".into(),
             ..node
         },
-        TermKind::Unary { value, .. } => Node {
-            label: "Neg".into(),
+        TermKind::String(_) => Node {
+            label: "String".into(),
+            ..node
+        },
+        TermKind::Boolean(_) => Node {
+            label: "Boolean".into(),
+            ..node
+        },
+        TermKind::Unary { op, value } => Node {
+            label: match op {
+                ruddy::ir::UnaryOp::Neg => "Neg",
+                ruddy::ir::UnaryOp::Not => "Not",
+            }
+            .into(),
             ..node
         }
         .child(term_node(ids, cx, mint, value, trace)),
@@ -229,6 +241,9 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 ruddy::ir::BinaryOp::Sub => "Sub",
                 ruddy::ir::BinaryOp::Mul => "Mul",
                 ruddy::ir::BinaryOp::Div => "Div",
+                ruddy::ir::BinaryOp::And => "And",
+                ruddy::ir::BinaryOp::Or => "Or",
+                ruddy::ir::BinaryOp::Xor => "Xor",
             }
             .into(),
             ..node
@@ -524,6 +539,22 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
         },
         PatternKind::Natural(_) => Node {
             label: "Natural".into(),
+            ..node
+        },
+        PatternKind::Integer(_) => Node {
+            label: "Integer".into(),
+            ..node
+        },
+        PatternKind::Real(_) => Node {
+            label: "Real".into(),
+            ..node
+        },
+        PatternKind::String(_) => Node {
+            label: "String".into(),
+            ..node
+        },
+        PatternKind::Boolean(_) => Node {
+            label: "Boolean".into(),
             ..node
         },
         PatternKind::Unit => Node {

@@ -11,13 +11,14 @@ use indexmap::IndexMap;
 use ruddy::{
     parse::{
         Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
-        ExprKind, HandlerArm, Path, Rest, StmtKind, SumCase, TypeField, TypeKind, When, Where,
+        ExprKind, HandlerArm, Path, PatternKind, Rest, StmtKind, SumCase, TypeField, TypeKind,
+        When, Where,
     },
     tracking::Tracked,
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, Shape, label, write_applied, write_apply, write_arrow,
+    Entry, Grouped, Mark, Prec, Shape, label, string, write_applied, write_apply, write_arrow,
     write_binary, write_let, write_match, write_pipeline, write_project, write_row, write_struct,
     write_sum, write_tag, write_unary,
 };
@@ -62,6 +63,18 @@ impl Grouped for Ast<'_, ExprKind> {
             ExprKind::Raise(_) => Prec::Lambda,
             ExprKind::Pipe { .. } => Prec::Pipeline,
             ExprKind::Binary {
+                op: ruddy::parse::BinaryOp::Or,
+                ..
+            } => Prec::Or,
+            ExprKind::Binary {
+                op: ruddy::parse::BinaryOp::Xor,
+                ..
+            } => Prec::Xor,
+            ExprKind::Binary {
+                op: ruddy::parse::BinaryOp::And,
+                ..
+            } => Prec::And,
+            ExprKind::Binary {
                 op: ruddy::parse::BinaryOp::Add | ruddy::parse::BinaryOp::Sub,
                 ..
             } => Prec::Addition,
@@ -88,6 +101,8 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Natural(_)
             | ExprKind::Integer(_)
             | ExprKind::Real(_)
+            | ExprKind::String(_)
+            | ExprKind::Boolean(_)
             | ExprKind::Unit => Prec::Atom,
         }
     }
@@ -298,13 +313,23 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Pipe { value, function } => {
                 write_pipeline(f, &Ast(&value.tracked), &Ast(&function.tracked))
             }
-            ExprKind::Unary { value, .. } => write_unary(f, "-", &Ast(&value.tracked)),
+            ExprKind::Unary { op, value } => write_unary(
+                f,
+                match op {
+                    ruddy::parse::UnaryOp::Neg => "-",
+                    ruddy::parse::UnaryOp::Not => "not ",
+                },
+                &Ast(&value.tracked),
+            ),
             ExprKind::Binary { op, left, right } => {
                 let (symbol, prec) = match op {
                     ruddy::parse::BinaryOp::Add => ("+", Prec::Addition),
                     ruddy::parse::BinaryOp::Sub => ("-", Prec::Addition),
                     ruddy::parse::BinaryOp::Mul => ("*", Prec::Multiplication),
                     ruddy::parse::BinaryOp::Div => ("/", Prec::Multiplication),
+                    ruddy::parse::BinaryOp::And => ("and", Prec::And),
+                    ruddy::parse::BinaryOp::Or => ("or", Prec::Or),
+                    ruddy::parse::BinaryOp::Xor => ("xor", Prec::Xor),
                 };
                 write_binary(f, &Ast(&left.tracked), symbol, &Ast(&right.tracked), prec)
             }
@@ -365,7 +390,71 @@ impl fmt::Display for Ast<'_, ExprKind> {
             ExprKind::Natural(value) => write!(f, "{value}n"),
             ExprKind::Integer(value) => write!(f, "{value}i"),
             ExprKind::Real(value) => write!(f, "{value}"),
+            ExprKind::String(value) => f.write_str(&string(value)),
+            ExprKind::Boolean(value) => write!(f, "{value}"),
             ExprKind::Unit => f.write_str("()"),
+        }
+    }
+}
+
+impl Grouped for Ast<'_, PatternKind> {
+    fn prec(&self) -> Prec {
+        match self.0 {
+            PatternKind::Tag {
+                payload: Some(_), ..
+            } => Prec::Apply,
+            PatternKind::Tag { payload: None, .. } => Prec::Tag,
+            PatternKind::Ident { .. }
+            | PatternKind::Wildcard
+            | PatternKind::Natural(_)
+            | PatternKind::Integer(_)
+            | PatternKind::Real(_)
+            | PatternKind::String(_)
+            | PatternKind::Boolean(_)
+            | PatternKind::Unit
+            | PatternKind::Struct { .. } => Prec::Atom,
+        }
+    }
+}
+
+impl fmt::Display for Ast<'_, PatternKind> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            PatternKind::Ident { name } => f.write_str(&name.tracked),
+            PatternKind::Wildcard => f.write_str("_"),
+            PatternKind::Natural(value) => write!(f, "{value}n"),
+            PatternKind::Integer(value) => write!(f, "{value}i"),
+            PatternKind::Real(value) => write!(f, "{value}"),
+            PatternKind::String(value) => f.write_str(&string(value)),
+            PatternKind::Boolean(value) => write!(f, "{value}"),
+            PatternKind::Unit => f.write_str("()"),
+            PatternKind::Tag { name, payload } => write_tag(
+                f,
+                &name.tracked,
+                None,
+                payload.as_deref().map(|payload| Ast(&payload.tracked)),
+            ),
+            PatternKind::Struct { fields, rest } => {
+                f.write_str("{")?;
+                let mut first = true;
+                for (name, pattern) in fields {
+                    if !first {
+                        f.write_str(", ")?;
+                    }
+                    first = false;
+                    match pattern {
+                        Some(pattern) => write!(f, " {}: {}", name.tracked, Ast(&pattern.tracked))?,
+                        None => write!(f, " {}", name.tracked)?,
+                    }
+                }
+                if rest.is_some() {
+                    if !first {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(" ..")?;
+                }
+                f.write_str(" }")
+            }
         }
     }
 }
@@ -583,6 +672,11 @@ pub fn clause(kind: &ClauseKind) -> impl fmt::Display + '_ {
 /// this is what keeps them spelled the way the printed tree spells them.
 pub fn effect(path: &Path) -> String {
     labelled(path)
+}
+
+/// Render one written pattern, including every primitive literal spelling.
+pub fn pattern(kind: &PatternKind) -> impl fmt::Display + '_ {
+    Ast(kind)
 }
 
 /// Render one written type, the [`expr`] counterpart.

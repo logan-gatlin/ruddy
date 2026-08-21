@@ -211,6 +211,8 @@ fn walk_locals(term: &Term, out: &mut Vec<Tracked<Symbol>>) {
         | TermKind::Natural(_)
         | TermKind::Integer(_)
         | TermKind::Real(_)
+        | TermKind::String(_)
+        | TermKind::Boolean(_)
         | TermKind::Error => {}
     }
 }

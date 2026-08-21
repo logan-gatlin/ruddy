@@ -15,7 +15,10 @@
 
 use std::fmt::Write;
 
-use ruddy::lir::{Block, Callee, End, Function, Global, Instr, Op, Output, Rep, Terminator};
+use ruddy::{
+    ir::Literal,
+    lir::{Block, Callee, End, Function, Global, Instr, Op, Output, Rep, Terminator},
+};
 
 /// How far one level of nesting indents. An arm label sits one level under its
 /// instruction and the arm's block one level under that, which is what makes a
@@ -80,8 +83,12 @@ pub fn instruction(output: &Output, instr: &Instr) -> String {
 /// The opcode alone, which is what a row of the tab is labelled with.
 pub fn opcode(op: &Op) -> &'static str {
     match op {
-        Op::Const(_) | Op::ConstInt(_) | Op::ConstReal(_) => "const",
+        Op::Const(_) => "const",
         Op::Neg(_) => "neg",
+        Op::Not(_) => "not",
+        Op::And { .. } => "and",
+        Op::Or { .. } => "or",
+        Op::Xor { .. } => "xor",
         Op::Add { .. } => "add",
         Op::Sub { .. } => "sub",
         Op::Mul { .. } => "mul",
@@ -97,7 +104,7 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::NewTag => "new_tag",
         Op::Catch { .. } => "catch",
         Op::SwitchTag { .. } => "switch_tag",
-        Op::SwitchNat { .. } => "switch_nat",
+        Op::SwitchPrim { .. } => "switch_prim",
         Op::SwitchPresence { .. } => "switch_presence",
         Op::SwitchRest { .. } => "switch_rest",
     }
@@ -157,12 +164,16 @@ pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
                     .map(|block| (Some("else".to_string()), &**block)),
             )
             .collect(),
-        Op::SwitchNat {
+        Op::SwitchPrim {
             cases, fallback, ..
         } => cases
             .iter()
-            .map(|case| (Some(case.value.to_string()), &case.block))
-            .chain(std::iter::once((Some("else".to_string()), &**fallback)))
+            .map(|case| (Some(literal(&case.value)), &case.block))
+            .chain(
+                fallback
+                    .iter()
+                    .map(|block| (Some("else".to_string()), &**block)),
+            )
             .collect(),
         Op::SwitchPresence {
             present, absent, ..
@@ -213,13 +224,27 @@ fn effect_name(name: &str) -> &str {
     name.split('\u{1f}').next().unwrap_or(name)
 }
 
+/// Render a primitive literal exactly as source syntax would spell it.
+/// Debug formatting keeps string delimiters and escapes intact.
+fn literal(value: &Literal) -> String {
+    match value {
+        Literal::Natural(value) => format!("{value}n"),
+        Literal::Integer(value) => format!("{value}i"),
+        Literal::Real(value) => value.to_string(),
+        Literal::String(value) => crate::print::string(value),
+        Literal::Boolean(value) => value.to_string(),
+    }
+}
+
 /// What one instruction does, with its operands.
 fn operation(output: &Output, op: &Op) -> String {
     match op {
-        Op::Const(value) => format!("const {value}n"),
-        Op::ConstInt(value) => format!("const {value}i"),
-        Op::ConstReal(value) => format!("const {value}"),
+        Op::Const(value) => format!("const {}", literal(value)),
         Op::Neg(value) => format!("neg %{value}"),
+        Op::Not(value) => format!("not %{value}"),
+        Op::And { left, right } => format!("and %{left}, %{right}"),
+        Op::Or { left, right } => format!("or %{left}, %{right}"),
+        Op::Xor { left, right } => format!("xor %{left}, %{right}"),
         Op::Add { left, right } => format!("add %{left}, %{right}"),
         Op::Sub { left, right } => format!("sub %{left}, %{right}"),
         Op::Mul { left, right } => format!("mul %{left}, %{right}"),
@@ -267,7 +292,7 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::NewTag => "new_tag".to_string(),
         Op::Catch { tag, .. } => format!("catch %{tag}:"),
         Op::SwitchTag { on, .. } => format!("switch_tag %{on}:"),
-        Op::SwitchNat { on, .. } => format!("switch_nat %{on}:"),
+        Op::SwitchPrim { on, .. } => format!("switch_prim %{on}:"),
         Op::SwitchPresence { on, field, .. } => {
             format!("switch_presence %{on}, {:?}:", effect_name(field))
         }

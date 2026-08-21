@@ -1981,7 +1981,7 @@ fn the_pattern_complaints_say_what_was_written() {
     // A number is the same complaint made about the other kind of test, and
     // the same code: what went wrong is the binding either way.
     let number = IrError::RefutableBinding {
-        found: ir::Refuter::Number(0),
+        found: ir::Refuter::Literal(ir::Literal::Natural(0)),
     };
     assert_eq!(number.code(), "binding-can-fail");
     assert_eq!(
