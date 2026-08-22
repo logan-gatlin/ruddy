@@ -284,6 +284,7 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Kind::Let => f.write_str("let"),
+            Kind::Extern => f.write_str("extern"),
             Kind::In => f.write_str("in"),
             Kind::Type => f.write_str("type"),
             Kind::End => f.write_str("end"),
@@ -637,6 +638,8 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateOperation => "duplicate-operation",
             ir::ErrorKind::NotAnOperation { .. } => "not-an-operation",
             ir::ErrorKind::ImpureOperation => "impure-operation",
+            ir::ErrorKind::NotAnExtern => "extern-not-function",
+            ir::ErrorKind::ImpureExtern => "impure-extern",
             ir::ErrorKind::MixedEffectForm => "mixed-effect-form",
             ir::ErrorKind::EffectsOutsideRow => "effects-outside-row",
             ir::ErrorKind::OperationOnAlias { .. } => "operation-on-alias",
@@ -812,6 +815,12 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::ImpureOperation => f.write_str(
                 "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
             ),
+            ir::ErrorKind::NotAnExtern => {
+                f.write_str("an extern must be a function: write `extern log : String -> () = console.log`")
+            }
+            ir::ErrorKind::ImpureExtern => {
+                f.write_str("an extern's signature must be pure")
+            }
             ir::ErrorKind::MixedEffectForm => f.write_str(
                 "an effect either declares operations or names other effects, not both",
             ),

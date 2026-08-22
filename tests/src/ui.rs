@@ -152,6 +152,8 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "here".to_string(),
         },
         IrError::ImpureOperation,
+        IrError::NotAnExtern,
+        IrError::ImpureExtern,
         IrError::MixedEffectForm,
         IrError::OperationOnAlias {
             effect: "Console".to_string(),

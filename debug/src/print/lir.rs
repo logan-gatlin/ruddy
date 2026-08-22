@@ -17,7 +17,7 @@ use std::fmt::Write;
 
 use ruddy::{
     ir::Literal,
-    lir::{Block, Callee, End, Function, Global, Instr, Op, Output, Rep, Terminator},
+    lir::{Block, Callee, End, Extern, Function, Global, Instr, Op, Output, Rep, Terminator},
 };
 
 /// How far one level of nesting indents. An arm label sits one level under its
@@ -25,14 +25,19 @@ use ruddy::{
 /// decision tree readable as a tree.
 const STEP: usize = 2;
 
-/// The whole listing: every function, then every global, one blank line apart.
-///
-/// Functions first because they are what a global refers to — a definition whose
-/// value is a `fn` has a global holding nothing but the closure of a wrapper
-/// printed above it.
+/// The whole listing: imports, functions, then initialized globals, one blank
+/// line apart. Imports lead because they have no initializer block; functions
+/// precede globals because a global may refer to a lifted wrapper above it.
 pub fn program(output: &Output) -> String {
     let mut out = String::new();
     let mut first = true;
+    for external in &output.externs {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        let _ = writeln!(out, "{}", extern_header(external));
+    }
     for function in &output.functions {
         if !first {
             out.push('\n');
@@ -50,6 +55,17 @@ pub fn program(output: &Output) -> String {
         block(output, &global.body, STEP, &mut out);
     }
     out
+}
+
+/// A target-provided declaration. It has no initializer block: a backend
+/// imports the value from this dotted target.
+pub fn extern_header(external: &Extern) -> String {
+    format!(
+        "extern {}: {} = {}",
+        external.name,
+        rep(external.rep),
+        external.target.join(".")
+    )
 }
 
 /// A function's header line: its name and its parameters, each with its

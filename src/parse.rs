@@ -40,8 +40,55 @@ pub struct Path {
     pub name: TrackedString,
 }
 
+/// A dotted target supplied by the compilation target rather than by Ruddy.
+///
+/// `console.log` is deliberately not an expression or a module path: dots in
+/// terms are record projections and `::` names Ruddy modules, while an extern
+/// target belongs to neither namespace. Its segments stay spelled and spanned
+/// so a backend can map the declaration without re-reading source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignPath {
+    pub segments: Vec<TrackedString>,
+}
+
+impl ForeignPath {
+    pub fn span(&self) -> Span {
+        self.segments
+            .first()
+            .expect("a foreign path has its required first name")
+            .span
+            .merge(
+                self.segments
+                    .last()
+                    .expect("a foreign path is nonempty")
+                    .span,
+            )
+    }
+}
+
+impl fmt::Display for ForeignPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (at, segment) in self.segments.iter().enumerate() {
+            if at > 0 {
+                f.write_str(".")?;
+            }
+            f.write_str(&segment.tracked)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum StmtKind {
+    /// `extern log : String -> () = console.log` — a target-supplied value.
+    ///
+    /// Its signature is required because there is no Ruddy body to infer from,
+    /// and it binds one ordinary term name for the module just as `let` does.
+    Extern {
+        name: TrackedString,
+        ty: Annotation,
+        target: ForeignPath,
+    },
     Let {
         /// What the definition binds: a bare name, which is every definition
         /// the language had before patterns, or a pattern that takes the value
@@ -1046,6 +1093,7 @@ impl Parser {
     fn stmt(&mut self) -> Option<Stmt> {
         match self.peek().map(|tok| &tok.tracked) {
             Some(Kind::Let) => self.let_stmt(),
+            Some(Kind::Extern) => self.extern_stmt(),
             Some(Kind::Type) => self.type_stmt(),
             Some(Kind::Effect) => self.effect_stmt(),
             Some(Kind::Module) => self.module_stmt(),
@@ -1220,6 +1268,33 @@ impl Parser {
             }
         }
         Some(span.track(StmtKind::Effect { name, cases }))
+    }
+
+    /// `extern <name> : <annotation> = <target>` — a target-supplied value.
+    /// Unlike a `let`, every piece is mandatory: an extern has no Ruddy body
+    /// to infer from, and its target is a dotted foreign name rather than an
+    /// expression that could otherwise consume the following statement.
+    fn extern_stmt(&mut self) -> Option<Stmt> {
+        let kw = self.advance().expect("the caller peeked `extern`");
+        let name = self.ident()?;
+        self.eat(&Kind::Colon)?;
+        let ty = self.annotation(true)?;
+        self.eat(&Kind::Equal)?;
+        let target = self.foreign_path()?;
+        let span = kw.span.merge(target.span());
+        Some(span.track(StmtKind::Extern { name, ty, target }))
+    }
+
+    /// `<name> ('.' <name>)*` — the target side of an extern declaration.
+    /// Dots are required between segments and at least one name is required,
+    /// which makes a malformed target stop exactly where the next component
+    /// should have started rather than being treated as an expression.
+    fn foreign_path(&mut self) -> Option<ForeignPath> {
+        let mut segments = vec![self.ident()?];
+        while self.eat_if(&Kind::Dot).is_some() {
+            segments.push(self.ident()?);
+        }
+        Some(ForeignPath { segments })
     }
 
     /// `let <pattern> [: <type>] = <expr>`. The ascription is optional: without

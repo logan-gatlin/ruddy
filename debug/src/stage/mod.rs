@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod constraints;
+pub mod externs;
 pub mod ir;
 pub mod lir;
 pub mod patterns;
@@ -107,8 +108,8 @@ pub enum Build {
 /// drift, because there is only one of them.
 #[derive(Default)]
 pub struct Trace {
-    /// One id per declaration row, in the order the stage renders them: every
-    /// `type` declaration, then every `let`.
+    /// One id per declaration row that has a published scheme, in the order
+    /// the IR stage renders them: every `type`, then every `extern` and `let`.
     pub decls: Vec<u32>,
     /// One entry per term row, with the type of the term it stands for.
     pub terms: Vec<(u32, Rc<Ty>)>,
@@ -164,6 +165,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(ast::build),
+    },
+    Spec {
+        id: "externs",
+        title: "Externs",
+        view: View::Tree,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(externs::build),
     },
     Spec {
         id: "ir",

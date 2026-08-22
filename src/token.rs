@@ -7,6 +7,8 @@ pub type Token = Tracked<Kind>;
 #[derive(Debug, Clone)]
 pub enum Kind {
     Let,
+    /// `extern`, declaring a target-provided top-level value.
+    Extern,
     In,
     Type,
     End,
@@ -333,6 +335,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let span = file_id.span(start, ident.len());
                 let kind = match ident.as_str() {
                     "let" => Kind::Let,
+                    "extern" => Kind::Extern,
                     "in" => Kind::In,
                     "type" => Kind::Type,
                     "end" => Kind::End,

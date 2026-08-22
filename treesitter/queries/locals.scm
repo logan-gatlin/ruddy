@@ -16,6 +16,7 @@
 ; ── what binds ───────────────────────────────────────────────────────────────
 
 (let_definition pattern: (identifier) @local.definition.var)
+(extern_definition name: (identifier) @local.definition.var)
 (let_expression pattern: (identifier) @local.definition.var)
 
 (function parameter: (identifier) @local.definition.parameter)

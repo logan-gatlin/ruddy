@@ -1761,3 +1761,19 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
          \x20 ret %8"
     );
 }
+
+#[test]
+fn externs_are_imports_not_global_initializers() {
+    let output = lowered("extern log : String -> () = console.log\nlet written = log \"hello\"");
+    assert_eq!(output.externs.len(), 1);
+    let external = &output.externs[0];
+    assert_eq!(external.name, "log");
+    assert_eq!(external.target, ["console", "log"]);
+    assert_eq!(output.globals.len(), 1, "externs have no initializer block");
+    assert_eq!(output.globals[0].name, "written");
+    let printed = print::lir::program(&output);
+    assert!(
+        printed.contains("global log"),
+        "the use reads the import:\n{printed}"
+    );
+}

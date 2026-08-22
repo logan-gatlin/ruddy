@@ -2075,3 +2075,35 @@ fn a_module_body_recovers_at_its_end() {
     assert_eq!(out.stmts.len(), 2, "{:#?}", out.stmts);
     assert!(matches!(out.stmts[1].tracked, StmtKind::Let { .. }));
 }
+
+#[test]
+fn an_extern_declares_a_dotted_foreign_target() {
+    let source = "extern log : String -> () = console.log";
+    assert_eq!(parse_one(source), source);
+    let output = parse(lex(source, FileID::GENERATED).tokens);
+    let StmtKind::Extern { name, ty, target } = &output.stmts[0].tracked else {
+        panic!("extern did not parse: {:#?}", output.stmts);
+    };
+    assert_eq!(name.tracked, "log");
+    assert!(matches!(ty.ty.tracked, TypeKind::Arrow { .. }));
+    assert_eq!(
+        target
+            .segments
+            .iter()
+            .map(|segment| segment.tracked.as_str())
+            .collect::<Vec<_>>(),
+        ["console", "log"]
+    );
+
+    for source in [
+        "extern log = console.log",
+        "extern log : String -> ()",
+        "extern log : String -> () = console.",
+    ] {
+        let output = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(
+            !output.errors.is_empty(),
+            "{source:?} parsed without an error"
+        );
+    }
+}

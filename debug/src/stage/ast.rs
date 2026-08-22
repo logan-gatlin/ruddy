@@ -67,6 +67,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 #[derive(Default)]
 struct Counts {
     lets: usize,
+    externs: usize,
     types: usize,
     effects: usize,
     modules: usize,
@@ -76,6 +77,7 @@ impl Counts {
     fn add(&mut self, stmt: &StmtKind) {
         match stmt {
             StmtKind::Let { .. } => self.lets += 1,
+            StmtKind::Extern { .. } => self.externs += 1,
             StmtKind::Type { .. } => self.types += 1,
             StmtKind::Effect { .. } => self.effects += 1,
             StmtKind::Module { .. } => self.modules += 1,
@@ -87,9 +89,13 @@ impl fmt::Display for Counts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} module · {} effect · {} type · {} let",
-            self.modules, self.effects, self.types, self.lets
-        )
+            "{} module · {} effect · {} type",
+            self.modules, self.effects, self.types
+        )?;
+        if self.externs > 0 {
+            write!(f, " · {} extern", self.externs)?;
+        }
+        write!(f, " · {} let", self.lets)
     }
 }
 
@@ -153,6 +159,13 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             module
         }
+        StmtKind::Extern { name, ty, target } => Node {
+            label: "Extern".into(),
+            ..node
+        }
+        .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span))
+        .child(annotation_node(ids, ty))
+        .child(Node::new(ids.next(), "Target", target.to_string()).at(target.span())),
         StmtKind::Let { pattern, ty, body } => {
             let mut let_node = Node {
                 label: "Let".into(),
