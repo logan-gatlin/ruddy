@@ -1093,12 +1093,6 @@ pub enum ErrorKind {
     /// nowhere else, and one sentence naming all three is what a reader can act
     /// on.
     ImpureOperation,
-    /// An extern's required signature is not an arrow. An import is called
-    /// through Ruddy, so its boundary has to say what it accepts and returns.
-    NotAnExtern,
-    /// An extern is a pure Ruddy binding. Its target may of course perform
-    /// host work, but that cannot be verified or represented by an import.
-    ImpureExtern,
     /// An effect declaration whose cases mix the two forms:
     /// `effect Bad = !Log + write : Nat -> ()`.
     ///
@@ -2063,12 +2057,6 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
                 let (module, name, annotation, target) = flat.externs[at].clone();
                 b.module = module;
                 let annotation = b.written(annotation, Place::Annotation);
-                match &annotation.ty.tracked {
-                    TypeKind::Arrow { effects, .. }
-                        if effects.effects.is_empty() && effects.tail.is_none() => {}
-                    TypeKind::Arrow { .. } => b.error(annotation.ty.span, ErrorKind::ImpureExtern),
-                    _ => b.error(annotation.ty.span, ErrorKind::NotAnExtern),
-                }
                 if let Some(symbol) = symbol {
                     program.externs.insert(
                         symbol,

@@ -963,8 +963,8 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // An extern has no initializer group to walk. Its written scheme is
     // nevertheless in scope before every group, exactly as a completed earlier
     // definition would be, so normal identifier lookup instantiates it at each
-    // use. The signature is authoritative; extern declarations are pure, so
-    // the host behaviour behind their target is outside Ruddy's effect model.
+    // use. The annotation is authoritative, including any effect row it
+    // declares for calls through the imported value.
     let mut externs = IndexMap::new();
     for (symbol, decl) in &program.externs {
         let annotation = decl

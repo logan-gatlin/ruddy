@@ -5164,19 +5164,13 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
 }
 
 #[test]
-fn an_extern_requires_a_pure_arrow_signature() {
-    for (source, kind) in [
-        (
-            "extern value : Nat = host.value",
-            "an extern must be a function",
-        ),
-        (
-            "effect Log = write : () -> ()\nextern log : String -> () + !Log = console.log",
-            "an extern's signature must be pure",
-        ),
-    ] {
-        let (_, output) = build_src(source);
-        assert_eq!(output.errors.len(), 1, "{source}: {:#?}", output.errors);
-        assert!(output.errors[0].kind.to_string().contains(kind));
-    }
+fn externs_accept_every_annotation_type() {
+    let (_, output) = build_src(
+        "effect Log = write : () -> ()\n\
+         extern count : Nat = host.count\n\
+         extern point : { x: Nat } = host.point\n\
+         extern log : String -> () + !Log = console.log",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(output.program.externs.len(), 3);
 }

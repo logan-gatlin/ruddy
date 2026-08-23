@@ -80,9 +80,9 @@ impl fmt::Display for ForeignPath {
 
 #[derive(Debug, Clone)]
 pub enum StmtKind {
-    /// `extern log : String -> () = console.log` — a target-supplied value.
+    /// `extern answer : Nat = host.answer` — a target-supplied value.
     ///
-    /// Its signature is required because there is no Ruddy body to infer from,
+    /// Its annotation is required because there is no Ruddy body to infer from,
     /// and it binds one ordinary term name for the module just as `let` does.
     Extern {
         name: TrackedString,

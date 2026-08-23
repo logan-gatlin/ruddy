@@ -2228,8 +2228,8 @@ fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
 }
 
 #[test]
-fn externs_reach_the_import_and_type_views() {
-    let source = "extern log : String -> () = console.log\nlet written = log \"hello\"";
+fn extern_values_reach_the_import_and_type_views() {
+    let source = "extern answer : Nat = host.answer\nlet next = answer";
     let snapshot = snapshot(source);
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -2245,20 +2245,20 @@ fn externs_reach_the_import_and_type_views() {
     };
     let externs = stage("externs");
     assert_eq!(externs.summary, "1 extern");
-    assert!(nodes(externs).iter().any(|node| node.text == "console.log"));
+    assert!(nodes(externs).iter().any(|node| node.text == "host.answer"));
     assert!(
         nodes(stage("types"))
             .iter()
-            .any(|node| node.label == "extern log" && node.text == "String -> {}")
+            .any(|node| node.label == "extern answer" && node.text == "Nat")
     );
     assert!(
         nodes(stage("ir"))
             .iter()
-            .any(|node| node.label == "extern log")
+            .any(|node| node.label == "extern answer")
     );
     assert!(
         nodes(stage("lir"))
             .iter()
-            .any(|node| node.label == "extern" && node.text.contains("console.log"))
+            .any(|node| node.label == "extern" && node.text.contains("host.answer"))
     );
 }
