@@ -318,6 +318,7 @@ impl Spec {
             id: self.id,
             title: self.title,
             view: self.view,
+            views: views(self.view),
             highlight: self.highlight,
             scoped: self.scoped,
             status,
@@ -328,6 +329,17 @@ impl Spec {
             debug: String::new(),
             annotates: self.annotates,
         }
+    }
+}
+
+/// The renderings the page can offer for a stage. Text is the canonical form
+/// of a span-free boundary, but its nodes remain useful as a navigable outline.
+fn views(view: View) -> &'static [View] {
+    match view {
+        View::Text => &[View::Text, View::Tree],
+        View::List => &[View::List],
+        View::Tree => &[View::Tree],
+        View::Steps => &[View::Steps],
     }
 }
 

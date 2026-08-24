@@ -739,7 +739,8 @@ fn the_lir_tab_skips_a_program_with_errors() {
 fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
     let artifact_stage = stage("artifact", "let id = fn x => x\n");
     assert_eq!(artifact_stage.status, Status::Ok);
-    assert!(matches!(artifact_stage.view, View::Text));
+    assert_eq!(artifact_stage.view, View::Text);
+    assert_eq!(artifact_stage.views, [View::Text, View::Tree]);
     assert!(
         artifact_stage
             .text
@@ -764,6 +765,9 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
 
     let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);
+    // The reader can select either artifact rendering before a bad edit; both
+    // must still be represented while the page explains why neither has data.
+    assert_eq!(skipped.views, [View::Text, View::Tree]);
     assert_eq!(skipped.summary, "artifact construction did not run");
     assert!(skipped.nodes.is_empty());
     assert!(skipped.text.is_none());

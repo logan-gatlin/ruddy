@@ -75,6 +75,9 @@ pub struct Stage {
     pub id: &'static str,
     pub title: &'static str,
     pub view: View,
+    /// Every reader-selectable rendering this stage supplies, in default-first
+    /// order. `Text` stages can additionally expose their structural outline.
+    pub views: &'static [View],
     /// A regular expression over this stage's row text, naming the runs that
     /// mean the same thing wherever they appear — a solver variable, say.
     /// Hovering one lights every other occurrence in the panel.
@@ -115,10 +118,9 @@ pub struct Stage {
     pub annotates: Option<&'static str>,
 }
 
-/// How a panel renders its nodes. `Text` has no producer yet; it is part of the
-/// contract so that a stage emitting assembly can be added without changing the
-/// wire format or the page.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// How a panel renders its nodes. A text stage may also offer its nodes as a
+/// structural outline without giving up its canonical text rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum View {

@@ -1040,6 +1040,21 @@ fn a_snapshot_survives_the_wire() {
     );
     assert_eq!(back["stages"][0]["view"], "list");
     assert_eq!(back["stages"][1]["view"], "tree");
+    let artifact = back["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .find(|stage| stage["id"] == "artifact")
+        .expect("the artifact stage is registered");
+    assert_eq!(
+        artifact["views"]
+            .as_array()
+            .expect("artifact views")
+            .iter()
+            .map(|view| view.as_str())
+            .collect::<Vec<_>>(),
+        [Some("text"), Some("tree")]
+    );
     // The file strip and everything a `Loc` is read against: one entry per file
     // the loader read, each carrying what the page turns an offset into a line
     // and a column with.

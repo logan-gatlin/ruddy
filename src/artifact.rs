@@ -1267,6 +1267,7 @@ pub mod text {
                         '\n' => out.push_str("\\n"),
                         '\r' => out.push_str("\\r"),
                         '\t' => out.push_str("\\t"),
+                        c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
                         c => out.push(c),
                     }
                 }
@@ -1350,13 +1351,29 @@ pub mod text {
                             'n' => '\n',
                             'r' => '\r',
                             't' => '\t',
+                            'u' => self.control_escape(),
                             _ => panic!("invalid artifact escape"),
                         });
                     }
+                    c if c.is_control() => panic!("unescaped control in artifact string"),
                     c => out.push(c),
                 }
             }
             Q(out)
+        }
+        fn control_escape(&mut self) -> char {
+            let mut value = 0;
+            for _ in 0..4 {
+                let digit = self.peek().expect("truncated artifact control escape");
+                self.at += digit.len_utf8();
+                value = value * 16 + digit.to_digit(16).expect("invalid artifact control escape");
+            }
+            let control = char::from_u32(value).expect("invalid artifact control escape");
+            assert!(
+                control.is_control() && !matches!(control, '\n' | '\r' | '\t'),
+                "invalid artifact control escape"
+            );
+            control
         }
     }
 
