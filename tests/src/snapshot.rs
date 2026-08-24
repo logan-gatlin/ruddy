@@ -86,6 +86,7 @@ fn every_stage_reports_on_the_demo() {
         [
             "tokens",
             "ast",
+            "externs",
             "ir",
             "constraints",
             "solve",
@@ -128,6 +129,7 @@ fn every_stage_reports_on_the_demo() {
         [
             "Tokens",
             "AST",
+            "Externs",
             "IR",
             "Constraints",
             "Solve",
@@ -1359,7 +1361,10 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     // LIR owns a phase too, and reports nothing here for the other reason a
     // stage can: the demo has errors in it, so lowering never ran and there is
     // no duration to report rather than no phase to have one.
-    assert_eq!(ids(false), ["constraints", "solve", "lir", "types-ir"]);
+    assert_eq!(
+        ids(false),
+        ["externs", "constraints", "solve", "lir", "types-ir"]
+    );
 
     // On a program with nothing wrong with it, it reports one like everybody
     // else — which is what makes the line above about the demo rather than
@@ -2220,4 +2225,40 @@ fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
         .iter()
         .find(|stage| stage.id == id)
         .unwrap_or_else(|| panic!("{id} is registered"))
+}
+
+#[test]
+fn extern_values_reach_the_import_and_type_views() {
+    let source = "extern answer : Nat = host.answer\nlet next = answer";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("no {id} stage"))
+    };
+    let externs = stage("externs");
+    assert_eq!(externs.summary, "1 extern");
+    assert!(nodes(externs).iter().any(|node| node.text == "host.answer"));
+    assert!(
+        nodes(stage("types"))
+            .iter()
+            .any(|node| node.label == "extern answer" && node.text == "Nat")
+    );
+    assert!(
+        nodes(stage("ir"))
+            .iter()
+            .any(|node| node.label == "extern answer")
+    );
+    assert!(
+        nodes(stage("lir"))
+            .iter()
+            .any(|node| node.label == "extern" && node.text.contains("host.answer"))
+    );
 }

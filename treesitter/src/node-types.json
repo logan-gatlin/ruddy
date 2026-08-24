@@ -1256,6 +1256,58 @@
     }
   },
   {
+    "type": "extern_definition",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "target": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "foreign_path",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "annotation",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "foreign_path",
+    "named": true,
+    "fields": {
+      "segment": {
+        "multiple": true,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "function",
     "named": true,
     "fields": {
@@ -2462,6 +2514,10 @@
           "named": true
         },
         {
+          "type": "extern_definition",
+          "named": true
+        },
+        {
           "type": "let_definition",
           "named": true
         },
@@ -3427,6 +3483,10 @@
           "named": true
         },
         {
+          "type": "extern_definition",
+          "named": true
+        },
+        {
           "type": "let_definition",
           "named": true
         },
@@ -4306,6 +4366,10 @@
   },
   {
     "type": "end",
+    "named": false
+  },
+  {
+    "type": "extern",
     "named": false
   },
   {

@@ -24,6 +24,7 @@
 (struct_type_field type: (identifier) @type)
 (sum_case payload: (identifier) @type)
 (operation_declaration signature: (identifier) @type)
+(extern_definition type: (annotation type: (identifier) @type))
 
 ; A path written where a type goes: the name at the end of it is the type, and
 ; the modules in front of it are painted with every other path's, below.
@@ -36,6 +37,7 @@
 (struct_type_field type: (path name: (identifier) @type))
 (sum_case payload: (path name: (identifier) @type))
 (operation_declaration signature: (path name: (identifier) @type))
+(extern_definition type: (annotation type: (path name: (identifier) @type)))
 
 (type_definition name: (identifier) @type.definition)
 
@@ -62,6 +64,8 @@
 (effect_definition name: (identifier) @module @namespace)
 (operation_declaration name: (identifier) @function)
 (operation name: (identifier) @function)
+(extern_definition name: (identifier) @function)
+(foreign_path segment: (identifier) @module @namespace)
 
 ; ── modules ──────────────────────────────────────────────────────────────────
 
@@ -105,6 +109,7 @@
 
 [
   "let"
+  "extern"
   "in"
   "type"
   "end"

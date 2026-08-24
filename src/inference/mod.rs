@@ -107,6 +107,10 @@ pub struct Output {
     /// nowhere else to be found, since the binder has no term of its own to
     /// carry a solved type.
     pub operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
+    /// The scheme each target-provided top-level value declared. Externs have
+    /// no body and are therefore intentionally separate from `schemes`, whose
+    /// entries each correspond to a term initializer.
+    pub externs: IndexMap<Symbol, Scheme>,
     /// The scheme each top-level term was inferred, or checked, to have.
     pub schemes: IndexMap<Symbol, Scheme>,
     /// The scheme each nested `let` was inferred, in the order the lets were
@@ -956,6 +960,29 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         }
     }
 
+    // An extern has no initializer group to walk. Its written scheme is
+    // nevertheless in scope before every group, exactly as a completed earlier
+    // definition would be, so normal identifier lookup instantiates it at each
+    // use. The annotation is authoritative, including any effect row it
+    // declares for calls through the imported value.
+    let mut externs = IndexMap::new();
+    for (symbol, decl) in &program.externs {
+        let annotation = decl
+            .annotation
+            .as_ref()
+            .expect("the parser requires every extern annotation");
+        let lowered = lower_annotation(mint, &mut table, annotation);
+        if !lowered.formula.is_true() {
+            let origin = Origin::Annotation(Named {
+                labels: lowered.names.clone(),
+            });
+            table.require(annotation.ty.span, origin, lowered.formula.clone());
+            report_flip(&mut table, &mut errors);
+        }
+        env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
+        externs.insert(*symbol, lowered.scheme);
+    }
+
     let mut schemes = IndexMap::new();
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
@@ -1310,6 +1337,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     Output {
         aliases,
         operations,
+        externs,
         schemes,
         locals,
         constraints,

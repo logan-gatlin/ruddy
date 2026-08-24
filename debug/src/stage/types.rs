@@ -49,6 +49,14 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.types.get(symbol).map(|decl| decl.name_span),
         )
     });
+    let externs = output.externs.iter().map(|(symbol, scheme)| {
+        (
+            "extern",
+            *symbol,
+            scheme.to_string(),
+            program.externs.get(symbol).map(|decl| decl.name_span),
+        )
+    });
     let schemes = output.schemes.iter().map(|(symbol, scheme)| {
         (
             "let",
@@ -59,6 +67,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     });
 
     let nodes: Vec<Node> = aliases
+        .chain(externs)
         .chain(schemes)
         .map(|(keyword, symbol, meaning, name_span)| {
             let mut node = Node::new(
@@ -140,10 +149,20 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         // read them in. What is left out and not shown anywhere raw is
         // `errors`, which reaches the page as diagnostics instead.
         debug: format!(
-            "aliases: {:#?}\n\nschemes: {:#?}",
-            output.aliases, output.schemes
+            "aliases: {:#?}\n\nexterns: {:#?}\n\nschemes: {:#?}",
+            output.aliases, output.externs, output.schemes
         ),
-        ..spec.stage(cx.status(), plural(output.schemes.len(), "scheme"))
+        ..spec.stage(
+            cx.status(),
+            match output.externs.is_empty() {
+                true => plural(output.schemes.len(), "scheme"),
+                false => format!(
+                    "{} · {}",
+                    plural(output.externs.len(), "extern"),
+                    plural(output.schemes.len(), "scheme")
+                ),
+            },
+        )
     }
 }
 
@@ -376,6 +395,10 @@ pub fn annotate(spec: &Spec, cx: &Cx, trace: &Trace) -> Stage {
         .types
         .keys()
         .map(|symbol| output.aliases.get(symbol).map(|ty| ty.to_string()));
+    let externs = program
+        .externs
+        .keys()
+        .map(|symbol| output.externs.get(symbol).map(|scheme| scheme.to_string()));
     let schemes = program
         .terms
         .keys()
@@ -383,7 +406,7 @@ pub fn annotate(spec: &Spec, cx: &Cx, trace: &Trace) -> Stage {
     let mut nodes: Vec<Node> = trace
         .decls
         .iter()
-        .zip(aliases.chain(schemes))
+        .zip(aliases.chain(externs).chain(schemes))
         .filter_map(|(id, text)| Some(Node::new(*id, "", text?)))
         .collect();
 

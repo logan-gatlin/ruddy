@@ -284,6 +284,7 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Kind::Let => f.write_str("let"),
+            Kind::Extern => f.write_str("extern"),
             Kind::In => f.write_str("in"),
             Kind::Type => f.write_str("type"),
             Kind::End => f.write_str("end"),

@@ -6491,3 +6491,46 @@ fn a_type_declared_in_one_module_unifies_with_a_use_in_another() {
     );
     assert_eq!(scheme(&mint, &output, "n"), "Nat");
 }
+
+#[test]
+fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
+    let (mint, _, output) = inferred(
+        "extern log : String -> () = console.log\n\
+         let written = log \"hello\"",
+    );
+    let (_, declared) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "log")
+        .expect("the extern scheme is published");
+    assert_eq!(declared.to_string(), "String -> {}");
+    assert_eq!(scheme(&mint, &output, "written"), "{}");
+    assert!(
+        output
+            .schemes
+            .keys()
+            .all(|symbol| mint.name(*symbol) != "log")
+    );
+
+    let (_, _, output) = infer_src(
+        "extern log : String -> () = console.log\n\
+         let wrong = log 1n",
+    );
+    assert_eq!(output.errors.len(), 1);
+    assert!(output.errors[0].kind.to_string().contains("String"));
+}
+
+#[test]
+fn an_extern_can_publish_a_non_function_scheme() {
+    let (mint, _, output) = inferred(
+        "extern answer : Nat = host.answer\n\
+         let next = answer",
+    );
+    let (_, declared) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "answer")
+        .expect("the extern scheme is published");
+    assert_eq!(declared.to_string(), "Nat");
+    assert_eq!(scheme(&mint, &output, "next"), "Nat");
+}

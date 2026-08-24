@@ -1761,3 +1761,20 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
          \x20 ret %8"
     );
 }
+
+#[test]
+fn extern_values_are_imports_not_global_initializers() {
+    let output = lowered("extern answer : Nat = host.answer\nlet next = answer");
+    assert_eq!(output.externs.len(), 1);
+    let external = &output.externs[0];
+    assert_eq!(external.name, "answer");
+    assert_eq!(external.target, ["host", "answer"]);
+    assert_eq!(external.rep, lir::Rep::Nat);
+    assert_eq!(output.globals.len(), 1, "externs have no initializer block");
+    assert_eq!(output.globals[0].name, "next");
+    let printed = print::lir::program(&output);
+    assert!(
+        printed.contains("global answer"),
+        "the use reads the import:\n{printed}"
+    );
+}

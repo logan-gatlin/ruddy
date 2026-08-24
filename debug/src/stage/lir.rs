@@ -35,6 +35,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 
     let mut ids = Ids::default();
     let mut nodes = Vec::new();
+    for external in &output.externs {
+        nodes.push(
+            Node::new(ids.next(), "extern", print::lir::extern_header(external)).at(external.span),
+        );
+    }
     for global in &output.globals {
         let node = Node::new(ids.next(), "global", print::lir::header(global)).at(global.span);
         nodes.push(node.children(rows(output, &global.body, &mut ids)));
@@ -50,11 +55,19 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         debug: format!("{output:#?}"),
         ..spec.stage(
             cx.status(),
-            format!(
-                "{} · {}",
-                plural(output.globals.len(), "global"),
-                plural(output.functions.len(), "function")
-            ),
+            match output.externs.is_empty() {
+                true => format!(
+                    "{} · {}",
+                    plural(output.globals.len(), "global"),
+                    plural(output.functions.len(), "function")
+                ),
+                false => format!(
+                    "{} · {} · {}",
+                    plural(output.externs.len(), "extern"),
+                    plural(output.globals.len(), "global"),
+                    plural(output.functions.len(), "function")
+                ),
+            },
         )
     }
 }

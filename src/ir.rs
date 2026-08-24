@@ -15,6 +15,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    /// Target-provided values. They bind in the term namespace but have no
+    /// initializer, so recursive initializer grouping never sees them.
+    pub externs: IndexMap<Symbol, Decl<Extern>>,
     pub terms: IndexMap<Symbol, Decl<Term>>,
     pub types: IndexMap<Symbol, Decl<Type>>,
     /// The effects declared, in the order they were written, each with the
@@ -142,6 +145,33 @@ pub struct Param {
     /// every *other* declaration does with what it is handed — so it is `false`
     /// until the fixpoint has run, which is the reading that decides nothing.
     pub relevant: bool,
+}
+
+/// A target-provided global value, named by a dotted target path.
+#[derive(Debug, Clone)]
+pub struct Extern {
+    pub target: ForeignPath,
+}
+
+/// A target path is neither a Ruddy module path nor a projection expression.
+#[derive(Debug, Clone)]
+pub struct ForeignPath {
+    pub segments: Vec<TrackedString>,
+}
+
+impl ForeignPath {
+    pub fn span(&self) -> Span {
+        self.segments
+            .first()
+            .expect("a lowered foreign path has a first segment")
+            .span
+            .merge(
+                self.segments
+                    .last()
+                    .expect("a lowered foreign path is nonempty")
+                    .span,
+            )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1316,12 +1346,29 @@ struct Flat {
     types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
     effects: Vec<(Option<Module>, TrackedString, Cases)>,
     terms: Vec<Defined>,
+    externs: Vec<External>,
+    /// Shared term/extern source order, which preserves duplicate precedence.
+    values: Vec<FlatValue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FlatValue {
+    Term(usize),
+    Extern(usize),
 }
 
 /// One `let`, as the parser read it and with the module it was written in: the
 /// pattern it binds, the annotation it may wear, and its value. Named because
 /// the tuple is the widest of the three and reads as noise inline.
 type Defined = (Option<Module>, Box<parse::Pattern>, Option<Annotated>, Body);
+
+/// One extern declaration, paired with the module it belongs to.
+type External = (Option<Module>, TrackedString, Annotated, parse::ForeignPath);
+
+enum ValueSymbols {
+    Term(Vec<Option<Symbol>>),
+    Extern(Option<Symbol>),
+}
 
 /// A written annotation, as the parser read it. Named so [`Flat`]'s rows fit on
 /// a line apiece.
@@ -1779,6 +1826,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         rigids: 0,
     };
     let mut program = Program {
+        externs: IndexMap::new(),
         terms: IndexMap::new(),
         types: IndexMap::new(),
         effects: IndexMap::new(),
@@ -1971,107 +2019,130 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // like any other definition. A name a pattern repeats binds nothing here —
     // the lowering walk reports it as the pattern mistake it is, not as a
     // second definition.
-    let defined: Vec<Vec<Option<Symbol>>> = flat
-        .terms
+    // Terms and externs share the same declaration pass, in written order:
+    // a duplicate belongs to whichever one appeared first, just as two lets do.
+    let declared: Vec<ValueSymbols> = flat
+        .values
         .iter()
-        .map(|(module, pattern, _, _)| {
-            b.module = *module;
-            let mut names = Vec::new();
-            pattern_names(pattern, &mut names);
-            let mut seen: Vec<String> = Vec::new();
-            names
-                .iter()
-                .map(|name| {
-                    if seen.contains(&name.tracked) {
-                        return None;
-                    }
-                    seen.push(name.tracked.clone());
-                    b.declare(Scope::Terms, name)
-                })
-                .collect()
+        .map(|value| match value {
+            FlatValue::Term(at) => {
+                let (module, pattern, _, _) = &flat.terms[*at];
+                b.module = *module;
+                let mut names = Vec::new();
+                pattern_names(pattern, &mut names);
+                let mut seen: Vec<String> = Vec::new();
+                ValueSymbols::Term(
+                    names
+                        .iter()
+                        .map(|name| {
+                            if seen.contains(&name.tracked) {
+                                return None;
+                            }
+                            seen.push(name.tracked.clone());
+                            b.declare(Scope::Terms, name)
+                        })
+                        .collect(),
+                )
+            }
+            FlatValue::Extern(at) => {
+                let (module, name, _, _) = &flat.externs[*at];
+                b.module = *module;
+                ValueSymbols::Extern(b.declare(Scope::Terms, name))
+            }
         })
         .collect();
-    for (declared, (module, pattern, ty, body)) in defined.into_iter().zip(flat.terms) {
-        b.module = module;
-        match pattern.tracked {
-            // A bare name is exactly the definition the language has always
-            // had. Annotation and body are lowered in the order they were
-            // written. A repeat's body is lowered like any other, though
-            // nothing keeps it: a bad name inside one is still the reader's
-            // to fix.
-            parse::PatternKind::Ident { name } => {
-                let symbol = declared
-                    .into_iter()
-                    .next()
-                    .expect("a bare name declares one symbol");
-                let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
-                let value = b.term(body.tracked);
+    for (value, symbols) in flat.values.into_iter().zip(declared) {
+        match (value, symbols) {
+            (FlatValue::Extern(at), ValueSymbols::Extern(symbol)) => {
+                let (module, name, annotation, target) = flat.externs[at].clone();
+                b.module = module;
+                let annotation = b.written(annotation, Place::Annotation);
                 if let Some(symbol) = symbol {
-                    program.terms.insert(
+                    program.externs.insert(
                         symbol,
                         Decl {
                             name_span: name.span,
-                            annotation,
-                            // A term binds no parameters of its own: a lambda's
-                            // argument is bound inside its body, not by the
-                            // definition.
+                            annotation: Some(annotation),
                             params: Vec::new(),
-                            value,
+                            value: Extern {
+                                target: ForeignPath {
+                                    segments: target.segments,
+                                },
+                            },
                         },
                     );
                 }
             }
-            // A pattern becomes ordinary top-level definitions: a fresh one
-            // holding the value — with the written annotation — and one per
-            // name, in written order. A pattern that could fail is refused,
-            // and its names are still defined, as error values, so downstream
-            // uses resolve.
-            tracked => {
-                let pspan = pattern.span;
-                let pattern = pspan.track(tracked);
-                let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
-                let value = b.term(body.tracked);
-                let mut binders = Binders::Declared(declared.into_iter());
-                let mut seen = Vec::new();
-                let mut dropped = Vec::new();
-                let pattern = b.pattern(pattern, &mut seen, &mut binders, &mut dropped);
-                match calm(&pattern) {
-                    Some(calm) => b.destructure_stmt(calm, annotation, value, &mut program.terms),
-                    None => {
-                        let (at, found) = refuter(&pattern)
-                            .expect("a pattern that is not calm names what refutes it");
-                        b.error(at, ErrorKind::RefutableBinding { found });
-                        let held = b.fresh("%value", pspan);
-                        program.terms.insert(
-                            held.tracked,
-                            Decl {
-                                name_span: pspan,
-                                annotation,
-                                params: Vec::new(),
-                                value,
-                            },
-                        );
-                        let mut names = Vec::new();
-                        pattern_binders(&pattern, &mut names);
-                        dropped.extend(names);
+            (FlatValue::Term(at), ValueSymbols::Term(declared)) => {
+                let (module, pattern, ty, body) = flat.terms[at].clone();
+                b.module = module;
+                match pattern.tracked {
+                    parse::PatternKind::Ident { name } => {
+                        let symbol = declared
+                            .into_iter()
+                            .next()
+                            .expect("a bare name declares one symbol");
+                        let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
+                        let value = b.term(body.tracked);
+                        if let Some(symbol) = symbol {
+                            program.terms.insert(
+                                symbol,
+                                Decl {
+                                    name_span: name.span,
+                                    annotation,
+                                    params: Vec::new(),
+                                    value,
+                                },
+                            );
+                        }
+                    }
+                    tracked => {
+                        let pspan = pattern.span;
+                        let pattern = pspan.track(tracked);
+                        let annotation = ty.map(|ty| b.written(ty, Place::Annotation));
+                        let value = b.term(body.tracked);
+                        let mut binders = Binders::Declared(declared.into_iter());
+                        let mut seen = Vec::new();
+                        let mut dropped = Vec::new();
+                        let pattern = b.pattern(pattern, &mut seen, &mut binders, &mut dropped);
+                        match calm(&pattern) {
+                            Some(calm) => {
+                                b.destructure_stmt(calm, annotation, value, &mut program.terms)
+                            }
+                            None => {
+                                let (at, found) = refuter(&pattern)
+                                    .expect("a pattern that is not calm names what refutes it");
+                                b.error(at, ErrorKind::RefutableBinding { found });
+                                let held = b.fresh("%value", pspan);
+                                program.terms.insert(
+                                    held.tracked,
+                                    Decl {
+                                        name_span: pspan,
+                                        annotation,
+                                        params: Vec::new(),
+                                        value,
+                                    },
+                                );
+                                let mut names = Vec::new();
+                                pattern_binders(&pattern, &mut names);
+                                dropped.extend(names);
+                            }
+                        }
+                        for name in dropped {
+                            program.terms.insert(
+                                name.tracked,
+                                Decl {
+                                    name_span: name.span,
+                                    annotation: None,
+                                    params: Vec::new(),
+                                    value: TermKind::Error.with_span(name.span),
+                                },
+                            );
+                        }
                     }
                 }
-                // The names with no position left — a refused binding's, and
-                // a dropped duplicate field's — are still ordinary top-level
-                // definitions, of error values, so downstream uses resolve
-                // and one mistake makes one complaint.
-                for name in dropped {
-                    program.terms.insert(
-                        name.tracked,
-                        Decl {
-                            name_span: name.span,
-                            annotation: None,
-                            params: Vec::new(),
-                            value: TermKind::Error.with_span(name.span),
-                        },
-                    );
-                }
             }
+            _ => unreachable!("value declarations preserve their kind"),
         }
     }
     // The term half of the loop refused above, and refused for the same
@@ -2118,6 +2189,11 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
         }
         rekey_term(&mut decl.value, &program.effect_ids, &mut b.errors);
+    }
+    for decl in program.externs.values_mut() {
+        if let Some(annotation) = &mut decl.annotation {
+            rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
+        }
     }
     // Which definitions have to be typed together, read off the values as they
     // finally stand — so a refused loop is a group of one naming nobody rather
@@ -2233,6 +2309,11 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
             rekey_type(&mut annotation.ty, &ids, errors);
         }
         rekey_term(&mut decl.value, &ids, errors);
+    }
+    for decl in program.externs.values_mut() {
+        if let Some(annotation) = &mut decl.annotation {
+            rekey_type(&mut annotation.ty, &ids, errors);
+        }
     }
 }
 
@@ -4209,6 +4290,11 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
         });
     }
+    for decl in program.externs.values_mut() {
+        if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
+            walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
+        }
+    }
     out
 }
 
@@ -4860,7 +4946,16 @@ impl Builder<'_> {
                     flat.types.push((outer, name, params, body))
                 }
                 StmtKind::Effect { name, cases } => flat.effects.push((outer, name, cases)),
-                StmtKind::Let { pattern, ty, body } => flat.terms.push((outer, pattern, ty, body)),
+                StmtKind::Let { pattern, ty, body } => {
+                    let at = flat.terms.len();
+                    flat.terms.push((outer, pattern, ty, body));
+                    flat.values.push(FlatValue::Term(at));
+                }
+                StmtKind::Extern { name, ty, target } => {
+                    let at = flat.externs.len();
+                    flat.externs.push((outer, name, ty, target));
+                    flat.values.push(FlatValue::Extern(at));
+                }
                 StmtKind::Module { name, body } => {
                     self.module = Some(self.declare_module(&name));
                     self.flatten(body.unwrap_or_default(), flat);

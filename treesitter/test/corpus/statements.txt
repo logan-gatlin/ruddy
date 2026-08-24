@@ -158,3 +158,22 @@ let b = 2
   (let_definition
     (identifier)
     (natural)))
+
+==================
+extern declaration
+==================
+
+extern log : String -> () = console.log
+
+---
+
+(source_file
+  (extern_definition
+    name: (identifier)
+    type: (annotation
+      type: (function_type
+        from: (identifier)
+        to: (unit)))
+    target: (foreign_path
+      segment: (identifier)
+      segment: (identifier))))

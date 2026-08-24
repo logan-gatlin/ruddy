@@ -529,3 +529,11 @@ fn a_version_component_keeps_all_u64_bits() {
         ] if value == u64::MAX
     ));
 }
+
+#[test]
+fn extern_is_reserved_as_a_declaration_keyword() {
+    assert!(
+        matches!(&kinds("extern log")[..], [Kind::Extern, Kind::Identifier(name)] if name == "log")
+    );
+    assert!(matches!(&kinds("external")[..], [Kind::Identifier(name)] if name == "external"));
+}

@@ -5119,3 +5119,58 @@ fn a_module_with_no_body_is_declared_and_empty() {
             .any(|s| mint.namespace(s) == Namespace::Modules && mint.name(s) == "A")
     );
 }
+
+#[test]
+fn externs_bind_terms_without_becoming_initializer_groups() {
+    let source = "extern log : String -> {} = console.log\nlet written = log \"hello\"";
+    let (mint, output) = built(source);
+    assert_eq!(output.program.externs.len(), 1);
+    assert_eq!(output.program.terms.len(), 1);
+    assert_eq!(groups(&mint, &output), vec![vec!["written"]]);
+    let (symbol, external) = output
+        .program
+        .externs
+        .first()
+        .expect("the extern is lowered");
+    assert_eq!(mint.name(*symbol), "log");
+    assert_eq!(
+        external
+            .value
+            .target
+            .segments
+            .iter()
+            .map(|part| part.tracked.as_str())
+            .collect::<Vec<_>>(),
+        ["console", "log"]
+    );
+    assert_eq!(
+        display_program(source),
+        "extern log : String -> {} = console.log\nlet written = log \"hello\""
+    );
+
+    for source in [
+        "extern log : String -> () = console.log\nlet log = fn x => x",
+        "let log = fn x => x\nextern log : String -> () = console.log",
+    ] {
+        let (_, output) = build_src(source);
+        assert!(matches!(
+            output.errors.first().map(|error| &error.kind),
+            Some(ErrorKind::Duplicate {
+                namespace: Namespace::Terms,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn externs_accept_every_annotation_type() {
+    let (_, output) = build_src(
+        "effect Log = write : () -> ()\n\
+         extern count : Nat = host.count\n\
+         extern point : { x: Nat } = host.point\n\
+         extern log : String -> () + !Log = console.log",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(output.program.externs.len(), 3);
+}

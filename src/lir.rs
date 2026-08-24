@@ -51,6 +51,10 @@ pub type FuncId = usize;
 /// earlier phase accepted, and lowering an accepted program cannot fail.
 #[derive(Debug, Clone)]
 pub struct Output {
+    /// Target-provided globals. Unlike [`Global`], these have no initializer:
+    /// a backend imports them from their dotted target instead of evaluating a
+    /// Ruddy block for them.
+    pub externs: Vec<Extern>,
     /// Every lifted `fn`, handler arm and generated wrapper, in the order they
     /// were lifted. Flat: no function nests inside another.
     pub functions: Vec<Function>,
@@ -58,6 +62,16 @@ pub struct Output {
     /// group first, and within a group the order the definitions appear in it.
     /// A backend initializes them in exactly this order.
     pub globals: Vec<Global>,
+}
+
+/// One target-provided global value, ready for a backend import table.
+#[derive(Debug, Clone)]
+pub struct Extern {
+    pub symbol: Symbol,
+    pub name: String,
+    pub target: Vec<String>,
+    pub span: Span,
+    pub rep: Rep,
 }
 
 /// One top-level function: what it takes, what it does, and what to call it in a
@@ -565,7 +579,25 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
     for symbol in &order {
         low.define(*symbol);
     }
+    let externs = program
+        .externs
+        .iter()
+        .map(|(symbol, decl)| Extern {
+            symbol: *symbol,
+            name: mint.name(*symbol).to_string(),
+            target: decl
+                .value
+                .target
+                .segments
+                .iter()
+                .map(|segment| segment.tracked.clone())
+                .collect(),
+            span: decl.value.target.span(),
+            rep: low.rep(inference.externs[symbol].body()),
+        })
+        .collect();
     Output {
+        externs,
         functions: low
             .functions
             .into_iter()
@@ -1745,7 +1777,16 @@ impl Lower<'_> {
                             name: self.mint.name(*symbol).to_string(),
                         },
                     );
-                    let have = self.program.terms[symbol].value.ty.clone();
+                    // A defined global was compiled at its definition's type;
+                    // an extern is supplied directly at this instantiated use
+                    // type, since it has no Ruddy initializer with another
+                    // shape to preserve.
+                    let have = self
+                        .program
+                        .terms
+                        .get(symbol)
+                        .map(|decl| decl.value.ty.clone())
+                        .unwrap_or_else(|| term.ty.clone());
                     self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }
