@@ -93,6 +93,7 @@ fn every_stage_reports_on_the_demo() {
             "presence",
             "patterns",
             "lir",
+            "artifact",
             "symbols",
             "types-ir"
         ]
@@ -103,7 +104,7 @@ fn every_stage_reports_on_the_demo() {
         // The demo ends in three deliberate mistakes, and LIR runs on accepted
         // programs alone — so its tab is the one that reports `Skipped` here,
         // with a summary saying so and no rows behind it.
-        if stage.id == "lir" {
+        if matches!(stage.id, "lir" | "artifact") {
             assert_eq!(stage.status, Status::Skipped);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -135,6 +136,7 @@ fn every_stage_reports_on_the_demo() {
             "Presence",
             "Patterns",
             "LIR",
+            "Artifact",
             "Symbols"
         ]
     );
@@ -1359,7 +1361,10 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     // LIR owns a phase too, and reports nothing here for the other reason a
     // stage can: the demo has errors in it, so lowering never ran and there is
     // no duration to report rather than no phase to have one.
-    assert_eq!(ids(false), ["constraints", "solve", "lir", "types-ir"]);
+    assert_eq!(
+        ids(false),
+        ["constraints", "solve", "lir", "artifact", "types-ir"]
+    );
 
     // On a program with nothing wrong with it, it reports one like everybody
     // else — which is what makes the line above about the demo rather than
@@ -1371,6 +1376,19 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         .expect("the lir stage is registered");
     assert_eq!(lir.status, Status::Ok);
     assert!(lir.micros.is_some());
+    let artifact = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "artifact")
+        .expect("the artifact stage is registered");
+    assert_eq!(artifact.status, Status::Ok);
+    assert!(artifact.micros.is_some());
+    assert!(
+        artifact
+            .text
+            .as_ref()
+            .is_some_and(|text| text.starts_with("(artifact "))
+    );
 }
 
 /// A tab's raw view dumps what that tab owns, and no more.

@@ -5,6 +5,7 @@
 //! file here and a line to [`REGISTRY`]; the page needs no change, because it
 //! builds its tabs, filters and cross-highlighting from the snapshot alone.
 
+pub mod artifact;
 pub mod ast;
 pub mod constraints;
 pub mod ir;
@@ -45,6 +46,8 @@ pub struct Cx<'a> {
     /// `None` whenever an earlier phase reported anything: LIR runs on accepted
     /// programs alone, which is what lets it be infallible.
     pub lir: Option<&'a ruddy::lir::Output>,
+    /// The canonical, span-free disk boundary built from accepted LIR.
+    pub artifact: Option<&'a ruddy::artifact::Artifact>,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -68,6 +71,7 @@ pub struct Phases {
     pub infer: u64,
     pub patterns: u64,
     pub lir: u64,
+    pub artifact: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -249,6 +253,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(lir::build),
+    },
+    Spec {
+        id: "artifact",
+        title: "Artifact",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(artifact::build),
     },
     Spec {
         id: "symbols",

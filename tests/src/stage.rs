@@ -5,7 +5,7 @@ use ruddy::types::Core;
 use ruddy_debug::{
     snapshot::{ROOT, compile},
     stage::{Build, REGISTRY, Spec, panicked, skipped},
-    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage},
+    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
 /// The header every snippet is compiled under: a bundle's root file must open
@@ -731,6 +731,43 @@ fn the_lir_tab_skips_a_program_with_errors() {
     assert_eq!(bad.summary, "lowering to LIR did not run");
     assert!(bad.nodes.is_empty());
     assert!(bad.micros.is_none());
+}
+
+/// The artifact is the canonical disk boundary: the text is directly usable,
+/// while its outline makes the public header and lowered sections discoverable.
+#[test]
+fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
+    let artifact_stage = stage("artifact", "let id = fn x => x\n");
+    assert_eq!(artifact_stage.status, Status::Ok);
+    assert!(matches!(artifact_stage.view, View::Text));
+    assert!(
+        artifact_stage
+            .text
+            .as_ref()
+            .is_some_and(|text| text.starts_with("(artifact "))
+    );
+    assert_eq!(
+        artifact_stage
+            .nodes
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>(),
+        ["header", "lir"],
+        "{:#?}",
+        artifact_stage.nodes
+    );
+    assert!(
+        artifact_stage.summary.contains("1 values"),
+        "{}",
+        artifact_stage.summary
+    );
+
+    let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.summary, "artifact construction did not run");
+    assert!(skipped.nodes.is_empty());
+    assert!(skipped.text.is_none());
+    assert!(skipped.micros.is_none());
 }
 
 /// The Tokens tab is one row per file with that file's own stream under it. A

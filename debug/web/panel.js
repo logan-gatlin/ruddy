@@ -245,6 +245,12 @@ function createPane(root, app, index) {
       return;
     }
 
+    if (view === "text") {
+      setRows(`<pre class="raw">${esc(stage.text || "(empty)")}</pre>`);
+      visible = [];
+      return;
+    }
+
     if (stage.status === "panicked") {
       const panic = snapshot.panic;
       setRows(

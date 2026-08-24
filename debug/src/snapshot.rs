@@ -16,6 +16,7 @@ use std::{
 };
 
 use ruddy::{
+    artifact,
     bundle::{self, Files},
     inference, ir, lir, patterns,
     symbol::Mint,
@@ -252,6 +253,20 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         _ => None,
     };
 
+    // The artifact is the first disk-boundary representation. Like LIR, it
+    // only exists for an accepted program, and retains no source spans.
+    let artifact = match (&built, &inferred, &lowered) {
+        (Some(built), Some(inferred), Some(lowered)) => {
+            let started = Instant::now();
+            let out = guard("artifact", &mut panicked, || {
+                artifact::build(&mint, &built.program, inferred, lowered)
+            });
+            micros.artifact = started.elapsed().as_micros() as u64;
+            out
+        }
+        _ => None,
+    };
+
     // Every file the loader read, in load order, with what the page needs to
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
@@ -277,6 +292,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         inference: inferred.as_ref(),
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
+        artifact: artifact.as_ref(),
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
