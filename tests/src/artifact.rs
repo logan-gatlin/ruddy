@@ -355,6 +355,43 @@ fn assert_bad_replacement(text: &str, from: &str, to: &str) {
     assert_malformed(&malformed);
 }
 
+/// Collapse layout whitespace without touching quoted strings. Malformed-input
+/// tests target grammar tags rather than the pretty-printer's line choices.
+fn compact(text: &str) -> String {
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut separating = false;
+    for character in text.chars() {
+        if quoted {
+            out.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if character == '"' {
+            if separating && !out.is_empty() {
+                out.push(' ');
+            }
+            separating = false;
+            quoted = true;
+            out.push(character);
+        } else if character.is_whitespace() {
+            separating = true;
+        } else {
+            if separating && !out.is_empty() {
+                out.push(' ');
+            }
+            separating = false;
+            out.push(character);
+        }
+    }
+    out
+}
+
 #[test]
 fn a_compiled_bundle_round_trips_through_canonical_text() {
     let artifact = built(
@@ -380,12 +417,56 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
 
     let printed = assert_round_trip(&artifact);
     assert!(
+        printed.starts_with("(artifact\n  (header"),
+        "artifact should use the canonical pretty layout:\n{printed}"
+    );
+    assert!(
+        printed.lines().count() > 10,
+        "a nontrivial artifact should be laid out across lines:\n{printed}"
+    );
+    assert!(
         !printed.contains("<test>"),
         "source paths must not cross the disk boundary"
     );
     assert!(
         !printed.contains("Span"),
         "source spans must not cross the disk boundary"
+    );
+}
+
+#[test]
+fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
+    let empty = |name: String| Artifact {
+        header: artifact::Header {
+            identity: artifact::Identity {
+                name,
+                version: "1".to_string(),
+            },
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+
+    assert_eq!(
+        empty("界".repeat(12)).print(),
+        "(artifact\n\
+         \x20 (header (identity \"界界界界界界界界界界界界\" \"1\") (values) (types) (effects))\n\
+         \x20 (lir (functions) (globals)))\n"
+    );
+    assert_eq!(
+        empty("界".repeat(13)).print(),
+        "(artifact\n\
+         \x20 (header\n\
+         \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
+         \x20   (values)\n\
+         \x20   (types)\n\
+         \x20   (effects))\n\
+         \x20 (lir (functions) (globals)))\n"
     );
 }
 
@@ -416,8 +497,10 @@ fn canonical_text_escapes_and_parses_every_control_character() {
     let printed = assert_round_trip(&artifact);
     let text = printed.strip_suffix('\n').unwrap();
     assert!(
-        !text.chars().any(char::is_control),
-        "canonical artifact text must not contain raw control characters"
+        !text
+            .chars()
+            .any(|character| character.is_control() && character != '\n'),
+        "artifact strings must not contain raw control characters"
     );
     for control in controls.chars() {
         let escape = match control {
@@ -435,7 +518,7 @@ fn canonical_text_escapes_and_parses_every_control_character() {
 
 #[test]
 fn malformed_trusted_text_paths_arities_and_tags_panic() {
-    let valid = assert_round_trip(&model_artifact());
+    let valid = compact(&assert_round_trip(&model_artifact()));
     for text in [
         "",
         "(",

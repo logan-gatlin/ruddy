@@ -819,11 +819,17 @@ fn rep(value: lir::Rep) -> Rep {
     }
 }
 
-/// Canonical text helpers.  The compact S-expression grammar is deliberately
-/// explicit: every type, formula, operation, nested block, and ordered map has
-/// a distinct tag.  Strings are quoted; the parser accepts trusted output only.
+/// Canonical text helpers. The S-expression grammar is deliberately explicit:
+/// every type, formula, operation, nested block, and ordered map has a distinct
+/// tag. The writer uses a fixed-width pretty layout; strings are quoted, and
+/// the parser accepts trusted output only.
 pub mod text {
     use super::*;
+    use pretty::RcDoc;
+
+    /// The fixed width of canonical artifact text. Keeping this here rather
+    /// than at the call site makes line breaking part of the format.
+    const WIDTH: usize = 80;
 
     #[derive(Debug, Clone)]
     enum S {
@@ -833,12 +839,15 @@ pub mod text {
     }
     use S::{Atom as A, List as L, Str as Q};
 
-    /// Print one artifact as canonical text, always ending in one newline.
+    /// Print one artifact as canonical text, pretty-printed at a fixed width
+    /// and always ending in one newline.
     pub fn print(value: &Artifact) -> String {
-        let mut out = String::new();
-        write_s(&artifact(value), &mut out);
-        out.push('\n');
-        out
+        let mut out = Vec::new();
+        doc(&artifact(value))
+            .render(WIDTH, &mut out)
+            .expect("writing an artifact to memory cannot fail");
+        out.push(b'\n');
+        String::from_utf8(out).expect("artifact text is UTF-8")
     }
     /// Parse canonical trusted text; malformed text panics.
     pub fn parse(input: &str) -> Artifact {
@@ -1255,35 +1264,32 @@ pub mod text {
         }
     }
 
-    fn write_s(value: &S, out: &mut String) {
+    fn doc(value: &S) -> RcDoc<'_, ()> {
         match value {
-            A(value) => out.push_str(value),
-            Q(value) => {
-                out.push('"');
-                for c in value.chars() {
-                    match c {
-                        '\\' => out.push_str("\\\\"),
-                        '"' => out.push_str("\\\""),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\t' => out.push_str("\\t"),
-                        c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-                        c => out.push(c),
-                    }
-                }
-                out.push('"');
-            }
-            L(values) => {
-                out.push('(');
-                for (i, value) in values.iter().enumerate() {
-                    if i != 0 {
-                        out.push(' ');
-                    }
-                    write_s(value, out);
-                }
-                out.push(')');
+            A(value) => RcDoc::text(value.as_str()),
+            Q(value) => RcDoc::text(quoted(value)),
+            L(values) => RcDoc::text("(")
+                .append(RcDoc::intersperse(values.iter().map(doc), RcDoc::line()).nest(2))
+                .append(")")
+                .group(),
+        }
+    }
+
+    fn quoted(value: &str) -> String {
+        let mut out = String::from("\"");
+        for c in value.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
             }
         }
+        out.push('"');
+        out
     }
 
     struct Parser<'a> {

@@ -745,7 +745,7 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         artifact_stage
             .text
             .as_ref()
-            .is_some_and(|text| text.starts_with("(artifact "))
+            .is_some_and(|text| text.starts_with("(artifact\n  (header"))
     );
     assert_eq!(
         artifact_stage
