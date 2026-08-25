@@ -36,6 +36,17 @@ fn lexes_numeric_literals() {
         kinds(&format!("{}n", u64::MAX))[..],
         [Kind::Natural(u64::MAX)]
     ));
+    assert_eq!(errors("1.5n")[0].kind, ErrorKind::MalformedNatural);
+}
+
+#[test]
+fn strings_finish_and_fail_at_every_boundary() {
+    assert!(
+        matches!(&kinds("\"hello\\nworld\"")[..], [Kind::String(value)] if value == "hello\nworld")
+    );
+    for malformed in ["\"unterminated", "\"slash\\", "\"bad\\q\""] {
+        assert_eq!(errors(malformed)[0].kind, ErrorKind::MalformedString);
+    }
 }
 
 #[test]

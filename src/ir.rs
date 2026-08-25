@@ -2229,7 +2229,7 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
         rekey_type(&mut decl.value, &ids, errors);
     }
     for decl in program.terms.values_mut() {
-        if let Some(annotation) = &mut decl.annotation {
+        for annotation in decl.annotation.iter_mut() {
             rekey_type(&mut annotation.ty, &ids, errors);
         }
         rekey_term(&mut decl.value, &ids, errors);
@@ -2418,9 +2418,9 @@ fn canonical_effect_row(
     format!("{};{tail}", labels.join(","))
 }
 
-/// One effect's module-independent interface, descending through effect rows.
-/// A back edge names only the effect's leaf name, so cycles terminate without
-/// making module identity part of structural equality.
+/// One effect's module-independent interface. Operation signatures are held
+/// pure by construction, so their nested types cannot lead back through an
+/// effect row to this interface.
 fn canonical_effect(
     symbol: Symbol,
     types: &IndexMap<Symbol, Decl<Type>>,
@@ -2429,9 +2429,7 @@ fn canonical_effect(
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
-    if !effects_seen.insert(symbol) {
-        return format!("!{}<rec>", mint.name(symbol));
-    }
+    effects_seen.insert(symbol);
     let interface = match effects.get(&symbol).map(|decl| &decl.value) {
         Some(Effect::Operations(operations)) => {
             let mut operations: Vec<_> = operations
@@ -2484,9 +2482,9 @@ fn canonical_effect(
 fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     let old = std::mem::take(&mut row.effects);
     for (_, label) in old {
-        let Some(id) = ids.get(&label.symbol()) else {
-            continue;
-        }; // aliases never survive expansion
+        // Aliases and unresolved names never survive expansion into a semantic
+        // row, so every remaining source symbol has a structural identity.
+        let id = &ids[&label.symbol()];
         if row.effects.contains_key(id) {
             errors.push(Error {
                 span: label.name_span(),
@@ -2591,9 +2589,8 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
             // arms naming one source effect are.
             let mut seen = HashSet::new();
             for arm in &handler.arms {
-                let Some(effect) = ids.get(&arm.effect.tracked) else {
-                    continue;
-                };
+                // Lowering retains only arms whose effect resolved.
+                let effect = &ids[&arm.effect.tracked];
                 if !seen.insert((effect.clone(), arm.op.tracked.clone())) {
                     errors.push(Error {
                         span: arm.op.span,

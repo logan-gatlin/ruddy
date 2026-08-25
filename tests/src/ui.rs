@@ -269,6 +269,7 @@ const RULES: &[Rule] = &[
     Rule::Arrow,
     Rule::Performs,
     Rule::Struct,
+    Rule::Refine,
     Rule::Sum,
     Rule::Presence {
         shape: Shape::Struct,
@@ -488,6 +489,34 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
     assert_eq!(
         Effect::Failed(failure.clone()).to_string(),
         failure.to_string()
+    );
+    assert_eq!(
+        Effect::Guarded {
+            premise: Formula::var(1),
+            obligation: Formula::var(2).not(),
+        }
+        .to_string(),
+        "requires not ?2 when ?1"
+    );
+}
+
+#[test]
+fn guarded_origins_keep_their_source_and_premise_readable() {
+    let source = inference::Origin::Refinement(inference::Named {
+        labels: vec![("x".to_string(), Presence::Var(1))],
+    });
+    assert_eq!(source.code(), "branch-refinement");
+    assert!(source.to_string().contains("structural presence relation"));
+
+    let guarded = inference::Origin::Guarded(inference::GuardedOrigin {
+        premise: Formula::var(0),
+        obligation: Formula::var(1).not(),
+        origin: Box::new(source),
+    });
+    assert_eq!(guarded.code(), "guarded");
+    assert_eq!(
+        guarded.to_string(),
+        "a structural presence relation produced in this arm when ?0"
     );
 }
 
@@ -1900,6 +1929,18 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
         ConstraintKind::Instance {
             symbol,
             ty: nat.clone(),
+            requirement: 0,
+        },
+        ConstraintKind::Match {
+            scrutinee: nat.clone(),
+            result: nat.clone(),
+            arms: Vec::new(),
+            store_end: 0,
+        },
+        ConstraintKind::Performs {
+            performed: Row::closed(),
+            ambient: Row::closed(),
+            inside: true,
         },
     ];
     let codes: HashSet<_> = kinds.iter().map(|kind| kind.code()).collect();
@@ -1956,6 +1997,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
     let use_site = ConstraintKind::Instance {
         symbol,
         ty: Rc::new(Ty::plain(Core::Var(4))),
+        requirement: 0,
     };
     assert_eq!(use_site.code(), "instance");
     assert_eq!(

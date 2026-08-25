@@ -1788,6 +1788,7 @@ impl Rule {
             Rule::Arrow => "arrow",
             Rule::Performs => "performs",
             Rule::Struct => "struct",
+            Rule::Refine => "refine",
             Rule::Sum => "sum",
             Rule::Presence { .. } => "presence",
             Rule::Unfold => "unfold",
@@ -1848,6 +1849,9 @@ impl fmt::Display for Rule {
             Rule::Struct => f.write_str(
                 "two types and their fields: shared fields field against field, the rest into whatever the other leaves open",
             ),
+            Rule::Refine => f.write_str(
+                "presence equality inside an arm becomes an implication from that arm's assumption",
+            ),
             Rule::Sum => f.write_str(
                 "two sums: shared cases case against case, the rest into the other's tail",
             ),
@@ -1879,6 +1883,10 @@ impl fmt::Display for Effect {
             // question asked about a shape, which is a step towards an answer
             // without being any smaller.
             Effect::Decomposed => f.write_str("replaced by the goals below"),
+            Effect::Guarded {
+                premise,
+                obligation,
+            } => write!(f, "requires {obligation} when {premise}"),
             Effect::Failed(kind) => kind.fmt(f),
         }
     }
@@ -1893,6 +1901,7 @@ impl ConstraintKind {
             ConstraintKind::Equal { .. } => "equal",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
+            ConstraintKind::Match { .. } => "match",
             ConstraintKind::Performs { .. } => "performs",
         }
     }
@@ -1940,6 +1949,16 @@ impl fmt::Display for ConstraintKind {
             ConstraintKind::Instance { ty, .. } => {
                 write!(f, "{ty} ~ a fresh copy of what this name was bound to")
             }
+            ConstraintKind::Match {
+                scrutinee,
+                result,
+                arms,
+                ..
+            } => write!(
+                f,
+                "presence-refined match with {} written arms over {scrutinee} -> {result}",
+                arms.len(),
+            ),
             // Read as the widening it is rather than as an equation: what
             // calling this may perform has to be allowed where it was written,
             // and the ambient may allow more. The two rows print in the effect
@@ -2130,6 +2149,8 @@ impl Origin {
             Origin::Coverage(_) => "match-coverage",
             Origin::Instance(_) => "use-site",
             Origin::Annotation(_) => "annotation",
+            Origin::Refinement(_) => "branch-refinement",
+            Origin::Guarded(_) => "guarded",
         }
     }
 }
@@ -2138,11 +2159,15 @@ impl Origin {
 /// beside each one.
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Origin::Coverage(_) => "what this match's arms cover between them",
-            Origin::Instance(_) => "what this use of a name requires of its presences",
-            Origin::Annotation(_) => "what this annotation's `where` clause promises",
-        })
+        match self {
+            Origin::Coverage(_) => f.write_str("what this match's arms cover between them"),
+            Origin::Instance(_) => f.write_str("what this use of a name requires of its presences"),
+            Origin::Annotation(_) => f.write_str("what this annotation's `where` clause promises"),
+            Origin::Refinement(_) => {
+                f.write_str("a structural presence relation produced in this arm")
+            }
+            Origin::Guarded(guarded) => write!(f, "{} when {}", guarded.origin, guarded.premise,),
+        }
     }
 }
 

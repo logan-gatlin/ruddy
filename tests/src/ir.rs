@@ -3543,6 +3543,15 @@ fn an_effect_declares_its_operations() {
     assert!(operations.is_empty());
 }
 
+#[test]
+fn recursive_types_have_a_finite_structural_effect_signature() {
+    let (_, out) = built(
+        "type Rec = { next: Rec }\n\
+         effect Visit = run : Rec -> Rec",
+    );
+    assert_eq!(out.program.effect_ids.len(), 1);
+}
+
 /// An alias names effects and declares nothing, and expands to the effects it
 /// names wherever a row mentions it — so no alias survives into what a
 /// definition is checked against, and none can be performed through.
