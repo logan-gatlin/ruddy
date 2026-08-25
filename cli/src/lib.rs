@@ -57,6 +57,7 @@ impl std::error::Error for CompileError {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    root: PathBuf,
     dependencies: IndexMap<String, DependencySpec>,
 }
 
@@ -67,30 +68,34 @@ struct DependencySpec {
     source: PathBuf,
 }
 
-/// Compile the bundle rooted at `root`, using the `Ruddy.toml` beside it.
+/// Compile the project in `directory`, whose `Ruddy.toml` names its bundle root.
 ///
+/// The root and dependency source paths are resolved relative to the manifest.
 /// Dependency artifacts are loaded and checked before compilation. Their
 /// identities, but never their source paths, are recorded in the returned
 /// artifact in manifest declaration order.
-pub fn compile(root: impl AsRef<Path>) -> Result<Artifact, CompileError> {
-    let root = root.as_ref();
+pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
+    let directory = directory.as_ref();
+    let manifest = load_manifest(directory)?;
+    let root = directory.join(&manifest.root);
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        return Err(CompileError::one("bundle root must have a UTF-8 file name"));
+        return Err(CompileError::one("manifest field `root` must name a file"));
     };
 
     let disk = Disk::new(parent);
     if disk.read(name).is_none() {
         return Err(CompileError::one(format!(
-            "could not read bundle root {}",
-            root.display()
+            "could not read bundle root {} configured by {}",
+            root.display(),
+            directory.join(MANIFEST).display()
         )));
     }
 
-    let dependencies = load_dependencies(parent)?;
+    let dependencies = load_dependencies(directory, manifest.dependencies)?;
 
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
@@ -176,7 +181,7 @@ pub fn compile(root: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     Ok(artifact)
 }
 
-fn load_dependencies(directory: &Path) -> Result<Vec<Dependency>, CompileError> {
+fn load_manifest(directory: &Path) -> Result<Manifest, CompileError> {
     let path = directory.join(MANIFEST);
     let source = fs::read_to_string(&path).map_err(|error| {
         CompileError::one(format!(
@@ -184,15 +189,19 @@ fn load_dependencies(directory: &Path) -> Result<Vec<Dependency>, CompileError> 
             path.display()
         ))
     })?;
-    let manifest: Manifest = toml::from_str(&source).map_err(|error| {
+    toml::from_str(&source).map_err(|error| {
         CompileError::one(format!(
             "could not parse manifest {}: {error}",
             path.display()
         ))
-    })?;
+    })
+}
 
-    manifest
-        .dependencies
+fn load_dependencies(
+    directory: &Path,
+    dependencies: IndexMap<String, DependencySpec>,
+) -> Result<Vec<Dependency>, CompileError> {
+    dependencies
         .into_iter()
         .map(|(name, spec)| load_dependency(directory, name, spec))
         .collect()
