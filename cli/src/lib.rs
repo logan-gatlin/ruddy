@@ -77,14 +77,15 @@ struct DependencySpec {
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     let directory = directory.as_ref();
     let manifest = load_manifest(directory)?;
+    let Some(name) = configured_file_name(&manifest.root) else {
+        return Err(CompileError::one("manifest field `root` must name a file"));
+    };
+    let source_directory = manifest.root.parent().unwrap_or(Path::new(""));
     let root = directory.join(&manifest.root);
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        return Err(CompileError::one("manifest field `root` must name a file"));
-    };
 
     let disk = Disk::new(parent);
     if disk.read(name).is_none() {
@@ -124,6 +125,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                     error.kind.code(),
                     error.span,
                     &error.kind,
+                    source_directory,
                 ));
             }
             for error in &file.parse_errors {
@@ -133,6 +135,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                     error.code(),
                     error.span,
                     error,
+                    source_directory,
                 ));
             }
         }
@@ -143,6 +146,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                 error.kind.code(),
                 error.span,
                 &error.kind,
+                source_directory,
             ));
         }
         for error in &built.errors {
@@ -152,6 +156,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                 error.kind.code(),
                 error.span,
                 &error.kind,
+                source_directory,
             ));
         }
         for error in &inferred.errors {
@@ -161,6 +166,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                 error.kind.code(),
                 error.span,
                 &error.kind,
+                source_directory,
             ));
         }
         for error in &checked.errors {
@@ -170,6 +176,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                 error.kind.code(),
                 error.span,
                 &error.kind,
+                source_directory,
             ));
         }
         return Err(CompileError::diagnostics(diagnostics));
@@ -179,6 +186,15 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     let mut artifact = Artifact::build(&mint, &built.program, &inferred, &lowered);
     artifact.header.dependencies = dependencies;
     Ok(artifact)
+}
+
+fn configured_file_name(root: &Path) -> Option<&str> {
+    let configured = root.to_str()?;
+    let final_component = configured.rsplit(std::path::is_separator).next()?;
+    if final_component.is_empty() || matches!(final_component, "." | "..") {
+        return None;
+    }
+    root.file_name()?.to_str()
 }
 
 fn load_manifest(directory: &Path) -> Result<Manifest, CompileError> {
@@ -276,6 +292,7 @@ fn diagnostic(
     code: &str,
     span: Span,
     message: &impl fmt::Display,
+    source_directory: &Path,
 ) -> String {
     let file = files.get_file(span.file_id);
     let before = file.content.get(..span.start).unwrap_or(&file.content);
@@ -287,8 +304,9 @@ fn diagnostic(
         .chars()
         .count()
         + 1;
+    let path = source_directory.join(&file.path);
     format!(
         "{}:{line}:{column}: error[{phase}/{code}]: {message}",
-        file.path
+        path.display()
     )
 }

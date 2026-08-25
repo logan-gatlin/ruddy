@@ -99,6 +99,39 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
 }
 
 #[test]
+fn nested_root_diagnostics_preserve_root_and_module_paths() {
+    let directory = project();
+    fs::create_dir(directory.path().join("src")).expect("create source directory");
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "root = \"src/app.hc\"\n[dependencies]\n",
+    )
+    .expect("write the manifest");
+    fs::write(
+        directory.path().join("src/app.hc"),
+        "bundle app 1.0.0\nlet bad : Nat = fn x => x\n",
+    )
+    .expect("write an invalid root");
+
+    let root_error = error(&directory);
+    assert!(root_error.contains("src/app.hc:2:"), "{root_error}");
+
+    fs::write(
+        directory.path().join("src/app.hc"),
+        "bundle app 1.0.0\nmodule Child\n",
+    )
+    .expect("replace the root");
+    fs::write(
+        directory.path().join("src/Child.hc"),
+        "let bad : Nat = fn x => x\n",
+    )
+    .expect("write an invalid module");
+
+    let module_error = error(&directory);
+    assert!(module_error.contains("src/Child.hc:1:"), "{module_error}");
+}
+
+#[test]
 fn the_manifest_is_required_and_must_be_valid_and_supported() {
     let directory = project();
     let missing = error(&directory);
@@ -245,13 +278,18 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
 #[test]
 fn the_configured_root_must_name_a_file() {
     let directory = tempfile::tempdir().unwrap();
-    fs::write(
-        directory.path().join("Ruddy.toml"),
-        "root = \"/\"\n[dependencies]\n",
-    )
-    .unwrap();
-    let error = compile(directory.path())
-        .expect_err("the root does not name a file")
-        .to_string();
-    assert!(error.contains("field `root` must name a file"), "{error}");
+    for root in ["", ".", "..", "src/", "src/.", "/"] {
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!("root = {root:?}\n[dependencies]\n"),
+        )
+        .unwrap();
+        let error = compile(directory.path())
+            .expect_err("the root does not name a file")
+            .to_string();
+        assert!(
+            error.contains("field `root` must name a file"),
+            "root `{root}`: {error}"
+        );
+    }
 }
