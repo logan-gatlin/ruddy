@@ -387,7 +387,12 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
 
     fs::write(&path, "old output").unwrap();
     assert_eq!(build_project(&project).unwrap(), path);
-    assert_eq!(fs::read_to_string(path).unwrap(), first);
+    assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    let entries: Vec<_> = fs::read_dir(project.join("build"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("sample.artifact")]);
 }
 
 #[test]

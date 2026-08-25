@@ -148,19 +148,22 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
 
     let manifest = path.join(MANIFEST);
     let root = path.join(ROOT);
+    let mut manifest_created = false;
     let result = (|| {
         write_new_file(&manifest, "root = \"main.hc\"\n\n[dependencies]\n")?;
+        manifest_created = true;
         write_new_file(
             &root,
             &format!("bundle {name} {INITIAL_VERSION}\n\nlet main = 0n\n"),
         )
     })();
     if result.is_err() {
-        // Remove only the two files this invocation owns, then the directory
-        // only if it is still empty. Never recursively delete a path another
-        // process could have populated while creation was in progress.
-        let _ = fs::remove_file(&root);
-        let _ = fs::remove_file(&manifest);
+        // A failed write cleans up its own partial file. Remove only an earlier
+        // file whose successful creation this invocation recorded, then remove
+        // the project directory only if nobody else has populated it.
+        if manifest_created {
+            let _ = fs::remove_file(&manifest);
+        }
         let _ = fs::remove_dir(path);
     }
     result
@@ -172,8 +175,15 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .create_new(true)
         .open(path)
         .map_err(|error| CliError::one(format!("could not create {}: {error}", path.display())))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(CliError::one(format!(
+            "could not write {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Compile the project in `directory` and write its canonical artifact under
@@ -197,8 +207,8 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
 }
 
 /// Write beside the old artifact first, so a failed write cannot truncate the
-/// last successful build. The final rename is atomic on the supported host
-/// filesystems because both paths have the same parent.
+/// last successful build. Replacing the destination is atomic where the host's
+/// rename operation supports replacement; Windows uses a recoverable backup.
 fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
     let name = path
         .file_name()
@@ -242,14 +252,96 @@ fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
             path.display()
         )));
     }
-    if let Err(error) = fs::rename(&temporary_path, path) {
-        let _ = fs::remove_file(&temporary_path);
+    match fs::rename(&temporary_path, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                replace_existing_windows(path, &temporary_path, error)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = fs::remove_file(&temporary_path);
+                Err(CliError::one(format!(
+                    "could not write artifact {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Windows does not replace an existing file with `rename`. Move the old
+/// regular file aside first, restore it if installation fails, and never move
+/// a blocking directory out of the way.
+#[cfg(windows)]
+fn replace_existing_windows(
+    path: &Path,
+    temporary_path: &Path,
+    initial_error: std::io::Error,
+) -> Result<(), CliError> {
+    let is_file = fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
+    if !is_file {
+        let _ = fs::remove_file(temporary_path);
         return Err(CliError::one(format!(
-            "could not write artifact {}: {error}",
+            "could not write artifact {}: {initial_error}",
             path.display()
         )));
     }
-    Ok(())
+
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("artifact");
+    let mut backup = None;
+    for attempt in 0..100 {
+        let candidate =
+            path.with_file_name(format!(".{name}.old-{}-{attempt}", std::process::id()));
+        match fs::rename(path, &candidate) {
+            Ok(()) => {
+                backup = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                let _ = fs::remove_file(temporary_path);
+                return Err(CliError::one(format!(
+                    "could not replace artifact {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let Some(backup) = backup else {
+        let _ = fs::remove_file(temporary_path);
+        return Err(CliError::one(format!(
+            "could not replace artifact {}: no backup filename was available",
+            path.display()
+        )));
+    };
+
+    if let Err(error) = fs::rename(temporary_path, path) {
+        let _ = fs::remove_file(temporary_path);
+        if let Err(restore_error) = fs::rename(&backup, path) {
+            return Err(CliError::one(format!(
+                "could not replace artifact {}: {error}; the previous artifact remains at {} because restoring it failed: {restore_error}",
+                path.display(),
+                backup.display()
+            )));
+        }
+        return Err(CliError::one(format!(
+            "could not replace artifact {}: {error}",
+            path.display()
+        )));
+    }
+
+    fs::remove_file(&backup).map_err(|error| {
+        CliError::one(format!(
+            "replaced artifact {}, but could not remove backup {}: {error}",
+            path.display(),
+            backup.display()
+        ))
+    })
 }
 
 /// A user-facing failure while loading a manifest or compiling its bundle.
