@@ -113,7 +113,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     )
     .expect("write an invalid root");
 
-    let root_error = error(&directory);
+    let root_error = error(&directory).replace('\\', "/");
     assert!(root_error.contains("src/app.hc:2:"), "{root_error}");
 
     fs::write(
@@ -127,11 +127,11 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     )
     .expect("write an invalid module");
 
-    let module_error = error(&directory);
+    let module_error = error(&directory).replace('\\', "/");
     assert!(module_error.contains("src/Child.hc:1:"), "{module_error}");
 
     fs::remove_file(directory.path().join("src/Child.hc")).expect("remove the module file");
-    let missing = error(&directory);
+    let missing = error(&directory).replace('\\', "/");
     assert!(
         missing.contains("create `src/Child.hc` or `src/Child/module.hc`"),
         "{missing}",
@@ -145,7 +145,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
         "let inside = 1n\n",
     )
     .expect("write the inside candidate");
-    let ambiguous = error(&directory);
+    let ambiguous = error(&directory).replace('\\', "/");
     assert!(
         ambiguous.contains("delete one of `src/Child.hc` or `src/Child/module.hc`"),
         "{ambiguous}",
