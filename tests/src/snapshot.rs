@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
+use ruddy::artifact::{Artifact, Dependency, Header, Identity, Lir};
 use ruddy_debug::{
     snapshot::{ROOT, compile, guard, install_hook},
-    stage::REGISTRY,
+    stage::{Cx, Phases, REGISTRY},
     wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
@@ -75,6 +76,60 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
     let mut out = Vec::new();
     walk(&stage.nodes, &mut out);
     out
+}
+
+#[test]
+fn artifact_stage_renders_one_dependency() {
+    let artifact = Artifact {
+        header: Header {
+            identity: Identity {
+                name: "demo".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: vec![Dependency {
+                name: "base".to_string(),
+                version: "2.3.4".to_string(),
+            }],
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let symbols = HashMap::new();
+    let cx = Cx {
+        files: &[],
+        bundle: None,
+        program: None,
+        inference: None,
+        patterns: None,
+        lir: None,
+        artifact: Some(&artifact),
+        mint: None,
+        symbols: &symbols,
+        micros: Phases::default(),
+        errored: false,
+    };
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "artifact")
+        .expect("the artifact stage is registered");
+
+    let stage = ruddy_debug::stage::artifact::build(spec, &cx);
+
+    assert_eq!(
+        stage.summary,
+        "1 dependency · 0 values · 0 types · 0 effects · 0 functions · 0 globals"
+    );
+    let dependencies = &stage.nodes[0].children[0];
+    assert_eq!(dependencies.label, "dependencies");
+    assert_eq!(dependencies.text, "1 declared");
+    assert_eq!(dependencies.children.len(), 1);
+    assert_eq!(dependencies.children[0].label, "dependency");
+    assert_eq!(dependencies.children[0].text, "base@2.3.4");
 }
 
 #[test]

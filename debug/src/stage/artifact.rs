@@ -7,7 +7,7 @@
 use ruddy::artifact::Artifact;
 
 use crate::{
-    stage::{Cx, Ids, Spec},
+    stage::{Cx, Ids, Spec, plural},
     wire::{Node, Stage},
 };
 
@@ -83,8 +83,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         ..spec.stage(
             cx.status(),
             format!(
-                "{} dependencies · {} values · {} types · {} effects · {} functions · {} globals",
-                artifact.header.dependencies.len(),
+                "{} · {} values · {} types · {} effects · {} functions · {} globals",
+                plural(artifact.header.dependencies.len(), "dependency"),
                 artifact.header.values.len(),
                 artifact.header.types.len(),
                 artifact.header.effects.len(),
