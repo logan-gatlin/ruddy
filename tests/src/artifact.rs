@@ -751,28 +751,28 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
 
     // Printing remains the compiler side of the round trip. Parsing and all
     // three recursive semantic families must fit a deliberately tiny stack.
-    let printed = std::thread::Builder::new()
+    let (value, printed) = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let printed = value.print();
-            std::mem::forget(value);
-            printed
+            (value, printed)
         })
         .unwrap()
         .join()
         .unwrap();
-    let handle = std::thread::Builder::new()
+    drop(value);
+    let parsed = std::thread::Builder::new()
         .stack_size(512 * 1024)
         .spawn(move || {
             let parsed = Artifact::try_parse(&printed).expect("deep artifact parses");
             assert_eq!(parsed.header.values.len(), 1);
             assert_eq!(parsed.lir.globals.len(), 1);
-            // Recursive model destruction is outside what this parser test is
-            // measuring and would itself consume the deliberately tiny stack.
-            std::mem::forget(parsed);
+            parsed
         })
+        .unwrap()
+        .join()
         .unwrap();
-    handle.join().unwrap();
+    drop(parsed);
 }
 
 #[test]
@@ -813,6 +813,25 @@ fn balanced_malformed_deep_values_fail_on_a_small_stack() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+#[test]
+fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
+    const DEPTH: usize = 30_000;
+    let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
+    let malformed = format!(
+        "(artifact (header (identity \"deep\" \"1\") (dependencies) \
+         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty unit (fields))))) \
+         (types) (effects)) (lir (functions) wrong))"
+    );
+
+    let error = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || Artifact::try_parse(&malformed).expect_err("malformed trailing LIR"))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(error.message(), "expected `globals` list");
 }
 
 #[test]

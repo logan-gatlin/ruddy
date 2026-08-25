@@ -1588,6 +1588,131 @@ pub mod text {
         }
     }
 
+    /// Destroy a rejected, partially decoded model without following its
+    /// recursive ownership on the call stack. Successful artifacts remain
+    /// ordinary values and use their normal derived destruction.
+    fn discard_artifact(artifact: Artifact) {
+        fn discard_formula(formula: Formula) {
+            let mut pending = vec![formula];
+            while let Some(formula) = pending.pop() {
+                match formula {
+                    Formula::Not(value) => pending.push(*value),
+                    Formula::And(left, right)
+                    | Formula::Or(left, right)
+                    | Formula::Iff(left, right)
+                    | Formula::Xor(left, right) => {
+                        pending.push(*left);
+                        pending.push(*right);
+                    }
+                    Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+                }
+            }
+        }
+
+        enum Semantic {
+            Ty(Type),
+            Row(Row),
+        }
+        fn discard_type(ty: Type) {
+            let mut pending = vec![Semantic::Ty(ty)];
+            while let Some(value) = pending.pop() {
+                match value {
+                    Semantic::Ty(Type { core, fields }) => {
+                        pending.extend(fields.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
+                        match core {
+                            Core::Arrow(from, to, effects) => {
+                                pending.push(Semantic::Ty(*from));
+                                pending.push(Semantic::Ty(*to));
+                                pending.push(Semantic::Row(effects));
+                            }
+                            Core::Sum(row) => pending.push(Semantic::Row(row)),
+                            Core::Named { args, .. } => {
+                                pending.extend(args.into_iter().map(Semantic::Ty));
+                            }
+                            Core::Unit
+                            | Core::Nat
+                            | Core::Int
+                            | Core::Real
+                            | Core::String
+                            | Core::Boolean
+                            | Core::Var(_)
+                            | Core::Bound(_)
+                            | Core::Rigid { .. }
+                            | Core::Undecided => {}
+                        }
+                    }
+                    Semantic::Row(Row { labels, rest }) => {
+                        pending.extend(labels.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
+                        if let Rest::More(row) = rest {
+                            pending.push(Semantic::Row(*row));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn discard_scheme(scheme: Scheme) {
+            discard_formula(scheme.formula);
+            discard_type(scheme.body);
+        }
+
+        fn discard_block(block: Block) {
+            let mut pending = vec![block];
+            while let Some(Block { instrs, .. }) = pending.pop() {
+                for Instr { op, .. } in instrs {
+                    match op {
+                        Op::Catch { body, .. } => pending.push(*body),
+                        Op::SwitchTag {
+                            cases, fallback, ..
+                        } => {
+                            pending.extend(cases.into_iter().map(|case| case.block));
+                            pending.extend(fallback.map(|block| *block));
+                        }
+                        Op::SwitchPrim {
+                            cases, fallback, ..
+                        } => {
+                            pending.extend(cases.into_iter().map(|case| case.block));
+                            pending.extend(fallback.map(|block| *block));
+                        }
+                        Op::SwitchPresence {
+                            present, absent, ..
+                        } => {
+                            pending.push(*present);
+                            pending.push(*absent);
+                        }
+                        Op::SwitchRest { none, some, .. } => {
+                            pending.push(*none);
+                            pending.push(*some);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let Artifact { header, lir } = artifact;
+        for value in header.values {
+            discard_scheme(value.scheme);
+        }
+        for declared in header.types {
+            discard_scheme(declared.scheme);
+        }
+        for effect in header.effects {
+            if let EffectKind::Operations(operations) = effect.kind {
+                for operation in operations {
+                    discard_type(operation.from);
+                    discard_type(operation.to);
+                }
+            }
+        }
+        for function in lir.functions {
+            discard_block(function.body);
+        }
+        for global in lir.globals {
+            discard_block(global.body);
+        }
+    }
+
     struct Reader {
         error: std::cell::RefCell<Option<ParseError>>,
     }
@@ -1602,7 +1727,10 @@ pub mod text {
         fn artifact(self, value: S) -> Result<Artifact, ParseError> {
             let artifact = self.read_artifact(value);
             match self.error.into_inner() {
-                Some(error) => Err(error),
+                Some(error) => {
+                    discard_artifact(artifact);
+                    Err(error)
+                }
                 None => Ok(artifact),
             }
         }
