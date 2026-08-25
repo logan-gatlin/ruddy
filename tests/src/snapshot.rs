@@ -110,6 +110,90 @@ fn supplied_dependencies_reach_debug_artifact_construction() {
 }
 
 #[test]
+fn invalid_dependency_configuration_is_diagnostic_and_skips_artifacts() {
+    for (dependencies, code, message) in [
+        (
+            vec![DependencySpec {
+                name: "_base".to_string(),
+                version: "1.2.3".to_string(),
+            }],
+            "bad-dependency-name",
+            "`_base` is not a valid Ruddy bundle name",
+        ),
+        (
+            vec![DependencySpec {
+                name: "base".to_string(),
+                version: "latest".to_string(),
+            }],
+            "bad-dependency-version",
+            "`latest` is not a valid semantic version for dependency `base`",
+        ),
+        (
+            vec![DependencySpec {
+                name: "base".to_string(),
+                version: "1.2.3+local".to_string(),
+            }],
+            "dependency-build-metadata",
+            "dependency `base` cannot use build metadata in version `1.2.3+local`",
+        ),
+        (
+            vec![
+                DependencySpec {
+                    name: "base".to_string(),
+                    version: "1.2.3".to_string(),
+                },
+                DependencySpec {
+                    name: "base".to_string(),
+                    version: "2.0.0".to_string(),
+                },
+            ],
+            "duplicate-dependency",
+            "dependency `base` is declared more than once",
+        ),
+    ] {
+        let snapshot = compile(
+            &CompileRequest {
+                name: "debugger".to_string(),
+                version: "1.0.0".to_string(),
+                files: vec![FileSpec {
+                    path: ROOT.to_string(),
+                    source: compiled("let main = 0n\n"),
+                }],
+                dependencies,
+                revision: 9,
+            },
+            1,
+        );
+
+        assert_eq!(snapshot.diagnostics.len(), 1, "{:#?}", snapshot.diagnostics);
+        assert_eq!(snapshot.diagnostics[0].stage, "bundle");
+        assert_eq!(snapshot.diagnostics[0].code, code);
+        assert_eq!(snapshot.diagnostics[0].message, message);
+        assert_eq!(snapshot.bundle.as_deref(), Some("debugger@1.0.0"));
+        assert_eq!(
+            snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == "ir")
+                .unwrap()
+                .status,
+            Status::Partial,
+            "source phases remain available despite configuration diagnostics"
+        );
+        assert_eq!(
+            snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == "artifact")
+                .unwrap()
+                .status,
+            Status::Skipped,
+            "invalid configuration must not produce an artifact"
+        );
+    }
+}
+
+#[test]
 fn every_stage_reports_on_the_demo() {
     let snapshot = bundle(&[(ROOT, DEMO)]);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();

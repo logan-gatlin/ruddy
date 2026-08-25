@@ -1,7 +1,8 @@
 # tree-sitter-ruddy
 
-The tree-sitter grammar for ruddy — the `.hc` files `src/main.rs` compiles and
-the debugger edits. It exists so that editors can colour, fold and navigate a
+The tree-sitter grammar for ruddy — the `.hc` files the `ruddy` compiler
+library parses, the command-line driver in `cli/src/main.rs` compiles, and the
+debugger edits. It exists so that editors can colour, fold and navigate a
 source file without running the compiler.
 
 `src/token.rs` and `src/parse.rs` are the source of truth. Every rule in

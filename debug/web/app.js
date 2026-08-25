@@ -243,9 +243,11 @@ async function openDoc(name) {
   // made it there — a crash, a lost connection, a closed tab mid-keystroke.
   let files = server?.files ?? cached?.files ?? [];
   state.notice = "";
-  const recovered = cached && !sameFiles(cached.files, files) && (!server || cached.at > server.modified_ms);
+  const recovered = cached &&
+    !sameDocumentConfiguration(cached, server, name) &&
+    (!server || cached.at > server.modified_ms);
   if (recovered) {
-    files = cached.files;
+    files = cached.files ?? [];
     state.notice = `restored unsaved changes to ${name}`;
   }
   // A document nobody has written yet — the switcher creates one by opening a
@@ -290,6 +292,26 @@ function sameFiles(a, b) {
   return (
     a?.length === b?.length &&
     a.every((file, i) => file.path === b[i].path && file.source === b[i].source)
+  );
+}
+
+/// Compare every editable part of a document. The server calls the configured
+/// identity `bundle_name` because its `name` is the storage key; the browser
+/// cache calls it `name`, so normalize that one wire-format difference first.
+function sameDocumentConfiguration(cache, server, documentName) {
+  if (!cache || !server) return false;
+  const cacheName = cache.bundle_name ?? cache.name ?? documentName;
+  const serverName = server.bundle_name ?? server.name ?? documentName;
+  const cacheDependencies = cache.dependencies ?? [];
+  const serverDependencies = server.dependencies ?? [];
+  return (
+    cacheName === serverName &&
+    (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
+    sameFiles(cache.files ?? [], server.files ?? []) &&
+    cacheDependencies.length === serverDependencies.length &&
+    cacheDependencies.every((dependency, i) =>
+      dependency.name === serverDependencies[i].name &&
+      dependency.version === serverDependencies[i].version)
   );
 }
 
@@ -451,6 +473,7 @@ function setLink(link) {
 
 function parseDependencies(input) {
   if (!input.trim()) return [];
+  const names = new Set();
   return input.split(",").map((raw, index) => {
     const part = raw.trim();
     const at = part.lastIndexOf("@");
@@ -459,6 +482,8 @@ function parseDependencies(input) {
     if (at <= 0 || !name || !version) {
       throw new Error(`Dependency ${index + 1} must be written as name@version (both parts are required).`);
     }
+    if (names.has(name)) throw new Error(`Dependency ${name} is declared more than once.`);
+    names.add(name);
     return { name, version };
   });
 }

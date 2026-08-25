@@ -9,7 +9,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     panic::{self, AssertUnwindSafe},
     sync::Once,
     time::Instant,
@@ -138,6 +138,61 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         ));
     }
     let identity = configured.as_ref().map(ToString::to_string);
+
+    // Dependency identities cross the same artifact boundary as the bundle's
+    // own identity, so accept exactly the identities `Bundle` accepts. The
+    // wire format is a list (unlike a TOML dependency table), which also means
+    // duplicate names need an explicit check. Configuration errors remain
+    // recoverable: source phases still run, while the diagnostic gate below
+    // prevents LIR and an apparently successful artifact from being built.
+    let mut dependency_names = HashSet::new();
+    for dependency in &req.dependencies {
+        if !dependency_names.insert(dependency.name.as_str()) {
+            diagnostics.push(raw(
+                "bundle",
+                "duplicate-dependency",
+                format!(
+                    "dependency `{}` is declared more than once",
+                    dependency.name
+                ),
+                None,
+            ));
+        }
+
+        let Ok(version) = Version::parse(&dependency.version) else {
+            diagnostics.push(raw(
+                "bundle",
+                "bad-dependency-version",
+                format!(
+                    "`{}` is not a valid semantic version for dependency `{}`",
+                    dependency.version, dependency.name
+                ),
+                None,
+            ));
+            continue;
+        };
+        if !version.build.is_empty() {
+            diagnostics.push(raw(
+                "bundle",
+                "dependency-build-metadata",
+                format!(
+                    "dependency `{}` cannot use build metadata in version `{}`",
+                    dependency.name, dependency.version
+                ),
+                None,
+            ));
+            continue;
+        }
+        if Bundle::new(&dependency.name, version).is_none() {
+            diagnostics.push(raw(
+                "bundle",
+                "bad-dependency-name",
+                format!("`{}` is not a valid Ruddy bundle name", dependency.name),
+                None,
+            ));
+        }
+    }
+
     let fallback = || {
         Bundle::new("fallback", Version::new(0, 0, 0))
             .expect("the debugger fallback identity is valid")
