@@ -7,7 +7,7 @@
 use ruddy::artifact::Artifact;
 
 use crate::{
-    stage::{Cx, Ids, Spec, plural},
+    stage::{Cx, Ids, Spec},
     wire::{Node, Stage},
 };
 
@@ -75,6 +75,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     )
     .children(lowered);
 
+    let dependencies = match artifact.header.dependencies.len() {
+        1 => "1 dependency".to_string(),
+        count => format!("{count} dependencies"),
+    };
+
     Stage {
         micros: Some(cx.micros.artifact),
         nodes: vec![header, lir],
@@ -84,7 +89,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             cx.status(),
             format!(
                 "{} · {} values · {} types · {} effects · {} functions · {} globals",
-                plural(artifact.header.dependencies.len(), "dependency"),
+                dependencies,
                 artifact.header.values.len(),
                 artifact.header.types.len(),
                 artifact.header.effects.len(),
