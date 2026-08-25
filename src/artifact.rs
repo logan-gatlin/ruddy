@@ -917,6 +917,29 @@ pub mod text {
         Str(String),
         List(Vec<S>),
     }
+
+    // Parsed S-expressions can be arbitrarily deep, including in malformed
+    // structural positions that the reader discards. Rust's derived drop walk
+    // would recurse through every nested `List`; drain descendants onto an
+    // explicit heap stack instead. This applies to every owned `S` (roots,
+    // parser stacks, reader task stacks, and truncated extras), so error paths
+    // are no less safe than successful decoding.
+    impl Drop for S {
+        fn drop(&mut self) {
+            let mut pending = Vec::new();
+            if let S::List(children) = self {
+                pending.append(children);
+            }
+            while let Some(mut value) = pending.pop() {
+                if let S::List(children) = &mut value {
+                    pending.append(children);
+                }
+                // `value` now has no owned descendants, so its own Drop is
+                // constant-depth.
+            }
+        }
+    }
+
     use S::{Atom as A, List as L, Str as Q};
 
     /// Print one artifact as canonical text, pretty-printed at a fixed width
@@ -1538,6 +1561,13 @@ pub mod text {
         }
     }
 
+    fn list_contents(mut value: S) -> Option<Vec<S>> {
+        match &mut value {
+            L(values) => Some(std::mem::take(values)),
+            _ => None,
+        }
+    }
+
     fn plain_fallback() -> Type {
         Type {
             core: Core::Undecided,
@@ -1598,14 +1628,14 @@ pub mod text {
             }
         }
 
-        fn list(&self, value: S, tag: &str) -> Vec<S> {
-            match value {
-                L(mut values) => {
+        fn list(&self, mut value: S, tag: &str) -> Vec<S> {
+            match &mut value {
+                L(values) => {
                     if !matches!(values.first(), Some(A(found)) if found == tag) {
                         self.fail(format!("expected `{tag}`"));
                     }
-                    self.take(&mut values);
-                    values
+                    self.take(values);
+                    std::mem::take(values)
                 }
                 _ => {
                     self.fail(format!("expected `{tag}` list"));
@@ -1614,9 +1644,9 @@ pub mod text {
             }
         }
 
-        fn atom(&self, value: S) -> String {
-            match value {
-                A(value) => value,
+        fn atom(&self, mut value: S) -> String {
+            match &mut value {
+                A(value) => std::mem::take(value),
                 _ => {
                     self.fail("expected artifact atom");
                     String::new()
@@ -1624,9 +1654,9 @@ pub mod text {
             }
         }
 
-        fn string(&self, value: S) -> String {
-            match value {
-                Q(value) => value,
+        fn string(&self, mut value: S) -> String {
+            match &mut value {
+                Q(value) => std::mem::take(value),
                 _ => {
                     self.fail("expected artifact string");
                     String::new()
@@ -1766,8 +1796,8 @@ pub mod text {
                     })
                 }
             };
-            let kind = match self.take(&mut value) {
-                L(mut values) => {
+            let kind = match list_contents(self.take(&mut value)) {
+                Some(mut values) => {
                     let tag = self.atom(self.take(&mut values));
                     match tag.as_str() {
                         "operations" => EffectKind::Operations(
@@ -1840,10 +1870,8 @@ pub mod text {
                         let mut names = Vec::with_capacity(fields.len());
                         let mut field_values = Vec::with_capacity(fields.len());
                         for field in fields {
-                            let values = match field {
-                                L(values) => values,
-                                _ => self.invalid("bad type field", Vec::new()),
-                            };
+                            let values = list_contents(field)
+                                .unwrap_or_else(|| self.invalid("bad type field", Vec::new()));
                             let mut values = self.exact(values, 2, "type field");
                             names.push(self.string(self.take(&mut values)));
                             field_values.push(self.take(&mut values));
@@ -1854,7 +1882,7 @@ pub mod text {
                         }
                         tasks.push(Task::Core(core));
                     }
-                    Task::Core(value) => match value {
+                    Task::Core(mut value) => match &mut value {
                         A(value) => out.push(Out::Core(match value.as_str() {
                             "unit" => Core::Unit,
                             "nat" => Core::Nat,
@@ -1865,7 +1893,8 @@ pub mod text {
                             "undecided" => Core::Undecided,
                             _ => self.invalid("invalid type core", Core::Undecided),
                         })),
-                        L(mut values) => {
+                        L(values) => {
+                            let mut values = std::mem::take(values);
                             let tag = self.atom(self.take(&mut values));
                             match tag.as_str() {
                                 "arrow" => {
@@ -1922,10 +1951,8 @@ pub mod text {
                         let mut names = Vec::with_capacity(labels.len());
                         let mut fields = Vec::with_capacity(labels.len());
                         for label in labels {
-                            let values = match label {
-                                L(values) => values,
-                                _ => self.invalid("bad row label", Vec::new()),
-                            };
+                            let values = list_contents(label)
+                                .unwrap_or_else(|| self.invalid("bad row label", Vec::new()));
                             let mut values = self.exact(values, 2, "row label");
                             names.push(self.string(self.take(&mut values)));
                             fields.push(self.take(&mut values));
@@ -1936,30 +1963,34 @@ pub mod text {
                             tasks.push(Task::Field(value));
                         }
                     }
-                    Task::Rest(value) => match value {
+                    Task::Rest(mut value) => match &mut value {
                         A(value) if value == "closed" => out.push(Out::Rest(Rest::Closed)),
                         A(value) if value == "undecided" => out.push(Out::Rest(Rest::Undecided)),
-                        L(mut values) => match self.atom(self.take(&mut values)).as_str() {
-                            "var" => out.push(Out::Rest(Rest::Var(
-                                self.number(self.exact(values, 1, "rest var").remove(0)),
-                            ))),
-                            "bound" => out.push(Out::Rest(Rest::Bound(
-                                self.number(self.exact(values, 1, "rest bound").remove(0)),
-                            ))),
-                            "rigid" => {
-                                let mut values = self.exact(values, 2, "rest rigid");
-                                let id = self.number(self.take(&mut values));
-                                let name = self.string(self.take(&mut values));
-                                out.push(Out::Rest(Rest::Rigid { id, name }));
+                        L(values) => {
+                            let mut values = std::mem::take(values);
+                            match self.atom(self.take(&mut values)).as_str() {
+                                "var" => out.push(Out::Rest(Rest::Var(
+                                    self.number(self.exact(values, 1, "rest var").remove(0)),
+                                ))),
+                                "bound" => out.push(Out::Rest(Rest::Bound(
+                                    self.number(self.exact(values, 1, "rest bound").remove(0)),
+                                ))),
+                                "rigid" => {
+                                    let mut values = self.exact(values, 2, "rest rigid");
+                                    let id = self.number(self.take(&mut values));
+                                    let name = self.string(self.take(&mut values));
+                                    out.push(Out::Rest(Rest::Rigid { id, name }));
+                                }
+                                "more" => {
+                                    let value = self.exact(values, 1, "more").remove(0);
+                                    tasks.push(Task::BuildMore);
+                                    tasks.push(Task::Row(value));
+                                }
+                                _ => out.push(Out::Rest(
+                                    self.invalid("invalid row rest", Rest::Undecided),
+                                )),
                             }
-                            "more" => {
-                                let value = self.exact(values, 1, "more").remove(0);
-                                tasks.push(Task::BuildMore);
-                                tasks.push(Task::Row(value));
-                            }
-                            _ => out
-                                .push(Out::Rest(self.invalid("invalid row rest", Rest::Undecided))),
-                        },
+                        }
                         _ => out.push(Out::Rest(self.invalid("invalid row rest", Rest::Undecided))),
                     },
                     Task::Field(value) => {
@@ -2069,20 +2100,23 @@ pub mod text {
                 _ => plain_fallback(),
             }
         }
-        fn read_presence(&self, value: S) -> Presence {
-            match value {
+        fn read_presence(&self, mut value: S) -> Presence {
+            match &mut value {
                 A(value) if value == "present" => Presence::Present,
                 A(value) if value == "absent" => Presence::Absent,
                 A(value) if value == "undecided" => Presence::Undecided,
-                L(mut values) => match self.atom(self.take(&mut values)).as_str() {
-                    "var" => {
-                        Presence::Var(self.number(self.exact(values, 1, "presence var").remove(0)))
+                L(values) => {
+                    let mut values = std::mem::take(values);
+                    match self.atom(self.take(&mut values)).as_str() {
+                        "var" => Presence::Var(
+                            self.number(self.exact(values, 1, "presence var").remove(0)),
+                        ),
+                        "bound" => Presence::Bound(
+                            self.number(self.exact(values, 1, "presence bound").remove(0)),
+                        ),
+                        _ => self.invalid("invalid presence", Presence::Undecided),
                     }
-                    "bound" => Presence::Bound(
-                        self.number(self.exact(values, 1, "presence bound").remove(0)),
-                    ),
-                    _ => self.invalid("invalid presence", Presence::Undecided),
-                },
+                }
                 _ => self.invalid("invalid presence", Presence::Undecided),
             }
         }
@@ -2105,10 +2139,11 @@ pub mod text {
                         let left = out.pop().unwrap_or(Formula::False);
                         out.push(make(Box::new(left), Box::new(right)));
                     }
-                    Task::Read(value) => match value {
+                    Task::Read(mut value) => match &mut value {
                         A(value) if value == "true" => out.push(Formula::True),
                         A(value) if value == "false" => out.push(Formula::False),
-                        L(mut values) => {
+                        L(values) => {
+                            let mut values = std::mem::take(values);
                             let tag = self.atom(self.take(&mut values));
                             match tag.as_str() {
                                 "var" => out.push(Formula::Var(
@@ -2262,10 +2297,7 @@ pub mod text {
                             out.push(Out::Op(self.read_leaf_op(value)));
                             continue;
                         }
-                        let mut values = match value {
-                            L(values) => values,
-                            _ => unreachable!(),
-                        };
+                        let mut values = list_contents(value).expect("recursive op is a list");
                         let tag = self.atom(self.take(&mut values));
                         match tag.as_str() {
                             "catch" => {
@@ -2287,10 +2319,9 @@ pub mod text {
                                 let mut names = Vec::with_capacity(cases.len());
                                 let mut blocks = Vec::with_capacity(cases.len());
                                 for case in cases {
-                                    let values = match case {
-                                        L(v) => v,
-                                        _ => self.invalid("bad tag case", Vec::new()),
-                                    };
+                                    let values = list_contents(case).unwrap_or_else(|| {
+                                        self.invalid("bad tag case", Vec::new())
+                                    });
                                     let mut values = self.exact(values, 2, "tag case");
                                     names.push(self.string(self.take(&mut values)));
                                     blocks.push(self.take(&mut values));
@@ -2319,10 +2350,9 @@ pub mod text {
                                 let mut literals = Vec::with_capacity(cases.len());
                                 let mut blocks = Vec::with_capacity(cases.len());
                                 for case in cases {
-                                    let values = match case {
-                                        L(v) => v,
-                                        _ => self.invalid("bad primitive case", Vec::new()),
-                                    };
+                                    let values = list_contents(case).unwrap_or_else(|| {
+                                        self.invalid("bad primitive case", Vec::new())
+                                    });
                                     let mut values = self.exact(values, 2, "primitive case");
                                     literals.push(self.read_literal(self.take(&mut values)));
                                     blocks.push(self.take(&mut values));
@@ -2485,10 +2515,11 @@ pub mod text {
             }
         }
         fn read_leaf_op(&self, value: S) -> Op {
-            let mut values = match value {
-                L(values) => values,
-                A(value) if value == "new-tag" => return Op::NewTag,
-                _ => return self.invalid("invalid operation", Op::NewTag),
+            if matches!(&value, A(atom) if atom == "new-tag") {
+                return Op::NewTag;
+            }
+            let Some(mut values) = list_contents(value) else {
+                return self.invalid("invalid operation", Op::NewTag);
             };
             let tag = self.atom(self.take(&mut values));
             match tag.as_str() {
@@ -2506,10 +2537,8 @@ pub mod text {
                     values
                         .into_iter()
                         .map(|value| {
-                            let value = match value {
-                                L(values) => values,
-                                _ => self.invalid("bad struct entry", Vec::new()),
-                            };
+                            let value = list_contents(value)
+                                .unwrap_or_else(|| self.invalid("bad struct entry", Vec::new()));
                             let mut value = self.exact(value, 2, "struct entry");
                             (
                                 self.string(self.take(&mut value)),
@@ -2551,8 +2580,8 @@ pub mod text {
                 }
                 "call" => {
                     let mut values = self.exact(values, 2, "call");
-                    let callee = match self.take(&mut values) {
-                        L(target) => {
+                    let callee = match list_contents(self.take(&mut values)) {
+                        Some(target) => {
                             let mut target = self.exact(target, 2, "call target");
                             match self.atom(self.take(&mut target)).as_str() {
                                 "direct" => Callee::Direct(self.number(self.take(&mut target))),
@@ -2583,10 +2612,8 @@ pub mod text {
             )
         }
         fn read_end(&self, value: S) -> End {
-            let mut values = match value {
-                L(values) => values,
-                _ => self.invalid("invalid terminator", Vec::new()),
-            };
+            let mut values = list_contents(value)
+                .unwrap_or_else(|| self.invalid("invalid terminator", Vec::new()));
             let tag = self.atom(self.take(&mut values));
             match tag.as_str() {
                 "ret" => End::Ret(self.number(self.exact(values, 1, "ret").remove(0))),
@@ -2602,10 +2629,8 @@ pub mod text {
             }
         }
         fn read_literal(&self, value: S) -> Literal {
-            let mut values = match value {
-                L(values) => values,
-                _ => self.invalid("invalid literal", Vec::new()),
-            };
+            let mut values =
+                list_contents(value).unwrap_or_else(|| self.invalid("invalid literal", Vec::new()));
             let tag = self.atom(self.take(&mut values));
             match tag.as_str() {
                 "nat" => {

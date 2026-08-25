@@ -788,6 +788,34 @@ fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
 }
 
 #[test]
+fn balanced_malformed_deep_values_fail_on_a_small_stack() {
+    const DEPTH: usize = 30_000;
+    let nested = format!("{}wrong{}", "(wrong ".repeat(DEPTH), ")".repeat(DEPTH));
+    let header = "(header (identity \"deep\" \"1\") (dependencies) (values) (types) (effects))";
+    let lir = "(lir (functions) (globals))";
+
+    // The first input is structurally balanced but puts an arbitrarily deep
+    // list where a dependency string belongs. The second puts the same value
+    // in an extra root slot, which `exact` must discard after reporting arity.
+    // Both exercise destruction of fully built parser data on semantic error.
+    let malformed = [
+        format!(
+            "(artifact (header (identity \"deep\" \"1\") (dependencies (dependency {nested} \"1\")) (values) (types) (effects)) {lir})"
+        ),
+        format!("(artifact {header} {lir} {nested})"),
+    ];
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            for text in malformed {
+                Artifact::try_parse(&text).expect_err("wrong deep structural value");
+            }
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
 fn artifact_function_indices_are_fixed_width_and_checked_by_the_parser() {
     let mut value = model_artifact();
     let closure = value.lir.functions[0]

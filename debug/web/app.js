@@ -423,16 +423,32 @@ function setLink(link) {
 
 // ── title bar ────────────────────────────────────────────────────────────
 
+function parseDependencies(input) {
+  if (!input.trim()) return [];
+  return input.split(",").map((raw, index) => {
+    const part = raw.trim();
+    const at = part.lastIndexOf("@");
+    const name = part.slice(0, at).trim();
+    const version = part.slice(at + 1).trim();
+    if (at <= 0 || !name || !version) {
+      throw new Error(`Dependency ${index + 1} must be written as name@version (both parts are required).`);
+    }
+    return { name, version };
+  });
+}
+
 function wireTitlebar() {
   el("doc-button").addEventListener("click", openSwitcher);
   el("dependencies").addEventListener("click", () => {
     const current = state.dependencies.map(({ name, version }) => `${name}@${version}`).join(", ");
     const entered = window.prompt("Dependencies (name@version, comma-separated)", current);
     if (entered === null) return;
-    state.dependencies = entered.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
-      const at = part.lastIndexOf("@");
-      return at > 0 ? { name: part.slice(0, at), version: part.slice(at + 1) } : { name: part, version: "" };
-    });
+    try {
+      state.dependencies = parseDependencies(entered);
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
     cacheLocally();
     scheduleCompile();
     renderTitlebar();
