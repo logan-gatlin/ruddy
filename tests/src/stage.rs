@@ -757,8 +757,11 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         "{:#?}",
         artifact_stage.nodes
     );
+    assert_eq!(artifact_stage.nodes[0].children[0].label, "dependencies");
+    assert_eq!(artifact_stage.nodes[0].children[0].text, "0 declared");
+    assert!(artifact_stage.nodes[0].children[0].children.is_empty());
     assert!(
-        artifact_stage.summary.contains("1 values"),
+        artifact_stage.summary.contains("0 dependencies · 1 values"),
         "{}",
         artifact_stage.summary
     );

@@ -24,6 +24,8 @@ pub struct Artifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub identity: Identity,
+    /// The bundles this artifact depends on.
+    pub dependencies: Vec<Dependency>,
     /// Every top-level `let`, in source declaration order.
     pub values: Vec<Value>,
     /// Every declared type, in source declaration order.
@@ -35,6 +37,13 @@ pub struct Header {
 /// The identity that owns an artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
+    pub name: String,
+    pub version: String,
+}
+
+/// The identity of one bundle this artifact depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
     pub name: String,
     pub version: String,
 }
@@ -392,6 +401,7 @@ pub fn build(
             name: mint.bundle().name().to_string(),
             version: mint.bundle().version().to_string(),
         },
+        dependencies: Vec::new(),
         values: program
             .terms
             .keys()
@@ -873,6 +883,9 @@ pub mod text {
                 Q(value.identity.name.clone()),
                 Q(value.identity.version.clone()),
             ]),
+            L(std::iter::once(A("dependencies".into()))
+                .chain(value.dependencies.iter().map(dependency))
+                .collect()),
             L(std::iter::once(A("values".into()))
                 .chain(value.values.iter().map(value_))
                 .collect()),
@@ -882,6 +895,13 @@ pub mod text {
             L(std::iter::once(A("effects".into()))
                 .chain(value.effects.iter().map(effect))
                 .collect()),
+        ])
+    }
+    fn dependency(value: &Dependency) -> S {
+        L(vec![
+            A("dependency".into()),
+            Q(value.name.clone()),
+            Q(value.version.clone()),
         ])
     }
     fn value_(value: &Value) -> S {
@@ -1434,7 +1454,7 @@ pub mod text {
         }
     }
     fn read_header(value: S) -> Header {
-        let mut values = exact(list(value, "header"), 4, "header");
+        let mut values = exact(list(value, "header"), 5, "header");
         let identity = {
             let mut value = exact(list(values.remove(0), "identity"), 2, "identity");
             Identity {
@@ -1444,6 +1464,10 @@ pub mod text {
         };
         Header {
             identity,
+            dependencies: many(values.remove(0), "dependencies")
+                .into_iter()
+                .map(read_dependency)
+                .collect(),
             values: many(values.remove(0), "values")
                 .into_iter()
                 .map(read_value)
@@ -1456,6 +1480,13 @@ pub mod text {
                 .into_iter()
                 .map(read_effect)
                 .collect(),
+        }
+    }
+    fn read_dependency(value: S) -> Dependency {
+        let mut value = exact(list(value, "dependency"), 2, "dependency");
+        Dependency {
+            name: string(value.remove(0)),
+            version: string(value.remove(0)),
         }
     }
     fn read_value(value: S) -> Value {

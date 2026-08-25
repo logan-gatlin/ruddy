@@ -18,7 +18,26 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let text = Artifact::print(artifact);
     let mut ids = Ids::default();
 
-    let mut interface = Vec::new();
+    let dependency_nodes: Vec<_> = artifact
+        .header
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            Node::new(
+                ids.next(),
+                "dependency",
+                format!("{}@{}", dependency.name, dependency.version),
+            )
+        })
+        .collect();
+    let mut interface = vec![
+        Node::new(
+            ids.next(),
+            "dependencies",
+            format!("{} declared", artifact.header.dependencies.len()),
+        )
+        .children(dependency_nodes),
+    ];
     for value in &artifact.header.values {
         interface.push(Node::new(ids.next(), "value", &value.name));
     }
@@ -64,7 +83,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         ..spec.stage(
             cx.status(),
             format!(
-                "{} values · {} types · {} effects · {} functions · {} globals",
+                "{} dependencies · {} values · {} types · {} effects · {} functions · {} globals",
+                artifact.header.dependencies.len(),
                 artifact.header.values.len(),
                 artifact.header.types.len(),
                 artifact.header.effects.len(),

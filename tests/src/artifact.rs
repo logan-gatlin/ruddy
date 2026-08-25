@@ -232,6 +232,16 @@ fn model_artifact() -> Artifact {
                 name: "bundle".to_string(),
                 version: "1.0.0".to_string(),
             },
+            dependencies: vec![
+                artifact::Dependency {
+                    name: "base".to_string(),
+                    version: "2.1.0".to_string(),
+                },
+                artifact::Dependency {
+                    name: "support".to_string(),
+                    version: "3.0.0-beta.1".to_string(),
+                },
+            ],
             values,
             types: vec![
                 artifact::DeclaredType {
@@ -403,6 +413,7 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
     );
     assert_eq!(artifact.header.identity.name, "tests");
     assert_eq!(artifact.header.identity.version, "0.1.0");
+    assert!(artifact.header.dependencies.is_empty());
     assert_eq!(artifact.header.values.len(), 2);
     assert_eq!(artifact.header.types.len(), 1);
     assert_eq!(artifact.header.effects.len(), 2);
@@ -442,6 +453,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
                 name,
                 version: "1".to_string(),
             },
+            dependencies: Vec::new(),
             values: Vec::new(),
             types: Vec::new(),
             effects: Vec::new(),
@@ -455,7 +467,12 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     assert_eq!(
         empty("界".repeat(12)).print(),
         "(artifact\n\
-         \x20 (header (identity \"界界界界界界界界界界界界\" \"1\") (values) (types) (effects))\n\
+         \x20 (header\n\
+         \x20   (identity \"界界界界界界界界界界界界\" \"1\")\n\
+         \x20   (dependencies)\n\
+         \x20   (values)\n\
+         \x20   (types)\n\
+         \x20   (effects))\n\
          \x20 (lir (functions) (globals)))\n"
     );
     assert_eq!(
@@ -463,10 +480,23 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
         "(artifact\n\
          \x20 (header\n\
          \x20   (identity \"界界界界界界界界界界界界界\" \"1\")\n\
+         \x20   (dependencies)\n\
          \x20   (values)\n\
          \x20   (types)\n\
          \x20   (effects))\n\
          \x20 (lir (functions) (globals)))\n"
+    );
+}
+
+#[test]
+fn dependencies_round_trip_in_canonical_text() {
+    let artifact = model_artifact();
+    let printed = assert_round_trip(&artifact);
+
+    assert!(printed.contains("(dependencies\n      (dependency \"base\" \"2.1.0\")"));
+    assert_eq!(
+        Artifact::parse(&printed).header.dependencies,
+        artifact.header.dependencies
     );
 }
 
@@ -525,14 +555,14 @@ fn malformed_trusted_text_paths_arities_and_tags_panic() {
         "\"",
         "(artifact)",
         "(artifact (header) (lir))",
-        "(artifact (header (identity \"x\" \"1\") (values) (types) (effects)) (lir (functions) (globals)) trailing)",
-        "(artifact (header (identity \"x\" \"1\") (values) (types) (effects)) (lir (functions) (globals)) extra",
-        "(artifact (header (identity \"\\u001\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u00gg\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u0041\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\u000a\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\ud800\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
-        "(artifact (header (identity \"\\q\" \"1\") (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"x\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) trailing)",
+        "(artifact (header (identity \"x\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)) extra",
+        "(artifact (header (identity \"\\u001\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u00gg\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u0041\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\u000a\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\ud800\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
+        "(artifact (header (identity \"\\q\" \"1\") (dependencies) (values) (types) (effects)) (lir (functions) (globals)))",
     ] {
         assert_malformed(text);
     }
@@ -541,6 +571,8 @@ fn malformed_trusted_text_paths_arities_and_tags_panic() {
         ("(artifact ", "(bundle "),
         ("(header ", "(heading "),
         ("(identity ", "(owner "),
+        ("(dependencies ", "(requires "),
+        ("(dependency ", "(requirement "),
         ("(values ", "(exports "),
         ("(value ", "(export "),
         ("(types ", "(declared-types "),
@@ -605,6 +637,7 @@ fn malformed_trusted_text_paths_arities_and_tags_panic() {
     for (from, to) in [
         ("(artifact ", "(artifact extra "),
         ("(identity \"bundle\" \"1.0.0\")", "(identity \"bundle\")"),
+        ("(dependency \"base\" \"2.1.0\")", "(dependency \"base\")"),
         ("(scheme 15 7", "(scheme 15"),
         ("(ty unit (fields", "(ty unit extra (fields"),
         ("(param 0 nat)", "(param 0 nat extra)"),
