@@ -129,6 +129,27 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
 
     let module_error = error(&directory);
     assert!(module_error.contains("src/Child.hc:1:"), "{module_error}");
+
+    fs::remove_file(directory.path().join("src/Child.hc")).expect("remove the module file");
+    let missing = error(&directory);
+    assert!(
+        missing.contains("create `src/Child.hc` or `src/Child/module.hc`"),
+        "{missing}",
+    );
+
+    fs::write(directory.path().join("src/Child.hc"), "let beside = 1n\n")
+        .expect("write the beside candidate");
+    fs::create_dir(directory.path().join("src/Child")).expect("create module directory");
+    fs::write(
+        directory.path().join("src/Child/module.hc"),
+        "let inside = 1n\n",
+    )
+    .expect("write the inside candidate");
+    let ambiguous = error(&directory);
+    assert!(
+        ambiguous.contains("delete one of `src/Child.hc` or `src/Child/module.hc`"),
+        "{ambiguous}",
+    );
 }
 
 #[test]

@@ -270,11 +270,14 @@ impl Loader<'_> {
         // but its body must not be spliced a second time: the repeated copy
         // would turn every declaration in the file into a spurious duplicate.
         // A logical module has exactly these two possible paths, so a loaded
-        // candidate can only be this same module reached earlier.
+        // *module body* candidate can only be this same module reached earlier.
+        // The root is not a module body merely because its configured name
+        // collides with one of these paths; it remains a real candidate below.
         if self
             .out
             .loaded
             .iter()
+            .skip(1)
             .any(|file| file.path == beside || file.path == inside)
         {
             return Vec::new();

@@ -301,6 +301,40 @@ fn a_module_with_two_files_is_reported_and_neither_is_read() {
     assert_eq!(names(&out.stmts), ["module Math", "let x"]);
 }
 
+/// The configured root is loaded for its root role, not as an earlier load of
+/// a same-named module body. Both module candidates must therefore still be
+/// considered when the root itself has the beside spelling.
+#[test]
+fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
+    let fs = Memory(HashMap::from([
+        (
+            "Child.hc".to_string(),
+            "bundle demo 0.1.0\nmodule Child\n".to_string(),
+        ),
+        (
+            "Child/module.hc".to_string(),
+            "let inside = 1n\n".to_string(),
+        ),
+    ]));
+    let mut manager = FileManager::new();
+    let out = bundle::load(&mut manager, &fs, "Child.hc");
+
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| &error.kind)
+            .collect::<Vec<_>>(),
+        [&ErrorKind::ModuleFileAmbiguous {
+            beside: "Child.hc".to_string(),
+            inside: "Child/module.hc".to_string(),
+        }],
+        "{:#?}",
+        out.errors,
+    );
+    assert_eq!(paths(&out), ["Child.hc"]);
+    assert_eq!(names(body(&out.stmts, "Child")), [] as [String; 0]);
+}
+
 /// Only the root file carries the identity, so a header anywhere else is a
 /// second answer to a settled question. The file's own statements still load.
 #[test]

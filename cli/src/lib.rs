@@ -145,7 +145,10 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
                 "bundle",
                 error.kind.code(),
                 error.span,
-                &error.kind,
+                &BundleMessage {
+                    kind: &error.kind,
+                    source_directory,
+                },
                 source_directory,
             ));
         }
@@ -284,6 +287,35 @@ fn load_dependency(
         name,
         version: requested,
     })
+}
+
+/// A bundle complaint rendered from the project boundary. The loader keeps
+/// candidate paths relative to the bundle root for debugger and in-memory
+/// consumers; at the CLI those instructions need the configured source
+/// directory prefix to name files the user can actually create or delete.
+struct BundleMessage<'a> {
+    kind: &'a bundle::ErrorKind,
+    source_directory: &'a Path,
+}
+
+impl fmt::Display for BundleMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            bundle::ErrorKind::ModuleFileMissing { beside, inside } => write!(
+                formatter,
+                "this module has no file; create `{}` or `{}`",
+                self.source_directory.join(beside).display(),
+                self.source_directory.join(inside).display(),
+            ),
+            bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
+                formatter,
+                "this module has two files; delete one of `{}` or `{}`",
+                self.source_directory.join(beside).display(),
+                self.source_directory.join(inside).display(),
+            ),
+            kind => kind.fmt(formatter),
+        }
+    }
 }
 
 fn diagnostic(
