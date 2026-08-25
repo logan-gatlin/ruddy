@@ -485,47 +485,12 @@ fn colons_written_apart_stay_two_colons() {
     assert!(matches!(kinds(":")[..], [Kind::Colon]));
 }
 
-/// The two words the module grammar reserves, and the rule that keeps `modules`
-/// and `bundles` ordinary names — the one `matches` already relies on.
+/// `module` is reserved, while words that merely start the same way and the
+/// former `bundle` keyword remain ordinary names.
 #[test]
-fn the_module_keywords_are_reserved() {
-    assert!(matches!(kinds("bundle")[..], [Kind::Bundle]));
+fn the_module_keyword_is_reserved() {
+    assert!(matches!(&kinds("bundle")[..], [Kind::Identifier(name)] if name == "bundle"));
     assert!(matches!(kinds("module")[..], [Kind::Module]));
     assert!(matches!(&kinds("bundles")[..], [Kind::Identifier(name)] if name == "bundles"));
     assert!(matches!(&kinds("modules")[..], [Kind::Identifier(name)] if name == "modules"));
-}
-
-/// A header needs no literal of its own: `0.1.0` is already three naturals with
-/// dots between them, which is why a prerelease is simply unwritable.
-#[test]
-fn a_version_lexes_as_naturals_and_dots() {
-    assert!(matches!(
-        kinds("bundle demo 0.1.0")[..],
-        [
-            Kind::Bundle,
-            Kind::Identifier(_),
-            Kind::Natural(0),
-            Kind::Dot,
-            Kind::Natural(1),
-            Kind::Dot,
-            Kind::Natural(0)
-        ]
-    ));
-}
-
-#[test]
-fn a_version_component_keeps_all_u64_bits() {
-    let source = format!("bundle demo {}.0.0", u64::MAX);
-    assert!(matches!(
-        kinds(&source)[..],
-        [
-            Kind::Bundle,
-            Kind::Identifier(_),
-            Kind::Natural(value),
-            Kind::Dot,
-            Kind::Natural(0),
-            Kind::Dot,
-            Kind::Natural(0)
-        ] if value == u64::MAX
-    ));
 }

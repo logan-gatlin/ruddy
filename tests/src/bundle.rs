@@ -15,7 +15,7 @@ use ruddy::{
     inference,
     ir::{self, TypeKind},
     parse::StmtKind,
-    symbol::{Mint, Version},
+    symbol::{Bundle, Mint, Version},
     tracking::{FileID, FileManager},
 };
 
@@ -86,19 +86,13 @@ fn fixture(name: &str) -> Disk {
     Disk::new(root)
 }
 
-/// The ordinary case: one file, a header, and nothing to splice. Everything
-/// after it is a variation on this, so it is worth pinning that the plain
-/// program costs no complaints at all.
+/// The ordinary case: one file and nothing to splice. Everything after it is
+/// a variation on this, so it is worth pinning that the plain program costs no
+/// complaints at all.
 #[test]
 fn a_single_file_bundle_loads_with_no_errors() {
-    let out = one("bundle demo 0.1.0\n\nlet id = fn x => x\n");
+    let out = one("let id = fn x => x\n");
 
-    let bundle = out
-        .bundle
-        .as_ref()
-        .expect("the header declared an identity");
-    assert_eq!(bundle.name(), "demo");
-    assert_eq!(*bundle.version(), Version::new(0, 1, 0));
     assert_eq!(paths(&out), ["main.hc"]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(names(&out.stmts), ["let id"]);
@@ -112,10 +106,7 @@ fn a_single_file_bundle_loads_with_no_errors() {
 #[test]
 fn a_nested_bundle_splices_every_file_into_one_tree() {
     let (manager, out) = load(&[
-        (
-            "main.hc",
-            "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
-        ),
+        ("main.hc", "module Math\nlet four = Math::double 2n\n"),
         ("Math.hc", "module Vec\nlet double = fn x => x\n"),
         ("Math/Vec.hc", "let zero = 0n\n"),
     ]);
@@ -156,14 +147,14 @@ fn file_modules_share_structural_effects() {
     let out = load(&[
         (
             "main.hc",
-            "bundle demo 0.1.0\nmodule Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n",
+            "module Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n",
         ),
         ("Foo.hc", "effect Log = write : Nat -> ()\n"),
         ("Bar.hc", "effect Log = write : Nat -> ()\n"),
     ])
     .1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let mut mint = Mint::new(out.bundle.clone().expect("bundle identity"));
+    let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
     let mut lowered = ir::build(&mut mint, out.stmts);
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
     let inferred = inference::infer(&mint, &mut lowered.program);
@@ -190,7 +181,7 @@ fn file_modules_share_structural_effects() {
 #[test]
 fn a_module_directory_serves_in_place_of_a_file_beside_it() {
     let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+        ("main.hc", "module Math\n"),
         ("Math/module.hc", "let double = fn x => x\n"),
     ])
     .1;
@@ -207,10 +198,7 @@ fn a_module_directory_serves_in_place_of_a_file_beside_it() {
 #[test]
 fn a_file_module_inside_an_inline_module_is_looked_for_under_it() {
     let out = load(&[
-        (
-            "main.hc",
-            "bundle demo 0.1.0\nmodule A =\n  module B\nend\n",
-        ),
+        ("main.hc", "module A =\n  module B\nend\n"),
         ("A/B.hc", "let x = 1n\n"),
         // Beside the root, where it must *not* be found: a loader that dropped
         // the enclosing module from the path would read this one and pass.
@@ -230,7 +218,7 @@ fn a_file_module_inside_an_inline_module_is_looked_for_under_it() {
 /// complaint in the program.
 #[test]
 fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
-    let out = one("bundle demo 0.1.0\nmodule Gone\nlet x = 1n\n");
+    let out = one("module Gone\nlet x = 1n\n");
 
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(
@@ -241,7 +229,7 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
         }
     );
     // At the declaration, which is the name the reader wrote.
-    let source = "bundle demo 0.1.0\nmodule Gone\nlet x = 1n\n";
+    let source = "module Gone\nlet x = 1n\n";
     let at = source.find("Gone").expect("the module is declared");
     assert_eq!(out.errors[0].span.start, at);
     // An empty body rather than none, so nothing downstream has to know the
@@ -256,13 +244,13 @@ fn a_module_with_no_file_is_reported_and_the_rest_still_loads() {
 #[test]
 fn a_repeated_file_module_does_not_splice_its_body_twice() {
     let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule Math\nmodule Math\n"),
+        ("main.hc", "module Math\nmodule Math\n"),
         ("Math.hc", "let double = fn x => x\n"),
     ])
     .1;
 
     assert_eq!(paths(&out), ["main.hc", "Math.hc"]);
-    let mut mint = ruddy::symbol::Mint::new(out.bundle.clone().expect("valid header"));
+    let mut mint = Mint::new(Bundle::new("demo", Version::new(0, 1, 0)).expect("valid bundle"));
     let built = ruddy::ir::build(&mut mint, out.stmts);
     assert_eq!(
         built
@@ -282,7 +270,7 @@ fn a_repeated_file_module_does_not_splice_its_body_twice() {
 #[test]
 fn a_module_with_two_files_is_reported_and_neither_is_read() {
     let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule Math\nlet x = 1n\n"),
+        ("main.hc", "module Math\nlet x = 1n\n"),
         ("Math.hc", "let beside = 1n\n"),
         ("Math/module.hc", "let inside = 1n\n"),
     ])
@@ -307,10 +295,7 @@ fn a_module_with_two_files_is_reported_and_neither_is_read() {
 #[test]
 fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
     let fs = Memory(HashMap::from([
-        (
-            "Child.hc".to_string(),
-            "bundle demo 0.1.0\nmodule Child\n".to_string(),
-        ),
+        ("Child.hc".to_string(), "module Child\n".to_string()),
         (
             "Child/module.hc".to_string(),
             "let inside = 1n\n".to_string(),
@@ -335,60 +320,6 @@ fn a_root_name_collision_does_not_hide_ambiguous_module_files() {
     assert_eq!(names(body(&out.stmts, "Child")), [] as [String; 0]);
 }
 
-/// Only the root file carries the identity, so a header anywhere else is a
-/// second answer to a settled question. The file's own statements still load.
-#[test]
-fn a_header_outside_the_root_is_reported_at_the_header() {
-    let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
-        ("Math.hc", "bundle other 1.0.0\nlet double = fn x => x\n"),
-    ])
-    .1;
-
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::MisplacedBundleDeclaration);
-    assert_eq!(out.errors[0].span.start, 0);
-    assert_eq!(out.errors[0].span.file_id, out.loaded[1].id);
-    // The root's identity stands, and the file loads anyway.
-    assert_eq!(
-        out.bundle.as_ref().expect("the root declared one").name(),
-        "demo"
-    );
-    assert_eq!(names(body(&out.stmts, "Math")), ["let double"]);
-}
-
-/// The root must open with one. Reported at the start of the file, which is
-/// where the missing line would go, and compilation continues under the
-/// fallback so every later phase still produces output.
-#[test]
-fn a_root_with_no_header_is_reported_at_the_start_of_the_file() {
-    let out = one("let x = 1n\n");
-
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::MissingBundleDeclaration);
-    assert_eq!(out.errors[0].span.start, 0);
-    assert_eq!(out.errors[0].span.width, 0);
-    assert!(out.bundle.is_none());
-    assert_eq!(names(&out.stmts), ["let x"]);
-}
-
-/// A name the mint cannot mangle is refused at the header, and the bundle comes
-/// back as none so the caller falls back. The rest of the file still loads —
-/// the whole point of the fallback is that a reader still typing the first line
-/// keeps seeing every later phase.
-#[test]
-fn a_header_the_mint_refuses_is_reported_and_leaves_no_identity() {
-    // A leading `_` is a perfectly good identifier and not a bundle name: only
-    // a letter may start one. Refused by `Bundle::new`, not by the lexer.
-    let out = one("bundle _demo 0.1.0\nlet x = 1n\n");
-
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::BadBundleIdentity);
-    assert_eq!(out.errors[0].span.start, 0);
-    assert!(out.bundle.is_none());
-    assert_eq!(names(&out.stmts), ["let x"]);
-}
-
 /// Every phase's complaints ride on their own file, so a lex error in a module
 /// file and a parse error in another are both reachable and both point at the
 /// right place. This is the half of the load that is not the loader's own
@@ -396,7 +327,7 @@ fn a_header_the_mint_refuses_is_reported_and_leaves_no_identity() {
 #[test]
 fn each_file_carries_its_own_lex_and_parse_errors() {
     let out = load(&[
-        ("main.hc", "bundle demo 0.1.0\nmodule A\nmodule B\n"),
+        ("main.hc", "module A\nmodule B\n"),
         ("A.hc", "let x = @\n"),
         ("B.hc", "let = 1n\n"),
     ])
@@ -422,13 +353,6 @@ fn disk_reads_a_checked_in_fixture() {
 
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(paths(&out), ["main.hc", "Math.hc", "Math/Vec.hc"]);
-    assert_eq!(
-        out.bundle
-            .as_ref()
-            .expect("the fixture has a header")
-            .name(),
-        "nested"
-    );
     let math = body(&out.stmts, "Math");
     assert_eq!(names(body(math, "Vec")), ["let zero"]);
 }
@@ -471,31 +395,13 @@ fn disk_answers_none_for_a_path_that_is_not_there() {
     assert!(fs.read("Math/Nope.hc").is_none());
 }
 
-/// The identity a bundle compiles under when its header is missing or refused.
-/// It has to be one the mint accepts, or the fallback would be a second way to
-/// fail rather than a way not to.
-#[test]
-fn the_fallback_identity_is_a_valid_bundle() {
-    let fallback = bundle::fallback();
-
-    assert_eq!(
-        ruddy::symbol::Bundle::new(fallback.name(), fallback.version().clone()),
-        Some(fallback.clone())
-    );
-    assert!(fallback.version().pre.is_empty());
-    assert!(fallback.version().build.is_empty());
-}
-
 /// A root the loader cannot read is an empty file rather than a panic. Only the
-/// root can reach this — a module's file is looked for before it is read — and
-/// what comes back is the complaint about the header it therefore does not
-/// have.
+/// root can reach this — a module's file is looked for before it is read.
 #[test]
 fn a_root_that_is_not_there_loads_as_an_empty_file() {
     let out = load(&[]).1;
 
     assert_eq!(paths(&out), ["main.hc"]);
     assert!(out.stmts.is_empty());
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::MissingBundleDeclaration);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
 }

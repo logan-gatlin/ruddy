@@ -87,7 +87,7 @@ fn a_file_path_is_a_relative_hc_path_and_nothing_else() {
 fn a_document_round_trips_through_the_disk() {
     let root = scratch("round-trip");
     let files = [
-        file("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+        file("main.hc", "module Math\n"),
         file("Math.hc", "module Vec\nlet double = fn x => x\n"),
         file("Math/Vec.hc", "let zero = 0n\n"),
     ];
@@ -103,7 +103,7 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(
         back,
         [
-            ("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+            ("main.hc", "module Math\n"),
             ("Math.hc", "module Vec\nlet double = fn x => x\n"),
             ("Math/Vec.hc", "let zero = 0n\n"),
         ]
@@ -124,14 +124,13 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         &root,
         "demo",
         &[
-            file("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+            file("main.hc", "module Math\n"),
             file("Math.hc", "let double = fn x => x\n"),
         ],
     )
     .expect("the document is written");
 
-    write(&root, "demo", &[file("main.hc", "bundle demo 0.1.0\n")])
-        .expect("the document is written again");
+    write(&root, "demo", &[file("main.hc", "")]).expect("the document is written again");
 
     let doc = read(&root, "demo").expect("the document is read back");
     let paths: Vec<&str> = doc.files.iter().map(|file| file.path.as_str()).collect();

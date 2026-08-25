@@ -2,7 +2,6 @@
 
 use ruddy::{
     parse::{ErrorKind, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse},
-    symbol::Version,
     token::lex,
     tracking::FileID,
 };
@@ -1822,82 +1821,6 @@ fn a_handler_arm_that_runs_out_reports_where_the_input_ended() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
     assert_eq!(out.errors[0].span.start, source.len());
-}
-
-/// The header a bundle's root file opens with. Read wherever it is written —
-/// which file must have one is [`ruddy::bundle`]'s to say — and never mistaken
-/// for a statement, so the rest of the file parses exactly as it did before.
-#[test]
-fn the_bundle_header_is_read_before_any_statement() {
-    let source = "bundle demo 0.1.0\nlet x = 1n\n";
-    let out = parse(lex(source, FileID::GENERATED).tokens);
-    assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let header = out.header.expect("the file opened with one");
-    assert_eq!(header.name.tracked, "demo");
-    assert_eq!(header.version.tracked, Version::new(0, 1, 0));
-    // The whole header: the keyword through the last version part.
-    assert_eq!(header.span.start, 0);
-    assert_eq!(header.span.end(), "bundle demo 0.1.0".len());
-    assert_eq!(out.stmts.len(), 1);
-}
-
-/// A file with no header simply has none. Requiring one in the root and
-/// refusing it everywhere else needs to know which file this is, and only the
-/// loader does.
-#[test]
-fn a_file_with_no_header_parses_without_one() {
-    let out = parse(lex("let x = 1n", FileID::GENERATED).tokens);
-    assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    assert!(out.header.is_none());
-    assert_eq!(out.stmts.len(), 1);
-}
-
-/// A version has three parts. Two is the unexpected token it looks like,
-/// reported where the third would have gone, and the file after it is still
-/// read — the recovery every malformed statement gets.
-#[test]
-fn a_version_with_two_parts_is_unexpected() {
-    let source = "bundle demo 0.1\nlet x = 1n";
-    let out = parse(lex(source, FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
-    assert_eq!(
-        out.errors[0].span.start,
-        source.find("let").expect("the let")
-    );
-    assert!(out.header.is_none());
-    assert_eq!(out.stmts.len(), 1);
-}
-
-/// A header that runs out of input, and one whose name is not a name. Each is
-/// reported where the missing piece would have gone, and the parser recovers to
-/// the next statement rather than reading the rest of the file as a version.
-#[test]
-fn a_malformed_header_is_reported_and_recovers() {
-    for source in [
-        "bundle demo",
-        "bundle demo 0.",
-        // A version part that is not a literal at all.
-        "bundle demo x.1.0",
-        "bundle 0.1.0",
-        "bundle",
-    ] {
-        let out = parse(lex(source, FileID::GENERATED).tokens);
-        assert!(!out.errors.is_empty(), "{source:?} parsed");
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected, "{source:?}");
-        assert!(out.header.is_none(), "{source:?}");
-    }
-}
-
-/// A part beyond the 64-bit numeric literal range leaves no token for the
-/// parser, which then reports the following punctuation.
-#[test]
-fn a_version_part_too_large_is_unexpected() {
-    let source = format!("bundle demo 0.{}.0", u128::from(u64::MAX) + 1);
-    let out = parse(lex(&source, FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
-    assert_eq!(out.errors[0].span.start, source.rfind('.').unwrap());
 }
 
 /// Both module forms, and the nesting that makes a bundle a tree. A body of
