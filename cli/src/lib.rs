@@ -109,6 +109,9 @@ where
 }
 
 /// Create a new Ruddy project without replacing an existing path.
+///
+/// A write failure can leave a partial project in place; it is not removed by
+/// pathname because another process may have replaced or populated its entries.
 pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     let path = path.as_ref();
     let name = path
@@ -148,25 +151,11 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
 
     let manifest = path.join(MANIFEST);
     let root = path.join(ROOT);
-    let mut manifest_created = false;
-    let result = (|| {
-        write_new_file(&manifest, "root = \"main.hc\"\n\n[dependencies]\n")?;
-        manifest_created = true;
-        write_new_file(
-            &root,
-            &format!("bundle {name} {INITIAL_VERSION}\n\nlet main = 0n\n"),
-        )
-    })();
-    if result.is_err() {
-        // A failed write cleans up its own partial file. Remove only an earlier
-        // file whose successful creation this invocation recorded, then remove
-        // the project directory only if nobody else has populated it.
-        if manifest_created {
-            let _ = fs::remove_file(&manifest);
-        }
-        let _ = fs::remove_dir(path);
-    }
-    result
+    write_new_file(&manifest, "root = \"main.hc\"\n\n[dependencies]\n")?;
+    write_new_file(
+        &root,
+        &format!("bundle {name} {INITIAL_VERSION}\n\nlet main = 0n\n"),
+    )
 }
 
 fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
@@ -175,15 +164,11 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .create_new(true)
         .open(path)
         .map_err(|error| CliError::one(format!("could not create {}: {error}", path.display())))?;
-    if let Err(error) = file.write_all(contents.as_bytes()) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(CliError::one(format!(
-            "could not write {}: {error}",
-            path.display()
-        )));
-    }
-    Ok(())
+    // Leave a partial scaffold behind on failure. Once this handle is dropped,
+    // pathname cleanup could delete an entry another process installed in its
+    // place; `create_new` still guarantees that this invocation overwrites none.
+    file.write_all(contents.as_bytes())
+        .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
 }
 
 /// Compile the project in `directory` and write its canonical artifact under
