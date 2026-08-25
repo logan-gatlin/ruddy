@@ -5,7 +5,7 @@ fn main() -> ExitCode {
         Ok(root) => root,
         Err(message) => {
             eprintln!("error: {message}");
-            eprintln!("usage: cli <bundle-root.hc>");
+            eprintln!("usage: ruddy <bundle-root.hc>");
             return ExitCode::FAILURE;
         }
     };

@@ -6,6 +6,10 @@ edition = "2024"
 [lib]
 name = "ruddy_cli"
 
+[[bin]]
+name = "ruddy"
+path = "src/main.rs"
+
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
 ruddy = { path = ".." }
