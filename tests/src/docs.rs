@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ruddy_debug::{
     docs::{delete, path, read, valid_file_path, valid_name, write},
-    wire::FileSpec,
+    wire::{DependencySpec, FileSpec},
 };
 
 #[test]
@@ -14,6 +14,9 @@ fn names_are_a_single_safe_segment() {
 
     // Everything that could reach outside the scratch directory.
     assert!(!valid_name(""));
+    assert!(!valid_name("3demo"));
+    assert!(!valid_name("_demo"));
+    assert!(!valid_name("-demo"));
     assert!(!valid_name(".."));
     assert!(!valid_name("a/b"));
     assert!(!valid_name("a\\b"));
@@ -91,10 +94,19 @@ fn a_document_round_trips_through_the_disk() {
         file("Math.hc", "module Vec\nlet double = fn x => x\n"),
         file("Math/Vec.hc", "let zero = 0n\n"),
     ];
-    write(&root, "demo", &files).expect("the document is written");
+    let dependencies = [DependencySpec {
+        name: "base".into(),
+        version: "2.0.0".into(),
+    }];
+    write(&root, "demo", "configured", "1.2.3", &dependencies, &files)
+        .expect("the document is written");
 
     let doc = read(&root, "demo").expect("the document is read back");
     assert_eq!(doc.name, "demo");
+    assert_eq!(doc.bundle_name, "configured");
+    assert_eq!(doc.version, "1.2.3");
+    assert_eq!(doc.dependencies.len(), 1);
+    assert_eq!(doc.dependencies[0].name, "base");
     let back: Vec<(&str, &str)> = doc
         .files
         .iter()
@@ -123,6 +135,9 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
     write(
         &root,
         "demo",
+        "demo",
+        "0.1.0",
+        &[],
         &[
             file("main.hc", "module Math\n"),
             file("Math.hc", "let double = fn x => x\n"),
@@ -130,7 +145,8 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
     )
     .expect("the document is written");
 
-    write(&root, "demo", &[file("main.hc", "")]).expect("the document is written again");
+    write(&root, "demo", "demo", "0.1.0", &[], &[file("main.hc", "")])
+        .expect("the document is written again");
 
     let doc = read(&root, "demo").expect("the document is read back");
     let paths: Vec<&str> = doc.files.iter().map(|file| file.path.as_str()).collect();

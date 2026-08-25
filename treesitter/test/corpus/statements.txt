@@ -158,3 +158,16 @@ let b = 2
   (let_definition
     (identifier)
     (natural)))
+
+================================================================================
+The former bundle keyword is an ordinary identifier
+================================================================================
+
+let bundle = bundle
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (identifier)))

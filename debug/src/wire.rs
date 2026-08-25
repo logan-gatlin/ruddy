@@ -287,12 +287,23 @@ pub struct DocMeta {
 #[derive(Debug, Serialize)]
 pub struct Doc {
     pub name: String,
+    pub bundle_name: String,
+    pub version: String,
+    pub dependencies: Vec<DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DocBody {
+    /// Optional only for compatibility with saves from debugger pages opened
+    /// before identity moved into document configuration.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<DependencySpec>,
     pub files: Vec<FileSpec>,
 }
 

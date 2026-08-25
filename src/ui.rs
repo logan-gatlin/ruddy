@@ -297,7 +297,6 @@ impl fmt::Display for Kind {
             Kind::Or => f.write_str("or"),
             Kind::Xor => f.write_str("xor"),
             Kind::Not => f.write_str("not"),
-            Kind::Bundle => f.write_str("bundle"),
             Kind::Module => f.write_str("module"),
             Kind::Equal => f.write_str("="),
             Kind::FatArrow => f.write_str("=>"),
@@ -533,9 +532,6 @@ impl bundle::ErrorKind {
         match self {
             bundle::ErrorKind::ModuleFileMissing { .. } => "module-file-missing",
             bundle::ErrorKind::ModuleFileAmbiguous { .. } => "module-file-ambiguous",
-            bundle::ErrorKind::MisplacedBundleDeclaration => "misplaced-bundle-declaration",
-            bundle::ErrorKind::MissingBundleDeclaration => "missing-bundle-declaration",
-            bundle::ErrorKind::BadBundleIdentity => "bad-bundle-identity",
         }
     }
 }
@@ -557,18 +553,6 @@ impl fmt::Display for bundle::ErrorKind {
             bundle::ErrorKind::ModuleFileAmbiguous { beside, inside } => write!(
                 f,
                 "this module has two files; delete one of `{beside}` or `{inside}`",
-            ),
-            bundle::ErrorKind::MisplacedBundleDeclaration => {
-                f.write_str("remove this bundle declaration; only the root file has one")
-            }
-            bundle::ErrorKind::MissingBundleDeclaration => {
-                f.write_str("add `bundle <name> <version>` at the top of this file")
-            }
-            // The name is the only thing that can be refused: build metadata is
-            // the other reason [`Bundle::new`] says no, and the header grammar
-            // has no way to spell one.
-            bundle::ErrorKind::BadBundleIdentity => f.write_str(
-                "a bundle name must start with a letter and use only letters, digits, `-` and `_`",
             ),
         }
     }

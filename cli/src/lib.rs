@@ -151,11 +151,13 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
 
     let manifest = path.join(MANIFEST);
     let root = path.join(ROOT);
-    write_new_file(&manifest, "root = \"main.hc\"\n\n[dependencies]\n")?;
     write_new_file(
-        &root,
-        &format!("bundle {name} {INITIAL_VERSION}\n\nlet main = 0n\n"),
-    )
+        &manifest,
+        &format!(
+            "name = {name:?}\nversion = {INITIAL_VERSION:?}\nroot = \"main.hc\"\n\n[dependencies]\n"
+        ),
+    )?;
+    write_new_file(&root, "let main = 0n\n")
 }
 
 fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
@@ -369,6 +371,8 @@ impl std::error::Error for CompileError {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    name: String,
+    version: String,
     root: PathBuf,
     dependencies: IndexMap<String, DependencySpec>,
 }
@@ -380,7 +384,8 @@ struct DependencySpec {
     source: PathBuf,
 }
 
-/// Compile the project in `directory`, whose `Ruddy.toml` names its bundle root.
+/// Compile the project in `directory`, whose `Ruddy.toml` names its bundle
+/// identity and source root.
 ///
 /// The root and dependency source paths are resolved relative to the manifest.
 /// Dependency artifacts are loaded and checked before compilation. Their
@@ -389,6 +394,7 @@ struct DependencySpec {
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     let directory = directory.as_ref();
     let manifest = load_manifest(directory)?;
+    let identity = configured_identity(&manifest.name, &manifest.version)?;
     let Some(name) = configured_file_name(&manifest.root) else {
         return Err(CompileError::one("manifest field `root` must name a file"));
     };
@@ -412,7 +418,7 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
-    let mut mint = Mint::new(loaded.bundle.clone().unwrap_or_else(bundle::fallback));
+    let mut mint = Mint::new(identity);
     let mut built = ir::build(&mut mint, loaded.stmts);
     let inferred = inference::infer(&mint, &mut built.program);
     let checked = patterns::check(&built.program, &inferred);
@@ -501,6 +507,24 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     let mut artifact = Artifact::build(&mint, &built.program, &inferred, &lowered);
     artifact.header.dependencies = dependencies;
     Ok(artifact)
+}
+
+fn configured_identity(name: &str, configured_version: &str) -> Result<Bundle, CompileError> {
+    let version = Version::parse(configured_version).map_err(|error| {
+        CompileError::one(format!(
+            "manifest field `version` has invalid semantic version `{configured_version}`: {error}"
+        ))
+    })?;
+    if !version.build.is_empty() {
+        return Err(CompileError::one(format!(
+            "manifest field `version` value `{version}` uses unsupported build metadata"
+        )));
+    }
+    Bundle::new(name, version).ok_or_else(|| {
+        CompileError::one(format!(
+            "manifest field `name` value `{name}` is not a valid Ruddy bundle name"
+        ))
+    })
 }
 
 fn configured_file_name(root: &Path) -> Option<&str> {
@@ -625,7 +649,6 @@ impl fmt::Display for BundleMessage<'_> {
                 self.source_directory.join(beside).display(),
                 self.source_directory.join(inside).display(),
             ),
-            kind => kind.fmt(formatter),
         }
     }
 }

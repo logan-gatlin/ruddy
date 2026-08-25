@@ -243,7 +243,8 @@ async function openDoc(name) {
   // made it there — a crash, a lost connection, a closed tab mid-keystroke.
   let files = server?.files ?? cached?.files ?? [];
   state.notice = "";
-  if (cached && !sameFiles(cached.files, files) && (!server || cached.at > server.modified_ms)) {
+  const recovered = cached && !sameFiles(cached.files, files) && (!server || cached.at > server.modified_ms);
+  if (recovered) {
     files = cached.files;
     state.notice = `restored unsaved changes to ${name}`;
   }
@@ -254,9 +255,11 @@ async function openDoc(name) {
 
   state.doc = name;
   state.files = files;
-  state.name = cached?.name ?? name;
-  state.version = cached?.version ?? "0.1.0";
-  state.dependencies = cached?.dependencies ?? [];
+  const configured = recovered ? cached : server ?? cached;
+  state.name = configured?.bundle_name ?? configured?.name ?? name;
+  state.version = configured?.version ?? "0.1.0";
+  state.dependencies = configured?.dependencies ?? [];
+  state.snapshot = null;
   state.active = 0;
   state.where = {};
   state.offsets = null;
@@ -335,7 +338,12 @@ async function saveNow() {
   try {
     await fetch(`/docs/${encodeURIComponent(state.doc)}`, {
       method: "PUT",
-      body: JSON.stringify({ files: state.files }),
+      body: JSON.stringify({
+        name: state.name,
+        version: state.version,
+        dependencies: state.dependencies,
+        files: state.files,
+      }),
     });
   } catch {
     // Offline: the local copy already has it, and the next save will catch up.
@@ -469,7 +477,9 @@ function wireTitlebar() {
       window.alert(error.message);
       return;
     }
+    state.snapshot = null;
     cacheLocally();
+    scheduleSave();
     scheduleCompile();
     renderTitlebar();
   });
@@ -484,6 +494,7 @@ function wireTitlebar() {
       return;
     }
     cacheLocally();
+    scheduleSave();
     scheduleCompile();
     renderTitlebar();
   });
@@ -494,8 +505,7 @@ function wireTitlebar() {
 function renderTitlebar() {
   el("doc-name").textContent = state.doc;
 
-  const bundle = state.snapshot?.bundle ?? `${state.name}@${state.version}`;
-  el("bundle").textContent = bundle;
+  el("bundle").textContent = `${state.name}@${state.version}`;
   el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
 
   const dependencies = el("dependencies");

@@ -33,8 +33,6 @@ pub enum Kind {
     Or,
     Xor,
     Not,
-    /// `bundle`, opening the header the root file of a bundle begins with.
-    Bundle,
     /// `module`, opening a module declaration — inline with an `=` and a body,
     /// or bare for a module whose body is another file.
     Module,
@@ -346,7 +344,6 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "or" => Kind::Or,
                     "xor" => Kind::Xor,
                     "not" => Kind::Not,
-                    "bundle" => Kind::Bundle,
                     "module" => Kind::Module,
                     "true" => Kind::Boolean(true),
                     "false" => Kind::Boolean(false),
@@ -364,20 +361,9 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // point belongs to the literal only when a digit follows it, so
             // `1.x` remains a projection.
             c if c.is_ascii_digit() => {
-                let version_part = in_version(&tokens);
-                let literal = number(&mut chars, !version_part);
+                let literal = number(&mut chars);
                 let span = file_id.span(start, literal.len());
-                let kind = if version_part {
-                    // A bundle version is spelled with bare integer components.
-                    // Do not first turn one into an f64: values near `u64::MAX`
-                    // cannot make that round trip without changing value.
-                    literal
-                        .parse()
-                        .map(Kind::Natural)
-                        .map_err(|_| ErrorKind::NaturalTooLarge)
-                } else {
-                    numeric(&literal)
-                };
+                let kind = numeric(&literal);
                 match kind {
                     Ok(kind) => tokens.push(span.track(kind)),
                     Err(kind) => errors.push(Error { span, kind }),
@@ -420,24 +406,6 @@ fn sigilled(
     match name.chars().next() {
         Some(c) if c.is_alphabetic() || c == '_' => (Ok(kind(name)), width),
         _ => (Err(ErrorKind::Unrecognized), width),
-    }
-}
-
-/// Whether the next digits are one of the three bare components of the root
-/// bundle's version. Versions deliberately retain exact integer spelling even
-/// though ordinary suffixless numbers are reals.
-fn in_version(tokens: &[Tracked<Kind>]) -> bool {
-    match tokens {
-        [first, second] => {
-            matches!(first.tracked, Kind::Bundle) && matches!(second.tracked, Kind::Identifier(_))
-        }
-        [first, second, component, dot] | [first, second, _, _, component, dot] => {
-            matches!(first.tracked, Kind::Bundle)
-                && matches!(second.tracked, Kind::Identifier(_))
-                && matches!(component.tracked, Kind::Natural(_))
-                && matches!(dot.tracked, Kind::Dot)
-        }
-        _ => false,
     }
 }
 
@@ -487,7 +455,7 @@ fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
 /// Consume one numeric literal, including its optional fractional part and
 /// type suffix. Any identifier character attached to it stays part of the
 /// literal so `1thing` is one useful lexical error rather than two terms.
-fn number(chars: &mut Peekable<CharIndices<'_>>, allow_decimal: bool) -> String {
+fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
     let mut literal = String::new();
     while let Some(&(_, c)) = chars.peek() {
         if c.is_ascii_digit() {
@@ -497,21 +465,8 @@ fn number(chars: &mut Peekable<CharIndices<'_>>, allow_decimal: bool) -> String 
             break;
         }
     }
-    let decimal = if allow_decimal
-        && matches!(chars.peek(), Some(&(_, '.')))
-        && matches!(chars.clone().nth(1), Some((_, c)) if c.is_ascii_digit())
-    {
-        // A second dot after the fractional digits makes this a bundle version
-        // component, not a decimal: `0.1.0` is three numeric tokens.
-        let mut look = chars.clone();
-        look.next();
-        while matches!(look.peek(), Some(&(_, c)) if c.is_ascii_digit()) {
-            look.next();
-        }
-        !matches!(look.peek(), Some(&(_, '.')))
-    } else {
-        false
-    };
+    let decimal = matches!(chars.peek(), Some(&(_, '.')))
+        && matches!(chars.clone().nth(1), Some((_, c)) if c.is_ascii_digit());
     if decimal {
         literal.push('.');
         chars.next();

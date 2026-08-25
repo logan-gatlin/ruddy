@@ -27,11 +27,7 @@ fn artifact(name: &str, version: &str) -> Artifact {
 
 fn project() -> TempDir {
     let directory = tempfile::tempdir().expect("a temporary project");
-    fs::write(
-        directory.path().join("main.hc"),
-        "bundle app 1.0.0\nlet id = fn x => x\n",
-    )
-    .expect("write the root");
+    fs::write(directory.path().join("main.hc"), "let id = fn x => x\n").expect("write the root");
     directory
 }
 
@@ -56,7 +52,7 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     write_artifact(directory.path(), "alpha.artifact", "alpha", "1.2.3-beta.1");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "root = \"main.hc\"\n[dependencies]\n\
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n\
          zeta = { version = \"2.0.0\", source = \"zeta.artifact\" }\n\
          alpha = { version = \"1.2.3-beta.1\", source = \"alpha.artifact\" }\n",
     )
@@ -89,7 +85,7 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
     .expect("move the root");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "root = \"src/app.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\n[dependencies]\n",
     )
     .expect("write the manifest");
 
@@ -104,23 +100,19 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     fs::create_dir(directory.path().join("src")).expect("create source directory");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "root = \"src/app.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\n[dependencies]\n",
     )
     .expect("write the manifest");
     fs::write(
         directory.path().join("src/app.hc"),
-        "bundle app 1.0.0\nlet bad : Nat = fn x => x\n",
+        "let bad : Nat = fn x => x\n",
     )
     .expect("write an invalid root");
 
     let root_error = error(&directory).replace('\\', "/");
-    assert!(root_error.contains("src/app.hc:2:"), "{root_error}");
+    assert!(root_error.contains("src/app.hc:1:"), "{root_error}");
 
-    fs::write(
-        directory.path().join("src/app.hc"),
-        "bundle app 1.0.0\nmodule Child\n",
-    )
-    .expect("replace the root");
+    fs::write(directory.path().join("src/app.hc"), "module Child\n").expect("replace the root");
     fs::write(
         directory.path().join("src/Child.hc"),
         "let bad : Nat = fn x => x\n",
@@ -160,37 +152,71 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
     assert!(missing.contains("Ruddy.toml"), "{missing}");
 
     for (manifest, expected) in [
-        ("", "missing field `root`"),
-        ("[dependencies]\n", "missing field `root`"),
-        ("root = 1\n[dependencies]\n", "invalid type"),
+        ("", "missing field `name`"),
+        ("[dependencies]\n", "missing field `name`"),
+        ("name = \"app\"\n", "missing field `version`"),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\n",
+            "missing field `root`",
+        ),
+        (
+            "name = 1\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+            "invalid type",
+        ),
+        (
+            "name = \"app\"\nversion = 1\nroot = \"main.hc\"\n[dependencies]\n",
+            "invalid type",
+        ),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = 1\n[dependencies]\n",
+            "invalid type",
+        ),
         ("[dependencies", "could not parse manifest"),
         (
-            "root = \"main.hc\"\ntitle = \"app\"\n[dependencies]\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\n",
             "unknown field `title`",
         ),
         ("title = \"app\"\n", "unknown field `title`"),
         (
-            "root = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
             "missing field `version`",
         ),
         (
-            "root = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
             "missing field `source`",
         ),
         (
-            "root = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
             "invalid type",
         ),
         (
-            "root = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
             "invalid type",
         ),
         (
-            "root = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
             "unknown field `registry`",
         ),
     ] {
         fs::write(directory.path().join("Ruddy.toml"), manifest).expect("replace the manifest");
+        let found = error(&directory);
+        assert!(found.contains(expected), "`{expected}` in:\n{found}");
+    }
+}
+
+#[test]
+fn manifest_bundle_identity_must_be_valid() {
+    let directory = project();
+    for (name, version, expected) in [
+        ("app", "not-semver", "invalid semantic version"),
+        ("not.a.name", "1.0.0", "not a valid Ruddy bundle name"),
+        ("app", "1.0.0+local", "unsupported build metadata"),
+    ] {
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!("name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\n[dependencies]\n"),
+        )
+        .expect("replace the manifest");
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
     }
@@ -207,7 +233,7 @@ fn dependency_names_and_versions_must_be_valid_artifact_identities() {
         fs::write(
             directory.path().join("Ruddy.toml"),
             format!(
-                "root = \"main.hc\"\n[dependencies]\n\"{name}\" = {{ version = \"{version}\", source = \"base.artifact\" }}\n"
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n\"{name}\" = {{ version = \"{version}\", source = \"base.artifact\" }}\n"
             ),
         )
         .expect("replace the manifest");
@@ -221,7 +247,7 @@ fn dependency_sources_must_be_readable_canonical_matching_artifacts() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "root = \"main.hc\"\n[dependencies]\nbase = { version = \"1.2.3\", source = \"base.artifact\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.2.3\", source = \"base.artifact\" }\n",
     )
     .expect("write the manifest");
 
@@ -266,7 +292,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     let missing = tempfile::tempdir().unwrap();
     fs::write(
         missing.path().join("Ruddy.toml"),
-        "root = \"missing.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"missing.hc\"\n[dependencies]\n",
     )
     .unwrap();
     let root_error = compile(missing.path())
@@ -280,17 +306,17 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "root = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
         directory.path().join("main.hc"),
-        "bundle app 1.0.0\nlet bad : Nat = fn x => x\n",
+        "let bad : Nat = fn x => x\n",
     )
     .unwrap();
     let compiler = error(&directory);
     assert!(compiler.contains("error[types/"), "{compiler}");
-    assert!(compiler.contains("main.hc:2:"), "{compiler}");
+    assert!(compiler.contains("main.hc:1:"), "{compiler}");
 
     let diagnostics = compile(directory.path()).expect_err("the program has a type error");
     assert_eq!(diagnostics.messages().len(), 1, "{diagnostics}");
@@ -302,7 +328,7 @@ fn the_configured_root_must_name_a_file() {
     for root in ["", ".", "..", "src/", "src/.", "/"] {
         fs::write(
             directory.path().join("Ruddy.toml"),
-            format!("root = {root:?}\n[dependencies]\n"),
+            format!("name = \"app\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\n"),
         )
         .unwrap();
         let error = compile(directory.path())
@@ -323,11 +349,11 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     new_project(&destination).expect("create the project");
     assert_eq!(
         fs::read_to_string(destination.join("Ruddy.toml")).unwrap(),
-        "root = \"main.hc\"\n\n[dependencies]\n"
+        "name = \"my_app\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n\n[dependencies]\n"
     );
     assert_eq!(
         fs::read_to_string(destination.join("main.hc")).unwrap(),
-        "bundle my_app 0.1.0\n\nlet main = 0n\n"
+        "let main = 0n\n"
     );
     assert_eq!(
         compile(&destination).unwrap().header.identity,
@@ -345,7 +371,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     );
     assert_eq!(
         fs::read_to_string(destination.join("main.hc")).unwrap(),
-        "bundle my_app 0.1.0\n\nlet main = 0n\n"
+        "let main = 0n\n"
     );
 }
 
