@@ -37,8 +37,8 @@ pub struct Cx<'a> {
     /// indexes them. A stage naming the file a node came from reads its path
     /// from here.
     pub files: &'a [FileInfo],
-    /// What the load produced: the tokens and the parse errors of every file,
-    /// the spliced statement tree, and the identity the header declared.
+    /// What the load produced: the tokens and parse errors of every file, and
+    /// the spliced statement tree.
     pub bundle: Option<&'a ruddy::bundle::Output>,
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,

@@ -10,19 +10,11 @@ use ruddy_debug::{
 
 const DEMO: &str = include_str!("../../demo.hc");
 
-/// The header every snippet is compiled under: a bundle's root file must open
-/// with one, so a snippet that did not write its own would be told so. Every
-/// span in the snippet therefore sits this many bytes further in.
-const HEADER: &str = "bundle demo 0.1.0\n";
-
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
-    (
-        ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
-    ),
+    (ROOT, "module Math\nlet four = Math::double 2n\n"),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
     ("Math/Vec.hc", "let zero = 0n\n"),
 ];
@@ -32,10 +24,9 @@ fn snapshot(snippet: &str) -> Snapshot {
     bundle(&[(ROOT, &compiled(snippet))])
 }
 
-/// What a snippet is compiled as, for the tests that check a span against the
-/// bytes it covers: the same text the compiler read, header and all.
+/// What a snippet is compiled as, for tests that inspect the exact bytes read.
 fn compiled(snippet: &str) -> String {
-    format!("{HEADER}{snippet}")
+    snippet.to_string()
 }
 
 /// A whole bundle, each file exactly as written — the request the page posts,
@@ -43,6 +34,8 @@ fn compiled(snippet: &str) -> String {
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            name: "demo".to_string(),
+            version: "0.1.0".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -57,13 +50,9 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
     )
 }
 
-/// Where a range written in a snippet's own offsets ends up on the wire: in the
-/// root file, [`HEADER`] bytes further in than the snippet spells it.
+/// Where a range written in a snippet's own offsets ends up on the wire.
 fn at(range: [usize; 2]) -> Option<Loc> {
-    Some(Loc {
-        file: 0,
-        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
-    })
+    Some(Loc { file: 0, range })
 }
 
 fn nodes(stage: &Stage) -> Vec<&Node> {
@@ -82,6 +71,8 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 fn compile_requests_without_dependencies_remain_compatible() {
     let request: CompileRequest =
         serde_json::from_str(r#"{"files":[{"path":"main.hc","source":""}],"revision":4}"#).unwrap();
+    assert_eq!(request.name, "demo");
+    assert_eq!(request.version, "0.1.0");
     assert!(request.dependencies.is_empty());
     assert_eq!(request.revision, 4);
 }
@@ -90,6 +81,8 @@ fn compile_requests_without_dependencies_remain_compatible() {
 fn supplied_dependencies_reach_debug_artifact_construction() {
     let snapshot = compile(
         &CompileRequest {
+            name: "debugger".to_string(),
+            version: "1.2.3".to_string(),
             files: vec![FileSpec {
                 path: ROOT.to_string(),
                 source: compiled("let main = 0n\n"),
@@ -102,6 +95,7 @@ fn supplied_dependencies_reach_debug_artifact_construction() {
         },
         1,
     );
+    assert_eq!(snapshot.bundle.as_deref(), Some("debugger@1.2.3"));
     let artifact = snapshot
         .stages
         .iter()
@@ -354,9 +348,7 @@ fn a_natural_reaches_every_stage() {
             .iter()
             .find(|stage| stage.id == id)
             .expect("the stage is registered");
-        // By what it says rather than by being the first of its kind: the
-        // header's version parts are naturals too, and they are written above
-        // every snippet.
+        // By what it says rather than by being the first of its kind.
         let node = nodes(stage)
             .into_iter()
             .find(|node| node.label == "Natural" && node.text == "42n")
@@ -424,8 +416,7 @@ fn the_surface_prerequisites_reach_every_stage() {
     // place the two trees are meant to differ.
     assert_eq!(labelled("ir", "Prim"), ["Nat", "Nat", "Nat"]);
     assert_eq!(labelled("tokens", "Arrow"), ["->"]);
-    // The two the header's version is written with, and then the projection's.
-    assert_eq!(labelled("tokens", "Dot"), [".", ".", "."]);
+    assert_eq!(labelled("tokens", "Dot"), ["."]);
 }
 
 /// The row forms — a `when`-named presence, and a named tail — checked through
@@ -460,13 +451,9 @@ fn rows_reach_every_stage() {
     assert_eq!(labelled("tokens", "DotDot"), [".."]);
     // `when` lexes as the ordinary identifier it is — contextual, not
     // reserved — which is what keeps a term or a label of that name writable.
-    // The `demo` in front of them is the header's own name, which is an
-    // identifier like any other.
     assert_eq!(
         labelled("tokens", "Identifier"),
-        [
-            "demo", "f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"
-        ]
+        ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
     );
 
     for id in ["ast", "ir"] {
@@ -1107,7 +1094,7 @@ fn a_snapshot_survives_the_wire() {
             .len()
             > 1
     );
-    // And the identity the root file declared, for the chip.
+    // And the externally supplied identity, for the chip.
     assert_eq!(back["bundle"], "demo@0.1.0");
     // Underscored fields are the page's, and have to survive too: the
     // editor's colouring is built from them.
@@ -1136,8 +1123,8 @@ fn a_snapshot_survives_the_wire() {
     assert!(json.contains("\"owner\""));
 }
 
-/// A bundle whose root file declares itself and nothing else is a program with
-/// nothing in it, not a program with something wrong with it.
+/// An empty root is a program with nothing in it, not a program with something
+/// wrong with it; identity is supplied independently.
 #[test]
 fn an_empty_buffer_is_not_an_error() {
     let snapshot = snapshot("");
@@ -1148,29 +1135,44 @@ fn an_empty_buffer_is_not_an_error() {
     );
     assert!(snapshot.panic.is_none());
     assert_eq!(snapshot.files.len(), 1);
-    assert_eq!(snapshot.files[0].len, HEADER.len());
-    assert_eq!(snapshot.files[0].line_starts, vec![0, HEADER.len()]);
+    assert_eq!(snapshot.files[0].len, 0);
+    assert_eq!(snapshot.files[0].line_starts, vec![0]);
 }
 
-/// A header the reader is halfway through typing is not a reason to stop
-/// compiling: the identity is reported as the mistake it is, the mint falls back
-/// to one of its own, and every later phase still runs.
+/// Bad externally supplied configuration is not a reason to stop compiling:
+/// it is reported, the mint falls back, and every later phase still runs.
 #[test]
 fn a_bad_bundle_is_reported_rather_than_fatal() {
-    // A name the lexer reads as an ordinary identifier and `Bundle::new`
-    // refuses: an identifier may open with `_` and a bundle name may not.
-    let snapshot = bundle(&[(ROOT, "bundle _x 0.1.0\nlet x = ()")]);
-    assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
-    // And the chip has nothing to show, because nothing was declared it could
-    // be shown from.
-    assert_eq!(snapshot.bundle, None);
-    // The fallback bundle still lowers the program.
-    let ir = snapshot
-        .stages
-        .iter()
-        .find(|stage| stage.id == "ir")
-        .expect("ir stage");
-    assert_eq!(ir.nodes.len(), 1);
+    for (name, version) in [
+        ("_x", "0.1.0"),
+        ("demo", "not-a-version"),
+        ("demo", "1.2.3+unsupported"),
+    ] {
+        let snapshot = compile(
+            &CompileRequest {
+                name: name.to_string(),
+                version: version.to_string(),
+                files: vec![FileSpec {
+                    path: ROOT.to_string(),
+                    source: "let x = ()".to_string(),
+                }],
+                dependencies: Vec::new(),
+                revision: 3,
+            },
+            1,
+        );
+        assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
+        // And the chip has nothing to show because the supplied identity was
+        // invalid.
+        assert_eq!(snapshot.bundle, None);
+        // The fallback bundle still lowers the program.
+        let ir = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "ir")
+            .expect("ir stage");
+        assert_eq!(ir.nodes.len(), 1);
+    }
 }
 
 /// The file list is the index every `Loc` on the wire points into, so it has to
@@ -1202,8 +1204,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
     // Each with what the page turns an offset in it into a line and a column.
     assert_eq!(snapshot.files[2].line_starts, vec![0, 14]);
 
-    // And the chip reads what the root file's header declared, which is the
-    // only place a bundle is named at all.
+    // And the chip reports the identity supplied independently of all files.
     assert_eq!(snapshot.bundle.as_deref(), Some("demo@0.1.0"));
 }
 
@@ -1213,10 +1214,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
 /// worse than revealing nothing.
 #[test]
 fn a_span_from_a_module_file_names_that_file() {
-    let snapshot = bundle(&[
-        (ROOT, "bundle demo 0.1.0\nmodule Math\n"),
-        ("Math.hc", "let double = nope\n"),
-    ]);
+    let snapshot = bundle(&[(ROOT, "module Math\n"), ("Math.hc", "let double = nope\n")]);
 
     // Every token of a file's row is a span in that file, which is the whole of
     // what the index has to get right.
@@ -1250,7 +1248,7 @@ fn a_span_from_a_module_file_names_that_file() {
 /// fix it.
 #[test]
 fn a_missing_module_file_reaches_the_strip() {
-    let root = "bundle demo 0.1.0\nmodule Math\nlet four = 4n\n";
+    let root = "module Math\nlet four = 4n\n";
     let snapshot = bundle(&[(ROOT, root)]);
 
     let [diagnostic] = snapshot.diagnostics.as_slice() else {
@@ -1305,7 +1303,7 @@ fn a_request_without_a_root_file_is_told_so() {
     // the file strip has one tab and the orphan module file is not in it.
     let files: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(files, [ROOT]);
-    assert_eq!(snapshot.bundle, None);
+    assert_eq!(snapshot.bundle.as_deref(), Some("demo@0.1.0"));
     assert!(snapshot.panic.is_none());
 }
 
@@ -2045,7 +2043,7 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
     );
 
     // Every span the two tabs hand out is a real position in this source — in
-    // the file it was written in, which for a snippet is the one the header
+    // the file it was written in, which for a snippet is the one the source
     // sits at the top of.
     let text = compiled(source);
     for id in ["ast", "ir"] {

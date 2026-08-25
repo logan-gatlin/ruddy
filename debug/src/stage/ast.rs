@@ -6,7 +6,6 @@
 use std::fmt;
 
 use ruddy::{
-    bundle,
     parse::{
         Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
         ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
@@ -37,20 +36,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let nodes: Vec<Node> = loaded
         .loaded
         .iter()
-        .enumerate()
-        .map(|(at, file)| {
+        .map(|file| {
             let stmts = written_in(&loaded.stmts, file.id);
             for stmt in &stmts {
                 counts.add(&stmt.tracked);
             }
-            // The header belongs to the root file and to no other, which is the
-            // one thing the root's row has that the rest have not.
-            let header = match at {
-                0 => header_node(&mut ids, loaded),
-                _ => None,
-            };
             Node::new(ids.next(), "File", file.path.clone())
-                .children(header)
                 .children(stmts.iter().map(|stmt| stmt_node(&mut ids, stmt)))
         })
         .collect();
@@ -116,20 +107,6 @@ fn written_in(stmts: &[Stmt], file: FileID) -> Vec<&Stmt> {
     let mut found = Vec::new();
     walk(stmts, file, &mut found);
     found
-}
-
-/// The `bundle` header, when the root file declared one the loader could use.
-///
-/// Read off the loaded identity rather than off a statement, because the header
-/// is not one: it is the file's own first line, and there is no node in the
-/// statement list for it to be.
-fn header_node(ids: &mut Ids, loaded: &bundle::Output) -> Option<Node> {
-    let bundle = loaded.bundle.as_ref()?;
-    Some(Node::new(
-        ids.next(),
-        "Bundle",
-        format!("bundle {} {}", bundle.name(), bundle.version()),
-    ))
 }
 
 fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {

@@ -155,11 +155,10 @@ input {
   border-color: var(--symbol);
 }
 
-/* Read-only: what the root file's header says, reported rather than offered.
-   A bundle with no usable header still compiles, under a fallback identity, so
-   that reads as absence rather than as an error. */
+/* Project identity is configuration rather than source; the chip is its
+   compact editor. Invalid input still compiles under a fallback identity. */
 .bundle {
-  cursor: default;
+  cursor: pointer;
 }
 .bundle.none {
   color: var(--fg-faint);

@@ -13,19 +13,11 @@ use ruddy_debug::{
     wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
-/// The header every snippet is compiled under: a bundle's root file must open
-/// with one, so a snippet that did not write its own would be told so. Every
-/// span in the snippet therefore sits this many bytes further in.
-const HEADER: &str = "bundle demo 0.1.0\n";
-
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
-    (
-        ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
-    ),
+    (ROOT, "module Math\nlet four = Math::double 2n\n"),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
     ("Math/Vec.hc", "let zero = 0n\n"),
 ];
@@ -871,7 +863,7 @@ fn the_tokens_tab_groups_its_rows_by_file() {
     assert_eq!(
         rows,
         [
-            ("File", "main.hc · 16 tokens"),
+            ("File", "main.hc · 9 tokens"),
             ("File", "Math.hc · 9 tokens"),
             ("File", "Math/Vec.hc · 4 tokens"),
         ],
@@ -891,7 +883,7 @@ fn the_tokens_tab_groups_its_rows_by_file() {
 
     // And the summary counts both: the tokens are what the tab renders, and the
     // files are what it renders them under.
-    assert_eq!(stage.summary, "29 tokens · 3 files");
+    assert_eq!(stage.summary, "22 tokens · 3 files");
 }
 
 /// The AST tab is one row per file holding the statements written in *that*
@@ -926,14 +918,10 @@ fn the_ast_tab_groups_its_rows_by_file() {
             .map(|node| node.label.as_str())
             .collect()
     };
-    // The root file leads with the header, which is the file's own first line
-    // rather than a statement — there is no node in the statement list for it
-    // to be.
-    assert_eq!(children(0), ["Bundle", "Module", "Let"]);
-    assert_eq!(stage.nodes[0].children[0].text, "bundle demo 0.1.0");
-    // And the module whose body is in `Math.hc` carries its name and nothing
-    // else: the body is that file's row.
-    let math = &stage.nodes[0].children[1];
+    assert_eq!(children(0), ["Module", "Let"]);
+    // The module whose body is in `Math.hc` carries its name and nothing else:
+    // the body is that file's row.
+    let math = &stage.nodes[0].children[0];
     assert_eq!(
         math.children
             .iter()
@@ -948,7 +936,7 @@ fn the_ast_tab_groups_its_rows_by_file() {
     // A module written inline is the other half of the rule: its statements
     // were written in this file, so this file's row is where they go.
     let nodes = tab("ast", "module A =\n  let x = 1n\nend\n");
-    let inline = &nodes[0].children[1];
+    let inline = &nodes[0].children[0];
     assert_eq!(inline.label, "Module");
     let kids: Vec<&str> = inline
         .children
@@ -1020,6 +1008,8 @@ fn the_symbols_tab_says_which_module_and_file_a_symbol_came_from() {
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            name: "demo".to_string(),
+            version: "0.1.0".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -1036,7 +1026,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
 
 /// One stage over one snippet, compiled as the whole of a bundle's root file.
 fn stage(id: &'static str, snippet: &str) -> Stage {
-    named(bundle(&[(ROOT, &format!("{HEADER}{snippet}"))]), id)
+    named(bundle(&[(ROOT, snippet)]), id)
 }
 
 /// One stage of a snapshot, by the id it is registered under.
@@ -1053,13 +1043,9 @@ fn tab(id: &'static str, snippet: &str) -> Vec<Node> {
     stage(id, snippet).nodes
 }
 
-/// Where a range written in a snippet's own offsets ends up on the wire: in the
-/// root file, [`HEADER`] bytes further in than the snippet spells it.
+/// Where a range written in a snippet's own offsets ends up on the wire.
 fn at(range: [usize; 2]) -> Option<Loc> {
-    Some(Loc {
-        file: 0,
-        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
-    })
+    Some(Loc { file: 0, range })
 }
 
 /// Every row of a tree, parents before children — the shape of the tree is not

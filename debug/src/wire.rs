@@ -27,6 +27,13 @@ pub struct Loc {
 
 #[derive(Debug, Deserialize)]
 pub struct CompileRequest {
+    /// The bundle identity supplied by project configuration in a normal
+    /// compilation. Defaults keep cached requests from older debugger pages
+    /// usable after identity moved out of source files.
+    #[serde(default = "default_name")]
+    pub name: String,
+    #[serde(default = "default_version")]
+    pub version: String,
     /// Every file of the bundle. `main.hc` is the root; a request without one
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
@@ -36,6 +43,14 @@ pub struct CompileRequest {
     pub dependencies: Vec<DependencySpec>,
     #[serde(default)]
     pub revision: u64,
+}
+
+fn default_name() -> String {
+    "demo".to_string()
+}
+
+fn default_version() -> String {
+    "0.1.0".to_string()
 }
 
 /// One dependency identity supplied by the debugger client.
@@ -72,9 +87,8 @@ pub struct Snapshot {
     /// depth-first through the modules. This is the index every [`Loc`] points
     /// into.
     pub files: Vec<FileInfo>,
-    /// The identity the root file's header declared, as `name@version`, or
-    /// `None` when it declared none the loader could use. Read-only on the
-    /// page: a bundle is named by its source and by nothing else.
+    /// The externally supplied identity this compilation used, as
+    /// `name@version`, or `None` when the supplied identity was invalid.
     pub bundle: Option<String>,
     pub stages: Vec<Stage>,
     pub diagnostics: Vec<Diagnostic>,

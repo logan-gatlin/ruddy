@@ -25,6 +25,10 @@ const state = {
   /// Every file of the open document, root first, exactly as the compile
   /// request carries them.
   files: [],
+  /// Bundle identity supplied independently of source, as a project manifest
+  /// would supply it to the command-line driver.
+  name: "demo",
+  version: "0.1.0",
   /// Dependency identities included in artifact construction.
   dependencies: [],
   /// Which of them is on screen. The editor holds one file at a time; the
@@ -250,6 +254,8 @@ async function openDoc(name) {
 
   state.doc = name;
   state.files = files;
+  state.name = cached?.name ?? name;
+  state.version = cached?.version ?? "0.1.0";
   state.dependencies = cached?.dependencies ?? [];
   state.active = 0;
   state.where = {};
@@ -295,7 +301,13 @@ function cacheLocally() {
       const at = Date.now();
       localStorage.setItem(
         docKey(state.doc),
-        JSON.stringify({ files: state.files, dependencies: state.dependencies, at }),
+        JSON.stringify({
+          files: state.files,
+          name: state.name,
+          version: state.version,
+          dependencies: state.dependencies,
+          at,
+        }),
       );
     } catch {
       // A full quota is not worth interrupting the loop over; the server copy
@@ -351,7 +363,13 @@ async function compileNow() {
     const response = await fetch("/compile", {
       method: "POST",
       signal: controller.signal,
-      body: JSON.stringify({ files: state.files, dependencies: state.dependencies, revision }),
+      body: JSON.stringify({
+        name: state.name,
+        version: state.version,
+        files: state.files,
+        dependencies: state.dependencies,
+        revision,
+      }),
     });
     const snapshot = await response.json();
     // A slower earlier compile must never overwrite a newer one.
@@ -439,6 +457,22 @@ function parseDependencies(input) {
 
 function wireTitlebar() {
   el("doc-button").addEventListener("click", openSwitcher);
+  el("bundle").addEventListener("click", () => {
+    const entered = window.prompt("Bundle identity (name@version)", `${state.name}@${state.version}`);
+    if (entered === null) return;
+    try {
+      const [identity] = parseDependencies(entered);
+      if (!identity || entered.includes(",")) throw new Error("A bundle identity must be written as name@version.");
+      state.name = identity.name;
+      state.version = identity.version;
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
+    cacheLocally();
+    scheduleCompile();
+    renderTitlebar();
+  });
   el("dependencies").addEventListener("click", () => {
     const current = state.dependencies.map(({ name, version }) => `${name}@${version}`).join(", ");
     const entered = window.prompt("Dependencies (name@version, comma-separated)", current);
@@ -460,13 +494,9 @@ function wireTitlebar() {
 function renderTitlebar() {
   el("doc-name").textContent = state.doc;
 
-  // Read-only: a bundle is named by its own source, so the chip reports what
-  // the root file's header declared rather than offering a second place to say
-  // it. Nothing to show is itself worth showing — that program mints its
-  // symbols under a fallback identity.
-  const bundle = state.snapshot?.bundle ?? null;
-  el("bundle").textContent = bundle ?? `no bundle header in ${ROOT}`;
-  el("bundle").classList.toggle("none", !bundle);
+  const bundle = state.snapshot?.bundle ?? `${state.name}@${state.version}`;
+  el("bundle").textContent = bundle;
+  el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
 
   const dependencies = el("dependencies");
   dependencies.textContent = state.dependencies.length === 1

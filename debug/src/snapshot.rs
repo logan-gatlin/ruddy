@@ -19,7 +19,7 @@ use ruddy::{
     artifact,
     bundle::{self, Files},
     inference, ir, lir, patterns,
-    symbol::Mint,
+    symbol::{Bundle, Mint, Version},
     tracking::{FileID, FileManager, Span},
     ui,
 };
@@ -42,9 +42,9 @@ thread_local! {
     static GUARDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The root file of every document, by convention. A bundle is described by its
-/// own source, so the one thing the debugger has to decide is where to start
-/// reading — and it decides it once, here, rather than offering a setting.
+/// The root file of every document, by convention. Its path and the bundle
+/// identity are supplied separately from source, just as a project manifest
+/// supplies them to the command-line driver.
 pub const ROOT: &str = "main.hc";
 
 /// The [`Files`] a request is: whatever the page has in its editor, and nothing
@@ -119,16 +119,30 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         ));
     }
 
-    let identity = loaded
-        .as_ref()
-        .and_then(|loaded| loaded.bundle.clone())
-        .map(|bundle| bundle.to_string());
-    let mut mint = Mint::new(
-        loaded
-            .as_ref()
-            .and_then(|loaded| loaded.bundle.clone())
-            .unwrap_or_else(bundle::fallback),
-    );
+    // Identity is project configuration, not source syntax. Keep malformed
+    // wire input recoverable like every compiler error: report it, mint under
+    // a stable fallback, and still show all later phases that can run.
+    let configured = Version::parse(&req.version)
+        .ok()
+        .filter(|version| version.build.is_empty())
+        .and_then(|version| Bundle::new(&req.name, version));
+    if configured.is_none() {
+        diagnostics.push(raw(
+            "bundle",
+            "bad-bundle-identity",
+            format!(
+                "`{}@{}` is not a valid Ruddy bundle identity",
+                req.name, req.version
+            ),
+            None,
+        ));
+    }
+    let identity = configured.as_ref().map(ToString::to_string);
+    let fallback = || {
+        Bundle::new("fallback", Version::new(0, 0, 0))
+            .expect("the debugger fallback identity is valid")
+    };
+    let mut mint = Mint::new(configured.unwrap_or_else(fallback));
 
     let mut built = loaded.as_ref().and_then(|loaded| {
         let started = Instant::now();
