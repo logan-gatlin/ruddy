@@ -11,6 +11,7 @@
 
 mod artifact;
 mod bundle;
+mod cli;
 mod docs;
 mod inference;
 mod ir;

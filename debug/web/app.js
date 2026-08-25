@@ -25,6 +25,8 @@ const state = {
   /// Every file of the open document, root first, exactly as the compile
   /// request carries them.
   files: [],
+  /// Dependency identities included in artifact construction.
+  dependencies: [],
   /// Which of them is on screen. The editor holds one file at a time; the
   /// compiler is always given all of them.
   active: 0,
@@ -248,6 +250,7 @@ async function openDoc(name) {
 
   state.doc = name;
   state.files = files;
+  state.dependencies = cached?.dependencies ?? [];
   state.active = 0;
   state.where = {};
   state.offsets = null;
@@ -290,7 +293,10 @@ function cacheLocally() {
   cacheTimer = setTimeout(() => {
     try {
       const at = Date.now();
-      localStorage.setItem(docKey(state.doc), JSON.stringify({ files: state.files, at }));
+      localStorage.setItem(
+        docKey(state.doc),
+        JSON.stringify({ files: state.files, dependencies: state.dependencies, at }),
+      );
     } catch {
       // A full quota is not worth interrupting the loop over; the server copy
       // is the durable one anyway.
@@ -345,7 +351,7 @@ async function compileNow() {
     const response = await fetch("/compile", {
       method: "POST",
       signal: controller.signal,
-      body: JSON.stringify({ files: state.files, revision }),
+      body: JSON.stringify({ files: state.files, dependencies: state.dependencies, revision }),
     });
     const snapshot = await response.json();
     // A slower earlier compile must never overwrite a newer one.
@@ -419,6 +425,18 @@ function setLink(link) {
 
 function wireTitlebar() {
   el("doc-button").addEventListener("click", openSwitcher);
+  el("dependencies").addEventListener("click", () => {
+    const current = state.dependencies.map(({ name, version }) => `${name}@${version}`).join(", ");
+    const entered = window.prompt("Dependencies (name@version, comma-separated)", current);
+    if (entered === null) return;
+    state.dependencies = entered.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
+      const at = part.lastIndexOf("@");
+      return at > 0 ? { name: part.slice(0, at), version: part.slice(at + 1) } : { name: part, version: "" };
+    });
+    cacheLocally();
+    scheduleCompile();
+    renderTitlebar();
+  });
   el("follow").addEventListener("click", () => toggleFollow());
   el("split").addEventListener("click", () => toggleSplit());
 }
@@ -433,6 +451,11 @@ function renderTitlebar() {
   const bundle = state.snapshot?.bundle ?? null;
   el("bundle").textContent = bundle ?? `no bundle header in ${ROOT}`;
   el("bundle").classList.toggle("none", !bundle);
+
+  const dependencies = el("dependencies");
+  dependencies.textContent = state.dependencies.length === 1
+    ? "1 dependency"
+    : `${state.dependencies.length || "no"} dependencies`;
 
   el("follow").classList.toggle("on", state.follow);
   el("split").classList.toggle("on", state.split);

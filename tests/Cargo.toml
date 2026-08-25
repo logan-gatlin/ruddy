@@ -6,7 +6,9 @@ publish = false
 
 [dependencies]
 ruddy = { path = ".." }
+ruddy-cli = { package = "cli", path = "../cli" }
 ruddy-debug = { path = "../debug" }
 indexmap = "2"
 regex = "1"
 serde_json = "1"
+tempfile = "3"

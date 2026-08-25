@@ -349,10 +349,26 @@ fn assert_round_trip(value: &Artifact) -> String {
     assert_eq!(parsed, *value);
     assert_eq!(artifact::print(&parsed), printed);
     assert_eq!(artifact::parse(&printed), parsed);
+    assert_eq!(Artifact::try_parse(&printed), Ok(parsed.clone()));
+    assert_eq!(artifact::try_parse(&printed), Ok(parsed.clone()));
+    assert_eq!(artifact::text::try_parse(&printed), Ok(parsed));
     printed
 }
 
+fn assert_parse_error(error: &artifact::ParseError) {
+    let public_error: &dyn std::error::Error = error;
+    assert!(!error.message().is_empty());
+    assert!(!public_error.to_string().is_empty());
+}
+
 fn assert_malformed(text: &str) {
+    for error in [
+        Artifact::try_parse(text).expect_err("malformed text unexpectedly parsed"),
+        artifact::try_parse(text).expect_err("malformed text unexpectedly parsed"),
+        artifact::text::try_parse(text).expect_err("malformed text unexpectedly parsed"),
+    ] {
+        assert_parse_error(&error);
+    }
     assert!(
         catch_unwind(AssertUnwindSafe(|| artifact::parse(text))).is_err(),
         "{text:?} unexpectedly parsed"
@@ -547,11 +563,25 @@ fn canonical_text_escapes_and_parses_every_control_character() {
 }
 
 #[test]
-fn malformed_trusted_text_paths_arities_and_tags_panic() {
+fn fallible_parse_errors_distinguish_syntax_from_structure() {
+    let syntax = artifact::try_parse("").unwrap_err();
+    assert_eq!(syntax.message(), "truncated artifact text");
+    assert_eq!(syntax.offset(), Some(0));
+    assert_eq!(syntax.to_string(), "truncated artifact text at byte 0");
+
+    let structure = Artifact::try_parse("(artifact)").unwrap_err();
+    assert_eq!(structure.message(), "bad `artifact` arity");
+    assert_eq!(structure.offset(), None);
+    assert_eq!(structure.to_string(), "bad `artifact` arity");
+}
+
+#[test]
+fn malformed_text_returns_errors_while_trusted_api_panics() {
     let valid = compact(&assert_round_trip(&model_artifact()));
     for text in [
         "",
         "(",
+        ")",
         "\"",
         "(artifact)",
         "(artifact (header) (lir))",
@@ -566,6 +596,7 @@ fn malformed_trusted_text_paths_arities_and_tags_panic() {
     ] {
         assert_malformed(text);
     }
+    assert_malformed(&"(".repeat(257));
 
     for (from, to) in [
         ("(artifact ", "(bundle "),
@@ -652,4 +683,127 @@ fn malformed_trusted_text_paths_arities_and_tags_panic() {
     ] {
         assert_bad_replacement(&valid, from, to);
     }
+}
+
+#[test]
+fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
+    const DEPTH: usize = 400;
+    let mut value = Artifact {
+        header: artifact::Header {
+            identity: artifact::Identity {
+                name: "deep".to_string(),
+                version: "1".to_string(),
+            },
+            dependencies: Vec::new(),
+            values: vec![artifact::Value {
+                name: "deep@1::value".to_string(),
+                scheme: Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: Formula::True,
+                    body: plain(Core::Unit),
+                },
+            }],
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            functions: Vec::new(),
+            globals: vec![Global {
+                name: "deep@1::value".to_string(),
+                body: Block {
+                    instrs: Vec::new(),
+                    end: End::Ret(0),
+                },
+            }],
+        },
+    };
+    for _ in 0..DEPTH {
+        value.header.values[0].scheme.formula = Formula::Not(Box::new(std::mem::replace(
+            &mut value.header.values[0].scheme.formula,
+            Formula::True,
+        )));
+        value.header.values[0].scheme.body = plain(Core::Named {
+            name: "deep@1::Layer".to_string(),
+            args: vec![std::mem::replace(
+                &mut value.header.values[0].scheme.body,
+                plain(Core::Unit),
+            )],
+        });
+        value.lir.globals[0].body = Block {
+            instrs: vec![Instr {
+                temp: 0,
+                rep: Rep::Unit,
+                op: Op::Catch {
+                    tag: 0,
+                    body: Box::new(std::mem::replace(
+                        &mut value.lir.globals[0].body,
+                        Block {
+                            instrs: Vec::new(),
+                            end: End::Ret(0),
+                        },
+                    )),
+                },
+            }],
+            end: End::Ret(0),
+        };
+    }
+
+    // Printing remains the compiler side of the round trip. Parsing and all
+    // three recursive semantic families must fit a deliberately tiny stack.
+    let printed = std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let printed = value.print();
+            std::mem::forget(value);
+            printed
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let parsed = Artifact::try_parse(&printed).expect("deep artifact parses");
+            assert_eq!(parsed.header.values.len(), 1);
+            assert_eq!(parsed.lir.globals.len(), 1);
+            // Recursive model destruction is outside what this parser test is
+            // measuring and would itself consume the deliberately tiny stack.
+            std::mem::forget(parsed);
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
+fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
+    let malformed = "(".repeat(50_000);
+    let handle = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || Artifact::try_parse(&malformed).expect_err("unterminated input"))
+        .unwrap();
+    let error = handle.join().unwrap();
+    assert_eq!(error.message(), "unterminated artifact list");
+    assert_eq!(error.offset(), Some(50_000));
+}
+
+#[test]
+fn artifact_function_indices_are_fixed_width_and_checked_by_the_parser() {
+    let mut value = model_artifact();
+    let closure = value.lir.functions[0]
+        .body
+        .instrs
+        .iter_mut()
+        .find_map(|instr| match &mut instr.op {
+            Op::Closure { func, .. } => Some(func),
+            _ => None,
+        })
+        .expect("model has a closure");
+    let fixed_width: &mut u64 = closure;
+    *fixed_width = u64::MAX;
+    let printed = assert_round_trip(&value);
+    assert!(printed.contains(&u64::MAX.to_string()));
+
+    let overflow = printed.replacen(&u64::MAX.to_string(), "18446744073709551616", 1);
+    assert_malformed(&overflow);
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ruddy_debug::{
     snapshot::{ROOT, compile, guard, install_hook},
     stage::REGISTRY,
-    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
+    wire::{CompileRequest, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -50,6 +50,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            dependencies: Vec::new(),
             revision: 3,
         },
         1,
@@ -75,6 +76,43 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
     let mut out = Vec::new();
     walk(&stage.nodes, &mut out);
     out
+}
+
+#[test]
+fn compile_requests_without_dependencies_remain_compatible() {
+    let request: CompileRequest =
+        serde_json::from_str(r#"{"files":[{"path":"main.hc","source":""}],"revision":4}"#).unwrap();
+    assert!(request.dependencies.is_empty());
+    assert_eq!(request.revision, 4);
+}
+
+#[test]
+fn supplied_dependencies_reach_debug_artifact_construction() {
+    let snapshot = compile(
+        &CompileRequest {
+            files: vec![FileSpec {
+                path: ROOT.to_string(),
+                source: compiled("let main = 0n\n"),
+            }],
+            dependencies: vec![DependencySpec {
+                name: "base".to_string(),
+                version: "2.3.4".to_string(),
+            }],
+            revision: 9,
+        },
+        1,
+    );
+    let artifact = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "artifact")
+        .expect("artifact stage is registered");
+    assert_eq!(artifact.status, Status::Ok);
+    assert!(artifact.text.as_deref().unwrap().contains("base"));
+    assert_eq!(
+        artifact.summary,
+        "1 dependency · 1 values · 0 types · 0 effects · 0 functions · 1 globals"
+    );
 }
 
 #[test]

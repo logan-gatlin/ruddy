@@ -30,8 +30,19 @@ pub struct CompileRequest {
     /// Every file of the bundle. `main.hc` is the root; a request without one
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
+    /// Bundle identities available to this debug compilation. Older clients
+    /// omit this field and retain the former empty dependency set.
+    #[serde(default)]
+    pub dependencies: Vec<DependencySpec>,
     #[serde(default)]
     pub revision: u64,
+}
+
+/// One dependency identity supplied by the debugger client.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DependencySpec {
+    pub name: String,
+    pub version: String,
 }
 
 /// One file of a bundle, as the page holds it.

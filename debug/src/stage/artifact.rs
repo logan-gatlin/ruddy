@@ -11,9 +11,18 @@ use crate::{
     wire::{Node, Stage},
 };
 
+/// Render the distinction between a phase that never ran and one that failed.
+pub fn missing(spec: &Spec, panicked: bool) -> Stage {
+    if panicked {
+        crate::stage::panicked(spec)
+    } else {
+        crate::stage::skipped(spec, "artifact construction did not run")
+    }
+}
+
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(artifact) = cx.artifact else {
-        return crate::stage::skipped(spec, "artifact construction did not run");
+        return missing(spec, cx.artifact_panicked);
     };
     let text = Artifact::print(artifact);
     let mut ids = Ids::default();

@@ -768,6 +768,7 @@ fn artifact_stage_renders_one_dependency() {
         patterns: None,
         lir: None,
         artifact: Some(&artifact),
+        artifact_panicked: false,
         mint: None,
         symbols: &symbols,
         micros: Phases::default(),
@@ -790,6 +791,22 @@ fn artifact_stage_renders_one_dependency() {
     assert_eq!(dependencies.children.len(), 1);
     assert_eq!(dependencies.children[0].label, "dependency");
     assert_eq!(dependencies.children[0].text, "base@2.3.4");
+}
+
+#[test]
+fn artifact_phase_panic_is_not_reported_as_skipped() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "artifact")
+        .expect("artifact stage is registered");
+    assert_eq!(
+        ruddy_debug::stage::artifact::missing(spec, true).status,
+        Status::Panicked
+    );
+    assert_eq!(
+        ruddy_debug::stage::artifact::missing(spec, false).status,
+        Status::Skipped
+    );
 }
 
 /// The artifact is the canonical disk boundary: the text is directly usable,
@@ -1010,6 +1027,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            dependencies: Vec::new(),
             revision: 0,
         },
         0,

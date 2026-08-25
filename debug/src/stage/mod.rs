@@ -48,6 +48,8 @@ pub struct Cx<'a> {
     pub lir: Option<&'a ruddy::lir::Output>,
     /// The canonical, span-free disk boundary built from accepted LIR.
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
+    /// Artifact construction ran but panicked, rather than being skipped.
+    pub artifact_panicked: bool,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.

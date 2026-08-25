@@ -255,12 +255,28 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
 
     // The artifact is the first disk-boundary representation. Like LIR, it
     // only exists for an accepted program, and retains no source spans.
+    let mut artifact_panicked = false;
     let artifact = match (&built, &inferred, &lowered) {
         (Some(built), Some(inferred), Some(lowered)) => {
             let started = Instant::now();
+            let dependencies = req
+                .dependencies
+                .iter()
+                .map(|dependency| artifact::Dependency {
+                    name: dependency.name.clone(),
+                    version: dependency.version.clone(),
+                })
+                .collect();
             let out = guard("artifact", &mut panicked, || {
-                artifact::build(&mint, &built.program, inferred, lowered)
+                artifact::build_with_dependencies(
+                    &mint,
+                    &built.program,
+                    inferred,
+                    lowered,
+                    dependencies,
+                )
             });
+            artifact_panicked = out.is_none();
             micros.artifact = started.elapsed().as_micros() as u64;
             out
         }
@@ -293,6 +309,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
+        artifact_panicked,
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
