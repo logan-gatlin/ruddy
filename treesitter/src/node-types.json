@@ -911,47 +911,6 @@
     }
   },
   {
-    "type": "bundle_declaration",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "identifier",
-            "named": true
-          }
-        ]
-      },
-      "version": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "bundle_version",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "bundle_version",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "natural",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
     "type": "clause_and",
     "named": true,
     "fields": {},
@@ -3419,10 +3378,6 @@
       "required": false,
       "types": [
         {
-          "type": "bundle_declaration",
-          "named": true
-        },
-        {
           "type": "effect_definition",
           "named": true
         },
@@ -4290,10 +4245,6 @@
   },
   {
     "type": "and",
-    "named": false
-  },
-  {
-    "type": "bundle",
     "named": false
   },
   {

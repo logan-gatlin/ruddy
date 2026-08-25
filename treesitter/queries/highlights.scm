@@ -113,7 +113,6 @@
   "fn"
   "effect"
   "handle"
-  "bundle"
   "module"
 ] @keyword
 

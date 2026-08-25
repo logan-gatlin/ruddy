@@ -77,7 +77,6 @@ module.exports = grammar({
       'or',
       'xor',
       'not',
-      'bundle',
       'module',
       'true',
       'false',
@@ -104,26 +103,7 @@ module.exports = grammar({
   ],
 
   rules: {
-    // A bundle's root file opens with its header; every other file in the
-    // bundle is statements and nothing else. Which file this is, is not the
-    // grammar's to know, so the header is optional here and required — or
-    // refused — by `bundle::load`.
-    source_file: $ => seq(optional($.bundle_declaration), repeat($._statement)),
-
-    /**
-     * `bundle demo 0.1.0` — the name and version the whole program is minted
-     * under, written before any statement and only once.
-     */
-    bundle_declaration: $ => seq(
-      'bundle',
-      field('name', $.identifier),
-      field('version', $.bundle_version),
-    ),
-
-    // `0.1.0`. Three naturals and two dots rather than a literal of its own,
-    // exactly as `token::lex` hands them over: a version needs no lexer rule,
-    // and prerelease versions are simply unwritable this way.
-    bundle_version: $ => seq(alias($.version_number, $.natural), '.', alias($.version_number, $.natural), '.', alias($.version_number, $.natural)),
+    source_file: $ => repeat($._statement),
 
     // ── Statements ────────────────────────────────────────────────────────
 
@@ -705,9 +685,5 @@ module.exports = grammar({
 
     /** The two boolean literals, reserved by token::lex. */
     boolean: _ => choice('true', 'false'),
-
-    // Bundle versions use bare integer components, so their dots can never be
-    // consumed as a real literal's decimal point.
-    version_number: _ => token(prec(1, /[0-9]+/)),
   },
 });
