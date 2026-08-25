@@ -161,78 +161,6 @@ fn presence_paths(ty: &Rc<Ty>, prefix: &str, found: &mut Vec<(String, Presence)>
     }
 }
 
-/// Make the presence slots in a covariant result fresh, preserving sharing
-/// within the result but not tying those slots back to the annotation. A
-/// function may forget presence information when it returns a value; the
-/// annotation's slots remain governed by its own `where` clause.
-fn forget_result_presences(
-    table: &mut Table,
-    ty: &Rc<Ty>,
-    fresh: &mut HashMap<crate::types::TyVar, Presence>,
-    positive: bool,
-) -> Rc<Ty> {
-    let presence = |table: &mut Table,
-                    fresh: &mut HashMap<crate::types::TyVar, Presence>,
-                    presence: &Presence| {
-        if !positive {
-            return presence.clone();
-        }
-        match presence {
-            Presence::Var(var) => fresh
-                .entry(*var)
-                .or_insert_with(|| table.fresh_presence())
-                .clone(),
-            presence => presence.clone(),
-        }
-    };
-    let fields = ty
-        .fields
-        .iter()
-        .map(|(name, field)| {
-            (
-                name.clone(),
-                RowField {
-                    presence: presence(table, fresh, &field.presence),
-                    ty: forget_result_presences(table, &field.ty, fresh, positive),
-                },
-            )
-        })
-        .collect();
-    let core = match &ty.core {
-        Core::Arrow(from, to, effects) => Core::Arrow(
-            forget_result_presences(table, from, fresh, !positive),
-            forget_result_presences(table, to, fresh, positive),
-            effects.clone(),
-        ),
-        Core::Sum(cases) => Core::Sum(Row {
-            labels: cases
-                .labels
-                .iter()
-                .map(|(name, case)| {
-                    (
-                        name.clone(),
-                        RowField {
-                            presence: presence(table, fresh, &case.presence),
-                            ty: forget_result_presences(table, &case.ty, fresh, positive),
-                        },
-                    )
-                })
-                .collect(),
-            rest: cases.rest.clone(),
-        }),
-        Core::Named { symbol, name, args } => Core::Named {
-            symbol: *symbol,
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|arg| forget_result_presences(table, arg, fresh, positive))
-                .collect(),
-        },
-        core => core.clone(),
-    };
-    Rc::new(Ty { core, fields })
-}
-
 fn covered(
     entries: &[(usize, Col)],
     named: &IndexMap<String, RowField>,
@@ -1159,12 +1087,6 @@ impl Constrain<'_> {
                     inside: true,
                 });
                 let held = self.answer.take();
-                // A return is a covariant boundary: it may forget which
-                // optional slots the value carried without equating those
-                // slots with the independently quantified presences in the
-                // annotation's result. Constants and contravariant positions
-                // remain exact.
-                let to = forget_result_presences(self.table, &to, &mut HashMap::new(), true);
                 self.check_term(body, &to);
                 self.answer = held;
                 self.leave(outer);

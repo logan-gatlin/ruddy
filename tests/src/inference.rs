@@ -5521,35 +5521,6 @@ fn a_shared_presence_prints_one_name() {
     );
 }
 
-/// Returning a value may forget its presence refinement. The result's
-/// independently constrained variables are part of the annotation's contract;
-/// checking the identity body must not collapse them onto the input variables.
-#[test]
-fn an_annotated_return_forgets_presence_identity() {
-    let source = "let scramble : \
-        { left when 'a: 't, right when 'b: 't } -> \
-        { left when 'c: 't, right when 'd: 't } \
-        where ('a != 'b) and ('c != 'd) = fn s => s";
-    let (mint, _, output) = inferred(source);
-    assert_eq!(
-        scheme(&mint, &output, "scramble"),
-        "{ left when 'a: 'e, right when 'b: 'e } -> \
-         { left when 'c: 'e, right when 'd: 'e } \
-         where ('a != 'b) and ('c != 'd)"
-    );
-}
-
-/// Presence forgetting changes only variables at a result boundary. A result
-/// that certainly requires a field still rejects a value that cannot have it.
-#[test]
-fn an_annotated_return_keeps_concrete_presence_demands() {
-    let (_, _, output) = infer_src("let bad : {} -> { x: Nat } = fn value => value");
-    let [error] = output.errors.as_slice() else {
-        panic!("expected one error: {:#?}", output.errors);
-    };
-    assert_eq!(error.kind.code(), "missing-field");
-}
-
 /// Fold-back, R8: a presence the store has already decided is no variable at
 /// all. The `let` pattern forces `x` present, `a != b` then forces `y` absent,
 /// and both are settled in the type — no variables and no clause survive.
