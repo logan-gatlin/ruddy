@@ -1,7 +1,10 @@
 //! Filesystem-facing Ruddy compiler entry point used by the command-line tool.
 
 use std::{
+    ffi::{OsStr, OsString},
     fmt, fs,
+    fs::OpenOptions,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -16,6 +19,238 @@ use ruddy::{
 use serde::Deserialize;
 
 const MANIFEST: &str = "Ruddy.toml";
+const ROOT: &str = "main.hc";
+const BUILD_DIRECTORY: &str = "build";
+const INITIAL_VERSION: &str = "0.1.0";
+
+/// The command-line syntax accepted by [`run`].
+pub const USAGE: &str = "ruddy new <path> | ruddy build";
+
+/// The successful filesystem action performed by [`run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// A project was scaffolded at this path.
+    Created(PathBuf),
+    /// An artifact was written to this path.
+    Built(PathBuf),
+}
+
+/// A user-facing command-line or filesystem failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliError {
+    rendered: String,
+    usage: bool,
+}
+
+impl CliError {
+    fn one(message: impl Into<String>) -> Self {
+        Self {
+            rendered: format!("error: {}", message.into()),
+            usage: false,
+        }
+    }
+
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            rendered: format!("error: {}", message.into()),
+            usage: true,
+        }
+    }
+
+    /// Whether the command's usage should be printed after this error.
+    pub const fn is_usage(&self) -> bool {
+        self.usage
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.rendered)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Parse and execute a Ruddy command relative to `current_directory`.
+///
+/// The iterator contains arguments after the executable name. Only `new
+/// <path>` and `build` are accepted.
+pub fn run<I, S>(arguments: I, current_directory: impl AsRef<Path>) -> Result<Outcome, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut arguments = arguments.into_iter().map(Into::into);
+    let Some(command) = arguments.next() else {
+        return Err(CliError::usage("expected a subcommand (`new` or `build`)"));
+    };
+
+    if command == OsStr::new("new") {
+        let Some(path) = arguments.next() else {
+            return Err(CliError::usage("`new` requires a project path"));
+        };
+        if arguments.next().is_some() {
+            return Err(CliError::usage("`new` accepts exactly one project path"));
+        }
+        let path = current_directory.as_ref().join(path);
+        new_project(&path)?;
+        Ok(Outcome::Created(path))
+    } else if command == OsStr::new("build") {
+        if arguments.next().is_some() {
+            return Err(CliError::usage("`build` does not accept arguments"));
+        }
+        build_project(current_directory).map(Outcome::Built)
+    } else {
+        Err(CliError::usage(format!(
+            "unknown subcommand `{}`; expected `new` or `build`",
+            command.to_string_lossy()
+        )))
+    }
+}
+
+/// Create a new Ruddy project without replacing an existing path.
+pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
+    let path = path.as_ref();
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            CliError::one(format!(
+                "project path `{}` has no valid bundle name",
+                path.display()
+            ))
+        })?;
+    let version = Version::new(0, 1, 0);
+    if Bundle::new(name, version).is_none() {
+        return Err(CliError::one(format!(
+            "project directory name `{name}` is not a valid Ruddy bundle name; names must start with an ASCII letter and contain only ASCII letters, digits, `-`, or `_`"
+        )));
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            CliError::one(format!(
+                "could not create parent directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::create_dir(path).map_err(|error| {
+        CliError::one(format!(
+            "could not create project directory {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    let manifest = path.join(MANIFEST);
+    let root = path.join(ROOT);
+    let result = (|| {
+        write_new_file(&manifest, "root = \"main.hc\"\n\n[dependencies]\n")?;
+        write_new_file(
+            &root,
+            &format!("bundle {name} {INITIAL_VERSION}\n\nlet main = 0n\n"),
+        )
+    })();
+    if result.is_err() {
+        // Remove only the two files this invocation owns, then the directory
+        // only if it is still empty. Never recursively delete a path another
+        // process could have populated while creation was in progress.
+        let _ = fs::remove_file(&root);
+        let _ = fs::remove_file(&manifest);
+        let _ = fs::remove_dir(path);
+    }
+    result
+}
+
+fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| CliError::one(format!("could not create {}: {error}", path.display())))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
+}
+
+/// Compile the project in `directory` and write its canonical artifact under
+/// `build/`. Existing build artifacts are replaced.
+pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let directory = directory.as_ref();
+    let artifact = compile(directory).map_err(|error| CliError {
+        rendered: error.to_string(),
+        usage: false,
+    })?;
+    let build = directory.join(BUILD_DIRECTORY);
+    fs::create_dir_all(&build).map_err(|error| {
+        CliError::one(format!(
+            "could not create build directory {}: {error}",
+            build.display()
+        ))
+    })?;
+    let path = build.join(format!("{}.artifact", artifact.header.identity.name));
+    replace_file(&path, artifact.print().as_bytes())?;
+    Ok(path)
+}
+
+/// Write beside the old artifact first, so a failed write cannot truncate the
+/// last successful build. The final rename is atomic on the supported host
+/// filesystems because both paths have the same parent.
+fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("artifact");
+    let mut temporary = None;
+    for attempt in 0..100 {
+        let candidate =
+            path.with_file_name(format!(".{name}.tmp-{}-{attempt}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(CliError::one(format!(
+                    "could not write artifact {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let Some((temporary_path, mut file)) = temporary else {
+        return Err(CliError::one(format!(
+            "could not write artifact {}: no temporary filename was available",
+            path.display()
+        )));
+    };
+
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(CliError::one(format!(
+            "could not write artifact {}: {error}",
+            path.display()
+        )));
+    }
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(CliError::one(format!(
+            "could not write artifact {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// A user-facing failure while loading a manifest or compiling its bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]

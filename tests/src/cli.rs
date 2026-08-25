@@ -3,7 +3,7 @@
 use std::{fs, path::Path};
 
 use ruddy::artifact::{Artifact, Header, Identity, Lir};
-use ruddy_cli::compile;
+use ruddy_cli::{Outcome, build_project, compile, new_project, run};
 use tempfile::TempDir;
 
 fn artifact(name: &str, version: &str) -> Artifact {
@@ -312,5 +312,140 @@ fn the_configured_root_must_name_a_file() {
             error.contains("field `root` must name a file"),
             "root `{root}`: {error}"
         );
+    }
+}
+
+#[test]
+fn new_scaffolds_a_compilable_project_without_overwriting() {
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("nested/my_app");
+
+    new_project(&destination).expect("create the project");
+    assert_eq!(
+        fs::read_to_string(destination.join("Ruddy.toml")).unwrap(),
+        "root = \"main.hc\"\n\n[dependencies]\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("main.hc")).unwrap(),
+        "bundle my_app 0.1.0\n\nlet main = 0n\n"
+    );
+    assert_eq!(
+        compile(&destination).unwrap().header.identity,
+        ruddy::artifact::Identity {
+            name: "my_app".into(),
+            version: "0.1.0".into(),
+        }
+    );
+
+    let error = new_project(&destination).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("could not create project directory")
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("main.hc")).unwrap(),
+        "bundle my_app 0.1.0\n\nlet main = 0n\n"
+    );
+}
+
+#[test]
+fn new_validates_the_bundle_name_and_reports_creation_failures() {
+    let parent = tempfile::tempdir().unwrap();
+    for name in ["3bad", "bad.name", "naïve"] {
+        let error = new_project(parent.path().join(name))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a valid Ruddy bundle name"), "{error}");
+        assert!(!parent.path().join(name).exists());
+    }
+
+    let nameless = new_project(Path::new("/")).unwrap_err().to_string();
+    assert!(nameless.contains("has no valid bundle name"), "{nameless}");
+
+    let blocking_file = parent.path().join("file");
+    fs::write(&blocking_file, "blocking parent").unwrap();
+    let error = new_project(blocking_file.join("child"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("could not create parent directory"),
+        "{error}"
+    );
+}
+
+#[test]
+fn build_writes_and_replaces_the_named_canonical_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("sample");
+    new_project(&project).unwrap();
+
+    let path = build_project(&project).expect("build project");
+    assert_eq!(path, project.join("build/sample.artifact"));
+    let first = fs::read_to_string(&path).unwrap();
+    assert_eq!(Artifact::try_parse(&first).unwrap().print(), first);
+
+    fs::write(&path, "old output").unwrap();
+    assert_eq!(build_project(&project).unwrap(), path);
+    assert_eq!(fs::read_to_string(path).unwrap(), first);
+}
+
+#[test]
+fn build_surfaces_compile_directory_and_artifact_write_failures() {
+    let missing = tempfile::tempdir().unwrap();
+    let compile_error = build_project(missing.path()).unwrap_err();
+    assert!(
+        compile_error
+            .to_string()
+            .contains("could not read manifest")
+    );
+    assert!(!compile_error.is_usage());
+
+    let blocked_build = tempfile::tempdir().unwrap();
+    new_project(blocked_build.path().join("app")).unwrap();
+    let project = blocked_build.path().join("app");
+    fs::write(project.join("build"), "not a directory").unwrap();
+    let error = build_project(&project).unwrap_err().to_string();
+    assert!(
+        error.contains("could not create build directory"),
+        "{error}"
+    );
+
+    let blocked_artifact = tempfile::tempdir().unwrap();
+    new_project(blocked_artifact.path().join("app")).unwrap();
+    let project = blocked_artifact.path().join("app");
+    fs::create_dir(project.join("build")).unwrap();
+    fs::create_dir(project.join("build/app.artifact")).unwrap();
+    let error = build_project(&project).unwrap_err().to_string();
+    assert!(error.contains("could not write artifact"), "{error}");
+    let entries: Vec<_> = fs::read_dir(project.join("build"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("app.artifact")]);
+}
+
+#[test]
+fn command_arguments_are_cargo_like_and_build_uses_the_current_directory() {
+    let current = tempfile::tempdir().unwrap();
+    assert_eq!(
+        run(["new", "app"], current.path()).unwrap(),
+        Outcome::Created(current.path().join("app"))
+    );
+    assert_eq!(
+        run(["build"], current.path().join("app")).unwrap(),
+        Outcome::Built(current.path().join("app/build/app.artifact"))
+    );
+
+    for (arguments, expected) in [
+        (vec![], "expected a subcommand"),
+        (vec!["new"], "requires a project path"),
+        (vec!["new", "one", "two"], "exactly one project path"),
+        (vec!["build", "elsewhere"], "does not accept arguments"),
+        (vec!["compile"], "unknown subcommand `compile`"),
+    ] {
+        let error = run(arguments, current.path()).unwrap_err();
+        assert!(error.is_usage());
+        assert!(error.to_string().contains(expected), "{error}");
     }
 }
