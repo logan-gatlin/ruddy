@@ -26,6 +26,32 @@ const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const INITIAL_VERSION: &str = "0.1.0";
 
+// Git documents most of these as repository-local environment, while the
+// remainder can redirect repository discovery or initialization. None should
+// let an invoking repository determine where a new project's metadata lands.
+const GIT_REPOSITORY_ENVIRONMENT: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_VERSION",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_QUARANTINE_PATH",
+];
+
 /// The command-line syntax accepted by [`run`].
 pub const USAGE: &str = "ruddy new <path> | ruddy build";
 
@@ -167,18 +193,17 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
 }
 
 fn initialize_git(path: &Path) -> Result<(), CliError> {
-    let output = Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .map_err(|error| {
-            CliError::one(format!(
-                "could not initialize Git repository {}: {error}",
-                path.display()
-            ))
-        })?;
+    let mut command = Command::new("git");
+    command.args(["init", "--quiet"]).current_dir(path);
+    for variable in GIT_REPOSITORY_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    let output = command.output().map_err(|error| {
+        CliError::one(format!(
+            "could not initialize Git repository {}: {error}",
+            path.display()
+        ))
+    })?;
     if output.status.success() {
         return Ok(());
     }

@@ -1,6 +1,33 @@
 //! Tests for the filesystem-facing CLI compiler API.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+const GIT_REPOSITORY_ENVIRONMENT: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_VERSION",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_QUARANTINE_PATH",
+];
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{Outcome, build_project, compile, new_project, run};
@@ -27,6 +54,63 @@ fn error(directory: &TempDir) -> String {
     compile(directory.path())
         .expect_err("compilation fails")
         .to_string()
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for variable in GIT_REPOSITORY_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    command
+}
+
+fn run_new_project_child(destination: &Path, path: &Path, environment: &[(&str, &str)]) -> String {
+    let result = destination.parent().unwrap().join("child-result");
+    let mut child = Command::new(env::current_exe().unwrap());
+    child
+        .args(["--exact", "cli::new_project_child", "--nocapture"])
+        .env("RUDDY_NEW_PROJECT_CHILD_DESTINATION", destination)
+        .env("RUDDY_NEW_PROJECT_CHILD_RESULT", &result)
+        .env("PATH", path);
+    for (variable, value) in environment {
+        child.env(variable, value);
+    }
+    let output = child.output().expect("run isolated new-project test child");
+    assert!(
+        output.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::read_to_string(result).expect("child recorded its result")
+}
+
+#[cfg(unix)]
+fn failing_git(directory: &Path, stderr: Option<&str>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::create_dir(directory).unwrap();
+    let executable = directory.join("git");
+    let message = stderr
+        .map(|message| format!("printf '%s\\n' {message:?} >&2\n"))
+        .unwrap_or_default();
+    fs::write(&executable, format!("#!/bin/sh\n{message}exit 23\n")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    directory.to_owned()
+}
+
+#[cfg(windows)]
+fn failing_git(directory: &Path, stderr: Option<&str>) -> PathBuf {
+    fs::create_dir(directory).unwrap();
+    let message = stderr
+        .map(|message| format!("echo {message} 1>&2\r\n"))
+        .unwrap_or_default();
+    fs::write(
+        directory.join("git.cmd"),
+        format!("@echo off\r\n{message}exit /b 23\r\n"),
+    )
+    .unwrap();
+    directory.to_owned()
 }
 
 #[test]
@@ -619,8 +703,8 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
         fs::read_to_string(destination.join(".gitignore")).unwrap(),
         "/build/\n"
     );
-    let git = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree", "--git-dir"])
+    let git = git_command()
+        .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
         .current_dir(&destination)
         .output()
         .expect("run Git in the generated project");
@@ -629,7 +713,20 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
         "{}",
         String::from_utf8_lossy(&git.stderr)
     );
-    assert_eq!(String::from_utf8(git.stdout).unwrap(), "true\n.git\n");
+    let paths: Vec<_> = String::from_utf8(git.stdout)
+        .unwrap()
+        .lines()
+        .map(PathBuf::from)
+        .collect();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        fs::canonicalize(&paths[0]).unwrap(),
+        fs::canonicalize(&destination).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(&paths[1]).unwrap(),
+        fs::canonicalize(destination.join(".git")).unwrap()
+    );
     assert_eq!(
         compile(&destination).unwrap().header.identity,
         ruddy::artifact::Identity {
@@ -648,6 +745,101 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
         fs::read_to_string(destination.join("main.hc")).unwrap(),
         "let main = 0n\n"
     );
+}
+
+#[test]
+fn new_project_child() {
+    let Some(destination) = env::var_os("RUDDY_NEW_PROJECT_CHILD_DESTINATION") else {
+        return;
+    };
+    let result = new_project(destination)
+        .map(|()| "ok".to_owned())
+        .unwrap_or_else(|error| error.to_string());
+    fs::write(
+        env::var_os("RUDDY_NEW_PROJECT_CHILD_RESULT").unwrap(),
+        result,
+    )
+    .unwrap();
+}
+
+#[test]
+fn new_reports_git_spawn_failure_and_leaves_the_scaffold() {
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("spawn_failure");
+    let empty_path = parent.path().join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+
+    let error = run_new_project_child(&destination, &empty_path, &[]);
+    assert!(
+        error.contains("could not initialize Git repository"),
+        "{error}"
+    );
+    assert!(error.contains("spawn_failure"), "{error}");
+    assert!(destination.join("Ruddy.toml").is_file());
+    assert!(destination.join("main.hc").is_file());
+    assert!(destination.join(".gitignore").is_file());
+}
+
+#[test]
+fn new_reports_git_exit_failures_with_and_without_stderr() {
+    for stderr in [Some("git exploded"), None] {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("exit_failure");
+        let path = failing_git(&parent.path().join("bin"), stderr);
+
+        let error = run_new_project_child(&destination, &path, &[]);
+        assert!(
+            error.contains("could not initialize Git repository"),
+            "{error}"
+        );
+        if let Some(stderr) = stderr {
+            assert!(error.contains(stderr), "{error}");
+        } else {
+            assert!(error.contains("23"), "{error}");
+        }
+        assert!(destination.join("Ruddy.toml").is_file());
+        assert!(destination.join("main.hc").is_file());
+        assert!(destination.join(".gitignore").is_file());
+    }
+}
+
+#[test]
+fn new_ignores_repository_redirecting_git_environment() {
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("poison_safe");
+    let poison = parent.path().join("poison");
+    fs::create_dir(&poison).unwrap();
+    let poison = poison.to_str().unwrap();
+    let environment = [
+        ("GIT_ALTERNATE_OBJECT_DIRECTORIES", poison),
+        ("GIT_CONFIG", poison),
+        ("GIT_CONFIG_PARAMETERS", "'poison.value=1'"),
+        ("GIT_CONFIG_COUNT", "invalid"),
+        ("GIT_OBJECT_DIRECTORY", poison),
+        ("GIT_DIR", poison),
+        ("GIT_WORK_TREE", poison),
+        ("GIT_IMPLICIT_WORK_TREE", "0"),
+        ("GIT_GRAFT_FILE", poison),
+        ("GIT_INDEX_FILE", poison),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ("GIT_REPLACE_REF_BASE", "refs/poison/"),
+        ("GIT_PREFIX", poison),
+        ("GIT_SHALLOW_FILE", poison),
+        ("GIT_COMMON_DIR", poison),
+        ("GIT_INDEX_VERSION", "2"),
+        ("GIT_NAMESPACE", "poison"),
+        ("GIT_CEILING_DIRECTORIES", poison),
+        ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
+        ("GIT_QUARANTINE_PATH", poison),
+    ];
+    let path = PathBuf::from(env::var_os("PATH").unwrap());
+
+    assert_eq!(
+        run_new_project_child(&destination, &path, &environment),
+        "ok"
+    );
+    assert!(destination.join(".git").is_dir());
+    assert_eq!(fs::read_dir(poison).unwrap().count(), 0);
 }
 
 #[test]
