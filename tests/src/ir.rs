@@ -4,8 +4,9 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, Effect, ErrorKind, Field, Output, PatternKind, SumCase, Term,
-        TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, Field, Output, PatternKind,
+        SumCase, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -5148,6 +5149,32 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
     }
 }
 
+fn effect_artifact(package: &str, interface: &str) -> a::Artifact {
+    a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: package.into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: vec![a::DeclaredEffect {
+                name: format!("{package}@1.0.0::IO"),
+                identity: Some(a::EffectIdentity {
+                    name: "IO".into(),
+                    interface: interface.into(),
+                }),
+                kind: a::EffectKind::Operations(Vec::new()),
+            }],
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
+}
+
 /// Artifact headers are the semantic boundary, so importing exercises every
 /// portable type/formula/row form rather than relying on source re-lowering.
 #[test]
@@ -5236,8 +5263,10 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             globals: Vec::new(),
         },
     };
-    let src = "module N =\n  effect Pick = get : dep::Box Nat -> ()\n  effect Recover = run : (() -> () + dep::!IO) -> ()\nend\n\
-               module S =\n  effect Pick = get : dep::Box String -> ()\n  effect Recover = run : (() -> () + dep::!Net) -> ()\nend\n\
+    let src = "type Wrap 'a = dep::Box 'a\n\
+               type Deep 'a = Wrap (Wrap 'a)\n\
+               module N =\n  effect Pick = get : Wrap Nat -> ()\n  effect DeepPick = get : Deep Nat -> ()\n  effect Recover = run : (() -> () + dep::!IO) -> ()\nend\n\
+               module S =\n  effect Pick = get : Wrap String -> ()\n  effect DeepPick = get : Deep String -> ()\n  effect Recover = run : (() -> () + dep::!Net) -> ()\nend\n\
                effect Both = dep::!A + dep::!B";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
@@ -5260,12 +5289,80 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
     };
     let picks = identities("Pick");
     assert_ne!(picks[0], picks[1], "Box Nat and Box String stay distinct");
+    let deep_picks = identities("DeepPick");
+    assert_ne!(
+        deep_picks[0], deep_picks[1],
+        "nested local aliases preserve imported application arguments"
+    );
     let recovered = identities("Recover");
     assert_ne!(
         recovered[0], recovered[1],
         "imported effect ids stay distinct"
     );
     assert_eq!(out.errors[2].span.start, src.rfind("dep::!B").unwrap());
+}
+
+#[test]
+fn imported_effects_in_recovery_signatures_compare_structurally() {
+    let first = effect_artifact("first", "read:{}->Nat");
+    let second = effect_artifact("second", "read:{}->Nat");
+    let distinct = effect_artifact("distinct", "read:{}->String");
+    let imports = [
+        DependencyImport {
+            alias: "first",
+            artifact: &first,
+        },
+        DependencyImport {
+            alias: "second",
+            artifact: &second,
+        },
+        DependencyImport {
+            alias: "distinct",
+            artifact: &distinct,
+        },
+    ];
+    let src = "module A =\n  effect Recover = run : (() -> () + first::!IO) -> ()\nend\n\
+               module B =\n  effect Recover = run : (() -> () + second::!IO) -> ()\nend\n\
+               module C =\n  effect Recover = run : (() -> () + distinct::!IO) -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let recover: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Recover")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(recover.len(), 3);
+    assert_eq!(recover[0], recover[1]);
+    assert_ne!(recover[0], recover[2]);
+}
+
+#[test]
+fn ir_dependency_aliases_reject_reserved_identifiers() {
+    let dependency = effect_artifact("dep", "read:{}->Nat");
+    let import = DependencyImport {
+        alias: "let",
+        artifact: &dependency,
+    };
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, Vec::new(), &[import], &[]);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::InvalidDependencyAlias { alias },
+            ..
+        }] if alias == "let"
+    ));
 }
 
 #[test]

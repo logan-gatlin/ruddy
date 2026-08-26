@@ -2548,7 +2548,7 @@ fn canonical_type(
     external_types: &IndexMap<Symbol, ExternalType>,
     effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
-    args: &[Type],
+    args: &[String],
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
@@ -2660,32 +2660,38 @@ fn canonical_type(
             head,
             args: applied,
             ..
-        } => canonical_named(
-            *head,
-            applied,
-            types,
-            effects,
-            external_types,
-            effect_ids,
-            mint,
-            types_seen,
-            effects_seen,
-        ),
+        } => {
+            let applied: Vec<_> = applied
+                .iter()
+                .map(|arg| {
+                    canonical_type(
+                        arg,
+                        types,
+                        effects,
+                        external_types,
+                        effect_ids,
+                        mint,
+                        args,
+                        types_seen,
+                        effects_seen,
+                    )
+                })
+                .collect();
+            canonical_named(
+                *head,
+                &applied,
+                types,
+                effects,
+                external_types,
+                effect_ids,
+                mint,
+                types_seen,
+                effects_seen,
+            )
+        }
         TypeKind::Param { index, .. } => args
             .get(*index as usize)
-            .map(|arg| {
-                canonical_type(
-                    arg,
-                    types,
-                    effects,
-                    external_types,
-                    effect_ids,
-                    mint,
-                    args,
-                    types_seen,
-                    effects_seen,
-                )
-            })
+            .cloned()
             .unwrap_or_else(|| format!("'{}", index)),
         TypeKind::Prim(prim) => format!("{prim:?}"),
         TypeKind::Effects(row) => format!(
@@ -2709,7 +2715,7 @@ fn canonical_type(
 #[allow(clippy::too_many_arguments)]
 fn canonical_named(
     symbol: Symbol,
-    args: &[Type],
+    args: &[String],
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external_types: &IndexMap<Symbol, ExternalType>,
@@ -2734,27 +2740,11 @@ fn canonical_named(
             effects_seen,
         )
     } else if let Some(decl) = external_types.get(&symbol) {
-        // Open the imported scheme structurally with the arguments at this
-        // application. Printing the unopened body made every `Box A` look like
-        // `Box 'a`, collapsing effects whose signatures used different
-        // applications of the same imported constructor.
-        let applied: Vec<_> = args
-            .iter()
-            .map(|arg| {
-                canonical_type(
-                    arg,
-                    types,
-                    effects,
-                    external_types,
-                    effect_ids,
-                    mint,
-                    &[],
-                    types_seen,
-                    effects_seen,
-                )
-            })
-            .collect();
-        canonical_semantic_type(decl.scheme.body(), &applied, external_types, types_seen)
+        // The syntactic traversal has already substituted every enclosing
+        // declaration's arguments. Apply those canonical values directly to
+        // the imported semantic scheme, so local-to-imported alias chains can
+        // neither lose an outer argument nor recurse on `Param -> Param`.
+        canonical_semantic_type(decl.scheme.body(), args, external_types, types_seen)
     } else {
         // A missing linked interface is recoverable (the graph-aware API can
         // supply it); retain a deterministic identity without pretending all
@@ -2940,8 +2930,12 @@ fn canonical_effect(
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
+    let name = match effect_ids.get(&symbol) {
+        Some(EffectId::Structural { name, .. }) => name.as_str(),
+        _ => mint.name(symbol),
+    };
     if !effects_seen.insert(symbol) {
-        return format!("!{}<rec>", mint.name(symbol));
+        return format!("!{name}<rec>");
     }
     let interface = match effects.get(&symbol).map(|decl| &decl.value) {
         Some(Effect::Operations(operations)) => {
@@ -3005,7 +2999,7 @@ fn canonical_effect(
         },
     };
     effects_seen.remove(&symbol);
-    format!("!{}<{interface}>", mint.name(symbol))
+    format!("!{name}<{interface}>")
 }
 
 fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
