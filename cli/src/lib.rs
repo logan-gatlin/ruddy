@@ -395,15 +395,15 @@ enum ManifestDependency {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestDependencyDetail {
-    package: String,
+    bundle: String,
     path: PathBuf,
 }
 
 impl ManifestDependency {
-    fn package<'a>(&'a self, alias: &'a str) -> &'a str {
+    fn bundle<'a>(&'a self, alias: &'a str) -> &'a str {
         match self {
             Self::Path(_) => alias,
-            Self::Detailed(detail) => &detail.package,
+            Self::Detailed(detail) => &detail.bundle,
         }
     }
 
@@ -491,7 +491,7 @@ where
     compile_sandboxed_aliased_dependency_graph(roots, sandbox)
 }
 
-/// Compile dependency roots whose source aliases differ from package names.
+/// Compile dependency roots whose source aliases differ from bundle names.
 pub fn compile_sandboxed_aliased_dependency_graph<I, A, N, P>(
     dependencies: I,
     sandbox: impl AsRef<Path>,
@@ -509,8 +509,8 @@ where
         ))
     })?;
     compile_aliased_dependency_graph_inner(
-        dependencies.into_iter().map(|(alias, package, path)| {
-            (alias.into(), package.into(), path.as_ref().to_path_buf())
+        dependencies.into_iter().map(|(alias, bundle, path)| {
+            (alias.into(), bundle.into(), path.as_ref().to_path_buf())
         }),
         Some(sandbox),
     )
@@ -612,7 +612,7 @@ impl GraphCompiler {
 
         let mut dependency_artifacts = Vec::with_capacity(manifest.dependencies.len());
         for (alias, specification) in &manifest.dependencies {
-            let expected = specification.package(alias);
+            let expected = specification.bundle(alias);
             let declared = specification.path();
             if !source_identifier(alias) {
                 self.active.pop();

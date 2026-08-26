@@ -5170,18 +5170,18 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
     }
 }
 
-fn effect_artifact(package: &str, interface: &str) -> a::Artifact {
+fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
     a::Artifact {
         header: a::Header {
             identity: a::Identity {
-                name: package.into(),
+                name: bundle.into(),
                 version: "1.0.0".into(),
             },
             dependencies: Vec::new(),
             values: Vec::new(),
             types: Vec::new(),
             effects: vec![a::DeclaredEffect {
-                name: format!("{package}@1.0.0::IO"),
+                name: format!("{bundle}@1.0.0::IO"),
                 identity: Some(a::EffectIdentity {
                     name: "IO".into(),
                     interface: interface.into(),

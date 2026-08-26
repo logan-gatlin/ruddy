@@ -84,14 +84,23 @@ fn compile_requests_without_dependencies_remain_compatible() {
     assert_eq!(request.revision, 4);
 
     let request: CompileRequest = serde_json::from_str(
-        r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
+        r#"{"files":[],"dependencies":{"http_core":{"bundle":"http-core","path":"../http-core"}}}"#,
     )
     .unwrap();
     assert!(matches!(
         &request.dependencies["http_core"],
         DependencySpec::Detailed(detail)
-            if detail.package == "http-core" && detail.path == "../http-core"
+            if detail.bundle == "http-core" && detail.path == "../http-core"
     ));
+
+    let old = serde_json::from_str::<CompileRequest>(
+        r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
+    )
+    .unwrap_err();
+    assert!(
+        old.to_string().contains("did not match any variant"),
+        "{old}"
+    );
 }
 
 #[test]
@@ -222,7 +231,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
 }
 
 #[test]
-fn dependencies_tab_correlates_same_package_versions_by_request_alias() {
+fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
     let scratch = tempfile::tempdir().unwrap();
     for (directory, version, source) in [
         ("old-lib", "1.0.0", "let one = 1n\n"),
@@ -242,7 +251,7 @@ fn dependencies_tab_correlates_same_package_versions_by_request_alias() {
     fs::create_dir_all(scratch.path().join("app")).unwrap();
     let detailed = |path: &str| {
         DependencySpec::Detailed(DependencyDetail {
-            package: "lib".into(),
+            bundle: "lib".into(),
             path: path.into(),
         })
     };
@@ -306,7 +315,7 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies.shared]\npackage = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(

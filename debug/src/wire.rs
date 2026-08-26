@@ -51,8 +51,8 @@ pub struct CompileRequest {
     pub revision: u64,
 }
 
-/// A string preserves the old same-name package/path form. The detailed form
-/// permits a source-safe alias to name a package identity containing `-`.
+/// A string preserves the old same-name bundle/path form. The detailed form
+/// permits a source-safe alias to name a bundle identity containing `-`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum DependencySpec {
@@ -63,7 +63,7 @@ pub enum DependencySpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DependencyDetail {
-    pub package: String,
+    pub bundle: String,
     pub path: String,
 }
 
@@ -86,10 +86,10 @@ impl PartialEq<&str> for DependencySpec {
 }
 
 impl DependencySpec {
-    pub fn package<'a>(&'a self, alias: &'a str) -> &'a str {
+    pub fn bundle<'a>(&'a self, alias: &'a str) -> &'a str {
         match self {
             Self::Path(_) => alias,
-            Self::Detailed(detail) => &detail.package,
+            Self::Detailed(detail) => &detail.bundle,
         }
     }
 

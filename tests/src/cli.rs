@@ -92,7 +92,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
 }
 
 #[test]
-fn detailed_dependencies_alias_hyphenated_package_identities() {
+fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     let directory = project();
     let dependency = directory.path().join("http-core");
     write_project(&dependency, "http-core", "1.0.0", &[]);
@@ -104,12 +104,23 @@ fn detailed_dependencies_alias_hyphenated_package_identities() {
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { bundle = \"http-core\", path = \"http-core\" }\n",
     )
     .unwrap();
 
     let built = compile(directory.path()).expect("the source alias resolves");
     assert_eq!(built.header.dependencies[0].name, "http-core");
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
+    )
+    .unwrap();
+    let old_field_error = error(&directory);
+    assert!(
+        old_field_error.contains("did not match any variant"),
+        "{old_field_error}"
+    );
 
     fs::write(
         directory.path().join("Ruddy.toml"),

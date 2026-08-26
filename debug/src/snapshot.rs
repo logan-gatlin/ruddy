@@ -186,7 +186,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 let mut completed = HashSet::new();
                 let mut resolved = Vec::new();
                 for (alias, specification) in &req.dependencies {
-                    let package = specification.package(alias);
+                    let bundle = specification.bundle(alias);
                     let declared = specification.path();
                     let declared_path = Path::new(declared);
                     match crate::docs::dependency_path(scratch, &project, declared_path).and_then(
@@ -195,7 +195,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                                 .map(|()| path)
                         },
                     ) {
-                        Ok(path) => resolved.push((alias.clone(), package.to_string(), path)),
+                        Ok(path) => resolved.push((alias.clone(), bundle.to_string(), path)),
                         Err(error) => diagnostics.push(raw(
                             "dependencies",
                             "dependency-path",

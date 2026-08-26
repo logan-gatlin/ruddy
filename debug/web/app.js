@@ -485,12 +485,12 @@ function parseDependencies(input) {
     const path = part.slice(equals + 1).trim();
     const at = left.indexOf("@");
     const alias = (at < 0 ? left : left.slice(0, at)).trim();
-    const packageName = (at < 0 ? alias : left.slice(at + 1)).trim();
-    if (equals <= 0 || !alias || !packageName || !path) {
-      throw new Error(`Dependency ${index + 1} must be written as alias=folder or alias@package=folder.`);
+    const bundleName = (at < 0 ? alias : left.slice(at + 1)).trim();
+    if (equals <= 0 || !alias || !bundleName || !path) {
+      throw new Error(`Dependency ${index + 1} must be written as alias=folder or alias@bundle=folder.`);
     }
     if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
-    dependencies[alias] = alias === packageName ? path : { package: packageName, path };
+    dependencies[alias] = alias === bundleName ? path : { bundle: bundleName, path };
   }
   return dependencies;
 }
@@ -498,7 +498,7 @@ function parseDependencies(input) {
 function printDependency(alias, specification) {
   return typeof specification === "string"
     ? `${alias}=${specification}`
-    : `${alias}@${specification.package}=${specification.path}`;
+    : `${alias}@${specification.bundle}=${specification.path}`;
 }
 
 function wireTitlebar() {
@@ -534,7 +534,7 @@ function wireTitlebar() {
   });
   el("dependencies").addEventListener("click", () => {
     const current = Object.entries(state.dependencies).map(([alias, specification]) => printDependency(alias, specification)).join(", ");
-    const entered = window.prompt("Dependencies (alias=folder or alias@package=folder, comma-separated)", current);
+    const entered = window.prompt("Dependencies (alias=folder or alias@bundle=folder, comma-separated)", current);
     if (entered === null) return;
     try {
       state.dependencies = parseDependencies(entered);

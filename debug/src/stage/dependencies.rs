@@ -12,8 +12,8 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .iter()
         .map(|(alias, specification)| {
             // The three slices are produced in preserved direct-request order.
-            // Alias position, unlike package name, distinguishes two requests
-            // for different versions of the same package.
+            // Alias position, unlike bundle name, distinguishes two requests
+            // for different versions of the same bundle.
             let position = cx
                 .dependency_aliases
                 .iter()
