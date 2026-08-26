@@ -7,6 +7,7 @@ use std::{
     fs::OpenOptions,
     io::Write as _,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use indexmap::IndexMap;
@@ -21,6 +22,7 @@ use serde::Deserialize;
 
 const MANIFEST: &str = "Ruddy.toml";
 const ROOT: &str = "main.hc";
+const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const INITIAL_VERSION: &str = "0.1.0";
 
@@ -111,8 +113,9 @@ where
 
 /// Create a new Ruddy project without replacing an existing path.
 ///
-/// A write failure can leave a partial project in place; it is not removed by
-/// pathname because another process may have replaced or populated its entries.
+/// A scaffolding or Git initialization failure can leave a partial project in
+/// place; it is not removed by pathname because another process may have
+/// replaced or populated its entries.
 pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
     let path = path.as_ref();
     let name = path
@@ -158,7 +161,39 @@ pub fn new_project(path: impl AsRef<Path>) -> Result<(), CliError> {
             "name = {name:?}\nversion = {INITIAL_VERSION:?}\nroot = \"main.hc\"\n\n[dependencies]\n"
         ),
     )?;
-    write_new_file(&root, "let main = 0n\n")
+    write_new_file(&root, "let main = 0n\n")?;
+    write_new_file(&path.join(GITIGNORE), "/build/\n")?;
+    initialize_git(path)
+}
+
+fn initialize_git(path: &Path) -> Result<(), CliError> {
+    let output = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .map_err(|error| {
+            CliError::one(format!(
+                "could not initialize Git repository {}: {error}",
+                path.display()
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    let detail = if detail.is_empty() {
+        output.status.to_string()
+    } else {
+        detail.to_owned()
+    };
+    Err(CliError::one(format!(
+        "could not initialize Git repository {}: {detail}",
+        path.display()
+    )))
 }
 
 fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {

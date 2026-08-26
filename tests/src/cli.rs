@@ -1,6 +1,6 @@
 //! Tests for the filesystem-facing CLI compiler API.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{Outcome, build_project, compile, new_project, run};
@@ -615,6 +615,21 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
         fs::read_to_string(destination.join("main.hc")).unwrap(),
         "let main = 0n\n"
     );
+    assert_eq!(
+        fs::read_to_string(destination.join(".gitignore")).unwrap(),
+        "/build/\n"
+    );
+    let git = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree", "--git-dir"])
+        .current_dir(&destination)
+        .output()
+        .expect("run Git in the generated project");
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    assert_eq!(String::from_utf8(git.stdout).unwrap(), "true\n.git\n");
     assert_eq!(
         compile(&destination).unwrap().header.identity,
         ruddy::artifact::Identity {
