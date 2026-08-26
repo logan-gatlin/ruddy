@@ -748,6 +748,10 @@ pub enum ErrorKind {
     InvalidDependencyAlias {
         alias: String,
     },
+    /// The same source-visible dependency alias was supplied more than once.
+    DuplicateDependencyAlias {
+        alias: String,
+    },
     /// The same artifact identity was supplied more than once.
     DuplicateDependency {
         name: String,
@@ -5468,6 +5472,7 @@ impl Builder<'_> {
     ) {
         let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
         let mut identities = HashSet::new();
+        let mut aliases = HashSet::new();
         let mut valid = Vec::with_capacity(dependencies.len());
         for import in dependencies {
             let identity = (
@@ -5481,7 +5486,7 @@ impl Builder<'_> {
                         alias: import.alias.to_string(),
                     },
                 });
-            } else if !identities.insert(identity) {
+            } else if identities.contains(&identity) {
                 self.errors.push(Error {
                     span: Span::default(),
                     kind: ErrorKind::DuplicateDependency {
@@ -5489,7 +5494,16 @@ impl Builder<'_> {
                         version: import.artifact.header.identity.version.clone(),
                     },
                 });
+            } else if aliases.contains(import.alias) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::DuplicateDependencyAlias {
+                        alias: import.alias.to_string(),
+                    },
+                });
             } else {
+                identities.insert(identity);
+                aliases.insert(import.alias);
                 valid.push(*import);
             }
         }

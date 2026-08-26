@@ -566,6 +566,7 @@ impl ir::ErrorKind {
     pub fn code(&self) -> &'static str {
         match self {
             ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
+            ir::ErrorKind::DuplicateDependencyAlias { .. } => "duplicate-dependency-alias",
             ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
             ir::ErrorKind::Undefined { namespace } => match namespace {
                 Namespace::Types => "undefined-type",
@@ -648,6 +649,9 @@ impl fmt::Display for ir::ErrorKind {
                 f,
                 "dependency alias `{alias}` is not a valid source identifier"
             ),
+            ir::ErrorKind::DuplicateDependencyAlias { alias } => {
+                write!(f, "dependency alias `{alias}` was imported more than once")
+            }
             ir::ErrorKind::DuplicateDependency { name, version } => {
                 write!(f, "dependency `{name}@{version}` was imported more than once")
             }

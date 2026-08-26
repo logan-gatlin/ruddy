@@ -5413,6 +5413,49 @@ fn ir_dependency_aliases_reject_reserved_identifiers() {
 }
 
 #[test]
+fn duplicate_dependency_aliases_are_rejected_without_merging_roots() {
+    let first = effect_artifact("first", "read:{}->Nat");
+    let mut second = effect_artifact("second", "send:String->{}");
+    second.header.effects[0].name = "second@1.0.0::Net".to_string();
+    second.header.effects[0].identity.as_mut().unwrap().name = "Net".to_string();
+    let imports = [
+        DependencyImport {
+            alias: "shared",
+            artifact: &first,
+        },
+        DependencyImport {
+            alias: "shared",
+            artifact: &second,
+        },
+    ];
+    let src = "effect Both = shared::!IO + shared::!Net";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-dependency-alias", "undefined-effect"]
+    );
+    assert!(
+        out.program
+            .external_names
+            .values()
+            .any(|name| name == "first@1.0.0::IO")
+    );
+    assert!(
+        !out.program
+            .external_names
+            .values()
+            .any(|name| name.starts_with("second@"))
+    );
+}
+
+#[test]
 fn dependency_interfaces_import_every_semantic_form() {
     let unit = || artifact_type(a::Core::Unit);
     let field = |presence| a::RowField {
