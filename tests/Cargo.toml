@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+gix = { version = "0.87.1", default-features = false, features = ["sha1"] }
 ruddy = { path = ".." }
 ruddy-cli = { package = "cli", path = "../cli" }
 ruddy-debug = { path = "../debug" }
