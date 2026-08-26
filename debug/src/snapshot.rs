@@ -201,6 +201,10 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         )),
                     }
                 }
+                let direct_paths: Vec<_> = resolved
+                    .iter()
+                    .map(|(_, path)| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                    .collect();
                 match ruddy_cli::compile_sandboxed_dependency_graph(resolved, scratch) {
                     Ok((graph, direct)) => {
                         linked_interfaces = graph
@@ -208,14 +212,15 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                             .iter()
                             .map(|project| project.artifact.clone())
                             .collect();
-                        dependency_interfaces = direct
+                        // Select source-visible roots by their canonical graph
+                        // path, not by the first matching bundle identity.
+                        dependency_interfaces = direct_paths
                             .iter()
-                            .filter_map(|identity| {
-                                graph.projects.iter().find(|project| {
-                                    project.artifact.header.identity.name == identity.name
-                                        && project.artifact.header.identity.version
-                                            == identity.version
-                                })
+                            .filter_map(|path| {
+                                graph
+                                    .projects
+                                    .iter()
+                                    .find(|project| &project.directory == path)
                             })
                             .map(|project| project.artifact.clone())
                             .collect();

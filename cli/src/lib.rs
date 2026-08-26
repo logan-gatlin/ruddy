@@ -500,6 +500,7 @@ where
 struct GraphCompiler {
     sandbox: Option<PathBuf>,
     completed: HashMap<PathBuf, usize>,
+    identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
     projects: Vec<CompiledProject>,
 }
@@ -529,6 +530,19 @@ impl GraphCompiler {
 
         let manifest = load_manifest(&directory, self.sandbox.as_deref())?;
         let identity = configured_identity(&manifest.name, &manifest.version)?;
+        let identity_key = (manifest.name.clone(), manifest.version.clone());
+        if let Some(previous) = self.identities.get(&identity_key)
+            && previous != &directory
+        {
+            return Err(CompileError::one(format!(
+                "projects {} and {} both declare bundle {}@{}",
+                previous.display(),
+                directory.display(),
+                manifest.name,
+                manifest.version
+            )));
+        }
+        self.identities.insert(identity_key, directory.clone());
         let active_name = edge
             .as_ref()
             .map(|(name, _)| name.clone())

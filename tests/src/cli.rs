@@ -396,6 +396,93 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
 }
 
 #[test]
+fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join("base");
+    let middle = root.path().join("middle");
+    let app = root.path().join("app");
+    write_project(&base, "base", "1.0.0", &[]);
+    fs::write(
+        base.join("main.hc"),
+        "effect Read = get : {} -> Nat\n\
+         type Cases 'r = #A Nat | ..'r\n\
+         let read : {} -> Nat + !Read = fn _ => !Read.get {}\n",
+    )
+    .unwrap();
+    write_project(&middle, "middle", "1.0.0", &[("base", "../base")]);
+    fs::write(
+        middle.join("main.hc"),
+        "effect Console = base::!Read\n\
+         effect Services = !Console\n\
+         let read : {} -> Nat + !Services = base::read\n",
+    )
+    .unwrap();
+    write_project(
+        &app,
+        "app",
+        "1.0.0",
+        &[("base", "../base"), ("middle", "../middle")],
+    );
+    fs::write(
+        app.join("main.hc"),
+        "type F = {} -> Nat + base::!Read\n\
+         let direct : F = base::read\n\
+         let linked : {} -> Nat + middle::!Services = middle::read\n",
+    )
+    .unwrap();
+    compile(&app)
+        .expect("imported effects remain in declared types and aliases close transitively");
+
+    fs::write(app.join("main.hc"), "type Bad = base::Cases Nat\n").unwrap();
+    let error = compile(&app).unwrap_err().to_string();
+    assert!(error.contains("not-a-row"), "{error}");
+
+    fs::write(app.join("main.hc"), "type Bad = base::Cases (#A Nat)\n").unwrap();
+    let error = compile(&app).unwrap_err().to_string();
+    assert!(error.contains("repeated-row-field"), "{error}");
+}
+
+#[test]
+fn distinct_projects_cannot_claim_one_bundle_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    write_project(&left, "same", "1.0.0", &[]);
+    write_project(&right, "same", "1.0.0", &[]);
+    // Two separate direct roots allow the same manifest name to be requested
+    // twice while preserving the dependency-key invariant.
+    let error = ruddy_cli::compile_dependency_graph([("same", &left), ("same", &right)])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("both declare bundle same@1.0.0"), "{error}");
+}
+
+#[test]
+fn imported_signature_types_participate_in_effect_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let dep = root.path().join("dep");
+    let app = root.path().join("app");
+    write_project(&dep, "dep", "1.0.0", &[]);
+    fs::write(dep.join("main.hc"), "type A = Nat\ntype B = String\n").unwrap();
+    write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
+    fs::write(
+        app.join("main.hc"),
+        "module X = effect Same = op : dep::A -> {} end\n\
+         module Y = effect Same = op : dep::B -> {} end\n",
+    )
+    .unwrap();
+    let artifact = compile(&app).unwrap();
+    let identities: Vec<_> = artifact
+        .header
+        .effects
+        .iter()
+        .filter_map(|effect| effect.identity.as_ref())
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0].interface, identities[1].interface);
+}
+
+#[test]
 fn dependency_cycles_are_reported_and_failed_graphs_write_nothing() {
     let root = tempfile::tempdir().unwrap();
     let a = root.path().join("a");

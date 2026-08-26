@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 use ruddy::{
-    artifact as a,
+    artifact as a, inference,
     ir::{
         Annotation, ClauseKind, Effect, ErrorKind, Field, Output, PatternKind, SumCase, Term,
         TermKind, TypeField, TypeKind, build, build_with_dependencies,
@@ -5140,6 +5140,42 @@ fn artifact_scheme(body: a::Type) -> a::Scheme {
 /// Artifact headers are the semantic boundary, so importing exercises every
 /// portable type/formula/row form rather than relying on source re-lowering.
 #[test]
+fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: vec![a::Dependency {
+                name: "base".to_string(),
+                version: "1.0.0".to_string(),
+            }],
+            values: Vec::new(),
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::Wrapper".to_string(),
+                params: Vec::new(),
+                scheme: artifact_scheme(artifact_type(a::Core::Named {
+                    name: "base@1.0.0::Hidden".to_string(),
+                    args: vec![artifact_type(a::Core::Nat)],
+                })),
+            }],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let parsed = parse::parse(lex("let value : dep::Wrapper = 0n", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let _inferred = inference::infer(&mint, &mut built.program);
+    assert_eq!(built.program.external_types.len(), 2);
+}
+
+#[test]
 fn dependency_interfaces_import_every_semantic_form() {
     let unit = || artifact_type(a::Core::Unit);
     let field = |presence| a::RowField {
@@ -5313,7 +5349,9 @@ fn dependency_interfaces_import_every_semantic_form() {
     let out = build_with_dependencies(&mut mint, Vec::new(), &[dependency, duplicate]);
 
     assert!(out.errors.is_empty());
-    assert_eq!(out.program.external_types.len(), 1);
+    // The declared type plus a recovery interface for the transitive `Remote`
+    // reference whose header was deliberately not supplied.
+    assert_eq!(out.program.external_types.len(), 2);
     assert_eq!(out.program.external_operations.len(), 1);
     assert!(
         out.program
