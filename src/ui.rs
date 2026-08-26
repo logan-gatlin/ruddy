@@ -565,6 +565,8 @@ impl ir::ErrorKind {
     /// have to re-inspect the variant to tell them apart.
     pub fn code(&self) -> &'static str {
         match self {
+            ir::ErrorKind::InvalidDependencyAlias { .. } => "invalid-dependency-alias",
+            ir::ErrorKind::DuplicateDependency { .. } => "duplicate-dependency",
             ir::ErrorKind::Undefined { namespace } => match namespace {
                 Namespace::Types => "undefined-type",
                 Namespace::Effects => "undefined-effect",
@@ -642,6 +644,13 @@ impl ir::ErrorKind {
 impl fmt::Display for ir::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ir::ErrorKind::InvalidDependencyAlias { alias } => write!(
+                f,
+                "dependency alias `{alias}` is not a valid source identifier"
+            ),
+            ir::ErrorKind::DuplicateDependency { name, version } => {
+                write!(f, "dependency `{name}@{version}` was imported more than once")
+            }
             ir::ErrorKind::Undefined { namespace } => write!(f, "undefined {namespace}"),
             ir::ErrorKind::Duplicate { namespace, .. } => write!(f, "duplicate {namespace}"),
             ir::ErrorKind::DuplicateField => f.write_str("duplicate field"),

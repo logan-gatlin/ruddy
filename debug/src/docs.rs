@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::ROOT,
-    wire::{Doc, DocMeta, FileSpec},
+    wire::{DependencySpec, Doc, DocMeta, FileSpec},
 };
 
 const EXTENSION: &str = "hc";
@@ -29,7 +29,7 @@ struct Manifest {
     name: String,
     version: String,
     root: String,
-    dependencies: IndexMap<String, String>,
+    dependencies: IndexMap<String, DependencySpec>,
 }
 
 /// The longest path a file inside a document may have. Long enough for a module
@@ -169,7 +169,7 @@ pub fn write(
     bundle_name: &str,
     version: &str,
     configured_root: &str,
-    dependencies: &IndexMap<String, String>,
+    dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
     let dir = path(root, name).ok_or_else(bad_name)?;

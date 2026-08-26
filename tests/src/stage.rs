@@ -755,8 +755,8 @@ fn artifact_stage_renders_one_dependency() {
     };
     let symbols = HashMap::new();
     let declarations = IndexMap::from([
-        ("base".to_string(), "../base".to_string()),
-        ("broken".to_string(), "../broken".to_string()),
+        ("base".to_string(), "../base".into()),
+        ("broken".to_string(), "../broken".into()),
     ]);
     let cx = Cx {
         files: &[],

@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use ruddy_debug::{
     snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
-    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
+    wire::{CompileRequest, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -79,12 +79,22 @@ fn compile_requests_without_dependencies_remain_compatible() {
     assert_eq!(request.version, "0.1.0");
     assert!(request.dependencies.is_empty());
     assert_eq!(request.revision, 4);
+
+    let request: CompileRequest = serde_json::from_str(
+        r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &request.dependencies["http_core"],
+        DependencySpec::Detailed(detail)
+            if detail.package == "http-core" && detail.path == "../http-core"
+    ));
 }
 
 #[test]
 fn dependency_paths_without_a_scratch_root_are_recoverable() {
     let mut dependencies = IndexMap::new();
-    dependencies.insert("base".to_string(), "../base".to_string());
+    dependencies.insert("base".to_string(), "../base".into());
     let snapshot = compile(
         &CompileRequest {
             name: "debugger".to_string(),
@@ -136,7 +146,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
-    dependencies.insert("base".to_string(), "../base".to_string());
+    dependencies.insert("base".to_string(), "../base".into());
     let request = CompileRequest {
         name: "app".to_string(),
         version: "1.0.0".to_string(),
@@ -347,6 +357,10 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
 }
 
 fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest {
+    let dependencies = dependencies
+        .into_iter()
+        .map(|(name, path)| (name, path.into()))
+        .collect();
     CompileRequest {
         name: "app".to_string(),
         version: "1.0.0".to_string(),

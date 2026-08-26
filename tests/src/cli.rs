@@ -92,6 +92,38 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
 }
 
 #[test]
+fn detailed_dependencies_alias_hyphenated_package_identities() {
+    let directory = project();
+    let dependency = directory.path().join("http-core");
+    write_project(&dependency, "http-core", "1.0.0", &[]);
+    fs::write(dependency.join("main.hc"), "let status = 200n\n").unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "let main = http_core::status\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
+    )
+    .unwrap();
+
+    let built = compile(directory.path()).expect("the source alias resolves");
+    assert_eq!(built.header.dependencies[0].name, "http-core");
+
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp-core = \"http-core\"\n",
+    )
+    .unwrap();
+    let error = error(&directory);
+    assert!(
+        error.contains("not a valid Ruddy source identifier"),
+        "{error}"
+    );
+}
+
+#[test]
 fn transitive_dependencies_are_linkable_but_not_source_visible() {
     let directory = project();
     write_project(&directory.path().join("base"), "base", "1.0.0", &[]);
@@ -273,23 +305,23 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ("title = \"app\"\n", "unknown field `title`"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
-            "invalid type",
+            "data did not match",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
-            "invalid type",
+            "data did not match",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
-            "invalid type",
+            "data did not match",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
-            "invalid type",
+            "data did not match",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
-            "invalid type",
+            "data did not match",
         ),
     ] {
         fs::write(directory.path().join("Ruddy.toml"), manifest).expect("replace the manifest");

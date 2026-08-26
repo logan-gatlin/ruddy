@@ -158,6 +158,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // recoverable so the active project's source phases remain inspectable.
     let dependency_started = Instant::now();
     let mut dependency_artifacts = Vec::new();
+    let mut dependency_aliases = Vec::new();
     let mut dependency_interfaces = Vec::new();
     let mut linked_interfaces = Vec::new();
     if !req.dependencies.is_empty() {
@@ -184,7 +185,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                 let mut active = HashSet::new();
                 let mut completed = HashSet::new();
                 let mut resolved = Vec::new();
-                for (name, declared) in &req.dependencies {
+                for (alias, specification) in &req.dependencies {
+                    let package = specification.package(alias);
+                    let declared = specification.path();
                     let declared_path = Path::new(declared);
                     match crate::docs::dependency_path(scratch, &project, declared_path).and_then(
                         |path| {
@@ -192,20 +195,23 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                                 .map(|()| path)
                         },
                     ) {
-                        Ok(path) => resolved.push((name.clone(), path)),
+                        Ok(path) => resolved.push((alias.clone(), package.to_string(), path)),
                         Err(error) => diagnostics.push(raw(
                             "dependencies",
                             "dependency-path",
-                            format!("dependency `{name}` at `{declared}`: {error}"),
+                            format!("dependency `{alias}` at `{declared}`: {error}"),
                             None,
                         )),
                     }
                 }
                 let direct_paths: Vec<_> = resolved
                     .iter()
-                    .map(|(_, path)| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                    .map(|(_, _, path)| {
+                        std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+                    })
                     .collect();
-                match ruddy_cli::compile_sandboxed_dependency_graph(resolved, scratch) {
+                dependency_aliases = resolved.iter().map(|(alias, _, _)| alias.clone()).collect();
+                match ruddy_cli::compile_sandboxed_aliased_dependency_graph(resolved, scratch) {
                     Ok((graph, direct)) => {
                         linked_interfaces = graph
                             .projects
@@ -247,10 +253,15 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut built = loaded.as_ref().and_then(|loaded| {
         let started = Instant::now();
         let out = guard("ir", &mut panicked, || {
-            ir::build_with_dependency_graph(
+            let imports: Vec<_> = dependency_aliases
+                .iter()
+                .zip(&dependency_interfaces)
+                .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+                .collect();
+            ir::build_with_dependency_imports(
                 &mut mint,
                 loaded.stmts.clone(),
-                &dependency_interfaces,
+                &imports,
                 &linked_interfaces,
             )
         });

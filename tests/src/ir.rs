@@ -4019,6 +4019,17 @@ fn structural_effect_duplicates_are_rejected() {
     );
 }
 
+#[test]
+fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
+    let src = "effect Log = write : Nat -> ()\n\
+               effect A = !Log\n\
+               effect B = !Log\n\
+               effect Both = !A + !B";
+    let (_, out) = build_src(src);
+    assert_eq!(codes_of(src), ["duplicate-case"]);
+    assert_eq!(out.errors[0].span.start, src.rfind("!B").unwrap());
+}
+
 /// Effect rows inside an operation's input/output signature participate in
 /// identity too. Their dependencies are compared structurally, not by the
 /// source module that declared them.
@@ -5176,6 +5187,88 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
 }
 
 #[test]
+fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::Box".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: artifact_type(a::Core::Bound(0)),
+                },
+            }],
+            effects: [
+                ("IO", "read:{}->Nat"),
+                ("Net", "send:String->{}"),
+                ("Log", "write:Nat->{}"),
+            ]
+            .into_iter()
+            .map(|(name, interface)| a::DeclaredEffect {
+                name: format!("dep@1.0.0::{name}"),
+                identity: Some(a::EffectIdentity {
+                    name: name.into(),
+                    interface: interface.into(),
+                }),
+                kind: a::EffectKind::Operations(Vec::new()),
+            })
+            .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
+                name: format!("dep@1.0.0::{name}"),
+                identity: None,
+                kind: a::EffectKind::Alias(vec!["dep@1.0.0::Log".into()]),
+            }))
+            .collect(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module N =\n  effect Pick = get : dep::Box Nat -> ()\n  effect Recover = run : (() -> () + dep::!IO) -> ()\nend\n\
+               module S =\n  effect Pick = get : dep::Box String -> ()\n  effect Recover = run : (() -> () + dep::!Net) -> ()\nend\n\
+               effect Both = dep::!A + dep::!B";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["impure-operation", "impure-operation", "duplicate-case"]
+    );
+    let identities = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect::<Vec<_>>()
+    };
+    let picks = identities("Pick");
+    assert_ne!(picks[0], picks[1], "Box Nat and Box String stay distinct");
+    let recovered = identities("Recover");
+    assert_ne!(
+        recovered[0], recovered[1],
+        "imported effect ids stay distinct"
+    );
+    assert_eq!(out.errors[2].span.start, src.rfind("dep::!B").unwrap());
+}
+
+#[test]
 fn dependency_interfaces_import_every_semantic_form() {
     let unit = || artifact_type(a::Core::Unit);
     let field = |presence| a::RowField {
@@ -5344,11 +5437,18 @@ fn dependency_interfaces_import_every_semantic_form() {
     };
     // A second header with the same root/name covers deterministic duplicate
     // handling; the first declaration remains the source-visible one.
-    let duplicate = dependency.clone();
+    let mut duplicate = dependency.clone();
+    duplicate.header.values.clear();
+    duplicate.header.types.clear();
+    duplicate.header.effects.clear();
     let mut mint = dummy_mint();
     let out = build_with_dependencies(&mut mint, Vec::new(), &[dependency, duplicate]);
 
-    assert!(out.errors.is_empty());
+    assert_eq!(out.errors.len(), 1);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::DuplicateDependency { .. }
+    ));
     // The declared type plus a recovery interface for the transitive `Remote`
     // reference whose header was deliberately not supplied.
     assert_eq!(out.program.external_types.len(), 2);

@@ -741,6 +741,15 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// A dependency alias cannot be written as a source path component.
+    InvalidDependencyAlias {
+        alias: String,
+    },
+    /// The same artifact identity was supplied more than once.
+    DuplicateDependency {
+        name: String,
+        version: String,
+    },
     /// A name with no definition in scope at the point it was written.
     Undefined {
         namespace: Namespace,
@@ -1793,12 +1802,48 @@ pub fn build_with_dependencies(
     build_with_dependency_graph(mint, stmts, dependencies, &[])
 }
 
+/// A direct artifact and the valid source identifier used to qualify it.
+///
+/// The alias is deliberately separate from the artifact identity: bundle names
+/// may contain `-`, while source path components may not.
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyImport<'a> {
+    pub alias: &'a str,
+    pub artifact: &'a artifact::Artifact,
+}
+
+/// Build against explicitly aliased direct dependencies and linked interfaces.
+pub fn build_with_dependency_imports(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[DependencyImport<'_>],
+    linked: &[artifact::Artifact],
+) -> Output {
+    build_with_dependency_imports_inner(mint, stmts, dependencies, linked)
+}
+
 /// Build against direct source-visible dependencies and additional linked
 /// implementation interfaces referenced by those dependencies.
 pub fn build_with_dependency_graph(
     mint: &mut Mint,
     stmts: Vec<Stmt>,
     dependencies: &[artifact::Artifact],
+    linked: &[artifact::Artifact],
+) -> Output {
+    let imports: Vec<_> = dependencies
+        .iter()
+        .map(|artifact| DependencyImport {
+            alias: &artifact.header.identity.name,
+            artifact,
+        })
+        .collect();
+    build_with_dependency_imports_inner(mint, stmts, &imports, linked)
+}
+
+fn build_with_dependency_imports_inner(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[DependencyImport<'_>],
     linked: &[artifact::Artifact],
 ) -> Output {
     let mut b = Builder {
@@ -1977,7 +2022,7 @@ pub fn build_with_dependency_graph(
     // Type declarations are complete, so their effect rows can now be keyed
     // by normalized operation interfaces before parameter-kind analysis reads
     // their lacks sets. Terms are re-keyed after they are lowered below.
-    structuralize_effects(&mut program, b.mint, &mut b.errors);
+    structuralize_effects(&mut program, b.mint, &b.expanded, &mut b.errors);
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
     // there, so no one body decides its own.
@@ -2381,7 +2426,12 @@ fn import_formula(value: &artifact::Formula) -> crate::types::Formula {
 /// Assign structural identities to effects and replace the provisional source
 /// symbols in every lowered effect row. Symbols remain on each label for
 /// operation lookup and editor navigation; the key is only row semantics.
-fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Error>) {
+fn structuralize_effects(
+    program: &mut Program,
+    mint: &Mint,
+    expansions: &HashMap<Symbol, IndexMap<String, Symbol>>,
+    errors: &mut Vec<Error>,
+) {
     // Imported rows were lowered with imported symbols before local effect
     // identities could be computed. Keep those identities in the rekeying map:
     // replacing the map with local-only identities silently dropped every
@@ -2405,6 +2455,7 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
                                     &program.types,
                                     &program.effects,
                                     &program.external_types,
+                                    &program.effect_ids,
                                     mint,
                                     &[],
                                     &mut types_seen,
@@ -2415,6 +2466,7 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
                                     &program.types,
                                     &program.effects,
                                     &program.external_types,
+                                    &program.effect_ids,
                                     mint,
                                     &[],
                                     &mut types_seen,
@@ -2442,11 +2494,25 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
                 }
             }
             Effect::Alias(named) => {
+                // Diagnose overlap after closing aliases transitively. Each
+                // written case gets its own expansion, so two differently
+                // named aliases that reach the same structural effect are not
+                // silently collapsed by the expansion map.
                 let mut seen = HashSet::new();
                 for item in named.values() {
-                    if let Some(id) = ids.get(&item.symbol)
-                        && !seen.insert(id.clone())
+                    let mut duplicate = false;
+                    for concrete in expansions
+                        .get(&item.symbol)
+                        .into_iter()
+                        .flat_map(IndexMap::values)
                     {
+                        if let Some(id) = ids.get(concrete)
+                            && !seen.insert(id.clone())
+                        {
+                            duplicate = true;
+                        }
+                    }
+                    if duplicate {
                         errors.push(Error {
                             span: item.name_span,
                             kind: ErrorKind::DuplicateCase,
@@ -2480,6 +2546,7 @@ fn canonical_type(
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     args: &[Type],
     types_seen: &mut HashSet<Symbol>,
@@ -2498,6 +2565,7 @@ fn canonical_type(
                                 types,
                                 effects,
                                 external_types,
+                                effect_ids,
                                 mint,
                                 args,
                                 types_seen,
@@ -2524,6 +2592,7 @@ fn canonical_type(
                                 types,
                                 effects,
                                 external_types,
+                                effect_ids,
                                 mint,
                                 args,
                                 types_seen,
@@ -2548,6 +2617,7 @@ fn canonical_type(
                 types,
                 effects,
                 external_types,
+                effect_ids,
                 mint,
                 args,
                 types_seen,
@@ -2558,6 +2628,7 @@ fn canonical_type(
                 types,
                 effects,
                 external_types,
+                effect_ids,
                 mint,
                 args,
                 types_seen,
@@ -2568,6 +2639,7 @@ fn canonical_type(
                 types,
                 effects,
                 external_types,
+                effect_ids,
                 mint,
                 types_seen,
                 effects_seen,
@@ -2579,6 +2651,7 @@ fn canonical_type(
             types,
             effects,
             external_types,
+            effect_ids,
             mint,
             types_seen,
             effects_seen,
@@ -2593,6 +2666,7 @@ fn canonical_type(
             types,
             effects,
             external_types,
+            effect_ids,
             mint,
             types_seen,
             effects_seen,
@@ -2605,6 +2679,7 @@ fn canonical_type(
                     types,
                     effects,
                     external_types,
+                    effect_ids,
                     mint,
                     args,
                     types_seen,
@@ -2620,6 +2695,7 @@ fn canonical_type(
                 types,
                 effects,
                 external_types,
+                effect_ids,
                 mint,
                 types_seen,
                 effects_seen,
@@ -2637,6 +2713,7 @@ fn canonical_named(
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
@@ -2650,17 +2727,34 @@ fn canonical_named(
             types,
             effects,
             external_types,
+            effect_ids,
             mint,
             args,
             types_seen,
             effects_seen,
         )
     } else if let Some(decl) = external_types.get(&symbol) {
-        // Artifact schemes are already structural semantic types. Looking
-        // through the imported declaration keeps two same-leaf effects apart
-        // when their signatures use different dependency types, rather than
-        // reducing every imported name to the old `?` placeholder.
-        decl.scheme.body().to_string()
+        // Open the imported scheme structurally with the arguments at this
+        // application. Printing the unopened body made every `Box A` look like
+        // `Box 'a`, collapsing effects whose signatures used different
+        // applications of the same imported constructor.
+        let applied: Vec<_> = args
+            .iter()
+            .map(|arg| {
+                canonical_type(
+                    arg,
+                    types,
+                    effects,
+                    external_types,
+                    effect_ids,
+                    mint,
+                    &[],
+                    types_seen,
+                    effects_seen,
+                )
+            })
+            .collect();
+        canonical_semantic_type(decl.scheme.body(), &applied, external_types, types_seen)
     } else {
         // A missing linked interface is recoverable (the graph-aware API can
         // supply it); retain a deterministic identity without pretending all
@@ -2671,14 +2765,126 @@ fn canonical_named(
     result
 }
 
+fn canonical_semantic_type(
+    ty: &Ty,
+    args: &[String],
+    external_types: &IndexMap<Symbol, ExternalType>,
+    seen: &mut HashSet<Symbol>,
+) -> String {
+    use crate::types::{Core, Presence, Rest, Row};
+
+    fn presence(value: &Presence) -> String {
+        match value {
+            Presence::Present => "+".into(),
+            Presence::Absent => "\\".into(),
+            Presence::Var(id) => format!("?{id}"),
+            Presence::Bound(id) => format!("'p{id}"),
+            Presence::Undecided => "?".into(),
+        }
+    }
+    fn row(
+        row_value: &Row,
+        args: &[String],
+        external_types: &IndexMap<Symbol, ExternalType>,
+        seen: &mut HashSet<Symbol>,
+    ) -> String {
+        let mut labels: Vec<_> = row_value
+            .labels
+            .iter()
+            .map(|(name, field)| {
+                format!(
+                    "{name}{}:{}",
+                    presence(&field.presence),
+                    canonical_semantic_type(&field.ty, args, external_types, seen)
+                )
+            })
+            .collect();
+        labels.sort();
+        let rest = match &row_value.rest {
+            Rest::Closed => "closed".into(),
+            Rest::Var(id) => format!("?{id}"),
+            Rest::Bound(id) => args
+                .get(*id as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("'#{id}")),
+            Rest::Rigid { id, .. } => format!("'r{id}"),
+            Rest::Undecided => "?".into(),
+            Rest::More(more) => row(more, args, external_types, seen),
+        };
+        format!("[{};{rest}]", labels.join(","))
+    }
+
+    let core = match &ty.core {
+        Core::Unit => "Unit".into(),
+        Core::Nat => "Nat".into(),
+        Core::Int => "Int".into(),
+        Core::Real => "Real".into(),
+        Core::String => "String".into(),
+        Core::Boolean => "Boolean".into(),
+        Core::Arrow(from, to, effects) => format!(
+            "({}->{}+{})",
+            canonical_semantic_type(from, args, external_types, seen),
+            canonical_semantic_type(to, args, external_types, seen),
+            row(effects, args, external_types, seen)
+        ),
+        Core::Sum(cases) => format!("sum{}", row(cases, args, external_types, seen)),
+        Core::Var(id) => format!("?{id}"),
+        Core::Bound(id) => args
+            .get(*id as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("'{id}")),
+        Core::Rigid { id, .. } => format!("'r{id}"),
+        Core::Named {
+            symbol,
+            args: applied,
+            ..
+        } => {
+            let applied: Vec<_> = applied
+                .iter()
+                .map(|arg| canonical_semantic_type(arg, args, external_types, seen))
+                .collect();
+            if !seen.insert(*symbol) {
+                "rec".into()
+            } else if let Some(decl) = external_types.get(symbol) {
+                let result =
+                    canonical_semantic_type(decl.scheme.body(), &applied, external_types, seen);
+                seen.remove(symbol);
+                result
+            } else {
+                format!("external#{:?}({})", symbol, applied.join(","))
+            }
+        }
+        Core::Undecided => "?".into(),
+    };
+    let mut fields: Vec<_> = ty
+        .fields
+        .iter()
+        .map(|(name, field)| {
+            format!(
+                "{name}{}:{}",
+                presence(&field.presence),
+                canonical_semantic_type(&field.ty, args, external_types, seen)
+            )
+        })
+        .collect();
+    fields.sort();
+    if fields.is_empty() {
+        core
+    } else {
+        format!("{core}{{{}}}", fields.join(","))
+    }
+}
+
 /// The structural meaning of an effect row inside an operation signature.
 /// Label order has no meaning; presence and tail do, and a label reaches the
 /// full interface of the effect it names rather than its declaration path.
+#[allow(clippy::too_many_arguments)]
 fn canonical_effect_row(
     row: &EffectRow,
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
@@ -2692,6 +2898,7 @@ fn canonical_effect_row(
                 types,
                 effects,
                 external_types,
+                effect_ids,
                 mint,
                 types_seen,
                 effects_seen,
@@ -2722,11 +2929,13 @@ fn canonical_effect_row(
 /// One effect's module-independent interface, descending through effect rows.
 /// A back edge names only the effect's leaf name, so cycles terminate without
 /// making module identity part of structural equality.
+#[allow(clippy::too_many_arguments)]
 fn canonical_effect(
     symbol: Symbol,
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
     external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
@@ -2746,6 +2955,7 @@ fn canonical_effect(
                             types,
                             effects,
                             external_types,
+                            effect_ids,
                             mint,
                             &[],
                             types_seen,
@@ -2756,6 +2966,7 @@ fn canonical_effect(
                             types,
                             effects,
                             external_types,
+                            effect_ids,
                             mint,
                             &[],
                             types_seen,
@@ -2778,6 +2989,7 @@ fn canonical_effect(
                         types,
                         effects,
                         external_types,
+                        effect_ids,
                         mint,
                         types_seen,
                         effects_seen,
@@ -2787,7 +2999,10 @@ fn canonical_effect(
             named.sort();
             named.join("+")
         }
-        None => "?".to_string(),
+        None => match effect_ids.get(&symbol) {
+            Some(EffectId::Structural { interface, .. }) => interface.clone(),
+            _ => "?".to_string(),
+        },
     };
     effects_seen.remove(&symbol);
     format!("!{}<{interface}>", mint.name(symbol))
@@ -2931,6 +3146,32 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
 
 /// The old nominal spelling used only while aliases are expanded during IR
 /// construction. It is never allowed into a semantic row.
+fn source_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+        && !matches!(
+            name,
+            "_" | "let"
+                | "in"
+                | "type"
+                | "end"
+                | "with"
+                | "match"
+                | "fn"
+                | "effect"
+                | "handle"
+                | "raise"
+                | "and"
+                | "or"
+                | "xor"
+                | "not"
+                | "module"
+                | "true"
+                | "false"
+        )
+}
+
 fn effect_key(mint: &Mint, symbol: Symbol) -> String {
     let mut names = vec![mint.name(symbol).to_string()];
     let mut parent = mint.parent(symbol);
@@ -5217,16 +5458,45 @@ impl Builder<'_> {
     /// resolver.
     fn import_dependencies(
         &mut self,
-        dependencies: &[artifact::Artifact],
+        dependencies: &[DependencyImport<'_>],
         linked: &[artifact::Artifact],
         program: &mut Program,
     ) {
         let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
+        let mut identities = HashSet::new();
+        let mut valid = Vec::with_capacity(dependencies.len());
+        for import in dependencies {
+            let identity = (
+                import.artifact.header.identity.name.clone(),
+                import.artifact.header.identity.version.clone(),
+            );
+            if !source_identifier(import.alias) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::InvalidDependencyAlias {
+                        alias: import.alias.to_string(),
+                    },
+                });
+            } else if !identities.insert(identity) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::DuplicateDependency {
+                        name: import.artifact.header.identity.name.clone(),
+                        version: import.artifact.header.identity.version.clone(),
+                    },
+                });
+            } else {
+                valid.push(*import);
+            }
+        }
 
         // Every linked declaration gets a semantic symbol, including
         // transitive implementation dependencies. Only the direct pass below
         // installs those symbols into source resolution tables.
-        for dependency in linked.iter().chain(dependencies) {
+        for dependency in linked
+            .iter()
+            .chain(valid.iter().map(|import| import.artifact))
+        {
             for (namespace, qualified) in dependency
                 .header
                 .values
@@ -5263,9 +5533,10 @@ impl Builder<'_> {
         // Declare every source-visible name first. Semantic interfaces may
         // refer forward, sideways, or through a transitive implementation
         // dependency, so conversion happens in the second pass.
-        for dependency in dependencies {
-            let root_name = &dependency.header.identity.name;
-            let root = match self.modules.get(&(None, root_name.clone())) {
+        for import in &valid {
+            let dependency = import.artifact;
+            let root_name = import.alias;
+            let root = match self.modules.get(&(None, root_name.to_string())) {
                 Some(&(module, _)) => module,
                 None => {
                     let module = self
@@ -5273,7 +5544,7 @@ impl Builder<'_> {
                         .module(None, root_name)
                         .expect("a dependency root was checked before minting");
                     self.modules
-                        .insert((None, root_name.clone()), (module, Span::default()));
+                        .insert((None, root_name.to_string()), (module, Span::default()));
                     module
                 }
             };
@@ -5325,7 +5596,10 @@ impl Builder<'_> {
             }
         }
 
-        for dependency in linked.iter().chain(dependencies) {
+        for dependency in linked
+            .iter()
+            .chain(valid.iter().map(|import| import.artifact))
+        {
             for value in &dependency.header.values {
                 let Some(&symbol) = symbols.get(&(Namespace::Terms, value.name.clone())) else {
                     continue;

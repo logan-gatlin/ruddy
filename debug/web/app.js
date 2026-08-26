@@ -30,7 +30,7 @@ const state = {
   name: "demo",
   version: "0.1.0",
   root: ROOT,
-  /// Dependency project paths keyed by expected bundle name.
+  /// Dependency project specs keyed by source module alias.
   dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
   /// compiler is always given all of them.
@@ -480,16 +480,25 @@ function parseDependencies(input) {
   const dependencies = {};
   for (const [index, raw] of input.split(",").entries()) {
     const part = raw.trim();
-    const at = part.indexOf("=");
-    const name = part.slice(0, at).trim();
-    const path = part.slice(at + 1).trim();
-    if (at <= 0 || !name || !path) {
-      throw new Error(`Dependency ${index + 1} must be written as name=folder.`);
+    const equals = part.indexOf("=");
+    const left = part.slice(0, equals).trim();
+    const path = part.slice(equals + 1).trim();
+    const at = left.indexOf("@");
+    const alias = (at < 0 ? left : left.slice(0, at)).trim();
+    const packageName = (at < 0 ? alias : left.slice(at + 1)).trim();
+    if (equals <= 0 || !alias || !packageName || !path) {
+      throw new Error(`Dependency ${index + 1} must be written as alias=folder or alias@package=folder.`);
     }
-    if (Object.hasOwn(dependencies, name)) throw new Error(`Dependency ${name} is declared more than once.`);
-    dependencies[name] = path;
+    if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
+    dependencies[alias] = alias === packageName ? path : { package: packageName, path };
   }
   return dependencies;
+}
+
+function printDependency(alias, specification) {
+  return typeof specification === "string"
+    ? `${alias}=${specification}`
+    : `${alias}@${specification.package}=${specification.path}`;
 }
 
 function wireTitlebar() {
@@ -524,8 +533,8 @@ function wireTitlebar() {
     renderTitlebar();
   });
   el("dependencies").addEventListener("click", () => {
-    const current = Object.entries(state.dependencies).map(([name, path]) => `${name}=${path}`).join(", ");
-    const entered = window.prompt("Dependencies (name=folder, comma-separated)", current);
+    const current = Object.entries(state.dependencies).map(([alias, specification]) => printDependency(alias, specification)).join(", ");
+    const entered = window.prompt("Dependencies (alias=folder or alias@package=folder, comma-separated)", current);
     if (entered === null) return;
     try {
       state.dependencies = parseDependencies(entered);

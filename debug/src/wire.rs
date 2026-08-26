@@ -41,14 +41,64 @@ pub struct CompileRequest {
     /// Every file of the active bundle. A request without its configured root
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
-    /// Dependency project folder paths keyed by expected bundle name.
+    /// Dependency project specifications keyed by source module alias.
     #[serde(default)]
-    pub dependencies: IndexMap<String, String>,
+    pub dependencies: IndexMap<String, DependencySpec>,
     /// Scratch document name, used to resolve saved dependency projects.
     #[serde(default = "default_name")]
     pub document: String,
     #[serde(default)]
     pub revision: u64,
+}
+
+/// A string preserves the old same-name package/path form. The detailed form
+/// permits a source-safe alias to name a package identity containing `-`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DependencySpec {
+    Path(String),
+    Detailed(DependencyDetail),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyDetail {
+    pub package: String,
+    pub path: String,
+}
+
+impl From<String> for DependencySpec {
+    fn from(path: String) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl From<&str> for DependencySpec {
+    fn from(path: &str) -> Self {
+        Self::Path(path.to_string())
+    }
+}
+
+impl PartialEq<&str> for DependencySpec {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, Self::Path(path) if path == other)
+    }
+}
+
+impl DependencySpec {
+    pub fn package<'a>(&'a self, alias: &'a str) -> &'a str {
+        match self {
+            Self::Path(_) => alias,
+            Self::Detailed(detail) => &detail.package,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Path(path) => path,
+            Self::Detailed(detail) => &detail.path,
+        }
+    }
 }
 
 fn default_name() -> String {
@@ -293,7 +343,7 @@ pub struct Doc {
     pub bundle_name: String,
     pub version: String,
     pub root: String,
-    pub dependencies: IndexMap<String, String>,
+    pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
 }
@@ -309,7 +359,7 @@ pub struct DocBody {
     #[serde(default = "default_root")]
     pub root: String,
     #[serde(default)]
-    pub dependencies: IndexMap<String, String>,
+    pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
 }
 

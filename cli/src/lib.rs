@@ -382,7 +382,37 @@ struct Manifest {
     name: String,
     version: String,
     root: PathBuf,
-    dependencies: IndexMap<String, PathBuf>,
+    dependencies: IndexMap<String, ManifestDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestDependency {
+    Path(PathBuf),
+    Detailed(ManifestDependencyDetail),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDependencyDetail {
+    package: String,
+    path: PathBuf,
+}
+
+impl ManifestDependency {
+    fn package<'a>(&'a self, alias: &'a str) -> &'a str {
+        match self {
+            Self::Path(_) => alias,
+            Self::Detailed(detail) => &detail.package,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) => path,
+            Self::Detailed(detail) => &detail.path,
+        }
+    }
 }
 
 /// One successfully compiled project in a dependency graph.
@@ -432,7 +462,13 @@ where
     N: Into<String>,
     P: AsRef<Path>,
 {
-    compile_dependency_graph_inner(dependencies, None)
+    compile_aliased_dependency_graph_inner(
+        dependencies.into_iter().map(|(name, path)| {
+            let name = name.into();
+            (name.clone(), name, path.as_ref().to_path_buf())
+        }),
+        None,
+    )
 }
 
 /// Compile dependency roots while confining every configured root and module
@@ -448,32 +484,57 @@ where
     N: Into<String>,
     P: AsRef<Path>,
 {
+    let roots = dependencies.into_iter().map(|(name, path)| {
+        let name = name.into();
+        (name.clone(), name, path.as_ref().to_path_buf())
+    });
+    compile_sandboxed_aliased_dependency_graph(roots, sandbox)
+}
+
+/// Compile dependency roots whose source aliases differ from package names.
+pub fn compile_sandboxed_aliased_dependency_graph<I, A, N, P>(
+    dependencies: I,
+    sandbox: impl AsRef<Path>,
+) -> Result<(CompiledGraph, Vec<Dependency>), CompileError>
+where
+    I: IntoIterator<Item = (A, N, P)>,
+    A: Into<String>,
+    N: Into<String>,
+    P: AsRef<Path>,
+{
     let sandbox = fs::canonicalize(sandbox.as_ref()).map_err(|error| {
         CompileError::one(format!(
             "could not resolve sandbox folder {}: {error}",
             sandbox.as_ref().display()
         ))
     })?;
-    compile_dependency_graph_inner(dependencies, Some(sandbox))
+    compile_aliased_dependency_graph_inner(
+        dependencies.into_iter().map(|(alias, package, path)| {
+            (alias.into(), package.into(), path.as_ref().to_path_buf())
+        }),
+        Some(sandbox),
+    )
 }
 
-fn compile_dependency_graph_inner<I, N, P>(
+fn compile_aliased_dependency_graph_inner<I>(
     dependencies: I,
     sandbox: Option<PathBuf>,
 ) -> Result<(CompiledGraph, Vec<Dependency>), CompileError>
 where
-    I: IntoIterator<Item = (N, P)>,
-    N: Into<String>,
-    P: AsRef<Path>,
+    I: IntoIterator<Item = (String, String, PathBuf)>,
 {
     let mut compiler = GraphCompiler {
         sandbox,
         ..GraphCompiler::default()
     };
     let mut direct = Vec::new();
-    for (expected, directory) in dependencies {
-        let expected = expected.into();
-        let directory = canonical_project_in(directory.as_ref(), compiler.sandbox.as_deref())?;
+    for (alias, expected, directory) in dependencies {
+        if !source_identifier(&alias) {
+            return Err(CompileError::one(format!(
+                "dependency alias `{alias}` is not a valid Ruddy source identifier"
+            )));
+        }
+        let directory = canonical_project_in(&directory, compiler.sandbox.as_deref())?;
         let manifest = load_manifest(&directory, compiler.sandbox.as_deref())?;
         if manifest.name != expected {
             return Err(CompileError::one(format!(
@@ -550,7 +611,15 @@ impl GraphCompiler {
         self.active.push((directory.clone(), active_name));
 
         let mut dependency_artifacts = Vec::with_capacity(manifest.dependencies.len());
-        for (expected, declared) in &manifest.dependencies {
+        for (alias, specification) in &manifest.dependencies {
+            let expected = specification.package(alias);
+            let declared = specification.path();
+            if !source_identifier(alias) {
+                self.active.pop();
+                return Err(CompileError::one(format!(
+                    "dependency alias `{alias}` is not a valid Ruddy source identifier"
+                )));
+            }
             let joined = directory.join(declared);
             let child = canonical_project_in(&joined, self.sandbox.as_deref())
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
@@ -566,10 +635,10 @@ impl GraphCompiler {
                 )));
             }
             let index = self
-                .visit(child, Some((expected.clone(), declared.clone())))
+                .visit(child, Some((expected.to_string(), declared.to_path_buf())))
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
             let child_artifact = &self.projects[index].artifact;
-            dependency_artifacts.push(child_artifact.clone());
+            dependency_artifacts.push((alias.clone(), child_artifact.clone()));
         }
 
         let linked_artifacts = self
@@ -651,7 +720,7 @@ fn compile_one(
     directory: &Path,
     manifest: Manifest,
     identity: Bundle,
-    dependencies: Vec<Artifact>,
+    dependencies: Vec<(String, Artifact)>,
     linked: Vec<Artifact>,
     sandbox: Option<&Path>,
 ) -> Result<Artifact, CompileError> {
@@ -685,8 +754,11 @@ fn compile_one(
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
     let mut mint = Mint::new(identity);
-    let mut built =
-        ir::build_with_dependency_graph(&mut mint, loaded.stmts, &dependencies, &linked);
+    let imports: Vec<_> = dependencies
+        .iter()
+        .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+        .collect();
+    let mut built = ir::build_with_dependency_imports(&mut mint, loaded.stmts, &imports, &linked);
     let inferred = inference::infer(&mint, &mut built.program);
     let checked = patterns::check(&built.program, &inferred);
 
@@ -773,7 +845,7 @@ fn compile_one(
     let lowered = lir::lower(&mint, &built.program, &inferred);
     let identities = dependencies
         .iter()
-        .map(|artifact| Dependency {
+        .map(|(_, artifact)| Dependency {
             name: artifact.header.identity.name.clone(),
             version: artifact.header.identity.version.clone(),
         })
@@ -785,6 +857,32 @@ fn compile_one(
         &lowered,
         identities,
     ))
+}
+
+fn source_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+        && !matches!(
+            name,
+            "_" | "let"
+                | "in"
+                | "type"
+                | "end"
+                | "with"
+                | "match"
+                | "fn"
+                | "effect"
+                | "handle"
+                | "raise"
+                | "and"
+                | "or"
+                | "xor"
+                | "not"
+                | "module"
+                | "true"
+                | "false"
+        )
 }
 
 fn configured_identity(name: &str, configured_version: &str) -> Result<Bundle, CompileError> {

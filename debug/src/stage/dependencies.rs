@@ -10,11 +10,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let children: Vec<Node> = cx
         .dependency_declarations
         .iter()
-        .map(|(name, path)| {
+        .map(|(alias, specification)| {
+            let package = specification.package(alias);
             let built = cx
                 .dependencies
                 .iter()
-                .find(|dependency| dependency.name == *name);
+                .find(|dependency| dependency.name == package);
             let interface = built.and_then(|dependency| {
                 cx.dependency_interfaces.iter().find(|artifact| {
                     artifact.header.identity.name == dependency.name
@@ -25,11 +26,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 ids.next(),
                 "project",
                 built.map_or_else(
-                    || name.clone(),
+                    || alias.clone(),
                     |dependency| format!("{}@{}", dependency.name, dependency.version),
                 ),
             )
-            .field("declared path", path)
+            .field("source alias", alias)
+            .field("declared path", specification.path())
             .field("status", if built.is_some() { "built" } else { "failed" })
             .field(
                 "artifact",
