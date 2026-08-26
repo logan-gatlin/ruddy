@@ -2565,7 +2565,7 @@ struct RegularType<'a> {
     mint: &'a Mint,
     effects_seen: &'a mut HashSet<Symbol>,
     nodes: Vec<RegularNode>,
-    named: HashMap<(Symbol, Vec<usize>), usize>,
+    named: HashMap<(Symbol, Vec<String>), usize>,
 }
 
 impl RegularType<'_> {
@@ -2714,7 +2714,13 @@ impl RegularType<'_> {
     }
 
     fn named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
-        let key = (symbol, args.clone());
+        // Node allocation is incidental; structural argument spellings make a
+        // fixed recursive application meet its memo entry even when rebuilding
+        // the same argument allocated fresh nodes on the way around.
+        let key = (
+            symbol,
+            args.iter().map(|argument| self.encode(*argument)).collect(),
+        );
         if let Some(id) = self.named.get(&key) {
             return *id;
         }
@@ -2724,12 +2730,26 @@ impl RegularType<'_> {
             self.source(&decl.value, &args)
         } else if let Some(decl) = self.external_types.get(&symbol) {
             if let Some(name) = &decl.unresolved {
-                self.atom(format!("unresolved:{name}"))
+                self.node(
+                    format!("unresolved:{name}"),
+                    args.iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(index, argument)| (format!("arg:{index}"), argument))
+                        .collect(),
+                )
             } else {
                 self.semantic(decl.scheme.body(), &args)
             }
         } else {
-            self.atom(format!("external:{}", self.mint.name(symbol)))
+            self.node(
+                format!("external:{}", self.mint.name(symbol)),
+                args.iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, argument)| (format!("arg:{index}"), argument))
+                    .collect(),
+            )
         };
         if body != id {
             self.nodes[id] = self.nodes[body].clone();

@@ -5266,8 +5266,8 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
             globals: Vec::new(),
         },
     };
-    let src = "effect Natural = get : dep::Natural -> ()\n\
-               effect Text = get : dep::Text -> ()";
+    let src = "module N =\n  effect Pick = get : dep::Natural -> ()\nend\n\
+               module S =\n  effect Pick = get : dep::Text -> ()\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
@@ -5278,6 +5278,23 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     assert_ne!(
         identities[0], identities[1],
         "Hidden Nat and Hidden String must not canonicalize as one recovery type"
+    );
+}
+
+#[test]
+fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
+    let (mint, out) = build_src(
+        "type T 'a = { next: T Nat }\n\
+         effect E = op : T String -> ()",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(
+        out.program
+            .effect_ids
+            .keys()
+            .filter(|symbol| mint.name(**symbol) == "E")
+            .count(),
+        1
     );
 }
 
