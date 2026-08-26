@@ -1,6 +1,6 @@
 //! Tests for the filesystem-facing CLI compiler API.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{Outcome, build_project, compile, new_project, run};
@@ -652,50 +652,42 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
 fn new_reports_git_initialization_failure_and_leaves_the_scaffold() {
     let parent = tempfile::tempdir().unwrap();
     let destination = parent.path().join("blocked_git");
-    let ready = std::sync::Arc::new(std::sync::Barrier::new(33));
-    let blockers: Vec<_> = (0..32)
-        .map(|_| {
-            let destination = destination.clone();
-            let ready = ready.clone();
-            std::thread::spawn(move || {
-                ready.wait();
-                let git_directory = destination.join(".git");
-                loop {
-                    match fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&git_directory)
-                    {
-                        Ok(_) => return,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            std::thread::yield_now();
-                        }
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::AlreadyExists
-                                && git_directory.is_file() =>
-                        {
-                            return;
-                        }
-                        Err(error) => panic!("could not block Git initialization: {error}"),
-                    }
-                }
-            })
-        })
-        .collect();
-    ready.wait();
+    let config = parent.path().join("malformed-git-config");
+    fs::write(&config, "[broken\n").unwrap();
 
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cli::new_project_with_malformed_git_config_child",
+        ])
+        .env("RUDDY_TEST_NEW_PROJECT_DESTINATION", &destination)
+        .env("GIT_CONFIG_GLOBAL", config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(destination.join("Ruddy.toml").is_file());
+    assert!(destination.join("main.hc").is_file());
+    assert!(destination.join(".gitignore").is_file());
+}
+
+#[test]
+#[ignore = "run in isolation by new_reports_git_initialization_failure_and_leaves_the_scaffold"]
+fn new_project_with_malformed_git_config_child() {
+    let destination = std::env::var_os("RUDDY_TEST_NEW_PROJECT_DESTINATION")
+        .map(std::path::PathBuf::from)
+        .expect("child project destination");
     let error = new_project(&destination).unwrap_err().to_string();
-    for blocker in blockers {
-        blocker.join().unwrap();
-    }
     assert!(
         error.contains("could not initialize Git repository"),
         "{error}"
     );
     assert!(error.contains("blocked_git"), "{error}");
-    assert!(destination.join("Ruddy.toml").is_file());
-    assert!(destination.join("main.hc").is_file());
-    assert!(destination.join(".gitignore").is_file());
 }
 
 #[test]
