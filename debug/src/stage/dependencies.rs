@@ -1,7 +1,7 @@
 //! Resolved project dependencies for the active debugger document.
 
 use crate::{
-    stage::{Cx, Ids, Spec, plural},
+    stage::{Cx, Ids, Spec},
     wire::{Node, Stage, Status},
 };
 
@@ -50,7 +50,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             } else {
                 Status::Partial
             },
-            plural(cx.dependencies.len(), "dependency"),
+            format!(
+                "{} declared · {} built",
+                cx.dependency_declarations.len(),
+                cx.dependencies.len()
+            ),
         )
     }
 }

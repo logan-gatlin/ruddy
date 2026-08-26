@@ -86,6 +86,14 @@ fn fixture(name: &str) -> Disk {
     Disk::new(root)
 }
 
+#[test]
+fn a_sandbox_that_cannot_be_resolved_reads_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.hc"), "let main = 0n\n").unwrap();
+    let disk = Disk::sandboxed(directory.path(), directory.path().join("missing"));
+    assert!(disk.read("main.hc").is_none());
+}
+
 /// The ordinary case: one file and nothing to splice. Everything after it is
 /// a variation on this, so it is worth pinning that the plain program costs no
 /// complaints at all.

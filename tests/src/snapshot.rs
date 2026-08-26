@@ -195,6 +195,114 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
 }
 
 #[test]
+fn failed_graph_validation_is_not_cached_as_completed() {
+    let scratch = tempfile::tempdir().unwrap();
+    fs::create_dir_all(scratch.path().join("app")).unwrap();
+    fs::create_dir_all(scratch.path().join("base")).unwrap();
+    fs::write(
+        scratch.path().join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nmissing = \"../../outside\"\n",
+    )
+    .unwrap();
+    fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
+    let request = dependency_request(IndexMap::from([
+        ("base".into(), "../base".into()),
+        ("alias".into(), "../base".into()),
+    ]));
+
+    let snapshot = compile_at(&request, 1, scratch.path());
+    assert_eq!(
+        snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "dependency-path")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(scratch.join("base")).unwrap();
+    let outside = outer.path().join("outside.hc");
+    fs::write(&outside, "let outside = 0n\n").unwrap();
+
+    for root in [
+        outside.display().to_string(),
+        "../../outside.hc".to_string(),
+    ] {
+        fs::write(
+            scratch.join("base/Ruddy.toml"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\n"),
+        )
+        .unwrap();
+        let snapshot = compile_at(
+            &dependency_request(IndexMap::from([("base".into(), "../base".into())])),
+            1,
+            &scratch,
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency-build"),
+            "{:#?}",
+            snapshot.diagnostics
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(scratch.join("base")).unwrap();
+    fs::write(
+        scratch.join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
+    let outside = outer.path().join("Escape.hc");
+    fs::write(&outside, "let escaped = 0n\n").unwrap();
+    std::os::unix::fs::symlink(&outside, scratch.join("base/Escape.hc")).unwrap();
+
+    let snapshot = compile_at(
+        &dependency_request(IndexMap::from([("base".into(), "../base".into())])),
+        1,
+        &scratch,
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dependency-build"),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+}
+
+fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest {
+    CompileRequest {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        root: ROOT.to_string(),
+        document: "app".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let app = 0n\n".to_string(),
+        }],
+        dependencies,
+        revision: 1,
+    }
+}
+
+#[test]
 fn every_stage_reports_on_the_demo() {
     let snapshot = bundle(&[(ROOT, DEMO)]);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();

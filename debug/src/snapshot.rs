@@ -179,12 +179,16 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         PathBuf::from("invalid-document")
                     }
                 };
-                let mut checked = HashSet::new();
+                let mut active = HashSet::new();
+                let mut completed = HashSet::new();
                 let mut resolved = Vec::new();
                 for (name, declared) in &req.dependencies {
                     let declared_path = Path::new(declared);
                     match crate::docs::dependency_path(scratch, &project, declared_path).and_then(
-                        |path| validate_sandbox_graph(scratch, &path, &mut checked).map(|()| path),
+                        |path| {
+                            validate_sandbox_graph(scratch, &path, &mut active, &mut completed)
+                                .map(|()| path)
+                        },
                     ) {
                         Ok(path) => resolved.push((name.clone(), path)),
                         Err(error) => diagnostics.push(raw(
@@ -195,7 +199,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         )),
                     }
                 }
-                match ruddy_cli::compile_dependency_graph(resolved) {
+                match ruddy_cli::compile_sandboxed_dependency_graph(resolved, scratch) {
                     Ok((_, direct)) => dependency_artifacts = direct,
                     Err(error) => diagnostics.push(raw(
                         "dependencies",
@@ -567,28 +571,36 @@ struct DependencyManifest {
 fn validate_sandbox_graph(
     scratch: &Path,
     project: &Path,
-    checked: &mut HashSet<PathBuf>,
+    active: &mut HashSet<PathBuf>,
+    completed: &mut HashSet<PathBuf>,
 ) -> std::io::Result<()> {
     let project = std::fs::canonicalize(project)?;
-    if !checked.insert(project.clone()) {
+    if completed.contains(&project) || !active.insert(project.clone()) {
         return Ok(());
     }
-    let manifest_path = project.join(crate::docs::MANIFEST);
-    let source = std::fs::read_to_string(&manifest_path)?;
-    let manifest: DependencyManifest = toml::from_str(&source).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "could not parse manifest {}: {error}",
-                manifest_path.display()
-            ),
-        )
-    })?;
-    for declared in manifest.dependencies.values() {
-        let child = crate::docs::dependency_path(scratch, &project, Path::new(declared))?;
-        validate_sandbox_graph(scratch, &child, checked)?;
+    let result = (|| {
+        let manifest_path = project.join(crate::docs::MANIFEST);
+        let source = std::fs::read_to_string(&manifest_path)?;
+        let manifest: DependencyManifest = toml::from_str(&source).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "could not parse manifest {}: {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+        for declared in manifest.dependencies.values() {
+            let child = crate::docs::dependency_path(scratch, &project, Path::new(declared))?;
+            validate_sandbox_graph(scratch, &child, active, completed)?;
+        }
+        Ok(())
+    })();
+    active.remove(&project);
+    if result.is_ok() {
+        completed.insert(project);
     }
-    Ok(())
+    result
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {

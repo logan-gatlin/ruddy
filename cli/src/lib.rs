@@ -432,11 +432,48 @@ where
     N: Into<String>,
     P: AsRef<Path>,
 {
-    let mut compiler = GraphCompiler::default();
+    compile_dependency_graph_inner(dependencies, None)
+}
+
+/// Compile dependency roots while confining every configured root and module
+/// source read to `sandbox`. The boundary is canonicalized once and each file
+/// is canonicalized immediately before it is read, so symlinked module
+/// candidates cannot escape it.
+pub fn compile_sandboxed_dependency_graph<I, N, P>(
+    dependencies: I,
+    sandbox: impl AsRef<Path>,
+) -> Result<(CompiledGraph, Vec<Dependency>), CompileError>
+where
+    I: IntoIterator<Item = (N, P)>,
+    N: Into<String>,
+    P: AsRef<Path>,
+{
+    let sandbox = fs::canonicalize(sandbox.as_ref()).map_err(|error| {
+        CompileError::one(format!(
+            "could not resolve sandbox folder {}: {error}",
+            sandbox.as_ref().display()
+        ))
+    })?;
+    compile_dependency_graph_inner(dependencies, Some(sandbox))
+}
+
+fn compile_dependency_graph_inner<I, N, P>(
+    dependencies: I,
+    sandbox: Option<PathBuf>,
+) -> Result<(CompiledGraph, Vec<Dependency>), CompileError>
+where
+    I: IntoIterator<Item = (N, P)>,
+    N: Into<String>,
+    P: AsRef<Path>,
+{
+    let mut compiler = GraphCompiler {
+        sandbox,
+        ..GraphCompiler::default()
+    };
     let mut direct = Vec::new();
     for (expected, directory) in dependencies {
         let expected = expected.into();
-        let directory = canonical_project(directory.as_ref())?;
+        let directory = canonical_project_in(directory.as_ref(), compiler.sandbox.as_deref())?;
         let manifest = load_manifest(&directory)?;
         if manifest.name != expected {
             return Err(CompileError::one(format!(
@@ -461,6 +498,7 @@ where
 
 #[derive(Default)]
 struct GraphCompiler {
+    sandbox: Option<PathBuf>,
     completed: HashMap<PathBuf, usize>,
     active: Vec<(PathBuf, String)>,
     projects: Vec<CompiledProject>,
@@ -500,7 +538,7 @@ impl GraphCompiler {
         let mut dependencies = Vec::with_capacity(manifest.dependencies.len());
         for (expected, declared) in &manifest.dependencies {
             let joined = directory.join(declared);
-            let child = canonical_project(&joined)
+            let child = canonical_project_in(&joined, self.sandbox.as_deref())
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
             let child_manifest = load_manifest(&child)
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
@@ -523,7 +561,13 @@ impl GraphCompiler {
             });
         }
 
-        let artifact = compile_one(&directory, manifest, identity, dependencies)?;
+        let artifact = compile_one(
+            &directory,
+            manifest,
+            identity,
+            dependencies,
+            self.sandbox.as_deref(),
+        )?;
         self.active.pop();
         let index = self.projects.len();
         self.projects.push(CompiledProject {
@@ -536,6 +580,10 @@ impl GraphCompiler {
 }
 
 fn canonical_project(directory: &Path) -> Result<PathBuf, CompileError> {
+    canonical_project_in(directory, None)
+}
+
+fn canonical_project_in(directory: &Path, sandbox: Option<&Path>) -> Result<PathBuf, CompileError> {
     let canonical = fs::canonicalize(directory).map_err(|error| {
         CompileError::one(format!(
             "could not resolve project folder {}: {error}",
@@ -546,6 +594,15 @@ fn canonical_project(directory: &Path) -> Result<PathBuf, CompileError> {
         return Err(CompileError::one(format!(
             "project path {} is not a folder",
             directory.display()
+        )));
+    }
+    if let Some(sandbox) = sandbox
+        && !canonical.starts_with(sandbox)
+    {
+        return Err(CompileError::one(format!(
+            "project folder {} escapes sandbox {}",
+            canonical.display(),
+            sandbox.display()
         )));
     }
     Ok(canonical)
@@ -578,7 +635,13 @@ fn compile_one(
     manifest: Manifest,
     identity: Bundle,
     dependencies: Vec<Dependency>,
+    sandbox: Option<&Path>,
 ) -> Result<Artifact, CompileError> {
+    if sandbox.is_some() && manifest.root.is_absolute() {
+        return Err(CompileError::one(
+            "manifest field `root` must be relative in a sandboxed build",
+        ));
+    }
     let Some(name) = configured_file_name(&manifest.root) else {
         return Err(CompileError::one("manifest field `root` must name a file"));
     };
@@ -589,7 +652,10 @@ fn compile_one(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
 
-    let disk = Disk::new(parent);
+    let disk = sandbox.map_or_else(
+        || Disk::new(parent),
+        |sandbox| Disk::sandboxed(parent, sandbox),
+    );
     if disk.read(name).is_none() {
         return Err(CompileError::one(format!(
             "could not read bundle root {} configured by {}",

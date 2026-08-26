@@ -131,6 +131,30 @@ fn a_document_round_trips_through_the_disk() {
     delete(&root, "demo").expect("the document is deleted");
 }
 
+#[test]
+fn the_configured_root_is_ordered_before_other_files() {
+    let root = scratch("configured-root-order");
+    write(
+        &root,
+        "demo",
+        "demo",
+        "0.1.0",
+        "start.hc",
+        &IndexMap::new(),
+        &[file("main.hc", ""), file("start.hc", "")],
+    )
+    .unwrap();
+
+    let doc = read(&root, "demo").unwrap();
+    assert_eq!(
+        doc.files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["start.hc", "main.hc"]
+    );
+}
+
 /// A write replaces a document rather than adding to one: a file the page
 /// dropped is gone from the disk too. Otherwise a module deleted in the editor
 /// would keep being compiled, and the reader would be shown a bundle nobody

@@ -754,6 +754,10 @@ fn artifact_stage_renders_one_dependency() {
         },
     };
     let symbols = HashMap::new();
+    let declarations = IndexMap::from([
+        ("base".to_string(), "../base".to_string()),
+        ("broken".to_string(), "../broken".to_string()),
+    ]);
     let cx = Cx {
         files: &[],
         bundle: None,
@@ -762,9 +766,9 @@ fn artifact_stage_renders_one_dependency() {
         patterns: None,
         lir: None,
         artifact: Some(&artifact),
-        dependency_declarations: &IndexMap::new(),
+        dependency_declarations: &declarations,
         dependencies: &artifact.header.dependencies,
-        dependencies_valid: true,
+        dependencies_valid: false,
         artifact_panicked: false,
         mint: None,
         symbols: &symbols,
@@ -788,6 +792,16 @@ fn artifact_stage_renders_one_dependency() {
     assert_eq!(dependencies.children.len(), 1);
     assert_eq!(dependencies.children[0].label, "dependency");
     assert_eq!(dependencies.children[0].text, "base@2.3.4");
+
+    let dependency_spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "dependencies")
+        .expect("the dependencies stage is registered");
+    let dependency_stage = ruddy_debug::stage::dependencies::build(dependency_spec, &cx);
+    assert_eq!(dependency_stage.status, Status::Partial);
+    assert_eq!(dependency_stage.summary, "2 declared · 1 built");
+    assert_eq!(dependency_stage.nodes[0].children.len(), 2);
+    assert_eq!(dependency_stage.nodes[0].children[1].text, "broken");
 }
 
 #[test]

@@ -141,11 +141,11 @@ pub fn list(root: &Path) -> io::Result<Vec<DocMeta>> {
 
 pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
     let dir = path(root, name).ok_or_else(bad_name)?;
-    let mut files = collect(&dir, "")?;
-    // The root first, then the rest by path: a stable order the page can show
-    // its file strip in without sorting it again.
-    files.sort_by_key(|file| (file.path != ROOT, file.path.clone()));
     let manifest = read_manifest(&dir)?;
+    let mut files = collect(&dir, "")?;
+    // The configured root first, then the rest by path: a stable order the page
+    // can show its file strip in without sorting it again.
+    files.sort_by_key(|file| (file.path != manifest.root, file.path.clone()));
     Ok(Doc {
         name: name.to_string(),
         bundle_name: manifest.name,

@@ -46,6 +46,7 @@ pub trait Files {
 /// [`Files`] over a real directory.
 pub struct Disk {
     root: PathBuf,
+    sandbox: Option<PathBuf>,
 }
 
 /// One file, as it was read.
@@ -109,7 +110,21 @@ struct Loader<'a> {
 impl Disk {
     /// Rooted at the directory holding the bundle's root file.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            sandbox: None,
+        }
+    }
+
+    /// Rooted at `root`, refusing every read whose canonical file is outside
+    /// `sandbox`. This is intended for callers compiling untrusted project
+    /// configuration: the check happens for each module candidate at the point
+    /// it is read, including candidates reached through symlinks.
+    pub fn sandboxed(root: impl Into<PathBuf>, sandbox: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            sandbox: Some(sandbox.into()),
+        }
     }
 }
 
@@ -120,6 +135,14 @@ impl Files for Disk {
         let mut file = self.root.clone();
         for segment in path.split('/') {
             file.push(segment);
+        }
+        if let Some(sandbox) = &self.sandbox {
+            let sandbox = std::fs::canonicalize(sandbox).ok()?;
+            let canonical = std::fs::canonicalize(&file).ok()?;
+            if !canonical.starts_with(&sandbox) {
+                return None;
+            }
+            return std::fs::read_to_string(canonical).ok();
         }
         std::fs::read_to_string(file).ok()
     }
