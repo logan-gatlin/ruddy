@@ -608,7 +608,7 @@ fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) 
 #[derive(serde::Deserialize)]
 struct DependencyManifest {
     #[serde(default)]
-    dependencies: indexmap::IndexMap<String, String>,
+    dependencies: indexmap::IndexMap<String, crate::wire::DependencySpec>,
 }
 
 fn validate_sandbox_graph(
@@ -644,8 +644,9 @@ fn validate_sandbox_graph(
                 ),
             )
         })?;
-        for declared in manifest.dependencies.values() {
-            let child = crate::docs::dependency_path(scratch, &project, Path::new(declared))?;
+        for specification in manifest.dependencies.values() {
+            let child =
+                crate::docs::dependency_path(scratch, &project, Path::new(specification.path()))?;
             validate_sandbox_graph(scratch, &child, active, completed)?;
         }
         Ok(())

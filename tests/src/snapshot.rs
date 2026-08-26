@@ -293,6 +293,54 @@ fn dependencies_tab_correlates_same_package_versions_by_request_alias() {
 }
 
 #[test]
+fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
+    let scratch = tempfile::tempdir().unwrap();
+    for directory in ["app", "base", "shared"] {
+        fs::create_dir_all(scratch.path().join(directory)).unwrap();
+    }
+    fs::write(
+        scratch.path().join("shared/Ruddy.toml"),
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
+    fs::write(
+        scratch.path().join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies.shared]\npackage = \"shared-package\"\npath = \"../shared\"\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("base/main.hc"),
+        "let value = shared::value\n",
+    )
+    .unwrap();
+
+    let request = CompileRequest {
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let value = base::value\n".into(),
+        }],
+        ..dependency_request(IndexMap::from([("base".into(), "../base".into())]))
+    };
+    let snapshot = compile_at(&request, 1, scratch.path());
+
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let dependencies = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .expect("dependencies stage");
+    assert_eq!(dependencies.status, Status::Ok);
+    // The tab lists source-visible roots only; successful compilation of
+    // `base::value` proves its detailed transitive dependency was linked.
+    assert_eq!(dependencies.nodes[0].children[0].text, "base@1.0.0");
+}
+
+#[test]
 fn failed_graph_validation_is_not_cached_as_completed() {
     let scratch = tempfile::tempdir().unwrap();
     fs::create_dir_all(scratch.path().join("app")).unwrap();
