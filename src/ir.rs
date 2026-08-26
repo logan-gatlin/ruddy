@@ -2560,41 +2560,36 @@ fn canonical_type(
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
     match &ty.tracked {
-        TypeKind::Struct { fields, .. } => {
-            let mut fields: Vec<_> = fields
-                .iter()
-                .map(|(name, field)| match field {
-                    TypeField::Written { value, .. } => {
-                        format!(
-                            "{name}:{}",
-                            canonical_type(
-                                value,
-                                types,
-                                effects,
-                                external_types,
-                                effect_ids,
-                                mint,
-                                args,
-                                types_seen,
-                                effects_seen
-                            )
-                        )
-                    }
-                    TypeField::Absent { .. } => format!("\\{name}"),
-                })
-                .collect();
-            fields.sort();
-            format!("{{{}}}", fields.join(","))
+        TypeKind::Struct { fields, tail } => {
+            let fields = fields.iter().map(|(name, field)| match field {
+                TypeField::Written { when, value, .. } => (
+                    name.clone(),
+                    canonical_written_presence(when),
+                    canonical_type(
+                        value,
+                        types,
+                        effects,
+                        external_types,
+                        effect_ids,
+                        mint,
+                        args,
+                        types_seen,
+                        effects_seen,
+                    ),
+                ),
+                TypeField::Absent { .. } => (name.clone(), "\\".to_string(), "?".to_string()),
+            });
+            canonical_ty(canonical_core_tail(tail, args), fields)
         }
-        TypeKind::Sum { cases, .. } => {
-            let mut cases: Vec<_> = cases
-                .iter()
-                .map(|(name, case)| match case {
-                    SumCase::Written { payload, .. } => format!(
-                        "#{name}:{}",
-                        payload
-                            .as_ref()
-                            .map(|ty| canonical_type(
+        TypeKind::Sum { cases, tail } => {
+            let labels = cases.iter().map(|(name, case)| match case {
+                SumCase::Written { when, payload, .. } => (
+                    name.clone(),
+                    canonical_written_presence(when),
+                    payload
+                        .as_ref()
+                        .map(|ty| {
+                            canonical_type(
                                 ty,
                                 types,
                                 effects,
@@ -2603,15 +2598,17 @@ fn canonical_type(
                                 mint,
                                 args,
                                 types_seen,
-                                effects_seen
-                            ))
-                            .unwrap_or_else(|| "{}".to_string())
-                    ),
-                    SumCase::Absent { .. } => format!("\\#{name}"),
-                })
-                .collect();
-            cases.sort();
-            format!("[{}]", cases.join("|"))
+                                effects_seen,
+                            )
+                        })
+                        .unwrap_or_else(|| "Unit".to_string()),
+                ),
+                SumCase::Absent { .. } => (name.clone(), "\\".to_string(), "?".to_string()),
+            });
+            format!(
+                "sum{}",
+                canonical_row(labels, canonical_row_tail(tail, args))
+            )
         }
         TypeKind::Arrow {
             from,
@@ -2648,6 +2645,7 @@ fn canonical_type(
                 external_types,
                 effect_ids,
                 mint,
+                args,
                 types_seen,
                 effects_seen,
             )
@@ -2701,8 +2699,10 @@ fn canonical_type(
             .cloned()
             .unwrap_or_else(|| format!("'{}", index)),
         TypeKind::Prim(prim) => format!("{prim:?}"),
+        // A standalone effect row is the same semantic row value as a sum;
+        // the parameter position supplies the shape when it is spliced.
         TypeKind::Effects(row) => format!(
-            "effects({})",
+            "sum{}",
             canonical_effect_row(
                 row,
                 types,
@@ -2710,6 +2710,7 @@ fn canonical_type(
                 external_types,
                 effect_ids,
                 mint,
+                args,
                 types_seen,
                 effects_seen,
             )
@@ -2766,6 +2767,76 @@ fn canonical_named(
     result
 }
 
+/// Shared structural spelling primitives. Both the source IR and imported
+/// semantic types feed these helpers, so representation details at the artifact
+/// boundary cannot change effect identity.
+fn canonical_ty(
+    core: String,
+    fields: impl IntoIterator<Item = (String, String, String)>,
+) -> String {
+    let mut fields: Vec<_> = fields
+        .into_iter()
+        .map(|(name, presence, ty)| format!("{name}{presence}:{ty}"))
+        .collect();
+    fields.sort();
+    if fields.is_empty() {
+        core
+    } else {
+        format!("{core}{{{}}}", fields.join(","))
+    }
+}
+
+fn canonical_row(
+    labels: impl IntoIterator<Item = (String, String, String)>,
+    rest: String,
+) -> String {
+    let mut labels: Vec<_> = labels
+        .into_iter()
+        .map(|(name, presence, ty)| format!("{name}{presence}:{ty}"))
+        .collect();
+    labels.sort();
+    format!("[{};{rest}]", labels.join(","))
+}
+
+fn canonical_effect_key(name: &str) -> String {
+    match name.split_once('\u{1f}') {
+        Some((name, interface)) => format!("!{name}<{interface}>"),
+        None => name.to_string(),
+    }
+}
+
+fn canonical_written_presence(when: &Option<Box<When>>) -> String {
+    match when.as_ref().and_then(|when| when.name.as_ref()) {
+        None if when.is_none() => "+".to_string(),
+        None => "?".to_string(),
+        Some(name) => format!("?{name}"),
+    }
+}
+
+fn canonical_core_tail(tail: &Option<Tail>, args: &[String]) -> String {
+    match tail.as_ref().map(|tail| &tail.of) {
+        None => "Unit".to_string(),
+        Some(Row::Anything) => "?".to_string(),
+        Some(Row::Named(name)) => format!("'r{name}"),
+        Some(Row::Param { index, .. }) => args
+            .get(*index as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("'{index}")),
+    }
+}
+
+fn canonical_row_tail(tail: &Option<Tail>, args: &[String]) -> String {
+    match tail.as_ref().map(|tail| &tail.of) {
+        None => "closed".to_string(),
+        Some(Row::Anything) => "?".to_string(),
+        Some(Row::Named(name)) => format!("'r{name}"),
+        Some(Row::Param { index, .. }) => args
+            .get(*index as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("'#{index}")),
+    }
+}
+
 fn canonical_semantic_type(
     ty: &Ty,
     args: &[String],
@@ -2789,18 +2860,17 @@ fn canonical_semantic_type(
         external_types: &IndexMap<Symbol, ExternalType>,
         seen: &mut HashSet<Symbol>,
     ) -> String {
-        let mut labels: Vec<_> = row_value
+        let labels: Vec<_> = row_value
             .labels
             .iter()
             .map(|(name, field)| {
-                format!(
-                    "{name}{}:{}",
+                (
+                    canonical_effect_key(name),
                     presence(&field.presence),
-                    canonical_semantic_type(&field.ty, args, external_types, seen)
+                    canonical_semantic_type(&field.ty, args, external_types, seen),
                 )
             })
             .collect();
-        labels.sort();
         let rest = match &row_value.rest {
             Rest::Closed => "closed".into(),
             Rest::Var(id) => format!("?{id}"),
@@ -2812,7 +2882,7 @@ fn canonical_semantic_type(
             Rest::Undecided => "?".into(),
             Rest::More(more) => row(more, args, external_types, seen),
         };
-        format!("[{};{rest}]", labels.join(","))
+        canonical_row(labels, rest)
     }
 
     let core = match &ty.core {
@@ -2860,23 +2930,14 @@ fn canonical_semantic_type(
         }
         Core::Undecided => "?".into(),
     };
-    let mut fields: Vec<_> = ty
-        .fields
-        .iter()
-        .map(|(name, field)| {
-            format!(
-                "{name}{}:{}",
-                presence(&field.presence),
-                canonical_semantic_type(&field.ty, args, external_types, seen)
-            )
-        })
-        .collect();
-    fields.sort();
-    if fields.is_empty() {
-        core
-    } else {
-        format!("{core}{{{}}}", fields.join(","))
-    }
+    let fields = ty.fields.iter().map(|(name, field)| {
+        (
+            name.clone(),
+            presence(&field.presence),
+            canonical_semantic_type(&field.ty, args, external_types, seen),
+        )
+    });
+    canonical_ty(core, fields)
 }
 
 /// The structural meaning of an effect row inside an operation signature.
@@ -2890,44 +2951,28 @@ fn canonical_effect_row(
     external_types: &IndexMap<Symbol, ExternalType>,
     effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
+    args: &[String],
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
-    let mut labels: Vec<_> = row
-        .effects
-        .values()
-        .map(|label| {
-            let effect = canonical_effect(
-                label.symbol(),
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                types_seen,
-                effects_seen,
-            );
-            match label {
-                EffectLabel::Written { when, .. } => format!(
-                    "+{effect}{}",
-                    when.as_ref()
-                        .map_or_else(String::new, |when| match &when.name {
-                            Some(name) => format!(" when {name}"),
-                            None => " when _".to_string(),
-                        })
-                ),
-                EffectLabel::Absent { .. } => format!("\\{effect}"),
-            }
-        })
-        .collect();
-    labels.sort();
-    let tail = match row.tail.as_ref().map(|tail| &tail.of) {
-        None => "closed".to_string(),
-        Some(Row::Anything) => "anything".to_string(),
-        Some(Row::Named(name)) => format!("'{name}"),
-        Some(Row::Param { index, .. }) => format!("'#{index}"),
-    };
-    format!("{};{tail}", labels.join(","))
+    let labels = row.effects.values().map(|label| {
+        let effect = canonical_effect(
+            label.symbol(),
+            types,
+            effects,
+            external_types,
+            effect_ids,
+            mint,
+            types_seen,
+            effects_seen,
+        );
+        let presence = match label {
+            EffectLabel::Written { when, .. } => canonical_written_presence(when),
+            EffectLabel::Absent { .. } => "\\".to_string(),
+        };
+        (effect, presence, "Unit".to_string())
+    });
+    canonical_row(labels, canonical_row_tail(&row.tail, args))
 }
 
 /// One effect's module-independent interface, descending through effect rows.
@@ -5752,6 +5797,37 @@ impl Builder<'_> {
             if !grew {
                 break;
             }
+        }
+
+        // A direct-only caller may hand us an alias that reaches a transitive
+        // effect without its defining header. Give that leaf a stable recovery
+        // identity before rows are rekeyed: dropping it would turn an annotated
+        // effect row into a pure one, while one shared sentinel would make
+        // unrelated missing effects equal. Graph-aware callers install the real
+        // identity above and therefore never take this path.
+        let unresolved_effects: Vec<_> = program
+            .external_names
+            .iter()
+            .filter(|(symbol, _)| {
+                self.mint.namespace(**symbol) == Namespace::Effects
+                    && !program.effect_ids.contains_key(*symbol)
+                    && !self.expanded.contains_key(*symbol)
+            })
+            .map(|(symbol, qualified)| (*symbol, qualified.clone()))
+            .collect();
+        for (symbol, qualified) in unresolved_effects {
+            let name = qualified
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified.as_str())
+                .to_string();
+            program.effect_ids.insert(
+                symbol,
+                EffectId::structural(name, format!("unresolved:{qualified}")),
+            );
+            self.expanded
+                .entry(symbol)
+                .or_insert_with(|| [(qualified, symbol)].into_iter().collect());
         }
 
         // A direct-only caller may hand us an interface containing a named
