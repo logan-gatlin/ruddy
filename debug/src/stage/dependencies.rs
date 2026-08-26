@@ -11,17 +11,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         .dependency_declarations
         .iter()
         .map(|(alias, specification)| {
-            let package = specification.package(alias);
-            let built = cx
-                .dependencies
+            // The three slices are produced in preserved direct-request order.
+            // Alias position, unlike package name, distinguishes two requests
+            // for different versions of the same package.
+            let position = cx
+                .dependency_aliases
                 .iter()
-                .find(|dependency| dependency.name == package);
-            let interface = built.and_then(|dependency| {
-                cx.dependency_interfaces.iter().find(|artifact| {
-                    artifact.header.identity.name == dependency.name
-                        && artifact.header.identity.version == dependency.version
-                })
-            });
+                .position(|resolved| resolved == alias);
+            let built = position.and_then(|index| cx.dependencies.get(index));
+            let interface = position.and_then(|index| cx.dependency_interfaces.get(index));
             let mut node = Node::new(
                 ids.next(),
                 "project",

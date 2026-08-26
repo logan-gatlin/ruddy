@@ -7,7 +7,10 @@ use indexmap::IndexMap;
 use ruddy_debug::{
     snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
-    wire::{CompileRequest, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
+    wire::{
+        CompileRequest, DependencyDetail, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage,
+        Status, View,
+    },
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -216,6 +219,77 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             .status,
         Status::Skipped
     );
+}
+
+#[test]
+fn dependencies_tab_correlates_same_package_versions_by_request_alias() {
+    let scratch = tempfile::tempdir().unwrap();
+    for (directory, version, source) in [
+        ("old-lib", "1.0.0", "let one = 1n\n"),
+        ("new-lib", "2.0.0", "let one = 1n\nlet two = 2n\n"),
+    ] {
+        let path = scratch.path().join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("main.hc"), source).unwrap();
+        fs::write(
+            path.join("Ruddy.toml"),
+            format!(
+                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(scratch.path().join("app")).unwrap();
+    let detailed = |path: &str| {
+        DependencySpec::Detailed(DependencyDetail {
+            package: "lib".into(),
+            path: path.into(),
+        })
+    };
+    let dependencies = IndexMap::from([
+        ("old".into(), detailed("../old-lib")),
+        ("new".into(), detailed("../new-lib")),
+    ]);
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let old_one = old::one\nlet new_two = new::two\n".into(),
+        }],
+        dependencies,
+        revision: 1,
+    };
+
+    let snapshot = compile_at(&request, 1, scratch.path());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .expect("dependencies stage");
+    let projects = &stage.nodes[0].children;
+    assert_eq!(
+        projects
+            .iter()
+            .map(|node| node.text.as_str())
+            .collect::<Vec<_>>(),
+        ["lib@1.0.0", "lib@2.0.0"]
+    );
+    let imported_values = |node: &Node| {
+        node.fields
+            .iter()
+            .find(|field| field.name == "imported values")
+            .map(|field| field.value.clone())
+    };
+    assert_eq!(imported_values(&projects[0]).as_deref(), Some("1"));
+    assert_eq!(imported_values(&projects[1]).as_deref(), Some("2"));
 }
 
 #[test]

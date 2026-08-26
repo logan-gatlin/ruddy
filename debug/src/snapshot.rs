@@ -433,6 +433,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
         dependency_declarations: &req.dependencies,
+        dependency_aliases: &dependency_aliases,
         dependencies: &dependency_artifacts,
         dependency_interfaces: &dependency_interfaces,
         dependencies_valid: !diagnostics

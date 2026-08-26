@@ -98,6 +98,9 @@ pub struct ExternalType {
     pub params: Vec<ParamKind>,
     pub relevant: Vec<bool>,
     pub scheme: Scheme,
+    /// Qualified identity retained when a direct-only interface references a
+    /// type whose transitive declaration was not supplied.
+    pub unresolved: Option<artifact::QualifiedName>,
 }
 
 #[derive(Debug, Clone)]
@@ -2744,7 +2747,11 @@ fn canonical_named(
         // declaration's arguments. Apply those canonical values directly to
         // the imported semantic scheme, so local-to-imported alias chains can
         // neither lose an outer argument nor recurse on `Param -> Param`.
-        canonical_semantic_type(decl.scheme.body(), args, external_types, types_seen)
+        if let Some(name) = &decl.unresolved {
+            format!("unresolved:{name}({})", args.join(","))
+        } else {
+            canonical_semantic_type(decl.scheme.body(), args, external_types, types_seen)
+        }
     } else {
         // A missing linked interface is recoverable (the graph-aware API can
         // supply it); retain a deterministic identity without pretending all
@@ -2836,8 +2843,11 @@ fn canonical_semantic_type(
             if !seen.insert(*symbol) {
                 "rec".into()
             } else if let Some(decl) = external_types.get(symbol) {
-                let result =
-                    canonical_semantic_type(decl.scheme.body(), &applied, external_types, seen);
+                let result = if let Some(name) = &decl.unresolved {
+                    format!("unresolved:{name}({})", applied.join(","))
+                } else {
+                    canonical_semantic_type(decl.scheme.body(), &applied, external_types, seen)
+                };
                 seen.remove(symbol);
                 result
             } else {
@@ -5640,6 +5650,7 @@ impl Builder<'_> {
                             .map(|param| param.relevant)
                             .collect(),
                         scheme,
+                        unresolved: None,
                     },
                 );
             }
@@ -5749,6 +5760,7 @@ impl Builder<'_> {
                     params: Vec::new(),
                     relevant: Vec::new(),
                     scheme: Scheme::new(0, Rc::new(Ty::default())),
+                    unresolved: program.external_names.get(&symbol).cloned(),
                 },
             );
         }

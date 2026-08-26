@@ -5214,6 +5214,53 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
 }
 
 #[test]
+fn missing_transitive_type_applications_keep_distinct_effect_identities() {
+    let alias = |name: &str, argument| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_type(a::Core::Named {
+            name: "base@1.0.0::Hidden".into(),
+            args: vec![artifact_type(argument)],
+        })),
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: vec![a::Dependency {
+                name: "base".into(),
+                version: "1.0.0".into(),
+            }],
+            values: Vec::new(),
+            types: vec![
+                alias("Natural", a::Core::Nat),
+                alias("Text", a::Core::String),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "effect Natural = get : dep::Natural -> ()\n\
+               effect Text = get : dep::Text -> ()";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identities: Vec<_> = out.program.effect_ids.values().collect();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(
+        identities[0], identities[1],
+        "Hidden Nat and Hidden String must not canonicalize as one recovery type"
+    );
+}
+
+#[test]
 fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
     let dependency = a::Artifact {
         header: a::Header {

@@ -51,6 +51,8 @@ pub struct Cx<'a> {
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
     /// Direct dependency artifacts successfully resolved for the active project.
     pub dependency_declarations: &'a indexmap::IndexMap<String, crate::wire::DependencySpec>,
+    /// Aliases for successfully resolved direct dependencies, in request order.
+    pub dependency_aliases: &'a [String],
     pub dependencies: &'a [ruddy::artifact::Dependency],
     pub dependency_interfaces: &'a [ruddy::artifact::Artifact],
     pub dependencies_valid: bool,

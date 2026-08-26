@@ -767,6 +767,7 @@ fn artifact_stage_renders_one_dependency() {
         lir: None,
         artifact: Some(&artifact),
         dependency_declarations: &declarations,
+        dependency_aliases: &["base".to_string()],
         dependencies: &artifact.header.dependencies,
         dependency_interfaces: &[],
         dependencies_valid: false,
