@@ -2547,6 +2547,393 @@ fn structuralize_effects(
 /// compare as pure ones. Recursive types and effects are represented by their
 /// module-less name at the back edge, so equivalent dependency cycles do not
 /// acquire a module path by accident.
+#[derive(Clone, Default)]
+struct RegularNode {
+    label: String,
+    edges: Vec<(String, usize)>,
+}
+
+/// A finite presentation of a regular type tree. Named declarations are
+/// memoized as graph nodes and then minimized by bisimulation before they are
+/// spelled. This deliberately canonicalizes the *infinite unfolding*, rather
+/// than the particular collection of aliases which happened to present it.
+struct RegularType<'a> {
+    types: &'a IndexMap<Symbol, Decl<Type>>,
+    effects: &'a IndexMap<Symbol, Decl<Effect>>,
+    external_types: &'a IndexMap<Symbol, ExternalType>,
+    effect_ids: &'a IndexMap<Symbol, EffectId>,
+    mint: &'a Mint,
+    effects_seen: &'a mut HashSet<Symbol>,
+    nodes: Vec<RegularNode>,
+    named: HashMap<(Symbol, Vec<usize>), usize>,
+}
+
+impl RegularType<'_> {
+    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(RegularNode {
+            label: label.into(),
+            edges,
+        });
+        id
+    }
+
+    fn atom(&mut self, value: impl Into<String>) -> usize {
+        self.node(value, Vec::new())
+    }
+
+    fn with_fields(&mut self, core: usize, fields: Vec<(String, String, usize)>) -> usize {
+        if fields.is_empty() {
+            return core;
+        }
+        let mut edges = Vec::with_capacity(fields.len() + 1);
+        edges.push(("core".into(), core));
+        edges.extend(
+            fields
+                .into_iter()
+                .map(|(name, presence, ty)| (format!("field:{name}:{presence}"), ty)),
+        );
+        self.node("fields", edges)
+    }
+
+    fn source(&mut self, ty: &Type, args: &[usize]) -> usize {
+        match &ty.tracked {
+            TypeKind::Struct { fields, tail } => {
+                let core = self.source_core_tail(tail, args);
+                let fields = fields
+                    .iter()
+                    .map(|(name, field)| match field {
+                        TypeField::Written { when, value, .. } => (
+                            name.clone(),
+                            canonical_written_presence(when),
+                            self.source(value, args),
+                        ),
+                        TypeField::Absent { .. } => (name.clone(), "\\".into(), self.atom("?")),
+                    })
+                    .collect();
+                self.with_fields(core, fields)
+            }
+            TypeKind::Sum { cases, tail } => {
+                let mut edges = Vec::new();
+                for (name, case) in cases {
+                    let (presence, payload) = match case {
+                        SumCase::Written { when, payload, .. } => (
+                            canonical_written_presence(when),
+                            payload
+                                .as_ref()
+                                .map(|ty| self.source(ty, args))
+                                .unwrap_or_else(|| self.atom("Unit")),
+                        ),
+                        SumCase::Absent { .. } => ("\\".into(), self.atom("?")),
+                    };
+                    edges.push((format!("label:{name}:{presence}"), payload));
+                }
+                edges.push(("tail".into(), self.source_row_tail(tail, args)));
+                self.node("sum", edges)
+            }
+            TypeKind::Arrow { from, to, effects } => {
+                let from = self.source(from, args);
+                let to = self.source(to, args);
+                let effects = self.source_effect_row(effects, args);
+                self.node(
+                    "arrow",
+                    vec![
+                        ("from".into(), from),
+                        ("to".into(), to),
+                        ("effects".into(), effects),
+                    ],
+                )
+            }
+            TypeKind::Ident(symbol) => self.named(*symbol, Vec::new()),
+            TypeKind::Apply {
+                head,
+                args: applied,
+                ..
+            } => {
+                let applied = applied.iter().map(|arg| self.source(arg, args)).collect();
+                self.named(*head, applied)
+            }
+            TypeKind::Param { index, .. } => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{}", index))),
+            TypeKind::Prim(prim) => self.atom(format!("{prim:?}")),
+            TypeKind::Effects(row) => self.source_effect_row(row, args),
+            TypeKind::Var(name) => self.atom(format!("'{name}")),
+            TypeKind::Hole | TypeKind::Error => self.atom("?"),
+        }
+    }
+
+    fn source_core_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
+        match tail.as_ref().map(|tail| &tail.of) {
+            None => self.atom("Unit"),
+            Some(Row::Anything) => self.atom("?"),
+            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
+            Some(Row::Param { index, .. }) => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{index}"))),
+        }
+    }
+
+    fn source_row_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
+        match tail.as_ref().map(|tail| &tail.of) {
+            None => self.atom("closed"),
+            Some(Row::Anything) => self.atom("?"),
+            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
+            Some(Row::Param { index, .. }) => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'#{index}"))),
+        }
+    }
+
+    fn source_effect_row(&mut self, row: &EffectRow, args: &[usize]) -> usize {
+        let mut edges = Vec::new();
+        for label in row.effects.values() {
+            let effect = canonical_effect(
+                label.symbol(),
+                self.types,
+                self.effects,
+                self.external_types,
+                self.effect_ids,
+                self.mint,
+                &mut HashSet::new(),
+                self.effects_seen,
+            );
+            let presence = match label {
+                EffectLabel::Written { when, .. } => canonical_written_presence(when),
+                EffectLabel::Absent { .. } => "\\".into(),
+            };
+            let unit = self.atom("Unit");
+            edges.push((format!("label:{effect}:{presence}"), unit));
+        }
+        let tail = self.source_row_tail(&row.tail, args);
+        edges.push(("tail".into(), tail));
+        self.node("sum", edges)
+    }
+
+    fn named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
+        let key = (symbol, args.clone());
+        if let Some(id) = self.named.get(&key) {
+            return *id;
+        }
+        let id = self.node("unproductive-cycle", Vec::new());
+        self.named.insert(key, id);
+        let body = if let Some(decl) = self.types.get(&symbol) {
+            self.source(&decl.value, &args)
+        } else if let Some(decl) = self.external_types.get(&symbol) {
+            if let Some(name) = &decl.unresolved {
+                self.atom(format!("unresolved:{name}"))
+            } else {
+                self.semantic(decl.scheme.body(), &args)
+            }
+        } else {
+            self.atom(format!("external:{}", self.mint.name(symbol)))
+        };
+        if body != id {
+            self.nodes[id] = self.nodes[body].clone();
+        }
+        id
+    }
+
+    fn semantic(&mut self, ty: &Ty, args: &[usize]) -> usize {
+        use crate::types::{Core, Presence};
+        fn presence(value: &Presence) -> String {
+            match value {
+                Presence::Present => "+".into(),
+                Presence::Absent => "\\".into(),
+                Presence::Var(id) => format!("?{id}"),
+                Presence::Bound(id) => format!("'p{id}"),
+                Presence::Undecided => "?".into(),
+            }
+        }
+        let core = match &ty.core {
+            Core::Unit => self.atom("Unit"),
+            Core::Nat => self.atom("Nat"),
+            Core::Int => self.atom("Int"),
+            Core::Real => self.atom("Real"),
+            Core::String => self.atom("String"),
+            Core::Boolean => self.atom("Boolean"),
+            Core::Arrow(from, to, effects) => {
+                let from = self.semantic(from, args);
+                let to = self.semantic(to, args);
+                let effects = self.semantic_row(effects, args);
+                self.node(
+                    "arrow",
+                    vec![
+                        ("from".into(), from),
+                        ("to".into(), to),
+                        ("effects".into(), effects),
+                    ],
+                )
+            }
+            Core::Sum(cases) => self.semantic_row(cases, args),
+            Core::Var(id) => self.atom(format!("?{id}")),
+            Core::Bound(id) => args
+                .get(*id as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{id}"))),
+            Core::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Core::Named {
+                symbol,
+                args: applied,
+                ..
+            } => {
+                let applied = applied.iter().map(|arg| self.semantic(arg, args)).collect();
+                self.named(*symbol, applied)
+            }
+            Core::Undecided => self.atom("?"),
+        };
+        let fields = ty
+            .fields
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.clone(),
+                    presence(&field.presence),
+                    self.semantic(&field.ty, args),
+                )
+            })
+            .collect();
+        self.with_fields(core, fields)
+    }
+
+    fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
+        use crate::types::Rest;
+        let mut edges = Vec::new();
+        for (name, field) in &row.labels {
+            let presence = match &field.presence {
+                crate::types::Presence::Present => "+".into(),
+                crate::types::Presence::Absent => "\\".into(),
+                crate::types::Presence::Var(id) => format!("?{id}"),
+                crate::types::Presence::Bound(id) => format!("'p{id}"),
+                crate::types::Presence::Undecided => "?".into(),
+            };
+            let ty = self.semantic(&field.ty, args);
+            edges.push((
+                format!("label:{}:{presence}", canonical_effect_key(name)),
+                ty,
+            ));
+        }
+        let tail = match &row.rest {
+            Rest::Closed => self.atom("closed"),
+            Rest::Var(id) => self.atom(format!("?{id}")),
+            Rest::Bound(id) => args
+                .get(*id as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'#{id}"))),
+            Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Rest::Undecided => self.atom("?"),
+            Rest::More(more) => self.semantic_row(more, args),
+        };
+        edges.push(("tail".into(), tail));
+        self.node("sum", edges)
+    }
+
+    fn encode(&self, root: usize) -> String {
+        // Color refinement computes the greatest bisimulation on this finite
+        // graph. Canonical color numbers are obtained by sorting signatures,
+        // then the reachable quotient is numbered from the root.
+        let mut colors = ranks(
+            self.nodes
+                .iter()
+                .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
+                .collect(),
+        );
+        loop {
+            let signatures: Vec<_> = self
+                .nodes
+                .iter()
+                .map(|node| {
+                    let mut edges: Vec<_> = node
+                        .edges
+                        .iter()
+                        .map(|(label, to)| (label.clone(), colors[*to]))
+                        .collect();
+                    edges.sort();
+                    (node.label.clone(), edges)
+                })
+                .collect();
+            let next = ranks(signatures);
+            let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
+            let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
+            colors = next;
+            if old_classes == new_classes {
+                break;
+            }
+        }
+        let mut representatives = vec![0; colors.iter().copied().max().map_or(0, |n| n + 1)];
+        for (node, color) in colors.iter().copied().enumerate() {
+            representatives[color] = node;
+        }
+        fn visit(
+            color: usize,
+            nodes: &[RegularNode],
+            colors: &[usize],
+            reps: &[usize],
+            ids: &mut HashMap<usize, usize>,
+            order: &mut Vec<usize>,
+        ) {
+            if ids.contains_key(&color) {
+                return;
+            }
+            ids.insert(color, order.len());
+            order.push(color);
+            let mut edges: Vec<_> = nodes[reps[color]]
+                .edges
+                .iter()
+                .map(|(label, to)| (label, colors[*to]))
+                .collect();
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, child) in edges {
+                visit(child, nodes, colors, reps, ids, order);
+            }
+        }
+        let mut ids = HashMap::new();
+        let mut order = Vec::new();
+        visit(
+            colors[root],
+            &self.nodes,
+            &colors,
+            &representatives,
+            &mut ids,
+            &mut order,
+        );
+        let mut out = String::new();
+        for color in order {
+            let node = &self.nodes[representatives[color]];
+            out.push_str(&format!(
+                "{}#{}:{}",
+                ids[&color],
+                node.label.len(),
+                node.label
+            ));
+            let mut edges: Vec<_> = node
+                .edges
+                .iter()
+                .map(|(label, to)| (label, colors[*to]))
+                .collect();
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (label, child) in edges {
+                out.push_str(&format!("|{}:{}>{}", label.len(), label, ids[&child]));
+            }
+            out.push(';');
+        }
+        out
+    }
+}
+
+fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
+    let mut sorted = values.clone();
+    sorted.sort();
+    sorted.dedup();
+    values
+        .iter()
+        .map(|value| sorted.binary_search(value).expect("ranked value"))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn canonical_type(
     ty: &Type,
@@ -2556,248 +2943,25 @@ fn canonical_type(
     effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     args: &[String],
-    types_seen: &mut HashSet<Symbol>,
+    _types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
-    match &ty.tracked {
-        TypeKind::Struct { fields, tail } => {
-            let fields = fields.iter().map(|(name, field)| match field {
-                TypeField::Written { when, value, .. } => (
-                    name.clone(),
-                    canonical_written_presence(when),
-                    canonical_type(
-                        value,
-                        types,
-                        effects,
-                        external_types,
-                        effect_ids,
-                        mint,
-                        args,
-                        types_seen,
-                        effects_seen,
-                    ),
-                ),
-                TypeField::Absent { .. } => (name.clone(), "\\".to_string(), "?".to_string()),
-            });
-            canonical_ty(canonical_core_tail(tail, args), fields)
-        }
-        TypeKind::Sum { cases, tail } => {
-            let labels = cases.iter().map(|(name, case)| match case {
-                SumCase::Written { when, payload, .. } => (
-                    name.clone(),
-                    canonical_written_presence(when),
-                    payload
-                        .as_ref()
-                        .map(|ty| {
-                            canonical_type(
-                                ty,
-                                types,
-                                effects,
-                                external_types,
-                                effect_ids,
-                                mint,
-                                args,
-                                types_seen,
-                                effects_seen,
-                            )
-                        })
-                        .unwrap_or_else(|| "Unit".to_string()),
-                ),
-                SumCase::Absent { .. } => (name.clone(), "\\".to_string(), "?".to_string()),
-            });
-            format!(
-                "sum{}",
-                canonical_row(labels, canonical_row_tail(tail, args))
-            )
-        }
-        TypeKind::Arrow {
-            from,
-            to,
-            effects: row,
-        } => format!(
-            "({}->{}+{})",
-            canonical_type(
-                from,
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                args,
-                types_seen,
-                effects_seen,
-            ),
-            canonical_type(
-                to,
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                args,
-                types_seen,
-                effects_seen,
-            ),
-            canonical_effect_row(
-                row,
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                args,
-                types_seen,
-                effects_seen,
-            )
-        ),
-        TypeKind::Ident(symbol) => canonical_named(
-            *symbol,
-            &[],
-            types,
-            effects,
-            external_types,
-            effect_ids,
-            mint,
-            types_seen,
-            effects_seen,
-        ),
-        TypeKind::Apply {
-            head,
-            args: applied,
-            ..
-        } => {
-            let applied: Vec<_> = applied
-                .iter()
-                .map(|arg| {
-                    canonical_type(
-                        arg,
-                        types,
-                        effects,
-                        external_types,
-                        effect_ids,
-                        mint,
-                        args,
-                        types_seen,
-                        effects_seen,
-                    )
-                })
-                .collect();
-            canonical_named(
-                *head,
-                &applied,
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                types_seen,
-                effects_seen,
-            )
-        }
-        TypeKind::Param { index, .. } => args
-            .get(*index as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("'{}", index)),
-        TypeKind::Prim(prim) => format!("{prim:?}"),
-        // A standalone effect row is the same semantic row value as a sum;
-        // the parameter position supplies the shape when it is spliced.
-        TypeKind::Effects(row) => format!(
-            "sum{}",
-            canonical_effect_row(
-                row,
-                types,
-                effects,
-                external_types,
-                effect_ids,
-                mint,
-                args,
-                types_seen,
-                effects_seen,
-            )
-        ),
-        TypeKind::Var(name) => format!("'{name}"),
-        TypeKind::Hole | TypeKind::Error => "?".to_string(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn canonical_named(
-    symbol: Symbol,
-    args: &[String],
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    external_types: &IndexMap<Symbol, ExternalType>,
-    effect_ids: &IndexMap<Symbol, EffectId>,
-    mint: &Mint,
-    types_seen: &mut HashSet<Symbol>,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    if !types_seen.insert(symbol) {
-        return "rec".to_string();
-    }
-    let result = if let Some(decl) = types.get(&symbol) {
-        canonical_type(
-            &decl.value,
-            types,
-            effects,
-            external_types,
-            effect_ids,
-            mint,
-            args,
-            types_seen,
-            effects_seen,
-        )
-    } else if let Some(decl) = external_types.get(&symbol) {
-        // The syntactic traversal has already substituted every enclosing
-        // declaration's arguments. Apply those canonical values directly to
-        // the imported semantic scheme, so local-to-imported alias chains can
-        // neither lose an outer argument nor recurse on `Param -> Param`.
-        if let Some(name) = &decl.unresolved {
-            format!("unresolved:{name}({})", args.join(","))
-        } else {
-            canonical_semantic_type(decl.scheme.body(), args, external_types, types_seen)
-        }
-    } else {
-        // A missing linked interface is recoverable (the graph-aware API can
-        // supply it); retain a deterministic identity without pretending all
-        // unresolved references are the same type.
-        format!("external:{}", mint.name(symbol))
+    let mut graph = RegularType {
+        types,
+        effects,
+        external_types,
+        effect_ids,
+        mint,
+        effects_seen,
+        nodes: Vec::new(),
+        named: HashMap::new(),
     };
-    types_seen.remove(&symbol);
-    result
+    let args: Vec<_> = args.iter().map(|arg| graph.atom(arg.clone())).collect();
+    let root = graph.source(ty, &args);
+    graph.encode(root)
 }
 
-/// Shared structural spelling primitives. Both the source IR and imported
-/// semantic types feed these helpers, so representation details at the artifact
-/// boundary cannot change effect identity.
-fn canonical_ty(
-    core: String,
-    fields: impl IntoIterator<Item = (String, String, String)>,
-) -> String {
-    let mut fields: Vec<_> = fields
-        .into_iter()
-        .map(|(name, presence, ty)| format!("{name}{presence}:{ty}"))
-        .collect();
-    fields.sort();
-    if fields.is_empty() {
-        core
-    } else {
-        format!("{core}{{{}}}", fields.join(","))
-    }
-}
-
-fn canonical_row(
-    labels: impl IntoIterator<Item = (String, String, String)>,
-    rest: String,
-) -> String {
-    let mut labels: Vec<_> = labels
-        .into_iter()
-        .map(|(name, presence, ty)| format!("{name}{presence}:{ty}"))
-        .collect();
-    labels.sort();
-    format!("[{};{rest}]", labels.join(","))
-}
-
+/// Imported and source effect labels share this structural spelling.
 fn canonical_effect_key(name: &str) -> String {
     match name.split_once('\u{1f}') {
         Some((name, interface)) => format!("!{name}<{interface}>"),
@@ -2813,171 +2977,8 @@ fn canonical_written_presence(when: &Option<Box<When>>) -> String {
     }
 }
 
-fn canonical_core_tail(tail: &Option<Tail>, args: &[String]) -> String {
-    match tail.as_ref().map(|tail| &tail.of) {
-        None => "Unit".to_string(),
-        Some(Row::Anything) => "?".to_string(),
-        Some(Row::Named(name)) => format!("'r{name}"),
-        Some(Row::Param { index, .. }) => args
-            .get(*index as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("'{index}")),
-    }
-}
-
-fn canonical_row_tail(tail: &Option<Tail>, args: &[String]) -> String {
-    match tail.as_ref().map(|tail| &tail.of) {
-        None => "closed".to_string(),
-        Some(Row::Anything) => "?".to_string(),
-        Some(Row::Named(name)) => format!("'r{name}"),
-        Some(Row::Param { index, .. }) => args
-            .get(*index as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("'#{index}")),
-    }
-}
-
-fn canonical_semantic_type(
-    ty: &Ty,
-    args: &[String],
-    external_types: &IndexMap<Symbol, ExternalType>,
-    seen: &mut HashSet<Symbol>,
-) -> String {
-    use crate::types::{Core, Presence, Rest, Row};
-
-    fn presence(value: &Presence) -> String {
-        match value {
-            Presence::Present => "+".into(),
-            Presence::Absent => "\\".into(),
-            Presence::Var(id) => format!("?{id}"),
-            Presence::Bound(id) => format!("'p{id}"),
-            Presence::Undecided => "?".into(),
-        }
-    }
-    fn row(
-        row_value: &Row,
-        args: &[String],
-        external_types: &IndexMap<Symbol, ExternalType>,
-        seen: &mut HashSet<Symbol>,
-    ) -> String {
-        let labels: Vec<_> = row_value
-            .labels
-            .iter()
-            .map(|(name, field)| {
-                (
-                    canonical_effect_key(name),
-                    presence(&field.presence),
-                    canonical_semantic_type(&field.ty, args, external_types, seen),
-                )
-            })
-            .collect();
-        let rest = match &row_value.rest {
-            Rest::Closed => "closed".into(),
-            Rest::Var(id) => format!("?{id}"),
-            Rest::Bound(id) => args
-                .get(*id as usize)
-                .cloned()
-                .unwrap_or_else(|| format!("'#{id}")),
-            Rest::Rigid { id, .. } => format!("'r{id}"),
-            Rest::Undecided => "?".into(),
-            Rest::More(more) => row(more, args, external_types, seen),
-        };
-        canonical_row(labels, rest)
-    }
-
-    let core = match &ty.core {
-        Core::Unit => "Unit".into(),
-        Core::Nat => "Nat".into(),
-        Core::Int => "Int".into(),
-        Core::Real => "Real".into(),
-        Core::String => "String".into(),
-        Core::Boolean => "Boolean".into(),
-        Core::Arrow(from, to, effects) => format!(
-            "({}->{}+{})",
-            canonical_semantic_type(from, args, external_types, seen),
-            canonical_semantic_type(to, args, external_types, seen),
-            row(effects, args, external_types, seen)
-        ),
-        Core::Sum(cases) => format!("sum{}", row(cases, args, external_types, seen)),
-        Core::Var(id) => format!("?{id}"),
-        Core::Bound(id) => args
-            .get(*id as usize)
-            .cloned()
-            .unwrap_or_else(|| format!("'{id}")),
-        Core::Rigid { id, .. } => format!("'r{id}"),
-        Core::Named {
-            symbol,
-            args: applied,
-            ..
-        } => {
-            let applied: Vec<_> = applied
-                .iter()
-                .map(|arg| canonical_semantic_type(arg, args, external_types, seen))
-                .collect();
-            if !seen.insert(*symbol) {
-                "rec".into()
-            } else if let Some(decl) = external_types.get(symbol) {
-                let result = if let Some(name) = &decl.unresolved {
-                    format!("unresolved:{name}({})", applied.join(","))
-                } else {
-                    canonical_semantic_type(decl.scheme.body(), &applied, external_types, seen)
-                };
-                seen.remove(symbol);
-                result
-            } else {
-                format!("external#{:?}({})", symbol, applied.join(","))
-            }
-        }
-        Core::Undecided => "?".into(),
-    };
-    let fields = ty.fields.iter().map(|(name, field)| {
-        (
-            name.clone(),
-            presence(&field.presence),
-            canonical_semantic_type(&field.ty, args, external_types, seen),
-        )
-    });
-    canonical_ty(core, fields)
-}
-
-/// The structural meaning of an effect row inside an operation signature.
-/// Label order has no meaning; presence and tail do, and a label reaches the
-/// full interface of the effect it names rather than its declaration path.
-#[allow(clippy::too_many_arguments)]
-fn canonical_effect_row(
-    row: &EffectRow,
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    external_types: &IndexMap<Symbol, ExternalType>,
-    effect_ids: &IndexMap<Symbol, EffectId>,
-    mint: &Mint,
-    args: &[String],
-    types_seen: &mut HashSet<Symbol>,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    let labels = row.effects.values().map(|label| {
-        let effect = canonical_effect(
-            label.symbol(),
-            types,
-            effects,
-            external_types,
-            effect_ids,
-            mint,
-            types_seen,
-            effects_seen,
-        );
-        let presence = match label {
-            EffectLabel::Written { when, .. } => canonical_written_presence(when),
-            EffectLabel::Absent { .. } => "\\".to_string(),
-        };
-        (effect, presence, "Unit".to_string())
-    });
-    canonical_row(labels, canonical_row_tail(&row.tail, args))
-}
-
 /// One effect's module-independent interface, descending through effect rows.
-/// A back edge names only the effect's leaf name, so cycles terminate without
-/// making module identity part of structural equality.
+/// Effect cycles terminate at a module-independent interface back edge.
 #[allow(clippy::too_many_arguments)]
 fn canonical_effect(
     symbol: Symbol,
@@ -5729,6 +5730,21 @@ impl Builder<'_> {
                 }
                 match &declaration.kind {
                     artifact::EffectKind::Operations(operations) => {
+                        // Trusted artifacts always carry the structural identity
+                        // of an operation declaration. Keep malformed or older
+                        // direct-only interfaces total as well: an absent
+                        // identity must never make every use of the effect pure.
+                        program.effect_ids.entry(symbol).or_insert_with(|| {
+                            EffectId::structural(
+                                declaration
+                                    .name
+                                    .rsplit("::")
+                                    .next()
+                                    .unwrap_or(&declaration.name)
+                                    .to_string(),
+                                format!("unresolved:{}", declaration.name),
+                            )
+                        });
                         self.expanded.insert(
                             symbol,
                             [(declaration.name.clone(), symbol)].into_iter().collect(),

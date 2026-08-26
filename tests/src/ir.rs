@@ -4020,6 +4020,27 @@ fn structural_effect_duplicates_are_rejected() {
     );
 }
 
+/// Effect identity is equality of regular trees, not equality of how many
+/// times a recursive declaration was unrolled before its back edge.
+#[test]
+fn recursive_effect_interfaces_ignore_finite_unrolling() {
+    let src = "module A =\n  type a = { n: a }\n  effect Loop = step : a -> ()\nend\n\
+               module B =\n  type b = { n: { n: b } }\n  effect Loop = step : b -> ()\nend\n\
+               effect Both = A::!Loop + B::!Loop";
+    assert_eq!(codes_of(src), ["duplicate-case"]);
+}
+
+/// A back edge retains which regular-tree state it returns to. In particular,
+/// a branch at the root cannot be confused with a loop at the root's child.
+#[test]
+fn recursive_effect_interfaces_preserve_branching_back_edges() {
+    let src = "module A =\n  type a = { left: middle, right: Nat }\n  type middle = { next: a }\n  effect Loop = step : a -> ()\nend\n\
+               module B =\n  type b = { left: middle, right: Nat }\n  type middle = { next: middle }\n  effect Loop = step : b -> ()\nend\n\
+               effect Both = A::!Loop + B::!Loop";
+    let (_, out) = build_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
 #[test]
 fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
     let src = "effect Log = write : Nat -> ()\n\
@@ -5284,6 +5305,11 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
                 identity: None,
                 kind: a::EffectKind::Alias(vec![target.into()]),
             })
+            .chain(std::iter::once(a::DeclaredEffect {
+                name: "dep@1.0.0::Legacy".into(),
+                identity: None,
+                kind: a::EffectKind::Operations(Vec::new()),
+            }))
             .collect(),
         },
         lir: a::Lir {
@@ -5294,7 +5320,8 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     let parsed = parse::parse(
         lex(
             "let f : () -> () + dep::!Console = fn x => x\n\
-         let g : () -> () + dep::!Network = fn x => x",
+         let g : () -> () + dep::!Network = fn x => x\n\
+         let h : () -> () + dep::!Legacy = fn x => x",
             FileID::GENERATED,
         )
         .tokens,
