@@ -579,7 +579,18 @@ fn validate_sandbox_graph(
         return Ok(());
     }
     let result = (|| {
-        let manifest_path = project.join(crate::docs::MANIFEST);
+        let configured_manifest = project.join(crate::docs::MANIFEST);
+        let manifest_path = std::fs::canonicalize(&configured_manifest)?;
+        let canonical_scratch = std::fs::canonicalize(scratch)?;
+        if !manifest_path.starts_with(&canonical_scratch) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "manifest {} escapes debug/scratch",
+                    configured_manifest.display()
+                ),
+            ));
+        }
         let source = std::fs::read_to_string(&manifest_path)?;
         let manifest: DependencyManifest = toml::from_str(&source).map_err(|error| {
             std::io::Error::new(

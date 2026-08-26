@@ -257,6 +257,51 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
 
 #[cfg(unix)]
 #[test]
+fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    let base = scratch.join("base");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
+    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n";
+    let outside = outer.path().join("outside.toml");
+    fs::write(&outside, manifest).unwrap();
+    std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
+
+    let request = dependency_request(IndexMap::from([("base".into(), "../base".into())]));
+    let snapshot = compile_at(&request, 1, &scratch);
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dependency-path"),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let error =
+        ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap_err();
+    assert!(error.to_string().contains("escapes sandbox"), "{error}");
+
+    fs::remove_file(base.join("Ruddy.toml")).unwrap();
+    let shared = scratch.join("base-manifest.toml");
+    fs::write(&shared, manifest).unwrap();
+    std::os::unix::fs::symlink(&shared, base.join("Ruddy.toml")).unwrap();
+
+    let snapshot = compile_at(&request, 2, &scratch);
+    assert!(
+        !snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("dependency-")),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     let outer = tempfile::tempdir().unwrap();
     let scratch = outer.path().join("scratch");

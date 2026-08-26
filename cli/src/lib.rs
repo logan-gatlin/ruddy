@@ -474,7 +474,7 @@ where
     for (expected, directory) in dependencies {
         let expected = expected.into();
         let directory = canonical_project_in(directory.as_ref(), compiler.sandbox.as_deref())?;
-        let manifest = load_manifest(&directory)?;
+        let manifest = load_manifest(&directory, compiler.sandbox.as_deref())?;
         if manifest.name != expected {
             return Err(CompileError::one(format!(
                 "dependency key `{expected}` resolves to project `{}` instead",
@@ -527,7 +527,7 @@ impl GraphCompiler {
             )));
         }
 
-        let manifest = load_manifest(&directory)?;
+        let manifest = load_manifest(&directory, self.sandbox.as_deref())?;
         let identity = configured_identity(&manifest.name, &manifest.version)?;
         let active_name = edge
             .as_ref()
@@ -540,7 +540,7 @@ impl GraphCompiler {
             let joined = directory.join(declared);
             let child = canonical_project_in(&joined, self.sandbox.as_deref())
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
-            let child_manifest = load_manifest(&child)
+            let child_manifest = load_manifest(&child, self.sandbox.as_deref())
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
             if child_manifest.name != *expected {
                 self.active.pop();
@@ -784,8 +784,29 @@ fn configured_file_name(root: &Path) -> Option<&str> {
     root.file_name()?.to_str()
 }
 
-fn load_manifest(directory: &Path) -> Result<Manifest, CompileError> {
-    let path = directory.join(MANIFEST);
+fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, CompileError> {
+    let configured = directory.join(MANIFEST);
+    let path = match sandbox {
+        Some(sandbox) => {
+            let canonical = fs::canonicalize(&configured).map_err(|error| {
+                CompileError::one(format!(
+                    "could not resolve manifest {}: {error}",
+                    configured.display()
+                ))
+            })?;
+            if !canonical.starts_with(sandbox) {
+                return Err(CompileError::one(format!(
+                    "manifest {} escapes sandbox {}",
+                    canonical.display(),
+                    sandbox.display()
+                )));
+            }
+            canonical
+        }
+        // Command-line builds intentionally retain their unrestricted root
+        // semantics; only debugger callers opt into a filesystem boundary.
+        None => configured,
+    };
     let source = fs::read_to_string(&path).map_err(|error| {
         CompileError::one(format!(
             "could not read manifest {}: {error}",
