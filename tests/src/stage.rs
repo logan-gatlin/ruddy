@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use regex::Regex;
 use ruddy::{
     artifact::{Artifact, Dependency, Header, Identity, Lir},
@@ -760,6 +762,9 @@ fn artifact_stage_renders_one_dependency() {
         patterns: None,
         lir: None,
         artifact: Some(&artifact),
+        dependency_declarations: &IndexMap::new(),
+        dependencies: &artifact.header.dependencies,
+        dependencies_valid: true,
         artifact_panicked: false,
         mint: None,
         symbols: &symbols,
@@ -1010,6 +1015,8 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
         &CompileRequest {
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
+            root: ROOT.to_string(),
+            document: "demo".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -1017,7 +1024,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
-            dependencies: Vec::new(),
+            dependencies: IndexMap::new(),
             revision: 0,
         },
         0,

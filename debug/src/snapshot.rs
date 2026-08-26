@@ -11,6 +11,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::Once,
     time::Instant,
 };
@@ -65,6 +66,16 @@ impl Files for Requested<'_> {
 }
 
 pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
+    compile_inner(req, build, None)
+}
+
+/// Compile an active browser project while loading dependency projects from a
+/// sandboxed debugger scratch directory.
+pub fn compile_at(req: &CompileRequest, build: u64, scratch: &Path) -> Snapshot {
+    compile_inner(req, build, Some(scratch))
+}
+
+fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Snapshot {
     install_hook();
 
     let mut files = FileManager::new();
@@ -75,7 +86,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     let fs = Requested(&req.files);
     let started = Instant::now();
     let loaded = guard("bundle", &mut panicked, || {
-        bundle::load(&mut files, &fs, ROOT)
+        bundle::load(&mut files, &fs, &req.root)
     });
     micros.load = started.elapsed().as_micros() as u64;
     // Lexing and parsing happen inside the load, once per file, so the two tabs
@@ -110,11 +121,15 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     // A request with no root has nothing to load. Said here rather than by the
     // loader, which reads an absent file as an empty one: only the debugger
     // knows that the page is meant to have put one there.
-    if fs.read(ROOT).is_none() {
+    if fs.read(&req.root).is_none() {
         diagnostics.push(raw(
             "bundle",
             "missing-root-file",
-            format!("a document needs a `{ROOT}`; it is the bundle's root file"),
+            if req.root == ROOT {
+                format!("a document needs a `{ROOT}`; it is the bundle's root file")
+            } else {
+                format!("a document needs its configured root `{}`", req.root)
+            },
             None,
         ));
     }
@@ -139,59 +154,60 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     }
     let identity = configured.as_ref().map(ToString::to_string);
 
-    // Dependency identities cross the same artifact boundary as the bundle's
-    // own identity, so accept exactly the identities `Bundle` accepts. The
-    // wire format is a list (unlike a TOML dependency table), which also means
-    // duplicate names need an explicit check. Configuration errors remain
-    // recoverable: source phases still run, while the diagnostic gate below
-    // prevents LIR and an apparently successful artifact from being built.
-    let mut dependency_names = HashSet::new();
-    for dependency in &req.dependencies {
-        if !dependency_names.insert(dependency.name.as_str()) {
-            diagnostics.push(raw(
-                "bundle",
-                "duplicate-dependency",
-                format!(
-                    "dependency `{}` is declared more than once",
-                    dependency.name
-                ),
+    // Resolve and compile saved dependency projects. Configuration failures are
+    // recoverable so the active project's source phases remain inspectable.
+    let dependency_started = Instant::now();
+    let mut dependency_artifacts = Vec::new();
+    if !req.dependencies.is_empty() {
+        match scratch {
+            None => diagnostics.push(raw(
+                "dependencies",
+                "missing-scratch-root",
+                "dependency projects require a debugger scratch root".to_string(),
                 None,
-            ));
-        }
-
-        let Ok(version) = Version::parse(&dependency.version) else {
-            diagnostics.push(raw(
-                "bundle",
-                "bad-dependency-version",
-                format!(
-                    "`{}` is not a valid semantic version for dependency `{}`",
-                    dependency.version, dependency.name
-                ),
-                None,
-            ));
-            continue;
-        };
-        if !version.build.is_empty() {
-            diagnostics.push(raw(
-                "bundle",
-                "dependency-build-metadata",
-                format!(
-                    "dependency `{}` cannot use build metadata in version `{}`",
-                    dependency.name, dependency.version
-                ),
-                None,
-            ));
-            continue;
-        }
-        if Bundle::new(&dependency.name, version).is_none() {
-            diagnostics.push(raw(
-                "bundle",
-                "bad-dependency-name",
-                format!("`{}` is not a valid Ruddy bundle name", dependency.name),
-                None,
-            ));
+            )),
+            Some(scratch) => {
+                let project = match crate::docs::path(scratch, &req.document) {
+                    Some(project) => project,
+                    None => {
+                        diagnostics.push(raw(
+                            "dependencies",
+                            "bad-document",
+                            "the active document name is invalid".to_string(),
+                            None,
+                        ));
+                        PathBuf::from("invalid-document")
+                    }
+                };
+                let mut checked = HashSet::new();
+                let mut resolved = Vec::new();
+                for (name, declared) in &req.dependencies {
+                    let declared_path = Path::new(declared);
+                    match crate::docs::dependency_path(scratch, &project, declared_path).and_then(
+                        |path| validate_sandbox_graph(scratch, &path, &mut checked).map(|()| path),
+                    ) {
+                        Ok(path) => resolved.push((name.clone(), path)),
+                        Err(error) => diagnostics.push(raw(
+                            "dependencies",
+                            "dependency-path",
+                            format!("dependency `{name}` at `{declared}`: {error}"),
+                            None,
+                        )),
+                    }
+                }
+                match ruddy_cli::compile_dependency_graph(resolved) {
+                    Ok((_, direct)) => dependency_artifacts = direct,
+                    Err(error) => diagnostics.push(raw(
+                        "dependencies",
+                        "dependency-build",
+                        error.to_string(),
+                        None,
+                    )),
+                }
+            }
         }
     }
+    micros.dependencies = dependency_started.elapsed().as_micros() as u64;
 
     let fallback = || {
         Bundle::new("fallback", Version::new(0, 0, 0))
@@ -328,14 +344,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     let artifact = match (&built, &inferred, &lowered) {
         (Some(built), Some(inferred), Some(lowered)) => {
             let started = Instant::now();
-            let dependencies = req
-                .dependencies
-                .iter()
-                .map(|dependency| artifact::Dependency {
-                    name: dependency.name.clone(),
-                    version: dependency.version.clone(),
-                })
-                .collect();
+            let dependencies = dependency_artifacts.clone();
             let out = guard("artifact", &mut panicked, || {
                 artifact::build_with_dependencies(
                     &mint,
@@ -378,6 +387,11 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
+        dependency_declarations: &req.dependencies,
+        dependencies: &dependency_artifacts,
+        dependencies_valid: !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "dependencies"),
         artifact_panicked,
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
@@ -542,6 +556,39 @@ fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) 
         });
     }
     diagnostic
+}
+
+#[derive(serde::Deserialize)]
+struct DependencyManifest {
+    #[serde(default)]
+    dependencies: indexmap::IndexMap<String, String>,
+}
+
+fn validate_sandbox_graph(
+    scratch: &Path,
+    project: &Path,
+    checked: &mut HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    let project = std::fs::canonicalize(project)?;
+    if !checked.insert(project.clone()) {
+        return Ok(());
+    }
+    let manifest_path = project.join(crate::docs::MANIFEST);
+    let source = std::fs::read_to_string(&manifest_path)?;
+    let manifest: DependencyManifest = toml::from_str(&source).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "could not parse manifest {}: {error}",
+                manifest_path.display()
+            ),
+        )
+    })?;
+    for declared in manifest.dependencies.values() {
+        let child = crate::docs::dependency_path(scratch, &project, Path::new(declared))?;
+        validate_sandbox_graph(scratch, &child, checked)?;
+    }
+    Ok(())
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {

@@ -29,8 +29,9 @@ const state = {
   /// would supply it to the command-line driver.
   name: "demo",
   version: "0.1.0",
-  /// Dependency identities included in artifact construction.
-  dependencies: [],
+  root: ROOT,
+  /// Dependency project paths keyed by expected bundle name.
+  dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
   /// compiler is always given all of them.
   active: 0,
@@ -260,7 +261,8 @@ async function openDoc(name) {
   const configured = recovered ? cached : server ?? cached;
   state.name = configured?.bundle_name ?? configured?.name ?? name;
   state.version = configured?.version ?? "0.1.0";
-  state.dependencies = configured?.dependencies ?? [];
+  state.root = configured?.root ?? ROOT;
+  state.dependencies = configured?.dependencies ?? {};
   state.snapshot = null;
   state.active = 0;
   state.where = {};
@@ -302,16 +304,14 @@ function sameDocumentConfiguration(cache, server, documentName) {
   if (!cache || !server) return false;
   const cacheName = cache.bundle_name ?? cache.name ?? documentName;
   const serverName = server.bundle_name ?? server.name ?? documentName;
-  const cacheDependencies = cache.dependencies ?? [];
-  const serverDependencies = server.dependencies ?? [];
+  const cacheDependencies = cache.dependencies ?? {};
+  const serverDependencies = server.dependencies ?? {};
   return (
     cacheName === serverName &&
     (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
+    (cache.root ?? ROOT) === (server.root ?? ROOT) &&
     sameFiles(cache.files ?? [], server.files ?? []) &&
-    cacheDependencies.length === serverDependencies.length &&
-    cacheDependencies.every((dependency, i) =>
-      dependency.name === serverDependencies[i].name &&
-      dependency.version === serverDependencies[i].version)
+    JSON.stringify(cacheDependencies) === JSON.stringify(serverDependencies)
   );
 }
 
@@ -330,6 +330,7 @@ function cacheLocally() {
           files: state.files,
           name: state.name,
           version: state.version,
+          root: state.root,
           dependencies: state.dependencies,
           at,
         }),
@@ -363,6 +364,7 @@ async function saveNow() {
       body: JSON.stringify({
         name: state.name,
         version: state.version,
+        root: state.root,
         dependencies: state.dependencies,
         files: state.files,
       }),
@@ -396,6 +398,8 @@ async function compileNow() {
       body: JSON.stringify({
         name: state.name,
         version: state.version,
+        root: state.root,
+        document: state.doc,
         files: state.files,
         dependencies: state.dependencies,
         revision,
@@ -472,20 +476,20 @@ function setLink(link) {
 // ── title bar ────────────────────────────────────────────────────────────
 
 function parseDependencies(input) {
-  if (!input.trim()) return [];
-  const names = new Set();
-  return input.split(",").map((raw, index) => {
+  if (!input.trim()) return {};
+  const dependencies = {};
+  for (const [index, raw] of input.split(",").entries()) {
     const part = raw.trim();
-    const at = part.lastIndexOf("@");
+    const at = part.indexOf("=");
     const name = part.slice(0, at).trim();
-    const version = part.slice(at + 1).trim();
-    if (at <= 0 || !name || !version) {
-      throw new Error(`Dependency ${index + 1} must be written as name@version (both parts are required).`);
+    const path = part.slice(at + 1).trim();
+    if (at <= 0 || !name || !path) {
+      throw new Error(`Dependency ${index + 1} must be written as name=folder.`);
     }
-    if (names.has(name)) throw new Error(`Dependency ${name} is declared more than once.`);
-    names.add(name);
-    return { name, version };
-  });
+    if (Object.hasOwn(dependencies, name)) throw new Error(`Dependency ${name} is declared more than once.`);
+    dependencies[name] = path;
+  }
+  return dependencies;
 }
 
 function wireTitlebar() {
@@ -494,10 +498,12 @@ function wireTitlebar() {
     const entered = window.prompt("Bundle identity (name@version)", `${state.name}@${state.version}`);
     if (entered === null) return;
     try {
-      const [identity] = parseDependencies(entered);
-      if (!identity || entered.includes(",")) throw new Error("A bundle identity must be written as name@version.");
-      state.name = identity.name;
-      state.version = identity.version;
+      const at = entered.lastIndexOf("@");
+      if (at <= 0 || entered.includes(",") || !entered.slice(at + 1).trim()) {
+        throw new Error("A bundle identity must be written as name@version.");
+      }
+      state.name = entered.slice(0, at).trim();
+      state.version = entered.slice(at + 1).trim();
     } catch (error) {
       window.alert(error.message);
       return;
@@ -508,9 +514,18 @@ function wireTitlebar() {
     scheduleCompile();
     renderTitlebar();
   });
+  el("root").addEventListener("click", () => {
+    const entered = window.prompt("Root source path", state.root);
+    if (entered === null || !entered.trim()) return;
+    state.root = entered.trim();
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+    renderTitlebar();
+  });
   el("dependencies").addEventListener("click", () => {
-    const current = state.dependencies.map(({ name, version }) => `${name}@${version}`).join(", ");
-    const entered = window.prompt("Dependencies (name@version, comma-separated)", current);
+    const current = Object.entries(state.dependencies).map(([name, path]) => `${name}=${path}`).join(", ");
+    const entered = window.prompt("Dependencies (name=folder, comma-separated)", current);
     if (entered === null) return;
     try {
       state.dependencies = parseDependencies(entered);
@@ -532,11 +547,13 @@ function renderTitlebar() {
 
   el("bundle").textContent = `${state.name}@${state.version}`;
   el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
+  el("root").textContent = state.root;
 
   const dependencies = el("dependencies");
-  dependencies.textContent = state.dependencies.length === 1
+  const dependencyCount = Object.keys(state.dependencies).length;
+  dependencies.textContent = dependencyCount === 1
     ? "1 dependency"
-    : `${state.dependencies.length || "no"} dependencies`;
+    : `${dependencyCount || "no"} dependencies`;
 
   el("follow").classList.toggle("on", state.follow);
   el("split").classList.toggle("on", state.split);

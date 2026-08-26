@@ -1,11 +1,13 @@
 //! Tests for [`ruddy_debug::snapshot`].
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
+
+use indexmap::IndexMap;
 
 use ruddy_debug::{
-    snapshot::{ROOT, compile, guard, install_hook},
+    snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
-    wire::{CompileRequest, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
+    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
@@ -36,6 +38,8 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
         &CompileRequest {
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
+            root: ROOT.to_string(),
+            document: "demo".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -43,7 +47,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
-            dependencies: Vec::new(),
+            dependencies: IndexMap::new(),
             revision: 3,
         },
         1,
@@ -78,119 +82,116 @@ fn compile_requests_without_dependencies_remain_compatible() {
 }
 
 #[test]
-fn supplied_dependencies_reach_debug_artifact_construction() {
+fn dependency_paths_without_a_scratch_root_are_recoverable() {
+    let mut dependencies = IndexMap::new();
+    dependencies.insert("base".to_string(), "../base".to_string());
     let snapshot = compile(
         &CompileRequest {
             name: "debugger".to_string(),
             version: "1.2.3".to_string(),
+            root: ROOT.to_string(),
+            document: "debugger".to_string(),
             files: vec![FileSpec {
                 path: ROOT.to_string(),
                 source: compiled("let main = 0n\n"),
             }],
-            dependencies: vec![DependencySpec {
-                name: "base".to_string(),
-                version: "2.3.4".to_string(),
-            }],
+            dependencies,
             revision: 9,
         },
         1,
     );
-    assert_eq!(snapshot.bundle.as_deref(), Some("debugger@1.2.3"));
-    let artifact = snapshot
-        .stages
-        .iter()
-        .find(|stage| stage.id == "artifact")
-        .expect("artifact stage is registered");
-    assert_eq!(artifact.status, Status::Ok);
-    assert!(artifact.text.as_deref().unwrap().contains("base"));
+    assert_eq!(snapshot.diagnostics[0].stage, "dependencies");
+    assert_eq!(snapshot.diagnostics[0].code, "missing-scratch-root");
     assert_eq!(
-        artifact.summary,
-        "1 dependency · 1 values · 0 types · 0 effects · 0 functions · 1 globals"
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "ir")
+            .unwrap()
+            .status,
+        Status::Partial
+    );
+    assert_eq!(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
     );
 }
 
 #[test]
-fn invalid_dependency_configuration_is_diagnostic_and_skips_artifacts() {
-    for (dependencies, code, message) in [
-        (
-            vec![DependencySpec {
-                name: "_base".to_string(),
-                version: "1.2.3".to_string(),
-            }],
-            "bad-dependency-name",
-            "`_base` is not a valid Ruddy bundle name",
-        ),
-        (
-            vec![DependencySpec {
-                name: "base".to_string(),
-                version: "latest".to_string(),
-            }],
-            "bad-dependency-version",
-            "`latest` is not a valid semantic version for dependency `base`",
-        ),
-        (
-            vec![DependencySpec {
-                name: "base".to_string(),
-                version: "1.2.3+local".to_string(),
-            }],
-            "dependency-build-metadata",
-            "dependency `base` cannot use build metadata in version `1.2.3+local`",
-        ),
-        (
-            vec![
-                DependencySpec {
-                    name: "base".to_string(),
-                    version: "1.2.3".to_string(),
-                },
-                DependencySpec {
-                    name: "base".to_string(),
-                    version: "2.0.0".to_string(),
-                },
-            ],
-            "duplicate-dependency",
-            "dependency `base` is declared more than once",
-        ),
-    ] {
-        let snapshot = compile(
-            &CompileRequest {
-                name: "debugger".to_string(),
-                version: "1.0.0".to_string(),
-                files: vec![FileSpec {
-                    path: ROOT.to_string(),
-                    source: compiled("let main = 0n\n"),
-                }],
-                dependencies,
-                revision: 9,
-            },
-            1,
-        );
+fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
+    let scratch = tempfile::tempdir().unwrap();
+    let app = scratch.path().join("app");
+    let base = scratch.path().join("base");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
+    fs::write(
+        base.join("Ruddy.toml"),
+        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    let mut dependencies = IndexMap::new();
+    dependencies.insert("base".to_string(), "../base".to_string());
+    let request = CompileRequest {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        root: ROOT.to_string(),
+        document: "app".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let app = 0n\n".to_string(),
+        }],
+        dependencies,
+        revision: 1,
+    };
+    let built = compile_at(&request, 1, scratch.path());
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    let artifact = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "artifact")
+        .unwrap();
+    assert!(
+        artifact
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("(dependency \"base\" \"2.3.4\")")
+    );
+    let dependencies = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .unwrap();
+    assert_eq!(dependencies.status, Status::Ok);
+    assert_eq!(dependencies.nodes[0].children[0].text, "base@2.3.4");
 
-        assert_eq!(snapshot.diagnostics.len(), 1, "{:#?}", snapshot.diagnostics);
-        assert_eq!(snapshot.diagnostics[0].stage, "bundle");
-        assert_eq!(snapshot.diagnostics[0].code, code);
-        assert_eq!(snapshot.diagnostics[0].message, message);
-        assert_eq!(snapshot.bundle.as_deref(), Some("debugger@1.0.0"));
-        assert_eq!(
-            snapshot
-                .stages
-                .iter()
-                .find(|stage| stage.id == "ir")
-                .unwrap()
-                .status,
-            Status::Partial,
-            "source phases remain available despite configuration diagnostics"
-        );
-        assert_eq!(
-            snapshot
-                .stages
-                .iter()
-                .find(|stage| stage.id == "artifact")
-                .unwrap()
-                .status,
-            Status::Skipped,
-            "invalid configuration must not produce an artifact"
-        );
-    }
+    fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
+    let failed = compile_at(&request, 1, scratch.path());
+    assert_eq!(failed.diagnostics[0].stage, "dependencies");
+    assert_eq!(
+        failed
+            .stages
+            .iter()
+            .find(|stage| stage.id == "lir")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+    assert_eq!(
+        failed
+            .stages
+            .iter()
+            .find(|stage| stage.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
 }
 
 #[test]
@@ -201,6 +202,7 @@ fn every_stage_reports_on_the_demo() {
         ids,
         [
             "tokens",
+            "dependencies",
             "ast",
             "ir",
             "constraints",
@@ -244,6 +246,7 @@ fn every_stage_reports_on_the_demo() {
         titles,
         [
             "Tokens",
+            "Dependencies",
             "AST",
             "IR",
             "Constraints",
@@ -1236,11 +1239,13 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
             &CompileRequest {
                 name: name.to_string(),
                 version: version.to_string(),
+                root: ROOT.to_string(),
+                document: "demo".to_string(),
                 files: vec![FileSpec {
                     path: ROOT.to_string(),
                     source: "let x = ()".to_string(),
                 }],
-                dependencies: Vec::new(),
+                dependencies: IndexMap::new(),
                 revision: 3,
             },
             1,
@@ -1490,7 +1495,14 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     assert_eq!(
         ids(true),
         [
-            "tokens", "ast", "ir", "types", "presence", "patterns", "symbols"
+            "tokens",
+            "dependencies",
+            "ast",
+            "ir",
+            "types",
+            "presence",
+            "patterns",
+            "symbols"
         ]
     );
     // LIR owns a phase too, and reports nothing here for the other reason a

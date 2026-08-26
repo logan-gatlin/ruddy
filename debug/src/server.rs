@@ -192,7 +192,11 @@ fn handle(mut request: Request, state: &State) {
         }),
         (Method::Post, "/compile") => match body(&mut request) {
             Ok(body) => match serde_json::from_str::<CompileRequest>(&body) {
-                Ok(req) => json(&snapshot::compile(&req, state.cfg.build)),
+                Ok(req) => json(&snapshot::compile_at(
+                    &req,
+                    state.cfg.build,
+                    &state.cfg.scratch,
+                )),
                 Err(err) => fail(400, &format!("bad request: {err}")),
             },
             Err(err) => fail(413, &err),
@@ -247,6 +251,7 @@ fn document(
                 name,
                 body.name.as_deref().unwrap_or(name),
                 body.version.as_deref().unwrap_or("0.1.0"),
+                &body.root,
                 &body.dependencies,
                 &files,
             ) {

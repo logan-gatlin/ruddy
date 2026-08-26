@@ -2,28 +2,9 @@
 
 use std::{fs, path::Path};
 
-use ruddy::artifact::{Artifact, Header, Identity, Lir};
+use ruddy::artifact::Artifact;
 use ruddy_cli::{Outcome, build_project, compile, new_project, run};
 use tempfile::TempDir;
-
-fn artifact(name: &str, version: &str) -> Artifact {
-    Artifact {
-        header: Header {
-            identity: Identity {
-                name: name.to_string(),
-                version: version.to_string(),
-            },
-            dependencies: Vec::new(),
-            values: Vec::new(),
-            types: Vec::new(),
-            effects: Vec::new(),
-        },
-        lir: Lir {
-            functions: Vec::new(),
-            globals: Vec::new(),
-        },
-    }
-}
 
 fn project() -> TempDir {
     let directory = tempfile::tempdir().expect("a temporary project");
@@ -31,12 +12,15 @@ fn project() -> TempDir {
     directory
 }
 
-fn write_artifact(directory: &Path, file: &str, name: &str, version: &str) {
-    fs::write(
-        directory.join(file),
-        artifact(name, version).print().as_bytes(),
-    )
-    .expect("write the dependency artifact");
+fn write_project(directory: &Path, name: &str, version: &str, dependencies: &[(&str, &str)]) {
+    fs::create_dir_all(directory).unwrap();
+    fs::write(directory.join("main.hc"), "let value = 0n\n").unwrap();
+    let mut manifest =
+        format!("name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\n[dependencies]\n");
+    for (dependency, path) in dependencies {
+        manifest.push_str(&format!("{dependency} = {path:?}\n"));
+    }
+    fs::write(directory.join("Ruddy.toml"), manifest).unwrap();
 }
 
 fn error(directory: &TempDir) -> String {
@@ -48,13 +32,16 @@ fn error(directory: &TempDir) -> String {
 #[test]
 fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     let directory = project();
-    write_artifact(directory.path(), "zeta.artifact", "zeta", "2.0.0");
-    write_artifact(directory.path(), "alpha.artifact", "alpha", "1.2.3-beta.1");
+    write_project(&directory.path().join("zeta"), "zeta", "2.0.0", &[]);
+    write_project(
+        &directory.path().join("alpha"),
+        "alpha",
+        "1.2.3-beta.1",
+        &[],
+    );
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n\
-         zeta = { version = \"2.0.0\", source = \"zeta.artifact\" }\n\
-         alpha = { version = \"1.2.3-beta.1\", source = \"alpha.artifact\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nzeta = \"zeta\"\nalpha = \"alpha\"\n",
     )
     .expect("write the manifest");
 
@@ -70,8 +57,8 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     let printed = built.print();
     assert!(printed.contains("(dependency \"zeta\" \"2.0.0\")"));
     assert!(printed.contains("(dependency \"alpha\" \"1.2.3-beta.1\")"));
-    assert!(!printed.contains("zeta.artifact"));
-    assert!(!printed.contains("alpha.artifact"));
+    assert!(!directory.path().join("zeta/build/zeta.artifact").exists());
+    assert!(!directory.path().join("alpha/build/alpha.artifact").exists());
 }
 
 #[test]
@@ -179,11 +166,11 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ("title = \"app\"\n", "unknown field `title`"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
-            "missing field `version`",
+            "invalid type",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
-            "missing field `source`",
+            "invalid type",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
@@ -195,7 +182,7 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
-            "unknown field `registry`",
+            "invalid type",
         ),
     ] {
         fs::write(directory.path().join("Ruddy.toml"), manifest).expect("replace the manifest");
@@ -223,67 +210,103 @@ fn manifest_bundle_identity_must_be_valid() {
 }
 
 #[test]
-fn dependency_names_and_versions_must_be_valid_artifact_identities() {
+fn dependency_projects_must_exist_compile_and_match_the_table_key() {
     let directory = project();
-    for (name, version, expected) in [
-        ("base", "not-semver", "invalid semantic version"),
-        ("not.a.name", "1.0.0", "not a valid Ruddy bundle name"),
-        ("base", "1.0.0+local", "unsupported build metadata"),
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = \"missing\"\n").unwrap();
+    assert!(error(&directory).contains("dependency `base`"));
+
+    write_project(&directory.path().join("child"), "other", "1.0.0", &[]);
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = \"child\"\n").unwrap();
+    assert!(error(&directory).contains("contains project `other` instead"));
+
+    write_project(&directory.path().join("child"), "base", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("child/main.hc"),
+        "let bad : Nat = fn x => x\n",
+    )
+    .unwrap();
+    let found = error(&directory);
+    assert!(found.contains("dependency `base`"));
+    assert!(found.contains("error[types/"));
+}
+
+#[test]
+fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = root.path().join("shared");
+    let left = root.path().join("left");
+    let right = root.path().join("right");
+    let app = root.path().join("app");
+    write_project(&shared, "shared", "3.0.0", &[]);
+    write_project(&left, "left", "2.0.0", &[("shared", "../shared")]);
+    write_project(&right, "right", "2.1.0", &[("shared", "../shared")]);
+    write_project(
+        &app,
+        "app",
+        "1.0.0",
+        &[("left", "../left"), ("right", "../right")],
+    );
+
+    let graph = ruddy_cli::compile_graph(&app).unwrap();
+    let names: Vec<_> = graph
+        .projects
+        .iter()
+        .map(|project| project.artifact.header.identity.name.as_str())
+        .collect();
+    assert_eq!(names, ["shared", "left", "right", "app"]);
+    assert_eq!(graph.projects[1].artifact.header.dependencies.len(), 1);
+    assert_eq!(
+        graph.projects[3]
+            .artifact
+            .header
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect::<Vec<_>>(),
+        ["left", "right"]
+    );
+    let (dependencies, direct) =
+        ruddy_cli::compile_dependency_graph([("left", &left), ("right", &right)]).unwrap();
+    assert_eq!(dependencies.projects.len(), 3);
+    assert_eq!(
+        direct
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect::<Vec<_>>(),
+        ["left", "right"]
+    );
+
+    let path = build_project(&app).unwrap();
+    assert_eq!(path, app.join("build/app.artifact"));
+    for (dir, name) in [
+        (&shared, "shared"),
+        (&left, "left"),
+        (&right, "right"),
+        (&app, "app"),
     ] {
-        fs::write(
-            directory.path().join("Ruddy.toml"),
-            format!(
-                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n\"{name}\" = {{ version = \"{version}\", source = \"base.artifact\" }}\n"
-            ),
-        )
-        .expect("replace the manifest");
-        let found = error(&directory);
-        assert!(found.contains(expected), "`{expected}` in:\n{found}");
+        assert!(dir.join(format!("build/{name}.artifact")).exists());
     }
 }
 
 #[test]
-fn dependency_sources_must_be_readable_canonical_matching_artifacts() {
-    let directory = project();
-    fs::write(
-        directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.2.3\", source = \"base.artifact\" }\n",
-    )
-    .expect("write the manifest");
+fn dependency_cycles_are_reported_and_failed_graphs_write_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a");
+    let b = root.path().join("b");
+    write_project(&a, "a", "1.0.0", &[("b", "../b")]);
+    write_project(&b, "b", "1.0.0", &[("a", "../a")]);
+    let found = ruddy_cli::compile(&a).unwrap_err().to_string();
+    assert!(found.contains("dependency cycle"), "{found}");
+    assert!(found.contains("a") && found.contains("b"), "{found}");
+    assert!(!a.join("build").exists());
+    assert!(!b.join("build").exists());
 
-    let unreadable = error(&directory);
-    assert!(unreadable.contains("could not read source for dependency `base`"));
-    assert!(unreadable.contains("base.artifact"));
-
-    fs::write(directory.path().join("base.artifact"), "not an artifact")
-        .expect("write malformed artifact text");
-    let malformed = error(&directory);
-    assert!(malformed.contains("is not a Ruddy artifact"), "{malformed}");
-
-    fs::write(
-        directory.path().join("base.artifact"),
-        format!(" {}", artifact("base", "1.2.3").print()),
-    )
-    .expect("write noncanonical artifact text");
-    let noncanonical = error(&directory);
-    assert!(
-        noncanonical.contains("is not in canonical artifact form"),
-        "{noncanonical}"
-    );
-
-    write_artifact(directory.path(), "base.artifact", "other", "1.2.3");
-    let wrong_name = error(&directory);
-    assert!(
-        wrong_name.contains("contains artifact `other` instead"),
-        "{wrong_name}"
-    );
-
-    write_artifact(directory.path(), "base.artifact", "base", "2.0.0");
-    let wrong_version = error(&directory);
-    assert!(
-        wrong_version.contains("requests version `1.2.3`")
-            && wrong_version.contains("contains version `2.0.0`"),
-        "{wrong_version}"
+    fs::create_dir_all(a.join("build")).unwrap();
+    fs::write(a.join("build/a.artifact"), "old").unwrap();
+    assert!(build_project(&a).is_err());
+    assert_eq!(
+        fs::read_to_string(a.join("build/a.artifact")).unwrap(),
+        "old"
     );
 }
 

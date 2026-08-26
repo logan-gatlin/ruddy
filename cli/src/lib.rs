@@ -1,6 +1,7 @@
 //! Filesystem-facing Ruddy compiler entry point used by the command-line tool.
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
@@ -173,24 +174,31 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
 }
 
-/// Compile the project in `directory` and write its canonical artifact under
-/// `build/`. Existing build artifacts are replaced.
+/// Compile the complete project graph, then write each project's canonical
+/// artifact to that project's own `build/` directory, dependencies first.
+/// No artifact is touched unless the entire graph compiles successfully.
 pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
-    let directory = directory.as_ref();
-    let artifact = compile(directory).map_err(|error| CliError {
+    let graph = compile_graph(directory).map_err(|error| CliError {
         rendered: error.to_string(),
         usage: false,
     })?;
-    let build = directory.join(BUILD_DIRECTORY);
-    fs::create_dir_all(&build).map_err(|error| {
-        CliError::one(format!(
-            "could not create build directory {}: {error}",
-            build.display()
-        ))
-    })?;
-    let path = build.join(format!("{}.artifact", artifact.header.identity.name));
-    replace_file(&path, artifact.print().as_bytes())?;
-    Ok(path)
+    let mut root = None;
+    for project in graph.projects {
+        let build = project.directory.join(BUILD_DIRECTORY);
+        fs::create_dir_all(&build).map_err(|error| {
+            CliError::one(format!(
+                "could not create build directory {}: {error}",
+                build.display()
+            ))
+        })?;
+        let path = build.join(format!(
+            "{}.artifact",
+            project.artifact.header.identity.name
+        ));
+        replace_file(&path, project.artifact.print().as_bytes())?;
+        root = Some(path);
+    }
+    root.ok_or_else(|| CliError::one("the project graph was empty"))
 }
 
 /// Write beside the old artifact first, so a failed write cannot truncate the
@@ -374,27 +382,203 @@ struct Manifest {
     name: String,
     version: String,
     root: PathBuf,
-    dependencies: IndexMap<String, DependencySpec>,
+    dependencies: IndexMap<String, PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DependencySpec {
-    version: String,
-    source: PathBuf,
+/// One successfully compiled project in a dependency graph.
+#[derive(Debug, Clone)]
+pub struct CompiledProject {
+    /// Canonical project directory containing `Ruddy.toml`.
+    pub directory: PathBuf,
+    /// The project's canonical in-memory artifact.
+    pub artifact: Artifact,
 }
 
-/// Compile the project in `directory`, whose `Ruddy.toml` names its bundle
-/// identity and source root.
-///
-/// The root and dependency source paths are resolved relative to the manifest.
-/// Dependency artifacts are loaded and checked before compilation. Their
-/// identities, but never their source paths, are recorded in the returned
-/// artifact in manifest declaration order.
+/// A successfully compiled graph, in unique dependency-first order. The root
+/// project is always last.
+#[derive(Debug, Clone)]
+pub struct CompiledGraph {
+    pub projects: Vec<CompiledProject>,
+}
+
+/// Compile the project in `directory` recursively and return only its artifact.
+/// This operation is side-effect free; use [`build_project`] to write artifacts.
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
-    let directory = directory.as_ref();
-    let manifest = load_manifest(directory)?;
-    let identity = configured_identity(&manifest.name, &manifest.version)?;
+    compile_graph(directory)?
+        .projects
+        .pop()
+        .map(|project| project.artifact)
+        .ok_or_else(|| CompileError::one("the project graph was empty"))
+}
+
+/// Compile every unique project reachable from `directory`, dependencies first.
+pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
+    let root = canonical_project(directory.as_ref())?;
+    let mut compiler = GraphCompiler::default();
+    compiler.visit(root, None)?;
+    Ok(CompiledGraph {
+        projects: compiler.projects,
+    })
+}
+
+/// Compile several dependency roots with one shared graph cache. The returned
+/// identities correspond to the input roots in order; graph projects remain
+/// unique and dependency-first across all roots.
+pub fn compile_dependency_graph<I, N, P>(
+    dependencies: I,
+) -> Result<(CompiledGraph, Vec<Dependency>), CompileError>
+where
+    I: IntoIterator<Item = (N, P)>,
+    N: Into<String>,
+    P: AsRef<Path>,
+{
+    let mut compiler = GraphCompiler::default();
+    let mut direct = Vec::new();
+    for (expected, directory) in dependencies {
+        let expected = expected.into();
+        let directory = canonical_project(directory.as_ref())?;
+        let manifest = load_manifest(&directory)?;
+        if manifest.name != expected {
+            return Err(CompileError::one(format!(
+                "dependency key `{expected}` resolves to project `{}` instead",
+                manifest.name
+            )));
+        }
+        let index = compiler.visit(directory, Some((expected, PathBuf::new())))?;
+        let artifact = &compiler.projects[index].artifact;
+        direct.push(Dependency {
+            name: artifact.header.identity.name.clone(),
+            version: artifact.header.identity.version.clone(),
+        });
+    }
+    Ok((
+        CompiledGraph {
+            projects: compiler.projects,
+        },
+        direct,
+    ))
+}
+
+#[derive(Default)]
+struct GraphCompiler {
+    completed: HashMap<PathBuf, usize>,
+    active: Vec<(PathBuf, String)>,
+    projects: Vec<CompiledProject>,
+}
+
+impl GraphCompiler {
+    fn visit(
+        &mut self,
+        directory: PathBuf,
+        edge: Option<(String, PathBuf)>,
+    ) -> Result<usize, CompileError> {
+        if let Some(&index) = self.completed.get(&directory) {
+            return Ok(index);
+        }
+        if let Some(at) = self.active.iter().position(|(path, _)| path == &directory) {
+            let mut chain: Vec<String> = self.active[at..]
+                .iter()
+                .map(|(path, name)| format!("{name} ({})", path.display()))
+                .collect();
+            if let Some((name, declared)) = edge {
+                chain.push(format!("{name} ({})", declared.display()));
+            }
+            return Err(CompileError::one(format!(
+                "dependency cycle: {}",
+                chain.join(" -> ")
+            )));
+        }
+
+        let manifest = load_manifest(&directory)?;
+        let identity = configured_identity(&manifest.name, &manifest.version)?;
+        let active_name = edge
+            .as_ref()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| manifest.name.clone());
+        self.active.push((directory.clone(), active_name));
+
+        let mut dependencies = Vec::with_capacity(manifest.dependencies.len());
+        for (expected, declared) in &manifest.dependencies {
+            let joined = directory.join(declared);
+            let child = canonical_project(&joined)
+                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
+            let child_manifest = load_manifest(&child)
+                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
+            if child_manifest.name != *expected {
+                self.active.pop();
+                return Err(CompileError::one(format!(
+                    "dependency `{expected}` declared as `{}` by {} contains project `{}` instead",
+                    declared.display(),
+                    directory.join(MANIFEST).display(),
+                    child_manifest.name
+                )));
+            }
+            let index = self
+                .visit(child, Some((expected.clone(), declared.clone())))
+                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
+            let child_artifact = &self.projects[index].artifact;
+            dependencies.push(Dependency {
+                name: child_artifact.header.identity.name.clone(),
+                version: child_artifact.header.identity.version.clone(),
+            });
+        }
+
+        let artifact = compile_one(&directory, manifest, identity, dependencies)?;
+        self.active.pop();
+        let index = self.projects.len();
+        self.projects.push(CompiledProject {
+            directory: directory.clone(),
+            artifact,
+        });
+        self.completed.insert(directory, index);
+        Ok(index)
+    }
+}
+
+fn canonical_project(directory: &Path) -> Result<PathBuf, CompileError> {
+    let canonical = fs::canonicalize(directory).map_err(|error| {
+        CompileError::one(format!(
+            "could not resolve project folder {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(CompileError::one(format!(
+            "project path {} is not a folder",
+            directory.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn dependency_error(
+    name: &str,
+    declared: &Path,
+    parent: &Path,
+    error: CompileError,
+) -> CompileError {
+    CompileError::diagnostics(
+        error
+            .messages
+            .into_iter()
+            .map(|message| {
+                format!(
+                    "error: dependency `{name}` at `{}` from {}:\n{}",
+                    declared.display(),
+                    parent.join(MANIFEST).display(),
+                    message
+                )
+            })
+            .collect(),
+    )
+}
+
+fn compile_one(
+    directory: &Path,
+    manifest: Manifest,
+    identity: Bundle,
+    dependencies: Vec<Dependency>,
+) -> Result<Artifact, CompileError> {
     let Some(name) = configured_file_name(&manifest.root) else {
         return Err(CompileError::one("manifest field `root` must name a file"));
     };
@@ -413,8 +597,6 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
             directory.join(MANIFEST).display()
         )));
     }
-
-    let dependencies = load_dependencies(directory, manifest.dependencies)?;
 
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
@@ -549,79 +731,6 @@ fn load_manifest(directory: &Path) -> Result<Manifest, CompileError> {
             "could not parse manifest {}: {error}",
             path.display()
         ))
-    })
-}
-
-fn load_dependencies(
-    directory: &Path,
-    dependencies: IndexMap<String, DependencySpec>,
-) -> Result<Vec<Dependency>, CompileError> {
-    dependencies
-        .into_iter()
-        .map(|(name, spec)| load_dependency(directory, name, spec))
-        .collect()
-}
-
-fn load_dependency(
-    directory: &Path,
-    name: String,
-    spec: DependencySpec,
-) -> Result<Dependency, CompileError> {
-    let version = Version::parse(&spec.version).map_err(|error| {
-        CompileError::one(format!(
-            "dependency `{name}` has invalid semantic version `{}`: {error}",
-            spec.version
-        ))
-    })?;
-    if !version.build.is_empty() {
-        return Err(CompileError::one(format!(
-            "dependency `{name}` version `{version}` uses unsupported build metadata"
-        )));
-    }
-    if Bundle::new(&name, version.clone()).is_none() {
-        return Err(CompileError::one(format!(
-            "dependency key `{name}` is not a valid Ruddy bundle name"
-        )));
-    }
-
-    let path = directory.join(&spec.source);
-    let source = fs::read_to_string(&path).map_err(|error| {
-        CompileError::one(format!(
-            "could not read source for dependency `{name}` at {}: {error}",
-            path.display()
-        ))
-    })?;
-    let artifact = Artifact::try_parse(&source).map_err(|error| {
-        CompileError::one(format!(
-            "dependency `{name}` source {} is not a Ruddy artifact: {error}",
-            path.display()
-        ))
-    })?;
-    if artifact.print() != source {
-        return Err(CompileError::one(format!(
-            "dependency `{name}` source {} is not in canonical artifact form",
-            path.display()
-        )));
-    }
-    if artifact.header.identity.name != name {
-        return Err(CompileError::one(format!(
-            "dependency `{name}` source {} contains artifact `{}` instead",
-            path.display(),
-            artifact.header.identity.name
-        )));
-    }
-    let requested = version.to_string();
-    if artifact.header.identity.version != requested {
-        return Err(CompileError::one(format!(
-            "dependency `{name}` requests version `{requested}`, but source {} contains version `{}`",
-            path.display(),
-            artifact.header.identity.version
-        )));
-    }
-
-    Ok(Dependency {
-        name,
-        version: requested,
     })
 }
 

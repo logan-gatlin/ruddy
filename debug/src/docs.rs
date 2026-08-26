@@ -1,7 +1,7 @@
 //! Scratch documents: the bundles you keep around while debugging.
 //!
 //! A document is a directory under `debug/scratch/<doc>/` holding plain `.hc`
-//! files and a small debugger configuration file. `main.hc` is the root; the
+//! files and a `Ruddy.toml` project manifest. The configured root and the
 //! rest are whatever its modules name. The page keeps a recovery copy in
 //! `localStorage`; this is the durable one.
 
@@ -11,22 +11,25 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::ROOT,
-    wire::{DependencySpec, Doc, DocMeta, FileSpec},
+    wire::{Doc, DocMeta, FileSpec},
 };
 
 const EXTENSION: &str = "hc";
-const CONFIG: &str = ".ruddy-debug.json";
+pub const MANIFEST: &str = "Ruddy.toml";
 const DEFAULT_VERSION: &str = "0.1.0";
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-struct Config {
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
     name: String,
     version: String,
-    dependencies: Vec<DependencySpec>,
+    root: String,
+    dependencies: IndexMap<String, String>,
 }
 
 /// The longest path a file inside a document may have. Long enough for a module
@@ -142,12 +145,13 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
     // The root first, then the rest by path: a stable order the page can show
     // its file strip in without sorting it again.
     files.sort_by_key(|file| (file.path != ROOT, file.path.clone()));
-    let config = read_config(&dir, name);
+    let manifest = read_manifest(&dir)?;
     Ok(Doc {
         name: name.to_string(),
-        bundle_name: config.name,
-        version: config.version,
-        dependencies: config.dependencies,
+        bundle_name: manifest.name,
+        version: manifest.version,
+        root: manifest.root,
+        dependencies: manifest.dependencies,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
     })
@@ -164,17 +168,20 @@ pub fn write(
     name: &str,
     bundle_name: &str,
     version: &str,
-    dependencies: &[DependencySpec],
+    configured_root: &str,
+    dependencies: &IndexMap<String, String>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
     let dir = path(root, name).ok_or_else(bad_name)?;
     fs::create_dir_all(&dir)?;
-    let config = Config {
+    let manifest = Manifest {
         name: bundle_name.to_string(),
         version: version.to_string(),
-        dependencies: dependencies.to_vec(),
+        root: configured_root.to_string(),
+        dependencies: dependencies.clone(),
     };
-    fs::write(dir.join(CONFIG), serde_json::to_vec_pretty(&config)?)?;
+    let source = toml::to_string(&manifest).map_err(io::Error::other)?;
+    fs::write(dir.join(MANIFEST), source)?;
     for file in files {
         let at = file_path(root, name, &file.path).ok_or_else(bad_name)?;
         if let Some(parent) = at.parent() {
@@ -194,16 +201,44 @@ pub fn write(
     modified_of(&dir)
 }
 
-fn read_config(dir: &Path, document_name: &str) -> Config {
-    fs::read(dir.join(CONFIG))
-        .ok()
-        .and_then(|source| serde_json::from_slice(&source).ok())
-        .filter(|config: &Config| !config.name.is_empty() && !config.version.is_empty())
-        .unwrap_or_else(|| Config {
-            name: document_name.to_string(),
-            version: DEFAULT_VERSION.to_string(),
-            dependencies: Vec::new(),
-        })
+fn read_manifest(dir: &Path) -> io::Result<Manifest> {
+    let path = dir.join(MANIFEST);
+    let source = fs::read_to_string(&path)?;
+    toml::from_str(&source).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse manifest {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Resolve a dependency path relative to a scratch project and prove that its
+/// canonical target remains inside the canonical scratch directory.
+pub fn dependency_path(scratch: &Path, project: &Path, declared: &Path) -> io::Result<PathBuf> {
+    if declared.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute dependency paths are not allowed",
+        ));
+    }
+    let scratch = fs::canonicalize(scratch)?;
+    let target = fs::canonicalize(project.join(declared))?;
+    if !target.starts_with(&scratch) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "dependency path `{}` escapes debug/scratch",
+                declared.display()
+            ),
+        ));
+    }
+    if !target.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("dependency path `{}` is not a folder", declared.display()),
+        ));
+    }
+    Ok(target)
 }
 
 pub fn delete(root: &Path, name: &str) -> io::Result<()> {
@@ -229,6 +264,12 @@ pub fn ensure(root: &Path, seed: &Path) -> io::Result<()> {
     {
         fs::create_dir_all(&demo)?;
         fs::write(demo.join(ROOT), source)?;
+        fs::write(
+            demo.join(MANIFEST),
+            format!(
+                "name = \"demo\"\nversion = \"{DEFAULT_VERSION}\"\nroot = \"{ROOT}\"\n\n[dependencies]\n"
+            ),
+        )?;
     }
     Ok(())
 }

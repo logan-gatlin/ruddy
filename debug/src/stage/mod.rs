@@ -8,6 +8,7 @@
 pub mod artifact;
 pub mod ast;
 pub mod constraints;
+pub mod dependencies;
 pub mod ir;
 pub mod lir;
 pub mod patterns;
@@ -48,6 +49,10 @@ pub struct Cx<'a> {
     pub lir: Option<&'a ruddy::lir::Output>,
     /// The canonical, span-free disk boundary built from accepted LIR.
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
+    /// Direct dependency artifacts successfully resolved for the active project.
+    pub dependency_declarations: &'a indexmap::IndexMap<String, String>,
+    pub dependencies: &'a [ruddy::artifact::Dependency],
+    pub dependencies_valid: bool,
     /// Artifact construction ran but panicked, rather than being skipped.
     pub artifact_panicked: bool,
     pub mint: Option<&'a Mint>,
@@ -66,6 +71,7 @@ pub struct Phases {
     /// The whole load: reading every file of the bundle, lexing it, parsing it
     /// and splicing the tree. [`Phases::lex`] and [`Phases::parse`] are the
     /// halves of it, summed across files.
+    pub dependencies: u64,
     pub load: u64,
     pub lex: u64,
     pub parse: u64,
@@ -161,6 +167,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(tokens::build),
+    },
+    Spec {
+        id: "dependencies",
+        title: "Dependencies",
+        view: View::Tree,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(dependencies::build),
     },
     Spec {
         id: "ast",

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use ruddy::tracking::{FileID, Span};
 use serde::{Deserialize, Serialize};
 
@@ -34,13 +35,18 @@ pub struct CompileRequest {
     pub name: String,
     #[serde(default = "default_version")]
     pub version: String,
-    /// Every file of the bundle. `main.hc` is the root; a request without one
+    /// Root path configured by the active project's manifest.
+    #[serde(default = "default_root")]
+    pub root: String,
+    /// Every file of the active bundle. A request without its configured root
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
-    /// Bundle identities available to this debug compilation. Older clients
-    /// omit this field and retain the former empty dependency set.
+    /// Dependency project folder paths keyed by expected bundle name.
     #[serde(default)]
-    pub dependencies: Vec<DependencySpec>,
+    pub dependencies: IndexMap<String, String>,
+    /// Scratch document name, used to resolve saved dependency projects.
+    #[serde(default = "default_name")]
+    pub document: String,
     #[serde(default)]
     pub revision: u64,
 }
@@ -53,11 +59,8 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
-/// One dependency identity supplied by the debugger client.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DependencySpec {
-    pub name: String,
-    pub version: String,
+fn default_root() -> String {
+    "main.hc".to_string()
 }
 
 /// One file of a bundle, as the page holds it.
@@ -289,7 +292,8 @@ pub struct Doc {
     pub name: String,
     pub bundle_name: String,
     pub version: String,
-    pub dependencies: Vec<DependencySpec>,
+    pub root: String,
+    pub dependencies: IndexMap<String, String>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
 }
@@ -302,8 +306,10 @@ pub struct DocBody {
     pub name: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    #[serde(default = "default_root")]
+    pub root: String,
     #[serde(default)]
-    pub dependencies: Vec<DependencySpec>,
+    pub dependencies: IndexMap<String, String>,
     pub files: Vec<FileSpec>,
 }
 

@@ -285,11 +285,13 @@ dependencies = [
 name = "ruddy-debug"
 version = "0.1.0"
 dependencies = [
+ "cli",
  "indexmap",
  "ruddy",
  "serde",
  "serde_json",
  "tiny_http",
+ "toml",
 ]
 
 [[package]]
