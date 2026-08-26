@@ -1745,7 +1745,10 @@ impl Lower<'_> {
                             name: self.mint.name(*symbol).to_string(),
                         },
                     );
-                    let have = self.program.terms[symbol].value.ty.clone();
+                    let have = self.program.terms.get(symbol).map_or_else(
+                        || self.program.external_schemes[symbol].body().clone(),
+                        |declaration| declaration.value.ty.clone(),
+                    );
                     self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }

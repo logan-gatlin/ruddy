@@ -144,7 +144,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
         document: "app".to_string(),
         files: vec![FileSpec {
             path: ROOT.to_string(),
-            source: "let app = 0n\n".to_string(),
+            source: "let app = base::base\n".to_string(),
         }],
         dependencies,
         revision: 1,
@@ -163,13 +163,27 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             .unwrap()
             .contains("(dependency \"base\" \"2.3.4\")")
     );
+    assert!(
+        artifact
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("base@2.3.4::base")
+    );
     let dependencies = built
         .stages
         .iter()
         .find(|stage| stage.id == "dependencies")
         .unwrap();
     assert_eq!(dependencies.status, Status::Ok);
-    assert_eq!(dependencies.nodes[0].children[0].text, "base@2.3.4");
+    let dependency = &dependencies.nodes[0].children[0];
+    assert_eq!(dependency.text, "base@2.3.4");
+    assert!(
+        dependency
+            .fields
+            .iter()
+            .any(|field| field.name == "imported values" && field.value == "1")
+    );
 
     fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
     let failed = compile_at(&request, 1, scratch.path());

@@ -15,7 +15,13 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 .dependencies
                 .iter()
                 .find(|dependency| dependency.name == *name);
-            Node::new(
+            let interface = built.and_then(|dependency| {
+                cx.dependency_interfaces.iter().find(|artifact| {
+                    artifact.header.identity.name == dependency.name
+                        && artifact.header.identity.version == dependency.version
+                })
+            });
+            let mut node = Node::new(
                 ids.next(),
                 "project",
                 built.map_or_else(
@@ -28,7 +34,17 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             .field(
                 "artifact",
                 if built.is_some() { "in memory" } else { "none" },
-            )
+            );
+            if let Some(interface) = interface {
+                node = node
+                    .field("imported values", interface.header.values.len().to_string())
+                    .field("imported types", interface.header.types.len().to_string())
+                    .field(
+                        "imported effects",
+                        interface.header.effects.len().to_string(),
+                    );
+            }
+            node
         })
         .collect();
     let root = Node::new(ids.next(), "active project", "browser source")

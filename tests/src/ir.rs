@@ -2,9 +2,10 @@
 
 use indexmap::IndexMap;
 use ruddy::{
+    artifact as a,
     ir::{
         Annotation, ClauseKind, Effect, ErrorKind, Field, Output, PatternKind, SumCase, Term,
-        TermKind, TypeField, TypeKind, build,
+        TermKind, TypeField, TypeKind, build, build_with_dependencies,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -5117,5 +5118,213 @@ fn a_module_with_no_body_is_declared_and_empty() {
     assert!(
         mint.symbols()
             .any(|s| mint.namespace(s) == Namespace::Modules && mint.name(s) == "A")
+    );
+}
+
+fn artifact_type(core: a::Core) -> a::Type {
+    a::Type {
+        core,
+        fields: Vec::new(),
+    }
+}
+
+fn artifact_scheme(body: a::Type) -> a::Scheme {
+    a::Scheme {
+        count: 0,
+        presences: 0,
+        formula: a::Formula::True,
+        body,
+    }
+}
+
+/// Artifact headers are the semantic boundary, so importing exercises every
+/// portable type/formula/row form rather than relying on source re-lowering.
+#[test]
+fn dependency_interfaces_import_every_semantic_form() {
+    let unit = || artifact_type(a::Core::Unit);
+    let field = |presence| a::RowField {
+        presence,
+        ty: unit(),
+    };
+    let rich = a::Type {
+        core: a::Core::Arrow(
+            Box::new(artifact_type(a::Core::Named {
+                name: "other@2.0.0::Remote".to_string(),
+                args: vec![artifact_type(a::Core::Bound(1))],
+            })),
+            Box::new(artifact_type(a::Core::Rigid {
+                id: 4,
+                name: "r".to_string(),
+            })),
+            a::Row {
+                labels: vec![
+                    ("present".to_string(), field(a::Presence::Present)),
+                    ("absent".to_string(), field(a::Presence::Absent)),
+                    ("var".to_string(), field(a::Presence::Var(2))),
+                    ("bound".to_string(), field(a::Presence::Bound(0))),
+                    ("unknown".to_string(), field(a::Presence::Undecided)),
+                ],
+                rest: a::Rest::More(Box::new(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Rigid {
+                        id: 5,
+                        name: "tail".to_string(),
+                    },
+                })),
+            },
+        ),
+        fields: vec![("x".to_string(), field(a::Presence::Present))],
+    };
+    let formula = a::Formula::And(
+        Box::new(a::Formula::Not(Box::new(a::Formula::Var(0)))),
+        Box::new(a::Formula::Or(
+            Box::new(a::Formula::Bound(1)),
+            Box::new(a::Formula::Iff(
+                Box::new(a::Formula::False),
+                Box::new(a::Formula::Xor(
+                    Box::new(a::Formula::True),
+                    Box::new(a::Formula::Bound(0)),
+                )),
+            )),
+        )),
+    );
+    let mut values = vec![a::Value {
+        name: "dep@1.0.0::M::rich".to_string(),
+        scheme: a::Scheme {
+            count: 3,
+            presences: 1,
+            formula,
+            body: rich,
+        },
+    }];
+    for (name, core) in [
+        ("unit", a::Core::Unit),
+        ("nat", a::Core::Nat),
+        ("int", a::Core::Int),
+        ("real", a::Core::Real),
+        ("string", a::Core::String),
+        ("boolean", a::Core::Boolean),
+        ("var", a::Core::Var(0)),
+        ("bound", a::Core::Bound(0)),
+        ("undecided", a::Core::Undecided),
+        (
+            "sum-closed",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            }),
+        ),
+        (
+            "sum-var",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Var(0),
+            }),
+        ),
+        (
+            "sum-bound",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        ),
+        (
+            "sum-undecided",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Undecided,
+            }),
+        ),
+    ] {
+        values.push(a::Value {
+            name: format!("dep@1.0.0::{name}"),
+            scheme: artifact_scheme(artifact_type(core)),
+        });
+    }
+    values.push(a::Value {
+        name: "wrong@1.0.0::ignored".to_string(),
+        scheme: artifact_scheme(unit()),
+    });
+
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: Vec::new(),
+            values,
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::M::T".to_string(),
+                params: vec![
+                    a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: vec!["x".to_string()],
+                        relevant: true,
+                    },
+                    a::Parameter {
+                        sense: a::Sense::Cases,
+                        lacks: Vec::new(),
+                        relevant: false,
+                    },
+                    a::Parameter {
+                        sense: a::Sense::Effects,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    },
+                ],
+                scheme: artifact_scheme(artifact_type(a::Core::Named {
+                    name: "dep@1.0.0::M::T".to_string(),
+                    args: Vec::new(),
+                })),
+            }],
+            effects: vec![
+                a::DeclaredEffect {
+                    name: "dep@1.0.0::M::Read".to_string(),
+                    identity: Some(a::EffectIdentity {
+                        name: "Read".to_string(),
+                        interface: "get:{}->Nat".to_string(),
+                    }),
+                    kind: a::EffectKind::Operations(vec![a::Operation {
+                        name: "get".to_string(),
+                        from: unit(),
+                        to: artifact_type(a::Core::Nat),
+                    }]),
+                },
+                a::DeclaredEffect {
+                    name: "dep@1.0.0::Alias".to_string(),
+                    identity: None,
+                    kind: a::EffectKind::Alias(vec![
+                        "dep@1.0.0::M::Read".to_string(),
+                        "other@2.0.0::IO".to_string(),
+                    ]),
+                },
+            ],
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    // A second header with the same root/name covers deterministic duplicate
+    // handling; the first declaration remains the source-visible one.
+    let duplicate = dependency.clone();
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, Vec::new(), &[dependency, duplicate]);
+
+    assert!(out.errors.is_empty());
+    assert_eq!(out.program.external_types.len(), 1);
+    assert_eq!(out.program.external_operations.len(), 1);
+    assert!(
+        out.program
+            .external_names
+            .values()
+            .any(|name| name == "other@2.0.0::IO")
+    );
+    assert!(
+        !out.program
+            .external_names
+            .values()
+            .any(|name| name.contains("ignored"))
     );
 }

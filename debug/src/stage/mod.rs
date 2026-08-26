@@ -52,6 +52,7 @@ pub struct Cx<'a> {
     /// Direct dependency artifacts successfully resolved for the active project.
     pub dependency_declarations: &'a indexmap::IndexMap<String, String>,
     pub dependencies: &'a [ruddy::artifact::Dependency],
+    pub dependency_interfaces: &'a [ruddy::artifact::Artifact],
     pub dependencies_valid: bool,
     /// Artifact construction ran but panicked, rather than being skipped.
     pub artifact_panicked: bool,

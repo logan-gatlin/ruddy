@@ -158,6 +158,8 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // recoverable so the active project's source phases remain inspectable.
     let dependency_started = Instant::now();
     let mut dependency_artifacts = Vec::new();
+    let mut dependency_interfaces = Vec::new();
+    let mut linked_interfaces = Vec::new();
     if !req.dependencies.is_empty() {
         match scratch {
             None => diagnostics.push(raw(
@@ -200,7 +202,25 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                     }
                 }
                 match ruddy_cli::compile_sandboxed_dependency_graph(resolved, scratch) {
-                    Ok((_, direct)) => dependency_artifacts = direct,
+                    Ok((graph, direct)) => {
+                        linked_interfaces = graph
+                            .projects
+                            .iter()
+                            .map(|project| project.artifact.clone())
+                            .collect();
+                        dependency_interfaces = direct
+                            .iter()
+                            .filter_map(|identity| {
+                                graph.projects.iter().find(|project| {
+                                    project.artifact.header.identity.name == identity.name
+                                        && project.artifact.header.identity.version
+                                            == identity.version
+                                })
+                            })
+                            .map(|project| project.artifact.clone())
+                            .collect();
+                        dependency_artifacts = direct;
+                    }
                     Err(error) => diagnostics.push(raw(
                         "dependencies",
                         "dependency-build",
@@ -222,7 +242,12 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut built = loaded.as_ref().and_then(|loaded| {
         let started = Instant::now();
         let out = guard("ir", &mut panicked, || {
-            ir::build(&mut mint, loaded.stmts.clone())
+            ir::build_with_dependency_graph(
+                &mut mint,
+                loaded.stmts.clone(),
+                &dependency_interfaces,
+                &linked_interfaces,
+            )
         });
         micros.build = started.elapsed().as_micros() as u64;
         out
@@ -393,6 +418,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         artifact: artifact.as_ref(),
         dependency_declarations: &req.dependencies,
         dependencies: &dependency_artifacts,
+        dependency_interfaces: &dependency_interfaces,
         dependencies_valid: !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.stage == "dependencies"),

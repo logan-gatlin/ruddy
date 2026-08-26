@@ -768,6 +768,7 @@ fn artifact_stage_renders_one_dependency() {
         artifact: Some(&artifact),
         dependency_declarations: &declarations,
         dependencies: &artifact.header.dependencies,
+        dependency_interfaces: &[],
         dependencies_valid: false,
         artifact_panicked: false,
         mint: None,

@@ -535,7 +535,7 @@ impl GraphCompiler {
             .unwrap_or_else(|| manifest.name.clone());
         self.active.push((directory.clone(), active_name));
 
-        let mut dependencies = Vec::with_capacity(manifest.dependencies.len());
+        let mut dependency_artifacts = Vec::with_capacity(manifest.dependencies.len());
         for (expected, declared) in &manifest.dependencies {
             let joined = directory.join(declared);
             let child = canonical_project_in(&joined, self.sandbox.as_deref())
@@ -555,17 +555,20 @@ impl GraphCompiler {
                 .visit(child, Some((expected.clone(), declared.clone())))
                 .map_err(|error| dependency_error(expected, declared, &directory, error))?;
             let child_artifact = &self.projects[index].artifact;
-            dependencies.push(Dependency {
-                name: child_artifact.header.identity.name.clone(),
-                version: child_artifact.header.identity.version.clone(),
-            });
+            dependency_artifacts.push(child_artifact.clone());
         }
 
+        let linked_artifacts = self
+            .projects
+            .iter()
+            .map(|project| project.artifact.clone())
+            .collect();
         let artifact = compile_one(
             &directory,
             manifest,
             identity,
-            dependencies,
+            dependency_artifacts,
+            linked_artifacts,
             self.sandbox.as_deref(),
         )?;
         self.active.pop();
@@ -634,7 +637,8 @@ fn compile_one(
     directory: &Path,
     manifest: Manifest,
     identity: Bundle,
-    dependencies: Vec<Dependency>,
+    dependencies: Vec<Artifact>,
+    linked: Vec<Artifact>,
     sandbox: Option<&Path>,
 ) -> Result<Artifact, CompileError> {
     if sandbox.is_some() && manifest.root.is_absolute() {
@@ -667,7 +671,8 @@ fn compile_one(
     let mut files = FileManager::new();
     let loaded = bundle::load(&mut files, &disk, name);
     let mut mint = Mint::new(identity);
-    let mut built = ir::build(&mut mint, loaded.stmts);
+    let mut built =
+        ir::build_with_dependency_graph(&mut mint, loaded.stmts, &dependencies, &linked);
     let inferred = inference::infer(&mint, &mut built.program);
     let checked = patterns::check(&built.program, &inferred);
 
@@ -752,9 +757,20 @@ fn compile_one(
     }
 
     let lowered = lir::lower(&mint, &built.program, &inferred);
-    let mut artifact = Artifact::build(&mint, &built.program, &inferred, &lowered);
-    artifact.header.dependencies = dependencies;
-    Ok(artifact)
+    let identities = dependencies
+        .iter()
+        .map(|artifact| Dependency {
+            name: artifact.header.identity.name.clone(),
+            version: artifact.header.identity.version.clone(),
+        })
+        .collect();
+    Ok(ruddy::artifact::build_with_dependencies(
+        &mint,
+        &built.program,
+        &inferred,
+        &lowered,
+        identities,
+    ))
 }
 
 fn configured_identity(name: &str, configured_version: &str) -> Result<Bundle, CompileError> {

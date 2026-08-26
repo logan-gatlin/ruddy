@@ -570,6 +570,9 @@ pub fn try_parse(input: &str) -> Result<Artifact, ParseError> {
 }
 
 fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
+    if let Some(qualified) = mint.external(symbol) {
+        return qualified.to_owned();
+    }
     let path = mint.path(symbol).to_string();
     let prefix = mint.bundle().name();
     let suffix = path

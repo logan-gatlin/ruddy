@@ -62,6 +62,113 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
 }
 
 #[test]
+fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
+    let directory = project();
+    let dependency = directory.path().join("std");
+    write_project(&dependency, "std", "0.1.0", &[]);
+    fs::write(
+        dependency.join("main.hc"),
+        "module Nested =\n  type Number = Nat\n  effect Read = get : {} -> Nat\n  let foo = 1n\nend\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "let value : std::Nested::Number = std::Nested::foo\nlet operation = std::Nested::!Read.get\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+    )
+    .unwrap();
+
+    let built = compile(directory.path()).expect("dependency members resolve");
+    let printed = built.print();
+    assert!(printed.contains("std@0.1.0::Nested::foo"), "{printed}");
+    assert!(printed.contains("std@0.1.0::Nested::Number"), "{printed}");
+    assert_eq!(built.header.values.len(), 2);
+    assert!(built.header.types.is_empty());
+    assert!(built.header.effects.is_empty());
+}
+
+#[test]
+fn transitive_dependencies_are_linkable_but_not_source_visible() {
+    let directory = project();
+    write_project(&directory.path().join("base"), "base", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("base/main.hc"),
+        "type Number = Nat\nlet foo : Number = 1n\n",
+    )
+    .unwrap();
+    write_project(
+        &directory.path().join("std"),
+        "std",
+        "1.0.0",
+        &[("base", "../base")],
+    );
+    fs::write(
+        directory.path().join("std/main.hc"),
+        "let foo = base::foo\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "let main : Nat = std::foo\n",
+    )
+    .unwrap();
+    let built = compile(directory.path()).expect("direct export backed by transitive global");
+    assert!(built.print().contains("std@1.0.0::foo"));
+
+    fs::write(directory.path().join("main.hc"), "let main = base::foo\n").unwrap();
+    let error = error(&directory);
+    assert!(error.contains("undefined module"), "{error}");
+}
+
+#[test]
+fn missing_dependency_paths_report_the_requested_namespace() {
+    let directory = project();
+    write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "let a = std::missing\nlet b : std::Missing = 1n\nlet c = std::!MissingEffect.op\nlet d = std::NoModule::x\n",
+    )
+    .unwrap();
+    let error = error(&directory);
+    assert!(error.contains("undefined term"), "{error}");
+    assert!(error.contains("undefined type"), "{error}");
+    assert!(error.contains("undefined effect"), "{error}");
+    assert!(error.contains("undefined module"), "{error}");
+}
+
+#[test]
+fn a_local_module_cannot_shadow_a_direct_dependency_root() {
+    let directory = project();
+    write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("main.hc"),
+        "module std = let local = 1n end\nlet main = 0n\n",
+    )
+    .unwrap();
+    let error = error(&directory);
+    assert!(error.contains("duplicate module"), "{error}");
+}
+
+#[test]
 fn the_configured_root_is_resolved_relative_to_the_manifest() {
     let directory = project();
     fs::create_dir(directory.path().join("src")).expect("create source directory");

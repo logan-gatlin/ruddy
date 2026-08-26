@@ -7,16 +7,24 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
+    artifact,
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{EffectId, ParamKind, Prim, Sense, Shape, Ty},
+    types::{EffectId, ParamKind, Prim, Scheme, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
 pub struct Program {
     pub terms: IndexMap<Symbol, Decl<Term>>,
     pub types: IndexMap<Symbol, Decl<Type>>,
+    /// Dependency declarations are not definitions of this bundle, but their
+    /// semantic interfaces participate in checking exactly as in-bundle
+    /// declarations do.
+    pub external_names: IndexMap<Symbol, artifact::QualifiedName>,
+    pub external_schemes: IndexMap<Symbol, Scheme>,
+    pub external_types: IndexMap<Symbol, ExternalType>,
+    pub external_operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
     /// The effects declared, in the order they were written, each with the
     /// operations it declares or the effects it stands for.
     pub effects: IndexMap<Symbol, Decl<Effect>>,
@@ -84,6 +92,14 @@ pub struct Named {
 /// with nothing keeps exactly the scheme it would have had if nothing here
 /// existed. Treating the whole file as one group would type-check every
 /// recursion and destroy the polymorphism of everything else.
+/// The imported semantic interface of a declared type.
+#[derive(Debug, Clone)]
+pub struct ExternalType {
+    pub params: Vec<ParamKind>,
+    pub relevant: Vec<bool>,
+    pub scheme: Scheme,
+}
+
 #[derive(Debug, Clone)]
 pub struct Group {
     /// The definitions in this group, in source order.
@@ -1763,6 +1779,28 @@ impl TermKind {
 }
 
 pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
+    build_with_dependencies(mint, stmts, &[])
+}
+
+/// Build IR with direct dependency artifact headers visible as root-qualified
+/// source namespaces. Artifact bodies remain linked implementation details;
+/// only declarations in these direct headers are installed in the resolver.
+pub fn build_with_dependencies(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[artifact::Artifact],
+) -> Output {
+    build_with_dependency_graph(mint, stmts, dependencies, &[])
+}
+
+/// Build against direct source-visible dependencies and additional linked
+/// implementation interfaces referenced by those dependencies.
+pub fn build_with_dependency_graph(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[artifact::Artifact],
+    linked: &[artifact::Artifact],
+) -> Output {
     let mut b = Builder {
         mint,
         module: None,
@@ -1781,10 +1819,15 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     let mut program = Program {
         terms: IndexMap::new(),
         types: IndexMap::new(),
+        external_names: IndexMap::new(),
+        external_schemes: IndexMap::new(),
+        external_types: IndexMap::new(),
+        external_operations: IndexMap::new(),
         effects: IndexMap::new(),
         effect_ids: IndexMap::new(),
         groups: Vec::new(),
     };
+    b.import_dependencies(dependencies, linked, &mut program);
     // The whole tree flattened before anything is declared: every module is
     // minted, over every file, and what each remaining statement is written in
     // is recorded beside it. Nothing is resolved on the way, so a module may be
@@ -1856,15 +1899,18 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // What each effect name stands for, once every declaration is in: itself,
     // or — for an alias — the effects it names, through however many aliases it
     // takes to reach them.
-    b.expanded = expansions(b.mint, &program.effects);
-    b.operations = program
-        .effects
-        .iter()
-        .filter_map(|(symbol, decl)| match &decl.value {
-            Effect::Operations(operations) => Some((*symbol, operations.keys().cloned().collect())),
-            Effect::Alias(_) => None,
-        })
-        .collect();
+    b.expanded.extend(expansions(b.mint, &program.effects));
+    b.operations.extend(
+        program
+            .effects
+            .iter()
+            .filter_map(|(symbol, decl)| match &decl.value {
+                Effect::Operations(operations) => {
+                    Some((*symbol, operations.keys().cloned().collect()))
+                }
+                Effect::Alias(_) => None,
+            }),
+    );
     for ((symbol, (module, name, _, body)), params) in
         declared.into_iter().zip(flat.types).zip(bound)
     {
@@ -2155,6 +2201,173 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     }
 }
 
+fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
+    let prefix = format!(
+        "{}@{}::",
+        dependency.header.identity.name, dependency.header.identity.version
+    );
+    let path = qualified.strip_prefix(&prefix)?;
+    let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
+    (!parts.is_empty() && parts.iter().all(|part| !part.is_empty())).then_some(parts)
+}
+
+fn imported_symbol(
+    mint: &mut Mint,
+    namespace: Namespace,
+    qualified: &str,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Symbol {
+    let key = (namespace, qualified.to_owned());
+    if let Some(&symbol) = symbols.get(&key) {
+        return symbol;
+    }
+    // References in an interface may target transitive dependencies. They get
+    // semantic symbols so inference can follow them, but are deliberately not
+    // installed in Builder::globals and therefore cannot be named by source.
+    let symbol = mint.local(None, namespace, qualified);
+    symbols.insert(key, symbol);
+    mint.register_external(symbol, qualified);
+    names.insert(symbol, qualified.to_owned());
+    symbol
+}
+
+fn import_scheme(
+    mint: &mut Mint,
+    scheme: &artifact::Scheme,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Scheme {
+    Scheme::constrained(
+        scheme.count,
+        scheme.presences,
+        import_type(mint, &scheme.body, symbols, names),
+        import_formula(&scheme.formula),
+    )
+}
+
+fn import_type(
+    mint: &mut Mint,
+    value: &artifact::Type,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Rc<Ty> {
+    let core = match &value.core {
+        artifact::Core::Unit => crate::types::Core::Unit,
+        artifact::Core::Nat => crate::types::Core::Nat,
+        artifact::Core::Int => crate::types::Core::Int,
+        artifact::Core::Real => crate::types::Core::Real,
+        artifact::Core::String => crate::types::Core::String,
+        artifact::Core::Boolean => crate::types::Core::Boolean,
+        artifact::Core::Arrow(from, to, effects) => crate::types::Core::Arrow(
+            import_type(mint, from, symbols, names),
+            import_type(mint, to, symbols, names),
+            import_row(mint, effects, symbols, names),
+        ),
+        artifact::Core::Sum(row) => crate::types::Core::Sum(import_row(mint, row, symbols, names)),
+        artifact::Core::Var(var) => crate::types::Core::Var(*var),
+        artifact::Core::Bound(var) => crate::types::Core::Bound(*var),
+        artifact::Core::Rigid { id, name } => crate::types::Core::Rigid {
+            id: *id,
+            name: Rc::from(name.as_str()),
+        },
+        artifact::Core::Named { name, args } => {
+            let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
+            crate::types::Core::Named {
+                symbol,
+                name: Rc::from(name.as_str()),
+                args: args
+                    .iter()
+                    .map(|arg| import_type(mint, arg, symbols, names))
+                    .collect::<Vec<_>>()
+                    .into(),
+            }
+        }
+        artifact::Core::Undecided => crate::types::Core::Undecided,
+    };
+    Rc::new(Ty {
+        core,
+        fields: value
+            .fields
+            .iter()
+            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+            .collect(),
+    })
+}
+
+fn import_row(
+    mint: &mut Mint,
+    value: &artifact::Row,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> crate::types::Row {
+    crate::types::Row {
+        labels: value
+            .labels
+            .iter()
+            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+            .collect(),
+        rest: match &value.rest {
+            artifact::Rest::Closed => crate::types::Rest::Closed,
+            artifact::Rest::Var(var) => crate::types::Rest::Var(*var),
+            artifact::Rest::Bound(var) => crate::types::Rest::Bound(*var),
+            artifact::Rest::Rigid { id, name } => crate::types::Rest::Rigid {
+                id: *id,
+                name: Rc::from(name.as_str()),
+            },
+            artifact::Rest::Undecided => crate::types::Rest::Undecided,
+            artifact::Rest::More(row) => {
+                crate::types::Rest::More(Rc::new(import_row(mint, row, symbols, names)))
+            }
+        },
+    }
+}
+
+fn import_row_field(
+    mint: &mut Mint,
+    value: &artifact::RowField,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> crate::types::RowField {
+    crate::types::RowField {
+        presence: match value.presence {
+            artifact::Presence::Present => crate::types::Presence::Present,
+            artifact::Presence::Absent => crate::types::Presence::Absent,
+            artifact::Presence::Var(var) => crate::types::Presence::Var(var),
+            artifact::Presence::Bound(var) => crate::types::Presence::Bound(var),
+            artifact::Presence::Undecided => crate::types::Presence::Undecided,
+        },
+        ty: import_type(mint, &value.ty, symbols, names),
+    }
+}
+
+fn import_formula(value: &artifact::Formula) -> crate::types::Formula {
+    use crate::types::{Atom, Formula};
+    match value {
+        artifact::Formula::True => Formula::True,
+        artifact::Formula::False => Formula::False,
+        artifact::Formula::Var(var) => Formula::Atom(Atom::Var(*var)),
+        artifact::Formula::Bound(var) => Formula::Atom(Atom::Bound(*var)),
+        artifact::Formula::Not(value) => Formula::Not(Rc::new(import_formula(value))),
+        artifact::Formula::And(left, right) => Formula::And(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Or(left, right) => Formula::Or(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Iff(left, right) => Formula::Iff(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Xor(left, right) => Formula::Xor(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+    }
+}
+
 /// Assign structural identities to effects and replace the provisional source
 /// symbols in every lowered effect row. Symbols remain on each label for
 /// operation lookup and editor navigation; the key is only row semantics.
@@ -2201,7 +2414,7 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
             Effect::Alias(_) => None,
         })
         .collect();
-    program.effect_ids = ids.clone();
+    program.effect_ids.extend(ids.clone());
     for decl in program.effects.values_mut() {
         match &mut decl.value {
             Effect::Operations(operations) => {
@@ -4896,6 +5109,236 @@ impl Builder<'_> {
             .expect("the name table already ruled out a repeat");
         self.globals.insert(key, (symbol, name.span));
         Some(symbol)
+    }
+
+    /// Install direct dependency headers before local declarations are
+    /// flattened. The dependency bundle name is an ordinary root module, so
+    /// the existing strict path walk handles nested modules without a second
+    /// resolver.
+    fn import_dependencies(
+        &mut self,
+        dependencies: &[artifact::Artifact],
+        linked: &[artifact::Artifact],
+        program: &mut Program,
+    ) {
+        let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
+
+        // Every linked declaration gets a semantic symbol, including
+        // transitive implementation dependencies. Only the direct pass below
+        // installs those symbols into source resolution tables.
+        for dependency in linked.iter().chain(dependencies) {
+            for (namespace, qualified) in dependency
+                .header
+                .values
+                .iter()
+                .map(|value| (Namespace::Terms, &value.name))
+                .chain(
+                    dependency
+                        .header
+                        .types
+                        .iter()
+                        .map(|value| (Namespace::Types, &value.name)),
+                )
+                .chain(
+                    dependency
+                        .header
+                        .effects
+                        .iter()
+                        .map(|value| (Namespace::Effects, &value.name)),
+                )
+            {
+                if dependency_path(dependency, qualified).is_none() {
+                    continue;
+                }
+                imported_symbol(
+                    self.mint,
+                    namespace,
+                    qualified,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+            }
+        }
+
+        // Declare every source-visible name first. Semantic interfaces may
+        // refer forward, sideways, or through a transitive implementation
+        // dependency, so conversion happens in the second pass.
+        for dependency in dependencies {
+            let root_name = &dependency.header.identity.name;
+            let root = match self.modules.get(&(None, root_name.clone())) {
+                Some(&(module, _)) => module,
+                None => {
+                    let module = self
+                        .mint
+                        .module(None, root_name)
+                        .expect("a dependency root was checked before minting");
+                    self.modules
+                        .insert((None, root_name.clone()), (module, Span::default()));
+                    module
+                }
+            };
+            for (namespace, qualified) in dependency
+                .header
+                .values
+                .iter()
+                .map(|value| (Namespace::Terms, &value.name))
+                .chain(
+                    dependency
+                        .header
+                        .types
+                        .iter()
+                        .map(|value| (Namespace::Types, &value.name)),
+                )
+                .chain(
+                    dependency
+                        .header
+                        .effects
+                        .iter()
+                        .map(|value| (Namespace::Effects, &value.name)),
+                )
+            {
+                let Some(parts) = dependency_path(dependency, qualified) else {
+                    continue;
+                };
+                let (modules, name) = parts.split_at(parts.len() - 1);
+                let mut parent = root;
+                for segment in modules {
+                    parent = match self.modules.get(&(Some(parent), segment.clone())) {
+                        Some(&(module, _)) => module,
+                        None => {
+                            let module = self
+                                .mint
+                                .module(Some(parent), segment)
+                                .expect("an imported module was checked before minting");
+                            self.modules
+                                .insert((Some(parent), segment.clone()), (module, Span::default()));
+                            module
+                        }
+                    };
+                }
+                let key = (Some(parent), namespace, name[0].clone());
+                if self.globals.contains_key(&key) {
+                    continue;
+                }
+                let symbol = symbols[&(namespace, qualified.clone())];
+                self.globals.insert(key, (symbol, Span::default()));
+            }
+        }
+
+        for dependency in linked.iter().chain(dependencies) {
+            for value in &dependency.header.values {
+                let Some(&symbol) = symbols.get(&(Namespace::Terms, value.name.clone())) else {
+                    continue;
+                };
+                let scheme = import_scheme(
+                    self.mint,
+                    &value.scheme,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+                program.external_schemes.insert(symbol, scheme);
+            }
+            for declaration in &dependency.header.types {
+                let Some(&symbol) = symbols.get(&(Namespace::Types, declaration.name.clone()))
+                else {
+                    continue;
+                };
+                let scheme = import_scheme(
+                    self.mint,
+                    &declaration.scheme,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+                let params: Vec<ParamKind> = declaration
+                    .params
+                    .iter()
+                    .map(|param| {
+                        let lacks = param.lacks.iter().cloned().collect();
+                        match param.sense {
+                            artifact::Sense::Type => ParamKind::Type { lacks },
+                            artifact::Sense::Cases => ParamKind::Cases { lacks },
+                            artifact::Sense::Effects => ParamKind::Effects { lacks },
+                        }
+                    })
+                    .collect();
+                self.arities.insert(symbol, params.len());
+                program.external_types.insert(
+                    symbol,
+                    ExternalType {
+                        params,
+                        relevant: declaration
+                            .params
+                            .iter()
+                            .map(|param| param.relevant)
+                            .collect(),
+                        scheme,
+                    },
+                );
+            }
+            for declaration in &dependency.header.effects {
+                let Some(&symbol) = symbols.get(&(Namespace::Effects, declaration.name.clone()))
+                else {
+                    continue;
+                };
+                if let Some(identity) = &declaration.identity {
+                    program.effect_ids.insert(
+                        symbol,
+                        EffectId::Structural {
+                            name: identity.name.clone(),
+                            interface: identity.interface.clone(),
+                        },
+                    );
+                }
+                match &declaration.kind {
+                    artifact::EffectKind::Operations(operations) => {
+                        self.expanded.insert(
+                            symbol,
+                            [(declaration.name.clone(), symbol)].into_iter().collect(),
+                        );
+                        self.operations.insert(
+                            symbol,
+                            operations
+                                .iter()
+                                .map(|operation| operation.name.clone())
+                                .collect(),
+                        );
+                        for operation in operations {
+                            let from = import_type(
+                                self.mint,
+                                &operation.from,
+                                &mut symbols,
+                                &mut program.external_names,
+                            );
+                            let to = import_type(
+                                self.mint,
+                                &operation.to,
+                                &mut symbols,
+                                &mut program.external_names,
+                            );
+                            program
+                                .external_operations
+                                .insert((symbol, operation.name.clone()), (from, to));
+                        }
+                    }
+                    artifact::EffectKind::Alias(names) => {
+                        let expansion = names
+                            .iter()
+                            .map(|name| {
+                                let target = imported_symbol(
+                                    self.mint,
+                                    Namespace::Effects,
+                                    name,
+                                    &mut symbols,
+                                    &mut program.external_names,
+                                );
+                                (name.clone(), target)
+                            })
+                            .collect();
+                        self.expanded.insert(symbol, expansion);
+                    }
+                }
+            }
+        }
     }
 
     /// [`declare`](Self::declare) in the module namespace, which has a door of
