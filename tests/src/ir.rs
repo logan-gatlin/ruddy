@@ -5349,7 +5349,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
         alias: "dep",
         artifact: &dependency,
     }];
-    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    let mut out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     let recovered: Vec<_> = out
         .program
@@ -5375,6 +5375,19 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             1,
             "missing effects must not become purity"
         );
+    }
+
+    // Recovery identities must survive the full inference path too. In
+    // particular, direct-only unresolved effects are semantic row labels, not
+    // names which inference may discard or attempt to look up transitively.
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(inferred.schemes.len(), 3);
+    for scheme in inferred.schemes.values() {
+        let ruddy::types::Core::Arrow(_, _, effects) = &scheme.body().core else {
+            panic!("expected inferred arrow")
+        };
+        assert_eq!(effects.labels.len(), 1, "inference lost recovered effect");
     }
 }
 
@@ -5405,6 +5418,207 @@ fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
             .collect();
         assert_eq!(identities.len(), 2);
         assert_ne!(identities[0], identities[1], "{name} lost its row argument");
+    }
+}
+
+#[test]
+fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels() {
+    let src = "type Record 'r = { x: Nat, ..'r }\n\
+               type Cases 'r = #X | ..'r\n\
+               effect A = a : () -> ()\n\
+               effect B = b : () -> ()\n\
+               effect C = c : () -> ()\n\
+               type Runs 'r = () -> () + !A + ..'r\n\
+               module Flat =\n  effect Record = get : { x: Nat, y: Nat } -> ()\n  effect Cases = get : (#X | #Y) -> ()\n  effect Runs = get : (() -> () + !A + !B) -> ()\nend\n\
+               module Composed =\n  effect Record = get : Record { y: Nat } -> ()\n  effect Cases = get : Cases (#Y) -> ()\n  effect Runs = get : Runs (!B) -> ()\nend\n\
+               module Different =\n  effect Record = get : Record { z: Nat } -> ()\n  effect Cases = get : Cases (#Z) -> ()\n  effect Runs = get : Runs (!C) -> ()\nend";
+    let (mint, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["impure-operation", "impure-operation", "impure-operation"]
+    );
+    for name in ["Record", "Cases", "Runs"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1], "{name} composition was not flattened");
+        assert_ne!(ids[0], ids[2], "{name} labels were lost while flattening");
+    }
+}
+
+#[test]
+fn row_composition_is_flattened_across_local_and_imported_types() {
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let named = |name: &str| {
+        artifact_type(a::Core::Named {
+            name: format!("dep@1.0.0::{name}"),
+            args: Vec::new(),
+        })
+    };
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let row = |label: &str| a::Row {
+        labels: vec![(label.into(), present(artifact_type(a::Core::Unit)))],
+        rest: a::Rest::Closed,
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![
+                declared(
+                    "RecordTail",
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("y".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared(
+                    "Record",
+                    a::Type {
+                        core: a::Core::Named {
+                            name: "dep@1.0.0::RecordTail".into(),
+                            args: Vec::new(),
+                        },
+                        fields: vec![("x".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared(
+                    "OtherRecord",
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("z".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared("CaseTail", artifact_type(a::Core::Sum(row("Y")))),
+                declared(
+                    "Cases",
+                    artifact_type(a::Core::Sum(a::Row {
+                        labels: row("X").labels,
+                        rest: a::Rest::More(Box::new(row("Y"))),
+                    })),
+                ),
+                declared("OtherCases", artifact_type(a::Core::Sum(row("Z")))),
+                // Keep a named indirection in the artifact too: flattening is
+                // deliberately performed after all regular nodes are built.
+                declared("RecordAlias", named("Record")),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "type LocalRecord = { x: Nat, y: Nat }\n\
+               type LocalCases = #X | #Y\n\
+               module L =\n  effect Record = get : LocalRecord -> ()\n  effect Cases = get : LocalCases -> ()\nend\n\
+               module I =\n  effect Record = get : dep::Record -> ()\n  effect Cases = get : dep::Cases -> ()\nend\n\
+               module D =\n  effect Record = get : dep::OtherRecord -> ()\n  effect Cases = get : dep::OtherCases -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for name in ["Record", "Cases"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1], "{name} composition was not flattened");
+        assert_ne!(ids[0], ids[2], "{name} labels were lost while flattening");
+    }
+}
+
+#[test]
+fn absent_semantic_payloads_do_not_affect_structural_identity() {
+    let absent = |ty| a::RowField {
+        presence: a::Presence::Absent,
+        ty,
+    };
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let types = [a::Core::Nat, a::Core::String]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, payload)| {
+            let suffix = index + 1;
+            [
+                declared(
+                    &format!("Record{suffix}"),
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("hidden".into(), absent(artifact_type(payload.clone())))],
+                    },
+                ),
+                declared(
+                    &format!("Cases{suffix}"),
+                    artifact_type(a::Core::Sum(a::Row {
+                        labels: vec![("Hidden".into(), absent(artifact_type(payload)))],
+                        rest: a::Rest::Closed,
+                    })),
+                ),
+            ]
+        })
+        .collect();
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types,
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module A =\n  effect Record = get : dep::Record1 -> ()\n  effect Cases = get : dep::Cases1 -> ()\nend\n\
+               module B =\n  effect Record = get : dep::Record2 -> ()\n  effect Cases = get : dep::Cases2 -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for name in ["Record", "Cases"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "absent {name} payload leaked into identity");
     }
 }
 

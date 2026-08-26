@@ -2809,11 +2809,12 @@ impl RegularType<'_> {
             .fields
             .iter()
             .map(|(name, field)| {
-                (
-                    name.clone(),
-                    presence(&field.presence),
-                    self.semantic(&field.ty, args),
-                )
+                let payload = if matches!(field.presence, Presence::Absent) {
+                    self.atom("?")
+                } else {
+                    self.semantic(&field.ty, args)
+                };
+                (name.clone(), presence(&field.presence), payload)
             })
             .collect();
         self.with_fields(core, fields)
@@ -2830,7 +2831,11 @@ impl RegularType<'_> {
                 crate::types::Presence::Bound(id) => format!("'p{id}"),
                 crate::types::Presence::Undecided => "?".into(),
             };
-            let ty = self.semantic(&field.ty, args);
+            let ty = if matches!(field.presence, crate::types::Presence::Absent) {
+                self.atom("?")
+            } else {
+                self.semantic(&field.ty, args)
+            };
             edges.push((
                 format!("label:{}:{presence}", canonical_effect_key(name)),
                 ty,
@@ -2851,7 +2856,43 @@ impl RegularType<'_> {
         self.node("sum", edges)
     }
 
-    fn encode(&self, root: usize) -> String {
+    /// Eliminate row-composition edges after the complete regular graph has
+    /// been built. A named tail may have been a placeholder when its caller
+    /// was visited, so doing this while lowering would make normalization
+    /// depend on declaration order. Epsilon closure also makes recursive row
+    /// graphs finite: each row node contributes its labels at most once.
+    fn flatten_rows(&mut self) {
+        let original = self.nodes.clone();
+        for root in 0..original.len() {
+            let (kind, join) = match original[root].label.as_str() {
+                "fields" => ("fields", "core"),
+                "sum" => ("sum", "tail"),
+                _ => continue,
+            };
+            let mut pending = vec![root];
+            let mut seen = HashSet::new();
+            let mut edges = Vec::new();
+            while let Some(node) = pending.pop() {
+                if !seen.insert(node) {
+                    continue;
+                }
+                for (label, child) in &original[node].edges {
+                    if label == join && original[*child].label == kind {
+                        pending.push(*child);
+                    } else {
+                        edges.push((label.clone(), *child));
+                    }
+                }
+            }
+            // Graph encoding is order independent, but stable storage keeps
+            // duplicate labels and multiple distinct exits deterministic too.
+            edges.sort();
+            self.nodes[root].edges = edges;
+        }
+    }
+
+    fn encode(&mut self, root: usize) -> String {
+        self.flatten_rows();
         // Color refinement computes the greatest bisimulation on this finite
         // graph. Canonical color numbers are obtained by sorting signatures,
         // then the reachable quotient is numbered from the root.
