@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use ruddy::tracking::{FileID, Span};
+pub use ruddy_cli::{DependencyDetail, DependencySpec};
 use serde::{Deserialize, Serialize};
 
 /// A byte range in one file, `[start, end)`. Always UTF-8 offsets, matching
@@ -51,55 +52,8 @@ pub struct CompileRequest {
     pub revision: u64,
 }
 
-/// A string preserves the old same-name bundle/path form. The detailed form
-/// permits a source-safe alias to name a bundle identity containing `-`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum DependencySpec {
-    Path(String),
-    Detailed(DependencyDetail),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DependencyDetail {
-    pub bundle: String,
-    pub path: String,
-}
-
-impl From<String> for DependencySpec {
-    fn from(path: String) -> Self {
-        Self::Path(path)
-    }
-}
-
-impl From<&str> for DependencySpec {
-    fn from(path: &str) -> Self {
-        Self::Path(path.to_string())
-    }
-}
-
-impl PartialEq<&str> for DependencySpec {
-    fn eq(&self, other: &&str) -> bool {
-        matches!(self, Self::Path(path) if path == other)
-    }
-}
-
-impl DependencySpec {
-    pub fn bundle<'a>(&'a self, alias: &'a str) -> &'a str {
-        match self {
-            Self::Path(_) => alias,
-            Self::Detailed(detail) => &detail.bundle,
-        }
-    }
-
-    pub fn path(&self) -> &str {
-        match self {
-            Self::Path(path) => path,
-            Self::Detailed(detail) => &detail.path,
-        }
-    }
-}
+// Dependency specifications are shared with the CLI so debugger manifests and
+// browser requests accept exactly the same path and HTTPS Git forms.
 
 fn default_name() -> String {
     "demo".to_string()

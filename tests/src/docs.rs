@@ -112,7 +112,11 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(doc.bundle_name, "configured");
     assert_eq!(doc.version, "1.2.3");
     assert_eq!(doc.root, "main.hc");
-    assert_eq!(doc.dependencies["base"], "../base");
+    assert!(matches!(
+        &doc.dependencies["base"],
+        ruddy_debug::wire::DependencySpec::Path(path)
+            if path == Path::new("../base")
+    ));
     let back: Vec<(&str, &str)> = doc
         .files
         .iter()

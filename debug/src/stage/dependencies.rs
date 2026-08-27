@@ -2,8 +2,30 @@
 
 use crate::{
     stage::{Cx, Ids, Spec},
-    wire::{Node, Stage, Status},
+    wire::{DependencySpec, Node, Stage, Status},
 };
+
+fn source(specification: &DependencySpec) -> String {
+    match specification {
+        DependencySpec::Path(path) => format!("path {}", path.display()),
+        DependencySpec::Detailed(detail) => {
+            if let Some(path) = &detail.path {
+                return format!("path {}", path.display());
+            }
+            let mut source = format!("git {}", detail.git.as_deref().unwrap_or("<missing>"));
+            if let Some((kind, value)) = detail
+                .branch
+                .as_deref()
+                .map(|value| ("branch", value))
+                .or_else(|| detail.tag.as_deref().map(|value| ("tag", value)))
+                .or_else(|| detail.rev.as_deref().map(|value| ("rev", value)))
+            {
+                source.push_str(&format!(" ({kind} {value})"));
+            }
+            source
+        }
+    }
+}
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let mut ids = Ids::default();
@@ -29,12 +51,15 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 ),
             )
             .field("source alias", alias)
-            .field("declared path", specification.path())
+            .field("source", source(specification))
             .field("status", if built.is_some() { "built" } else { "failed" })
             .field(
                 "artifact",
                 if built.is_some() { "in memory" } else { "none" },
             );
+            if let Some(path) = specification.path() {
+                node = node.field("declared path", path.display().to_string());
+            }
             if let Some(interface) = interface {
                 node = node
                     .field("imported values", interface.header.values.len().to_string())

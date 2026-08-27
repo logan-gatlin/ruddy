@@ -3,7 +3,9 @@
 //! A document is a directory under `debug/scratch/<doc>/` holding plain `.hc`
 //! files and a `Ruddy.toml` project manifest. The configured root and the
 //! rest are whatever its modules name. The page keeps a recovery copy in
-//! `localStorage`; this is the durable one.
+//! `localStorage`; this is the durable one. Saved manifests share the CLI's
+//! path and HTTPS Git dependency contract, including branch, tag, and revision
+//! selectors.
 
 use std::{
     fs, io,

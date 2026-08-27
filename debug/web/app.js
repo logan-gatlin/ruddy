@@ -482,23 +482,43 @@ function parseDependencies(input) {
     const part = raw.trim();
     const equals = part.indexOf("=");
     const left = part.slice(0, equals).trim();
-    const path = part.slice(equals + 1).trim();
+    let source = part.slice(equals + 1).trim();
     const at = left.indexOf("@");
     const alias = (at < 0 ? left : left.slice(0, at)).trim();
     const bundleName = (at < 0 ? alias : left.slice(at + 1)).trim();
-    if (equals <= 0 || !alias || !bundleName || !path) {
-      throw new Error(`Dependency ${index + 1} must be written as alias=folder or alias@bundle=folder.`);
+    if (equals <= 0 || !alias || !bundleName || !source) {
+      throw new Error(`Dependency ${index + 1} must be written as alias=folder, alias@bundle=folder, or alias=https://git-url[#branch=name|#tag=name|#rev=commit].`);
     }
     if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
-    dependencies[alias] = alias === bundleName ? path : { bundle: bundleName, path };
+
+    if (source.startsWith("https://")) {
+      const detail = { git: source };
+      const selector = source.match(/#(branch|tag|rev)=([^#]+)$/);
+      if (selector) {
+        detail.git = source.slice(0, selector.index);
+        detail[selector[1]] = selector[2].trim();
+        if (!detail[selector[1]]) throw new Error(`Dependency ${alias} has an empty Git selector.`);
+      }
+      if (alias !== bundleName) detail.bundle = bundleName;
+      dependencies[alias] = detail;
+    } else {
+      dependencies[alias] = alias === bundleName ? source : { bundle: bundleName, path: source };
+    }
   }
   return dependencies;
 }
 
 function printDependency(alias, specification) {
-  return typeof specification === "string"
-    ? `${alias}=${specification}`
-    : `${alias}@${specification.bundle}=${specification.path}`;
+  if (typeof specification === "string") return `${alias}=${specification}`;
+  const bundle = specification.bundle && specification.bundle !== alias
+    ? `@${specification.bundle}`
+    : "";
+  if (specification.git) {
+    const selector = ["branch", "tag", "rev"].find((kind) => specification[kind]);
+    const suffix = selector ? `#${selector}=${specification[selector]}` : "";
+    return `${alias}${bundle}=${specification.git}${suffix}`;
+  }
+  return `${alias}${bundle}=${specification.path}`;
 }
 
 function wireTitlebar() {
@@ -534,7 +554,7 @@ function wireTitlebar() {
   });
   el("dependencies").addEventListener("click", () => {
     const current = Object.entries(state.dependencies).map(([alias, specification]) => printDependency(alias, specification)).join(", ");
-    const entered = window.prompt("Dependencies (alias=folder or alias@bundle=folder, comma-separated)", current);
+    const entered = window.prompt("Dependencies (alias=folder or alias=https://url#branch=name; @bundle aliases, comma-separated)", current);
     if (entered === null) return;
     try {
       state.dependencies = parseDependencies(entered);

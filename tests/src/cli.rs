@@ -1,9 +1,13 @@
 //! Tests for the filesystem-facing CLI compiler API.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use ruddy::artifact::Artifact;
-use ruddy_cli::{Outcome, build_project, compile, new_project, run};
+use ruddy_cli::{Lockfile, Outcome, build_project, compile, new_project, run};
 use tempfile::TempDir;
 
 fn project() -> TempDir {
@@ -118,7 +122,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     .unwrap();
     let old_field_error = error(&directory);
     assert!(
-        old_field_error.contains("did not match any variant"),
+        old_field_error.contains("unknown field `package`"),
         "{old_field_error}"
     );
 
@@ -316,29 +320,217 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ("title = \"app\"\n", "unknown field `title`"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
-            "data did not match",
+            "unknown field `source`",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
-            "data did not match",
+            "unknown field `version`",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
-            "data did not match",
+            "unknown field `version`",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
-            "data did not match",
+            "unknown field `version`",
         ),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
-            "data did not match",
+            "unknown field `version`",
         ),
     ] {
         fs::write(directory.path().join("Ruddy.toml"), manifest).expect("replace the manifest");
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
     }
+}
+
+#[test]
+fn git_dependency_manifest_validation_is_strict_and_contextual() {
+    let directory = project();
+    for (specification, expected) in [
+        ("{ git = \"http://example.test/repo\" }", "must use HTTPS"),
+        ("{ git = \"ssh://example.test/repo\" }", "must use HTTPS"),
+        (
+            "{ path = \"dep\", git = \"https://example.test/repo\" }",
+            "both `path` and `git`",
+        ),
+        ("{ bundle = \"base\" }", "either `path` or `git`"),
+        (
+            "{ path = \"dep\", branch = \"main\" }",
+            "selectors require a `git`",
+        ),
+        (
+            "{ git = \"https://example.test/repo\", branch = \"\" }",
+            "must not be empty",
+        ),
+        (
+            "{ git = \"https://example.test/repo\", branch = \"main\", tag = \"v1\" }",
+            "conflicting",
+        ),
+        (
+            "{ git = \"https://example.test/repo\", unknown = true }",
+            "unknown field `unknown`",
+        ),
+    ] {
+        fs::write(directory.path().join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {specification}\n")).unwrap();
+        let found = error(&directory);
+        assert!(found.contains(expected), "`{expected}` in:\n{found}");
+        if !expected.starts_with("unknown field") {
+            assert!(found.contains("dependency `base`"), "{found}");
+        }
+        assert!(!directory.path().join("Ruddy.lock").exists());
+    }
+}
+
+#[test]
+fn https_fetch_failures_are_contextual_and_do_not_create_a_lockfile() {
+    let directory = project();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
+    let found = error(&directory);
+    assert!(found.contains("dependency `base`"), "{found}");
+    assert!(
+        found.contains("could not fetch or check out Git dependency"),
+        "{found}"
+    );
+    assert!(!directory.path().join("Ruddy.lock").exists());
+}
+
+#[test]
+fn a_locked_cached_git_dependency_builds_offline_and_reuses_its_commit() {
+    let parent = tempfile::tempdir().unwrap();
+    let app = parent.path().join("app");
+    let home = parent.path().join("ruddy-home");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cli::locked_cached_git_dependency_child",
+        ])
+        .env("RUDDY_TEST_GIT_APP", &app)
+        .env("RUDDY_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with a dedicated RUDDY_HOME"]
+fn locked_cached_git_dependency_child() {
+    let app = PathBuf::from(std::env::var_os("RUDDY_TEST_GIT_APP").unwrap());
+    let home = PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap());
+    let url = "https://offline.invalid/base.git";
+    let seed = home.join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let repository = gix::init(&seed).unwrap();
+    let tree = repository
+        .write_object(gix::objs::Tree::empty())
+        .unwrap()
+        .detach();
+    let signature = gix::actor::Signature {
+        name: "Ruddy Tests".into(),
+        email: "test@example.invalid".into(),
+        time: gix::date::Time::default(),
+    };
+    let id = repository
+        .write_object(gix::objs::Commit {
+            tree,
+            parents: Default::default(),
+            author: signature.clone(),
+            committer: signature,
+            encoding: None,
+            message: "fixture".into(),
+            extra_headers: Vec::new(),
+        })
+        .unwrap()
+        .detach();
+    repository
+        .reference(
+            "HEAD",
+            id,
+            gix::refs::transaction::PreviousValue::Any,
+            "test pin",
+        )
+        .unwrap();
+    drop(repository);
+    let commit = id.to_hex().to_string();
+    let key = format!("{url}{:?}", ruddy_cli::GitSelector::Branch("main"));
+    let hash = key.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    let checkout = home
+        .join("git/checkouts")
+        .join(format!("{hash:016x}"))
+        .join(&commit);
+    fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+    fs::rename(seed, &checkout).unwrap();
+    fs::write(
+        checkout.join("Ruddy.toml"),
+        "name = \"base\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(checkout.join("main.hc"), "let value = 2n\n").unwrap();
+    fs::create_dir_all(&app).unwrap();
+    fs::write(app.join("main.hc"), "let main = base::value\n").unwrap();
+    fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
+    let lock =
+        format!("version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {commit:?}\n");
+    fs::write(app.join("Ruddy.lock"), &lock).unwrap();
+    let first = compile(&app).unwrap();
+    let second = compile(&app).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.header.dependencies[0].name, "base");
+    assert_eq!(fs::read_to_string(app.join("Ruddy.lock")).unwrap(), lock);
+}
+
+#[test]
+fn exact_revisions_require_full_commit_ids_before_network_access() {
+    let directory = project();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
+    let found = error(&directory);
+    assert!(found.contains("full 40-digit object ID"), "{found}");
+    assert!(!directory.path().join("Ruddy.lock").exists());
+}
+
+#[test]
+fn malformed_and_unsupported_lockfiles_are_diagnosed_without_replacement() {
+    let directory = project();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    for source in [
+        "not toml =",
+        "version = 2\n",
+        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\ncommit = \"short\"\n",
+        "version = 1\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ntag = \"v1\"\ncommit = \"0000000000000000000000000000000000000000\"\n",
+    ] {
+        fs::write(directory.path().join("Ruddy.lock"), source).unwrap();
+        let found = error(&directory);
+        assert!(found.contains("lockfile"), "{found}");
+        assert_eq!(
+            fs::read_to_string(directory.path().join("Ruddy.lock")).unwrap(),
+            source
+        );
+    }
+}
+
+#[test]
+fn public_lockfile_format_round_trips_deterministically() {
+    let source = "version = 1\n\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ncommit = \"0123456789abcdef0123456789abcdef01234567\"\n";
+    let lock: Lockfile = toml::from_str(source).unwrap();
+    assert_eq!(lock.version, 1);
+    assert_eq!(lock.entries[0].selector.branch.as_deref(), Some("main"));
+    assert_eq!(
+        toml::from_str::<Lockfile>(&toml::to_string_pretty(&lock).unwrap()).unwrap(),
+        lock
+    );
 }
 
 #[test]

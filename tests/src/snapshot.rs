@@ -90,17 +90,27 @@ fn compile_requests_without_dependencies_remain_compatible() {
     assert!(matches!(
         &request.dependencies["http_core"],
         DependencySpec::Detailed(detail)
-            if detail.bundle == "http-core" && detail.path == "../http-core"
+            if detail.bundle.as_deref() == Some("http-core")
+                && detail.path.as_deref() == Some(std::path::Path::new("../http-core"))
+    ));
+
+    let git: CompileRequest = serde_json::from_str(
+        r#"{"files":[],"dependencies":{"http_core":{"bundle":"http-core","git":"https://example.test/http-core","branch":"next"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &git.dependencies["http_core"],
+        DependencySpec::Detailed(detail)
+            if detail.bundle.as_deref() == Some("http-core")
+                && detail.git.as_deref() == Some("https://example.test/http-core")
+                && detail.branch.as_deref() == Some("next")
     ));
 
     let old = serde_json::from_str::<CompileRequest>(
         r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
     )
     .unwrap_err();
-    assert!(
-        old.to_string().contains("did not match any variant"),
-        "{old}"
-    );
+    assert!(old.to_string().contains("unknown field `package`"), "{old}");
 }
 
 #[test]
@@ -204,6 +214,12 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
         dependency
             .fields
             .iter()
+            .any(|field| field.name == "source" && field.value == "path ../base")
+    );
+    assert!(
+        dependency
+            .fields
+            .iter()
             .any(|field| field.name == "imported values" && field.value == "1")
     );
 
@@ -251,8 +267,12 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
     fs::create_dir_all(scratch.path().join("app")).unwrap();
     let detailed = |path: &str| {
         DependencySpec::Detailed(DependencyDetail {
-            bundle: "lib".into(),
-            path: path.into(),
+            bundle: Some("lib".into()),
+            path: Some(path.into()),
+            git: None,
+            branch: None,
+            tag: None,
+            rev: None,
         })
     };
     let dependencies = IndexMap::from([
@@ -350,7 +370,7 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
 }
 
 #[test]
-fn failed_graph_validation_is_not_cached_as_completed() {
+fn failed_graph_validation_is_reported_for_the_dependency_build() {
     let scratch = tempfile::tempdir().unwrap();
     fs::create_dir_all(scratch.path().join("app")).unwrap();
     fs::create_dir_all(scratch.path().join("base")).unwrap();
@@ -370,9 +390,9 @@ fn failed_graph_validation_is_not_cached_as_completed() {
         snapshot
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "dependency-path")
+            .filter(|diagnostic| diagnostic.code == "dependency-build")
             .count(),
-        2
+        1
     );
 }
 
@@ -430,7 +450,7 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
         snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "dependency-path"),
+            .any(|diagnostic| diagnostic.code == "dependency-build"),
         "{:#?}",
         snapshot.diagnostics
     );

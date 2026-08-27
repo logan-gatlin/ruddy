@@ -17,7 +17,10 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     tracking::{FileManager, Span},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+mod git;
+pub use git::{LOCKFILE, LockedGit, LockedSelector, Lockfile, ruddy_home};
 
 const MANIFEST: &str = "Ruddy.toml";
 const ROOT: &str = "main.hc";
@@ -398,33 +401,198 @@ struct Manifest {
     dependencies: IndexMap<String, ManifestDependency>,
 }
 
-#[derive(Debug, Deserialize)]
+pub type ManifestDependency = DependencySpec;
+
+/// A path or HTTPS Git dependency as accepted in `Ruddy.toml` and debugger requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
-enum ManifestDependency {
+pub enum DependencySpec {
     Path(PathBuf),
-    Detailed(ManifestDependencyDetail),
+    Detailed(DependencyDetail),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestDependencyDetail {
-    bundle: String,
-    path: PathBuf,
+pub struct DependencyDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
-impl ManifestDependency {
-    fn bundle<'a>(&'a self, alias: &'a str) -> &'a str {
+#[derive(Debug, Clone, Copy)]
+pub enum GitSelector<'a> {
+    Default,
+    Branch(&'a str),
+    Tag(&'a str),
+    Rev(&'a str),
+}
+
+impl DependencySpec {
+    pub fn bundle<'a>(&'a self, alias: &'a str) -> &'a str {
         match self {
             Self::Path(_) => alias,
-            Self::Detailed(detail) => &detail.bundle,
+            Self::Detailed(detail) => detail.bundle.as_deref().unwrap_or(alias),
         }
     }
-
-    fn path(&self) -> &Path {
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Path(path) => path,
-            Self::Detailed(detail) => &detail.path,
+            Self::Path(path) => Some(path),
+            Self::Detailed(detail) => detail.path.as_deref(),
         }
+    }
+    pub fn git(&self) -> Option<&str> {
+        match self {
+            Self::Path(_) => None,
+            Self::Detailed(detail) => detail.git.as_deref(),
+        }
+    }
+    pub fn selector(&self) -> Result<GitSelector<'_>, CompileError> {
+        let Self::Detailed(detail) = self else {
+            return Ok(GitSelector::Default);
+        };
+        let selectors = [
+            detail.branch.as_deref(),
+            detail.tag.as_deref(),
+            detail.rev.as_deref(),
+        ];
+        if selectors.iter().flatten().count() > 1 {
+            return Err(CompileError::one(
+                "Git dependency has conflicting `branch`, `tag`, and `rev` selectors",
+            ));
+        }
+        for value in selectors.iter().flatten() {
+            if value.is_empty() {
+                return Err(CompileError::one(
+                    "Git dependency selectors must not be empty",
+                ));
+            }
+        }
+        Ok(if let Some(v) = selectors[0] {
+            GitSelector::Branch(v)
+        } else if let Some(v) = selectors[1] {
+            GitSelector::Tag(v)
+        } else if let Some(v) = selectors[2] {
+            GitSelector::Rev(v)
+        } else {
+            GitSelector::Default
+        })
+    }
+    fn validate(&self) -> Result<(), CompileError> {
+        let Self::Detailed(detail) = self else {
+            return Ok(());
+        };
+        match (detail.path.is_some(), detail.git.as_deref()) {
+            (true, Some(_)) => {
+                return Err(CompileError::one(
+                    "dependency cannot specify both `path` and `git`",
+                ));
+            }
+            (false, None) => {
+                return Err(CompileError::one(
+                    "dependency must specify either `path` or `git`",
+                ));
+            }
+            (_, Some(url)) if !url.starts_with("https://") => {
+                return Err(CompileError::one(format!(
+                    "Git dependency URL `{url}` must use HTTPS"
+                )));
+            }
+            _ => {}
+        }
+        if detail.git.is_none()
+            && (detail.branch.is_some() || detail.tag.is_some() || detail.rev.is_some())
+        {
+            return Err(CompileError::one(
+                "dependency selectors require a `git` source",
+            ));
+        }
+        self.selector()?;
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for DependencySpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DependencySpec;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a dependency path string or dependency table")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(DependencySpec::Path(value.into()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(DependencySpec::Path(value.into()))
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut detail = DependencyDetail {
+                    bundle: None,
+                    path: None,
+                    git: None,
+                    branch: None,
+                    tag: None,
+                    rev: None,
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    let slot = match key.as_str() {
+                        "bundle" => &mut detail.bundle,
+                        "git" => &mut detail.git,
+                        "branch" => &mut detail.branch,
+                        "tag" => &mut detail.tag,
+                        "rev" => &mut detail.rev,
+                        "path" => {
+                            if detail.path.is_some() {
+                                return Err(serde::de::Error::duplicate_field("path"));
+                            }
+                            detail.path = Some(PathBuf::from(map.next_value::<String>()?));
+                            continue;
+                        }
+                        _ => {
+                            return Err(serde::de::Error::unknown_field(
+                                &key,
+                                &["bundle", "path", "git", "branch", "tag", "rev"],
+                            ));
+                        }
+                    };
+                    if slot.is_some() {
+                        return Err(serde::de::Error::duplicate_field(match key.as_str() {
+                            "bundle" => "bundle",
+                            "git" => "git",
+                            "branch" => "branch",
+                            "tag" => "tag",
+                            _ => "rev",
+                        }));
+                    }
+                    *slot = Some(map.next_value()?);
+                }
+                Ok(DependencySpec::Detailed(detail))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl From<String> for DependencySpec {
+    fn from(path: String) -> Self {
+        Self::Path(path.into())
+    }
+}
+impl From<&str> for DependencySpec {
+    fn from(path: &str) -> Self {
+        Self::Path(path.into())
     }
 }
 
@@ -445,7 +613,8 @@ pub struct CompiledGraph {
 }
 
 /// Compile the project in `directory` recursively and return only its artifact.
-/// This operation is side-effect free; use [`build_project`] to write artifacts.
+/// Git dependencies may populate the Ruddy cache and a successful resolution may
+/// atomically update the root `Ruddy.lock`; no build artifacts are written.
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
     compile_graph(directory)?
         .projects
@@ -457,8 +626,15 @@ pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
 /// Compile every unique project reachable from `directory`, dependencies first.
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
     let root = canonical_project(directory.as_ref())?;
-    let mut compiler = GraphCompiler::default();
+    let resolver = git::Resolver::new(&root)?;
+    let mut compiler = GraphCompiler {
+        resolver: Some(resolver),
+        ..GraphCompiler::default()
+    };
     compiler.visit(root, None)?;
+    if let Some(resolver) = &compiler.resolver {
+        resolver.write_if_changed()?;
+    }
     Ok(CompiledGraph {
         projects: compiler.projects,
     })
@@ -502,6 +678,90 @@ where
         (name.clone(), name, path.as_ref().to_path_buf())
     });
     compile_sandboxed_aliased_dependency_graph(roots, sandbox)
+}
+
+/// Resolve path and Git dependency specifications for a debugger project.
+/// Local paths remain confined to `sandbox`; fetched Git trees are confined to
+/// their immutable cache checkout. The project's `Ruddy.lock` is updated only
+/// after the complete dependency graph compiles.
+pub fn compile_sandboxed_dependency_specs<I, A>(
+    dependencies: I,
+    project: impl AsRef<Path>,
+    sandbox: impl AsRef<Path>,
+) -> Result<(CompiledGraph, Vec<Dependency>, Vec<PathBuf>), CompileError>
+where
+    I: IntoIterator<Item = (A, DependencySpec)>,
+    A: Into<String>,
+{
+    let sandbox = fs::canonicalize(sandbox.as_ref()).map_err(|error| {
+        CompileError::one(format!(
+            "could not resolve sandbox folder {}: {error}",
+            sandbox.as_ref().display()
+        ))
+    })?;
+    let project = canonical_project_in(project.as_ref(), Some(&sandbox))?;
+    let resolver = git::Resolver::new(&project)?;
+    let mut compiler = GraphCompiler {
+        sandbox: Some(sandbox),
+        resolver: Some(resolver),
+        ..GraphCompiler::default()
+    };
+    let mut direct = Vec::new();
+    let mut paths = Vec::new();
+    for (alias, specification) in dependencies {
+        let alias = alias.into();
+        specification.validate()?;
+        if !source_identifier(&alias) {
+            return Err(CompileError::one(format!(
+                "dependency alias `{alias}` is not a valid Ruddy source identifier"
+            )));
+        }
+        let expected = specification.bundle(&alias).to_string();
+        let directory = if let Some(path) = specification.path() {
+            canonical_project_in(&project.join(path), compiler.sandbox.as_deref())?
+        } else {
+            let path = compiler
+                .resolver
+                .as_mut()
+                .expect("resolver")
+                .resolve(&specification)?;
+            let path = canonical_project(&path)?;
+            compiler.git_roots.push(path.clone());
+            path
+        };
+        let manifest = load_manifest(
+            &directory,
+            compiler
+                .git_roots
+                .iter()
+                .find(|root| directory.starts_with(root))
+                .map(PathBuf::as_path)
+                .or(compiler.sandbox.as_deref()),
+        )?;
+        if manifest.name != expected {
+            return Err(CompileError::one(format!(
+                "dependency key `{expected}` resolves to project `{}` instead",
+                manifest.name
+            )));
+        }
+        let index = compiler.visit(directory.clone(), Some((expected, PathBuf::new())))?;
+        let artifact = &compiler.projects[index].artifact;
+        direct.push(Dependency {
+            name: artifact.header.identity.name.clone(),
+            version: artifact.header.identity.version.clone(),
+        });
+        paths.push(directory);
+    }
+    if let Some(resolver) = &compiler.resolver {
+        resolver.write_if_changed()?;
+    }
+    Ok((
+        CompiledGraph {
+            projects: compiler.projects,
+        },
+        direct,
+        paths,
+    ))
 }
 
 /// Compile dependency roots whose source aliases differ from bundle names.
@@ -573,6 +833,8 @@ where
 #[derive(Default)]
 struct GraphCompiler {
     sandbox: Option<PathBuf>,
+    resolver: Option<git::Resolver>,
+    git_roots: Vec<PathBuf>,
     completed: HashMap<PathBuf, usize>,
     identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
@@ -602,7 +864,13 @@ impl GraphCompiler {
             )));
         }
 
-        let manifest = load_manifest(&directory, self.sandbox.as_deref())?;
+        let boundary = self
+            .git_roots
+            .iter()
+            .find(|root| directory.starts_with(root))
+            .cloned()
+            .or_else(|| self.sandbox.clone());
+        let manifest = load_manifest(&directory, boundary.as_deref())?;
         let identity = configured_identity(&manifest.name, &manifest.version)?;
         let identity_key = (manifest.name.clone(), manifest.version.clone());
         if let Some(previous) = self.identities.get(&identity_key)
@@ -625,20 +893,56 @@ impl GraphCompiler {
 
         let mut dependency_artifacts = Vec::with_capacity(manifest.dependencies.len());
         for (alias, specification) in &manifest.dependencies {
-            let expected = specification.bundle(alias);
-            let declared = specification.path();
+            let expected = specification.bundle(alias).to_string();
+            if let Err(error) = specification.validate() {
+                self.active.pop();
+                return Err(dependency_error(
+                    &expected,
+                    Path::new("<source>"),
+                    &directory,
+                    error,
+                ));
+            }
             if !source_identifier(alias) {
                 self.active.pop();
                 return Err(CompileError::one(format!(
                     "dependency alias `{alias}` is not a valid Ruddy source identifier"
                 )));
             }
-            let joined = directory.join(declared);
-            let child = canonical_project_in(&joined, self.sandbox.as_deref())
-                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
-            let child_manifest = load_manifest(&child, self.sandbox.as_deref())
-                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
-            if child_manifest.name != *expected {
+            let declared = specification
+                .path()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(specification.git().unwrap_or("<source>")));
+            let child = if let Some(path) = specification.path() {
+                canonical_project_in(&directory.join(path), boundary.as_deref())
+            } else {
+                self.resolver
+                    .as_mut()
+                    .ok_or_else(|| {
+                        CompileError::one(
+                            "Git dependencies are unavailable in this compilation mode",
+                        )
+                    })
+                    .and_then(|resolver| resolver.resolve(specification))
+                    .and_then(|path| canonical_project(&path))
+                    .inspect(|child| {
+                        if !self.git_roots.contains(child) {
+                            self.git_roots.push(child.clone());
+                        }
+                    })
+            }
+            .map_err(|error: CompileError| {
+                dependency_error(&expected, &declared, &directory, error)
+            })?;
+            let child_boundary = self
+                .git_roots
+                .iter()
+                .find(|root| child.starts_with(root))
+                .map(PathBuf::as_path)
+                .or(self.sandbox.as_deref());
+            let child_manifest = load_manifest(&child, child_boundary)
+                .map_err(|error| dependency_error(&expected, &declared, &directory, error))?;
+            if child_manifest.name != expected {
                 self.active.pop();
                 return Err(CompileError::one(format!(
                     "dependency `{expected}` declared as `{}` by {} contains project `{}` instead",
@@ -648,8 +952,8 @@ impl GraphCompiler {
                 )));
             }
             let index = self
-                .visit(child, Some((expected.to_string(), declared.to_path_buf())))
-                .map_err(|error| dependency_error(expected, declared, &directory, error))?;
+                .visit(child, Some((expected.clone(), declared.clone())))
+                .map_err(|error| dependency_error(&expected, &declared, &directory, error))?;
             let child_artifact = &self.projects[index].artifact;
             dependency_artifacts.push((alias.clone(), child_artifact.clone()));
         }
@@ -665,7 +969,7 @@ impl GraphCompiler {
             identity,
             dependency_artifacts,
             linked_artifacts,
-            self.sandbox.as_deref(),
+            boundary.as_deref(),
         )?;
         self.active.pop();
         let index = self.projects.len();

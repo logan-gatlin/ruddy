@@ -9,7 +9,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Once,
@@ -182,37 +182,17 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
                         PathBuf::from("invalid-document")
                     }
                 };
-                let mut active = HashSet::new();
-                let mut completed = HashSet::new();
-                let mut resolved = Vec::new();
-                for (alias, specification) in &req.dependencies {
-                    let bundle = specification.bundle(alias);
-                    let declared = specification.path();
-                    let declared_path = Path::new(declared);
-                    match crate::docs::dependency_path(scratch, &project, declared_path).and_then(
-                        |path| {
-                            validate_sandbox_graph(scratch, &path, &mut active, &mut completed)
-                                .map(|()| path)
-                        },
-                    ) {
-                        Ok(path) => resolved.push((alias.clone(), bundle.to_string(), path)),
-                        Err(error) => diagnostics.push(raw(
-                            "dependencies",
-                            "dependency-path",
-                            format!("dependency `{alias}` at `{declared}`: {error}"),
-                            None,
-                        )),
-                    }
-                }
-                let direct_paths: Vec<_> = resolved
+                let specifications = req
+                    .dependencies
                     .iter()
-                    .map(|(_, _, path)| {
-                        std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())
-                    })
-                    .collect();
-                dependency_aliases = resolved.iter().map(|(alias, _, _)| alias.clone()).collect();
-                match ruddy_cli::compile_sandboxed_aliased_dependency_graph(resolved, scratch) {
-                    Ok((graph, direct)) => {
+                    .map(|(alias, specification)| (alias.clone(), specification.clone()));
+                match ruddy_cli::compile_sandboxed_dependency_specs(
+                    specifications,
+                    &project,
+                    scratch,
+                ) {
+                    Ok((graph, direct, direct_paths)) => {
+                        dependency_aliases = req.dependencies.keys().cloned().collect();
                         linked_interfaces = graph
                             .projects
                             .iter()
@@ -603,59 +583,6 @@ fn inference_diagnostic(error: &inference::Error, files: &HashMap<FileID, u32>) 
         });
     }
     diagnostic
-}
-
-#[derive(serde::Deserialize)]
-struct DependencyManifest {
-    #[serde(default)]
-    dependencies: indexmap::IndexMap<String, crate::wire::DependencySpec>,
-}
-
-fn validate_sandbox_graph(
-    scratch: &Path,
-    project: &Path,
-    active: &mut HashSet<PathBuf>,
-    completed: &mut HashSet<PathBuf>,
-) -> std::io::Result<()> {
-    let project = std::fs::canonicalize(project)?;
-    if completed.contains(&project) || !active.insert(project.clone()) {
-        return Ok(());
-    }
-    let result = (|| {
-        let configured_manifest = project.join(crate::docs::MANIFEST);
-        let manifest_path = std::fs::canonicalize(&configured_manifest)?;
-        let canonical_scratch = std::fs::canonicalize(scratch)?;
-        if !manifest_path.starts_with(&canonical_scratch) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "manifest {} escapes debug/scratch",
-                    configured_manifest.display()
-                ),
-            ));
-        }
-        let source = std::fs::read_to_string(&manifest_path)?;
-        let manifest: DependencyManifest = toml::from_str(&source).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "could not parse manifest {}: {error}",
-                    manifest_path.display()
-                ),
-            )
-        })?;
-        for specification in manifest.dependencies.values() {
-            let child =
-                crate::docs::dependency_path(scratch, &project, Path::new(specification.path()))?;
-            validate_sandbox_graph(scratch, &child, active, completed)?;
-        }
-        Ok(())
-    })();
-    active.remove(&project);
-    if result.is_ok() {
-        completed.insert(project);
-    }
-    result
 }
 
 fn raw(stage: &'static str, code: &'static str, message: String, span: Option<Loc>) -> Diagnostic {
