@@ -285,6 +285,9 @@ fn bare_identifier(name: &str) -> bool {
             "_" | "let"
                 | "extern"
                 | "in"
+                | "if"
+                | "then"
+                | "else"
                 | "type"
                 | "end"
                 | "with"
@@ -364,6 +367,9 @@ impl fmt::Display for Kind {
             Kind::End => f.write_str("end"),
             Kind::With => f.write_str("with"),
             Kind::Match => f.write_str("match"),
+            Kind::If => f.write_str("if"),
+            Kind::Then => f.write_str("then"),
+            Kind::Else => f.write_str("else"),
             Kind::Fn => f.write_str("fn"),
             Kind::Effect => f.write_str("effect"),
             Kind::Handle => f.write_str("handle"),
@@ -699,10 +705,11 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateOperation => "duplicate-operation",
             ir::ErrorKind::NotAnOperation { .. } => "not-an-operation",
             ir::ErrorKind::ImpureOperation => "impure-operation",
-            ir::ErrorKind::MixedEffectForm => "mixed-effect-form",
             ir::ErrorKind::EffectsOutsideRow => "effects-outside-row",
             ir::ErrorKind::OperationOnAlias { .. } => "operation-on-alias",
             ir::ErrorKind::UnknownOperation { .. } => "unknown-operation",
+            ir::ErrorKind::BareOperationUnavailable { .. } => "bare-operation-unavailable",
+            ir::ErrorKind::NamedOperationOnUnnamed { .. } => "named-operation-on-unnamed",
             ir::ErrorKind::PartialHandler { .. } => "partial-handler",
             ir::ErrorKind::DuplicateArm { .. } => "duplicate-arm",
             ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
@@ -884,9 +891,6 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::ImpureOperation => f.write_str(
                 "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
             ),
-            ir::ErrorKind::MixedEffectForm => f.write_str(
-                "an effect either declares operations or names other effects, not both",
-            ),
             // Said as where effects do go, since the reader has written
             // something that means one thing and put it where nothing means
             // it: what is missing is an arrow to carry them.
@@ -903,6 +907,19 @@ impl fmt::Display for ir::ErrorKind {
                 "no operation `{op}` on effect `{}`",
                 label(Shape::Effect, effect),
             ),
+            ir::ErrorKind::BareOperationUnavailable { effect, suggestion } => match suggestion {
+                Some(op) => write!(
+                    f,
+                    "effect `{}` has only named operations; write `!{effect}.{op}`",
+                    label(Shape::Effect, effect),
+                ),
+                None => write!(f, "empty effect `{}` has no operation", label(Shape::Effect, effect)),
+            },
+            ir::ErrorKind::NamedOperationOnUnnamed { effect, op } => write!(
+                f,
+                "effect `{}` has one unnamed operation; write `!{effect}` instead of `!{effect}.{op}`",
+                label(Shape::Effect, effect),
+            ),
             // Named rather than counted: the reader has to write an arm for
             // each of them, and the list is the whole of what they have to do.
             ir::ErrorKind::PartialHandler { effect, missing } => write!(
@@ -911,9 +928,9 @@ impl fmt::Display for ir::ErrorKind {
                 label(Shape::Effect, effect),
                 listed(missing),
             ),
-            ir::ErrorKind::DuplicateArm { effect, op } => write!(
+            ir::ErrorKind::DuplicateArm { effect, selector } => write!(
                 f,
-                "duplicate arm for `{}.{op}`",
+                "duplicate arm for `{}{selector}`",
                 label(Shape::Effect, effect),
             ),
             ir::ErrorKind::DuplicateReturn { .. } => f.write_str("duplicate return arm"),
@@ -1760,7 +1777,7 @@ impl Named<'_> {
         self.labels
             .iter()
             .find(|(_, decides)| *decides == presence)
-            .map(|(label, _)| label.split('\u{1f}').next().unwrap_or(label).to_string())
+            .map(|(label, _)| label.to_string())
             .unwrap_or_else(|| atom.to_string())
     }
 }

@@ -37,6 +37,25 @@ fn printed(source: &str) -> (String, String) {
     (ast, print::ir::program(&built.program, &mint).to_string())
 }
 
+/// The surface printer keeps conditionals recognizable while the IR printer
+/// honestly shows the ordinary Boolean match they become. A chain remains a
+/// single-final-`end` chain in the surface tree and nests in the false branch
+/// after lowering.
+#[test]
+fn an_if_prints_as_surface_syntax_and_ir_match() {
+    let (ast, ir) = printed("let choose = if true then 1n else 2n end");
+    assert_eq!(ast, "let choose = if true then 1n else 2n end");
+    assert_eq!(
+        ir,
+        "let choose = match true with | true => 1n | false => 2n end"
+    );
+
+    let source = "let choose = if p then 1n else if q then 2n else 3n end";
+    let ast = ast_of(source);
+    assert_eq!(ast, source);
+    assert_eq!(ast_of(&ast), ast, "conditional printing is a fixed point");
+}
+
 /// Rendering `{ name: value }` is one rule, in `print`, that both printers
 /// read. It used to be a copy each, so the AST tab and the IR tab could come to
 /// disagree about the same braces without anything noticing.
@@ -542,7 +561,7 @@ fn a_scheme_prints_the_clause_it_requires() {
 /// arrow on re-reading; the round trip is what says so.
 #[test]
 fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
-    let effects = "effect Log = | write : Nat -> {}\n";
+    let effects = "effect Log = { write: Nat -> {} }\n";
     for body in [
         // A row, and a result that is not an arrow: no parentheses.
         "Nat -> Nat + !Log",
@@ -571,7 +590,7 @@ fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
 /// bare either way.
 #[test]
 fn a_printed_effect_row_re_lowers_to_itself() {
-    let effects = "effect Log = write : Nat -> ()\neffect IO = print : Nat -> ()\n";
+    let effects = "effect Log = { write: Nat -> () }\neffect IO = { print: Nat -> () }\n";
     // A scheme's quantified tail prints `..'a`, which is a letter the writer
     // did not choose and no re-lowering could recover — the rule every other
     // quantified variable already keeps. So what is re-lowered is the concrete
@@ -618,8 +637,8 @@ fn a_printed_effect_row_re_lowers_to_itself() {
 /// re-lowers.
 #[test]
 fn an_alias_prints_as_the_effects_it_names() {
-    let source = "effect Log = write : Nat -> ()\n\
-                  effect IO = print : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect IO = { print: Nat -> () }\n\
                   effect Console = !Log + !IO\n\
                   let f : Nat -> Nat + !Console = fn x => x";
     let (written, scheme) = types_of(source);
@@ -634,14 +653,18 @@ fn an_alias_prints_as_the_effects_it_names() {
 #[test]
 fn both_trees_render_the_effect_forms() {
     for source in [
-        "effect Log = | write : Nat -> {}",
-        "effect Log = | write : Nat -> {} | flush : {} -> {}",
+        "effect Log = Nat -> {}",
+        "effect Log = { value: Nat } -> {}",
+        "effect Apply = (Nat -> Nat) -> {}",
+        "effect Apply = { run: (Nat -> Nat) -> {} }",
+        "effect Log = { write: Nat -> {} }",
+        "effect Log = { write: Nat -> {}, flush: {} -> {} }",
         "effect Nil",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
-        "effect Log = | write : Nat -> {}\n\
+        "effect Log = { write: Nat -> {} }\n\
          let f : Nat -> Nat + \\!Log + ..'e = fn x => x",
-        "effect Log = | write : Nat -> {}\n\
+        "effect Log = { write: Nat -> {} }\n\
          let f : Nat -> Nat + !Log (when 'a) + ..'e = fn x => x",
     ] {
         let (ast, ir) = printed(source);
@@ -649,7 +672,7 @@ fn both_trees_render_the_effect_forms() {
         assert_eq!(ir, source, "{source}");
     }
 
-    let source = "effect Log = | write : Nat -> {}\n\
+    let source = "effect Log = { write: Nat -> {} }\n\
                   let h = fn n => handle !Log.write n with | !Log.write s => {} | return x => x end";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);

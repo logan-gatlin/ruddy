@@ -83,6 +83,24 @@ fn witness_of(checks: &patterns::Output) -> String {
         .expect("an unhandled-values complaint carries the witness")
 }
 
+/// Lowering supplies both Boolean cases for every conditional, so the normal
+/// pattern checker sees an exhaustive match and has no conditional-specific
+/// exception to make. Else-if produces one exhaustive report per condition.
+#[test]
+fn desugared_conditionals_are_exhaustive_boolean_matches() {
+    let checks = clean("let choose = if true then 1n else 2n end");
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+    let checks = clean("let choose = if true then 1n else if false then 2n else 3n end");
+    assert_eq!(checks.reports.len(), 2, "{:#?}", checks.reports);
+    for report in &checks.reports {
+        assert!(matches!(report.coverage, Coverage::Exhaustive));
+        assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+    }
+}
+
 /// The motivating program: exact arms over every presence combination of two
 /// fields. Exhaustive, every arm reachable, and — the other half being
 /// inference's — no complaint from anywhere.

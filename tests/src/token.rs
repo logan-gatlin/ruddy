@@ -572,6 +572,32 @@ fn the_module_keyword_is_reserved() {
     assert!(matches!(&kinds("modules")[..], [Kind::Identifier(name)] if name == "modules"));
 }
 
+/// Conditionals spend three exact words. The lexer reads a complete word
+/// before deciding whether it is reserved, so names which merely contain one
+/// of them remain available.
+#[test]
+fn conditional_keywords_are_reserved_as_exact_words() {
+    assert!(matches!(
+        kinds("if p then a else b end")[..],
+        [
+            Kind::If,
+            Kind::Identifier(_),
+            Kind::Then,
+            Kind::Identifier(_),
+            Kind::Else,
+            Kind::Identifier(_),
+            Kind::End,
+        ]
+    ));
+
+    for name in ["iffy", "s_if", "thenable", "athen", "elsewhere", "orelse"] {
+        assert!(
+            matches!(&kinds(name)[..], [Kind::Identifier(found)] if found == name),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn extern_is_reserved_as_a_declaration_keyword() {
     assert!(

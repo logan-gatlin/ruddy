@@ -159,7 +159,14 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "here".to_string(),
         },
         IrError::ImpureOperation,
-        IrError::MixedEffectForm,
+        IrError::BareOperationUnavailable {
+            effect: "Log".to_string(),
+            suggestion: Some("write".to_string()),
+        },
+        IrError::NamedOperationOnUnnamed {
+            effect: "Log".to_string(),
+            op: "write".to_string(),
+        },
         IrError::OperationOnAlias {
             effect: "Console".to_string(),
         },
@@ -173,7 +180,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateArm {
             effect: "Log".to_string(),
-            op: "write".to_string(),
+            selector: ir::OperationSelector::Named("write".to_string()),
         },
         IrError::DuplicateReturn { previous: span },
         IrError::RaiseOutsideArm,
@@ -977,6 +984,9 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         TokenKind::Let,
         TokenKind::Extern,
         TokenKind::In,
+        TokenKind::If,
+        TokenKind::Then,
+        TokenKind::Else,
         TokenKind::Type,
         TokenKind::End,
         TokenKind::With,
@@ -2672,6 +2682,16 @@ fn a_formula_can_be_quoted_in_its_labels() {
         ),
         "x != y"
     );
+    assert_eq!(
+        ui::in_labels(
+            &formula,
+            &[
+                ("left\u{1f}right".to_string(), Presence::Var(0)),
+                ("other".to_string(), Presence::Var(1)),
+            ]
+        ),
+        "left\u{1f}right != other"
+    );
     // A presence no label decides falls back to the presence itself.
     assert_eq!(
         ui::in_labels(&formula, &[("x".to_string(), Presence::Var(0))]),
@@ -2698,10 +2718,6 @@ fn the_effect_complaints_are_read_in_effects() {
             "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
         ),
         (
-            IrError::MixedEffectForm,
-            "an effect either declares operations or names other effects, not both",
-        ),
-        (
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
@@ -2724,9 +2740,16 @@ fn the_effect_complaints_are_read_in_effects() {
         (
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
-                op: "write".to_string(),
+                selector: ir::OperationSelector::Named("write".to_string()),
             },
             "duplicate arm for `!Log.write`",
+        ),
+        (
+            IrError::DuplicateArm {
+                effect: "Log".to_string(),
+                selector: ir::OperationSelector::Unnamed,
+            },
+            "duplicate arm for `!Log`",
         ),
         (
             IrError::DuplicateReturn {
@@ -2752,6 +2775,15 @@ fn the_effect_complaints_are_read_in_effects() {
     ] {
         assert_eq!(kind.to_string(), message, "{}", kind.code());
     }
+
+    assert_eq!(
+        IrError::BareOperationUnavailable {
+            effect: "Nil".to_string(),
+            suggestion: None,
+        }
+        .to_string(),
+        "empty effect `!Nil` has no operation"
+    );
 
     for (kind, message) in [
         (

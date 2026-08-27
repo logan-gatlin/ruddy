@@ -821,7 +821,7 @@ fn quoted_sum_labels_and_separator_fields_reach_the_debugger_tabs() {
 fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
     let nodes = tab(
         "lir",
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end\n",
@@ -1018,6 +1018,23 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         artifact_stage.summary
     );
 
+    let source = "effect Log = Nat -> ()\n\
+                  let main = fn n => handle !Log n with | !Log value => () end\n";
+    let unnamed = stage("artifact", source);
+    let effect = unnamed.nodes[0]
+        .children
+        .iter()
+        .find(|node| node.label == "effect")
+        .expect("artifact outline includes the effect");
+    assert_eq!(effect.children[0].label, "selector");
+    assert_eq!(effect.children[0].text, "unnamed");
+    let text = unnamed.text.as_deref().expect("canonical artifact text");
+    assert!(text.contains("(field-key unnamed-operation)"), "{text}");
+    assert!(!text.contains("ruddy:unnamed-operation"), "{text}");
+    assert!(!unnamed.debug.contains("ruddy:unnamed-operation"));
+    let lowered = stage("lir", source);
+    assert!(!lowered.debug.contains("ruddy:unnamed-operation"));
+
     let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);
     // The reader can select either artifact rendering before a bad edit; both
@@ -1104,6 +1121,78 @@ fn the_tokens_tab_groups_its_rows_by_file() {
     // And the summary counts both: the tokens are what the tab renders, and the
     // files are what it renders them under.
     assert_eq!(stage.summary, "22 tokens · 3 files");
+}
+
+#[test]
+fn conditionals_are_coherent_across_the_surface_debugger_tabs() {
+    let source = "let choice = if true then 1n else if false then 2n else 3n end\n";
+    let snapshot = bundle(&[(ROOT, source)]);
+
+    let tokens = named(bundle(&[(ROOT, source)]), "tokens");
+    let keywords: Vec<(&str, &str)> = tokens.nodes[0]
+        .children
+        .iter()
+        .filter(|token| matches!(token.text.as_str(), "if" | "then" | "else"))
+        .map(|token| {
+            let class = token
+                .fields
+                .iter()
+                .find(|field| field.name == "_class")
+                .expect("every token has an editor class");
+            (token.label.as_str(), class.value.as_str())
+        })
+        .collect();
+    assert_eq!(
+        keywords,
+        [
+            ("If", "keyword"),
+            ("Then", "keyword"),
+            ("Else", "keyword"),
+            ("If", "keyword"),
+            ("Then", "keyword"),
+            ("Else", "keyword"),
+        ]
+    );
+
+    let ast = named(snapshot, "ast");
+    let if_node = flatten(&ast.nodes)
+        .into_iter()
+        .find(|node| node.label == "If")
+        .expect("the surface conditional has its own AST row");
+    assert_eq!(
+        if_node.text,
+        "if true then 1n else if false then 2n else 3n end"
+    );
+    assert_eq!(
+        if_node
+            .children
+            .iter()
+            .map(|child| child.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Predicate", "Then", "Else"]
+    );
+    assert_eq!(if_node.children[0].text, "true");
+    assert_eq!(if_node.children[0].span, at([16, 20]));
+    assert_eq!(if_node.children[1].text, "1n");
+    assert_eq!(if_node.children[1].span, at([26, 28]));
+    assert_eq!(if_node.children[2].text, "if false then 2n else 3n end");
+    assert_eq!(if_node.children[2].span, at([34, 62]));
+    assert!(
+        flatten(&if_node.children[2].children)
+            .iter()
+            .any(|node| node.label == "If"),
+        "the flattened spelling still preserves the nested surface node"
+    );
+
+    let ir = named(bundle(&[(ROOT, source)]), "ir");
+    assert_eq!(
+        flatten(&ir.nodes)
+            .into_iter()
+            .filter(|node| node.label == "Match")
+            .count(),
+        2,
+        "each surface conditional lowers through the existing Match row"
+    );
 }
 
 /// The AST tab is one row per file holding the statements written in *that*

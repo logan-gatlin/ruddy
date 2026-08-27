@@ -85,6 +85,32 @@ fn boolean_operators_accept_only_booleans() {
 }
 
 #[test]
+fn conditionals_require_a_boolean_and_unify_their_branches() {
+    let (mint, _, output) = inferred(
+        "let n = if true then 1n else 2n end\n\
+         let id = fn p => if p then p else false end",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+    assert_eq!(scheme(&mint, &output, "id"), "Boolean -> Boolean");
+
+    let (_, _, output) = infer_src("let bad = if 1n then 2n else 3n end");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Boolean`, found `Nat`"
+    );
+
+    let (_, _, output) = infer_src("let bad = if true then 1n else false end");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    let message = output.errors[0].kind.to_string();
+    assert!(message.contains("type mismatch"), "{message}");
+    assert!(
+        message.contains("Nat") && message.contains("Boolean"),
+        "{message}"
+    );
+}
+
+#[test]
 fn every_primitive_is_a_distinct_type() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\
@@ -6081,8 +6107,8 @@ fn infer_codes(src: &str) -> Vec<&'static str> {
 }
 
 /// The three effect declarations every example in the spec is written against.
-const EFFECTS: &str = "effect Log = write : Nat -> ()\n\
-                       effect IO = print : Nat -> ()\n";
+const EFFECTS: &str = "effect Log = { write: Nat -> () }\n\
+                       effect IO = { print: Nat -> () }\n";
 
 /// R23's closing rule, over the four schemes the spec names. An effect row
 /// variable the solver learned nothing about sits on one arrow and no other, so
@@ -6143,8 +6169,8 @@ fn a_handler_discharges_what_its_arms_cover() {
 /// discharges it.
 #[test]
 fn same_interface_effects_are_interchangeable_across_modules() {
-    let src = "module Foo =\n  effect Log = write : Nat -> ()\nend\n\
-               module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+    let src = "module Foo =\n  effect Log = { write: Nat -> () }\nend\n\
+               module Bar =\n  effect Log = { write: Nat -> () }\nend\n\
                let foo : Nat -> {} + Foo::!Log = fn n => let _ = Foo::!Log.write n in {}\n\
                let bar : Nat -> {} + Bar::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
                let cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
@@ -6163,7 +6189,7 @@ fn same_interface_effects_are_interchangeable_across_modules() {
 #[test]
 fn an_arm_resumes_and_raise_aborts() {
     let (mint, _, output) = inferred(
-        "effect Fail = oops : () -> Nat\n\
+        "effect Fail = { oops: () -> Nat }\n\
          let fallback : () -> Nat = fn _ =>\n\
            handle !Fail.oops () with | !Fail.oops _ => 0n end\n\
          let recover : () -> Nat = fn _ =>\n\

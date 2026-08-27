@@ -158,8 +158,8 @@ fn file_modules_share_structural_effects() {
             "main.hc",
             "module Foo\nmodule Bar\nlet cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n",
         ),
-        ("Foo.hc", "effect Log = write : Nat -> ()\n"),
-        ("Bar.hc", "effect Log = write : Nat -> ()\n"),
+        ("Foo.hc", "effect Log = { write: Nat -> () }\n"),
+        ("Bar.hc", "effect Log = { write: Nat -> () }\n"),
     ])
     .1;
     assert!(out.errors.is_empty(), "{:#?}", out.errors);

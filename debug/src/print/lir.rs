@@ -17,7 +17,9 @@ use std::{collections::HashSet, fmt::Write};
 
 use ruddy::{
     ir::{Literal, Program},
-    lir::{Block, Callee, End, Extern, Function, Global, Instr, Op, Output, Rep, Terminator},
+    lir::{
+        Block, Callee, End, Extern, FieldKey, Function, Global, Instr, Op, Output, Rep, Terminator,
+    },
     types::{EffectId, Shape},
 };
 
@@ -46,10 +48,17 @@ impl Labels {
         Self { effects }
     }
 
-    fn field<'a>(&self, name: &'a str, generated: bool) -> &'a str {
+    fn named<'a>(&self, name: &'a str, generated: bool) -> &'a str {
         match generated && self.effects.contains(name) {
             true => name.split_once('\u{1f}').map_or(name, |(name, _)| name),
             false => name,
+        }
+    }
+
+    fn field<'a>(&self, field: &'a FieldKey, generated: bool) -> &'a str {
+        match field {
+            FieldKey::Named(name) => self.named(name, generated),
+            FieldKey::UnnamedOperation => "<unnamed>",
         }
     }
 }
@@ -302,11 +311,14 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
         Op::Struct(fields) => {
             let entries: Vec<String> = fields
                 .iter()
-                .map(|(name, temp)| {
-                    format!(
-                        "{}: %{temp}",
-                        crate::print::label(Shape::Struct, labels.field(name, generated))
-                    )
+                .map(|(field, temp)| {
+                    let name = match field {
+                        FieldKey::Named(_) => {
+                            crate::print::label(Shape::Struct, labels.field(field, generated))
+                        }
+                        FieldKey::UnnamedOperation => "<unnamed>".to_string(),
+                    };
+                    format!("{name}: %{temp}")
                 })
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
@@ -352,13 +364,13 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
         Op::SwitchPresence { on, field, .. } => {
             format!(
                 "switch_presence %{on}, {:?}:",
-                labels.field(field, generated)
+                labels.named(field, generated)
             )
         }
         Op::SwitchRest { on, fields, .. } => {
             let names: Vec<String> = fields
                 .iter()
-                .map(|name| format!("{:?}", labels.field(name, generated)))
+                .map(|name| format!("{:?}", labels.named(name, generated)))
                 .collect();
             format!("switch_rest %{on}, [{}]:", names.join(", "))
         }

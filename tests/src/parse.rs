@@ -600,8 +600,8 @@ fn arrows_are_right_associative() {
 fn quoted_field_labels_parse_everywhere_and_print_canonically() {
     for (src, printed) in [
         (
-            r###"let v = {"field name": x, "plain": y, "let": z}"###,
-            r###"let v = { "field name": x, plain: y, "let": z }"###,
+            r###"let v = {"field name": x, "plain": y, "let": z, "if": a, "then": b, "else": c}"###,
+            r###"let v = { "field name": x, plain: y, "let": z, "if": a, "then": b, "else": c }"###,
         ),
         (
             r###"let v = record."field name"."plain""###,
@@ -1067,7 +1067,7 @@ fn a_sum_and_a_struct_nest_without_help() {
 fn every_position_that_can_fail_reports_before_it_does() {
     // An effect's `=` commits to a case list, but keeps the empty declaration
     // for lowering after reporting a token that cannot begin a case.
-    let out = parse(lex("effect E = 1n", FileID::GENERATED).tokens);
+    let out = parse(lex("effect E = {}", FileID::GENERATED).tokens);
     assert!(!out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "{:#?}", out.stmts);
 
@@ -1314,6 +1314,97 @@ fn a_let_expression_reports_where_it_fails() {
     let out = parse(lex("let a = let x = 1n  let b = 2n", FileID::GENERATED).tokens);
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
+}
+
+/// A conditional is a self-delimiting expression whose three positions each
+/// accept a full expression. Its printer preserves the surface construct
+/// rather than exposing the match used by lowering.
+#[test]
+fn parses_if_expressions_and_full_branches() {
+    for src in [
+        "let a = if true then 1n else 2n end",
+        "let a = if not false and true then f 1n else let x = 2n in x end",
+        "let a = if p then fn x => x else fn y => y end",
+        "let a = { value: if p then a else b end }",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// An ungrouped `else if` is one chain and spends one final `end`. The nested
+/// node is the outer alternative, so a longer chain associates to the right.
+/// A grouped conditional with its own `end` remains accepted as the explicit
+/// nested spelling and canonicalizes to the chain.
+#[test]
+fn else_if_chains_share_the_final_end() {
+    assert_eq!(
+        parse_one("let a = if p then x else if q then y else z end"),
+        "let a = if p then x else if q then y else z end"
+    );
+    assert_eq!(
+        parse_one("let a = if p then w else if q then x else if r then y else z end"),
+        "let a = if p then w else if q then x else if r then y else z end"
+    );
+    assert_eq!(
+        parse_one("let a = if p then x else (if q then y else z end) end"),
+        "let a = if p then x else if q then y else z end"
+    );
+    // A conditional in the consequent is independent and therefore closes
+    // before the outer `else`.
+    assert_eq!(
+        parse_one("let a = if p then if q then x else y end else z end"),
+        "let a = if p then if q then x else y end else z end"
+    );
+}
+
+/// Like `match`, an if-expression can head application and projection, but an
+/// application must parenthesize one used as its argument.
+#[test]
+fn an_if_has_match_expression_precedence() {
+    assert_eq!(
+        parse_one("let a = if p then f else g end x"),
+        "let a = if p then f else g end x"
+    );
+    assert_eq!(
+        parse_one("let a = if p then x else y end.field"),
+        "let a = (if p then x else y end).field"
+    );
+    assert_eq!(
+        parse_one("let a = f (if p then x else y end)"),
+        "let a = f (if p then x else y end)"
+    );
+
+    let src = "let a = f if p then x else y end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    assert_eq!(out.errors[0].span.start, src.find("if").unwrap());
+}
+
+/// Every promised part of a conditional is mandatory. In particular there is
+/// no implicit unit branch and no optional `else`.
+#[test]
+fn an_if_reports_each_missing_part() {
+    for src in [
+        "let a = if then x else y end",
+        "let a = if p x else y end",
+        "let a = if p then else y end",
+        "let a = if p then x y end",
+        "let a = if p then x else end",
+        "let a = if p then x else y",
+        // Failure from a clause entered through the else-if recursion is
+        // propagated to the outer conditional too.
+        "let a = if p then x else if",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+
+    // All three words are globally reserved rather than contextual binders.
+    for src in ["let if = 1n", "let then = 1n", "let else = 1n"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    }
 }
 
 /// The match expression, printed back as written: leading `|` on every arm —
@@ -1678,48 +1769,43 @@ fn a_rest_must_end_the_struct_pattern() {
     assert_eq!(out.errors[0].span.width, 0);
 }
 
-/// Both forms of an `effect` declaration, printed back as they were written.
-/// Which of the two a declaration is, is not the parser's to say — it records
-/// the cases and lowering reads the `:`s — so a mixed one parses too.
+/// Every accepted effect body is disjoint and round-trips canonically.
 #[test]
 fn effect_declarations() {
     assert_eq!(
-        parse_one("effect Log = write : Nat -> ()"),
-        "effect Log = | write : Nat -> ()"
+        parse_one("effect Log = String -> ()"),
+        "effect Log = String -> ()"
     );
     assert_eq!(
-        parse_one("effect Log = write : Nat -> () | flush : () -> ()"),
-        "effect Log = | write : Nat -> () | flush : () -> ()"
+        parse_one("effect Log = { write: Nat -> () }"),
+        "effect Log = { write: Nat -> () }"
     );
-    // An alias: effects, no signatures, unioned with the `+` a row writes —
-    // and no leading mark, since a union has nothing to lead with.
+    assert_eq!(
+        parse_one("effect Log = { write: Nat -> (), flush: () -> (), }"),
+        "effect Log = { write: Nat -> (), flush: () -> () }"
+    );
+    assert_eq!(
+        parse_one("effect StructInput = { value: Nat } -> ()"),
+        "effect StructInput = { value: Nat } -> ()"
+    );
     assert_eq!(
         parse_one("effect Console = !Log + !IO"),
         "effect Console = !Log + !IO"
     );
-    // A bar between aliases is the union too, and prints back as the `+` it
-    // means: the leading one is still optional, as it is on a sum.
-    assert_eq!(
-        parse_one("effect Console = | !Log | !IO"),
-        "effect Console = !Log + !IO"
-    );
-    assert_eq!(
-        parse_one("effect Console = | !Log"),
-        "effect Console = !Log"
-    );
-    // The empty effect has neither an assignment nor cases.
     assert_eq!(parse_one("effect Nil"), "effect Nil");
-    for source in ["effect Nil = |", "effect Nil ="] {
+    for source in [
+        "effect Nil = |",
+        "effect Nil =",
+        "effect Old = write : Nat -> () | flush : () -> ()",
+        "effect Empty = {}",
+        "effect NonFunction = { op: Nat }",
+        "effect MissingColon = { op Nat -> () }",
+        "effect Unclosed = {",
+        "effect Open = { op: Nat -> (), .. }",
+    ] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
-        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+        assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
     }
-    // A mix of the two forms parses; refusing it is lowering's. Each case
-    // prints with the mark its own form writes, which is what re-parses.
-    assert_eq!(
-        parse_one("effect Bad = !Log | w : Nat -> ()"),
-        "effect Bad = !Log | w : Nat -> ()"
-    );
 }
 
 /// A mark between cases promises another one, so nothing after it is reported
@@ -1906,11 +1992,8 @@ fn an_operation_is_told_from_a_projection_by_the_sigil() {
     // printed form brackets the case, which is how a tag carrying a payload is
     // told from one being read off.
     assert_eq!(parse_one("let a = #Ok.x"), "let a = (#Ok).x");
-    // An effect is a value of nothing, so one written alone is refused where
-    // it stands rather than lowered into a complaint about a term.
-    let out = parse(lex("let a = !Log", FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    // A bare effect label is the unnamed selector and is first-class.
+    assert_eq!(parse_one("let a = !Log"), "let a = !Log");
 }
 
 /// One statement's parsed tree, for the tests that assert about the shape
@@ -1950,9 +2033,9 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
         ("let a = !Log.1", "1"),
         // An operation declares a signature, so the `:` is not optional: a
         // case with no `:` is the alias it does not look like.
-        ("effect E = op | w : Nat -> ()", "|"),
+        ("effect E = op | w : Nat -> ()", "op |"),
         // And the signature is a type, whatever else was written there.
-        ("effect E = op : ,", ","),
+        ("effect E = { op: , }", ","),
         // A `\` promises an effect, so anything but one after it is
         // reported — the rule a sum's absent case keeps.
         ("let f : A -> B + \\x = g", "x"),
