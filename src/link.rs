@@ -83,6 +83,12 @@ pub enum LinkError {
         namespace: DeclarationNamespace,
         name: String,
     },
+    NamedTypeArityMismatch {
+        owner: String,
+        name: String,
+        expected: usize,
+        found: usize,
+    },
     MissingGlobal {
         owner: String,
         target: String,
@@ -189,6 +195,15 @@ impl fmt::Display for LinkError {
                 f,
                 "artifact `{owner}` interface references missing {namespace} declaration `{name}`"
             ),
+            Self::NamedTypeArityMismatch {
+                owner,
+                name,
+                expected,
+                found,
+            } => write!(
+                f,
+                "artifact `{owner}` interface applies named type `{name}` with {found} arguments, but its declaration has {expected} parameters"
+            ),
             Self::MissingGlobal { owner, target } => {
                 write!(f, "artifact `{owner}` references missing global `{target}`")
             }
@@ -278,7 +293,7 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
         });
     }
 
-    let mut declared_types = HashSet::new();
+    let mut declared_types = HashMap::new();
     let mut declared_effects = HashSet::new();
     let mut globals = HashSet::new();
     for artifact in artifacts {
@@ -329,7 +344,13 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
                 name: global.name.clone(),
             });
         }
-        declared_types.extend(artifact.header.types.iter().map(|item| item.name.as_str()));
+        declared_types.extend(
+            artifact
+                .header
+                .types
+                .iter()
+                .map(|item| (item.name.as_str(), item.params.len())),
+        );
         declared_effects.extend(
             artifact
                 .header
@@ -553,7 +574,7 @@ fn validate_declaration_names<'a>(
 
 fn validate_declaration_references(
     artifact: &Artifact,
-    declared_types: &HashSet<&str>,
+    declared_types: &HashMap<&str, usize>,
     declared_effects: &HashSet<&str>,
 ) -> Result<(), LinkError> {
     let owner = identity(artifact);
@@ -610,12 +631,28 @@ fn validate_declaration_references(
                     }
                     artifact::Core::Sum(row) => parts.push(Part::Row(row)),
                     artifact::Core::Named { name, args } => {
-                        validate_declaration_reference(
-                            &owner,
-                            DeclarationNamespace::Type,
-                            name,
-                            declared_types,
-                        )?;
+                        if parse_source_qualified_owner(name).is_none() {
+                            return Err(LinkError::MalformedDeclarationReference {
+                                owner,
+                                namespace: DeclarationNamespace::Type,
+                                name: name.clone(),
+                            });
+                        }
+                        let Some(expected) = declared_types.get(name.as_str()) else {
+                            return Err(LinkError::MissingDeclarationReference {
+                                owner,
+                                namespace: DeclarationNamespace::Type,
+                                name: name.clone(),
+                            });
+                        };
+                        if args.len() != *expected {
+                            return Err(LinkError::NamedTypeArityMismatch {
+                                owner,
+                                name: name.clone(),
+                                expected: *expected,
+                                found: args.len(),
+                            });
+                        }
                         parts.extend(args.iter().map(Part::Type));
                     }
                     artifact::Core::Unit

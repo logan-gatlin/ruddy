@@ -601,17 +601,26 @@ fn field(ty: a::Type) -> a::RowField {
     }
 }
 
+fn parameter() -> a::Parameter {
+    a::Parameter {
+        sense: a::Sense::Type,
+        lacks: vec![],
+        relevant: true,
+    }
+}
+
 #[test]
 fn validates_qualified_references_through_every_interface_shape() {
     let type_name = "app@1.0.0::T";
+    let leaf_type_name = "app@1.0.0::Leaf";
     let effect_name = "app@1.0.0::E";
     let inner_row = a::Row {
-        labels: vec![("more".into(), field(named(type_name)))],
+        labels: vec![("more".into(), field(named(leaf_type_name)))],
         rest: a::Rest::Closed,
     };
     let sum = a::Type {
         core: a::Core::Sum(a::Row {
-            labels: vec![("case".into(), field(named(type_name)))],
+            labels: vec![("case".into(), field(named(leaf_type_name)))],
             rest: a::Rest::More(Box::new(inner_row)),
         }),
         fields: vec![],
@@ -621,17 +630,17 @@ fn validates_qualified_references_through_every_interface_shape() {
             name: type_name.into(),
             args: vec![a::Type {
                 core: a::Core::Arrow(
-                    Box::new(named(type_name)),
+                    Box::new(named(leaf_type_name)),
                     Box::new(sum),
                     a::Row {
-                        labels: vec![("effect".into(), field(named(type_name)))],
+                        labels: vec![("effect".into(), field(named(leaf_type_name)))],
                         rest: a::Rest::Closed,
                     },
                 ),
-                fields: vec![("arrow-field".into(), field(named(type_name)))],
+                fields: vec![("arrow-field".into(), field(named(leaf_type_name)))],
             }],
         },
-        fields: vec![("type-field".into(), field(named(type_name)))],
+        fields: vec![("type-field".into(), field(named(leaf_type_name)))],
     };
 
     let mut input = artifact(
@@ -643,11 +652,16 @@ fn validates_qualified_references_through_every_interface_shape() {
     input.header.values[0].scheme.body = rich.clone();
     input.header.types.push(a::DeclaredType {
         name: type_name.into(),
-        params: vec![],
+        params: vec![parameter()],
         scheme: a::Scheme {
             body: rich.clone(),
             ..scheme()
         },
+    });
+    input.header.types.push(a::DeclaredType {
+        name: leaf_type_name.into(),
+        params: vec![],
+        scheme: scheme(),
     });
     input.header.effects.push(a::DeclaredEffect {
         name: effect_name.into(),
@@ -659,7 +673,7 @@ fn validates_qualified_references_through_every_interface_shape() {
         kind: a::EffectKind::Operations(vec![a::Operation {
             name: "op".into(),
             from: rich,
-            to: named(type_name),
+            to: named(leaf_type_name),
         }]),
     });
     input.header.effects.push(a::DeclaredEffect {
@@ -667,7 +681,85 @@ fn validates_qualified_references_through_every_interface_shape() {
         identity: None,
         kind: a::EffectKind::Alias(vec![effect_name.into()]),
     });
-    link::link(&[input]).expect("all nested references resolve in their namespace");
+    link::link(&[input]).expect("all nested references resolve with their declared arities");
+}
+
+#[test]
+fn validates_named_type_application_arity_across_artifacts() {
+    let mut dep = artifact("dep", &[], vec![], vec![]);
+    dep.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Zero".into(),
+        params: vec![],
+        scheme: scheme(),
+    });
+    dep.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Pair".into(),
+        params: vec![parameter(), parameter()],
+        scheme: scheme(),
+    });
+    let mut root = artifact(
+        "app",
+        &[("dep", "1.0.0")],
+        vec![],
+        vec![global("app@1.0.0::value", block(vec![]))],
+    );
+    root.header.values[0].scheme.body = a::Type {
+        core: a::Core::Named {
+            name: "dep@1.0.0::Pair".into(),
+            args: vec![named("dep@1.0.0::Zero"), named("dep@1.0.0::Zero")],
+        },
+        fields: vec![],
+    };
+
+    link::link(&[dep, root]).expect("zero and nonzero external arities match");
+}
+
+#[test]
+fn rejects_too_few_and_too_many_named_type_arguments_precisely() {
+    let declared = |params: usize| {
+        let mut dep = artifact("dep", &[], vec![], vec![]);
+        dep.header.types.push(a::DeclaredType {
+            name: "dep@1.0.0::T".into(),
+            params: vec![parameter(); params],
+            scheme: scheme(),
+        });
+        dep
+    };
+    let referencing = |args: usize| {
+        let mut root = artifact(
+            "app",
+            &[("dep", "1.0.0")],
+            vec![],
+            vec![global("app@1.0.0::value", block(vec![]))],
+        );
+        root.header.values[0].scheme.body = a::Type {
+            core: a::Core::Named {
+                name: "dep@1.0.0::T".into(),
+                args: vec![scheme().body; args],
+            },
+            fields: vec![],
+        };
+        root
+    };
+
+    assert_eq!(
+        link::link(&[declared(2), referencing(1)]),
+        Err(LinkError::NamedTypeArityMismatch {
+            owner: "app@1.0.0".into(),
+            name: "dep@1.0.0::T".into(),
+            expected: 2,
+            found: 1,
+        })
+    );
+    assert_eq!(
+        link::link(&[declared(0), referencing(1)]),
+        Err(LinkError::NamedTypeArityMismatch {
+            owner: "app@1.0.0".into(),
+            name: "dep@1.0.0::T".into(),
+            expected: 0,
+            found: 1,
+        })
+    );
 }
 
 #[test]
@@ -928,6 +1020,12 @@ fn every_link_error_has_a_user_facing_message() {
             owner: "a@1.0.0".into(),
             namespace: DeclarationNamespace::Effect,
             name: "b@1.0.0::E".into(),
+        },
+        LinkError::NamedTypeArityMismatch {
+            owner: "a@1.0.0".into(),
+            name: "b@1.0.0::T".into(),
+            expected: 2,
+            found: 1,
         },
         LinkError::MissingGlobal {
             owner: "a".into(),
