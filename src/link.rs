@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     artifact::{self, Artifact, Callee, Op},
-    symbol::{Bundle, Version},
+    symbol::{Bundle, Namespace, Version, demangle},
 };
 
 /// A malformed or conflicting input to static linking.
@@ -331,11 +331,46 @@ fn qualified_owner(name: &str) -> Result<&str, LinkError> {
 fn parse_qualified_owner(name: &str) -> Option<&str> {
     let (owner, path) = name.split_once("::")?;
     let (bundle, version) = owner.split_once('@')?;
-    (valid_identity(bundle, version) && path.split("::").all(canonical_component)).then_some(owner)
+    if !valid_identity(bundle, version) {
+        return None;
+    }
+    (path.split("::").all(source_identifier)
+        || (!path.contains("::") && synthetic_value(path, bundle, version)))
+    .then_some(owner)
 }
 
-fn canonical_component(name: &str) -> bool {
-    source_identifier(name) || name == "_" || name.strip_prefix('%').is_some_and(source_identifier)
+/// Recognize exactly the portable spelling emitted for a compiler-local value.
+/// The canonical symbol mangling proves uniqueness and carries its namespace,
+/// owner, module chain, and local disambiguator; accepting an arbitrary `%foo`
+/// here would merely replace duplicate rejection with ambiguous names.
+fn synthetic_value(component: &str, bundle: &str, version: &str) -> bool {
+    let Some(mangled) = component.strip_prefix('%') else {
+        return false;
+    };
+    let Some(symbol) = demangle(mangled) else {
+        return false;
+    };
+    if symbol.bundle.name() != bundle || symbol.bundle.version().to_string() != version {
+        return false;
+    }
+    // Canonical manglings always carry at least one component.
+    let (declaration, modules) = symbol
+        .path
+        .split_last()
+        .expect("demangle returned a nonempty symbol path");
+    declaration.namespace == Namespace::Terms
+        && declaration.disambiguator.is_some()
+        && modules.iter().all(|module| {
+            module.namespace == Namespace::Modules
+                && module.disambiguator.is_none()
+                && source_identifier(&module.name)
+        })
+}
+
+fn parse_source_qualified_owner(name: &str) -> Option<&str> {
+    let (owner, path) = name.split_once("::")?;
+    let (bundle, version) = owner.split_once('@')?;
+    (valid_identity(bundle, version) && path.split("::").all(source_identifier)).then_some(owner)
 }
 
 fn source_identifier(name: &str) -> bool {
@@ -401,7 +436,13 @@ fn validate_declaration_names<'a>(
 ) -> Result<(), LinkError> {
     let mut seen = HashSet::new();
     for name in names {
-        let Some(parsed_owner) = parse_qualified_owner(name) else {
+        let parsed_owner = match namespace {
+            DeclarationNamespace::Value => parse_qualified_owner(name),
+            DeclarationNamespace::Type | DeclarationNamespace::Effect => {
+                parse_source_qualified_owner(name)
+            }
+        };
+        let Some(parsed_owner) = parsed_owner else {
             return Err(LinkError::MalformedDeclaration {
                 namespace,
                 name: name.to_string(),

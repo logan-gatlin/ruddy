@@ -1,6 +1,10 @@
 use ruddy::{
-    artifact as a,
+    artifact as a, inference, ir,
     link::{self, DeclarationNamespace, LinkError},
+    lir, parse, patterns,
+    symbol::{Bundle, Mint, Namespace, Version},
+    token,
+    tracking::FileManager,
 };
 
 fn artifact(
@@ -58,6 +62,24 @@ fn global(name: &str, body: a::Block) -> a::Global {
         name: name.into(),
         body,
     }
+}
+
+fn compiled(source: &str) -> a::Artifact {
+    let mut files = FileManager::new();
+    let file = files.register_new_file("<test>".into(), source.into());
+    let lexed = token::lex(source, file);
+    assert!(lexed.errors.is_empty(), "{:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let bundle = Bundle::new("app", Version::new(1, 0, 0)).unwrap();
+    let mut mint = Mint::new(bundle);
+    let mut program = ir::build(&mut mint, parsed.stmts).program;
+    let inferred = inference::infer(&mint, &mut program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let checked = patterns::check(&program, &inferred);
+    assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
+    let lowered = lir::lower(&mint, &program, &inferred);
+    a::Artifact::build(&mint, &program, &inferred, &lowered)
 }
 
 fn scheme() -> a::Scheme {
@@ -227,6 +249,27 @@ fn links_every_item_and_recursively_relocates_function_indices() {
         panic!()
     };
     assert_eq!(func, 0);
+}
+
+#[test]
+fn links_multiple_top_level_wildcard_definitions_without_aliasing_them() {
+    let artifact = compiled("let _ = 1n\nlet _ = 2n\nlet keep = 3n\nlet _ = keep");
+    assert_eq!(artifact.header.values.len(), 4);
+    assert_eq!(artifact.lir.globals.len(), 4);
+
+    let names: std::collections::HashSet<_> = artifact
+        .lir
+        .globals
+        .iter()
+        .map(|global| global.name.as_str())
+        .collect();
+    assert_eq!(names.len(), 4, "every discarded initializer stays distinct");
+    for value in &artifact.header.values {
+        assert!(names.contains(value.name.as_str()));
+    }
+
+    let linked = link::link(&[artifact]).expect("compiler-produced wildcard names are portable");
+    assert_eq!(linked.lir.globals.len(), 4);
 }
 
 #[test]
@@ -497,6 +540,107 @@ fn validates_public_declarations_in_every_namespace_and_artifact() {
         assert!(matches!(
             link::link(&[duplicate, root]),
             Err(LinkError::DuplicateDeclaration { namespace: found, .. }) if found == namespace
+        ));
+    }
+}
+
+#[test]
+fn qualified_validation_is_namespace_sensitive_and_synthetic_names_are_exact() {
+    let valid = compiled("let _ = 1n");
+    let synthetic = valid.header.values[0].name.clone();
+    assert!(synthetic.contains("::%_R"), "{synthetic}");
+    link::link(&[valid]).unwrap();
+
+    for bad in [
+        "app@1.0.0::_",
+        "app@1.0.0::%discard",
+        "app@1.0.0::Module::%discard",
+        "app@1.0.0::Module::_",
+    ] {
+        let input = artifact("app", &[], vec![], vec![global(bad, block(vec![]))]);
+        assert!(
+            matches!(link::link(&[input]), Err(LinkError::MalformedGlobal { .. })),
+            "{bad}"
+        );
+    }
+
+    for namespace in [DeclarationNamespace::Type, DeclarationNamespace::Effect] {
+        for bad in ["app@1.0.0::_", "app@1.0.0::%hidden", synthetic.as_str()] {
+            let mut input = artifact("app", &[], vec![], vec![]);
+            match namespace {
+                DeclarationNamespace::Type => input.header.types.push(a::DeclaredType {
+                    name: bad.into(),
+                    params: vec![],
+                    scheme: scheme(),
+                }),
+                DeclarationNamespace::Effect => input.header.effects.push(a::DeclaredEffect {
+                    name: bad.into(),
+                    identity: None,
+                    kind: a::EffectKind::Alias(vec![]),
+                }),
+                DeclarationNamespace::Value => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    link::link(&[input]),
+                    Err(LinkError::MalformedDeclaration { namespace: found, .. }) if found == namespace
+                ),
+                "{namespace:?}: {bad}"
+            );
+        }
+    }
+
+    let mut bad_value = artifact("app", &[], vec![], vec![]);
+    bad_value.header.values.push(a::Value {
+        name: "app@1.0.0::%hidden".into(),
+        scheme: scheme(),
+    });
+    assert!(matches!(
+        link::link(&[bad_value]),
+        Err(LinkError::MalformedDeclaration {
+            namespace: DeclarationNamespace::Value,
+            ..
+        })
+    ));
+
+    // A canonical local mangling is still invalid when embedded under the
+    // wrong artifact owner, even if its textual owner prefix is rewritten.
+    let forged = synthetic.replacen("app@1.0.0::", "other@1.0.0::", 1);
+    let input = artifact("other", &[], vec![], vec![global(&forged, block(vec![]))]);
+    assert!(matches!(
+        link::link(&[input]),
+        Err(LinkError::MalformedGlobal { .. })
+    ));
+
+    // Exercise the semantic checks inside a canonical mangling rather than
+    // treating successful decoding alone as authorization for `%...`.
+    let bundle = Bundle::new("app", Version::new(1, 0, 0)).unwrap();
+    let mut mint = Mint::new(bundle);
+    let module = mint.module(None, "Good").unwrap();
+    let local = mint.local(Some(module), Namespace::Terms, "%discard");
+    let nested = format!("app@1.0.0::%{}", mint.mangle(local));
+    let input = artifact("app", &[], vec![], vec![global(&nested, block(vec![]))]);
+    link::link(&[input]).expect("a local under a source-valid module is canonical");
+
+    let wrong_namespace = mint.local(None, Namespace::Types, "%discard");
+    let bad_module = mint.module(None, "bad-name").unwrap();
+    let under_bad_module = mint.local(Some(bad_module), Namespace::Terms, "%discard");
+    let wrong_parent_namespace = nested.replacen("M4Good", "T4Good", 1);
+    let local_parent = nested.replacen("M4Good", "M4Goods0", 1);
+    for mangled in [
+        mint.mangle(wrong_namespace),
+        mint.mangle(under_bad_module),
+        wrong_parent_namespace
+            .strip_prefix("app@1.0.0::%")
+            .unwrap()
+            .into(),
+        local_parent.strip_prefix("app@1.0.0::%").unwrap().into(),
+    ] {
+        let name = format!("app@1.0.0::%{mangled}");
+        let input = artifact("app", &[], vec![], vec![global(&name, block(vec![]))]);
+        assert!(matches!(
+            link::link(&[input]),
+            Err(LinkError::MalformedGlobal { .. })
         ));
     }
 }

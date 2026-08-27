@@ -573,6 +573,19 @@ fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
     if let Some(qualified) = mint.external(symbol) {
         return qualified.to_owned();
     }
+    // Source paths deliberately do not distinguish locals. Artifact names must:
+    // top-level wildcard definitions are fresh local symbols and multiple such
+    // globals can coexist. A full canonical mangling is deterministic and
+    // injective, while `%` keeps this compiler-only component disjoint from
+    // every source identifier.
+    if mint.is_local(symbol) {
+        return format!(
+            "{}@{}::%{}",
+            mint.bundle().name(),
+            mint.bundle().version(),
+            mint.mangle(symbol)
+        );
+    }
     let path = mint.path(symbol).to_string();
     let prefix = mint.bundle().name();
     let suffix = path
