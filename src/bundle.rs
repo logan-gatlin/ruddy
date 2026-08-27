@@ -1,10 +1,10 @@
 //! Reading a whole bundle: the root file, and every file its modules name.
 //!
-//! A bundle is described entirely by its source. The root file opens with
-//! `bundle <name> <version>`, `module A = ... end` nests a module inline, and
-//! `module A` alone says the body is in another file — which is looked for at
-//! the path the module's own position in the tree spells. There is no build
-//! metadata anywhere, and nothing outside a `.hc` file decides what is in one.
+//! A bundle's source consists of a configured root file and the files reached
+//! through its module declarations. `module A = ... end` nests a module inline,
+//! and `module A` alone says the body is in another file — which is looked for
+//! at the path the module's own position in the tree spells. Bundle identity is
+//! supplied by the driver from project configuration.
 //!
 //! What comes out is one spliced statement list, in which every
 //! [`StmtKind::Module`] carries a body, so [`ir::build`](crate::ir::build) sees
@@ -21,8 +21,7 @@ use std::{path::PathBuf, time::Instant};
 
 use crate::{
     parse::{self, Stmt, StmtKind},
-    symbol::{Bundle, Version},
-    token::{self, Kind, Token},
+    token::{self, Token},
     tracking::{FileID, FileManager, Span},
 };
 
@@ -47,6 +46,7 @@ pub trait Files {
 /// [`Files`] over a real directory.
 pub struct Disk {
     root: PathBuf,
+    sandbox: Option<PathBuf>,
 }
 
 /// One file, as it was read.
@@ -73,9 +73,6 @@ pub struct Loaded {
 
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// `None` when the header was missing or [`Bundle::new`] refused it; the
-    /// caller mints under [`fallback`] so the later phases still run.
-    pub bundle: Option<Bundle>,
     /// Every file's statements, spliced: each [`StmtKind::Module`] carries a
     /// body.
     pub stmts: Vec<Stmt>,
@@ -91,9 +88,8 @@ pub struct Error {
 }
 
 /// Everything loading can refuse. Every one of them is recoverable: the loader
-/// reports it, substitutes an empty body or a fallback identity, and keeps
-/// going, so one missing file does not hide every other complaint in the
-/// program.
+/// reports it, substitutes an empty body, and keeps going, so one missing file
+/// does not hide every other complaint in the program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
     /// A file module whose file is at neither of the two paths it could be at.
@@ -102,13 +98,6 @@ pub enum ErrorKind {
     /// A file module whose file is at *both* paths. Which one was meant is not
     /// the loader's to guess.
     ModuleFileAmbiguous { beside: String, inside: String },
-    /// A `bundle` header in a file that is not the root.
-    MisplacedBundleDeclaration,
-    /// A root file that does not open with one.
-    MissingBundleDeclaration,
-    /// A header [`Bundle::new`] refused. Only the name can be refused: build
-    /// metadata is the other reason, and the header grammar cannot spell one.
-    BadBundleIdentity,
 }
 
 /// The whole load, in progress.
@@ -121,7 +110,21 @@ struct Loader<'a> {
 impl Disk {
     /// Rooted at the directory holding the bundle's root file.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            sandbox: None,
+        }
+    }
+
+    /// Rooted at `root`, refusing every read whose canonical file is outside
+    /// `sandbox`. This is intended for callers compiling untrusted project
+    /// configuration: the check happens for each module candidate at the point
+    /// it is read, including candidates reached through symlinks.
+    pub fn sandboxed(root: impl Into<PathBuf>, sandbox: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            sandbox: Some(sandbox.into()),
+        }
     }
 }
 
@@ -133,18 +136,16 @@ impl Files for Disk {
         for segment in path.split('/') {
             file.push(segment);
         }
+        if let Some(sandbox) = &self.sandbox {
+            let sandbox = std::fs::canonicalize(sandbox).ok()?;
+            let canonical = std::fs::canonicalize(&file).ok()?;
+            if !canonical.starts_with(&sandbox) {
+                return None;
+            }
+            return std::fs::read_to_string(canonical).ok();
+        }
         std::fs::read_to_string(file).ok()
     }
-}
-
-/// The identity a bundle compiles under when its header is missing or refused.
-///
-/// Written once, here, rather than invented by each driver: a program whose
-/// first line is still being typed should mangle the same way in the debugger
-/// as it does at the command line, and two fallbacks would be two answers to
-/// one question.
-pub fn fallback() -> Bundle {
-    Bundle::new("fallback", Version::new(0, 0, 0)).expect("the fallback identity is valid")
 }
 
 /// Read a bundle: the root file, every file its modules name, and one spliced
@@ -159,13 +160,12 @@ pub fn load(files: &mut FileManager, fs: &dyn Files, root: &str) -> Output {
         files,
         fs,
         out: Output {
-            bundle: None,
             stmts: Vec::new(),
             loaded: Vec::new(),
             errors: Vec::new(),
         },
     };
-    let mut stmts = loader.file(root, true);
+    let mut stmts = loader.file(root);
     loader.splice(&mut stmts, &mut Vec::new());
     loader.out.stmts = stmts;
     loader.out
@@ -177,7 +177,7 @@ impl Loader<'_> {
     /// A file that is not there reads as an empty one. Only the root can reach
     /// that: a module's file is looked for before it is read, and the two ways
     /// that can go wrong are complaints of their own.
-    fn file(&mut self, path: &str, root: bool) -> Vec<Stmt> {
+    fn file(&mut self, path: &str) -> Vec<Stmt> {
         let source = self.fs.read(path).unwrap_or_default();
         let id = self
             .files
@@ -191,7 +191,6 @@ impl Loader<'_> {
         let parsed = parse::parse(lexed.tokens.clone());
         let parse_micros = started.elapsed().as_micros() as u64;
 
-        self.header(&lexed.tokens, parsed.header.as_ref(), id, root);
         self.out.loaded.push(Loaded {
             id,
             path: path.to_string(),
@@ -202,33 +201,6 @@ impl Loader<'_> {
             parse_micros,
         });
         parsed.stmts
-    }
-
-    /// The three rules about a header: the root must have one, no other file
-    /// may, and the one the root has must be an identity [`Bundle::new`]
-    /// accepts.
-    ///
-    /// Whether the root *has* one is asked of the tokens rather than of the
-    /// parsed header, so a header that was written and did not parse is one
-    /// complaint — the parser's — rather than two.
-    fn header(&mut self, tokens: &[Token], header: Option<&parse::Header>, id: FileID, root: bool) {
-        if !root {
-            if let Some(header) = header {
-                self.error(header.span, ErrorKind::MisplacedBundleDeclaration);
-            }
-            return;
-        }
-        if !matches!(tokens.first().map(|tok| &tok.tracked), Some(Kind::Bundle)) {
-            // At the start of the file, which is where the missing line goes.
-            self.error(id.span(0, 0), ErrorKind::MissingBundleDeclaration);
-        }
-        let Some(header) = header else {
-            return;
-        };
-        match Bundle::new(&header.name.tracked, header.version.tracked.clone()) {
-            Some(bundle) => self.out.bundle = Some(bundle),
-            None => self.error(header.span, ErrorKind::BadBundleIdentity),
-        }
     }
 
     /// Fill in the body of every file module in `stmts`, and walk into every
@@ -270,11 +242,14 @@ impl Loader<'_> {
         // but its body must not be spliced a second time: the repeated copy
         // would turn every declaration in the file into a spurious duplicate.
         // A logical module has exactly these two possible paths, so a loaded
-        // candidate can only be this same module reached earlier.
+        // *module body* candidate can only be this same module reached earlier.
+        // The root is not a module body merely because its configured name
+        // collides with one of these paths; it remains a real candidate below.
         if self
             .out
             .loaded
             .iter()
+            .skip(1)
             .any(|file| file.path == beside || file.path == inside)
         {
             return Vec::new();
@@ -283,8 +258,8 @@ impl Loader<'_> {
             self.fs.read(&beside).is_some(),
             self.fs.read(&inside).is_some(),
         ) {
-            (true, false) => self.file(&beside, false),
-            (false, true) => self.file(&inside, false),
+            (true, false) => self.file(&beside),
+            (false, true) => self.file(&inside),
             (true, true) => {
                 self.error(at, ErrorKind::ModuleFileAmbiguous { beside, inside });
                 Vec::new()

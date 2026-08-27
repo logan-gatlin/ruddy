@@ -1,9 +1,11 @@
 //! Scratch documents: the bundles you keep around while debugging.
 //!
 //! A document is a directory under `debug/scratch/<doc>/` holding plain `.hc`
-//! files, so anything else — the CLI compiler, `grep`, an editor — can read one
-//! too. `main.hc` is the root; the rest are whatever its modules name. The page
-//! keeps its own copy in `localStorage`; this is the durable one.
+//! files and a `Ruddy.toml` project manifest. The configured root and the
+//! rest are whatever its modules name. The page keeps a recovery copy in
+//! `localStorage`; this is the durable one. Saved manifests share the CLI's
+//! path and HTTPS Git dependency contract, including branch, tag, and revision
+//! selectors.
 
 use std::{
     fs, io,
@@ -11,12 +13,26 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
 use crate::{
     snapshot::ROOT,
-    wire::{Doc, DocMeta, FileSpec},
+    wire::{DependencySpec, Doc, DocMeta, FileSpec},
 };
 
 const EXTENSION: &str = "hc";
+pub const MANIFEST: &str = "Ruddy.toml";
+const DEFAULT_VERSION: &str = "0.1.0";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    name: String,
+    version: String,
+    root: String,
+    dependencies: IndexMap<String, DependencySpec>,
+}
 
 /// The longest path a file inside a document may have. Long enough for a module
 /// nested deeper than anyone will nest one, short enough that no request can ask
@@ -28,7 +44,7 @@ const MAX_PATH: usize = 128;
 /// [`valid_file_path`] are the only checks standing between a URL and the
 /// filesystem; keep both total.
 pub fn valid_name(name: &str) -> bool {
-    name.len() <= 64 && segment(name)
+    name.len() <= 64 && name.starts_with(|c: char| c.is_ascii_alphabetic()) && segment(name)
 }
 
 /// One segment of a path inside the scratch directory: non-empty, and drawn
@@ -127,12 +143,17 @@ pub fn list(root: &Path) -> io::Result<Vec<DocMeta>> {
 
 pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
     let dir = path(root, name).ok_or_else(bad_name)?;
+    let manifest = read_manifest(&dir)?;
     let mut files = collect(&dir, "")?;
-    // The root first, then the rest by path: a stable order the page can show
-    // its file strip in without sorting it again.
-    files.sort_by_key(|file| (file.path != ROOT, file.path.clone()));
+    // The configured root first, then the rest by path: a stable order the page
+    // can show its file strip in without sorting it again.
+    files.sort_by_key(|file| (file.path != manifest.root, file.path.clone()));
     Ok(Doc {
         name: name.to_string(),
+        bundle_name: manifest.name,
+        version: manifest.version,
+        root: manifest.root,
+        dependencies: manifest.dependencies,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
     })
@@ -144,9 +165,25 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
 /// not in it is deleted, so what comes back from [`read`] is what was sent. A
 /// file the page renamed is a write and a delete rather than a move, which is
 /// the same thing from here and one fewer operation to get wrong.
-pub fn write(root: &Path, name: &str, files: &[FileSpec]) -> io::Result<u128> {
+pub fn write(
+    root: &Path,
+    name: &str,
+    bundle_name: &str,
+    version: &str,
+    configured_root: &str,
+    dependencies: &IndexMap<String, DependencySpec>,
+    files: &[FileSpec],
+) -> io::Result<u128> {
     let dir = path(root, name).ok_or_else(bad_name)?;
     fs::create_dir_all(&dir)?;
+    let manifest = Manifest {
+        name: bundle_name.to_string(),
+        version: version.to_string(),
+        root: configured_root.to_string(),
+        dependencies: dependencies.clone(),
+    };
+    let source = toml::to_string(&manifest).map_err(io::Error::other)?;
+    fs::write(dir.join(MANIFEST), source)?;
     for file in files {
         let at = file_path(root, name, &file.path).ok_or_else(bad_name)?;
         if let Some(parent) = at.parent() {
@@ -164,6 +201,46 @@ pub fn write(root: &Path, name: &str, files: &[FileSpec]) -> io::Result<u128> {
     }
     modified(&dir)?;
     modified_of(&dir)
+}
+
+fn read_manifest(dir: &Path) -> io::Result<Manifest> {
+    let path = dir.join(MANIFEST);
+    let source = fs::read_to_string(&path)?;
+    toml::from_str(&source).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse manifest {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Resolve a dependency path relative to a scratch project and prove that its
+/// canonical target remains inside the canonical scratch directory.
+pub fn dependency_path(scratch: &Path, project: &Path, declared: &Path) -> io::Result<PathBuf> {
+    if declared.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute dependency paths are not allowed",
+        ));
+    }
+    let scratch = fs::canonicalize(scratch)?;
+    let target = fs::canonicalize(project.join(declared))?;
+    if !target.starts_with(&scratch) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "dependency path `{}` escapes debug/scratch",
+                declared.display()
+            ),
+        ));
+    }
+    if !target.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("dependency path `{}` is not a folder", declared.display()),
+        ));
+    }
+    Ok(target)
 }
 
 pub fn delete(root: &Path, name: &str) -> io::Result<()> {
@@ -189,6 +266,12 @@ pub fn ensure(root: &Path, seed: &Path) -> io::Result<()> {
     {
         fs::create_dir_all(&demo)?;
         fs::write(demo.join(ROOT), source)?;
+        fs::write(
+            demo.join(MANIFEST),
+            format!(
+                "name = \"demo\"\nversion = \"{DEFAULT_VERSION}\"\nroot = \"{ROOT}\"\n\n[dependencies]\n"
+            ),
+        )?;
     }
     Ok(())
 }

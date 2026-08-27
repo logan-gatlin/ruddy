@@ -239,12 +239,10 @@ function createPane(root, app, index) {
     renderViews();
 
     const view = viewOf(app, stage);
-    if (view === "raw") {
-      setRows(`<pre class="raw">${esc(stage.debug || "(empty)")}</pre>`);
-      visible = [];
-      return;
-    }
-
+    // A stage that did not build has no canonical text or outline to show.
+    // Check that before choosing either rendering, so a Text stage reports the
+    // same useful status as a Tree or List stage rather than a misleading
+    // empty document.
     if (stage.status === "panicked") {
       const panic = snapshot.panic;
       setRows(
@@ -255,9 +253,22 @@ function createPane(root, app, index) {
       visible = [];
       return;
     }
-    if (stage.status === "skipped" || !stage.nodes.length) {
-      const why = stage.status === "skipped" ? stage.summary : "nothing to show";
-      setRows(`<div class="pane-note">${esc(why)}</div>`);
+    if (stage.status === "error" || stage.status === "skipped" || !stage.nodes.length) {
+      const why = stage.status === "error" || stage.status === "skipped" ? stage.summary : "nothing to show";
+      const bad = stage.status === "error" ? " bad" : "";
+      setRows(`<div class="pane-note${bad}">${esc(why)}</div>`);
+      visible = [];
+      return;
+    }
+
+    if (view === "raw") {
+      setRows(`<pre class="raw">${esc(stage.debug || "(empty)")}</pre>`);
+      visible = [];
+      return;
+    }
+
+    if (view === "text") {
+      setRows(`<pre class="raw">${esc(stage.text || "(empty)")}</pre>`);
       visible = [];
       return;
     }
@@ -489,7 +500,12 @@ function createPane(root, app, index) {
       .filter((s) => !s.annotates)
       .map((s, i) => {
         const on = s.id === stage.id ? " on" : "";
-        const bad = s.status === "panicked" ? " bad" : s.status === "partial" ? " warn" : "";
+        const bad =
+          s.status === "panicked" || s.status === "error"
+            ? " bad"
+            : s.status === "partial"
+              ? " warn"
+              : "";
         return (
           `<button class="tab${on}${bad}" data-stage="${s.id}" title="${esc(s.summary)}">` +
           `<span class="key">${i + 1}</span>${esc(s.title)}</button>`
@@ -500,10 +516,9 @@ function createPane(root, app, index) {
 
   function renderViews() {
     const current = viewOf(app, stage);
-    // A stage's own view, or the raw dump every stage has. Naming the first
-    // button after `stage.view` is what lets a list stage stop offering a
-    // "tree" it never rendered.
-    views.innerHTML = [stage.view, "raw"]
+    // The stage owns which renderings are meaningful. `raw` remains the one
+    // universal escape hatch for fields the page has not learned to render.
+    views.innerHTML = [...(stage.views ?? [stage.view]), "raw"]
       .map(
         (view) =>
           `<button data-view="${view}" class="${view === current ? "on" : ""}">${view}</button>`,
@@ -665,12 +680,13 @@ function columnsOf(stage) {
   return seen;
 }
 
-/// Which of a stage's two views is showing. Only `raw` is a deviation — every
-/// stage has one — so anything else means the view the stage was registered
-/// with, and a name left in storage by an older build falls back to it rather
-/// than to a blank pane.
+/// Which supported rendering is showing. `raw` is universal; every other
+/// saved choice must be one the stage supplied, so an obsolete local setting
+/// falls back to the stage default instead of selecting an empty pane.
 function viewOf(app, stage) {
-  return app.state.views[stage.id] === "raw" ? "raw" : stage.view;
+  const selected = app.state.views[stage.id];
+  if (selected === "raw") return "raw";
+  return (stage.views ?? [stage.view]).includes(selected) ? selected : stage.view;
 }
 
 /// Which symbol a row belongs to, whether it names it (`symbol`) or is only

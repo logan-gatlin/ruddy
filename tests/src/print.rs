@@ -844,22 +844,6 @@ fn the_ast_printer_round_trips_modules_and_paths() {
     }
 }
 
-/// The header is not a statement, so it is not in the tree the printer walks —
-/// but the AST tab shows it, and what it shows is the line the reader wrote.
-#[test]
-fn the_header_reads_back_as_the_line_it_was_written_as() {
-    let mut files = FileManager::new();
-    let source = "bundle demo 0.1.0\nlet x = 1n";
-    let file = files.register_new_file("main.hc".to_string(), source.to_string());
-    let parsed = parse::parse(token::lex(source, file).tokens);
-    let header = parsed.header.expect("the file opened with one");
-
-    assert_eq!(
-        format!("bundle {} {}", header.name.tracked, header.version.tracked),
-        "bundle demo 0.1.0"
-    );
-}
-
 /// Print one source through the AST printer and read the result back, so a
 /// printed tree that needs a bracket it did not write is caught here rather
 /// than by a reader pasting it into a file.

@@ -118,6 +118,10 @@ pub struct Mint {
     globals: HashMap<(Option<Module>, Namespace, Name), Symbol>,
     /// The next disambiguator for each local path.
     locals: HashMap<(Option<Module>, Namespace, Name), u32>,
+    /// Portable artifact spelling for dependency-interface symbols represented
+    /// inside this mint. These symbols participate in checking but retain the
+    /// bundle that actually owns them at the artifact boundary.
+    external: HashMap<Symbol, String>,
 }
 
 /// Every bundle in one compilation, and the mint each one owns.
@@ -256,6 +260,7 @@ impl Mint {
             symbols: Vec::new(),
             globals: HashMap::new(),
             locals: HashMap::new(),
+            external: HashMap::new(),
         }
     }
 
@@ -316,6 +321,17 @@ impl Mint {
             parent,
             disambiguator: Some(disambiguator),
         })
+    }
+
+    /// Associate an imported semantic symbol with its portable qualified name.
+    pub fn register_external(&mut self, symbol: Symbol, qualified: impl Into<String>) {
+        self.data(symbol);
+        self.external.insert(symbol, qualified.into());
+    }
+
+    /// The portable qualified name of an imported symbol.
+    pub fn external(&self, symbol: Symbol) -> Option<&str> {
+        self.external.get(&symbol).map(String::as_str)
     }
 
     /// The name the symbol was minted from, as written in the source.

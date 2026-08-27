@@ -2,9 +2,11 @@
 
 use indexmap::IndexMap;
 use ruddy::{
+    artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, Effect, ErrorKind, Field, Output, PatternKind, SumCase, Term,
-        TermKind, TypeField, TypeKind, build,
+        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, Field, Output, PatternKind,
+        SumCase, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
+        build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -4027,6 +4029,38 @@ fn structural_effect_duplicates_are_rejected() {
     );
 }
 
+/// Effect identity is equality of regular trees, not equality of how many
+/// times a recursive declaration was unrolled before its back edge.
+#[test]
+fn recursive_effect_interfaces_ignore_finite_unrolling() {
+    let src = "module A =\n  type a = { n: a }\n  effect Loop = step : a -> ()\nend\n\
+               module B =\n  type b = { n: { n: b } }\n  effect Loop = step : b -> ()\nend\n\
+               effect Both = A::!Loop + B::!Loop";
+    assert_eq!(codes_of(src), ["duplicate-case"]);
+}
+
+/// A back edge retains which regular-tree state it returns to. In particular,
+/// a branch at the root cannot be confused with a loop at the root's child.
+#[test]
+fn recursive_effect_interfaces_preserve_branching_back_edges() {
+    let src = "module A =\n  type a = { left: middle, right: Nat }\n  type middle = { next: a }\n  effect Loop = step : a -> ()\nend\n\
+               module B =\n  type b = { left: middle, right: Nat }\n  type middle = { next: middle }\n  effect Loop = step : b -> ()\nend\n\
+               effect Both = A::!Loop + B::!Loop";
+    let (_, out) = build_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+#[test]
+fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
+    let src = "effect Log = write : Nat -> ()\n\
+               effect A = !Log\n\
+               effect B = !Log\n\
+               effect Both = !A + !B";
+    let (_, out) = build_src(src);
+    assert_eq!(codes_of(src), ["duplicate-case"]);
+    assert_eq!(out.errors[0].span.start, src.rfind("!B").unwrap());
+}
+
 /// Effect rows inside an operation's input/output signature participate in
 /// identity too. Their dependencies are compared structurally, not by the
 /// source module that declared them.
@@ -5126,6 +5160,958 @@ fn a_module_with_no_body_is_declared_and_empty() {
     assert!(
         mint.symbols()
             .any(|s| mint.namespace(s) == Namespace::Modules && mint.name(s) == "A")
+    );
+}
+
+fn artifact_type(core: a::Core) -> a::Type {
+    a::Type {
+        core,
+        fields: Vec::new(),
+    }
+}
+
+fn artifact_scheme(body: a::Type) -> a::Scheme {
+    a::Scheme {
+        count: 0,
+        presences: 0,
+        formula: a::Formula::True,
+        body,
+    }
+}
+
+fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
+    a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: bundle.into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: vec![a::DeclaredEffect {
+                name: format!("{bundle}@1.0.0::IO"),
+                identity: Some(a::EffectIdentity {
+                    name: "IO".into(),
+                    interface: interface.into(),
+                }),
+                kind: a::EffectKind::Operations(Vec::new()),
+            }],
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    }
+}
+
+/// Artifact headers are the semantic boundary, so importing exercises every
+/// portable type/formula/row form rather than relying on source re-lowering.
+#[test]
+fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: vec![a::Dependency {
+                name: "base".to_string(),
+                version: "1.0.0".to_string(),
+            }],
+            values: Vec::new(),
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::Wrapper".to_string(),
+                params: Vec::new(),
+                scheme: artifact_scheme(artifact_type(a::Core::Named {
+                    name: "base@1.0.0::Hidden".to_string(),
+                    args: vec![artifact_type(a::Core::Nat)],
+                })),
+            }],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let parsed = parse::parse(lex("let value : dep::Wrapper = 0n", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let mut built = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let _inferred = inference::infer(&mint, &mut built.program);
+    assert_eq!(built.program.external_types.len(), 2);
+}
+
+#[test]
+fn missing_transitive_type_applications_keep_distinct_effect_identities() {
+    let alias = |name: &str, argument| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_type(a::Core::Named {
+            name: "base@1.0.0::Hidden".into(),
+            args: vec![artifact_type(argument)],
+        })),
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: vec![a::Dependency {
+                name: "base".into(),
+                version: "1.0.0".into(),
+            }],
+            values: Vec::new(),
+            types: vec![
+                alias("Natural", a::Core::Nat),
+                alias("Text", a::Core::String),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module N =\n  effect Pick = get : dep::Natural -> ()\nend\n\
+               module S =\n  effect Pick = get : dep::Text -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identities: Vec<_> = out.program.effect_ids.values().collect();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(
+        identities[0], identities[1],
+        "Hidden Nat and Hidden String must not canonicalize as one recovery type"
+    );
+}
+
+#[test]
+fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
+    let (mint, out) = build_src(
+        "type T 'a = { next: T Nat }\n\
+         effect E = op : T String -> ()",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(
+        out.program
+            .effect_ids
+            .keys()
+            .filter(|symbol| mint.name(**symbol) == "E")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: vec![a::Dependency {
+                name: "base".into(),
+                version: "1.0.0".into(),
+            }],
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: [
+                ("Console", "base@1.0.0::Hidden"),
+                ("Network", "base@1.0.0::Other"),
+            ]
+            .into_iter()
+            .map(|(name, target)| a::DeclaredEffect {
+                name: format!("dep@1.0.0::{name}"),
+                identity: None,
+                kind: a::EffectKind::Alias(vec![target.into()]),
+            })
+            .chain(std::iter::once(a::DeclaredEffect {
+                name: "dep@1.0.0::Legacy".into(),
+                identity: None,
+                kind: a::EffectKind::Operations(Vec::new()),
+            }))
+            .collect(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let parsed = parse::parse(
+        lex(
+            "let f : () -> () + dep::!Console = fn x => x\n\
+         let g : () -> () + dep::!Network = fn x => x\n\
+         let h : () -> () + dep::!Legacy = fn x => x",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let imports = [DependencyImport {
+        alias: "dep",
+        artifact: &dependency,
+    }];
+    let mut out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let recovered: Vec<_> = out
+        .program
+        .effect_ids
+        .values()
+        .filter(|identity| {
+            matches!(
+                identity,
+                ruddy::types::EffectId::Structural { interface, .. }
+                    if interface.starts_with("unresolved:base@1.0.0::")
+            )
+        })
+        .collect();
+    assert_eq!(recovered.len(), 2);
+    assert_ne!(recovered[0], recovered[1]);
+    for declaration in out.program.terms.values() {
+        let annotation = declaration.annotation.as_ref().unwrap();
+        let TypeKind::Arrow { effects, .. } = &annotation.ty.tracked else {
+            panic!("expected arrow annotation")
+        };
+        assert_eq!(
+            effects.effects.len(),
+            1,
+            "missing effects must not become purity"
+        );
+    }
+
+    // Recovery identities must survive the full inference path too. In
+    // particular, direct-only unresolved effects are semantic row labels, not
+    // names which inference may discard or attempt to look up transitively.
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(inferred.schemes.len(), 3);
+    for scheme in inferred.schemes.values() {
+        let ruddy::types::Core::Arrow(_, _, effects) = &scheme.body().core else {
+            panic!("expected inferred arrow")
+        };
+        assert_eq!(effects.labels.len(), 1, "inference lost recovered effect");
+    }
+}
+
+#[test]
+fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
+    let src = "type Record 'r = { x: Nat, ..'r }\n\
+               type Cases 'r = #X | ..'r\n\
+               effect A = a : () -> ()\n\
+               effect B = b : () -> ()\n\
+               type Runs 'e = () -> () + ..'e\n\
+               module Y =\n  effect RecordPick = get : Record { y: Nat } -> ()\n  effect CasePick = get : Cases (#Y) -> ()\n  effect RunPick = get : Runs (!A) -> ()\nend\n\
+               module Z =\n  effect RecordPick = get : Record { z: Nat } -> ()\n  effect CasePick = get : Cases (#Z) -> ()\n  effect RunPick = get : Runs (!B) -> ()\nend";
+    let (mint, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["impure-operation", "impure-operation"]
+    );
+    for name in ["RecordPick", "CasePick", "RunPick"] {
+        let identities: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1], "{name} lost its row argument");
+    }
+}
+
+#[test]
+fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels() {
+    let src = "type Record 'r = { x: Nat, ..'r }\n\
+               type Cases 'r = #X | ..'r\n\
+               effect A = a : () -> ()\n\
+               effect B = b : () -> ()\n\
+               effect C = c : () -> ()\n\
+               type Runs 'r = () -> () + !A + ..'r\n\
+               module Flat =\n  effect Record = get : { x: Nat, y: Nat } -> ()\n  effect Cases = get : (#X | #Y) -> ()\n  effect Runs = get : (() -> () + !A + !B) -> ()\nend\n\
+               module Composed =\n  effect Record = get : Record { y: Nat } -> ()\n  effect Cases = get : Cases (#Y) -> ()\n  effect Runs = get : Runs (!B) -> ()\nend\n\
+               module Different =\n  effect Record = get : Record { z: Nat } -> ()\n  effect Cases = get : Cases (#Z) -> ()\n  effect Runs = get : Runs (!C) -> ()\nend";
+    let (mint, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["impure-operation", "impure-operation", "impure-operation"]
+    );
+    for name in ["Record", "Cases", "Runs"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1], "{name} composition was not flattened");
+        assert_ne!(ids[0], ids[2], "{name} labels were lost while flattening");
+    }
+}
+
+#[test]
+fn row_composition_is_flattened_across_local_and_imported_types() {
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let named = |name: &str| {
+        artifact_type(a::Core::Named {
+            name: format!("dep@1.0.0::{name}"),
+            args: Vec::new(),
+        })
+    };
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let row = |label: &str| a::Row {
+        labels: vec![(label.into(), present(artifact_type(a::Core::Unit)))],
+        rest: a::Rest::Closed,
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![
+                declared(
+                    "RecordTail",
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("y".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared(
+                    "Record",
+                    a::Type {
+                        core: a::Core::Named {
+                            name: "dep@1.0.0::RecordTail".into(),
+                            args: Vec::new(),
+                        },
+                        fields: vec![("x".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared(
+                    "OtherRecord",
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("z".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+                declared("CaseTail", artifact_type(a::Core::Sum(row("Y")))),
+                declared(
+                    "Cases",
+                    artifact_type(a::Core::Sum(a::Row {
+                        labels: row("X").labels,
+                        rest: a::Rest::More(Box::new(row("Y"))),
+                    })),
+                ),
+                declared("OtherCases", artifact_type(a::Core::Sum(row("Z")))),
+                // Keep a named indirection in the artifact too: flattening is
+                // deliberately performed after all regular nodes are built.
+                declared("RecordAlias", named("Record")),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "type LocalRecord = { x: Nat, y: Nat }\n\
+               type LocalCases = #X | #Y\n\
+               module L =\n  effect Record = get : LocalRecord -> ()\n  effect Cases = get : LocalCases -> ()\nend\n\
+               module I =\n  effect Record = get : dep::Record -> ()\n  effect Cases = get : dep::Cases -> ()\nend\n\
+               module D =\n  effect Record = get : dep::OtherRecord -> ()\n  effect Cases = get : dep::OtherCases -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for name in ["Record", "Cases"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1], "{name} composition was not flattened");
+        assert_ne!(ids[0], ids[2], "{name} labels were lost while flattening");
+    }
+}
+
+#[test]
+fn absent_semantic_payloads_do_not_affect_structural_identity() {
+    let absent = |ty| a::RowField {
+        presence: a::Presence::Absent,
+        ty,
+    };
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let types = [a::Core::Nat, a::Core::String]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, payload)| {
+            let suffix = index + 1;
+            [
+                declared(
+                    &format!("Record{suffix}"),
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("hidden".into(), absent(artifact_type(payload.clone())))],
+                    },
+                ),
+                declared(
+                    &format!("Cases{suffix}"),
+                    artifact_type(a::Core::Sum(a::Row {
+                        labels: vec![("Hidden".into(), absent(artifact_type(payload)))],
+                        rest: a::Rest::Closed,
+                    })),
+                ),
+            ]
+        })
+        .collect();
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types,
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module A =\n  effect Record = get : dep::Record1 -> ()\n  effect Cases = get : dep::Cases1 -> ()\nend\n\
+               module B =\n  effect Record = get : dep::Record2 -> ()\n  effect Cases = get : dep::Cases2 -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for name in ["Record", "Cases"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "absent {name} payload leaked into identity");
+    }
+}
+
+#[test]
+fn local_and_imported_structural_types_share_one_canonical_encoding() {
+    let unit = || artifact_type(a::Core::Unit);
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let record = a::Type {
+        core: a::Core::Unit,
+        fields: vec![("x".into(), present(artifact_type(a::Core::Nat)))],
+    };
+    let sum = artifact_type(a::Core::Sum(a::Row {
+        labels: vec![("X".into(), present(unit()))],
+        rest: a::Rest::Closed,
+    }));
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![
+                declared("Record", record),
+                declared("Cases", sum),
+                declared(
+                    "Alias",
+                    artifact_type(a::Core::Named {
+                        name: "dep@1.0.0::Record".into(),
+                        args: Vec::new(),
+                    }),
+                ),
+                declared(
+                    "Different",
+                    a::Type {
+                        core: a::Core::Unit,
+                        fields: vec![("z".into(), present(artifact_type(a::Core::Nat)))],
+                    },
+                ),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "type LocalRecord = { x: Nat }\n\
+               type LocalCases = #X\n\
+               type LocalAlias = LocalRecord\n\
+               module L =\n  effect Record = get : LocalRecord -> ()\n  effect Cases = get : LocalCases -> ()\n  effect Alias = get : LocalAlias -> ()\nend\n\
+               module I =\n  effect Record = get : dep::Record -> ()\n  effect Cases = get : dep::Cases -> ()\n  effect Alias = get : dep::Alias -> ()\nend\n\
+               module D =\n  effect Record = get : dep::Different -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    for name in ["Cases", "Alias"] {
+        let ids: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            ids[0], ids[1],
+            "{name} differs across syntax/semantic boundary"
+        );
+    }
+    let records: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Record")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0], records[1]);
+    assert_ne!(records[0], records[2]);
+}
+
+#[test]
+fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::Box".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: artifact_type(a::Core::Bound(0)),
+                },
+            }],
+            effects: [
+                ("IO", "read:{}->Nat"),
+                ("Net", "send:String->{}"),
+                ("Log", "write:Nat->{}"),
+            ]
+            .into_iter()
+            .map(|(name, interface)| a::DeclaredEffect {
+                name: format!("dep@1.0.0::{name}"),
+                identity: Some(a::EffectIdentity {
+                    name: name.into(),
+                    interface: interface.into(),
+                }),
+                kind: a::EffectKind::Operations(Vec::new()),
+            })
+            .chain(["A", "B"].into_iter().map(|name| a::DeclaredEffect {
+                name: format!("dep@1.0.0::{name}"),
+                identity: None,
+                kind: a::EffectKind::Alias(vec!["dep@1.0.0::Log".into()]),
+            }))
+            .collect(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "type Wrap 'a = dep::Box 'a\n\
+               type Deep 'a = Wrap (Wrap 'a)\n\
+               module N =\n  effect Pick = get : Wrap Nat -> ()\n  effect DeepPick = get : Deep Nat -> ()\n  effect Recover = run : (() -> () + dep::!IO) -> ()\nend\n\
+               module S =\n  effect Pick = get : Wrap String -> ()\n  effect DeepPick = get : Deep String -> ()\n  effect Recover = run : (() -> () + dep::!Net) -> ()\nend\n\
+               effect Both = dep::!A + dep::!B";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["impure-operation", "impure-operation", "duplicate-case"]
+    );
+    let identities = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect::<Vec<_>>()
+    };
+    let picks = identities("Pick");
+    assert_ne!(picks[0], picks[1], "Box Nat and Box String stay distinct");
+    let deep_picks = identities("DeepPick");
+    assert_ne!(
+        deep_picks[0], deep_picks[1],
+        "nested local aliases preserve imported application arguments"
+    );
+    let recovered = identities("Recover");
+    assert_ne!(
+        recovered[0], recovered[1],
+        "imported effect ids stay distinct"
+    );
+    assert_eq!(out.errors[2].span.start, src.rfind("dep::!B").unwrap());
+}
+
+#[test]
+fn imported_effects_in_recovery_signatures_compare_structurally() {
+    let first = effect_artifact("first", "read:{}->Nat");
+    let second = effect_artifact("second", "read:{}->Nat");
+    let distinct = effect_artifact("distinct", "read:{}->String");
+    let imports = [
+        DependencyImport {
+            alias: "first",
+            artifact: &first,
+        },
+        DependencyImport {
+            alias: "second",
+            artifact: &second,
+        },
+        DependencyImport {
+            alias: "distinct",
+            artifact: &distinct,
+        },
+    ];
+    let src = "module A =\n  effect Recover = run : (() -> () + first::!IO) -> ()\nend\n\
+               module B =\n  effect Recover = run : (() -> () + second::!IO) -> ()\nend\n\
+               module C =\n  effect Recover = run : (() -> () + distinct::!IO) -> ()\nend";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let recover: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Recover")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(recover.len(), 3);
+    assert_eq!(recover[0], recover[1]);
+    assert_ne!(recover[0], recover[2]);
+}
+
+#[test]
+fn ir_dependency_aliases_reject_reserved_identifiers() {
+    let dependency = effect_artifact("dep", "read:{}->Nat");
+    let import = DependencyImport {
+        alias: "let",
+        artifact: &dependency,
+    };
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, Vec::new(), &[import], &[]);
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::InvalidDependencyAlias { alias },
+            ..
+        }] if alias == "let"
+    ));
+}
+
+#[test]
+fn duplicate_dependency_aliases_are_rejected_without_merging_roots() {
+    let first = effect_artifact("first", "read:{}->Nat");
+    let mut second = effect_artifact("second", "send:String->{}");
+    second.header.effects[0].name = "second@1.0.0::Net".to_string();
+    second.header.effects[0].identity.as_mut().unwrap().name = "Net".to_string();
+    let imports = [
+        DependencyImport {
+            alias: "shared",
+            artifact: &first,
+        },
+        DependencyImport {
+            alias: "shared",
+            artifact: &second,
+        },
+    ];
+    let src = "effect Both = shared::!IO + shared::!Net";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependency_imports(&mut mint, parsed.stmts, &imports, &[]);
+
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-dependency-alias", "undefined-effect"]
+    );
+    assert!(
+        out.program
+            .external_names
+            .values()
+            .any(|name| name == "first@1.0.0::IO")
+    );
+    assert!(
+        !out.program
+            .external_names
+            .values()
+            .any(|name| name.starts_with("second@"))
+    );
+}
+
+#[test]
+fn dependency_interfaces_import_every_semantic_form() {
+    let unit = || artifact_type(a::Core::Unit);
+    let field = |presence| a::RowField {
+        presence,
+        ty: unit(),
+    };
+    let rich = a::Type {
+        core: a::Core::Arrow(
+            Box::new(artifact_type(a::Core::Named {
+                name: "other@2.0.0::Remote".to_string(),
+                args: vec![artifact_type(a::Core::Bound(1))],
+            })),
+            Box::new(artifact_type(a::Core::Rigid {
+                id: 4,
+                name: "r".to_string(),
+            })),
+            a::Row {
+                labels: vec![
+                    ("present".to_string(), field(a::Presence::Present)),
+                    ("absent".to_string(), field(a::Presence::Absent)),
+                    ("var".to_string(), field(a::Presence::Var(2))),
+                    ("bound".to_string(), field(a::Presence::Bound(0))),
+                    ("unknown".to_string(), field(a::Presence::Undecided)),
+                ],
+                rest: a::Rest::More(Box::new(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Rigid {
+                        id: 5,
+                        name: "tail".to_string(),
+                    },
+                })),
+            },
+        ),
+        fields: vec![("x".to_string(), field(a::Presence::Present))],
+    };
+    let formula = a::Formula::And(
+        Box::new(a::Formula::Not(Box::new(a::Formula::Var(0)))),
+        Box::new(a::Formula::Or(
+            Box::new(a::Formula::Bound(1)),
+            Box::new(a::Formula::Iff(
+                Box::new(a::Formula::False),
+                Box::new(a::Formula::Xor(
+                    Box::new(a::Formula::True),
+                    Box::new(a::Formula::Bound(0)),
+                )),
+            )),
+        )),
+    );
+    let mut values = vec![a::Value {
+        name: "dep@1.0.0::M::rich".to_string(),
+        scheme: a::Scheme {
+            count: 3,
+            presences: 1,
+            formula,
+            body: rich,
+        },
+    }];
+    for (name, core) in [
+        ("unit", a::Core::Unit),
+        ("nat", a::Core::Nat),
+        ("int", a::Core::Int),
+        ("real", a::Core::Real),
+        ("string", a::Core::String),
+        ("boolean", a::Core::Boolean),
+        ("var", a::Core::Var(0)),
+        ("bound", a::Core::Bound(0)),
+        ("undecided", a::Core::Undecided),
+        (
+            "sum-closed",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            }),
+        ),
+        (
+            "sum-var",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Var(0),
+            }),
+        ),
+        (
+            "sum-bound",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        ),
+        (
+            "sum-undecided",
+            a::Core::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Undecided,
+            }),
+        ),
+    ] {
+        values.push(a::Value {
+            name: format!("dep@1.0.0::{name}"),
+            scheme: artifact_scheme(artifact_type(core)),
+        });
+    }
+    values.push(a::Value {
+        name: "wrong@1.0.0::ignored".to_string(),
+        scheme: artifact_scheme(unit()),
+    });
+
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: Vec::new(),
+            values,
+            types: vec![a::DeclaredType {
+                name: "dep@1.0.0::M::T".to_string(),
+                params: vec![
+                    a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: vec!["x".to_string()],
+                        relevant: true,
+                    },
+                    a::Parameter {
+                        sense: a::Sense::Cases,
+                        lacks: Vec::new(),
+                        relevant: false,
+                    },
+                    a::Parameter {
+                        sense: a::Sense::Effects,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    },
+                ],
+                scheme: artifact_scheme(artifact_type(a::Core::Named {
+                    name: "dep@1.0.0::M::T".to_string(),
+                    args: Vec::new(),
+                })),
+            }],
+            effects: vec![
+                a::DeclaredEffect {
+                    name: "dep@1.0.0::M::Read".to_string(),
+                    identity: Some(a::EffectIdentity {
+                        name: "Read".to_string(),
+                        interface: "get:{}->Nat".to_string(),
+                    }),
+                    kind: a::EffectKind::Operations(vec![a::Operation {
+                        name: "get".to_string(),
+                        from: unit(),
+                        to: artifact_type(a::Core::Nat),
+                    }]),
+                },
+                a::DeclaredEffect {
+                    name: "dep@1.0.0::Alias".to_string(),
+                    identity: None,
+                    kind: a::EffectKind::Alias(vec![
+                        "dep@1.0.0::M::Read".to_string(),
+                        "other@2.0.0::IO".to_string(),
+                    ]),
+                },
+            ],
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    // A second header with the same root/name covers deterministic duplicate
+    // handling; the first declaration remains the source-visible one.
+    let mut duplicate = dependency.clone();
+    duplicate.header.values.clear();
+    duplicate.header.types.clear();
+    duplicate.header.effects.clear();
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, Vec::new(), &[dependency, duplicate]);
+
+    assert_eq!(out.errors.len(), 1);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::DuplicateDependency { .. }
+    ));
+    // The declared type plus a recovery interface for the transitive `Remote`
+    // reference whose header was deliberately not supplied.
+    assert_eq!(out.program.external_types.len(), 2);
+    assert_eq!(out.program.external_operations.len(), 1);
+    assert!(
+        out.program
+            .external_names
+            .values()
+            .any(|name| name == "other@2.0.0::IO")
+    );
+    assert!(
+        !out.program
+            .external_names
+            .values()
+            .any(|name| name.contains("ignored"))
     );
 }
 

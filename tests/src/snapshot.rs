@@ -1,28 +1,25 @@
 //! Tests for [`ruddy_debug::snapshot`].
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
+
+use indexmap::IndexMap;
 
 use ruddy_debug::{
-    snapshot::{ROOT, compile, guard, install_hook},
+    snapshot::{ROOT, compile, compile_at, guard, install_hook},
     stage::REGISTRY,
-    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
+    wire::{
+        CompileRequest, DependencyDetail, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage,
+        Status, View,
+    },
 };
 
 const DEMO: &str = include_str!("../../demo.hc");
-
-/// The header every snippet is compiled under: a bundle's root file must open
-/// with one, so a snippet that did not write its own would be told so. Every
-/// span in the snippet therefore sits this many bytes further in.
-const HEADER: &str = "bundle demo 0.1.0\n";
 
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
-    (
-        ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
-    ),
+    (ROOT, "module Math\nlet four = Math::double 2n\n"),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
     ("Math/Vec.hc", "let zero = 0n\n"),
 ];
@@ -32,10 +29,9 @@ fn snapshot(snippet: &str) -> Snapshot {
     bundle(&[(ROOT, &compiled(snippet))])
 }
 
-/// What a snippet is compiled as, for the tests that check a span against the
-/// bytes it covers: the same text the compiler read, header and all.
+/// What a snippet is compiled as, for tests that inspect the exact bytes read.
 fn compiled(snippet: &str) -> String {
-    format!("{HEADER}{snippet}")
+    snippet.to_string()
 }
 
 /// A whole bundle, each file exactly as written — the request the page posts,
@@ -43,6 +39,10 @@ fn compiled(snippet: &str) -> String {
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            name: "demo".to_string(),
+            version: "0.1.0".to_string(),
+            root: ROOT.to_string(),
+            document: "demo".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -50,19 +50,16 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            dependencies: IndexMap::new(),
             revision: 3,
         },
         1,
     )
 }
 
-/// Where a range written in a snippet's own offsets ends up on the wire: in the
-/// root file, [`HEADER`] bytes further in than the snippet spells it.
+/// Where a range written in a snippet's own offsets ends up on the wire.
 fn at(range: [usize; 2]) -> Option<Loc> {
-    Some(Loc {
-        file: 0,
-        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
-    })
+    Some(Loc { file: 0, range })
 }
 
 fn nodes(stage: &Stage) -> Vec<&Node> {
@@ -78,6 +75,458 @@ fn nodes(stage: &Stage) -> Vec<&Node> {
 }
 
 #[test]
+fn compile_requests_without_dependencies_remain_compatible() {
+    let request: CompileRequest =
+        serde_json::from_str(r#"{"files":[{"path":"main.hc","source":""}],"revision":4}"#).unwrap();
+    assert_eq!(request.name, "demo");
+    assert_eq!(request.version, "0.1.0");
+    assert!(request.dependencies.is_empty());
+    assert_eq!(request.revision, 4);
+
+    let request: CompileRequest = serde_json::from_str(
+        r#"{"files":[],"dependencies":{"http_core":{"bundle":"http-core","path":"../http-core"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &request.dependencies["http_core"],
+        DependencySpec::Detailed(detail)
+            if detail.bundle.as_deref() == Some("http-core")
+                && detail.path.as_deref() == Some(std::path::Path::new("../http-core"))
+    ));
+
+    let git: CompileRequest = serde_json::from_str(
+        r#"{"files":[],"dependencies":{"http_core":{"bundle":"http-core","git":"https://example.test/http-core","branch":"next"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        &git.dependencies["http_core"],
+        DependencySpec::Detailed(detail)
+            if detail.bundle.as_deref() == Some("http-core")
+                && detail.git.as_deref() == Some("https://example.test/http-core")
+                && detail.branch.as_deref() == Some("next")
+    ));
+
+    let old = serde_json::from_str::<CompileRequest>(
+        r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
+    )
+    .unwrap_err();
+    assert!(old.to_string().contains("unknown field `package`"), "{old}");
+}
+
+#[test]
+fn dependency_paths_without_a_scratch_root_are_recoverable() {
+    let mut dependencies = IndexMap::new();
+    dependencies.insert("base".to_string(), "../base".into());
+    let snapshot = compile(
+        &CompileRequest {
+            name: "debugger".to_string(),
+            version: "1.2.3".to_string(),
+            root: ROOT.to_string(),
+            document: "debugger".to_string(),
+            files: vec![FileSpec {
+                path: ROOT.to_string(),
+                source: compiled("let main = 0n\n"),
+            }],
+            dependencies,
+            revision: 9,
+        },
+        1,
+    );
+    assert_eq!(snapshot.diagnostics[0].stage, "dependencies");
+    assert_eq!(snapshot.diagnostics[0].code, "missing-scratch-root");
+    assert_eq!(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "ir")
+            .unwrap()
+            .status,
+        Status::Partial
+    );
+    assert_eq!(
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+}
+
+#[test]
+fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
+    let scratch = tempfile::tempdir().unwrap();
+    let app = scratch.path().join("app");
+    let base = scratch.path().join("base");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
+    fs::write(
+        base.join("Ruddy.toml"),
+        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    let mut dependencies = IndexMap::new();
+    dependencies.insert("base".to_string(), "../base".into());
+    let request = CompileRequest {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        root: ROOT.to_string(),
+        document: "app".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let app = base::base\n".to_string(),
+        }],
+        dependencies,
+        revision: 1,
+    };
+    let built = compile_at(&request, 1, scratch.path());
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    let artifact = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "artifact")
+        .unwrap();
+    assert!(
+        artifact
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("(dependency \"base\" \"2.3.4\")")
+    );
+    assert!(
+        artifact
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("base@2.3.4::base")
+    );
+    let dependencies = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .unwrap();
+    assert_eq!(dependencies.status, Status::Ok);
+    let dependency = &dependencies.nodes[0].children[0];
+    assert_eq!(dependency.text, "base@2.3.4");
+    assert!(
+        dependency
+            .fields
+            .iter()
+            .any(|field| field.name == "source" && field.value == "path ../base")
+    );
+    assert!(
+        dependency
+            .fields
+            .iter()
+            .any(|field| field.name == "imported values" && field.value == "1")
+    );
+
+    fs::write(base.join("main.hc"), "let bad : Nat = fn x => x\n").unwrap();
+    let failed = compile_at(&request, 1, scratch.path());
+    assert_eq!(failed.diagnostics[0].stage, "dependencies");
+    assert_eq!(
+        failed
+            .stages
+            .iter()
+            .find(|stage| stage.id == "lir")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+    assert_eq!(
+        failed
+            .stages
+            .iter()
+            .find(|stage| stage.id == "artifact")
+            .unwrap()
+            .status,
+        Status::Skipped
+    );
+}
+
+#[test]
+fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
+    let scratch = tempfile::tempdir().unwrap();
+    for (directory, version, source) in [
+        ("old-lib", "1.0.0", "let one = 1n\n"),
+        ("new-lib", "2.0.0", "let one = 1n\nlet two = 2n\n"),
+    ] {
+        let path = scratch.path().join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("main.hc"), source).unwrap();
+        fs::write(
+            path.join("Ruddy.toml"),
+            format!(
+                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\n"
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(scratch.path().join("app")).unwrap();
+    let detailed = |path: &str| {
+        DependencySpec::Detailed(DependencyDetail {
+            bundle: Some("lib".into()),
+            path: Some(path.into()),
+            git: None,
+            branch: None,
+            tag: None,
+            rev: None,
+        })
+    };
+    let dependencies = IndexMap::from([
+        ("old".into(), detailed("../old-lib")),
+        ("new".into(), detailed("../new-lib")),
+    ]);
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let old_one = old::one\nlet new_two = new::two\n".into(),
+        }],
+        dependencies,
+        revision: 1,
+    };
+
+    let snapshot = compile_at(&request, 1, scratch.path());
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .expect("dependencies stage");
+    let projects = &stage.nodes[0].children;
+    assert_eq!(
+        projects
+            .iter()
+            .map(|node| node.text.as_str())
+            .collect::<Vec<_>>(),
+        ["lib@1.0.0", "lib@2.0.0"]
+    );
+    let imported_values = |node: &Node| {
+        node.fields
+            .iter()
+            .find(|field| field.name == "imported values")
+            .map(|field| field.value.clone())
+    };
+    assert_eq!(imported_values(&projects[0]).as_deref(), Some("1"));
+    assert_eq!(imported_values(&projects[1]).as_deref(), Some("2"));
+}
+
+#[test]
+fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
+    let scratch = tempfile::tempdir().unwrap();
+    for directory in ["app", "base", "shared"] {
+        fs::create_dir_all(scratch.path().join(directory)).unwrap();
+    }
+    fs::write(
+        scratch.path().join("shared/Ruddy.toml"),
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
+    fs::write(
+        scratch.path().join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+    )
+    .unwrap();
+    fs::write(
+        scratch.path().join("base/main.hc"),
+        "let value = shared::value\n",
+    )
+    .unwrap();
+
+    let request = CompileRequest {
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let value = base::value\n".into(),
+        }],
+        ..dependency_request(IndexMap::from([("base".into(), "../base".into())]))
+    };
+    let snapshot = compile_at(&request, 1, scratch.path());
+
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let dependencies = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .expect("dependencies stage");
+    assert_eq!(dependencies.status, Status::Ok);
+    // The tab lists source-visible roots only; successful compilation of
+    // `base::value` proves its detailed transitive dependency was linked.
+    assert_eq!(dependencies.nodes[0].children[0].text, "base@1.0.0");
+}
+
+#[test]
+fn failed_graph_validation_is_reported_for_the_dependency_build() {
+    let scratch = tempfile::tempdir().unwrap();
+    fs::create_dir_all(scratch.path().join("app")).unwrap();
+    fs::create_dir_all(scratch.path().join("base")).unwrap();
+    fs::write(
+        scratch.path().join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nmissing = \"../../outside\"\n",
+    )
+    .unwrap();
+    fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
+    let request = dependency_request(IndexMap::from([
+        ("base".into(), "../base".into()),
+        ("alias".into(), "../base".into()),
+    ]));
+
+    let snapshot = compile_at(&request, 1, scratch.path());
+    assert_eq!(
+        snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "dependency-build")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(scratch.join("base")).unwrap();
+    let outside = outer.path().join("outside.hc");
+    fs::write(&outside, "let outside = 0n\n").unwrap();
+
+    for root in [
+        outside.display().to_string(),
+        "../../outside.hc".to_string(),
+    ] {
+        fs::write(
+            scratch.join("base/Ruddy.toml"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\n"),
+        )
+        .unwrap();
+        let snapshot = compile_at(
+            &dependency_request(IndexMap::from([("base".into(), "../base".into())])),
+            1,
+            &scratch,
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency-build"),
+            "{:#?}",
+            snapshot.diagnostics
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    let base = scratch.join("base");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
+    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n";
+    let outside = outer.path().join("outside.toml");
+    fs::write(&outside, manifest).unwrap();
+    std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
+
+    let request = dependency_request(IndexMap::from([("base".into(), "../base".into())]));
+    let snapshot = compile_at(&request, 1, &scratch);
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dependency-build"),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let error =
+        ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap_err();
+    assert!(error.to_string().contains("escapes sandbox"), "{error}");
+
+    fs::remove_file(base.join("Ruddy.toml")).unwrap();
+    let shared = scratch.join("base-manifest.toml");
+    fs::write(&shared, manifest).unwrap();
+    std::os::unix::fs::symlink(&shared, base.join("Ruddy.toml")).unwrap();
+
+    let snapshot = compile_at(&request, 2, &scratch);
+    assert!(
+        !snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("dependency-")),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    ruddy_cli::compile_sandboxed_dependency_graph([("base", &base)], &scratch).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    fs::create_dir_all(scratch.join("app")).unwrap();
+    fs::create_dir_all(scratch.join("base")).unwrap();
+    fs::write(
+        scratch.join("base/Ruddy.toml"),
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
+    let outside = outer.path().join("Escape.hc");
+    fs::write(&outside, "let escaped = 0n\n").unwrap();
+    std::os::unix::fs::symlink(&outside, scratch.join("base/Escape.hc")).unwrap();
+
+    let snapshot = compile_at(
+        &dependency_request(IndexMap::from([("base".into(), "../base".into())])),
+        1,
+        &scratch,
+    );
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dependency-build"),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+}
+
+fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest {
+    let dependencies = dependencies
+        .into_iter()
+        .map(|(name, path)| (name, path.into()))
+        .collect();
+    CompileRequest {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        root: ROOT.to_string(),
+        document: "app".to_string(),
+        files: vec![FileSpec {
+            path: ROOT.to_string(),
+            source: "let app = 0n\n".to_string(),
+        }],
+        dependencies,
+        revision: 1,
+    }
+}
+
+#[test]
 fn every_stage_reports_on_the_demo() {
     let snapshot = bundle(&[(ROOT, DEMO)]);
     let ids: Vec<_> = snapshot.stages.iter().map(|stage| stage.id).collect();
@@ -85,6 +534,7 @@ fn every_stage_reports_on_the_demo() {
         ids,
         [
             "tokens",
+            "dependencies",
             "ast",
             "externs",
             "ir",
@@ -94,6 +544,8 @@ fn every_stage_reports_on_the_demo() {
             "presence",
             "patterns",
             "lir",
+            "artifact",
+            "linked",
             "symbols",
             "types-ir"
         ]
@@ -104,7 +556,7 @@ fn every_stage_reports_on_the_demo() {
         // The demo ends in three deliberate mistakes, and LIR runs on accepted
         // programs alone — so its tab is the one that reports `Skipped` here,
         // with a summary saying so and no rows behind it.
-        if stage.id == "lir" {
+        if matches!(stage.id, "lir" | "artifact" | "linked") {
             assert_eq!(stage.status, Status::Skipped);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -128,6 +580,7 @@ fn every_stage_reports_on_the_demo() {
         titles,
         [
             "Tokens",
+            "Dependencies",
             "AST",
             "Externs",
             "IR",
@@ -137,6 +590,8 @@ fn every_stage_reports_on_the_demo() {
             "Presence",
             "Patterns",
             "LIR",
+            "Artifact",
+            "Linked Artifact",
             "Symbols"
         ]
     );
@@ -316,9 +771,7 @@ fn a_natural_reaches_every_stage() {
             .iter()
             .find(|stage| stage.id == id)
             .expect("the stage is registered");
-        // By what it says rather than by being the first of its kind: the
-        // header's version parts are naturals too, and they are written above
-        // every snippet.
+        // By what it says rather than by being the first of its kind.
         let node = nodes(stage)
             .into_iter()
             .find(|node| node.label == "Natural" && node.text == "42n")
@@ -386,8 +839,7 @@ fn the_surface_prerequisites_reach_every_stage() {
     // place the two trees are meant to differ.
     assert_eq!(labelled("ir", "Prim"), ["Nat", "Nat", "Nat"]);
     assert_eq!(labelled("tokens", "Arrow"), ["->"]);
-    // The two the header's version is written with, and then the projection's.
-    assert_eq!(labelled("tokens", "Dot"), [".", ".", "."]);
+    assert_eq!(labelled("tokens", "Dot"), ["."]);
 }
 
 /// The row forms — a `when`-named presence, and a named tail — checked through
@@ -422,13 +874,9 @@ fn rows_reach_every_stage() {
     assert_eq!(labelled("tokens", "DotDot"), [".."]);
     // `when` lexes as the ordinary identifier it is — contextual, not
     // reserved — which is what keeps a term or a label of that name writable.
-    // The `demo` in front of them is the header's own name, which is an
-    // identifier like any other.
     assert_eq!(
         labelled("tokens", "Identifier"),
-        [
-            "demo", "f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"
-        ]
+        ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
     );
 
     for id in ["ast", "ir"] {
@@ -1040,6 +1488,21 @@ fn a_snapshot_survives_the_wire() {
     );
     assert_eq!(back["stages"][0]["view"], "list");
     assert_eq!(back["stages"][1]["view"], "tree");
+    let artifact = back["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .find(|stage| stage["id"] == "artifact")
+        .expect("the artifact stage is registered");
+    assert_eq!(
+        artifact["views"]
+            .as_array()
+            .expect("artifact views")
+            .iter()
+            .map(|view| view.as_str())
+            .collect::<Vec<_>>(),
+        [Some("text"), Some("tree")]
+    );
     // The file strip and everything a `Loc` is read against: one entry per file
     // the loader read, each carrying what the page turns an offset into a line
     // and a column with.
@@ -1054,7 +1517,7 @@ fn a_snapshot_survives_the_wire() {
             .len()
             > 1
     );
-    // And the identity the root file declared, for the chip.
+    // And the externally supplied identity, for the chip.
     assert_eq!(back["bundle"], "demo@0.1.0");
     // Underscored fields are the page's, and have to survive too: the
     // editor's colouring is built from them.
@@ -1083,8 +1546,8 @@ fn a_snapshot_survives_the_wire() {
     assert!(json.contains("\"owner\""));
 }
 
-/// A bundle whose root file declares itself and nothing else is a program with
-/// nothing in it, not a program with something wrong with it.
+/// An empty root is a program with nothing in it, not a program with something
+/// wrong with it; identity is supplied independently.
 #[test]
 fn an_empty_buffer_is_not_an_error() {
     let snapshot = snapshot("");
@@ -1095,29 +1558,46 @@ fn an_empty_buffer_is_not_an_error() {
     );
     assert!(snapshot.panic.is_none());
     assert_eq!(snapshot.files.len(), 1);
-    assert_eq!(snapshot.files[0].len, HEADER.len());
-    assert_eq!(snapshot.files[0].line_starts, vec![0, HEADER.len()]);
+    assert_eq!(snapshot.files[0].len, 0);
+    assert_eq!(snapshot.files[0].line_starts, vec![0]);
 }
 
-/// A header the reader is halfway through typing is not a reason to stop
-/// compiling: the identity is reported as the mistake it is, the mint falls back
-/// to one of its own, and every later phase still runs.
+/// Bad externally supplied configuration is not a reason to stop compiling:
+/// it is reported, the mint falls back, and every later phase still runs.
 #[test]
 fn a_bad_bundle_is_reported_rather_than_fatal() {
-    // A name the lexer reads as an ordinary identifier and `Bundle::new`
-    // refuses: an identifier may open with `_` and a bundle name may not.
-    let snapshot = bundle(&[(ROOT, "bundle _x 0.1.0\nlet x = ()")]);
-    assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
-    // And the chip has nothing to show, because nothing was declared it could
-    // be shown from.
-    assert_eq!(snapshot.bundle, None);
-    // The fallback bundle still lowers the program.
-    let ir = snapshot
-        .stages
-        .iter()
-        .find(|stage| stage.id == "ir")
-        .expect("ir stage");
-    assert_eq!(ir.nodes.len(), 1);
+    for (name, version) in [
+        ("_x", "0.1.0"),
+        ("demo", "not-a-version"),
+        ("demo", "1.2.3+unsupported"),
+    ] {
+        let snapshot = compile(
+            &CompileRequest {
+                name: name.to_string(),
+                version: version.to_string(),
+                root: ROOT.to_string(),
+                document: "demo".to_string(),
+                files: vec![FileSpec {
+                    path: ROOT.to_string(),
+                    source: "let x = ()".to_string(),
+                }],
+                dependencies: IndexMap::new(),
+                revision: 3,
+            },
+            1,
+        );
+        assert_eq!(snapshot.diagnostics[0].code, "bad-bundle-identity");
+        // And the chip has nothing to show because the supplied identity was
+        // invalid.
+        assert_eq!(snapshot.bundle, None);
+        // The fallback bundle still lowers the program.
+        let ir = snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == "ir")
+            .expect("ir stage");
+        assert_eq!(ir.nodes.len(), 1);
+    }
 }
 
 /// The file list is the index every `Loc` on the wire points into, so it has to
@@ -1149,8 +1629,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
     // Each with what the page turns an offset in it into a line and a column.
     assert_eq!(snapshot.files[2].line_starts, vec![0, 14]);
 
-    // And the chip reads what the root file's header declared, which is the
-    // only place a bundle is named at all.
+    // And the chip reports the identity supplied independently of all files.
     assert_eq!(snapshot.bundle.as_deref(), Some("demo@0.1.0"));
 }
 
@@ -1160,10 +1639,7 @@ fn a_bundle_lists_every_file_the_loader_read() {
 /// worse than revealing nothing.
 #[test]
 fn a_span_from_a_module_file_names_that_file() {
-    let snapshot = bundle(&[
-        (ROOT, "bundle demo 0.1.0\nmodule Math\n"),
-        ("Math.hc", "let double = nope\n"),
-    ]);
+    let snapshot = bundle(&[(ROOT, "module Math\n"), ("Math.hc", "let double = nope\n")]);
 
     // Every token of a file's row is a span in that file, which is the whole of
     // what the index has to get right.
@@ -1197,7 +1673,7 @@ fn a_span_from_a_module_file_names_that_file() {
 /// fix it.
 #[test]
 fn a_missing_module_file_reaches_the_strip() {
-    let root = "bundle demo 0.1.0\nmodule Math\nlet four = 4n\n";
+    let root = "module Math\nlet four = 4n\n";
     let snapshot = bundle(&[(ROOT, root)]);
 
     let [diagnostic] = snapshot.diagnostics.as_slice() else {
@@ -1252,7 +1728,7 @@ fn a_request_without_a_root_file_is_told_so() {
     // the file strip has one tab and the orphan module file is not in it.
     let files: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(files, [ROOT]);
-    assert_eq!(snapshot.bundle, None);
+    assert_eq!(snapshot.bundle.as_deref(), Some("demo@0.1.0"));
     assert!(snapshot.panic.is_none());
 }
 
@@ -1355,7 +1831,14 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     assert_eq!(
         ids(true),
         [
-            "tokens", "ast", "ir", "types", "presence", "patterns", "symbols"
+            "tokens",
+            "dependencies",
+            "ast",
+            "ir",
+            "types",
+            "presence",
+            "patterns",
+            "symbols"
         ]
     );
     // LIR owns a phase too, and reports nothing here for the other reason a
@@ -1363,7 +1846,15 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     // no duration to report rather than no phase to have one.
     assert_eq!(
         ids(false),
-        ["externs", "constraints", "solve", "lir", "types-ir"]
+        [
+            "externs",
+            "constraints",
+            "solve",
+            "lir",
+            "artifact",
+            "linked",
+            "types-ir"
+        ]
     );
 
     // On a program with nothing wrong with it, it reports one like everybody
@@ -1376,6 +1867,26 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         .expect("the lir stage is registered");
     assert_eq!(lir.status, Status::Ok);
     assert!(lir.micros.is_some());
+    let artifact = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "artifact")
+        .expect("the artifact stage is registered");
+    assert_eq!(artifact.status, Status::Ok);
+    assert!(artifact.micros.is_some());
+    let linked = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "linked")
+        .expect("the link stage is registered");
+    assert_eq!(linked.status, Status::Ok);
+    assert!(linked.micros.is_some());
+    assert!(
+        artifact
+            .text
+            .as_ref()
+            .is_some_and(|text| text.starts_with("(artifact\n  (header"))
+    );
 }
 
 /// A tab's raw view dumps what that tab owns, and no more.
@@ -1979,7 +2490,7 @@ fn a_match_and_a_pattern_let_reach_every_stage() {
     );
 
     // Every span the two tabs hand out is a real position in this source — in
-    // the file it was written in, which for a snippet is the one the header
+    // the file it was written in, which for a snippet is the one the source
     // sits at the top of.
     let text = compiled(source);
     for id in ["ast", "ir"] {

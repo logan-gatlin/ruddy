@@ -1,0 +1,19 @@
+# Ruddy
+
+Ruddy projects are configured by `Ruddy.toml`. Dependencies can be local paths or HTTPS Git repositories:
+
+```toml
+[dependencies]
+local = "../local"
+http_core = { path = "../http-core", bundle = "http-core" }
+remote = { git = "https://example.com/team/remote.git", branch = "main" }
+release = { git = "https://example.com/team/release.git", tag = "v1.0.0" }
+pinned = { git = "https://example.com/team/pinned.git", rev = "0123456" }
+aliased = { git = "https://example.com/team/http-core.git", bundle = "http-core" }
+```
+
+A Git dependency accepts at most one of `branch`, `tag`, or `rev`; without one, Ruddy resolves the remote default branch. `rev` currently accepts an unambiguous 7–40 digit hexadecimal commit prefix reachable through the repository's normally fetched branches or tags; arbitrary revision expressions and other advertised ref names are not yet accepted. Only HTTPS URLs are accepted, including after ambient Git URL rewriting. A successful resolution records the full lowercase commit in the root project's `Ruddy.lock`, including transitive Git dependencies. Commit `Ruddy.lock` for reproducible builds. A failed resolution or compilation does not replace it.
+
+Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—Ruddy never invokes a Git executable. `RUDDY_HOME` uses a non-empty explicit override when set and otherwise defaults to `$HOME/.ruddy` (independent of `XDG_CACHE_HOME`). All global Git cache data lives beneath `$RUDDY_HOME/cache/git`: checkouts are in `$RUDDY_HOME/cache/git/checkouts`, with temporary clones and the advisory lock alongside them under that cache directory. The project-local `Ruddy.lock` is not part of this cache. Resolution can populate the cache even if compilation later fails. Cached trees are restored to their locked commit under a cross-process lock before every compilation. `compile` and `compile_graph` write no artifacts, but may fetch dependencies and update `Ruddy.lock`; `build` writes local artifacts only after the entire graph compiles and never writes into Git cache checkouts.
+
+`ruddy new NAME` creates a project and initializes its repository. `Ruddy.lock` is generated on the first dependency resolution and is intentionally not ignored; only `/build/` is listed in a new project's `.gitignore`.

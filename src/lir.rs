@@ -1802,16 +1802,25 @@ impl Lower<'_> {
                             name: self.mint.name(*symbol).to_string(),
                         },
                     );
-                    // A defined global was compiled at its definition's type;
-                    // an extern is supplied directly at this instantiated use
-                    // type, since it has no Ruddy initializer with another
-                    // shape to preserve.
+                    // A defined or dependency global was compiled at its
+                    // declared type. An extern is supplied directly at this
+                    // instantiated use type, since it has no Ruddy initializer
+                    // with another shape to preserve.
                     let have = self
                         .program
                         .terms
                         .get(symbol)
                         .map(|decl| decl.value.ty.clone())
-                        .unwrap_or_else(|| term.ty.clone());
+                        .or_else(|| {
+                            self.program
+                                .external_schemes
+                                .get(symbol)
+                                .map(|scheme| scheme.body().clone())
+                        })
+                        .unwrap_or_else(|| {
+                            debug_assert!(self.program.externs.contains_key(symbol));
+                            term.ty.clone()
+                        });
                     self.contain(temp, &have);
                     self.fitted(&term.ty, &have, temp, body)
                 }

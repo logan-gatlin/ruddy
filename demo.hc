@@ -1,4 +1,3 @@
-bundle demo 0.1.0
 
 let id = fn x => x
 

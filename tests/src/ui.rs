@@ -56,8 +56,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("parse", error.code(), error.to_string()));
     }
 
-    // Loading, whose five kinds are the whole of what reading a bundle's files
-    // can refuse.
+    // Loading can refuse either spelling of a module file.
     for kind in [
         BundleError::ModuleFileMissing {
             beside: "Math.hc".to_string(),
@@ -67,9 +66,6 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             beside: "Math.hc".to_string(),
             inside: "Math/module.hc".to_string(),
         },
-        BundleError::MisplacedBundleDeclaration,
-        BundleError::MissingBundleDeclaration,
-        BundleError::BadBundleIdentity,
     ] {
         all.push(("bundle", kind.code(), kind.to_string()));
     }
@@ -2628,15 +2624,11 @@ fn the_module_namespace_has_codes_of_its_own() {
     assert_eq!(duplicate.to_string(), "duplicate module");
 }
 
-/// The five things reading a bundle's files can refuse, worded and coded like
-/// every other phase's — so the driver and the debugger cannot describe the
-/// same program differently.
-///
-/// The two about a module's file name the exact paths that were looked for,
-/// because a reader told only "no file" still has to work out where one would
-/// have gone.
+/// The two things reading a bundle's files can refuse, worded and coded like
+/// every other phase's. They name the exact paths that were looked for, because
+/// a reader told only "no file" still has to work out where one would have gone.
 #[test]
-fn the_bundle_phase_words_and_codes_its_five_refusals() {
+fn the_bundle_phase_words_and_codes_its_refusals() {
     let missing = BundleError::ModuleFileMissing {
         beside: "Math.hc".to_string(),
         inside: "Math/module.hc".to_string(),
@@ -2656,37 +2648,12 @@ fn the_bundle_phase_words_and_codes_its_five_refusals() {
         ambiguous.to_string(),
         "this module has two files; delete one of `Math.hc` or `Math/module.hc`"
     );
-
-    assert_eq!(
-        BundleError::MisplacedBundleDeclaration.code(),
-        "misplaced-bundle-declaration"
-    );
-    assert_eq!(
-        BundleError::MisplacedBundleDeclaration.to_string(),
-        "remove this bundle declaration; only the root file has one"
-    );
-
-    assert_eq!(
-        BundleError::MissingBundleDeclaration.code(),
-        "missing-bundle-declaration"
-    );
-    assert_eq!(
-        BundleError::MissingBundleDeclaration.to_string(),
-        "add `bundle <name> <version>` at the top of this file"
-    );
-
-    assert_eq!(BundleError::BadBundleIdentity.code(), "bad-bundle-identity");
-    assert_eq!(
-        BundleError::BadBundleIdentity.to_string(),
-        "a bundle name must start with a letter and use only letters, digits, `-` and `_`"
-    );
 }
 
-/// The two tokens the module grammar added print as the lexemes they were
-/// written with, so a printed stream re-lexes to the tokens it came from.
+/// The tokens the module grammar added print as the lexemes they were written
+/// with, so a printed stream re-lexes to the tokens it came from.
 #[test]
 fn the_module_tokens_print_as_they_were_written() {
-    assert_eq!(TokenKind::Bundle.to_string(), "bundle");
     assert_eq!(TokenKind::Module.to_string(), "module");
     assert_eq!(TokenKind::ColonColon.to_string(), "::");
 }

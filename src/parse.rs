@@ -3,25 +3,11 @@ use std::fmt;
 use indexmap::IndexMap;
 
 use crate::{
-    symbol::Version,
     token::{Kind, Token},
     tracking::{Span, Tracked, TrackedString},
 };
 
 pub type Stmt = Tracked<StmtKind>;
-
-/// The header a bundle's root file begins with: `bundle demo 0.1.0`.
-///
-/// Read wherever it is written, and required in the root file and forbidden
-/// everywhere else by [`bundle::load`](crate::bundle::load) rather than here —
-/// only the loader knows which file it is looking at.
-#[derive(Debug, Clone)]
-pub struct Header {
-    pub name: TrackedString,
-    pub version: Tracked<Version>,
-    /// The whole header: the keyword, the name and the three version parts.
-    pub span: Span,
-}
 
 /// A name, and the modules it is reached through: `Math::Vec::zero`.
 ///
@@ -753,11 +739,6 @@ pub enum Place {
 
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// The `bundle` header, when the file opened with one. Read wherever it is
-    /// written and required nowhere: which file is the root — and so which file
-    /// must have one and which may not — is
-    /// [`bundle::load`](crate::bundle::load)'s to know.
-    pub header: Option<Header>,
     pub stmts: Vec<Stmt>,
     pub errors: Vec<Error>,
 }
@@ -812,22 +793,9 @@ impl Annotation {
 
 pub fn parse(toks: Vec<Token>) -> Output {
     let mut p = Parser::new(toks);
-    // The header is read where it was written and demanded nowhere: a file with
-    // none simply has none here, and whether that is a mistake depends on which
-    // file it is — which is [`bundle::load`](crate::bundle::load)'s to know. A
-    // malformed one is reported like any other malformed statement and the
-    // cursor recovers to the next one, so the rest of the file is still read.
-    let header = match matches!(p.peek().map(|tok| &tok.tracked), Some(Kind::Bundle)) {
-        true => p.header().or_else(|| {
-            p.recover();
-            None
-        }),
-        false => None,
-    };
     let stmts = p.stmts(None);
 
     Output {
-        header,
         stmts,
         errors: p.errors,
     }
@@ -1027,55 +995,6 @@ impl Parser {
         };
         self.advance();
         Some(Path { modules, name })
-    }
-
-    /// `bundle <name> <major>.<minor>.<patch>` — the header a bundle's root
-    /// file begins with.
-    ///
-    /// The version needs no token of its own: `0.1.0` already lexes as three
-    /// naturals with dots between them, which is why a prerelease is simply
-    /// unwritable — there is no lexeme for one.
-    fn header(&mut self) -> Option<Header> {
-        let kw = self.advance().expect("the caller peeked `bundle`");
-        let name = self.ident()?;
-        let version = self.version()?;
-        Some(Header {
-            span: kw.span.merge(version.span),
-            name,
-            version,
-        })
-    }
-
-    /// `<major>.<minor>.<patch>`, each part a natural literal.
-    fn version(&mut self) -> Option<Tracked<Version>> {
-        let (major, span) = self.version_part()?;
-        self.eat(&Kind::Dot)?;
-        let (minor, _) = self.version_part()?;
-        self.eat(&Kind::Dot)?;
-        let (patch, last) = self.version_part()?;
-        Some(span.merge(last).track(Version::new(major, minor, patch)))
-    }
-
-    /// One part of a version: a natural literal that fits in the `u64` a
-    /// [`Version`] holds. One that does not is the unexpected token it is —
-    /// there is nothing else the digits could have been meant as.
-    fn version_part(&mut self) -> Option<(u64, Span)> {
-        let read = match self.peek() {
-            Some(tok) => match tok.tracked {
-                Kind::Natural(value) => Some((value, tok.span)),
-                Kind::Real(value) if value.fract() == 0.0 => u64::try_from(value as u128)
-                    .ok()
-                    .map(|part| (part, tok.span)),
-                _ => return self.unexpected(),
-            },
-            None => return self.unexpected(),
-        };
-        let read = match read {
-            Some(read) => read,
-            None => return self.unexpected(),
-        };
-        self.advance();
-        Some(read)
     }
 
     /// A run of statements: the whole file, or the body of an inline module.

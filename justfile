@@ -127,6 +127,10 @@ test:
 build:
     cargo build --workspace
 
+# Build and install the CLI into Cargo's executable directory.
+install:
+    cargo install --locked --path "{{justfile_directory()}}/cli"
+
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
 cov *args:

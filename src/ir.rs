@@ -7,10 +7,11 @@ use std::{
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
+    artifact,
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{EffectId, ParamKind, Prim, Sense, Shape, Ty},
+    types::{EffectId, ParamKind, Prim, Scheme, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,13 @@ pub struct Program {
     pub externs: IndexMap<Symbol, Decl<Extern>>,
     pub terms: IndexMap<Symbol, Decl<Term>>,
     pub types: IndexMap<Symbol, Decl<Type>>,
+    /// Dependency declarations are not definitions of this bundle, but their
+    /// semantic interfaces participate in checking exactly as in-bundle
+    /// declarations do.
+    pub external_names: IndexMap<Symbol, artifact::QualifiedName>,
+    pub external_schemes: IndexMap<Symbol, Scheme>,
+    pub external_types: IndexMap<Symbol, ExternalType>,
+    pub external_operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
     /// The effects declared, in the order they were written, each with the
     /// operations it declares or the effects it stands for.
     pub effects: IndexMap<Symbol, Decl<Effect>>,
@@ -87,6 +95,17 @@ pub struct Named {
 /// with nothing keeps exactly the scheme it would have had if nothing here
 /// existed. Treating the whole file as one group would type-check every
 /// recursion and destroy the polymorphism of everything else.
+/// The imported semantic interface of a declared type.
+#[derive(Debug, Clone)]
+pub struct ExternalType {
+    pub params: Vec<ParamKind>,
+    pub relevant: Vec<bool>,
+    pub scheme: Scheme,
+    /// Qualified identity retained when a direct-only interface references a
+    /// type whose transitive declaration was not supplied.
+    pub unresolved: Option<artifact::QualifiedName>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Group {
     /// The definitions in this group, in source order.
@@ -755,6 +774,19 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// A dependency alias cannot be written as a source path component.
+    InvalidDependencyAlias {
+        alias: String,
+    },
+    /// The same source-visible dependency alias was supplied more than once.
+    DuplicateDependencyAlias {
+        alias: String,
+    },
+    /// The same artifact identity was supplied more than once.
+    DuplicateDependency {
+        name: String,
+        version: String,
+    },
     /// A name with no definition in scope at the point it was written.
     Undefined {
         namespace: Namespace,
@@ -1810,6 +1842,64 @@ impl TermKind {
 }
 
 pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
+    build_with_dependencies(mint, stmts, &[])
+}
+
+/// Build IR with direct dependency artifact headers visible as root-qualified
+/// source namespaces. Artifact bodies remain linked implementation details;
+/// only declarations in these direct headers are installed in the resolver.
+pub fn build_with_dependencies(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[artifact::Artifact],
+) -> Output {
+    build_with_dependency_graph(mint, stmts, dependencies, &[])
+}
+
+/// A direct artifact and the valid source identifier used to qualify it.
+///
+/// The alias is deliberately separate from the artifact identity: bundle names
+/// may contain `-`, while source path components may not.
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyImport<'a> {
+    pub alias: &'a str,
+    pub artifact: &'a artifact::Artifact,
+}
+
+/// Build against explicitly aliased direct dependencies and linked interfaces.
+pub fn build_with_dependency_imports(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[DependencyImport<'_>],
+    linked: &[artifact::Artifact],
+) -> Output {
+    build_with_dependency_imports_inner(mint, stmts, dependencies, linked)
+}
+
+/// Build against direct source-visible dependencies and additional linked
+/// implementation interfaces referenced by those dependencies.
+pub fn build_with_dependency_graph(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[artifact::Artifact],
+    linked: &[artifact::Artifact],
+) -> Output {
+    let imports: Vec<_> = dependencies
+        .iter()
+        .map(|artifact| DependencyImport {
+            alias: &artifact.header.identity.name,
+            artifact,
+        })
+        .collect();
+    build_with_dependency_imports_inner(mint, stmts, &imports, linked)
+}
+
+fn build_with_dependency_imports_inner(
+    mint: &mut Mint,
+    stmts: Vec<Stmt>,
+    dependencies: &[DependencyImport<'_>],
+    linked: &[artifact::Artifact],
+) -> Output {
     let mut b = Builder {
         mint,
         module: None,
@@ -1829,10 +1919,15 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         externs: IndexMap::new(),
         terms: IndexMap::new(),
         types: IndexMap::new(),
+        external_names: IndexMap::new(),
+        external_schemes: IndexMap::new(),
+        external_types: IndexMap::new(),
+        external_operations: IndexMap::new(),
         effects: IndexMap::new(),
         effect_ids: IndexMap::new(),
         groups: Vec::new(),
     };
+    b.import_dependencies(dependencies, linked, &mut program);
     // The whole tree flattened before anything is declared: every module is
     // minted, over every file, and what each remaining statement is written in
     // is recorded beside it. Nothing is resolved on the way, so a module may be
@@ -1866,11 +1961,12 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
             b.declare_params(params)
         })
         .collect();
-    b.arities = declared
-        .iter()
-        .zip(&bound)
-        .filter_map(|(symbol, params)| Some(((*symbol)?, params.len())))
-        .collect();
+    b.arities.extend(
+        declared
+            .iter()
+            .zip(&bound)
+            .filter_map(|(symbol, params)| Some(((*symbol)?, params.len()))),
+    );
     // Effects next, and before any type body: a `type` declaration may name one
     // in an arrow it writes, and an alias written anywhere has to be expandable
     // wherever a row mentions it. Their names are bound before any of their own
@@ -1904,15 +2000,18 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // What each effect name stands for, once every declaration is in: itself,
     // or — for an alias — the effects it names, through however many aliases it
     // takes to reach them.
-    b.expanded = expansions(b.mint, &program.effects);
-    b.operations = program
-        .effects
-        .iter()
-        .filter_map(|(symbol, decl)| match &decl.value {
-            Effect::Operations(operations) => Some((*symbol, operations.keys().cloned().collect())),
-            Effect::Alias(_) => None,
-        })
-        .collect();
+    b.expanded = expansions(b.mint, &program.effects, &b.expanded);
+    b.operations.extend(
+        program
+            .effects
+            .iter()
+            .filter_map(|(symbol, decl)| match &decl.value {
+                Effect::Operations(operations) => {
+                    Some((*symbol, operations.keys().cloned().collect()))
+                }
+                Effect::Alias(_) => None,
+            }),
+    );
     for ((symbol, (module, name, _, body)), params) in
         declared.into_iter().zip(flat.types).zip(bound)
     {
@@ -1978,7 +2077,7 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     // Type declarations are complete, so their effect rows can now be keyed
     // by normalized operation interfaces before parameter-kind analysis reads
     // their lacks sets. Terms are re-keyed after they are lowered below.
-    structuralize_effects(&mut program, b.mint, &mut b.errors);
+    structuralize_effects(&mut program, b.mint, &b.expanded, &mut b.errors);
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
     // there, so no one body decides its own.
@@ -2006,6 +2105,15 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
         decl.value = span.track(TypeKind::Error);
         kinds.remove(symbol);
     }
+    // Imported constructors impose exactly the same row-shape and lacks
+    // conditions at a use site as local constructors. Their kinds came from
+    // the artifact header rather than the local fixpoint above.
+    kinds.extend(
+        program
+            .external_types
+            .iter()
+            .map(|(symbol, declaration)| (*symbol, declaration.params.clone())),
+    );
     // Every definition's name is bound before any definition's body is read —
     // the hoist the `type` half above already gets, and for the same reason.
     // That is the whole of what makes a definition able to name itself and two
@@ -2231,52 +2339,234 @@ pub fn build(mint: &mut Mint, stmts: Vec<Stmt>) -> Output {
     }
 }
 
+fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<Vec<String>> {
+    let prefix = format!(
+        "{}@{}::",
+        dependency.header.identity.name, dependency.header.identity.version
+    );
+    let path = qualified.strip_prefix(&prefix)?;
+    let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
+    (!parts.is_empty() && parts.iter().all(|part| !part.is_empty())).then_some(parts)
+}
+
+fn imported_symbol(
+    mint: &mut Mint,
+    namespace: Namespace,
+    qualified: &str,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Symbol {
+    let key = (namespace, qualified.to_owned());
+    if let Some(&symbol) = symbols.get(&key) {
+        return symbol;
+    }
+    // References in an interface may target transitive dependencies. They get
+    // semantic symbols so inference can follow them, but are deliberately not
+    // installed in Builder::globals and therefore cannot be named by source.
+    let symbol = mint.local(None, namespace, qualified);
+    symbols.insert(key, symbol);
+    mint.register_external(symbol, qualified);
+    names.insert(symbol, qualified.to_owned());
+    symbol
+}
+
+fn import_scheme(
+    mint: &mut Mint,
+    scheme: &artifact::Scheme,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Scheme {
+    Scheme::constrained(
+        scheme.count,
+        scheme.presences,
+        import_type(mint, &scheme.body, symbols, names),
+        import_formula(&scheme.formula),
+    )
+}
+
+fn import_type(
+    mint: &mut Mint,
+    value: &artifact::Type,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> Rc<Ty> {
+    let core = match &value.core {
+        artifact::Core::Unit => crate::types::Core::Unit,
+        artifact::Core::Nat => crate::types::Core::Nat,
+        artifact::Core::Int => crate::types::Core::Int,
+        artifact::Core::Real => crate::types::Core::Real,
+        artifact::Core::String => crate::types::Core::String,
+        artifact::Core::Boolean => crate::types::Core::Boolean,
+        artifact::Core::Arrow(from, to, effects) => crate::types::Core::Arrow(
+            import_type(mint, from, symbols, names),
+            import_type(mint, to, symbols, names),
+            import_row(mint, effects, symbols, names),
+        ),
+        artifact::Core::Sum(row) => crate::types::Core::Sum(import_row(mint, row, symbols, names)),
+        artifact::Core::Var(var) => crate::types::Core::Var(*var),
+        artifact::Core::Bound(var) => crate::types::Core::Bound(*var),
+        artifact::Core::Rigid { id, name } => crate::types::Core::Rigid {
+            id: *id,
+            name: Rc::from(name.as_str()),
+        },
+        artifact::Core::Named { name, args } => {
+            let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
+            crate::types::Core::Named {
+                symbol,
+                name: Rc::from(name.as_str()),
+                args: args
+                    .iter()
+                    .map(|arg| import_type(mint, arg, symbols, names))
+                    .collect::<Vec<_>>()
+                    .into(),
+            }
+        }
+        artifact::Core::Undecided => crate::types::Core::Undecided,
+    };
+    Rc::new(Ty {
+        core,
+        fields: value
+            .fields
+            .iter()
+            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+            .collect(),
+    })
+}
+
+fn import_row(
+    mint: &mut Mint,
+    value: &artifact::Row,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> crate::types::Row {
+    crate::types::Row {
+        labels: value
+            .labels
+            .iter()
+            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+            .collect(),
+        rest: match &value.rest {
+            artifact::Rest::Closed => crate::types::Rest::Closed,
+            artifact::Rest::Var(var) => crate::types::Rest::Var(*var),
+            artifact::Rest::Bound(var) => crate::types::Rest::Bound(*var),
+            artifact::Rest::Rigid { id, name } => crate::types::Rest::Rigid {
+                id: *id,
+                name: Rc::from(name.as_str()),
+            },
+            artifact::Rest::Undecided => crate::types::Rest::Undecided,
+            artifact::Rest::More(row) => {
+                crate::types::Rest::More(Rc::new(import_row(mint, row, symbols, names)))
+            }
+        },
+    }
+}
+
+fn import_row_field(
+    mint: &mut Mint,
+    value: &artifact::RowField,
+    symbols: &mut HashMap<(Namespace, String), Symbol>,
+    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+) -> crate::types::RowField {
+    crate::types::RowField {
+        presence: match value.presence {
+            artifact::Presence::Present => crate::types::Presence::Present,
+            artifact::Presence::Absent => crate::types::Presence::Absent,
+            artifact::Presence::Var(var) => crate::types::Presence::Var(var),
+            artifact::Presence::Bound(var) => crate::types::Presence::Bound(var),
+            artifact::Presence::Undecided => crate::types::Presence::Undecided,
+        },
+        ty: import_type(mint, &value.ty, symbols, names),
+    }
+}
+
+fn import_formula(value: &artifact::Formula) -> crate::types::Formula {
+    use crate::types::{Atom, Formula};
+    match value {
+        artifact::Formula::True => Formula::True,
+        artifact::Formula::False => Formula::False,
+        artifact::Formula::Var(var) => Formula::Atom(Atom::Var(*var)),
+        artifact::Formula::Bound(var) => Formula::Atom(Atom::Bound(*var)),
+        artifact::Formula::Not(value) => Formula::Not(Rc::new(import_formula(value))),
+        artifact::Formula::And(left, right) => Formula::And(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Or(left, right) => Formula::Or(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Iff(left, right) => Formula::Iff(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+        artifact::Formula::Xor(left, right) => Formula::Xor(
+            Rc::new(import_formula(left)),
+            Rc::new(import_formula(right)),
+        ),
+    }
+}
+
 /// Assign structural identities to effects and replace the provisional source
 /// symbols in every lowered effect row. Symbols remain on each label for
 /// operation lookup and editor navigation; the key is only row semantics.
-fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Error>) {
-    let ids: IndexMap<Symbol, EffectId> = program
-        .effects
-        .iter()
-        .filter_map(|(symbol, decl)| match &decl.value {
-            Effect::Operations(operations) => {
-                let mut interface: Vec<_> = operations
-                    .iter()
-                    .map(|(name, op)| {
-                        let mut types_seen = HashSet::new();
-                        let mut effects_seen = HashSet::new();
-                        format!(
-                            "{name}:{}->{}",
-                            canonical_type(
-                                &op.from,
-                                &program.types,
-                                &program.effects,
-                                mint,
-                                &[],
-                                &mut types_seen,
-                                &mut effects_seen,
-                            ),
-                            canonical_type(
-                                &op.to,
-                                &program.types,
-                                &program.effects,
-                                mint,
-                                &[],
-                                &mut types_seen,
-                                &mut effects_seen,
+fn structuralize_effects(
+    program: &mut Program,
+    mint: &Mint,
+    expansions: &HashMap<Symbol, IndexMap<String, Symbol>>,
+    errors: &mut Vec<Error>,
+) {
+    // Imported rows were lowered with imported symbols before local effect
+    // identities could be computed. Keep those identities in the rekeying map:
+    // replacing the map with local-only identities silently dropped every
+    // dependency effect from local declared types.
+    let mut ids = program.effect_ids.clone();
+    ids.extend(
+        program
+            .effects
+            .iter()
+            .filter_map(|(symbol, decl)| match &decl.value {
+                Effect::Operations(operations) => {
+                    let mut interface: Vec<_> = operations
+                        .iter()
+                        .map(|(name, op)| {
+                            let mut types_seen = HashSet::new();
+                            let mut effects_seen = HashSet::new();
+                            format!(
+                                "{name}:{}->{}",
+                                canonical_type(
+                                    &op.from,
+                                    &program.types,
+                                    &program.effects,
+                                    &program.external_types,
+                                    &program.effect_ids,
+                                    mint,
+                                    &[],
+                                    &mut types_seen,
+                                    &mut effects_seen,
+                                ),
+                                canonical_type(
+                                    &op.to,
+                                    &program.types,
+                                    &program.effects,
+                                    &program.external_types,
+                                    &program.effect_ids,
+                                    mint,
+                                    &[],
+                                    &mut types_seen,
+                                    &mut effects_seen,
+                                )
                             )
-                        )
-                    })
-                    .collect();
-                interface.sort();
-                Some((
-                    *symbol,
-                    EffectId::structural(mint.name(*symbol).to_string(), interface.join("|")),
-                ))
-            }
-            Effect::Alias(_) => None,
-        })
-        .collect();
+                        })
+                        .collect();
+                    interface.sort();
+                    Some((
+                        *symbol,
+                        EffectId::structural(mint.name(*symbol).to_string(), interface.join("|")),
+                    ))
+                }
+                Effect::Alias(_) => None,
+            }),
+    );
     program.effect_ids = ids.clone();
     for decl in program.effects.values_mut() {
         match &mut decl.value {
@@ -2287,11 +2577,25 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
                 }
             }
             Effect::Alias(named) => {
+                // Diagnose overlap after closing aliases transitively. Each
+                // written case gets its own expansion, so two differently
+                // named aliases that reach the same structural effect are not
+                // silently collapsed by the expansion map.
                 let mut seen = HashSet::new();
                 for item in named.values() {
-                    if let Some(id) = ids.get(&item.symbol)
-                        && !seen.insert(id.clone())
+                    let mut duplicate = false;
+                    for concrete in expansions
+                        .get(&item.symbol)
+                        .into_iter()
+                        .flat_map(IndexMap::values)
                     {
+                        if let Some(id) = ids.get(concrete)
+                            && !seen.insert(id.clone())
+                        {
+                            duplicate = true;
+                        }
+                    }
+                    if duplicate {
                         errors.push(Error {
                             span: item.name_span,
                             kind: ErrorKind::DuplicateCase,
@@ -2324,193 +2628,517 @@ fn structuralize_effects(program: &mut Program, mint: &Mint, errors: &mut Vec<Er
 /// compare as pure ones. Recursive types and effects are represented by their
 /// module-less name at the back edge, so equivalent dependency cycles do not
 /// acquire a module path by accident.
+#[derive(Clone, Default)]
+struct RegularNode {
+    label: String,
+    edges: Vec<(String, usize)>,
+}
+
+/// A finite presentation of a regular type tree. Named declarations are
+/// memoized as graph nodes and then minimized by bisimulation before they are
+/// spelled. This deliberately canonicalizes the *infinite unfolding*, rather
+/// than the particular collection of aliases which happened to present it.
+struct RegularType<'a> {
+    types: &'a IndexMap<Symbol, Decl<Type>>,
+    effects: &'a IndexMap<Symbol, Decl<Effect>>,
+    external_types: &'a IndexMap<Symbol, ExternalType>,
+    effect_ids: &'a IndexMap<Symbol, EffectId>,
+    mint: &'a Mint,
+    effects_seen: &'a mut HashSet<Symbol>,
+    nodes: Vec<RegularNode>,
+    named: HashMap<(Symbol, Vec<String>), usize>,
+}
+
+impl RegularType<'_> {
+    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(RegularNode {
+            label: label.into(),
+            edges,
+        });
+        id
+    }
+
+    fn atom(&mut self, value: impl Into<String>) -> usize {
+        self.node(value, Vec::new())
+    }
+
+    fn with_fields(&mut self, core: usize, fields: Vec<(String, String, usize)>) -> usize {
+        if fields.is_empty() {
+            return core;
+        }
+        let mut edges = Vec::with_capacity(fields.len() + 1);
+        edges.push(("core".into(), core));
+        edges.extend(
+            fields
+                .into_iter()
+                .map(|(name, presence, ty)| (format!("field:{name}:{presence}"), ty)),
+        );
+        self.node("fields", edges)
+    }
+
+    fn source(&mut self, ty: &Type, args: &[usize]) -> usize {
+        match &ty.tracked {
+            TypeKind::Struct { fields, tail } => {
+                let core = self.source_core_tail(tail, args);
+                let fields = fields
+                    .iter()
+                    .map(|(name, field)| match field {
+                        TypeField::Written { when, value, .. } => (
+                            name.clone(),
+                            canonical_written_presence(when),
+                            self.source(value, args),
+                        ),
+                        TypeField::Absent { .. } => (name.clone(), "\\".into(), self.atom("?")),
+                    })
+                    .collect();
+                self.with_fields(core, fields)
+            }
+            TypeKind::Sum { cases, tail } => {
+                let mut edges = Vec::new();
+                for (name, case) in cases {
+                    let (presence, payload) = match case {
+                        SumCase::Written { when, payload, .. } => (
+                            canonical_written_presence(when),
+                            payload
+                                .as_ref()
+                                .map(|ty| self.source(ty, args))
+                                .unwrap_or_else(|| self.atom("Unit")),
+                        ),
+                        SumCase::Absent { .. } => ("\\".into(), self.atom("?")),
+                    };
+                    edges.push((format!("label:{name}:{presence}"), payload));
+                }
+                edges.push(("tail".into(), self.source_row_tail(tail, args)));
+                self.node("sum", edges)
+            }
+            TypeKind::Arrow { from, to, effects } => {
+                let from = self.source(from, args);
+                let to = self.source(to, args);
+                let effects = self.source_effect_row(effects, args);
+                self.node(
+                    "arrow",
+                    vec![
+                        ("from".into(), from),
+                        ("to".into(), to),
+                        ("effects".into(), effects),
+                    ],
+                )
+            }
+            TypeKind::Ident(symbol) => self.named(*symbol, Vec::new()),
+            TypeKind::Apply {
+                head,
+                args: applied,
+                ..
+            } => {
+                let applied = applied.iter().map(|arg| self.source(arg, args)).collect();
+                self.named(*head, applied)
+            }
+            TypeKind::Param { index, .. } => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{}", index))),
+            TypeKind::Prim(prim) => self.atom(format!("{prim:?}")),
+            TypeKind::Effects(row) => self.source_effect_row(row, args),
+            TypeKind::Var(name) => self.atom(format!("'{name}")),
+            TypeKind::Hole | TypeKind::Error => self.atom("?"),
+        }
+    }
+
+    fn source_core_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
+        match tail.as_ref().map(|tail| &tail.of) {
+            None => self.atom("Unit"),
+            Some(Row::Anything) => self.atom("?"),
+            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
+            Some(Row::Param { index, .. }) => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{index}"))),
+        }
+    }
+
+    fn source_row_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
+        match tail.as_ref().map(|tail| &tail.of) {
+            None => self.atom("closed"),
+            Some(Row::Anything) => self.atom("?"),
+            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
+            Some(Row::Param { index, .. }) => args
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'#{index}"))),
+        }
+    }
+
+    fn source_effect_row(&mut self, row: &EffectRow, args: &[usize]) -> usize {
+        let mut edges = Vec::new();
+        for label in row.effects.values() {
+            let effect = canonical_effect(
+                label.symbol(),
+                self.types,
+                self.effects,
+                self.external_types,
+                self.effect_ids,
+                self.mint,
+                &mut HashSet::new(),
+                self.effects_seen,
+            );
+            let presence = match label {
+                EffectLabel::Written { when, .. } => canonical_written_presence(when),
+                EffectLabel::Absent { .. } => "\\".into(),
+            };
+            let unit = self.atom("Unit");
+            edges.push((format!("label:{effect}:{presence}"), unit));
+        }
+        let tail = self.source_row_tail(&row.tail, args);
+        edges.push(("tail".into(), tail));
+        self.node("sum", edges)
+    }
+
+    fn named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
+        // Node allocation is incidental; structural argument spellings make a
+        // fixed recursive application meet its memo entry even when rebuilding
+        // the same argument allocated fresh nodes on the way around.
+        let key = (
+            symbol,
+            args.iter().map(|argument| self.encode(*argument)).collect(),
+        );
+        if let Some(id) = self.named.get(&key) {
+            return *id;
+        }
+        let id = self.node("unproductive-cycle", Vec::new());
+        self.named.insert(key, id);
+        let body = if let Some(decl) = self.types.get(&symbol) {
+            self.source(&decl.value, &args)
+        } else if let Some(decl) = self.external_types.get(&symbol) {
+            if let Some(name) = &decl.unresolved {
+                self.node(
+                    format!("unresolved:{name}"),
+                    args.iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(index, argument)| (format!("arg:{index}"), argument))
+                        .collect(),
+                )
+            } else {
+                self.semantic(decl.scheme.body(), &args)
+            }
+        } else {
+            self.node(
+                format!("external:{}", self.mint.name(symbol)),
+                args.iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, argument)| (format!("arg:{index}"), argument))
+                    .collect(),
+            )
+        };
+        if body != id {
+            self.nodes[id] = self.nodes[body].clone();
+        }
+        id
+    }
+
+    fn semantic(&mut self, ty: &Ty, args: &[usize]) -> usize {
+        use crate::types::{Core, Presence};
+        fn presence(value: &Presence) -> String {
+            match value {
+                Presence::Present => "+".into(),
+                Presence::Absent => "\\".into(),
+                Presence::Var(id) => format!("?{id}"),
+                Presence::Bound(id) => format!("'p{id}"),
+                Presence::Undecided => "?".into(),
+            }
+        }
+        let core = match &ty.core {
+            Core::Unit => self.atom("Unit"),
+            Core::Nat => self.atom("Nat"),
+            Core::Int => self.atom("Int"),
+            Core::Real => self.atom("Real"),
+            Core::String => self.atom("String"),
+            Core::Boolean => self.atom("Boolean"),
+            Core::Arrow(from, to, effects) => {
+                let from = self.semantic(from, args);
+                let to = self.semantic(to, args);
+                let effects = self.semantic_row(effects, args);
+                self.node(
+                    "arrow",
+                    vec![
+                        ("from".into(), from),
+                        ("to".into(), to),
+                        ("effects".into(), effects),
+                    ],
+                )
+            }
+            Core::Sum(cases) => self.semantic_row(cases, args),
+            Core::Var(id) => self.atom(format!("?{id}")),
+            Core::Bound(id) => args
+                .get(*id as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'{id}"))),
+            Core::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Core::Named {
+                symbol,
+                args: applied,
+                ..
+            } => {
+                let applied = applied.iter().map(|arg| self.semantic(arg, args)).collect();
+                self.named(*symbol, applied)
+            }
+            Core::Undecided => self.atom("?"),
+        };
+        let fields = ty
+            .fields
+            .iter()
+            .map(|(name, field)| {
+                let payload = if matches!(field.presence, Presence::Absent) {
+                    self.atom("?")
+                } else {
+                    self.semantic(&field.ty, args)
+                };
+                (name.clone(), presence(&field.presence), payload)
+            })
+            .collect();
+        self.with_fields(core, fields)
+    }
+
+    fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
+        use crate::types::Rest;
+        let mut edges = Vec::new();
+        for (name, field) in &row.labels {
+            let presence = match &field.presence {
+                crate::types::Presence::Present => "+".into(),
+                crate::types::Presence::Absent => "\\".into(),
+                crate::types::Presence::Var(id) => format!("?{id}"),
+                crate::types::Presence::Bound(id) => format!("'p{id}"),
+                crate::types::Presence::Undecided => "?".into(),
+            };
+            let ty = if matches!(field.presence, crate::types::Presence::Absent) {
+                self.atom("?")
+            } else {
+                self.semantic(&field.ty, args)
+            };
+            edges.push((
+                format!("label:{}:{presence}", canonical_effect_key(name)),
+                ty,
+            ));
+        }
+        let tail = match &row.rest {
+            Rest::Closed => self.atom("closed"),
+            Rest::Var(id) => self.atom(format!("?{id}")),
+            Rest::Bound(id) => args
+                .get(*id as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'#{id}"))),
+            Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Rest::Undecided => self.atom("?"),
+            Rest::More(more) => self.semantic_row(more, args),
+        };
+        edges.push(("tail".into(), tail));
+        self.node("sum", edges)
+    }
+
+    /// Eliminate row-composition edges after the complete regular graph has
+    /// been built. A named tail may have been a placeholder when its caller
+    /// was visited, so doing this while lowering would make normalization
+    /// depend on declaration order. Epsilon closure also makes recursive row
+    /// graphs finite: each row node contributes its labels at most once.
+    fn flatten_rows(&mut self) {
+        let original = self.nodes.clone();
+        for root in 0..original.len() {
+            let (kind, join) = match original[root].label.as_str() {
+                "fields" => ("fields", "core"),
+                "sum" => ("sum", "tail"),
+                _ => continue,
+            };
+            let mut pending = vec![root];
+            let mut seen = HashSet::new();
+            let mut edges = Vec::new();
+            while let Some(node) = pending.pop() {
+                if !seen.insert(node) {
+                    continue;
+                }
+                for (label, child) in &original[node].edges {
+                    if label == join && original[*child].label == kind {
+                        pending.push(*child);
+                    } else {
+                        edges.push((label.clone(), *child));
+                    }
+                }
+            }
+            // Graph encoding is order independent, but stable storage keeps
+            // duplicate labels and multiple distinct exits deterministic too.
+            edges.sort();
+            self.nodes[root].edges = edges;
+        }
+    }
+
+    fn encode(&mut self, root: usize) -> String {
+        self.flatten_rows();
+        // Color refinement computes the greatest bisimulation on this finite
+        // graph. Canonical color numbers are obtained by sorting signatures,
+        // then the reachable quotient is numbered from the root.
+        let mut colors = ranks(
+            self.nodes
+                .iter()
+                .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
+                .collect(),
+        );
+        loop {
+            let signatures: Vec<_> = self
+                .nodes
+                .iter()
+                .map(|node| {
+                    let mut edges: Vec<_> = node
+                        .edges
+                        .iter()
+                        .map(|(label, to)| (label.clone(), colors[*to]))
+                        .collect();
+                    edges.sort();
+                    (node.label.clone(), edges)
+                })
+                .collect();
+            let next = ranks(signatures);
+            let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
+            let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
+            colors = next;
+            if old_classes == new_classes {
+                break;
+            }
+        }
+        let mut representatives = vec![0; colors.iter().copied().max().map_or(0, |n| n + 1)];
+        for (node, color) in colors.iter().copied().enumerate() {
+            representatives[color] = node;
+        }
+        fn visit(
+            color: usize,
+            nodes: &[RegularNode],
+            colors: &[usize],
+            reps: &[usize],
+            ids: &mut HashMap<usize, usize>,
+            order: &mut Vec<usize>,
+        ) {
+            if ids.contains_key(&color) {
+                return;
+            }
+            ids.insert(color, order.len());
+            order.push(color);
+            let mut edges: Vec<_> = nodes[reps[color]]
+                .edges
+                .iter()
+                .map(|(label, to)| (label, colors[*to]))
+                .collect();
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, child) in edges {
+                visit(child, nodes, colors, reps, ids, order);
+            }
+        }
+        let mut ids = HashMap::new();
+        let mut order = Vec::new();
+        visit(
+            colors[root],
+            &self.nodes,
+            &colors,
+            &representatives,
+            &mut ids,
+            &mut order,
+        );
+        let mut out = String::new();
+        for color in order {
+            let node = &self.nodes[representatives[color]];
+            out.push_str(&format!(
+                "{}#{}:{}",
+                ids[&color],
+                node.label.len(),
+                node.label
+            ));
+            let mut edges: Vec<_> = node
+                .edges
+                .iter()
+                .map(|(label, to)| (label, colors[*to]))
+                .collect();
+            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (label, child) in edges {
+                out.push_str(&format!("|{}:{}>{}", label.len(), label, ids[&child]));
+            }
+            out.push(';');
+        }
+        out
+    }
+}
+
+fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
+    let mut sorted = values.clone();
+    sorted.sort();
+    sorted.dedup();
+    values
+        .iter()
+        .map(|value| sorted.binary_search(value).expect("ranked value"))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn canonical_type(
     ty: &Type,
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
+    external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
-    args: &[Type],
-    types_seen: &mut HashSet<Symbol>,
+    args: &[String],
+    _types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
-    match &ty.tracked {
-        TypeKind::Struct { fields, .. } => {
-            let mut fields: Vec<_> = fields
-                .iter()
-                .map(|(name, field)| match field {
-                    TypeField::Written { value, .. } => {
-                        format!(
-                            "{name}:{}",
-                            canonical_type(
-                                value,
-                                types,
-                                effects,
-                                mint,
-                                args,
-                                types_seen,
-                                effects_seen
-                            )
-                        )
-                    }
-                    TypeField::Absent { .. } => format!("\\{name}"),
-                })
-                .collect();
-            fields.sort();
-            format!("{{{}}}", fields.join(","))
-        }
-        TypeKind::Sum { cases, .. } => {
-            let mut cases: Vec<_> = cases
-                .iter()
-                .map(|(name, case)| match case {
-                    SumCase::Written { payload, .. } => format!(
-                        "#{name}:{}",
-                        payload
-                            .as_ref()
-                            .map(|ty| canonical_type(
-                                ty,
-                                types,
-                                effects,
-                                mint,
-                                args,
-                                types_seen,
-                                effects_seen
-                            ))
-                            .unwrap_or_else(|| "{}".to_string())
-                    ),
-                    SumCase::Absent { .. } => format!("\\#{name}"),
-                })
-                .collect();
-            cases.sort();
-            format!("[{}]", cases.join("|"))
-        }
-        TypeKind::Arrow {
-            from,
-            to,
-            effects: row,
-        } => format!(
-            "({}->{}+{})",
-            canonical_type(from, types, effects, mint, args, types_seen, effects_seen),
-            canonical_type(to, types, effects, mint, args, types_seen, effects_seen),
-            canonical_effect_row(row, types, effects, mint, types_seen, effects_seen)
-        ),
-        TypeKind::Ident(symbol) => {
-            canonical_named(*symbol, &[], types, effects, mint, types_seen, effects_seen)
-        }
-        TypeKind::Apply {
-            head,
-            args: applied,
-            ..
-        } => canonical_named(
-            *head,
-            applied,
-            types,
-            effects,
-            mint,
-            types_seen,
-            effects_seen,
-        ),
-        TypeKind::Param { index, .. } => args
-            .get(*index as usize)
-            .map(|arg| canonical_type(arg, types, effects, mint, args, types_seen, effects_seen))
-            .unwrap_or_else(|| format!("'{}", index)),
-        TypeKind::Prim(prim) => format!("{prim:?}"),
-        TypeKind::Effects(row) => format!(
-            "effects({})",
-            canonical_effect_row(row, types, effects, mint, types_seen, effects_seen)
-        ),
-        TypeKind::Var(name) => format!("'{name}"),
-        TypeKind::Hole | TypeKind::Error => "?".to_string(),
-    }
-}
-
-fn canonical_named(
-    symbol: Symbol,
-    args: &[Type],
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    mint: &Mint,
-    types_seen: &mut HashSet<Symbol>,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    if !types_seen.insert(symbol) {
-        return "rec".to_string();
-    }
-    let result = types.get(&symbol).map_or_else(
-        || "?".to_string(),
-        |decl| {
-            canonical_type(
-                &decl.value,
-                types,
-                effects,
-                mint,
-                args,
-                types_seen,
-                effects_seen,
-            )
-        },
-    );
-    types_seen.remove(&symbol);
-    result
-}
-
-/// The structural meaning of an effect row inside an operation signature.
-/// Label order has no meaning; presence and tail do, and a label reaches the
-/// full interface of the effect it names rather than its declaration path.
-fn canonical_effect_row(
-    row: &EffectRow,
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    mint: &Mint,
-    types_seen: &mut HashSet<Symbol>,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    let mut labels: Vec<_> = row
-        .effects
-        .values()
-        .map(|label| {
-            let effect = canonical_effect(
-                label.symbol(),
-                types,
-                effects,
-                mint,
-                types_seen,
-                effects_seen,
-            );
-            match label {
-                EffectLabel::Written { when, .. } => format!(
-                    "+{effect}{}",
-                    when.as_ref()
-                        .map_or_else(String::new, |when| match &when.name {
-                            Some(name) => format!(" when {name}"),
-                            None => " when _".to_string(),
-                        })
-                ),
-                EffectLabel::Absent { .. } => format!("\\{effect}"),
-            }
-        })
-        .collect();
-    labels.sort();
-    let tail = match row.tail.as_ref().map(|tail| &tail.of) {
-        None => "closed".to_string(),
-        Some(Row::Anything) => "anything".to_string(),
-        Some(Row::Named(name)) => format!("'{name}"),
-        Some(Row::Param { index, .. }) => format!("'#{index}"),
+    let mut graph = RegularType {
+        types,
+        effects,
+        external_types,
+        effect_ids,
+        mint,
+        effects_seen,
+        nodes: Vec::new(),
+        named: HashMap::new(),
     };
-    format!("{};{tail}", labels.join(","))
+    let args: Vec<_> = args.iter().map(|arg| graph.atom(arg.clone())).collect();
+    let root = graph.source(ty, &args);
+    graph.encode(root)
 }
 
-/// One effect's module-independent interface. Operation signatures are held
-/// pure by construction, so their nested types cannot lead back through an
-/// effect row to this interface.
+/// Imported and source effect labels share this structural spelling.
+fn canonical_effect_key(name: &str) -> String {
+    match name.split_once('\u{1f}') {
+        Some((name, interface)) => format!("!{name}<{interface}>"),
+        None => name.to_string(),
+    }
+}
+
+fn canonical_written_presence(when: &Option<Box<When>>) -> String {
+    match when.as_ref().and_then(|when| when.name.as_ref()) {
+        None if when.is_none() => "+".to_string(),
+        None => "?".to_string(),
+        Some(name) => format!("?{name}"),
+    }
+}
+
+/// One effect's module-independent interface, descending through effect rows.
+/// Effect cycles terminate at a module-independent interface back edge.
+#[allow(clippy::too_many_arguments)]
 fn canonical_effect(
     symbol: Symbol,
     types: &IndexMap<Symbol, Decl<Type>>,
     effects: &IndexMap<Symbol, Decl<Effect>>,
+    external_types: &IndexMap<Symbol, ExternalType>,
+    effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
     types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
-    effects_seen.insert(symbol);
+    let name = match effect_ids.get(&symbol) {
+        Some(EffectId::Structural { name, .. }) => name.as_str(),
+        _ => mint.name(symbol),
+    };
+    if !effects_seen.insert(symbol) {
+        return format!("!{name}<rec>");
+    }
     let interface = match effects.get(&symbol).map(|decl| &decl.value) {
         Some(Effect::Operations(operations)) => {
             let mut operations: Vec<_> = operations
@@ -2522,6 +3150,8 @@ fn canonical_effect(
                             &operation.from,
                             types,
                             effects,
+                            external_types,
+                            effect_ids,
                             mint,
                             &[],
                             types_seen,
@@ -2531,6 +3161,8 @@ fn canonical_effect(
                             &operation.to,
                             types,
                             effects,
+                            external_types,
+                            effect_ids,
                             mint,
                             &[],
                             types_seen,
@@ -2548,24 +3180,36 @@ fn canonical_effect(
             let mut named: Vec<_> = named
                 .values()
                 .map(|named| {
-                    canonical_effect(named.symbol, types, effects, mint, types_seen, effects_seen)
+                    canonical_effect(
+                        named.symbol,
+                        types,
+                        effects,
+                        external_types,
+                        effect_ids,
+                        mint,
+                        types_seen,
+                        effects_seen,
+                    )
                 })
                 .collect();
             named.sort();
             named.join("+")
         }
-        None => "?".to_string(),
+        None => match effect_ids.get(&symbol) {
+            Some(EffectId::Structural { interface, .. }) => interface.clone(),
+            _ => "?".to_string(),
+        },
     };
     effects_seen.remove(&symbol);
-    format!("!{}<{interface}>", mint.name(symbol))
+    format!("!{name}<{interface}>")
 }
 
 fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
     let old = std::mem::take(&mut row.effects);
     for (_, label) in old {
-        // Aliases and unresolved names never survive expansion into a semantic
-        // row, so every remaining source symbol has a structural identity.
-        let id = &ids[&label.symbol()];
+        let Some(id) = ids.get(&label.symbol()) else {
+            continue;
+        }; // aliases never survive expansion
         if row.effects.contains_key(id) {
             errors.push(Error {
                 span: label.name_span(),
@@ -2670,8 +3314,9 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
             // arms naming one source effect are.
             let mut seen = HashSet::new();
             for arm in &handler.arms {
-                // Lowering retains only arms whose effect resolved.
-                let effect = &ids[&arm.effect.tracked];
+                let Some(effect) = ids.get(&arm.effect.tracked) else {
+                    continue;
+                };
                 if !seen.insert((effect.clone(), arm.op.tracked.clone())) {
                     errors.push(Error {
                         span: arm.op.span,
@@ -2697,6 +3342,32 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
 
 /// The old nominal spelling used only while aliases are expanded during IR
 /// construction. It is never allowed into a semantic row.
+fn source_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+        && !matches!(
+            name,
+            "_" | "let"
+                | "in"
+                | "type"
+                | "end"
+                | "with"
+                | "match"
+                | "fn"
+                | "effect"
+                | "handle"
+                | "raise"
+                | "and"
+                | "or"
+                | "xor"
+                | "not"
+                | "module"
+                | "true"
+                | "false"
+        )
+}
+
 fn effect_key(mint: &Mint, symbol: Symbol) -> String {
     let mut names = vec![mint.name(symbol).to_string()];
     let mut parent = mint.parent(symbol);
@@ -2727,22 +3398,21 @@ fn effect_key(mint: &Mint, symbol: Symbol) -> String {
 fn expansions(
     mint: &Mint,
     effects: &IndexMap<Symbol, Decl<Effect>>,
+    imported: &HashMap<Symbol, IndexMap<String, Symbol>>,
 ) -> HashMap<Symbol, IndexMap<String, Symbol>> {
     // A declaration with operations is the effect itself, whatever it declares
     // — including the empty one, which declares nothing and is still an effect
-    // a row may name. An alias starts from nothing and grows below.
-    let mut out: HashMap<Symbol, IndexMap<String, Symbol>> = effects
-        .iter()
-        .map(|(symbol, decl)| {
-            let stands = match &decl.value {
-                Effect::Operations(_) => {
-                    [(effect_key(mint, *symbol), *symbol)].into_iter().collect()
-                }
-                Effect::Alias(_) => IndexMap::new(),
-            };
-            (*symbol, stands)
-        })
-        .collect();
+    // a row may name. An alias starts from nothing and grows below. Imported
+    // expansions seed the same fixpoint so a local alias can reach through a
+    // dependency alias or operation.
+    let mut out = imported.clone();
+    out.extend(effects.iter().map(|(symbol, decl)| {
+        let stands = match &decl.value {
+            Effect::Operations(_) => [(effect_key(mint, *symbol), *symbol)].into_iter().collect(),
+            Effect::Alias(_) => IndexMap::new(),
+        };
+        (*symbol, stands)
+    }));
     loop {
         let mut grew = false;
         for (symbol, decl) in effects {
@@ -2826,10 +3496,12 @@ impl Follow<'_> {
             }
             return Stands::Loop;
         }
-        // Every symbol a body can name was declared, and every declaration that
-        // was made is in this table: a name that repeats one binds nothing and
-        // so is never written into a type at all.
-        let decl = &self.types[&symbol];
+        // Imported declarations live in the semantic interface table rather
+        // than this local syntax table. They are already validated and cannot
+        // participate in a local bare-name recursion cycle.
+        let Some(decl) = self.types.get(&symbol) else {
+            return Stands::Shape;
+        };
         self.open.push(symbol);
         self.marks.push(self.fielded);
         let stands = self.ty(&decl.value);
@@ -4988,6 +5660,372 @@ impl Builder<'_> {
             .expect("the name table already ruled out a repeat");
         self.globals.insert(key, (symbol, name.span));
         Some(symbol)
+    }
+
+    /// Install direct dependency headers before local declarations are
+    /// flattened. The dependency bundle name is an ordinary root module, so
+    /// the existing strict path walk handles nested modules without a second
+    /// resolver.
+    fn import_dependencies(
+        &mut self,
+        dependencies: &[DependencyImport<'_>],
+        linked: &[artifact::Artifact],
+        program: &mut Program,
+    ) {
+        let mut symbols: HashMap<(Namespace, String), Symbol> = HashMap::new();
+        let mut identities = HashSet::new();
+        let mut aliases = HashSet::new();
+        let mut valid = Vec::with_capacity(dependencies.len());
+        for import in dependencies {
+            let identity = (
+                import.artifact.header.identity.name.clone(),
+                import.artifact.header.identity.version.clone(),
+            );
+            if !source_identifier(import.alias) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::InvalidDependencyAlias {
+                        alias: import.alias.to_string(),
+                    },
+                });
+            } else if identities.contains(&identity) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::DuplicateDependency {
+                        name: import.artifact.header.identity.name.clone(),
+                        version: import.artifact.header.identity.version.clone(),
+                    },
+                });
+            } else if aliases.contains(import.alias) {
+                self.errors.push(Error {
+                    span: Span::default(),
+                    kind: ErrorKind::DuplicateDependencyAlias {
+                        alias: import.alias.to_string(),
+                    },
+                });
+            } else {
+                identities.insert(identity);
+                aliases.insert(import.alias);
+                valid.push(*import);
+            }
+        }
+
+        // Every linked declaration gets a semantic symbol, including
+        // transitive implementation dependencies. Only the direct pass below
+        // installs those symbols into source resolution tables.
+        for dependency in linked
+            .iter()
+            .chain(valid.iter().map(|import| import.artifact))
+        {
+            for (namespace, qualified) in dependency
+                .header
+                .values
+                .iter()
+                .map(|value| (Namespace::Terms, &value.name))
+                .chain(
+                    dependency
+                        .header
+                        .types
+                        .iter()
+                        .map(|value| (Namespace::Types, &value.name)),
+                )
+                .chain(
+                    dependency
+                        .header
+                        .effects
+                        .iter()
+                        .map(|value| (Namespace::Effects, &value.name)),
+                )
+            {
+                if dependency_path(dependency, qualified).is_none() {
+                    continue;
+                }
+                imported_symbol(
+                    self.mint,
+                    namespace,
+                    qualified,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+            }
+        }
+
+        // Declare every source-visible name first. Semantic interfaces may
+        // refer forward, sideways, or through a transitive implementation
+        // dependency, so conversion happens in the second pass.
+        for import in &valid {
+            let dependency = import.artifact;
+            let root_name = import.alias;
+            let root = match self.modules.get(&(None, root_name.to_string())) {
+                Some(&(module, _)) => module,
+                None => {
+                    let module = self
+                        .mint
+                        .module(None, root_name)
+                        .expect("a dependency root was checked before minting");
+                    self.modules
+                        .insert((None, root_name.to_string()), (module, Span::default()));
+                    module
+                }
+            };
+            for (namespace, qualified) in dependency
+                .header
+                .values
+                .iter()
+                .map(|value| (Namespace::Terms, &value.name))
+                .chain(
+                    dependency
+                        .header
+                        .types
+                        .iter()
+                        .map(|value| (Namespace::Types, &value.name)),
+                )
+                .chain(
+                    dependency
+                        .header
+                        .effects
+                        .iter()
+                        .map(|value| (Namespace::Effects, &value.name)),
+                )
+            {
+                let Some(parts) = dependency_path(dependency, qualified) else {
+                    continue;
+                };
+                let (modules, name) = parts.split_at(parts.len() - 1);
+                let mut parent = root;
+                for segment in modules {
+                    parent = match self.modules.get(&(Some(parent), segment.clone())) {
+                        Some(&(module, _)) => module,
+                        None => {
+                            let module = self
+                                .mint
+                                .module(Some(parent), segment)
+                                .expect("an imported module was checked before minting");
+                            self.modules
+                                .insert((Some(parent), segment.clone()), (module, Span::default()));
+                            module
+                        }
+                    };
+                }
+                let key = (Some(parent), namespace, name[0].clone());
+                if self.globals.contains_key(&key) {
+                    continue;
+                }
+                let symbol = symbols[&(namespace, qualified.clone())];
+                self.globals.insert(key, (symbol, Span::default()));
+            }
+        }
+
+        for dependency in linked
+            .iter()
+            .chain(valid.iter().map(|import| import.artifact))
+        {
+            for value in &dependency.header.values {
+                let Some(&symbol) = symbols.get(&(Namespace::Terms, value.name.clone())) else {
+                    continue;
+                };
+                let scheme = import_scheme(
+                    self.mint,
+                    &value.scheme,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+                program.external_schemes.insert(symbol, scheme);
+            }
+            for declaration in &dependency.header.types {
+                let Some(&symbol) = symbols.get(&(Namespace::Types, declaration.name.clone()))
+                else {
+                    continue;
+                };
+                let scheme = import_scheme(
+                    self.mint,
+                    &declaration.scheme,
+                    &mut symbols,
+                    &mut program.external_names,
+                );
+                let params: Vec<ParamKind> = declaration
+                    .params
+                    .iter()
+                    .map(|param| {
+                        let lacks = param.lacks.iter().cloned().collect();
+                        match param.sense {
+                            artifact::Sense::Type => ParamKind::Type { lacks },
+                            artifact::Sense::Cases => ParamKind::Cases { lacks },
+                            artifact::Sense::Effects => ParamKind::Effects { lacks },
+                        }
+                    })
+                    .collect();
+                self.arities.insert(symbol, params.len());
+                program.external_types.insert(
+                    symbol,
+                    ExternalType {
+                        params,
+                        relevant: declaration
+                            .params
+                            .iter()
+                            .map(|param| param.relevant)
+                            .collect(),
+                        scheme,
+                        unresolved: None,
+                    },
+                );
+            }
+            for declaration in &dependency.header.effects {
+                let Some(&symbol) = symbols.get(&(Namespace::Effects, declaration.name.clone()))
+                else {
+                    continue;
+                };
+                if let Some(identity) = &declaration.identity {
+                    program.effect_ids.insert(
+                        symbol,
+                        EffectId::Structural {
+                            name: identity.name.clone(),
+                            interface: identity.interface.clone(),
+                        },
+                    );
+                }
+                match &declaration.kind {
+                    artifact::EffectKind::Operations(operations) => {
+                        // Trusted artifacts always carry the structural identity
+                        // of an operation declaration. Keep malformed or older
+                        // direct-only interfaces total as well: an absent
+                        // identity must never make every use of the effect pure.
+                        program.effect_ids.entry(symbol).or_insert_with(|| {
+                            EffectId::structural(
+                                declaration
+                                    .name
+                                    .rsplit("::")
+                                    .next()
+                                    .unwrap_or(&declaration.name)
+                                    .to_string(),
+                                format!("unresolved:{}", declaration.name),
+                            )
+                        });
+                        self.expanded.insert(
+                            symbol,
+                            [(declaration.name.clone(), symbol)].into_iter().collect(),
+                        );
+                        self.operations.insert(
+                            symbol,
+                            operations
+                                .iter()
+                                .map(|operation| operation.name.clone())
+                                .collect(),
+                        );
+                        for operation in operations {
+                            let from = import_type(
+                                self.mint,
+                                &operation.from,
+                                &mut symbols,
+                                &mut program.external_names,
+                            );
+                            let to = import_type(
+                                self.mint,
+                                &operation.to,
+                                &mut symbols,
+                                &mut program.external_names,
+                            );
+                            program
+                                .external_operations
+                                .insert((symbol, operation.name.clone()), (from, to));
+                        }
+                    }
+                    artifact::EffectKind::Alias(names) => {
+                        let expansion = names
+                            .iter()
+                            .map(|name| {
+                                let target = imported_symbol(
+                                    self.mint,
+                                    Namespace::Effects,
+                                    name,
+                                    &mut symbols,
+                                    &mut program.external_names,
+                                );
+                                (name.clone(), target)
+                            })
+                            .collect();
+                        self.expanded.insert(symbol, expansion);
+                    }
+                }
+            }
+        }
+
+        // Imported aliases can point forward and through any number of linked
+        // headers. Close the expansion map over itself after every header has
+        // been installed; the one-pass insertion above otherwise leaves
+        // `Alias -> Alias -> Effect` ending at an identity-less alias, which is
+        // subsequently dropped while rows are rekeyed.
+        loop {
+            let previous = self.expanded.clone();
+            let mut grew = false;
+            for expansion in self.expanded.values_mut() {
+                let reached: Vec<_> = expansion.values().copied().collect();
+                for target in reached {
+                    for (name, concrete) in previous.get(&target).into_iter().flatten() {
+                        grew |= expansion.insert(name.clone(), *concrete).is_none();
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        // A direct-only caller may hand us an alias that reaches a transitive
+        // effect without its defining header. Give that leaf a stable recovery
+        // identity before rows are rekeyed: dropping it would turn an annotated
+        // effect row into a pure one, while one shared sentinel would make
+        // unrelated missing effects equal. Graph-aware callers install the real
+        // identity above and therefore never take this path.
+        let unresolved_effects: Vec<_> = program
+            .external_names
+            .iter()
+            .filter(|(symbol, _)| {
+                self.mint.namespace(**symbol) == Namespace::Effects
+                    && !program.effect_ids.contains_key(*symbol)
+                    && !self.expanded.contains_key(*symbol)
+            })
+            .map(|(symbol, qualified)| (*symbol, qualified.clone()))
+            .collect();
+        for (symbol, qualified) in unresolved_effects {
+            let name = qualified
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified.as_str())
+                .to_string();
+            program.effect_ids.insert(
+                symbol,
+                EffectId::structural(name, format!("unresolved:{qualified}")),
+            );
+            self.expanded
+                .entry(symbol)
+                .or_insert_with(|| [(qualified, symbol)].into_iter().collect());
+        }
+
+        // A direct-only caller may hand us an interface containing a named
+        // transitive type without its defining header. Keep inference total by
+        // installing an undecided recovery declaration. Graph-aware callers
+        // replace these with the real schemes during the import pass above.
+        let unresolved: Vec<_> = program
+            .external_names
+            .keys()
+            .copied()
+            .filter(|symbol| {
+                self.mint.namespace(*symbol) == Namespace::Types
+                    && !program.external_types.contains_key(symbol)
+            })
+            .collect();
+        for symbol in unresolved {
+            program.external_types.insert(
+                symbol,
+                ExternalType {
+                    params: Vec::new(),
+                    relevant: Vec::new(),
+                    scheme: Scheme::new(0, Rc::new(Ty::default())),
+                    unresolved: program.external_names.get(&symbol).cloned(),
+                },
+            );
+        }
     }
 
     /// [`declare`](Self::declare) in the module namespace, which has a door of

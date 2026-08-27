@@ -1,26 +1,25 @@
 //! Tests for [`ruddy_debug::stage`].
 
+use std::collections::HashMap;
+
+use indexmap::IndexMap;
+
 use regex::Regex;
-use ruddy::types::Core;
+use ruddy::{
+    artifact::{Artifact, Dependency, Header, Identity, Lir},
+    types::Core,
+};
 use ruddy_debug::{
     snapshot::{ROOT, compile},
-    stage::{Build, REGISTRY, Spec, panicked, skipped},
-    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage},
+    stage::{Build, Cx, Phases, REGISTRY, Spec, panicked, skipped},
+    wire::{CompileRequest, FileSpec, Loc, Node, Snapshot, Stage, Status, View},
 };
-
-/// The header every snippet is compiled under: a bundle's root file must open
-/// with one, so a snippet that did not write its own would be told so. Every
-/// span in the snippet therefore sits this many bytes further in.
-const HEADER: &str = "bundle demo 0.1.0\n";
 
 /// A bundle of three files, one per shape a module's body can come from: an
 /// inline module, a module beside its parent, and a module inside the directory
 /// its parent's name spells.
 const NESTED: &[(&str, &str)] = &[
-    (
-        ROOT,
-        "bundle demo 0.1.0\nmodule Math\nlet four = Math::double 2n\n",
-    ),
+    (ROOT, "module Math\nlet four = Math::double 2n\n"),
     ("Math.hc", "module Vec\nlet double = fn x => x\n"),
     ("Math/Vec.hc", "let zero = 0n\n"),
 ];
@@ -839,6 +838,179 @@ fn the_lir_tab_skips_a_program_with_errors() {
     assert!(bad.micros.is_none());
 }
 
+#[test]
+fn artifact_stage_renders_one_dependency() {
+    let artifact = Artifact {
+        header: Header {
+            identity: Identity {
+                name: "demo".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            dependencies: vec![Dependency {
+                name: "base".to_string(),
+                version: "2.3.4".to_string(),
+            }],
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        lir: Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let symbols = HashMap::new();
+    let declarations = IndexMap::from([
+        ("base".to_string(), "../base".into()),
+        ("broken".to_string(), "../broken".into()),
+    ]);
+    let cx = Cx {
+        files: &[],
+        bundle: None,
+        program: None,
+        inference: None,
+        patterns: None,
+        lir: None,
+        artifact: Some(&artifact),
+        linked: None,
+        dependency_declarations: &declarations,
+        dependency_aliases: &["base".to_string()],
+        dependencies: &artifact.header.dependencies,
+        dependency_interfaces: &[],
+        dependencies_valid: false,
+        artifact_panicked: false,
+        link_error: None,
+        link_panicked: false,
+        mint: None,
+        symbols: &symbols,
+        micros: Phases::default(),
+        errored: false,
+    };
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "artifact")
+        .expect("the artifact stage is registered");
+
+    let stage = ruddy_debug::stage::artifact::build(spec, &cx);
+
+    assert_eq!(
+        stage.summary,
+        "1 dependency · 0 values · 0 types · 0 effects · 0 functions · 0 globals"
+    );
+    let dependencies = &stage.nodes[0].children[0];
+    assert_eq!(dependencies.label, "dependencies");
+    assert_eq!(dependencies.text, "1 declared");
+    assert_eq!(dependencies.children.len(), 1);
+    assert_eq!(dependencies.children[0].label, "dependency");
+    assert_eq!(dependencies.children[0].text, "base@2.3.4");
+
+    let dependency_spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "dependencies")
+        .expect("the dependencies stage is registered");
+    let dependency_stage = ruddy_debug::stage::dependencies::build(dependency_spec, &cx);
+    assert_eq!(dependency_stage.status, Status::Partial);
+    assert_eq!(dependency_stage.summary, "2 declared · 1 built");
+    assert_eq!(dependency_stage.nodes[0].children.len(), 2);
+    assert_eq!(dependency_stage.nodes[0].children[1].text, "broken");
+}
+
+#[test]
+fn artifact_phase_panic_is_not_reported_as_skipped() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "artifact")
+        .expect("artifact stage is registered");
+    assert_eq!(
+        ruddy_debug::stage::artifact::missing(spec, true).status,
+        Status::Panicked
+    );
+    assert_eq!(
+        ruddy_debug::stage::artifact::missing(spec, false).status,
+        Status::Skipped
+    );
+}
+
+/// The artifact is the canonical disk boundary: the text is directly usable,
+/// while its outline makes the public header and lowered sections discoverable.
+#[test]
+fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
+    let artifact_stage = stage("artifact", "let id = fn x => x\n");
+    assert_eq!(artifact_stage.status, Status::Ok);
+    assert_eq!(artifact_stage.view, View::Text);
+    assert_eq!(artifact_stage.views, [View::Text, View::Tree]);
+    assert!(
+        artifact_stage
+            .text
+            .as_ref()
+            .is_some_and(|text| text.starts_with("(artifact\n  (header"))
+    );
+    assert_eq!(
+        artifact_stage
+            .nodes
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>(),
+        ["header", "lir"],
+        "{:#?}",
+        artifact_stage.nodes
+    );
+    assert_eq!(artifact_stage.nodes[0].children[0].label, "dependencies");
+    assert_eq!(artifact_stage.nodes[0].children[0].text, "0 declared");
+    assert!(artifact_stage.nodes[0].children[0].children.is_empty());
+    assert!(
+        artifact_stage.summary.contains("0 dependencies · 1 values"),
+        "{}",
+        artifact_stage.summary
+    );
+
+    let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
+    assert_eq!(skipped.status, Status::Skipped);
+    // The reader can select either artifact rendering before a bad edit; both
+    // must still be represented while the page explains why neither has data.
+    assert_eq!(skipped.views, [View::Text, View::Tree]);
+    assert_eq!(skipped.summary, "artifact construction did not run");
+    assert!(skipped.nodes.is_empty());
+    assert!(skipped.text.is_none());
+    assert!(skipped.micros.is_none());
+}
+
+#[test]
+fn link_failure_is_distinct_from_a_skip_and_a_panic() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "linked")
+        .expect("linked stage is registered");
+    let failed = ruddy_debug::stage::linked::missing(spec, false, Some("bad graph"));
+    assert_eq!(failed.status, Status::Error);
+    assert_eq!(failed.summary, "bad graph");
+    assert_eq!(failed.micros, Some(0));
+    let panicked = ruddy_debug::stage::linked::missing(spec, true, Some("bad graph"));
+    assert_eq!(panicked.status, Status::Panicked);
+    assert_eq!(panicked.micros, Some(0));
+    let skipped = ruddy_debug::stage::linked::missing(spec, false, None);
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.micros, None);
+}
+
+#[test]
+fn linked_artifact_is_a_distinct_final_phase_tab() {
+    let linked = stage("linked", "let id = fn x => x\n");
+    assert_eq!(linked.title, "Linked Artifact");
+    assert_eq!(linked.status, Status::Ok);
+    assert_eq!(linked.view, View::Text);
+    assert!(
+        linked
+            .text
+            .as_ref()
+            .is_some_and(|text| text.contains("(dependencies)"))
+    );
+
+    let skipped = stage("linked", "let bad : Nat = fn x => x\n");
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.summary, "static linking did not run");
+}
+
 /// The Tokens tab is one row per file with that file's own stream under it. A
 /// bundle is several streams rather than one, and a flat list would run the last
 /// token of one file into the first of the next with nothing to say where the
@@ -857,7 +1029,7 @@ fn the_tokens_tab_groups_its_rows_by_file() {
     assert_eq!(
         rows,
         [
-            ("File", "main.hc · 16 tokens"),
+            ("File", "main.hc · 9 tokens"),
             ("File", "Math.hc · 9 tokens"),
             ("File", "Math/Vec.hc · 4 tokens"),
         ],
@@ -877,7 +1049,7 @@ fn the_tokens_tab_groups_its_rows_by_file() {
 
     // And the summary counts both: the tokens are what the tab renders, and the
     // files are what it renders them under.
-    assert_eq!(stage.summary, "29 tokens · 3 files");
+    assert_eq!(stage.summary, "22 tokens · 3 files");
 }
 
 /// The AST tab is one row per file holding the statements written in *that*
@@ -912,14 +1084,10 @@ fn the_ast_tab_groups_its_rows_by_file() {
             .map(|node| node.label.as_str())
             .collect()
     };
-    // The root file leads with the header, which is the file's own first line
-    // rather than a statement — there is no node in the statement list for it
-    // to be.
-    assert_eq!(children(0), ["Bundle", "Module", "Let"]);
-    assert_eq!(stage.nodes[0].children[0].text, "bundle demo 0.1.0");
-    // And the module whose body is in `Math.hc` carries its name and nothing
-    // else: the body is that file's row.
-    let math = &stage.nodes[0].children[1];
+    assert_eq!(children(0), ["Module", "Let"]);
+    // The module whose body is in `Math.hc` carries its name and nothing else:
+    // the body is that file's row.
+    let math = &stage.nodes[0].children[0];
     assert_eq!(
         math.children
             .iter()
@@ -934,7 +1102,7 @@ fn the_ast_tab_groups_its_rows_by_file() {
     // A module written inline is the other half of the rule: its statements
     // were written in this file, so this file's row is where they go.
     let nodes = tab("ast", "module A =\n  let x = 1n\nend\n");
-    let inline = &nodes[0].children[1];
+    let inline = &nodes[0].children[0];
     assert_eq!(inline.label, "Module");
     let kids: Vec<&str> = inline
         .children
@@ -1006,6 +1174,10 @@ fn the_symbols_tab_says_which_module_and_file_a_symbol_came_from() {
 fn bundle(files: &[(&str, &str)]) -> Snapshot {
     compile(
         &CompileRequest {
+            name: "demo".to_string(),
+            version: "0.1.0".to_string(),
+            root: ROOT.to_string(),
+            document: "demo".to_string(),
             files: files
                 .iter()
                 .map(|(path, source)| FileSpec {
@@ -1013,6 +1185,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            dependencies: IndexMap::new(),
             revision: 0,
         },
         0,
@@ -1021,7 +1194,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
 
 /// One stage over one snippet, compiled as the whole of a bundle's root file.
 fn stage(id: &'static str, snippet: &str) -> Stage {
-    named(bundle(&[(ROOT, &format!("{HEADER}{snippet}"))]), id)
+    named(bundle(&[(ROOT, snippet)]), id)
 }
 
 /// One stage of a snapshot, by the id it is registered under.
@@ -1038,13 +1211,9 @@ fn tab(id: &'static str, snippet: &str) -> Vec<Node> {
     stage(id, snippet).nodes
 }
 
-/// Where a range written in a snippet's own offsets ends up on the wire: in the
-/// root file, [`HEADER`] bytes further in than the snippet spells it.
+/// Where a range written in a snippet's own offsets ends up on the wire.
 fn at(range: [usize; 2]) -> Option<Loc> {
-    Some(Loc {
-        file: 0,
-        range: [range[0] + HEADER.len(), range[1] + HEADER.len()],
-    })
+    Some(Loc { file: 0, range })
 }
 
 /// Every row of a tree, parents before children — the shape of the tree is not

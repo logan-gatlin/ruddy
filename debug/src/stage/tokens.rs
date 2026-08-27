@@ -86,7 +86,6 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Or => "Or",
         Kind::Xor => "Xor",
         Kind::Not => "Not",
-        Kind::Bundle => "Bundle",
         Kind::Module => "Module",
         Kind::Equal => "Equal",
         Kind::FatArrow => "FatArrow",

@@ -9,10 +9,13 @@
 //! reach a release build.
 #![cfg(test)]
 
+mod artifact;
 mod bundle;
+mod cli;
 mod docs;
 mod inference;
 mod ir;
+mod link;
 mod lir;
 mod parse;
 mod patterns;

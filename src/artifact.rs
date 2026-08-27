@@ -1,0 +1,2799 @@
+//! A portable, span-free bundle artifact.
+//!
+//! Artifacts are the compiler's disk boundary.  They intentionally contain no
+//! source locations, file paths, or [`crate::symbol::Symbol`]s: external value
+//! references are qualified by the identity of the bundle that owns them.
+//! [`parse`] accepts only compiler-produced text and deliberately panics for
+//! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
+//! v1 format, not a compatibility promise.
+
+use std::{error::Error, fmt};
+
+use crate::{
+    inference, ir, lir,
+    symbol::{Mint, Symbol},
+    types,
+};
+
+/// An error encountered while parsing artifact text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    message: String,
+    offset: Option<usize>,
+}
+
+impl ParseError {
+    fn syntax(message: impl Into<String>, offset: usize) -> Self {
+        Self {
+            message: message.into(),
+            offset: Some(offset),
+        }
+    }
+
+    fn structure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            offset: None,
+        }
+    }
+
+    /// A description of the malformed input.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The byte offset for syntax errors, when one is available.
+    pub fn offset(&self) -> Option<usize> {
+        self.offset
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.offset {
+            Some(offset) => write!(formatter, "{} at byte {offset}", self.message),
+            None => formatter.write_str(&self.message),
+        }
+    }
+}
+
+impl Error for ParseError {}
+
+/// A complete, serializable bundle artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub header: Header,
+    pub lir: Lir,
+}
+
+/// The public interface of one bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    pub identity: Identity,
+    /// The bundles this artifact depends on.
+    pub dependencies: Vec<Dependency>,
+    /// Every top-level `let`, in source declaration order.
+    pub values: Vec<Value>,
+    /// Every declared type, in source declaration order.
+    pub types: Vec<DeclaredType>,
+    /// Every declared effect, in source declaration order.
+    pub effects: Vec<DeclaredEffect>,
+}
+
+/// The identity that owns an artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub name: String,
+    pub version: String,
+}
+
+/// The identity of one bundle this artifact depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    pub name: String,
+    pub version: String,
+}
+
+/// A globally addressable declaration.  Its spelling is
+/// `bundle@version::module::name`.
+pub type QualifiedName = String;
+
+/// One exported value and its normalized semantic scheme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Value {
+    pub name: QualifiedName,
+    pub scheme: Scheme,
+}
+
+/// A declared type and the semantics of its parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredType {
+    pub name: QualifiedName,
+    pub params: Vec<Parameter>,
+    pub scheme: Scheme,
+}
+
+/// The semantic role of a declared type parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    pub sense: Sense,
+    pub lacks: Vec<String>,
+    pub relevant: bool,
+}
+
+/// The role a parameter has in its declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sense {
+    Type,
+    Cases,
+    Effects,
+}
+
+/// A declared effect and its semantic identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredEffect {
+    pub name: QualifiedName,
+    /// `None` for an alias: aliases expand to other effects and do not name a
+    /// row label of their own.
+    pub identity: Option<EffectIdentity>,
+    pub kind: EffectKind,
+}
+
+/// The structural identity used by semantic effect rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectIdentity {
+    pub name: String,
+    pub interface: String,
+}
+
+/// An effect's operations, or the effects an alias expands to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectKind {
+    Operations(Vec<Operation>),
+    Alias(Vec<QualifiedName>),
+}
+
+/// One operation's public signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operation {
+    pub name: String,
+    pub from: Type,
+    pub to: Type,
+}
+
+/// A normalized scheme.  Quantifier positions use the compiler's one shared
+/// index space: presences are `0..presences`, then types and rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scheme {
+    pub count: u32,
+    pub presences: u32,
+    pub formula: Formula,
+    pub body: Type,
+}
+
+/// A normalized semantic type, independent of compiler symbols and spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Type {
+    pub core: Core,
+    pub fields: Vec<(String, RowField)>,
+}
+
+/// A type's core, before its structural fields are laid over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Core {
+    Unit,
+    Nat,
+    Int,
+    Real,
+    String,
+    Boolean,
+    Arrow(Box<Type>, Box<Type>, Row),
+    Sum(Row),
+    Var(u32),
+    Bound(u32),
+    Rigid {
+        id: u32,
+        name: String,
+    },
+    Named {
+        name: QualifiedName,
+        args: Vec<Type>,
+    },
+    Undecided,
+}
+
+/// A normalized sum or effect row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub labels: Vec<(String, RowField)>,
+    pub rest: Rest,
+}
+
+/// The part of a sum or effect row beyond its named labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rest {
+    Closed,
+    Var(u32),
+    Bound(u32),
+    Rigid { id: u32, name: String },
+    Undecided,
+    More(Box<Row>),
+}
+
+/// One row label and its (possibly conditional) payload type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowField {
+    pub presence: Presence,
+    pub ty: Type,
+}
+
+/// Whether a structural label is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    Present,
+    Absent,
+    Var(u32),
+    Bound(u32),
+    Undecided,
+}
+
+/// A propositional constraint over presence variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Formula {
+    True,
+    False,
+    Var(u32),
+    Bound(u32),
+    Not(Box<Formula>),
+    And(Box<Formula>, Box<Formula>),
+    Or(Box<Formula>, Box<Formula>),
+    Iff(Box<Formula>, Box<Formula>),
+    Xor(Box<Formula>, Box<Formula>),
+}
+
+/// The span-free LIR portion of an artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lir {
+    pub functions: Vec<Function>,
+    pub globals: Vec<Global>,
+}
+
+/// A lifted LIR function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Block,
+}
+
+/// An LIR parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Param {
+    pub temp: u32,
+    pub rep: Rep,
+}
+
+/// A top-level initializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Global {
+    pub name: QualifiedName,
+    pub body: Block,
+}
+
+/// An ordered instruction list and one terminator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    pub instrs: Vec<Instr>,
+    pub end: End,
+}
+
+/// A value-producing instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instr {
+    pub temp: u32,
+    pub rep: Rep,
+    pub op: Op,
+}
+
+/// A span-free LIR operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    Const(Literal),
+    Neg(u32),
+    Not(u32),
+    And {
+        left: u32,
+        right: u32,
+    },
+    Or {
+        left: u32,
+        right: u32,
+    },
+    Xor {
+        left: u32,
+        right: u32,
+    },
+    Add {
+        left: u32,
+        right: u32,
+    },
+    Sub {
+        left: u32,
+        right: u32,
+    },
+    Mul {
+        left: u32,
+        right: u32,
+    },
+    Div {
+        left: u32,
+        right: u32,
+    },
+    Struct(Vec<(String, u32)>),
+    Merge(Vec<u32>),
+    Project {
+        base: u32,
+        field: String,
+    },
+    Tag {
+        name: String,
+        payload: Option<u32>,
+    },
+    Payload(u32),
+    Closure {
+        /// Index into [`Lir::functions`], fixed-width on the artifact boundary.
+        func: u64,
+        captures: Vec<u32>,
+    },
+    Call {
+        callee: Callee,
+        args: Vec<u32>,
+    },
+    Global {
+        target: QualifiedName,
+    },
+    NewTag,
+    Catch {
+        tag: u32,
+        body: Box<Block>,
+    },
+    SwitchTag {
+        on: u32,
+        cases: Vec<TagCase>,
+        fallback: Option<Box<Block>>,
+    },
+    SwitchPrim {
+        on: u32,
+        cases: Vec<PrimCase>,
+        fallback: Option<Box<Block>>,
+    },
+    SwitchPresence {
+        on: u32,
+        field: String,
+        present: Box<Block>,
+        absent: Box<Block>,
+    },
+    SwitchRest {
+        on: u32,
+        fields: Vec<String>,
+        none: Box<Block>,
+        some: Box<Block>,
+    },
+}
+
+/// The target of an LIR call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Callee {
+    /// Index into [`Lir::functions`], fixed-width on the artifact boundary.
+    Direct(u64),
+    Indirect(u32),
+}
+
+/// One tag-dispatch branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagCase {
+    pub name: String,
+    pub block: Block,
+}
+
+/// One primitive-dispatch branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimCase {
+    pub value: Literal,
+    pub block: Block,
+}
+
+/// A block terminator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum End {
+    Ret(u32),
+    Yield(u32),
+    Throw { tag: u32, value: u32 },
+}
+
+/// A literal.  Reals retain their bit representation, including NaNs and signed
+/// zero, so equality does not accidentally change program data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Literal {
+    Natural(u64),
+    Integer(i64),
+    Real(u64),
+    String(String),
+    Boolean(bool),
+}
+
+/// The machine representation retained by LIR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rep {
+    Nat,
+    Int,
+    Real,
+    String,
+    Boolean,
+    Unit,
+    Struct,
+    Sum,
+    Fn,
+    Any,
+}
+
+/// Build an artifact after inference and LIR lowering succeeded.
+pub fn build(
+    mint: &Mint,
+    program: &ir::Program,
+    inference: &inference::Output,
+    lir: &lir::Output,
+) -> Artifact {
+    build_with_dependencies(mint, program, inference, lir, Vec::new())
+}
+
+/// Build an artifact with the dependency identities supplied by its driver.
+pub fn build_with_dependencies(
+    mint: &Mint,
+    program: &ir::Program,
+    inference: &inference::Output,
+    lir: &lir::Output,
+    dependencies: Vec<Dependency>,
+) -> Artifact {
+    let header = Header {
+        identity: Identity {
+            name: mint.bundle().name().to_string(),
+            version: mint.bundle().version().to_string(),
+        },
+        dependencies,
+        values: program
+            .terms
+            .keys()
+            .map(|symbol| Value {
+                name: qualified(mint, *symbol),
+                scheme: scheme(mint, &inference.schemes[symbol]),
+            })
+            .collect(),
+        types: program
+            .types
+            .iter()
+            .map(|(symbol, declaration)| DeclaredType {
+                name: qualified(mint, *symbol),
+                params: declaration
+                    .params
+                    .iter()
+                    .map(|param| Parameter {
+                        sense: match param.kind.sense() {
+                            types::Sense::Type => Sense::Type,
+                            types::Sense::Cases => Sense::Cases,
+                            types::Sense::Effects => Sense::Effects,
+                            types::Sense::Presence => {
+                                panic!("a type parameter cannot be a presence")
+                            }
+                        },
+                        lacks: param.kind.lacks().iter().cloned().collect(),
+                        relevant: param.relevant,
+                    })
+                    .collect(),
+                scheme: scheme(mint, &inference.aliases[symbol]),
+            })
+            .collect(),
+        effects: program
+            .effects
+            .iter()
+            .map(|(symbol, declaration)| DeclaredEffect {
+                name: qualified(mint, *symbol),
+                identity: program.effect_ids.get(symbol).map(effect_id),
+                kind: match &declaration.value {
+                    ir::Effect::Operations(operations) => EffectKind::Operations(
+                        operations
+                            .iter()
+                            .map(|(name, _)| {
+                                let (from, to) = &inference.operations[&(*symbol, name.clone())];
+                                Operation {
+                                    name: name.clone(),
+                                    from: ty(mint, from),
+                                    to: ty(mint, to),
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ir::Effect::Alias(effects) => EffectKind::Alias(
+                        effects
+                            .values()
+                            .map(|effect| qualified(mint, effect.symbol))
+                            .collect(),
+                    ),
+                },
+            })
+            .collect(),
+    };
+    Artifact {
+        header,
+        lir: lower_lir(mint, lir),
+    }
+}
+
+impl Artifact {
+    /// Build an artifact after inference and LIR lowering succeeded.
+    pub fn build(
+        mint: &Mint,
+        program: &ir::Program,
+        inference: &inference::Output,
+        lir: &lir::Output,
+    ) -> Self {
+        build(mint, program, inference, lir)
+    }
+
+    /// Canonical textual serialization.
+    pub fn print(&self) -> String {
+        print(self)
+    }
+    /// Parse trusted internal artifact text. Malformed input panics.
+    pub fn parse(input: &str) -> Self {
+        parse(input)
+    }
+
+    /// Parse artifact text without panicking on malformed input.
+    pub fn try_parse(input: &str) -> Result<Self, ParseError> {
+        try_parse(input)
+    }
+}
+
+/// Print canonical artifact text.
+pub fn print(artifact: &Artifact) -> String {
+    text::print(artifact)
+}
+/// Parse trusted internal artifact text. Malformed input panics.
+pub fn parse(input: &str) -> Artifact {
+    text::parse(input)
+}
+
+/// Parse artifact text without panicking on malformed input.
+pub fn try_parse(input: &str) -> Result<Artifact, ParseError> {
+    text::try_parse(input)
+}
+
+fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
+    if let Some(qualified) = mint.external(symbol) {
+        return qualified.to_owned();
+    }
+    // Source paths deliberately do not distinguish locals. Artifact names must:
+    // top-level wildcard definitions are fresh local symbols and multiple such
+    // globals can coexist. A full canonical mangling is deterministic and
+    // injective, while `%` keeps this compiler-only component disjoint from
+    // every source identifier.
+    if mint.is_local(symbol) {
+        return format!(
+            "{}@{}::%{}",
+            mint.bundle().name(),
+            mint.bundle().version(),
+            mint.mangle(symbol)
+        );
+    }
+    let path = mint.path(symbol).to_string();
+    let prefix = mint.bundle().name();
+    let suffix = path
+        .strip_prefix(prefix)
+        .expect("a mint path starts with its bundle");
+    format!(
+        "{}@{}{}",
+        mint.bundle().name(),
+        mint.bundle().version(),
+        suffix
+    )
+}
+
+fn effect_id(id: &types::EffectId) -> EffectIdentity {
+    match id {
+        types::EffectId::Structural { name, interface } => EffectIdentity {
+            name: name.clone(),
+            interface: interface.clone(),
+        },
+        types::EffectId::Pending(_) => {
+            panic!("artifact building requires structural effect identities")
+        }
+    }
+}
+
+fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
+    Scheme {
+        count: value.count(),
+        presences: value.presences(),
+        formula: formula(value.formula()),
+        body: ty(mint, value.body()),
+    }
+}
+
+fn ty(mint: &Mint, value: &types::Ty) -> Type {
+    Type {
+        core: match &value.core {
+            types::Core::Unit => Core::Unit,
+            types::Core::Nat => Core::Nat,
+            types::Core::Int => Core::Int,
+            types::Core::Real => Core::Real,
+            types::Core::String => Core::String,
+            types::Core::Boolean => Core::Boolean,
+            types::Core::Arrow(from, to, effects) => Core::Arrow(
+                Box::new(ty(mint, from)),
+                Box::new(ty(mint, to)),
+                row(mint, effects),
+            ),
+            types::Core::Sum(row_) => Core::Sum(row(mint, row_)),
+            types::Core::Var(value) => Core::Var(*value),
+            types::Core::Bound(value) => Core::Bound(*value),
+            types::Core::Rigid { id, name } => Core::Rigid {
+                id: *id,
+                name: name.to_string(),
+            },
+            types::Core::Named { symbol, args, .. } => Core::Named {
+                name: qualified(mint, *symbol),
+                args: args.iter().map(|arg| ty(mint, arg)).collect(),
+            },
+            types::Core::Undecided => Core::Undecided,
+        },
+        fields: value
+            .fields
+            .iter()
+            .map(|(name, field)| (name.clone(), row_field(mint, field)))
+            .collect(),
+    }
+}
+
+fn row(mint: &Mint, value: &types::Row) -> Row {
+    Row {
+        labels: value
+            .labels
+            .iter()
+            .map(|(name, field)| (name.clone(), row_field(mint, field)))
+            .collect(),
+        rest: match &value.rest {
+            types::Rest::Closed => Rest::Closed,
+            types::Rest::Var(value) => Rest::Var(*value),
+            types::Rest::Bound(value) => Rest::Bound(*value),
+            types::Rest::Rigid { id, name } => Rest::Rigid {
+                id: *id,
+                name: name.to_string(),
+            },
+            types::Rest::Undecided => Rest::Undecided,
+            types::Rest::More(row_) => Rest::More(Box::new(row(mint, row_))),
+        },
+    }
+}
+
+fn row_field(mint: &Mint, value: &types::RowField) -> RowField {
+    RowField {
+        presence: match &value.presence {
+            types::Presence::Present => Presence::Present,
+            types::Presence::Absent => Presence::Absent,
+            types::Presence::Var(value) => Presence::Var(*value),
+            types::Presence::Bound(value) => Presence::Bound(*value),
+            types::Presence::Undecided => Presence::Undecided,
+        },
+        ty: ty(mint, &value.ty),
+    }
+}
+
+fn formula(value: &types::Formula) -> Formula {
+    match value {
+        types::Formula::True => Formula::True,
+        types::Formula::False => Formula::False,
+        types::Formula::Atom(types::Atom::Var(value)) => Formula::Var(*value),
+        types::Formula::Atom(types::Atom::Bound(value)) => Formula::Bound(*value),
+        types::Formula::Not(value) => Formula::Not(Box::new(formula(value))),
+        types::Formula::And(left, right) => {
+            Formula::And(Box::new(formula(left)), Box::new(formula(right)))
+        }
+        types::Formula::Or(left, right) => {
+            Formula::Or(Box::new(formula(left)), Box::new(formula(right)))
+        }
+        types::Formula::Iff(left, right) => {
+            Formula::Iff(Box::new(formula(left)), Box::new(formula(right)))
+        }
+        types::Formula::Xor(left, right) => {
+            Formula::Xor(Box::new(formula(left)), Box::new(formula(right)))
+        }
+    }
+}
+
+fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
+    Lir {
+        functions: output
+            .functions
+            .iter()
+            .map(|function| Function {
+                name: function.name.clone(),
+                params: function
+                    .params
+                    .iter()
+                    .map(|param| Param {
+                        temp: param.temp,
+                        rep: rep(param.rep),
+                    })
+                    .collect(),
+                body: block(mint, &function.body),
+            })
+            .collect(),
+        globals: output
+            .globals
+            .iter()
+            .map(|global| Global {
+                name: qualified(mint, global.symbol),
+                body: block(mint, &global.body),
+            })
+            .collect(),
+    }
+}
+
+fn block(mint: &Mint, value: &lir::Block) -> Block {
+    Block {
+        instrs: value
+            .instrs
+            .iter()
+            .map(|instr| Instr {
+                temp: instr.temp,
+                rep: rep(instr.rep),
+                op: op(mint, &instr.op),
+            })
+            .collect(),
+        end: end(value.end.kind),
+    }
+}
+
+fn op(mint: &Mint, value: &lir::Op) -> Op {
+    use lir::Op as Source;
+    match value {
+        Source::Const(value) => Op::Const(literal(value)),
+        Source::Neg(value) => Op::Neg(*value),
+        Source::Not(value) => Op::Not(*value),
+        Source::And { left, right } => Op::And {
+            left: *left,
+            right: *right,
+        },
+        Source::Or { left, right } => Op::Or {
+            left: *left,
+            right: *right,
+        },
+        Source::Xor { left, right } => Op::Xor {
+            left: *left,
+            right: *right,
+        },
+        Source::Add { left, right } => Op::Add {
+            left: *left,
+            right: *right,
+        },
+        Source::Sub { left, right } => Op::Sub {
+            left: *left,
+            right: *right,
+        },
+        Source::Mul { left, right } => Op::Mul {
+            left: *left,
+            right: *right,
+        },
+        Source::Div { left, right } => Op::Div {
+            left: *left,
+            right: *right,
+        },
+        Source::Struct(fields) => Op::Struct(
+            fields
+                .iter()
+                .map(|(name, temp)| (name.clone(), *temp))
+                .collect(),
+        ),
+        Source::Merge(values) => Op::Merge(values.clone()),
+        Source::Project { base, field } => Op::Project {
+            base: *base,
+            field: field.clone(),
+        },
+        Source::Tag { name, payload } => Op::Tag {
+            name: name.clone(),
+            payload: *payload,
+        },
+        Source::Payload(value) => Op::Payload(*value),
+        Source::Closure { func, captures } => Op::Closure {
+            func: u64::try_from(*func).expect("LIR function index does not fit artifact format"),
+            captures: captures.clone(),
+        },
+        Source::Call { callee, args } => Op::Call {
+            callee: match callee {
+                lir::Callee::Direct(value) => Callee::Direct(
+                    u64::try_from(*value).expect("LIR function index does not fit artifact format"),
+                ),
+                lir::Callee::Indirect(value) => Callee::Indirect(*value),
+            },
+            args: args.clone(),
+        },
+        Source::Global { symbol, .. } => Op::Global {
+            target: qualified(mint, *symbol),
+        },
+        Source::NewTag => Op::NewTag,
+        Source::Catch { tag, body } => Op::Catch {
+            tag: *tag,
+            body: Box::new(block(mint, body)),
+        },
+        Source::SwitchTag {
+            on,
+            cases,
+            fallback,
+        } => Op::SwitchTag {
+            on: *on,
+            cases: cases
+                .iter()
+                .map(|case| TagCase {
+                    name: case.name.clone(),
+                    block: block(mint, &case.block),
+                })
+                .collect(),
+            fallback: fallback
+                .as_ref()
+                .map(|block_| Box::new(block(mint, block_))),
+        },
+        Source::SwitchPrim {
+            on,
+            cases,
+            fallback,
+        } => Op::SwitchPrim {
+            on: *on,
+            cases: cases
+                .iter()
+                .map(|case| PrimCase {
+                    value: literal(&case.value),
+                    block: block(mint, &case.block),
+                })
+                .collect(),
+            fallback: fallback
+                .as_ref()
+                .map(|block_| Box::new(block(mint, block_))),
+        },
+        Source::SwitchPresence {
+            on,
+            field,
+            present,
+            absent,
+        } => Op::SwitchPresence {
+            on: *on,
+            field: field.clone(),
+            present: Box::new(block(mint, present)),
+            absent: Box::new(block(mint, absent)),
+        },
+        Source::SwitchRest {
+            on,
+            fields,
+            none,
+            some,
+        } => Op::SwitchRest {
+            on: *on,
+            fields: fields.clone(),
+            none: Box::new(block(mint, none)),
+            some: Box::new(block(mint, some)),
+        },
+    }
+}
+
+fn literal(value: &ir::Literal) -> Literal {
+    match value {
+        ir::Literal::Natural(value) => Literal::Natural(*value),
+        ir::Literal::Integer(value) => Literal::Integer(*value),
+        ir::Literal::Real(value) => Literal::Real(value.to_bits()),
+        ir::Literal::String(value) => Literal::String(value.clone()),
+        ir::Literal::Boolean(value) => Literal::Boolean(*value),
+    }
+}
+fn end(value: lir::End) -> End {
+    match value {
+        lir::End::Ret(value) => End::Ret(value),
+        lir::End::Yield(value) => End::Yield(value),
+        lir::End::Throw { tag, value } => End::Throw { tag, value },
+    }
+}
+fn rep(value: lir::Rep) -> Rep {
+    match value {
+        lir::Rep::Nat => Rep::Nat,
+        lir::Rep::Int => Rep::Int,
+        lir::Rep::Real => Rep::Real,
+        lir::Rep::String => Rep::String,
+        lir::Rep::Boolean => Rep::Boolean,
+        lir::Rep::Unit => Rep::Unit,
+        lir::Rep::Struct => Rep::Struct,
+        lir::Rep::Sum => Rep::Sum,
+        lir::Rep::Fn => Rep::Fn,
+        lir::Rep::Any => Rep::Any,
+    }
+}
+
+/// Canonical text helpers. The S-expression grammar is deliberately explicit:
+/// every type, formula, operation, nested block, and ordered map has a distinct
+/// tag. The writer uses a fixed-width pretty layout; strings are quoted, and
+/// the parser accepts trusted output only.
+pub mod text {
+    use super::*;
+    use pretty::RcDoc;
+
+    /// The fixed width of canonical artifact text. Keeping this here rather
+    /// than at the call site makes line breaking part of the format.
+    const WIDTH: usize = 80;
+    #[derive(Debug, Clone)]
+    enum S {
+        Atom(String),
+        Str(String),
+        List(Vec<S>),
+    }
+
+    // Parsed S-expressions can be arbitrarily deep, including in malformed
+    // structural positions that the reader discards. Rust's derived drop walk
+    // would recurse through every nested `List`; drain descendants onto an
+    // explicit heap stack instead. This applies to every owned `S` (roots,
+    // parser stacks, reader task stacks, and truncated extras), so error paths
+    // are no less safe than successful decoding.
+    impl Drop for S {
+        fn drop(&mut self) {
+            let mut pending = Vec::new();
+            if let S::List(children) = self {
+                pending.append(children);
+            }
+            while let Some(mut value) = pending.pop() {
+                if let S::List(children) = &mut value {
+                    pending.append(children);
+                }
+                // `value` now has no owned descendants, so its own Drop is
+                // constant-depth.
+            }
+        }
+    }
+
+    use S::{Atom as A, List as L, Str as Q};
+
+    /// Print one artifact as canonical text, pretty-printed at a fixed width
+    /// and always ending in one newline.
+    pub fn print(value: &Artifact) -> String {
+        let mut out = Vec::new();
+        doc(&artifact(value))
+            .render(WIDTH, &mut out)
+            .expect("writing an artifact to memory cannot fail");
+        out.push(b'\n');
+        String::from_utf8(out).expect("artifact text is UTF-8")
+    }
+    /// Parse canonical trusted text; malformed text panics.
+    pub fn parse(input: &str) -> Artifact {
+        try_parse(input).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Parse canonical text without panicking on malformed input.
+    pub fn try_parse(input: &str) -> Result<Artifact, ParseError> {
+        let mut parser = Parser { input, at: 0 };
+        let value = parser.value()?;
+        parser.space();
+        if parser.at != input.len() {
+            return Err(ParseError::syntax("trailing artifact text", parser.at));
+        }
+        Reader::new().artifact(value)
+    }
+
+    fn artifact(value: &Artifact) -> S {
+        L(vec![
+            A("artifact".into()),
+            header(&value.header),
+            lir(&value.lir),
+        ])
+    }
+    fn header(value: &Header) -> S {
+        L(vec![
+            A("header".into()),
+            L(vec![
+                A("identity".into()),
+                Q(value.identity.name.clone()),
+                Q(value.identity.version.clone()),
+            ]),
+            L(std::iter::once(A("dependencies".into()))
+                .chain(value.dependencies.iter().map(dependency))
+                .collect()),
+            L(std::iter::once(A("values".into()))
+                .chain(value.values.iter().map(value_))
+                .collect()),
+            L(std::iter::once(A("types".into()))
+                .chain(value.types.iter().map(declared_type))
+                .collect()),
+            L(std::iter::once(A("effects".into()))
+                .chain(value.effects.iter().map(effect))
+                .collect()),
+        ])
+    }
+    fn dependency(value: &Dependency) -> S {
+        L(vec![
+            A("dependency".into()),
+            Q(value.name.clone()),
+            Q(value.version.clone()),
+        ])
+    }
+    fn value_(value: &Value) -> S {
+        L(vec![
+            A("value".into()),
+            Q(value.name.clone()),
+            scheme(&value.scheme),
+        ])
+    }
+    fn declared_type(value: &DeclaredType) -> S {
+        L(vec![
+            A("type".into()),
+            Q(value.name.clone()),
+            L(std::iter::once(A("params".into()))
+                .chain(value.params.iter().map(parameter))
+                .collect()),
+            scheme(&value.scheme),
+        ])
+    }
+    fn parameter(value: &Parameter) -> S {
+        L(vec![
+            A("param".into()),
+            A(match value.sense {
+                Sense::Type => "type",
+                Sense::Cases => "cases",
+                Sense::Effects => "effects",
+            }
+            .into()),
+            A(value.relevant.to_string()),
+            L(std::iter::once(A("lacks".into()))
+                .chain(value.lacks.iter().cloned().map(Q))
+                .collect()),
+        ])
+    }
+    fn effect(value: &DeclaredEffect) -> S {
+        L(vec![
+            A("effect".into()),
+            Q(value.name.clone()),
+            match &value.identity {
+                Some(identity) => L(vec![
+                    A("identity".into()),
+                    Q(identity.name.clone()),
+                    Q(identity.interface.clone()),
+                ]),
+                None => L(vec![A("identity".into()), A("none".into())]),
+            },
+            match &value.kind {
+                EffectKind::Operations(values) => L(std::iter::once(A("operations".into()))
+                    .chain(values.iter().map(operation))
+                    .collect()),
+                EffectKind::Alias(values) => L(std::iter::once(A("alias".into()))
+                    .chain(values.iter().cloned().map(Q))
+                    .collect()),
+            },
+        ])
+    }
+    fn operation(value: &Operation) -> S {
+        L(vec![
+            A("operation".into()),
+            Q(value.name.clone()),
+            ty(&value.from),
+            ty(&value.to),
+        ])
+    }
+    fn scheme(value: &Scheme) -> S {
+        L(vec![
+            A("scheme".into()),
+            A(value.count.to_string()),
+            A(value.presences.to_string()),
+            formula(&value.formula),
+            ty(&value.body),
+        ])
+    }
+    fn ty(value: &Type) -> S {
+        L(vec![
+            A("ty".into()),
+            core(&value.core),
+            L(std::iter::once(A("fields".into()))
+                .chain(
+                    value
+                        .fields
+                        .iter()
+                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
+                )
+                .collect()),
+        ])
+    }
+    fn core(value: &Core) -> S {
+        match value {
+            Core::Unit => A("unit".into()),
+            Core::Nat => A("nat".into()),
+            Core::Int => A("int".into()),
+            Core::Real => A("real".into()),
+            Core::String => A("string".into()),
+            Core::Boolean => A("boolean".into()),
+            Core::Arrow(from, to, row_) => L(vec![A("arrow".into()), ty(from), ty(to), row(row_)]),
+            Core::Sum(row_) => L(vec![A("sum".into()), row(row_)]),
+            Core::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
+            Core::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
+            Core::Rigid { id, name } => {
+                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
+            }
+            Core::Named { name, args } => L(std::iter::once(A("named".into()))
+                .chain(std::iter::once(Q(name.clone())))
+                .chain(args.iter().map(ty))
+                .collect()),
+            Core::Undecided => A("undecided".into()),
+        }
+    }
+    fn row(value: &Row) -> S {
+        L(vec![
+            A("row".into()),
+            L(std::iter::once(A("labels".into()))
+                .chain(
+                    value
+                        .labels
+                        .iter()
+                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
+                )
+                .collect()),
+            rest(&value.rest),
+        ])
+    }
+    fn rest(value: &Rest) -> S {
+        match value {
+            Rest::Closed => A("closed".into()),
+            Rest::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
+            Rest::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
+            Rest::Rigid { id, name } => {
+                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
+            }
+            Rest::Undecided => A("undecided".into()),
+            Rest::More(value) => L(vec![A("more".into()), row(value)]),
+        }
+    }
+    fn row_field(value: &RowField) -> S {
+        L(vec![
+            A("field".into()),
+            presence(&value.presence),
+            ty(&value.ty),
+        ])
+    }
+    fn presence(value: &Presence) -> S {
+        match value {
+            Presence::Present => A("present".into()),
+            Presence::Absent => A("absent".into()),
+            Presence::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
+            Presence::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
+            Presence::Undecided => A("undecided".into()),
+        }
+    }
+    fn formula(value: &Formula) -> S {
+        match value {
+            Formula::True => A("true".into()),
+            Formula::False => A("false".into()),
+            Formula::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
+            Formula::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
+            Formula::Not(value) => L(vec![A("not".into()), formula(value)]),
+            Formula::And(left, right) => pair("and", left, right),
+            Formula::Or(left, right) => pair("or", left, right),
+            Formula::Iff(left, right) => pair("iff", left, right),
+            Formula::Xor(left, right) => pair("xor", left, right),
+        }
+    }
+    fn pair(tag: &str, left: &Formula, right: &Formula) -> S {
+        L(vec![A(tag.into()), formula(left), formula(right)])
+    }
+
+    fn lir(value: &Lir) -> S {
+        L(vec![
+            A("lir".into()),
+            L(std::iter::once(A("functions".into()))
+                .chain(value.functions.iter().map(function))
+                .collect()),
+            L(std::iter::once(A("globals".into()))
+                .chain(value.globals.iter().map(global))
+                .collect()),
+        ])
+    }
+    fn function(value: &Function) -> S {
+        L(vec![
+            A("function".into()),
+            Q(value.name.clone()),
+            L(std::iter::once(A("params".into()))
+                .chain(value.params.iter().map(param))
+                .collect()),
+            block(&value.body),
+        ])
+    }
+    fn param(value: &Param) -> S {
+        L(vec![
+            A("param".into()),
+            A(value.temp.to_string()),
+            A(rep_name(value.rep).into()),
+        ])
+    }
+    fn global(value: &Global) -> S {
+        L(vec![
+            A("global".into()),
+            Q(value.name.clone()),
+            block(&value.body),
+        ])
+    }
+    fn block(value: &Block) -> S {
+        L(vec![
+            A("block".into()),
+            L(std::iter::once(A("instrs".into()))
+                .chain(value.instrs.iter().map(instr))
+                .collect()),
+            end(&value.end),
+        ])
+    }
+    fn instr(value: &Instr) -> S {
+        L(vec![
+            A("instr".into()),
+            A(value.temp.to_string()),
+            A(rep_name(value.rep).into()),
+            op(&value.op),
+        ])
+    }
+    fn op(value: &Op) -> S {
+        match value {
+            Op::Const(value) => L(vec![A("const".into()), literal(value)]),
+            Op::Neg(value) => unary("neg", *value),
+            Op::Not(value) => unary("not", *value),
+            Op::And { left, right } => binary("and", *left, *right),
+            Op::Or { left, right } => binary("or", *left, *right),
+            Op::Xor { left, right } => binary("xor", *left, *right),
+            Op::Add { left, right } => binary("add", *left, *right),
+            Op::Sub { left, right } => binary("sub", *left, *right),
+            Op::Mul { left, right } => binary("mul", *left, *right),
+            Op::Div { left, right } => binary("div", *left, *right),
+            Op::Struct(fields) => L(std::iter::once(A("struct".into()))
+                .chain(
+                    fields
+                        .iter()
+                        .map(|(name, value)| L(vec![Q(name.clone()), A(value.to_string())])),
+                )
+                .collect()),
+            Op::Merge(values) => L(std::iter::once(A("merge".into()))
+                .chain(values.iter().map(|value| A(value.to_string())))
+                .collect()),
+            Op::Project { base, field } => L(vec![
+                A("project".into()),
+                A(base.to_string()),
+                Q(field.clone()),
+            ]),
+            Op::Tag { name, payload } => L(std::iter::once(A("tag".into()))
+                .chain(std::iter::once(Q(name.clone())))
+                .chain(payload.iter().map(|value| A(value.to_string())))
+                .collect()),
+            Op::Payload(value) => unary("payload", *value),
+            Op::Closure { func, captures } => L(vec![
+                A("closure".into()),
+                A(func.to_string()),
+                L(std::iter::once(A("captures".into()))
+                    .chain(captures.iter().map(|value| A(value.to_string())))
+                    .collect()),
+            ]),
+            Op::Call { callee, args } => L(vec![
+                A("call".into()),
+                match callee {
+                    Callee::Direct(value) => L(vec![A("direct".into()), A(value.to_string())]),
+                    Callee::Indirect(value) => L(vec![A("indirect".into()), A(value.to_string())]),
+                },
+                L(std::iter::once(A("args".into()))
+                    .chain(args.iter().map(|value| A(value.to_string())))
+                    .collect()),
+            ]),
+            Op::Global { target } => L(vec![A("global".into()), Q(target.clone())]),
+            Op::NewTag => A("new-tag".into()),
+            Op::Catch { tag, body } => L(vec![A("catch".into()), A(tag.to_string()), block(body)]),
+            Op::SwitchTag {
+                on,
+                cases,
+                fallback,
+            } => L(vec![
+                A("switch-tag".into()),
+                A(on.to_string()),
+                L(std::iter::once(A("cases".into()))
+                    .chain(
+                        cases
+                            .iter()
+                            .map(|case| L(vec![Q(case.name.clone()), block(&case.block)])),
+                    )
+                    .collect()),
+                optional_block("fallback", fallback),
+            ]),
+            Op::SwitchPrim {
+                on,
+                cases,
+                fallback,
+            } => L(vec![
+                A("switch-prim".into()),
+                A(on.to_string()),
+                L(std::iter::once(A("cases".into()))
+                    .chain(
+                        cases
+                            .iter()
+                            .map(|case| L(vec![literal(&case.value), block(&case.block)])),
+                    )
+                    .collect()),
+                optional_block("fallback", fallback),
+            ]),
+            Op::SwitchPresence {
+                on,
+                field,
+                present,
+                absent,
+            } => L(vec![
+                A("switch-presence".into()),
+                A(on.to_string()),
+                Q(field.clone()),
+                block(present),
+                block(absent),
+            ]),
+            Op::SwitchRest {
+                on,
+                fields,
+                none,
+                some,
+            } => L(vec![
+                A("switch-rest".into()),
+                A(on.to_string()),
+                L(std::iter::once(A("fields".into()))
+                    .chain(fields.iter().cloned().map(Q))
+                    .collect()),
+                block(none),
+                block(some),
+            ]),
+        }
+    }
+    fn unary(tag: &str, value: u32) -> S {
+        L(vec![A(tag.into()), A(value.to_string())])
+    }
+    fn binary(tag: &str, left: u32, right: u32) -> S {
+        L(vec![
+            A(tag.into()),
+            A(left.to_string()),
+            A(right.to_string()),
+        ])
+    }
+    fn optional_block(tag: &str, value: &Option<Box<Block>>) -> S {
+        L(std::iter::once(A(tag.into()))
+            .chain(value.iter().map(|value| block(value)))
+            .collect())
+    }
+    fn end(value: &End) -> S {
+        match value {
+            End::Ret(value) => unary("ret", *value),
+            End::Yield(value) => unary("yield", *value),
+            End::Throw { tag, value } => L(vec![
+                A("throw".into()),
+                A(tag.to_string()),
+                A(value.to_string()),
+            ]),
+        }
+    }
+    fn literal(value: &Literal) -> S {
+        match value {
+            Literal::Natural(value) => L(vec![A("nat".into()), A(value.to_string())]),
+            Literal::Integer(value) => L(vec![A("int".into()), A(value.to_string())]),
+            Literal::Real(value) => L(vec![A("real".into()), A(value.to_string())]),
+            Literal::String(value) => L(vec![A("string".into()), Q(value.clone())]),
+            Literal::Boolean(value) => L(vec![A("bool".into()), A(value.to_string())]),
+        }
+    }
+    fn rep_name(value: Rep) -> &'static str {
+        match value {
+            Rep::Nat => "nat",
+            Rep::Int => "int",
+            Rep::Real => "real",
+            Rep::String => "string",
+            Rep::Boolean => "boolean",
+            Rep::Unit => "unit",
+            Rep::Struct => "struct",
+            Rep::Sum => "sum",
+            Rep::Fn => "fn",
+            Rep::Any => "any",
+        }
+    }
+
+    fn doc(value: &S) -> RcDoc<'_, ()> {
+        match value {
+            A(value) => RcDoc::text(value.as_str()),
+            Q(value) => RcDoc::text(quoted(value)),
+            L(values) => RcDoc::text("(")
+                .append(RcDoc::intersperse(values.iter().map(doc), RcDoc::line()).nest(2))
+                .append(")")
+                .group(),
+        }
+    }
+
+    fn quoted(value: &str) -> String {
+        let mut out = String::from("\"");
+        for c in value.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    struct Parser<'a> {
+        input: &'a str,
+        at: usize,
+    }
+    impl<'a> Parser<'a> {
+        fn space(&mut self) {
+            while let Some(character) = self.peek() {
+                if !character.is_whitespace() {
+                    break;
+                }
+                self.at += character.len_utf8();
+            }
+        }
+        fn value(&mut self) -> Result<S, ParseError> {
+            // S-expression nesting is data, not control flow. Keeping open
+            // lists on the heap lets a valid artifact be as deep as memory
+            // permits and lets malformed deep input fail normally.
+            let mut lists: Vec<Vec<S>> = Vec::new();
+            let mut root = None;
+            loop {
+                self.space();
+                match self.peek() {
+                    Some('(') => {
+                        self.at += 1;
+                        lists.push(Vec::new());
+                    }
+                    Some(')') => {
+                        let close_at = self.at;
+                        self.at += 1;
+                        let Some(values) = lists.pop() else {
+                            return Err(ParseError::syntax("unexpected `)`", close_at));
+                        };
+                        let value = L(values);
+                        if let Some(parent) = lists.last_mut() {
+                            parent.push(value);
+                        } else if root.replace(value).is_some() {
+                            return Err(ParseError::syntax("trailing artifact text", close_at));
+                        } else {
+                            return Ok(root.expect("root was just installed"));
+                        }
+                    }
+                    Some('"') => {
+                        let value = self.string()?;
+                        if let Some(parent) = lists.last_mut() {
+                            parent.push(value);
+                        } else {
+                            return Ok(value);
+                        }
+                    }
+                    Some(_) => {
+                        let value = self.atom();
+                        if let Some(parent) = lists.last_mut() {
+                            parent.push(value);
+                        } else {
+                            return Ok(value);
+                        }
+                    }
+                    None if lists.is_empty() => {
+                        return Err(ParseError::syntax("truncated artifact text", self.at));
+                    }
+                    None => {
+                        return Err(ParseError::syntax("unterminated artifact list", self.at));
+                    }
+                }
+            }
+        }
+        fn peek(&self) -> Option<char> {
+            self.input.get(self.at..)?.chars().next()
+        }
+        fn atom(&mut self) -> S {
+            let start = self.at;
+            while let Some(c) = self.peek() {
+                if c.is_whitespace() || matches!(c, '(' | ')') {
+                    break;
+                }
+                self.at += c.len_utf8();
+            }
+            A(self.input[start..self.at].to_string())
+        }
+        fn string(&mut self) -> Result<S, ParseError> {
+            self.at += 1;
+            let mut out = String::new();
+            loop {
+                let Some(c) = self.peek() else {
+                    return Err(ParseError::syntax("unterminated artifact string", self.at));
+                };
+                self.at += c.len_utf8();
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        let Some(escape) = self.peek() else {
+                            return Err(ParseError::syntax("truncated artifact escape", self.at));
+                        };
+                        self.at += escape.len_utf8();
+                        out.push(match escape {
+                            '\\' => '\\',
+                            '"' => '"',
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            'u' => self.control_escape()?,
+                            _ => {
+                                return Err(ParseError::syntax(
+                                    "invalid artifact escape",
+                                    self.at - escape.len_utf8(),
+                                ));
+                            }
+                        });
+                    }
+                    c if c.is_control() => {
+                        return Err(ParseError::syntax(
+                            "unescaped control in artifact string",
+                            self.at - c.len_utf8(),
+                        ));
+                    }
+                    c => out.push(c),
+                }
+            }
+            Ok(Q(out))
+        }
+        fn control_escape(&mut self) -> Result<char, ParseError> {
+            let start = self.at;
+            let mut value = 0;
+            for _ in 0..4 {
+                let Some(digit) = self.peek() else {
+                    return Err(ParseError::syntax(
+                        "truncated artifact control escape",
+                        self.at,
+                    ));
+                };
+                self.at += digit.len_utf8();
+                let Some(value_digit) = digit.to_digit(16) else {
+                    return Err(ParseError::syntax(
+                        "invalid artifact control escape",
+                        self.at - digit.len_utf8(),
+                    ));
+                };
+                value = value * 16 + value_digit;
+            }
+            let Some(control) = char::from_u32(value) else {
+                return Err(ParseError::syntax("invalid artifact control escape", start));
+            };
+            if !control.is_control() || matches!(control, '\n' | '\r' | '\t') {
+                return Err(ParseError::syntax("invalid artifact control escape", start));
+            }
+            Ok(control)
+        }
+    }
+
+    fn list_contents(mut value: S) -> Option<Vec<S>> {
+        match &mut value {
+            L(values) => Some(std::mem::take(values)),
+            _ => None,
+        }
+    }
+
+    fn plain_fallback() -> Type {
+        Type {
+            core: Core::Undecided,
+            fields: Vec::new(),
+        }
+    }
+    fn row_fallback() -> Row {
+        Row {
+            labels: Vec::new(),
+            rest: Rest::Undecided,
+        }
+    }
+
+    fn block_fallback() -> Block {
+        Block {
+            instrs: Vec::new(),
+            end: End::Ret(0),
+        }
+    }
+
+    /// Destroy a rejected, partially decoded model without following its
+    /// recursive ownership on the call stack. Successful artifacts remain
+    /// ordinary values and use their normal derived destruction.
+    fn discard_artifact(artifact: Artifact) {
+        fn discard_formula(formula: Formula) {
+            let mut pending = vec![formula];
+            while let Some(formula) = pending.pop() {
+                match formula {
+                    Formula::Not(value) => pending.push(*value),
+                    Formula::And(left, right)
+                    | Formula::Or(left, right)
+                    | Formula::Iff(left, right)
+                    | Formula::Xor(left, right) => {
+                        pending.push(*left);
+                        pending.push(*right);
+                    }
+                    Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+                }
+            }
+        }
+
+        enum Semantic {
+            Ty(Type),
+            Row(Row),
+        }
+        fn discard_type(ty: Type) {
+            let mut pending = vec![Semantic::Ty(ty)];
+            while let Some(value) = pending.pop() {
+                match value {
+                    Semantic::Ty(Type { core, fields }) => {
+                        pending.extend(fields.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
+                        match core {
+                            Core::Arrow(from, to, effects) => {
+                                pending.push(Semantic::Ty(*from));
+                                pending.push(Semantic::Ty(*to));
+                                pending.push(Semantic::Row(effects));
+                            }
+                            Core::Sum(row) => pending.push(Semantic::Row(row)),
+                            Core::Named { args, .. } => {
+                                pending.extend(args.into_iter().map(Semantic::Ty));
+                            }
+                            Core::Unit
+                            | Core::Nat
+                            | Core::Int
+                            | Core::Real
+                            | Core::String
+                            | Core::Boolean
+                            | Core::Var(_)
+                            | Core::Bound(_)
+                            | Core::Rigid { .. }
+                            | Core::Undecided => {}
+                        }
+                    }
+                    Semantic::Row(Row { labels, rest }) => {
+                        pending.extend(labels.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
+                        if let Rest::More(row) = rest {
+                            pending.push(Semantic::Row(*row));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn discard_scheme(scheme: Scheme) {
+            discard_formula(scheme.formula);
+            discard_type(scheme.body);
+        }
+
+        fn discard_block(block: Block) {
+            let mut pending = vec![block];
+            while let Some(Block { instrs, .. }) = pending.pop() {
+                for Instr { op, .. } in instrs {
+                    match op {
+                        Op::Catch { body, .. } => pending.push(*body),
+                        Op::SwitchTag {
+                            cases, fallback, ..
+                        } => {
+                            pending.extend(cases.into_iter().map(|case| case.block));
+                            pending.extend(fallback.map(|block| *block));
+                        }
+                        Op::SwitchPrim {
+                            cases, fallback, ..
+                        } => {
+                            pending.extend(cases.into_iter().map(|case| case.block));
+                            pending.extend(fallback.map(|block| *block));
+                        }
+                        Op::SwitchPresence {
+                            present, absent, ..
+                        } => {
+                            pending.push(*present);
+                            pending.push(*absent);
+                        }
+                        Op::SwitchRest { none, some, .. } => {
+                            pending.push(*none);
+                            pending.push(*some);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let Artifact { header, lir } = artifact;
+        for value in header.values {
+            discard_scheme(value.scheme);
+        }
+        for declared in header.types {
+            discard_scheme(declared.scheme);
+        }
+        for effect in header.effects {
+            if let EffectKind::Operations(operations) = effect.kind {
+                for operation in operations {
+                    discard_type(operation.from);
+                    discard_type(operation.to);
+                }
+            }
+        }
+        for function in lir.functions {
+            discard_block(function.body);
+        }
+        for global in lir.globals {
+            discard_block(global.body);
+        }
+    }
+
+    struct Reader {
+        error: std::cell::RefCell<Option<ParseError>>,
+    }
+
+    impl Reader {
+        fn new() -> Self {
+            Self {
+                error: std::cell::RefCell::new(None),
+            }
+        }
+
+        fn artifact(self, value: S) -> Result<Artifact, ParseError> {
+            let artifact = self.read_artifact(value);
+            match self.error.into_inner() {
+                Some(error) => {
+                    discard_artifact(artifact);
+                    Err(error)
+                }
+                None => Ok(artifact),
+            }
+        }
+
+        fn fail(&self, message: impl Into<String>) {
+            let mut error = self.error.borrow_mut();
+            if error.is_none() {
+                *error = Some(ParseError::structure(message));
+            }
+        }
+
+        fn invalid<T>(&self, message: impl Into<String>, fallback: T) -> T {
+            self.fail(message);
+            fallback
+        }
+
+        fn take(&self, values: &mut Vec<S>) -> S {
+            if values.is_empty() {
+                self.fail("missing artifact value");
+                A(String::new())
+            } else {
+                values.remove(0)
+            }
+        }
+
+        fn list(&self, mut value: S, tag: &str) -> Vec<S> {
+            match &mut value {
+                L(values) => {
+                    if !matches!(values.first(), Some(A(found)) if found == tag) {
+                        self.fail(format!("expected `{tag}`"));
+                    }
+                    self.take(values);
+                    std::mem::take(values)
+                }
+                _ => {
+                    self.fail(format!("expected `{tag}` list"));
+                    Vec::new()
+                }
+            }
+        }
+
+        fn atom(&self, mut value: S) -> String {
+            match &mut value {
+                A(value) => std::mem::take(value),
+                _ => {
+                    self.fail("expected artifact atom");
+                    String::new()
+                }
+            }
+        }
+
+        fn string(&self, mut value: S) -> String {
+            match &mut value {
+                Q(value) => std::mem::take(value),
+                _ => {
+                    self.fail("expected artifact string");
+                    String::new()
+                }
+            }
+        }
+
+        fn exact(&self, mut values: Vec<S>, count: usize, tag: &str) -> Vec<S> {
+            if values.len() != count {
+                self.fail(format!("bad `{tag}` arity"));
+                values.resize_with(count, || A(String::new()));
+                values.truncate(count);
+            }
+            values
+        }
+
+        fn number<T: std::str::FromStr + Default>(&self, value: S) -> T {
+            match self.atom(value).parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    self.fail("invalid artifact number");
+                    T::default()
+                }
+            }
+        }
+
+        fn boolean(&self, value: S) -> bool {
+            match self.atom(value).as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    self.fail("invalid artifact boolean");
+                    false
+                }
+            }
+        }
+
+        fn many(&self, value: S, tag: &str) -> Vec<S> {
+            self.list(value, tag)
+        }
+
+        fn read_artifact(&self, value: S) -> Artifact {
+            let mut values = self.exact(self.list(value, "artifact"), 2, "artifact");
+            Artifact {
+                header: self.read_header(self.take(&mut values)),
+                lir: self.read_lir(self.take(&mut values)),
+            }
+        }
+        fn read_header(&self, value: S) -> Header {
+            let mut values = self.exact(self.list(value, "header"), 5, "header");
+            let identity = {
+                let mut value =
+                    self.exact(self.list(self.take(&mut values), "identity"), 2, "identity");
+                Identity {
+                    name: self.string(self.take(&mut value)),
+                    version: self.string(self.take(&mut value)),
+                }
+            };
+            Header {
+                identity,
+                dependencies: self
+                    .many(self.take(&mut values), "dependencies")
+                    .into_iter()
+                    .map(|value| self.read_dependency(value))
+                    .collect(),
+                values: self
+                    .many(self.take(&mut values), "values")
+                    .into_iter()
+                    .map(|value| self.read_value(value))
+                    .collect(),
+                types: self
+                    .many(self.take(&mut values), "types")
+                    .into_iter()
+                    .map(|value| self.read_declared_type(value))
+                    .collect(),
+                effects: self
+                    .many(self.take(&mut values), "effects")
+                    .into_iter()
+                    .map(|value| self.read_effect(value))
+                    .collect(),
+            }
+        }
+        fn read_dependency(&self, value: S) -> Dependency {
+            let mut value = self.exact(self.list(value, "dependency"), 2, "dependency");
+            Dependency {
+                name: self.string(self.take(&mut value)),
+                version: self.string(self.take(&mut value)),
+            }
+        }
+        fn read_value(&self, value: S) -> Value {
+            let mut value = self.exact(self.list(value, "value"), 2, "value");
+            Value {
+                name: self.string(self.take(&mut value)),
+                scheme: self.read_scheme(self.take(&mut value)),
+            }
+        }
+        fn read_declared_type(&self, value: S) -> DeclaredType {
+            let mut value = self.exact(self.list(value, "type"), 3, "type");
+            DeclaredType {
+                name: self.string(self.take(&mut value)),
+                params: self
+                    .many(self.take(&mut value), "params")
+                    .into_iter()
+                    .map(|value| self.read_parameter(value))
+                    .collect(),
+                scheme: self.read_scheme(self.take(&mut value)),
+            }
+        }
+        fn read_parameter(&self, value: S) -> Parameter {
+            let mut value = self.exact(self.list(value, "param"), 3, "param");
+            Parameter {
+                sense: match self.atom(self.take(&mut value)).as_str() {
+                    "type" => Sense::Type,
+                    "cases" => Sense::Cases,
+                    "effects" => Sense::Effects,
+                    _ => self.invalid("invalid parameter sense", Sense::Type),
+                },
+                relevant: self.boolean(self.take(&mut value)),
+                lacks: self
+                    .many(self.take(&mut value), "lacks")
+                    .into_iter()
+                    .map(|value| self.string(value))
+                    .collect(),
+            }
+        }
+        fn read_effect(&self, value: S) -> DeclaredEffect {
+            let mut value = self.exact(self.list(value, "effect"), 3, "effect");
+            let name = self.string(self.take(&mut value));
+            let id = self.list(self.take(&mut value), "identity");
+            let identity = match id.as_slice() {
+                [A(none)] if none == "none" => None,
+                _ => {
+                    let mut id = self.exact(id, 2, "identity");
+                    Some(EffectIdentity {
+                        name: self.string(self.take(&mut id)),
+                        interface: self.string(self.take(&mut id)),
+                    })
+                }
+            };
+            let kind = match list_contents(self.take(&mut value)) {
+                Some(mut values) => {
+                    let tag = self.atom(self.take(&mut values));
+                    match tag.as_str() {
+                        "operations" => EffectKind::Operations(
+                            values
+                                .into_iter()
+                                .map(|value| self.read_operation(value))
+                                .collect(),
+                        ),
+                        "alias" => EffectKind::Alias(
+                            values.into_iter().map(|value| self.string(value)).collect(),
+                        ),
+                        _ => self.invalid("invalid effect kind", EffectKind::Alias(Vec::new())),
+                    }
+                }
+                _ => self.invalid("invalid effect kind", EffectKind::Alias(Vec::new())),
+            };
+            DeclaredEffect {
+                name,
+                identity,
+                kind,
+            }
+        }
+        fn read_operation(&self, value: S) -> Operation {
+            let mut value = self.exact(self.list(value, "operation"), 3, "operation");
+            Operation {
+                name: self.string(self.take(&mut value)),
+                from: self.read_ty(self.take(&mut value)),
+                to: self.read_ty(self.take(&mut value)),
+            }
+        }
+        fn read_scheme(&self, value: S) -> Scheme {
+            let mut value = self.exact(self.list(value, "scheme"), 4, "scheme");
+            Scheme {
+                count: self.number(self.take(&mut value)),
+                presences: self.number(self.take(&mut value)),
+                formula: self.read_formula(self.take(&mut value)),
+                body: self.read_ty(self.take(&mut value)),
+            }
+        }
+        fn read_ty(&self, value: S) -> Type {
+            enum Task {
+                Ty(S),
+                Core(S),
+                Row(S),
+                Rest(S),
+                Field(S),
+                BuildTy { fields: Vec<String> },
+                BuildArrow,
+                BuildSum,
+                BuildNamed { name: String, count: usize },
+                BuildRow { labels: Vec<String> },
+                BuildMore,
+                BuildField(Presence),
+            }
+            enum Out {
+                Ty(Type),
+                Core(Core),
+                Row(Row),
+                Rest(Rest),
+                Field(RowField),
+            }
+            let mut tasks = vec![Task::Ty(value)];
+            let mut out = Vec::new();
+            while let Some(task) = tasks.pop() {
+                match task {
+                    Task::Ty(value) => {
+                        let mut values = self.exact(self.list(value, "ty"), 2, "ty");
+                        let core = self.take(&mut values);
+                        let fields = self.many(self.take(&mut values), "fields");
+                        let mut names = Vec::with_capacity(fields.len());
+                        let mut field_values = Vec::with_capacity(fields.len());
+                        for field in fields {
+                            let values = list_contents(field)
+                                .unwrap_or_else(|| self.invalid("bad type field", Vec::new()));
+                            let mut values = self.exact(values, 2, "type field");
+                            names.push(self.string(self.take(&mut values)));
+                            field_values.push(self.take(&mut values));
+                        }
+                        tasks.push(Task::BuildTy { fields: names });
+                        for value in field_values.into_iter().rev() {
+                            tasks.push(Task::Field(value));
+                        }
+                        tasks.push(Task::Core(core));
+                    }
+                    Task::Core(mut value) => match &mut value {
+                        A(value) => out.push(Out::Core(match value.as_str() {
+                            "unit" => Core::Unit,
+                            "nat" => Core::Nat,
+                            "int" => Core::Int,
+                            "real" => Core::Real,
+                            "string" => Core::String,
+                            "boolean" => Core::Boolean,
+                            "undecided" => Core::Undecided,
+                            _ => self.invalid("invalid type core", Core::Undecided),
+                        })),
+                        L(values) => {
+                            let mut values = std::mem::take(values);
+                            let tag = self.atom(self.take(&mut values));
+                            match tag.as_str() {
+                                "arrow" => {
+                                    let mut values = self.exact(values, 3, "arrow");
+                                    let from = self.take(&mut values);
+                                    let to = self.take(&mut values);
+                                    let effects = self.take(&mut values);
+                                    tasks.push(Task::BuildArrow);
+                                    tasks.push(Task::Row(effects));
+                                    tasks.push(Task::Ty(to));
+                                    tasks.push(Task::Ty(from));
+                                }
+                                "sum" => {
+                                    let value = self.exact(values, 1, "sum").remove(0);
+                                    tasks.push(Task::BuildSum);
+                                    tasks.push(Task::Row(value));
+                                }
+                                "var" => out.push(Out::Core(Core::Var(
+                                    self.number(self.exact(values, 1, "var").remove(0)),
+                                ))),
+                                "bound" => out.push(Out::Core(Core::Bound(
+                                    self.number(self.exact(values, 1, "bound").remove(0)),
+                                ))),
+                                "rigid" => {
+                                    let mut values = self.exact(values, 2, "rigid");
+                                    let id = self.number(self.take(&mut values));
+                                    let name = self.string(self.take(&mut values));
+                                    out.push(Out::Core(Core::Rigid { id, name }));
+                                }
+                                "named" => {
+                                    if values.is_empty() {
+                                        self.fail("named type is missing name");
+                                    }
+                                    let name = self.string(self.take(&mut values));
+                                    let count = values.len();
+                                    tasks.push(Task::BuildNamed { name, count });
+                                    for value in values.into_iter().rev() {
+                                        tasks.push(Task::Ty(value));
+                                    }
+                                }
+                                _ => out.push(Out::Core(
+                                    self.invalid("invalid type core", Core::Undecided),
+                                )),
+                            }
+                        }
+                        _ => out.push(Out::Core(
+                            self.invalid("invalid type core", Core::Undecided),
+                        )),
+                    },
+                    Task::Row(value) => {
+                        let mut values = self.exact(self.list(value, "row"), 2, "row");
+                        let labels = self.many(self.take(&mut values), "labels");
+                        let rest = self.take(&mut values);
+                        let mut names = Vec::with_capacity(labels.len());
+                        let mut fields = Vec::with_capacity(labels.len());
+                        for label in labels {
+                            let values = list_contents(label)
+                                .unwrap_or_else(|| self.invalid("bad row label", Vec::new()));
+                            let mut values = self.exact(values, 2, "row label");
+                            names.push(self.string(self.take(&mut values)));
+                            fields.push(self.take(&mut values));
+                        }
+                        tasks.push(Task::BuildRow { labels: names });
+                        tasks.push(Task::Rest(rest));
+                        for value in fields.into_iter().rev() {
+                            tasks.push(Task::Field(value));
+                        }
+                    }
+                    Task::Rest(mut value) => match &mut value {
+                        A(value) if value == "closed" => out.push(Out::Rest(Rest::Closed)),
+                        A(value) if value == "undecided" => out.push(Out::Rest(Rest::Undecided)),
+                        L(values) => {
+                            let mut values = std::mem::take(values);
+                            match self.atom(self.take(&mut values)).as_str() {
+                                "var" => out.push(Out::Rest(Rest::Var(
+                                    self.number(self.exact(values, 1, "rest var").remove(0)),
+                                ))),
+                                "bound" => out.push(Out::Rest(Rest::Bound(
+                                    self.number(self.exact(values, 1, "rest bound").remove(0)),
+                                ))),
+                                "rigid" => {
+                                    let mut values = self.exact(values, 2, "rest rigid");
+                                    let id = self.number(self.take(&mut values));
+                                    let name = self.string(self.take(&mut values));
+                                    out.push(Out::Rest(Rest::Rigid { id, name }));
+                                }
+                                "more" => {
+                                    let value = self.exact(values, 1, "more").remove(0);
+                                    tasks.push(Task::BuildMore);
+                                    tasks.push(Task::Row(value));
+                                }
+                                _ => out.push(Out::Rest(
+                                    self.invalid("invalid row rest", Rest::Undecided),
+                                )),
+                            }
+                        }
+                        _ => out.push(Out::Rest(self.invalid("invalid row rest", Rest::Undecided))),
+                    },
+                    Task::Field(value) => {
+                        let mut values = self.exact(self.list(value, "field"), 2, "field");
+                        let presence = self.read_presence(self.take(&mut values));
+                        let ty = self.take(&mut values);
+                        tasks.push(Task::BuildField(presence));
+                        tasks.push(Task::Ty(ty));
+                    }
+                    Task::BuildField(presence) => {
+                        let ty = match out.pop() {
+                            Some(Out::Ty(value)) => value,
+                            _ => plain_fallback(),
+                        };
+                        out.push(Out::Field(RowField { presence, ty }));
+                    }
+                    Task::BuildTy { fields } => {
+                        let mut decoded = Vec::with_capacity(fields.len());
+                        for _ in 0..fields.len() {
+                            decoded.push(match out.pop() {
+                                Some(Out::Field(value)) => value,
+                                _ => RowField {
+                                    presence: Presence::Undecided,
+                                    ty: plain_fallback(),
+                                },
+                            });
+                        }
+                        decoded.reverse();
+                        let core = match out.pop() {
+                            Some(Out::Core(value)) => value,
+                            _ => Core::Undecided,
+                        };
+                        out.push(Out::Ty(Type {
+                            core,
+                            fields: fields.into_iter().zip(decoded).collect(),
+                        }));
+                    }
+                    Task::BuildArrow => {
+                        let effects = match out.pop() {
+                            Some(Out::Row(v)) => v,
+                            _ => row_fallback(),
+                        };
+                        let to = match out.pop() {
+                            Some(Out::Ty(v)) => v,
+                            _ => plain_fallback(),
+                        };
+                        let from = match out.pop() {
+                            Some(Out::Ty(v)) => v,
+                            _ => plain_fallback(),
+                        };
+                        out.push(Out::Core(Core::Arrow(
+                            Box::new(from),
+                            Box::new(to),
+                            effects,
+                        )));
+                    }
+                    Task::BuildSum => {
+                        let row = match out.pop() {
+                            Some(Out::Row(v)) => v,
+                            _ => row_fallback(),
+                        };
+                        out.push(Out::Core(Core::Sum(row)));
+                    }
+                    Task::BuildNamed { name, count } => {
+                        let mut args = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            args.push(match out.pop() {
+                                Some(Out::Ty(v)) => v,
+                                _ => plain_fallback(),
+                            });
+                        }
+                        args.reverse();
+                        out.push(Out::Core(Core::Named { name, args }));
+                    }
+                    Task::BuildRow { labels } => {
+                        let rest = match out.pop() {
+                            Some(Out::Rest(v)) => v,
+                            _ => Rest::Undecided,
+                        };
+                        let mut fields = Vec::with_capacity(labels.len());
+                        for _ in 0..labels.len() {
+                            fields.push(match out.pop() {
+                                Some(Out::Field(v)) => v,
+                                _ => RowField {
+                                    presence: Presence::Undecided,
+                                    ty: plain_fallback(),
+                                },
+                            });
+                        }
+                        fields.reverse();
+                        out.push(Out::Row(Row {
+                            labels: labels.into_iter().zip(fields).collect(),
+                            rest,
+                        }));
+                    }
+                    Task::BuildMore => {
+                        let row = match out.pop() {
+                            Some(Out::Row(v)) => v,
+                            _ => row_fallback(),
+                        };
+                        out.push(Out::Rest(Rest::More(Box::new(row))));
+                    }
+                }
+            }
+            match out.pop() {
+                Some(Out::Ty(value)) => value,
+                _ => plain_fallback(),
+            }
+        }
+        fn read_presence(&self, mut value: S) -> Presence {
+            match &mut value {
+                A(value) if value == "present" => Presence::Present,
+                A(value) if value == "absent" => Presence::Absent,
+                A(value) if value == "undecided" => Presence::Undecided,
+                L(values) => {
+                    let mut values = std::mem::take(values);
+                    match self.atom(self.take(&mut values)).as_str() {
+                        "var" => Presence::Var(
+                            self.number(self.exact(values, 1, "presence var").remove(0)),
+                        ),
+                        "bound" => Presence::Bound(
+                            self.number(self.exact(values, 1, "presence bound").remove(0)),
+                        ),
+                        _ => self.invalid("invalid presence", Presence::Undecided),
+                    }
+                }
+                _ => self.invalid("invalid presence", Presence::Undecided),
+            }
+        }
+        fn read_formula(&self, value: S) -> Formula {
+            enum Task {
+                Read(S),
+                Not,
+                Pair(fn(Box<Formula>, Box<Formula>) -> Formula),
+            }
+            let mut tasks = vec![Task::Read(value)];
+            let mut out = Vec::new();
+            while let Some(task) = tasks.pop() {
+                match task {
+                    Task::Not => {
+                        let value = out.pop().unwrap_or(Formula::False);
+                        out.push(Formula::Not(Box::new(value)));
+                    }
+                    Task::Pair(make) => {
+                        let right = out.pop().unwrap_or(Formula::False);
+                        let left = out.pop().unwrap_or(Formula::False);
+                        out.push(make(Box::new(left), Box::new(right)));
+                    }
+                    Task::Read(mut value) => match &mut value {
+                        A(value) if value == "true" => out.push(Formula::True),
+                        A(value) if value == "false" => out.push(Formula::False),
+                        L(values) => {
+                            let mut values = std::mem::take(values);
+                            let tag = self.atom(self.take(&mut values));
+                            match tag.as_str() {
+                                "var" => out.push(Formula::Var(
+                                    self.number(self.exact(values, 1, "formula var").remove(0)),
+                                )),
+                                "bound" => out.push(Formula::Bound(
+                                    self.number(self.exact(values, 1, "formula bound").remove(0)),
+                                )),
+                                "not" => {
+                                    let value = self.exact(values, 1, "not").remove(0);
+                                    tasks.push(Task::Not);
+                                    tasks.push(Task::Read(value));
+                                }
+                                tag @ ("and" | "or" | "iff" | "xor") => {
+                                    let make = match tag {
+                                        "and" => Formula::And,
+                                        "or" => Formula::Or,
+                                        "iff" => Formula::Iff,
+                                        _ => Formula::Xor,
+                                    };
+                                    let mut values = self.exact(values, 2, tag);
+                                    let left = self.take(&mut values);
+                                    let right = self.take(&mut values);
+                                    tasks.push(Task::Pair(make));
+                                    tasks.push(Task::Read(right));
+                                    tasks.push(Task::Read(left));
+                                }
+                                _ => out.push(self.invalid("invalid formula", Formula::False)),
+                            }
+                        }
+                        _ => out.push(self.invalid("invalid formula", Formula::False)),
+                    },
+                }
+            }
+            out.pop().unwrap_or(Formula::False)
+        }
+
+        fn read_lir(&self, value: S) -> Lir {
+            let mut value = self.exact(self.list(value, "lir"), 2, "lir");
+            Lir {
+                functions: self
+                    .many(self.take(&mut value), "functions")
+                    .into_iter()
+                    .map(|value| self.read_function(value))
+                    .collect(),
+                globals: self
+                    .many(self.take(&mut value), "globals")
+                    .into_iter()
+                    .map(|value| self.read_global(value))
+                    .collect(),
+            }
+        }
+        fn read_function(&self, value: S) -> Function {
+            let mut value = self.exact(self.list(value, "function"), 3, "function");
+            Function {
+                name: self.string(self.take(&mut value)),
+                params: self
+                    .many(self.take(&mut value), "params")
+                    .into_iter()
+                    .map(|value| self.read_param(value))
+                    .collect(),
+                body: self.read_block(self.take(&mut value)),
+            }
+        }
+        fn read_param(&self, value: S) -> Param {
+            let mut value = self.exact(self.list(value, "param"), 2, "param");
+            Param {
+                temp: self.number(self.take(&mut value)),
+                rep: self.read_rep(self.take(&mut value)),
+            }
+        }
+        fn read_global(&self, value: S) -> Global {
+            let mut value = self.exact(self.list(value, "global"), 2, "global");
+            Global {
+                name: self.string(self.take(&mut value)),
+                body: self.read_block(self.take(&mut value)),
+            }
+        }
+        fn read_block(&self, value: S) -> Block {
+            enum Task {
+                Block(S),
+                Instr(S),
+                Op(S),
+                BuildBlock {
+                    count: usize,
+                    end: End,
+                },
+                BuildInstr {
+                    temp: u32,
+                    rep: Rep,
+                },
+                Catch {
+                    tag: u32,
+                },
+                SwitchTag {
+                    on: u32,
+                    names: Vec<String>,
+                    fallback: bool,
+                },
+                SwitchPrim {
+                    on: u32,
+                    values: Vec<Literal>,
+                    fallback: bool,
+                },
+                SwitchPresence {
+                    on: u32,
+                    field: String,
+                },
+                SwitchRest {
+                    on: u32,
+                    fields: Vec<String>,
+                },
+            }
+            enum Out {
+                Block(Block),
+                Instr(Instr),
+                Op(Op),
+            }
+            let mut tasks = vec![Task::Block(value)];
+            let mut out = Vec::new();
+            while let Some(task) = tasks.pop() {
+                match task {
+                    Task::Block(value) => {
+                        let mut values = self.exact(self.list(value, "block"), 2, "block");
+                        let instrs = self.many(self.take(&mut values), "instrs");
+                        let end = self.read_end(self.take(&mut values));
+                        tasks.push(Task::BuildBlock {
+                            count: instrs.len(),
+                            end,
+                        });
+                        for instr in instrs.into_iter().rev() {
+                            tasks.push(Task::Instr(instr));
+                        }
+                    }
+                    Task::Instr(value) => {
+                        let mut values = self.exact(self.list(value, "instr"), 3, "instr");
+                        let temp = self.number(self.take(&mut values));
+                        let rep = self.read_rep(self.take(&mut values));
+                        let op = self.take(&mut values);
+                        tasks.push(Task::BuildInstr { temp, rep });
+                        tasks.push(Task::Op(op));
+                    }
+                    Task::Op(value) => {
+                        let recursive = match &value {
+                            L(values) => {
+                                matches!(values.first(), Some(A(tag)) if matches!(tag.as_str(), "catch" | "switch-tag" | "switch-prim" | "switch-presence" | "switch-rest"))
+                            }
+                            _ => false,
+                        };
+                        if !recursive {
+                            out.push(Out::Op(self.read_leaf_op(value)));
+                            continue;
+                        }
+                        let mut values = list_contents(value).expect("recursive op is a list");
+                        let tag = self.atom(self.take(&mut values));
+                        match tag.as_str() {
+                            "catch" => {
+                                let mut values = self.exact(values, 2, "catch");
+                                let tag = self.number(self.take(&mut values));
+                                let body = self.take(&mut values);
+                                tasks.push(Task::Catch { tag });
+                                tasks.push(Task::Block(body));
+                            }
+                            "switch-tag" => {
+                                let mut values = self.exact(values, 3, "switch-tag");
+                                let on = self.number(self.take(&mut values));
+                                let cases = self.many(self.take(&mut values), "cases");
+                                let fallback = self.list(self.take(&mut values), "fallback");
+                                if fallback.len() > 1 {
+                                    self.fail("bad optional block");
+                                }
+                                let fallback = fallback.into_iter().next();
+                                let mut names = Vec::with_capacity(cases.len());
+                                let mut blocks = Vec::with_capacity(cases.len());
+                                for case in cases {
+                                    let values = list_contents(case).unwrap_or_else(|| {
+                                        self.invalid("bad tag case", Vec::new())
+                                    });
+                                    let mut values = self.exact(values, 2, "tag case");
+                                    names.push(self.string(self.take(&mut values)));
+                                    blocks.push(self.take(&mut values));
+                                }
+                                tasks.push(Task::SwitchTag {
+                                    on,
+                                    names,
+                                    fallback: fallback.is_some(),
+                                });
+                                if let Some(block) = fallback {
+                                    tasks.push(Task::Block(block));
+                                }
+                                for block in blocks.into_iter().rev() {
+                                    tasks.push(Task::Block(block));
+                                }
+                            }
+                            "switch-prim" => {
+                                let mut values = self.exact(values, 3, "switch-prim");
+                                let on = self.number(self.take(&mut values));
+                                let cases = self.many(self.take(&mut values), "cases");
+                                let fallback = self.list(self.take(&mut values), "fallback");
+                                if fallback.len() > 1 {
+                                    self.fail("bad optional block");
+                                }
+                                let fallback = fallback.into_iter().next();
+                                let mut literals = Vec::with_capacity(cases.len());
+                                let mut blocks = Vec::with_capacity(cases.len());
+                                for case in cases {
+                                    let values = list_contents(case).unwrap_or_else(|| {
+                                        self.invalid("bad primitive case", Vec::new())
+                                    });
+                                    let mut values = self.exact(values, 2, "primitive case");
+                                    literals.push(self.read_literal(self.take(&mut values)));
+                                    blocks.push(self.take(&mut values));
+                                }
+                                tasks.push(Task::SwitchPrim {
+                                    on,
+                                    values: literals,
+                                    fallback: fallback.is_some(),
+                                });
+                                if let Some(block) = fallback {
+                                    tasks.push(Task::Block(block));
+                                }
+                                for block in blocks.into_iter().rev() {
+                                    tasks.push(Task::Block(block));
+                                }
+                            }
+                            "switch-presence" => {
+                                let mut values = self.exact(values, 4, "switch-presence");
+                                let on = self.number(self.take(&mut values));
+                                let field = self.string(self.take(&mut values));
+                                let present = self.take(&mut values);
+                                let absent = self.take(&mut values);
+                                tasks.push(Task::SwitchPresence { on, field });
+                                tasks.push(Task::Block(absent));
+                                tasks.push(Task::Block(present));
+                            }
+                            "switch-rest" => {
+                                let mut values = self.exact(values, 4, "switch-rest");
+                                let on = self.number(self.take(&mut values));
+                                let fields = self
+                                    .many(self.take(&mut values), "fields")
+                                    .into_iter()
+                                    .map(|v| self.string(v))
+                                    .collect();
+                                let none = self.take(&mut values);
+                                let some = self.take(&mut values);
+                                tasks.push(Task::SwitchRest { on, fields });
+                                tasks.push(Task::Block(some));
+                                tasks.push(Task::Block(none));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    Task::BuildInstr { temp, rep } => {
+                        let op = match out.pop() {
+                            Some(Out::Op(v)) => v,
+                            _ => Op::NewTag,
+                        };
+                        out.push(Out::Instr(Instr { temp, rep, op }));
+                    }
+                    Task::BuildBlock { count, end } => {
+                        let mut instrs = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            instrs.push(match out.pop() {
+                                Some(Out::Instr(v)) => v,
+                                _ => Instr {
+                                    temp: 0,
+                                    rep: Rep::Any,
+                                    op: Op::NewTag,
+                                },
+                            });
+                        }
+                        instrs.reverse();
+                        out.push(Out::Block(Block { instrs, end }));
+                    }
+                    Task::Catch { tag } => {
+                        let body = pop_block(&mut out);
+                        out.push(Out::Op(Op::Catch {
+                            tag,
+                            body: Box::new(body),
+                        }));
+                    }
+                    Task::SwitchTag {
+                        on,
+                        names,
+                        fallback,
+                    } => {
+                        let fallback = fallback.then(|| Box::new(pop_block(&mut out)));
+                        let mut blocks = (0..names.len())
+                            .map(|_| pop_block(&mut out))
+                            .collect::<Vec<_>>();
+                        blocks.reverse();
+                        out.push(Out::Op(Op::SwitchTag {
+                            on,
+                            cases: names
+                                .into_iter()
+                                .zip(blocks)
+                                .map(|(name, block)| TagCase { name, block })
+                                .collect(),
+                            fallback,
+                        }));
+                    }
+                    Task::SwitchPrim {
+                        on,
+                        values,
+                        fallback,
+                    } => {
+                        let fallback = fallback.then(|| Box::new(pop_block(&mut out)));
+                        let mut blocks = (0..values.len())
+                            .map(|_| pop_block(&mut out))
+                            .collect::<Vec<_>>();
+                        blocks.reverse();
+                        out.push(Out::Op(Op::SwitchPrim {
+                            on,
+                            cases: values
+                                .into_iter()
+                                .zip(blocks)
+                                .map(|(value, block)| PrimCase { value, block })
+                                .collect(),
+                            fallback,
+                        }));
+                    }
+                    Task::SwitchPresence { on, field } => {
+                        let absent = pop_block(&mut out);
+                        let present = pop_block(&mut out);
+                        out.push(Out::Op(Op::SwitchPresence {
+                            on,
+                            field,
+                            present: Box::new(present),
+                            absent: Box::new(absent),
+                        }));
+                    }
+                    Task::SwitchRest { on, fields } => {
+                        let some = pop_block(&mut out);
+                        let none = pop_block(&mut out);
+                        out.push(Out::Op(Op::SwitchRest {
+                            on,
+                            fields,
+                            none: Box::new(none),
+                            some: Box::new(some),
+                        }));
+                    }
+                }
+            }
+            return match out.pop() {
+                Some(Out::Block(v)) => v,
+                _ => block_fallback(),
+            };
+
+            fn pop_block(out: &mut Vec<Out>) -> Block {
+                match out.pop() {
+                    Some(Out::Block(v)) => v,
+                    _ => block_fallback(),
+                }
+            }
+        }
+        fn read_rep(&self, value: S) -> Rep {
+            match self.atom(value).as_str() {
+                "nat" => Rep::Nat,
+                "int" => Rep::Int,
+                "real" => Rep::Real,
+                "string" => Rep::String,
+                "boolean" => Rep::Boolean,
+                "unit" => Rep::Unit,
+                "struct" => Rep::Struct,
+                "sum" => Rep::Sum,
+                "fn" => Rep::Fn,
+                "any" => Rep::Any,
+                _ => self.invalid("invalid representation", Rep::Any),
+            }
+        }
+        fn read_leaf_op(&self, value: S) -> Op {
+            if matches!(&value, A(atom) if atom == "new-tag") {
+                return Op::NewTag;
+            }
+            let Some(mut values) = list_contents(value) else {
+                return self.invalid("invalid operation", Op::NewTag);
+            };
+            let tag = self.atom(self.take(&mut values));
+            match tag.as_str() {
+                "const" => Op::Const(self.read_literal(self.exact(values, 1, "const").remove(0))),
+                "neg" => Op::Neg(self.number(self.exact(values, 1, "neg").remove(0))),
+                "not" => Op::Not(self.number(self.exact(values, 1, "not").remove(0))),
+                "and" => self.op_binary(values, |left, right| Op::And { left, right }, "and"),
+                "or" => self.op_binary(values, |left, right| Op::Or { left, right }, "or"),
+                "xor" => self.op_binary(values, |left, right| Op::Xor { left, right }, "xor"),
+                "add" => self.op_binary(values, |left, right| Op::Add { left, right }, "add"),
+                "sub" => self.op_binary(values, |left, right| Op::Sub { left, right }, "sub"),
+                "mul" => self.op_binary(values, |left, right| Op::Mul { left, right }, "mul"),
+                "div" => self.op_binary(values, |left, right| Op::Div { left, right }, "div"),
+                "struct" => Op::Struct(
+                    values
+                        .into_iter()
+                        .map(|value| {
+                            let value = list_contents(value)
+                                .unwrap_or_else(|| self.invalid("bad struct entry", Vec::new()));
+                            let mut value = self.exact(value, 2, "struct entry");
+                            (
+                                self.string(self.take(&mut value)),
+                                self.number(self.take(&mut value)),
+                            )
+                        })
+                        .collect(),
+                ),
+                "merge" => Op::Merge(values.into_iter().map(|value| self.number(value)).collect()),
+                "project" => {
+                    let mut values = self.exact(values, 2, "project");
+                    Op::Project {
+                        base: self.number(self.take(&mut values)),
+                        field: self.string(self.take(&mut values)),
+                    }
+                }
+                "tag" => {
+                    if values.is_empty() || values.len() > 2 {
+                        self.fail("bad tag");
+                        values.truncate(2);
+                    }
+                    let name = self.string(self.take(&mut values));
+                    Op::Tag {
+                        name,
+                        payload: values.pop().map(|value| self.number(value)),
+                    }
+                }
+                "payload" => Op::Payload(self.number(self.exact(values, 1, "payload").remove(0))),
+                "closure" => {
+                    let mut values = self.exact(values, 2, "closure");
+                    Op::Closure {
+                        func: self.number(self.take(&mut values)),
+                        captures: self
+                            .many(self.take(&mut values), "captures")
+                            .into_iter()
+                            .map(|value| self.number(value))
+                            .collect(),
+                    }
+                }
+                "call" => {
+                    let mut values = self.exact(values, 2, "call");
+                    let callee = match list_contents(self.take(&mut values)) {
+                        Some(target) => {
+                            let mut target = self.exact(target, 2, "call target");
+                            match self.atom(self.take(&mut target)).as_str() {
+                                "direct" => Callee::Direct(self.number(self.take(&mut target))),
+                                "indirect" => Callee::Indirect(self.number(self.take(&mut target))),
+                                _ => self.invalid("bad call target", Callee::Indirect(0)),
+                            }
+                        }
+                        _ => self.invalid("bad call target", Callee::Indirect(0)),
+                    };
+                    let args = self
+                        .many(self.take(&mut values), "args")
+                        .into_iter()
+                        .map(|value| self.number(value))
+                        .collect();
+                    Op::Call { callee, args }
+                }
+                "global" => Op::Global {
+                    target: self.string(self.exact(values, 1, "global").remove(0)),
+                },
+                _ => self.invalid("invalid operation", Op::NewTag),
+            }
+        }
+        fn op_binary(&self, values: Vec<S>, make: fn(u32, u32) -> Op, tag: &str) -> Op {
+            let mut values = self.exact(values, 2, tag);
+            make(
+                self.number(self.take(&mut values)),
+                self.number(self.take(&mut values)),
+            )
+        }
+        fn read_end(&self, value: S) -> End {
+            let mut values = list_contents(value)
+                .unwrap_or_else(|| self.invalid("invalid terminator", Vec::new()));
+            let tag = self.atom(self.take(&mut values));
+            match tag.as_str() {
+                "ret" => End::Ret(self.number(self.exact(values, 1, "ret").remove(0))),
+                "yield" => End::Yield(self.number(self.exact(values, 1, "yield").remove(0))),
+                "throw" => {
+                    let mut values = self.exact(values, 2, "throw");
+                    End::Throw {
+                        tag: self.number(self.take(&mut values)),
+                        value: self.number(self.take(&mut values)),
+                    }
+                }
+                _ => self.invalid("invalid terminator", End::Ret(0)),
+            }
+        }
+        fn read_literal(&self, value: S) -> Literal {
+            let mut values =
+                list_contents(value).unwrap_or_else(|| self.invalid("invalid literal", Vec::new()));
+            let tag = self.atom(self.take(&mut values));
+            match tag.as_str() {
+                "nat" => {
+                    Literal::Natural(self.number(self.exact(values, 1, "nat literal").remove(0)))
+                }
+                "int" => {
+                    Literal::Integer(self.number(self.exact(values, 1, "int literal").remove(0)))
+                }
+                "real" => {
+                    Literal::Real(self.number(self.exact(values, 1, "real literal").remove(0)))
+                }
+                "string" => {
+                    Literal::String(self.string(self.exact(values, 1, "string literal").remove(0)))
+                }
+                "bool" => {
+                    Literal::Boolean(self.boolean(self.exact(values, 1, "bool literal").remove(0)))
+                }
+                _ => self.invalid("invalid literal", Literal::Boolean(false)),
+            }
+        }
+    }
+}

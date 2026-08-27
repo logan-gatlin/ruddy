@@ -1,27 +1,4 @@
 ================================================================================
-A bundle's root file opens with its name and version
-================================================================================
-
-bundle demo 0.1.0
-
-let id = fn x => x
-
---------------------------------------------------------------------------------
-
-(source_file
-  (bundle_declaration
-    (identifier)
-    (bundle_version
-      (natural)
-      (natural)
-      (natural)))
-  (let_definition
-    (identifier)
-    (function
-      (identifier)
-      (identifier))))
-
-================================================================================
 A module written inline, and the empty one
 ================================================================================
 

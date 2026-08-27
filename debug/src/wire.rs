@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use ruddy::tracking::{FileID, Span};
+pub use ruddy_cli::{DependencyDetail, DependencySpec};
 use serde::{Deserialize, Serialize};
 
 /// A byte range in one file, `[start, end)`. Always UTF-8 offsets, matching
@@ -27,11 +29,42 @@ pub struct Loc {
 
 #[derive(Debug, Deserialize)]
 pub struct CompileRequest {
-    /// Every file of the bundle. `main.hc` is the root; a request without one
+    /// The bundle identity supplied by project configuration in a normal
+    /// compilation. Defaults keep cached requests from older debugger pages
+    /// usable after identity moved out of source files.
+    #[serde(default = "default_name")]
+    pub name: String,
+    #[serde(default = "default_version")]
+    pub version: String,
+    /// Root path configured by the active project's manifest.
+    #[serde(default = "default_root")]
+    pub root: String,
+    /// Every file of the active bundle. A request without its configured root
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
+    /// Dependency project specifications keyed by source module alias.
+    #[serde(default)]
+    pub dependencies: IndexMap<String, DependencySpec>,
+    /// Scratch document name, used to resolve saved dependency projects.
+    #[serde(default = "default_name")]
+    pub document: String,
     #[serde(default)]
     pub revision: u64,
+}
+
+// Dependency specifications are shared with the CLI so debugger manifests and
+// browser requests accept exactly the same path and HTTPS Git forms.
+
+fn default_name() -> String {
+    "demo".to_string()
+}
+
+fn default_version() -> String {
+    "0.1.0".to_string()
+}
+
+fn default_root() -> String {
+    "main.hc".to_string()
 }
 
 /// One file of a bundle, as the page holds it.
@@ -61,9 +94,8 @@ pub struct Snapshot {
     /// depth-first through the modules. This is the index every [`Loc`] points
     /// into.
     pub files: Vec<FileInfo>,
-    /// The identity the root file's header declared, as `name@version`, or
-    /// `None` when it declared none the loader could use. Read-only on the
-    /// page: a bundle is named by its source and by nothing else.
+    /// The externally supplied identity this compilation used, as
+    /// `name@version`, or `None` when the supplied identity was invalid.
     pub bundle: Option<String>,
     pub stages: Vec<Stage>,
     pub diagnostics: Vec<Diagnostic>,
@@ -75,6 +107,9 @@ pub struct Stage {
     pub id: &'static str,
     pub title: &'static str,
     pub view: View,
+    /// Every reader-selectable rendering this stage supplies, in default-first
+    /// order. `Text` stages can additionally expose their structural outline.
+    pub views: &'static [View],
     /// A regular expression over this stage's row text, naming the runs that
     /// mean the same thing wherever they appear — a solver variable, say.
     /// Hovering one lights every other occurrence in the panel.
@@ -115,10 +150,9 @@ pub struct Stage {
     pub annotates: Option<&'static str>,
 }
 
-/// How a panel renders its nodes. `Text` has no producer yet; it is part of the
-/// contract so that a stage emitting assembly can be added without changing the
-/// wire format or the page.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// How a panel renders its nodes. A text stage may also offer its nodes as a
+/// structural outline without giving up its canonical text rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum View {
@@ -138,6 +172,8 @@ pub enum Status {
     Partial,
     /// Its input never arrived, so there was nothing to render.
     Skipped,
+    /// It ran normally but rejected its input.
+    Error,
     Panicked,
 }
 
@@ -260,12 +296,26 @@ pub struct DocMeta {
 #[derive(Debug, Serialize)]
 pub struct Doc {
     pub name: String,
+    pub bundle_name: String,
+    pub version: String,
+    pub root: String,
+    pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DocBody {
+    /// Optional only for compatibility with saves from debugger pages opened
+    /// before identity moved into document configuration.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default = "default_root")]
+    pub root: String,
+    #[serde(default)]
+    pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
 }
 

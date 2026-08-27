@@ -11,14 +11,16 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::Once,
     time::Instant,
 };
 
 use ruddy::{
+    artifact,
     bundle::{self, Files},
     inference, ir, lir, patterns,
-    symbol::Mint,
+    symbol::{Bundle, Mint, Version},
     tracking::{FileID, FileManager, Span},
     ui,
 };
@@ -41,9 +43,9 @@ thread_local! {
     static GUARDING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The root file of every document, by convention. A bundle is described by its
-/// own source, so the one thing the debugger has to decide is where to start
-/// reading — and it decides it once, here, rather than offering a setting.
+/// The root file of every document, by convention. Its path and the bundle
+/// identity are supplied separately from source, just as a project manifest
+/// supplies them to the command-line driver.
 pub const ROOT: &str = "main.hc";
 
 /// The [`Files`] a request is: whatever the page has in its editor, and nothing
@@ -64,6 +66,16 @@ impl Files for Requested<'_> {
 }
 
 pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
+    compile_inner(req, build, None)
+}
+
+/// Compile an active browser project while loading dependency projects from a
+/// sandboxed debugger scratch directory.
+pub fn compile_at(req: &CompileRequest, build: u64, scratch: &Path) -> Snapshot {
+    compile_inner(req, build, Some(scratch))
+}
+
+fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Snapshot {
     install_hook();
 
     let mut files = FileManager::new();
@@ -74,7 +86,7 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     let fs = Requested(&req.files);
     let started = Instant::now();
     let loaded = guard("bundle", &mut panicked, || {
-        bundle::load(&mut files, &fs, ROOT)
+        bundle::load(&mut files, &fs, &req.root)
     });
     micros.load = started.elapsed().as_micros() as u64;
     // Lexing and parsing happen inside the load, once per file, so the two tabs
@@ -109,30 +121,129 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
     // A request with no root has nothing to load. Said here rather than by the
     // loader, which reads an absent file as an empty one: only the debugger
     // knows that the page is meant to have put one there.
-    if fs.read(ROOT).is_none() {
+    if fs.read(&req.root).is_none() {
         diagnostics.push(raw(
             "bundle",
             "missing-root-file",
-            format!("a document needs a `{ROOT}`; it is the bundle's root file"),
+            if req.root == ROOT {
+                format!("a document needs a `{ROOT}`; it is the bundle's root file")
+            } else {
+                format!("a document needs its configured root `{}`", req.root)
+            },
             None,
         ));
     }
 
-    let identity = loaded
-        .as_ref()
-        .and_then(|loaded| loaded.bundle.clone())
-        .map(|bundle| bundle.to_string());
-    let mut mint = Mint::new(
-        loaded
-            .as_ref()
-            .and_then(|loaded| loaded.bundle.clone())
-            .unwrap_or_else(bundle::fallback),
-    );
+    // Identity is project configuration, not source syntax. Keep malformed
+    // wire input recoverable like every compiler error: report it, mint under
+    // a stable fallback, and still show all later phases that can run.
+    let configured = Version::parse(&req.version)
+        .ok()
+        .filter(|version| version.build.is_empty())
+        .and_then(|version| Bundle::new(&req.name, version));
+    if configured.is_none() {
+        diagnostics.push(raw(
+            "bundle",
+            "bad-bundle-identity",
+            format!(
+                "`{}@{}` is not a valid Ruddy bundle identity",
+                req.name, req.version
+            ),
+            None,
+        ));
+    }
+    let identity = configured.as_ref().map(ToString::to_string);
+
+    // Resolve and compile saved dependency projects. Configuration failures are
+    // recoverable so the active project's source phases remain inspectable.
+    let dependency_started = Instant::now();
+    let mut dependency_artifacts = Vec::new();
+    let mut dependency_aliases = Vec::new();
+    let mut dependency_interfaces = Vec::new();
+    let mut linked_interfaces = Vec::new();
+    if !req.dependencies.is_empty() {
+        match scratch {
+            None => diagnostics.push(raw(
+                "dependencies",
+                "missing-scratch-root",
+                "dependency projects require a debugger scratch root".to_string(),
+                None,
+            )),
+            Some(scratch) => {
+                let project = match crate::docs::path(scratch, &req.document) {
+                    Some(project) => project,
+                    None => {
+                        diagnostics.push(raw(
+                            "dependencies",
+                            "bad-document",
+                            "the active document name is invalid".to_string(),
+                            None,
+                        ));
+                        PathBuf::from("invalid-document")
+                    }
+                };
+                let specifications = req
+                    .dependencies
+                    .iter()
+                    .map(|(alias, specification)| (alias.clone(), specification.clone()));
+                match ruddy_cli::compile_sandboxed_dependency_specs(
+                    specifications,
+                    &project,
+                    scratch,
+                ) {
+                    Ok((graph, direct, direct_paths)) => {
+                        dependency_aliases = req.dependencies.keys().cloned().collect();
+                        linked_interfaces = graph
+                            .projects
+                            .iter()
+                            .map(|project| project.artifact.clone())
+                            .collect();
+                        // Select source-visible roots by their canonical graph
+                        // path, not by the first matching bundle identity.
+                        dependency_interfaces = direct_paths
+                            .iter()
+                            .filter_map(|path| {
+                                graph
+                                    .projects
+                                    .iter()
+                                    .find(|project| &project.directory == path)
+                            })
+                            .map(|project| project.artifact.clone())
+                            .collect();
+                        dependency_artifacts = direct;
+                    }
+                    Err(error) => diagnostics.push(raw(
+                        "dependencies",
+                        "dependency-build",
+                        error.to_string(),
+                        None,
+                    )),
+                }
+            }
+        }
+    }
+    micros.dependencies = dependency_started.elapsed().as_micros() as u64;
+
+    let fallback = || {
+        Bundle::new("fallback", Version::new(0, 0, 0))
+            .expect("the debugger fallback identity is valid")
+    };
+    let mut mint = Mint::new(configured.unwrap_or_else(fallback));
 
     let mut built = loaded.as_ref().and_then(|loaded| {
         let started = Instant::now();
         let out = guard("ir", &mut panicked, || {
-            ir::build(&mut mint, loaded.stmts.clone())
+            let imports: Vec<_> = dependency_aliases
+                .iter()
+                .zip(&dependency_interfaces)
+                .map(|(alias, artifact)| ir::DependencyImport { alias, artifact })
+                .collect();
+            ir::build_with_dependency_imports(
+                &mut mint,
+                loaded.stmts.clone(),
+                &imports,
+                &linked_interfaces,
+            )
         });
         micros.build = started.elapsed().as_micros() as u64;
         out
@@ -252,6 +363,58 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         _ => None,
     };
 
+    // The artifact is the first disk-boundary representation. Like LIR, it
+    // only exists for an accepted program, and retains no source spans.
+    let mut artifact_panicked = false;
+    let artifact = match (&built, &inferred, &lowered) {
+        (Some(built), Some(inferred), Some(lowered)) => {
+            let started = Instant::now();
+            let dependencies = dependency_artifacts.clone();
+            let out = guard("artifact", &mut panicked, || {
+                artifact::build_with_dependencies(
+                    &mint,
+                    &built.program,
+                    inferred,
+                    lowered,
+                    dependencies,
+                )
+            });
+            artifact_panicked = out.is_none();
+            micros.artifact = started.elapsed().as_micros() as u64;
+            out
+        }
+        _ => None,
+    };
+
+    // Linking is a distinct final phase. Dependency artifacts remain separate
+    // compilation boundaries above; this output copies their code into the
+    // active root and therefore needs no external artifacts at execution time.
+    let errored_before_link = !diagnostics.is_empty();
+    let mut link_error = None;
+    let mut link_panicked = false;
+    let linked = artifact.as_ref().and_then(|artifact| {
+        let started = Instant::now();
+        let mut graph = linked_interfaces.clone();
+        graph.push(artifact.clone());
+        let out = guard("link", &mut panicked, || ruddy::link::link(&graph));
+        link_panicked = out.is_none();
+        micros.link = started.elapsed().as_micros() as u64;
+        match out {
+            Some(Ok(linked)) => Some(linked),
+            Some(Err(error)) => {
+                let message = error.to_string();
+                diagnostics.push(raw("link", "invalid-artifact-graph", message.clone(), None));
+                link_error = Some(message);
+                None
+            }
+            None => None,
+        }
+    });
+    diagnostics.sort_by_key(|d| d.span.map(|at| (at.file, at.range[0])).unwrap_or((0, 0)));
+    for (i, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic.id = i as u32;
+    }
+
     // Every file the loader read, in load order, with what the page needs to
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
@@ -277,10 +440,24 @@ pub fn compile(req: &CompileRequest, build: u64) -> Snapshot {
         inference: inferred.as_ref(),
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
+        artifact: artifact.as_ref(),
+        linked: linked.as_ref(),
+        dependency_declarations: &req.dependencies,
+        dependency_aliases: &dependency_aliases,
+        dependencies: &dependency_artifacts,
+        dependency_interfaces: &dependency_interfaces,
+        dependencies_valid: !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "dependencies"),
+        artifact_panicked,
+        link_error: link_error.as_deref(),
+        link_panicked,
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
-        errored: !diagnostics.is_empty(),
+        // A link-only diagnostic belongs to the final tab and must not
+        // retroactively downgrade compiler phases that already succeeded.
+        errored: errored_before_link,
     };
 
     // In registry order, which is also dependency order: a stage that annotates

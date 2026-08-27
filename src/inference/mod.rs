@@ -1055,6 +1055,12 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             let kinds = decl.params.iter().map(|param| param.kind.clone()).collect();
             (*symbol, kinds)
         })
+        .chain(
+            program
+                .external_types
+                .iter()
+                .map(|(symbol, declaration)| (*symbol, declaration.params.clone())),
+        )
         .collect();
     // And which of them are nominal within themselves: those every parameter of
     // which survives unfolding, so that comparing two applications argument by
@@ -1065,7 +1071,21 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         .iter()
         .filter(|(_, decl)| decl.params.iter().all(|param| param.relevant))
         .map(|(symbol, _)| *symbol)
+        .chain(
+            program
+                .external_types
+                .iter()
+                .filter(|(_, declaration)| declaration.relevant.iter().all(|relevant| *relevant))
+                .map(|(symbol, _)| *symbol),
+        )
         .collect();
+
+    aliases.extend(
+        program
+            .external_types
+            .iter()
+            .map(|(symbol, declaration)| (*symbol, declaration.scheme.clone())),
+    );
 
     // Aliases first: annotations refer to them. A name inside a body stays a
     // name, so this pass reads no alias it is still building and the order it
@@ -1084,7 +1104,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // the reason the aliases above are: a signature is a plain closed arrow, so
     // it mentions no variable and lowering one twice would only mint two copies
     // of nothing.
-    let mut operations = constrain::Operations::new();
+    let mut operations = program.external_operations.clone();
     for (symbol, decl) in &program.effects {
         let ir::Effect::Operations(declared) = &decl.value else {
             continue;
@@ -1120,6 +1140,12 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     }
 
     let mut schemes = IndexMap::new();
+    env.extend(
+        program
+            .external_schemes
+            .iter()
+            .map(|(symbol, scheme)| (*symbol, Binding::Poly(scheme.clone()))),
+    );
     let mut locals = IndexMap::new();
     let mut constraints = IndexMap::new();
     let mut promises = IndexMap::new();

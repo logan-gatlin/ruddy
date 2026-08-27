@@ -5,10 +5,13 @@
 //! file here and a line to [`REGISTRY`]; the page needs no change, because it
 //! builds its tabs, filters and cross-highlighting from the snapshot alone.
 
+pub mod artifact;
 pub mod ast;
 pub mod constraints;
+pub mod dependencies;
 pub mod externs;
 pub mod ir;
+pub mod linked;
 pub mod lir;
 pub mod patterns;
 pub mod presence;
@@ -37,8 +40,8 @@ pub struct Cx<'a> {
     /// indexes them. A stage naming the file a node came from reads its path
     /// from here.
     pub files: &'a [FileInfo],
-    /// What the load produced: the tokens and the parse errors of every file,
-    /// the spliced statement tree, and the identity the header declared.
+    /// What the load produced: the tokens and parse errors of every file, and
+    /// the spliced statement tree.
     pub bundle: Option<&'a ruddy::bundle::Output>,
     pub program: Option<&'a ruddy::ir::Program>,
     pub inference: Option<&'a ruddy::inference::Output>,
@@ -46,6 +49,23 @@ pub struct Cx<'a> {
     /// `None` whenever an earlier phase reported anything: LIR runs on accepted
     /// programs alone, which is what lets it be infallible.
     pub lir: Option<&'a ruddy::lir::Output>,
+    /// The canonical, span-free per-project disk boundary built from accepted LIR.
+    pub artifact: Option<&'a ruddy::artifact::Artifact>,
+    /// The self-contained artifact produced by statically linking the graph.
+    pub linked: Option<&'a ruddy::artifact::Artifact>,
+    /// Direct dependency artifacts successfully resolved for the active project.
+    pub dependency_declarations: &'a indexmap::IndexMap<String, crate::wire::DependencySpec>,
+    /// Aliases for successfully resolved direct dependencies, in request order.
+    pub dependency_aliases: &'a [String],
+    pub dependencies: &'a [ruddy::artifact::Dependency],
+    pub dependency_interfaces: &'a [ruddy::artifact::Artifact],
+    pub dependencies_valid: bool,
+    /// Artifact construction ran but panicked, rather than being skipped.
+    pub artifact_panicked: bool,
+    /// Static linking ran but rejected its artifact graph.
+    pub link_error: Option<&'a str>,
+    /// Static linking ran but panicked, rather than being skipped.
+    pub link_panicked: bool,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -62,6 +82,7 @@ pub struct Phases {
     /// The whole load: reading every file of the bundle, lexing it, parsing it
     /// and splicing the tree. [`Phases::lex`] and [`Phases::parse`] are the
     /// halves of it, summed across files.
+    pub dependencies: u64,
     pub load: u64,
     pub lex: u64,
     pub parse: u64,
@@ -69,6 +90,8 @@ pub struct Phases {
     pub infer: u64,
     pub patterns: u64,
     pub lir: u64,
+    pub artifact: u64,
+    pub link: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -156,6 +179,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(tokens::build),
+    },
+    Spec {
+        id: "dependencies",
+        title: "Dependencies",
+        view: View::Tree,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(dependencies::build),
     },
     Spec {
         id: "ast",
@@ -261,6 +293,24 @@ pub const REGISTRY: &[Spec] = &[
         build: Build::Panel(lir::build),
     },
     Spec {
+        id: "artifact",
+        title: "Artifact",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(artifact::build),
+    },
+    Spec {
+        id: "linked",
+        title: "Linked Artifact",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(linked::build),
+    },
+    Spec {
         id: "symbols",
         title: "Symbols",
         view: View::List,
@@ -315,6 +365,7 @@ impl Spec {
             id: self.id,
             title: self.title,
             view: self.view,
+            views: views(self.view),
             highlight: self.highlight,
             scoped: self.scoped,
             status,
@@ -325,6 +376,17 @@ impl Spec {
             debug: String::new(),
             annotates: self.annotates,
         }
+    }
+}
+
+/// The renderings the page can offer for a stage. Text is the canonical form
+/// of a span-free boundary, but its nodes remain useful as a navigable outline.
+fn views(view: View) -> &'static [View] {
+    match view {
+        View::Text => &[View::Text, View::Tree],
+        View::List => &[View::List],
+        View::Tree => &[View::Tree],
+        View::Steps => &[View::Steps],
     }
 }
 
@@ -422,4 +484,9 @@ pub fn skipped(spec: &Spec, why: &str) -> Stage {
 /// at the top level of the snapshot.
 pub fn panicked(spec: &Spec) -> Stage {
     spec.stage(Status::Panicked, "panicked")
+}
+
+/// A stage that ran and rejected its input normally.
+pub fn failed(spec: &Spec, why: &str) -> Stage {
+    spec.stage(Status::Error, why)
 }

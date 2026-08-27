@@ -25,6 +25,13 @@ const state = {
   /// Every file of the open document, root first, exactly as the compile
   /// request carries them.
   files: [],
+  /// Bundle identity supplied independently of source, as a project manifest
+  /// would supply it to the command-line driver.
+  name: "demo",
+  version: "0.1.0",
+  root: ROOT,
+  /// Dependency project specs keyed by source module alias.
+  dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
   /// compiler is always given all of them.
   active: 0,
@@ -237,8 +244,11 @@ async function openDoc(name) {
   // made it there — a crash, a lost connection, a closed tab mid-keystroke.
   let files = server?.files ?? cached?.files ?? [];
   state.notice = "";
-  if (cached && !sameFiles(cached.files, files) && (!server || cached.at > server.modified_ms)) {
-    files = cached.files;
+  const recovered = cached &&
+    !sameDocumentConfiguration(cached, server, name) &&
+    (!server || cached.at > server.modified_ms);
+  if (recovered) {
+    files = cached.files ?? [];
     state.notice = `restored unsaved changes to ${name}`;
   }
   // A document nobody has written yet — the switcher creates one by opening a
@@ -248,6 +258,12 @@ async function openDoc(name) {
 
   state.doc = name;
   state.files = files;
+  const configured = recovered ? cached : server ?? cached;
+  state.name = configured?.bundle_name ?? configured?.name ?? name;
+  state.version = configured?.version ?? "0.1.0";
+  state.root = configured?.root ?? ROOT;
+  state.dependencies = configured?.dependencies ?? {};
+  state.snapshot = null;
   state.active = 0;
   state.where = {};
   state.offsets = null;
@@ -281,6 +297,24 @@ function sameFiles(a, b) {
   );
 }
 
+/// Compare every editable part of a document. The server calls the configured
+/// identity `bundle_name` because its `name` is the storage key; the browser
+/// cache calls it `name`, so normalize that one wire-format difference first.
+function sameDocumentConfiguration(cache, server, documentName) {
+  if (!cache || !server) return false;
+  const cacheName = cache.bundle_name ?? cache.name ?? documentName;
+  const serverName = server.bundle_name ?? server.name ?? documentName;
+  const cacheDependencies = cache.dependencies ?? {};
+  const serverDependencies = server.dependencies ?? {};
+  return (
+    cacheName === serverName &&
+    (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
+    (cache.root ?? ROOT) === (server.root ?? ROOT) &&
+    sameFiles(cache.files ?? [], server.files ?? []) &&
+    JSON.stringify(cacheDependencies) === JSON.stringify(serverDependencies)
+  );
+}
+
 let cacheTimer = null;
 
 /// Debounced off the keystroke: `localStorage` is synchronous, and there is no
@@ -290,7 +324,17 @@ function cacheLocally() {
   cacheTimer = setTimeout(() => {
     try {
       const at = Date.now();
-      localStorage.setItem(docKey(state.doc), JSON.stringify({ files: state.files, at }));
+      localStorage.setItem(
+        docKey(state.doc),
+        JSON.stringify({
+          files: state.files,
+          name: state.name,
+          version: state.version,
+          root: state.root,
+          dependencies: state.dependencies,
+          at,
+        }),
+      );
     } catch {
       // A full quota is not worth interrupting the loop over; the server copy
       // is the durable one anyway.
@@ -317,7 +361,13 @@ async function saveNow() {
   try {
     await fetch(`/docs/${encodeURIComponent(state.doc)}`, {
       method: "PUT",
-      body: JSON.stringify({ files: state.files }),
+      body: JSON.stringify({
+        name: state.name,
+        version: state.version,
+        root: state.root,
+        dependencies: state.dependencies,
+        files: state.files,
+      }),
     });
   } catch {
     // Offline: the local copy already has it, and the next save will catch up.
@@ -345,7 +395,15 @@ async function compileNow() {
     const response = await fetch("/compile", {
       method: "POST",
       signal: controller.signal,
-      body: JSON.stringify({ files: state.files, revision }),
+      body: JSON.stringify({
+        name: state.name,
+        version: state.version,
+        root: state.root,
+        document: state.doc,
+        files: state.files,
+        dependencies: state.dependencies,
+        revision,
+      }),
     });
     const snapshot = await response.json();
     // A slower earlier compile must never overwrite a newer one.
@@ -417,8 +475,101 @@ function setLink(link) {
 
 // ── title bar ────────────────────────────────────────────────────────────
 
+function parseDependencies(input) {
+  if (!input.trim()) return {};
+  const dependencies = {};
+  for (const [index, raw] of input.split(",").entries()) {
+    const part = raw.trim();
+    const equals = part.indexOf("=");
+    const left = part.slice(0, equals).trim();
+    let source = part.slice(equals + 1).trim();
+    const at = left.indexOf("@");
+    const alias = (at < 0 ? left : left.slice(0, at)).trim();
+    const bundleName = (at < 0 ? alias : left.slice(at + 1)).trim();
+    if (equals <= 0 || !alias || !bundleName || !source) {
+      throw new Error(`Dependency ${index + 1} must be written as alias=folder, alias@bundle=folder, or alias=https://git-url[#branch=name|#tag=name|#rev=commit].`);
+    }
+    if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
+
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(source) && !source.startsWith("https://")) {
+      throw new Error(`Dependency ${alias} uses an unsupported URL scheme; Git dependencies must use HTTPS.`);
+    }
+    if (source.startsWith("https://")) {
+      const detail = { git: source };
+      const selector = source.match(/#(branch|tag|rev)=([^#]+)$/);
+      if (selector) {
+        detail.git = source.slice(0, selector.index);
+        detail[selector[1]] = selector[2].trim();
+        if (!detail[selector[1]]) throw new Error(`Dependency ${alias} has an empty Git selector.`);
+      }
+      if (alias !== bundleName) detail.bundle = bundleName;
+      dependencies[alias] = detail;
+    } else {
+      dependencies[alias] = alias === bundleName ? source : { bundle: bundleName, path: source };
+    }
+  }
+  return dependencies;
+}
+
+function printDependency(alias, specification) {
+  if (typeof specification === "string") return `${alias}=${specification}`;
+  const bundle = specification.bundle && specification.bundle !== alias
+    ? `@${specification.bundle}`
+    : "";
+  if (specification.git) {
+    const selector = ["branch", "tag", "rev"].find((kind) => specification[kind]);
+    const suffix = selector ? `#${selector}=${specification[selector]}` : "";
+    return `${alias}${bundle}=${specification.git}${suffix}`;
+  }
+  return `${alias}${bundle}=${specification.path}`;
+}
+
 function wireTitlebar() {
   el("doc-button").addEventListener("click", openSwitcher);
+  el("bundle").addEventListener("click", () => {
+    const entered = window.prompt("Bundle identity (name@version)", `${state.name}@${state.version}`);
+    if (entered === null) return;
+    try {
+      const at = entered.lastIndexOf("@");
+      if (at <= 0 || entered.includes(",") || !entered.slice(at + 1).trim()) {
+        throw new Error("A bundle identity must be written as name@version.");
+      }
+      state.name = entered.slice(0, at).trim();
+      state.version = entered.slice(at + 1).trim();
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
+    state.snapshot = null;
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+    renderTitlebar();
+  });
+  el("root").addEventListener("click", () => {
+    const entered = window.prompt("Root source path", state.root);
+    if (entered === null || !entered.trim()) return;
+    state.root = entered.trim();
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+    renderTitlebar();
+  });
+  el("dependencies").addEventListener("click", () => {
+    const current = Object.entries(state.dependencies).map(([alias, specification]) => printDependency(alias, specification)).join(", ");
+    const entered = window.prompt("Dependencies (alias=folder or alias=https://url#branch=name; @bundle aliases, comma-separated)", current);
+    if (entered === null) return;
+    try {
+      state.dependencies = parseDependencies(entered);
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+    renderTitlebar();
+  });
   el("follow").addEventListener("click", () => toggleFollow());
   el("split").addEventListener("click", () => toggleSplit());
 }
@@ -426,13 +577,15 @@ function wireTitlebar() {
 function renderTitlebar() {
   el("doc-name").textContent = state.doc;
 
-  // Read-only: a bundle is named by its own source, so the chip reports what
-  // the root file's header declared rather than offering a second place to say
-  // it. Nothing to show is itself worth showing — that program mints its
-  // symbols under a fallback identity.
-  const bundle = state.snapshot?.bundle ?? null;
-  el("bundle").textContent = bundle ?? `no bundle header in ${ROOT}`;
-  el("bundle").classList.toggle("none", !bundle);
+  el("bundle").textContent = `${state.name}@${state.version}`;
+  el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
+  el("root").textContent = state.root;
+
+  const dependencies = el("dependencies");
+  const dependencyCount = Object.keys(state.dependencies).length;
+  dependencies.textContent = dependencyCount === 1
+    ? "1 dependency"
+    : `${dependencyCount || "no"} dependencies`;
 
   el("follow").classList.toggle("on", state.follow);
   el("split").classList.toggle("on", state.split);

@@ -192,7 +192,11 @@ fn handle(mut request: Request, state: &State) {
         }),
         (Method::Post, "/compile") => match body(&mut request) {
             Ok(body) => match serde_json::from_str::<CompileRequest>(&body) {
-                Ok(req) => json(&snapshot::compile(&req, state.cfg.build)),
+                Ok(req) => json(&snapshot::compile_at(
+                    &req,
+                    state.cfg.build,
+                    &state.cfg.scratch,
+                )),
                 Err(err) => fail(400, &format!("bad request: {err}")),
             },
             Err(err) => fail(413, &err),
@@ -232,16 +236,25 @@ fn document(
                 Ok(body) => body,
                 Err(err) => return fail(413, &err),
             };
-            let files = match serde_json::from_str::<DocBody>(&body) {
-                Ok(body) => body.files,
+            let body = match serde_json::from_str::<DocBody>(&body) {
+                Ok(body) => body,
                 Err(err) => return fail(400, &format!("bad request: {err}")),
             };
+            let files = body.files;
             // Every path is checked before anything is written, so a request
             // with one bad path leaves the document exactly as it was.
             if !files.iter().all(|file| docs::valid_file_path(&file.path)) {
                 return fail(400, "invalid file path");
             }
-            match docs::write(&state.cfg.scratch, name, &files) {
+            match docs::write(
+                &state.cfg.scratch,
+                name,
+                body.name.as_deref().unwrap_or(name),
+                body.version.as_deref().unwrap_or("0.1.0"),
+                &body.root,
+                &body.dependencies,
+                &files,
+            ) {
                 Ok(modified_ms) => json(&serde_json::json!({ "modified_ms": modified_ms })),
                 Err(err) => fail(500, &err.to_string()),
             }

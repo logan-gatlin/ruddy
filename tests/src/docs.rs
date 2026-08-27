@@ -2,8 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
 use ruddy_debug::{
-    docs::{delete, path, read, valid_file_path, valid_name, write},
+    docs::{delete, dependency_path, path, read, valid_file_path, valid_name, write},
     wire::FileSpec,
 };
 
@@ -14,6 +15,9 @@ fn names_are_a_single_safe_segment() {
 
     // Everything that could reach outside the scratch directory.
     assert!(!valid_name(""));
+    assert!(!valid_name("3demo"));
+    assert!(!valid_name("_demo"));
+    assert!(!valid_name("-demo"));
     assert!(!valid_name(".."));
     assert!(!valid_name("a/b"));
     assert!(!valid_name("a\\b"));
@@ -87,14 +91,32 @@ fn a_file_path_is_a_relative_hc_path_and_nothing_else() {
 fn a_document_round_trips_through_the_disk() {
     let root = scratch("round-trip");
     let files = [
-        file("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+        file("main.hc", "module Math\n"),
         file("Math.hc", "module Vec\nlet double = fn x => x\n"),
         file("Math/Vec.hc", "let zero = 0n\n"),
     ];
-    write(&root, "demo", &files).expect("the document is written");
+    let dependencies = IndexMap::from([("base".into(), "../base".into())]);
+    write(
+        &root,
+        "demo",
+        "configured",
+        "1.2.3",
+        "main.hc",
+        &dependencies,
+        &files,
+    )
+    .expect("the document is written");
 
     let doc = read(&root, "demo").expect("the document is read back");
     assert_eq!(doc.name, "demo");
+    assert_eq!(doc.bundle_name, "configured");
+    assert_eq!(doc.version, "1.2.3");
+    assert_eq!(doc.root, "main.hc");
+    assert!(matches!(
+        &doc.dependencies["base"],
+        ruddy_debug::wire::DependencySpec::Path(path)
+            if path == Path::new("../base")
+    ));
     let back: Vec<(&str, &str)> = doc
         .files
         .iter()
@@ -103,7 +125,7 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(
         back,
         [
-            ("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+            ("main.hc", "module Math\n"),
             ("Math.hc", "module Vec\nlet double = fn x => x\n"),
             ("Math/Vec.hc", "let zero = 0n\n"),
         ]
@@ -111,6 +133,30 @@ fn a_document_round_trips_through_the_disk() {
     assert!(doc.modified_ms > 0);
 
     delete(&root, "demo").expect("the document is deleted");
+}
+
+#[test]
+fn the_configured_root_is_ordered_before_other_files() {
+    let root = scratch("configured-root-order");
+    write(
+        &root,
+        "demo",
+        "demo",
+        "0.1.0",
+        "start.hc",
+        &IndexMap::new(),
+        &[file("main.hc", ""), file("start.hc", "")],
+    )
+    .unwrap();
+
+    let doc = read(&root, "demo").unwrap();
+    assert_eq!(
+        doc.files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["start.hc", "main.hc"]
+    );
 }
 
 /// A write replaces a document rather than adding to one: a file the page
@@ -123,15 +169,27 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
     write(
         &root,
         "demo",
+        "demo",
+        "0.1.0",
+        "main.hc",
+        &IndexMap::new(),
         &[
-            file("main.hc", "bundle demo 0.1.0\nmodule Math\n"),
+            file("main.hc", "module Math\n"),
             file("Math.hc", "let double = fn x => x\n"),
         ],
     )
     .expect("the document is written");
 
-    write(&root, "demo", &[file("main.hc", "bundle demo 0.1.0\n")])
-        .expect("the document is written again");
+    write(
+        &root,
+        "demo",
+        "demo",
+        "0.1.0",
+        "main.hc",
+        &IndexMap::new(),
+        &[file("main.hc", "")],
+    )
+    .expect("the document is written again");
 
     let doc = read(&root, "demo").expect("the document is read back");
     let paths: Vec<&str> = doc.files.iter().map(|file| file.path.as_str()).collect();
@@ -149,6 +207,43 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("the scratch directory is created");
     root
+}
+
+#[test]
+fn dependency_paths_are_canonical_and_sandboxed() {
+    let root = scratch("dependencies");
+    let app = root.join("app");
+    let base = root.join("base");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&base).unwrap();
+    assert_eq!(
+        dependency_path(&root, &app, Path::new("../base")).unwrap(),
+        std::fs::canonicalize(&base).unwrap()
+    );
+    assert!(dependency_path(&root, &app, Path::new("/tmp")).is_err());
+    assert!(dependency_path(&root, &app, Path::new("../../")).is_err());
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/tmp", root.join("outside")).unwrap();
+        assert!(dependency_path(&root, &app, Path::new("../outside")).is_err());
+    }
+}
+
+#[test]
+fn missing_and_invalid_manifests_are_not_replaced_by_json_defaults() {
+    let root = scratch("manifest-errors");
+    std::fs::create_dir(root.join("demo")).unwrap();
+    std::fs::write(root.join("demo/.ruddy-debug.json"), r#"{"name":"old"}"#).unwrap();
+    assert_eq!(
+        read(&root, "demo").unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::write(root.join("demo/Ruddy.toml"), "not toml =").unwrap();
+    assert_eq!(
+        read(&root, "demo").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }
 
 fn file(path: &str, source: &str) -> FileSpec {
