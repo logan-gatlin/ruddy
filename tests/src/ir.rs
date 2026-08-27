@@ -5366,7 +5366,8 @@ fn imported_named_handler_coverage_and_diagnostics_use_artifact_selectors() {
         let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
         assert!(parsed.errors.is_empty());
         let mut mint = dummy_mint();
-        let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency.clone()]);
+        let out =
+            build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
         (mint, out)
     };
     let complete = "let main = fn n => handle dep::!IO.write n with\n\
