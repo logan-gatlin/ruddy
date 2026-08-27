@@ -10,7 +10,7 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
+        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
         ExprKind, HandlerArm, Path, PatternKind, Rest, StmtKind, SumCase, TypeField, TypeKind,
         When, Where,
     },
@@ -55,9 +55,7 @@ impl Grouped for Ast<'_, ExprKind> {
             // head an application and be projected from; but it is not an
             // application *argument* by grammar, so an argument position
             // brackets it. Below `Atom` is exactly that split.
-            // Self-delimiting on the right — the `end` closes it — so a
-            // handler groups exactly as a match does.
-            ExprKind::Match { .. } | ExprKind::Handle { .. } => Prec::Apply,
+            ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Handle { .. } => Prec::Apply,
             // The body runs as far right as it can, so anything appended after
             // a `raise` would be read as part of what it carries.
             ExprKind::Raise(_) => Prec::Lambda,
@@ -352,6 +350,11 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 &Ast(&value.tracked),
                 &Ast(&body.tracked),
             ),
+            ExprKind::If {
+                predicate,
+                consequent,
+                alternative,
+            } => write_if(f, predicate, consequent, alternative, true),
             // The pattern prints through the compiler's own `Display`, so the
             // arm a match shows is the arm the parser read.
             ExprKind::Match { scrutinee, arms } => write_match(
@@ -546,6 +549,38 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
         Some(name) => format!("'{}", name.tracked.clone()),
         None => "_".to_string(),
     }))
+}
+
+/// Render a conditional, flattening a conditional alternative into the
+/// language's one-`end` `else if` spelling.
+///
+/// Grouping is intentionally absent from the parse tree, so an explicitly
+/// parenthesized nested alternative canonicalizes to the same chain.
+fn write_if(
+    f: &mut fmt::Formatter<'_>,
+    predicate: &Expr,
+    consequent: &Expr,
+    alternative: &Expr,
+    final_end: bool,
+) -> fmt::Result {
+    write!(
+        f,
+        "if {} then {} else ",
+        Ast(&predicate.tracked),
+        Ast(&consequent.tracked)
+    )?;
+    match &alternative.tracked {
+        ExprKind::If {
+            predicate,
+            consequent,
+            alternative,
+        } => write_if(f, predicate, consequent, alternative, false)?,
+        other => write!(f, "{}", Ast(other))?,
+    }
+    if final_end {
+        f.write_str(" end")?;
+    }
+    Ok(())
 }
 
 /// Render one handler arm: what it answers, the name it binds, and its body.

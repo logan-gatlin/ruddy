@@ -85,6 +85,32 @@ fn boolean_operators_accept_only_booleans() {
 }
 
 #[test]
+fn conditionals_require_a_boolean_and_unify_their_branches() {
+    let (mint, _, output) = inferred(
+        "let n = if true then 1n else 2n end\n\
+         let id = fn p => if p then p else false end",
+    );
+    assert_eq!(scheme(&mint, &output, "n"), "Nat");
+    assert_eq!(scheme(&mint, &output, "id"), "Boolean -> Boolean");
+
+    let (_, _, output) = infer_src("let bad = if 1n then 2n else 3n end");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Boolean`, found `Nat`"
+    );
+
+    let (_, _, output) = infer_src("let bad = if true then 1n else false end");
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    let message = output.errors[0].kind.to_string();
+    assert!(message.contains("type mismatch"), "{message}");
+    assert!(
+        message.contains("Nat") && message.contains("Boolean"),
+        "{message}"
+    );
+}
+
+#[test]
 fn every_primitive_is_a_distinct_type() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\

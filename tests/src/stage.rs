@@ -1052,6 +1052,78 @@ fn the_tokens_tab_groups_its_rows_by_file() {
     assert_eq!(stage.summary, "22 tokens · 3 files");
 }
 
+#[test]
+fn conditionals_are_coherent_across_the_surface_debugger_tabs() {
+    let source = "let choice = if true then 1n else if false then 2n else 3n end\n";
+    let snapshot = bundle(&[(ROOT, source)]);
+
+    let tokens = named(bundle(&[(ROOT, source)]), "tokens");
+    let keywords: Vec<(&str, &str)> = tokens.nodes[0]
+        .children
+        .iter()
+        .filter(|token| matches!(token.text.as_str(), "if" | "then" | "else"))
+        .map(|token| {
+            let class = token
+                .fields
+                .iter()
+                .find(|field| field.name == "_class")
+                .expect("every token has an editor class");
+            (token.label.as_str(), class.value.as_str())
+        })
+        .collect();
+    assert_eq!(
+        keywords,
+        [
+            ("If", "keyword"),
+            ("Then", "keyword"),
+            ("Else", "keyword"),
+            ("If", "keyword"),
+            ("Then", "keyword"),
+            ("Else", "keyword"),
+        ]
+    );
+
+    let ast = named(snapshot, "ast");
+    let if_node = flatten(&ast.nodes)
+        .into_iter()
+        .find(|node| node.label == "If")
+        .expect("the surface conditional has its own AST row");
+    assert_eq!(
+        if_node.text,
+        "if true then 1n else if false then 2n else 3n end"
+    );
+    assert_eq!(
+        if_node
+            .children
+            .iter()
+            .map(|child| child.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Predicate", "Then", "Else"]
+    );
+    assert_eq!(if_node.children[0].text, "true");
+    assert_eq!(if_node.children[0].span, at([16, 20]));
+    assert_eq!(if_node.children[1].text, "1n");
+    assert_eq!(if_node.children[1].span, at([26, 28]));
+    assert_eq!(if_node.children[2].text, "if false then 2n else 3n end");
+    assert_eq!(if_node.children[2].span, at([34, 62]));
+    assert!(
+        flatten(&if_node.children[2].children)
+            .iter()
+            .any(|node| node.label == "If"),
+        "the flattened spelling still preserves the nested surface node"
+    );
+
+    let ir = named(bundle(&[(ROOT, source)]), "ir");
+    assert_eq!(
+        flatten(&ir.nodes)
+            .into_iter()
+            .filter(|node| node.label == "Match")
+            .count(),
+        2,
+        "each surface conditional lowers through the existing Match row"
+    );
+}
+
 /// The AST tab is one row per file holding the statements written in *that*
 /// file. The tree the loader hands over is spliced, so a module whose body came
 /// from another file has to be rendered as the leaf it was written as — nesting

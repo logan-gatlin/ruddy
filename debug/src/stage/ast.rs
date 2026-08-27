@@ -204,6 +204,16 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
     }
 }
 
+fn expr_role_node(ids: &mut Ids, role: &'static str, expr: &Expr) -> Node {
+    Node::new(
+        ids.next(),
+        role,
+        print::ast::expr(&expr.tracked).to_string(),
+    )
+    .at(expr.span)
+    .child(expr_node(ids, expr))
+}
+
 fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
     let node = Node::new(ids.next(), "", print::ast::expr(&expr.tracked).to_string()).at(expr.span);
     match &expr.tracked {
@@ -280,6 +290,20 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
                 .child(expr_node(ids, value))
                 .child(expr_node(ids, body))
         }
+        // Keep the three roles explicit: unlike a match's arms, all three are
+        // expressions, and their position alone should not be needed to tell
+        // the predicate from either result branch.
+        ExprKind::If {
+            predicate,
+            consequent,
+            alternative,
+        } => Node {
+            label: "If".into(),
+            ..node
+        }
+        .child(expr_role_node(ids, "Predicate", predicate))
+        .child(expr_role_node(ids, "Then", consequent))
+        .child(expr_role_node(ids, "Else", alternative)),
         ExprKind::Struct(fields) => Node {
             label: "Struct".into(),
             ..node

@@ -17,6 +17,10 @@ pub enum Kind {
     /// around it were reserved long before this keyword existed; this is what
     /// they were reserved for.
     Match,
+    /// `if`, `then`, and `else` delimit a conditional expression.
+    If,
+    Then,
+    Else,
     Fn,
     /// `effect`, opening an effect declaration.
     Effect,
@@ -339,6 +343,9 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                     "end" => Kind::End,
                     "with" => Kind::With,
                     "match" => Kind::Match,
+                    "if" => Kind::If,
+                    "then" => Kind::Then,
+                    "else" => Kind::Else,
                     "fn" => Kind::Fn,
                     "effect" => Kind::Effect,
                     "handle" => Kind::Handle,

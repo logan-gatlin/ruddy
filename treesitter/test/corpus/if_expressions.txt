@@ -1,0 +1,87 @@
+================================================================================
+An if expression has a condition and two branches
+================================================================================
+
+let sign = fn n =>
+  if n then 1 else 0 end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (if_expression
+        (identifier)
+        (natural)
+        (natural)))))
+
+================================================================================
+Else-if arms share one final end
+================================================================================
+
+let classify = fn n =>
+  if n then #Positive
+  else if false then #Impossible
+  else if true then #Zero
+  else #Negative
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (function
+      (identifier)
+      (if_expression
+        (identifier)
+        (tag_expression
+          (tag))
+        (else_if_arm
+          (boolean)
+          (tag_expression
+            (tag)))
+        (else_if_arm
+          (boolean)
+          (tag_expression
+            (tag)))
+        (tag_expression
+          (tag))))))
+
+================================================================================
+An if expression can be projected, applied, and nested in a branch
+================================================================================
+
+let result =
+  (if ready then make else fallback end).value arg
+
+let nested =
+  if outer then
+    if inner then one else two end
+  else three end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (application
+      (projection
+        (parenthesized_expression
+          (if_expression
+            (identifier)
+            (identifier)
+            (identifier)))
+        (identifier))
+      (identifier)))
+  (let_definition
+    (identifier)
+    (if_expression
+      (identifier)
+      (if_expression
+        (identifier)
+        (identifier)
+        (identifier))
+      (identifier))))
