@@ -52,6 +52,14 @@ pub enum LinkError {
     DuplicateGlobal {
         name: String,
     },
+    ValueWithoutGlobal {
+        owner: String,
+        name: String,
+    },
+    GlobalWithoutValue {
+        owner: String,
+        name: String,
+    },
     MalformedDeclaration {
         namespace: DeclarationNamespace,
         name: String,
@@ -132,6 +140,14 @@ impl fmt::Display for LinkError {
             Self::DuplicateGlobal { name } => {
                 write!(f, "artifact graph defines global `{name}` more than once")
             }
+            Self::ValueWithoutGlobal { owner, name } => write!(
+                f,
+                "artifact `{owner}` declares public value `{name}` without a matching LIR global"
+            ),
+            Self::GlobalWithoutValue { owner, name } => write!(
+                f,
+                "artifact `{owner}` defines LIR global `{name}` without a matching public value declaration"
+            ),
             Self::MalformedDeclaration { namespace, name } => {
                 write!(f, "malformed qualified public {namespace} name `{name}`")
             }
@@ -239,7 +255,7 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let mut globals = HashSet::new();
     for artifact in artifacts {
         let owner = identity(artifact);
-        validate_declarations(artifact, &owner)?;
+        let mut local_globals = HashSet::new();
         for global in &artifact.lir.globals {
             let parsed_owner = qualified_owner(&global.name)?;
             if parsed_owner != owner {
@@ -248,11 +264,42 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
                     owner,
                 });
             }
-            if !globals.insert(global.name.clone()) {
+            if !local_globals.insert(global.name.as_str()) {
                 return Err(LinkError::DuplicateGlobal {
                     name: global.name.clone(),
                 });
             }
+            // Distinct validated owners cannot spell the same qualified name.
+            globals.insert(global.name.clone());
+        }
+        validate_declarations(artifact, &owner)?;
+        let values: HashSet<_> = artifact
+            .header
+            .values
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+        if let Some(value) = artifact
+            .header
+            .values
+            .iter()
+            .find(|value| !local_globals.contains(value.name.as_str()))
+        {
+            return Err(LinkError::ValueWithoutGlobal {
+                owner,
+                name: value.name.clone(),
+            });
+        }
+        if let Some(global) = artifact
+            .lir
+            .globals
+            .iter()
+            .find(|global| !values.contains(global.name.as_str()))
+        {
+            return Err(LinkError::GlobalWithoutValue {
+                owner,
+                name: global.name.clone(),
+            });
         }
     }
 

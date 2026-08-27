@@ -13,6 +13,13 @@ fn artifact(
     functions: Vec<a::Function>,
     globals: Vec<a::Global>,
 ) -> a::Artifact {
+    let values = globals
+        .iter()
+        .map(|global| a::Value {
+            name: global.name.clone(),
+            scheme: scheme(),
+        })
+        .collect();
     a::Artifact {
         header: a::Header {
             identity: a::Identity {
@@ -26,7 +33,7 @@ fn artifact(
                     version: (*version).into(),
                 })
                 .collect(),
-            values: Vec::new(),
+            values,
             types: Vec::new(),
             effects: Vec::new(),
         },
@@ -167,7 +174,7 @@ fn links_every_item_and_recursively_relocates_function_indices() {
             }]),
         )],
     );
-    let mut root = artifact(
+    let root = artifact(
         "app",
         &[("dep", "1.0.0")],
         vec![function("app-f", root_body)],
@@ -179,19 +186,6 @@ fn links_every_item_and_recursively_relocates_function_indices() {
             }]),
         )],
     );
-    root.header.values.push(a::Value {
-        name: "app@1.0.0::main".into(),
-        scheme: a::Scheme {
-            count: 0,
-            presences: 0,
-            formula: a::Formula::True,
-            body: a::Type {
-                core: a::Core::Unit,
-                fields: vec![],
-            },
-        },
-    });
-
     let linked = link::link(&[dep, root.clone()]).unwrap();
     assert_eq!(linked.header.identity, root.header.identity);
     assert_eq!(linked.header.values, root.header.values);
@@ -270,6 +264,51 @@ fn links_multiple_top_level_wildcard_definitions_without_aliasing_them() {
 
     let linked = link::link(&[artifact]).expect("compiler-produced wildcard names are portable");
     assert_eq!(linked.lir.globals.len(), 4);
+}
+
+#[test]
+fn rejects_header_value_and_lir_global_mismatches_per_input() {
+    let mut missing = artifact(
+        "dep",
+        &[],
+        vec![],
+        vec![global("dep@1.0.0::implemented", block(vec![]))],
+    );
+    missing.lir.globals.clear();
+    let root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+    let error = link::link(&[missing, root]).unwrap_err();
+    assert_eq!(
+        error,
+        LinkError::ValueWithoutGlobal {
+            owner: "dep@1.0.0".into(),
+            name: "dep@1.0.0::implemented".into(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "artifact `dep@1.0.0` declares public value `dep@1.0.0::implemented` without a matching LIR global"
+    );
+
+    let mut undeclared = artifact(
+        "dep",
+        &[],
+        vec![],
+        vec![global("dep@1.0.0::hidden", block(vec![]))],
+    );
+    undeclared.header.values.clear();
+    let root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+    let error = link::link(&[undeclared, root]).unwrap_err();
+    assert_eq!(
+        error,
+        LinkError::GlobalWithoutValue {
+            owner: "dep@1.0.0".into(),
+            name: "dep@1.0.0::hidden".into(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "artifact `dep@1.0.0` defines LIR global `dep@1.0.0::hidden` without a matching public value declaration"
+    );
 }
 
 #[test]
@@ -469,6 +508,7 @@ fn validates_public_declarations_in_every_namespace_and_artifact() {
         name: shared.into(),
         scheme: scheme(),
     });
+    valid.lir.globals.push(global(shared, block(Vec::new())));
     valid.header.types.push(a::DeclaredType {
         name: shared.into(),
         params: vec![],
@@ -677,6 +717,14 @@ fn every_link_error_has_a_user_facing_message() {
             owner: "a".into(),
         },
         LinkError::DuplicateGlobal {
+            name: "a@1.0.0::x".into(),
+        },
+        LinkError::ValueWithoutGlobal {
+            owner: "a@1.0.0".into(),
+            name: "a@1.0.0::x".into(),
+        },
+        LinkError::GlobalWithoutValue {
+            owner: "a@1.0.0".into(),
             name: "a@1.0.0::x".into(),
         },
         LinkError::MalformedDeclaration {
