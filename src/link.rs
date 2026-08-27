@@ -73,6 +73,16 @@ pub enum LinkError {
         namespace: DeclarationNamespace,
         name: String,
     },
+    MalformedDeclarationReference {
+        owner: String,
+        namespace: DeclarationNamespace,
+        name: String,
+    },
+    MissingDeclarationReference {
+        owner: String,
+        namespace: DeclarationNamespace,
+        name: String,
+    },
     MissingGlobal {
         owner: String,
         target: String,
@@ -163,6 +173,22 @@ impl fmt::Display for LinkError {
                 f,
                 "artifact defines public {namespace} `{name}` more than once"
             ),
+            Self::MalformedDeclarationReference {
+                owner,
+                namespace,
+                name,
+            } => write!(
+                f,
+                "artifact `{owner}` interface references malformed qualified {namespace} name `{name}`"
+            ),
+            Self::MissingDeclarationReference {
+                owner,
+                namespace,
+                name,
+            } => write!(
+                f,
+                "artifact `{owner}` interface references missing {namespace} declaration `{name}`"
+            ),
             Self::MissingGlobal { owner, target } => {
                 write!(f, "artifact `{owner}` references missing global `{target}`")
             }
@@ -252,6 +278,8 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
         });
     }
 
+    let mut declared_types = HashSet::new();
+    let mut declared_effects = HashSet::new();
     let mut globals = HashSet::new();
     for artifact in artifacts {
         let owner = identity(artifact);
@@ -301,6 +329,17 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
                 name: global.name.clone(),
             });
         }
+        declared_types.extend(artifact.header.types.iter().map(|item| item.name.as_str()));
+        declared_effects.extend(
+            artifact
+                .header
+                .effects
+                .iter()
+                .map(|item| item.name.as_str()),
+        );
+    }
+    for artifact in artifacts {
+        validate_declaration_references(artifact, &declared_types, &declared_effects)?;
     }
 
     let mut functions = Vec::new();
@@ -508,6 +547,119 @@ fn validate_declaration_names<'a>(
                 name: name.to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_declaration_references(
+    artifact: &Artifact,
+    declared_types: &HashSet<&str>,
+    declared_effects: &HashSet<&str>,
+) -> Result<(), LinkError> {
+    let owner = identity(artifact);
+    let mut pending = Vec::new();
+    pending.extend(
+        artifact
+            .header
+            .values
+            .iter()
+            .map(|declaration| &declaration.scheme.body),
+    );
+    pending.extend(
+        artifact
+            .header
+            .types
+            .iter()
+            .map(|declaration| &declaration.scheme.body),
+    );
+    for effect in &artifact.header.effects {
+        match &effect.kind {
+            artifact::EffectKind::Operations(operations) => {
+                for operation in operations {
+                    pending.push(&operation.from);
+                    pending.push(&operation.to);
+                }
+            }
+            artifact::EffectKind::Alias(targets) => {
+                for target in targets {
+                    validate_declaration_reference(
+                        &owner,
+                        DeclarationNamespace::Effect,
+                        target,
+                        declared_effects,
+                    )?;
+                }
+            }
+        }
+    }
+
+    enum Part<'a> {
+        Type(&'a artifact::Type),
+        Row(&'a artifact::Row),
+    }
+    let mut parts: Vec<_> = pending.into_iter().map(Part::Type).collect();
+    while let Some(part) = parts.pop() {
+        match part {
+            Part::Type(ty) => {
+                parts.extend(ty.fields.iter().map(|(_, field)| Part::Type(&field.ty)));
+                match &ty.core {
+                    artifact::Core::Arrow(from, to, effects) => {
+                        parts.push(Part::Type(from));
+                        parts.push(Part::Type(to));
+                        parts.push(Part::Row(effects));
+                    }
+                    artifact::Core::Sum(row) => parts.push(Part::Row(row)),
+                    artifact::Core::Named { name, args } => {
+                        validate_declaration_reference(
+                            &owner,
+                            DeclarationNamespace::Type,
+                            name,
+                            declared_types,
+                        )?;
+                        parts.extend(args.iter().map(Part::Type));
+                    }
+                    artifact::Core::Unit
+                    | artifact::Core::Nat
+                    | artifact::Core::Int
+                    | artifact::Core::Real
+                    | artifact::Core::String
+                    | artifact::Core::Boolean
+                    | artifact::Core::Var(_)
+                    | artifact::Core::Bound(_)
+                    | artifact::Core::Rigid { .. }
+                    | artifact::Core::Undecided => {}
+                }
+            }
+            Part::Row(row) => {
+                parts.extend(row.labels.iter().map(|(_, field)| Part::Type(&field.ty)));
+                if let artifact::Rest::More(more) = &row.rest {
+                    parts.push(Part::Row(more));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_declaration_reference(
+    owner: &str,
+    namespace: DeclarationNamespace,
+    name: &str,
+    declarations: &HashSet<&str>,
+) -> Result<(), LinkError> {
+    if parse_source_qualified_owner(name).is_none() {
+        return Err(LinkError::MalformedDeclarationReference {
+            owner: owner.to_string(),
+            namespace,
+            name: name.to_string(),
+        });
+    }
+    if !declarations.contains(name) {
+        return Err(LinkError::MissingDeclarationReference {
+            owner: owner.to_string(),
+            namespace,
+            name: name.to_string(),
+        });
     }
     Ok(())
 }

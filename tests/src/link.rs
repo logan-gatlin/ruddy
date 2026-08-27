@@ -584,6 +584,185 @@ fn validates_public_declarations_in_every_namespace_and_artifact() {
     }
 }
 
+fn named(name: &str) -> a::Type {
+    a::Type {
+        core: a::Core::Named {
+            name: name.into(),
+            args: vec![],
+        },
+        fields: vec![],
+    }
+}
+
+fn field(ty: a::Type) -> a::RowField {
+    a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    }
+}
+
+#[test]
+fn validates_qualified_references_through_every_interface_shape() {
+    let type_name = "app@1.0.0::T";
+    let effect_name = "app@1.0.0::E";
+    let inner_row = a::Row {
+        labels: vec![("more".into(), field(named(type_name)))],
+        rest: a::Rest::Closed,
+    };
+    let sum = a::Type {
+        core: a::Core::Sum(a::Row {
+            labels: vec![("case".into(), field(named(type_name)))],
+            rest: a::Rest::More(Box::new(inner_row)),
+        }),
+        fields: vec![],
+    };
+    let rich = a::Type {
+        core: a::Core::Named {
+            name: type_name.into(),
+            args: vec![a::Type {
+                core: a::Core::Arrow(
+                    Box::new(named(type_name)),
+                    Box::new(sum),
+                    a::Row {
+                        labels: vec![("effect".into(), field(named(type_name)))],
+                        rest: a::Rest::Closed,
+                    },
+                ),
+                fields: vec![("arrow-field".into(), field(named(type_name)))],
+            }],
+        },
+        fields: vec![("type-field".into(), field(named(type_name)))],
+    };
+
+    let mut input = artifact(
+        "app",
+        &[],
+        vec![],
+        vec![global("app@1.0.0::value", block(vec![]))],
+    );
+    input.header.values[0].scheme.body = rich.clone();
+    input.header.types.push(a::DeclaredType {
+        name: type_name.into(),
+        params: vec![],
+        scheme: a::Scheme {
+            body: rich.clone(),
+            ..scheme()
+        },
+    });
+    input.header.effects.push(a::DeclaredEffect {
+        name: effect_name.into(),
+        // These are structural display/hash data, not declaration references.
+        identity: Some(a::EffectIdentity {
+            name: "not qualified".into(),
+            interface: "also not qualified".into(),
+        }),
+        kind: a::EffectKind::Operations(vec![a::Operation {
+            name: "op".into(),
+            from: rich,
+            to: named(type_name),
+        }]),
+    });
+    input.header.effects.push(a::DeclaredEffect {
+        name: "app@1.0.0::Alias".into(),
+        identity: None,
+        kind: a::EffectKind::Alias(vec![effect_name.into()]),
+    });
+    link::link(&[input]).expect("all nested references resolve in their namespace");
+}
+
+#[test]
+fn rejects_malformed_and_missing_embedded_declaration_references_in_every_artifact() {
+    let with_named = |target: &str| {
+        let mut input = artifact(
+            "dep",
+            &[],
+            vec![],
+            vec![global("dep@1.0.0::value", block(vec![]))],
+        );
+        input.header.values[0].scheme.body = named(target);
+        input
+    };
+    let root = || artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+
+    assert_eq!(
+        link::link(&[with_named("bad"), root()]),
+        Err(LinkError::MalformedDeclarationReference {
+            owner: "dep@1.0.0".into(),
+            namespace: DeclarationNamespace::Type,
+            name: "bad".into(),
+        })
+    );
+    assert_eq!(
+        link::link(&[with_named("dep@1.0.0::Missing"), root()]),
+        Err(LinkError::MissingDeclarationReference {
+            owner: "dep@1.0.0".into(),
+            namespace: DeclarationNamespace::Type,
+            name: "dep@1.0.0::Missing".into(),
+        })
+    );
+
+    for (target, malformed) in [
+        ("bad", true),
+        ("dep::Missing", true),
+        ("dep@1.0.0::Missing", false),
+    ] {
+        let mut dep = artifact("dep", &[], vec![], vec![]);
+        dep.header.effects.push(a::DeclaredEffect {
+            name: "dep@1.0.0::Alias".into(),
+            identity: None,
+            kind: a::EffectKind::Alias(vec![target.into()]),
+        });
+        let error = link::link(&[dep, root()]).unwrap_err();
+        assert!(match error {
+            LinkError::MalformedDeclarationReference {
+                namespace: DeclarationNamespace::Effect,
+                ..
+            } => malformed,
+            LinkError::MissingDeclarationReference {
+                namespace: DeclarationNamespace::Effect,
+                ..
+            } => !malformed,
+            _ => false,
+        });
+    }
+}
+
+#[test]
+fn deeply_nested_interface_reference_validation_is_stack_safe() {
+    let mut row = a::Row {
+        labels: vec![("bottom".into(), field(named("malformed")))],
+        rest: a::Rest::Closed,
+    };
+    for _ in 0..50_000 {
+        row = a::Row {
+            labels: vec![],
+            rest: a::Rest::More(Box::new(row)),
+        };
+    }
+    let mut input = artifact("app", &[], vec![], vec![]);
+    input.header.types.push(a::DeclaredType {
+        name: "app@1.0.0::Deep".into(),
+        params: vec![],
+        scheme: a::Scheme {
+            body: a::Type {
+                core: a::Core::Sum(row),
+                fields: vec![],
+            },
+            ..scheme()
+        },
+    });
+    let error = link::link(std::slice::from_ref(&input)).unwrap_err();
+    assert!(matches!(
+        error,
+        LinkError::MalformedDeclarationReference {
+            namespace: DeclarationNamespace::Type,
+            ..
+        }
+    ));
+    // Recursive derived drop is separate from the linker's iterative walk.
+    std::mem::forget(input);
+}
+
 #[test]
 fn qualified_validation_is_namespace_sensitive_and_synthetic_names_are_exact() {
     let valid = compiled("let _ = 1n");
@@ -739,6 +918,16 @@ fn every_link_error_has_a_user_facing_message() {
         LinkError::DuplicateDeclaration {
             namespace: DeclarationNamespace::Effect,
             name: "a@1.0.0::E".into(),
+        },
+        LinkError::MalformedDeclarationReference {
+            owner: "a@1.0.0".into(),
+            namespace: DeclarationNamespace::Type,
+            name: "bad".into(),
+        },
+        LinkError::MissingDeclarationReference {
+            owner: "a@1.0.0".into(),
+            namespace: DeclarationNamespace::Effect,
+            name: "b@1.0.0::E".into(),
         },
         LinkError::MissingGlobal {
             owner: "a".into(),
