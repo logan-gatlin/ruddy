@@ -60,6 +60,7 @@ fn names(stmts: &[ruddy::parse::Stmt]) -> Vec<String> {
         .iter()
         .map(|stmt| match &stmt.tracked {
             StmtKind::Let { pattern, .. } => format!("let {}", pattern.tracked),
+            StmtKind::Extern { name, .. } => format!("extern {}", name.tracked),
             StmtKind::Type { name, .. } => format!("type {}", name.tracked),
             StmtKind::Effect { name, .. } => format!("effect {}", name.tracked),
             StmtKind::Module { name, .. } => format!("module {}", name.tracked),

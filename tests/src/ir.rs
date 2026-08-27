@@ -3545,6 +3545,15 @@ fn an_effect_declares_its_operations() {
     assert!(operations.is_empty());
 }
 
+#[test]
+fn recursive_types_have_a_finite_structural_effect_signature() {
+    let (_, out) = built(
+        "type Rec = { next: Rec }\n\
+         effect Visit = run : Rec -> Rec",
+    );
+    assert_eq!(out.program.effect_ids.len(), 1);
+}
+
 /// An alias names effects and declares nothing, and expands to the effects it
 /// names wherever a row mentions it — so no alias survives into what a
 /// definition is checked against, and none can be performed through.
@@ -6104,4 +6113,59 @@ fn dependency_interfaces_import_every_semantic_form() {
             .values()
             .any(|name| name.contains("ignored"))
     );
+}
+
+#[test]
+fn externs_bind_terms_without_becoming_initializer_groups() {
+    let source = "extern log : String -> {} = console.log\nlet written = log \"hello\"";
+    let (mint, output) = built(source);
+    assert_eq!(output.program.externs.len(), 1);
+    assert_eq!(output.program.terms.len(), 1);
+    assert_eq!(groups(&mint, &output), vec![vec!["written"]]);
+    let (symbol, external) = output
+        .program
+        .externs
+        .first()
+        .expect("the extern is lowered");
+    assert_eq!(mint.name(*symbol), "log");
+    assert_eq!(
+        external
+            .value
+            .target
+            .segments
+            .iter()
+            .map(|part| part.tracked.as_str())
+            .collect::<Vec<_>>(),
+        ["console", "log"]
+    );
+    assert_eq!(
+        display_program(source),
+        "extern log : String -> {} = console.log\nlet written = log \"hello\""
+    );
+
+    for source in [
+        "extern log : String -> () = console.log\nlet log = fn x => x",
+        "let log = fn x => x\nextern log : String -> () = console.log",
+    ] {
+        let (_, output) = build_src(source);
+        assert!(matches!(
+            output.errors.first().map(|error| &error.kind),
+            Some(ErrorKind::Duplicate {
+                namespace: Namespace::Terms,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn externs_accept_every_annotation_type() {
+    let (_, output) = build_src(
+        "effect Log = write : () -> ()\n\
+         extern count : Nat = host.count\n\
+         extern point : { x: Nat } = host.point\n\
+         extern log : String -> () + !Log = console.log",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert_eq!(output.program.externs.len(), 3);
 }

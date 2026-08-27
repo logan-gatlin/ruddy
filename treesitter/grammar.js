@@ -64,6 +64,7 @@ module.exports = grammar({
   reserved: {
     global: _ => [
       'let',
+      'extern',
       'in',
       'type',
       'end',
@@ -108,6 +109,7 @@ module.exports = grammar({
     // ── Statements ────────────────────────────────────────────────────────
 
     _statement: $ => choice(
+      $.extern_definition,
       $.let_definition,
       $.type_definition,
       $.effect_definition,
@@ -129,6 +131,19 @@ module.exports = grammar({
       field('name', $.identifier),
       optional(seq('=', repeat($._statement), 'end')),
     ),
+
+    /** `extern <name> : <annotation> = <target>` — a target-provided value. */
+    extern_definition: $ => seq(
+      'extern',
+      field('name', $.identifier),
+      ':',
+      field('type', $.annotation),
+      '=',
+      field('target', $.foreign_path),
+    ),
+
+    /** `console.log` — a dotted target, not a Ruddy path or projection. */
+    foreign_path: $ => sepBy1('.', field('segment', $.identifier)),
 
     /** `let <pattern> [: <annotation>] = <expr>` */
     let_definition: $ => seq(

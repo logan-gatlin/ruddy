@@ -312,9 +312,13 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         "let p = fn a => match a with | {x} => {} | {y} => {} end",
     );
     let labels: Vec<&str> = nodes.iter().map(|node| node.label.as_str()).collect();
-    assert_eq!(labels, ["match-coverage", "let p"], "{nodes:#?}");
-    assert_eq!(nodes[1].text, "where 'a != 'b");
-    assert_eq!(nodes[1].children[0].label, "patterns assume");
+    assert_eq!(
+        labels,
+        ["match-coverage", "match refinement", "let p"],
+        "{nodes:#?}"
+    );
+    assert_eq!(nodes[2].text, "where 'a != 'b");
+    assert_eq!(nodes[2].children[0].label, "patterns assume");
     let rows: Vec<(&str, &str)> = nodes[0]
         .children
         .iter()
@@ -323,10 +327,12 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
     assert_eq!(rows[0].0, "origin");
     assert_eq!(rows[1].0, "verdict");
     assert!(rows[1].1.starts_with("satisfiable"), "{rows:#?}");
-    assert_eq!(rows[2].0, "arm 0");
-    assert_eq!(rows[3].0, "arm 1");
-    assert_eq!(rows[4].0, "field x");
-    assert_eq!(rows[5].0, "field y");
+    assert_eq!(rows[2].0, "arm 0 raw");
+    assert_eq!(rows[3].0, "arm 0 effective");
+    assert_eq!(rows[4].0, "arm 1 raw");
+    assert_eq!(rows[5].0, "arm 1 effective");
+    assert_eq!(rows[6].0, "field x");
+    assert_eq!(rows[7].0, "field y");
     // Every row points at the match it came from, so a click lights it.
     assert!(nodes[0].span.is_some(), "{nodes:#?}");
 
@@ -434,6 +440,106 @@ fn the_presence_tab_renders_the_store_and_the_clauses() {
         .map(|child| (child.label.as_str(), child.text.as_str()))
         .collect();
     assert_eq!(rows, [("patterns assume", "unconstrained")], "{nodes:#?}");
+}
+
+#[test]
+fn branch_refinement_is_coherent_across_the_debugger_tabs() {
+    let source = "let swap = fn v => match v with \
+                  | {a} => { b: a } | {b} => { a: b } end";
+
+    let presence = tab("presence", source);
+    let rows = flatten(&presence);
+    let refined = rows
+        .iter()
+        .find(|node| node.label == "match refinement")
+        .expect("the Presence tab owns the refinement trace");
+    assert_eq!(refined.text, "2 arms");
+    assert!(
+        rows.iter().any(|node| node.label == "effective assumption"),
+        "{presence:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|node| { node.label == "entailed" && (node.text == "a" || node.text == "not a") }),
+        "{presence:#?}"
+    );
+    assert!(
+        rows.iter().any(|node| node.label == "guarded obligation"),
+        "{presence:#?}"
+    );
+
+    let constraints = tab("constraints", source);
+    let rows = flatten(&constraints);
+    assert!(rows.iter().any(|node| node.label == "match"));
+    assert!(rows.iter().any(|node| node.label == "arm 0"));
+
+    let solve = tab("solve", source);
+    let rows = flatten(&solve);
+    assert!(rows.iter().any(|node| node.label == "refine"));
+    assert!(rows.iter().any(|node| {
+        node.fields
+            .iter()
+            .any(|field| field.name == "_effect" && field.value.contains("when"))
+    }));
+
+    let types = tab("types", source);
+    let rows = flatten(&types);
+    let scheme = rows
+        .iter()
+        .find(|node| node.label == "let swap")
+        .expect("the inferred scheme");
+    assert_eq!(
+        scheme.text,
+        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+    );
+
+    let patterns = tab("patterns", source);
+    let rows = flatten(&patterns);
+    assert_eq!(
+        rows.iter().filter(|node| node.label == "reachable").count(),
+        2
+    );
+    assert!(
+        rows.iter()
+            .any(|node| node.label == "coverage" && node.text == "exhaustive")
+    );
+
+    let presence = tab(
+        "presence",
+        "let nested = fn v => match v with\n\
+         | {left} => match left with | {x} => 1n | {y} => 2n end\n\
+         | {right} => 3n end",
+    );
+    let groups: Vec<&Node> = presence
+        .iter()
+        .filter(|node| node.label == "match refinement")
+        .collect();
+    assert_eq!(groups.len(), 2, "{presence:#?}");
+    assert!(groups.iter().all(|group| group.text == "2 arms"));
+
+    let source = "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+                  let route = fn v => match v with | {x, ..} => one v | rest => {} end";
+    let constraints = stage("constraints", source);
+    let rows = flatten(&constraints.nodes);
+    let arm = rows
+        .iter()
+        .find(|node| node.label == "arm 0")
+        .expect("the guarded arm");
+    assert_eq!(
+        arm.children[0].label, "use-site",
+        "{:#?}",
+        constraints.nodes
+    );
+    let visible = rows
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.label.as_str(),
+                "equal" | "let" | "instance" | "match" | "performs" | "use-site"
+            )
+        })
+        .count();
+    assert_eq!(constraints.summary, format!("{visible} constraints"));
 }
 
 /// A program that never reaches inference leaves the tab with nothing to

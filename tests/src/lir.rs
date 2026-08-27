@@ -379,6 +379,35 @@ fn an_optional_field_becomes_a_presence_test() {
     );
 }
 
+#[test]
+fn a_refined_swap_uses_the_existing_presence_switch() {
+    for source in [
+        "let swap : { a when 'a: Nat, b when 'b: Nat } -> \
+         { a when 'b: Nat, b when 'a: Nat } where 'a != 'b = fn v =>\n\
+         match v with | {a} => { b: a } | {b} => { a: b } end",
+        "let swap = fn v => match v with \
+         | {a} => { b: a } | {b} => { a: b } end",
+    ] {
+        let printed = section(source, "fn swap(");
+        assert_eq!(
+            printed.matches("switch_presence").count(),
+            1,
+            "the second presence is entailed on each path:\n{printed}"
+        );
+        assert!(printed.contains("project"), "{printed}");
+        assert!(printed.contains("struct { b:"), "{printed}");
+        assert!(printed.contains("struct { a:"), "{printed}");
+    }
+
+    let nested = section(
+        "let nested = fn v => match v with\n\
+         | {left} => match left with | {x} => 1n | {y} => 2n end\n\
+         | {right} => 3n end",
+        "fn nested(",
+    );
+    assert_eq!(nested.matches("switch_presence").count(), 2, "{nested}");
+}
+
 /// An exact pattern against a type that is open has to ask whether the value
 /// carries anything beyond the fields the type names — which is the one thing
 /// separating it from the open pattern beside it.
@@ -450,6 +479,24 @@ fn every_primitive_pattern_uses_switch_prim() {
         );
         assert!(printed.contains("switch_prim"), "{printed}");
         assert!(printed.contains(case), "{printed}");
+    }
+}
+
+#[test]
+fn a_complete_boolean_and_typed_wildcards_take_both_dispatch_paths() {
+    let boolean = section(
+        "let f = fn x => match x with | false => 0n | true => 1n end",
+        "fn f(",
+    );
+    assert!(boolean.contains("switch_prim"), "{boolean}");
+    assert!(!boolean.contains("else =>"), "{boolean}");
+
+    for primitive in ["Nat", "Int", "Real", "String", "Boolean"] {
+        let printed = section(
+            &format!("let f : {primitive} -> {primitive} = fn x => match x with | y => y end"),
+            "fn f(",
+        );
+        assert!(!printed.contains("switch_prim"), "{primitive}: {printed}");
     }
 }
 
@@ -1759,5 +1806,22 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
          \x20 %7: nat = const 2n\n\
          \x20 %8: nat = call %6, %7\n\
          \x20 ret %8"
+    );
+}
+
+#[test]
+fn extern_values_are_imports_not_global_initializers() {
+    let output = lowered("extern answer : Nat = host.answer\nlet next = answer");
+    assert_eq!(output.externs.len(), 1);
+    let external = &output.externs[0];
+    assert_eq!(external.name, "answer");
+    assert_eq!(external.target, ["host", "answer"]);
+    assert_eq!(external.rep, lir::Rep::Nat);
+    assert_eq!(output.globals.len(), 1, "externs have no initializer block");
+    assert_eq!(output.globals[0].name, "next");
+    let printed = print::lir::program(&output);
+    assert!(
+        printed.contains("global answer"),
+        "the use reads the import:\n{printed}"
     );
 }

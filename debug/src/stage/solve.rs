@@ -59,7 +59,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 // which is two places for one notation to change in.
                 Effect::Bound { .. } => node = node.field("_bind", effect),
                 Effect::Failed(kind) => node = node.field("_error", kind.to_string()).error(),
-                Effect::None | Effect::Decomposed => {}
+                Effect::None | Effect::Decomposed | Effect::Guarded { .. } => {}
             }
 
             // `owner`, not `symbol`: a step is spanned by the sub-expression

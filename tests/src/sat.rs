@@ -87,6 +87,10 @@ fn the_canonical_form_is_the_shape_a_reader_wrote() {
 
     assert_eq!(canonical(var(0).xor(var(1))), "?0 != ?1");
     assert_eq!(canonical(var(0).iff(var(1))), "?0 = ?1");
+    assert_eq!(
+        sat::project(&var(0).xor(var(1)), &[Atom::Var(1), Atom::Var(0)],).to_string(),
+        "?1 != ?0"
+    );
     // The long way round comes out the same: the special cases are decided by
     // what the formula *is*, not by how it was written.
     assert_eq!(

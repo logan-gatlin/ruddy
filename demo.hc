@@ -63,6 +63,20 @@ let both : { x when 'a: 'c, y when 'b: 'd } -> {} where 'a = 'b
       | {} => {}
     end
 
+let swap_fields :
+  { a when 'a: Nat, b when 'b: Nat }
+  -> { a when 'b: Nat, b when 'a: Nat }
+  where 'a != 'b
+  = fn v =>
+    match v with
+      | {a} => { b: a }
+      | {b} => { a: b }
+    end
+
+let swapped_a = swap_fields { a: 1n }
+
+let swapped_b = swap_fields { b: 2n }
+
 type Option 'T = #Some 'T | #None
 
 let some = #Some 1

@@ -536,6 +536,7 @@ fn every_stage_reports_on_the_demo() {
             "tokens",
             "dependencies",
             "ast",
+            "externs",
             "ir",
             "constraints",
             "solve",
@@ -581,6 +582,7 @@ fn every_stage_reports_on_the_demo() {
             "Tokens",
             "Dependencies",
             "AST",
+            "Externs",
             "IR",
             "Constraints",
             "Solve",
@@ -1845,6 +1847,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     assert_eq!(
         ids(false),
         [
+            "externs",
             "constraints",
             "solve",
             "lir",
@@ -2733,4 +2736,40 @@ fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
         .iter()
         .find(|stage| stage.id == id)
         .unwrap_or_else(|| panic!("{id} is registered"))
+}
+
+#[test]
+fn extern_values_reach_the_import_and_type_views() {
+    let source = "extern answer : Nat = host.answer\nlet next = answer";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .unwrap_or_else(|| panic!("no {id} stage"))
+    };
+    let externs = stage("externs");
+    assert_eq!(externs.summary, "1 extern");
+    assert!(nodes(externs).iter().any(|node| node.text == "host.answer"));
+    assert!(
+        nodes(stage("types"))
+            .iter()
+            .any(|node| node.label == "extern answer" && node.text == "Nat")
+    );
+    assert!(
+        nodes(stage("ir"))
+            .iter()
+            .any(|node| node.label == "extern answer")
+    );
+    assert!(
+        nodes(stage("lir"))
+            .iter()
+            .any(|node| node.label == "extern" && node.text.contains("host.answer"))
+    );
 }

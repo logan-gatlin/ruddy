@@ -7,8 +7,9 @@
 use ruddy::{
     inference,
     ir::{
-        Annotation, Clause, ClauseKind, Decl, Effect, EffectLabel, EffectRow, Handler, Pattern,
-        PatternKind, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind, Variable, When,
+        Annotation, Clause, ClauseKind, Decl, Effect, EffectLabel, EffectRow, Extern, Handler,
+        Pattern, PatternKind, Row, SumCase, Tail, Term, TermKind, Type, TypeField, TypeKind,
+        Variable, When,
     },
     symbol::{Mint, Symbol},
     tracking::Span,
@@ -37,7 +38,6 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
     // printer uses, which is the order lowering read them in.
     for (symbol, decl) in &program.effects {
         let node = decl_node(&mut ids, cx, mint, "effect", *symbol, decl, effect_node);
-        trace.decls.push(node.id);
         nodes.push(node);
     }
     for (symbol, decl) in &program.types {
@@ -52,6 +52,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
             decl,
             |ids, cx, mint, ty| type_node(ids, cx, mint, ty, &[]),
         );
+        trace.decls.push(node.id);
+        nodes.push(node);
+    }
+    for (symbol, decl) in &program.externs {
+        let node = decl_node(&mut ids, cx, mint, "extern", *symbol, decl, extern_node);
         trace.decls.push(node.id);
         nodes.push(node);
     }
@@ -73,13 +78,16 @@ pub fn build(spec: &Spec, cx: &Cx) -> (Stage, Trace) {
     // thing lowering decided: how many separate schemes the terms will turn
     // into, which is the whole difference between a file of definitions and one
     // definition written many times.
-    let summary = format!(
-        "{} · {} · {} · {}",
+    let mut summary = vec![
         plural(program.effects.len(), "effect"),
         plural(program.types.len(), "type"),
-        plural(program.terms.len(), "term"),
-        plural(program.groups.len(), "group")
-    );
+    ];
+    if !program.externs.is_empty() {
+        summary.push(plural(program.externs.len(), "extern"));
+    }
+    summary.push(plural(program.terms.len(), "term"));
+    summary.push(plural(program.groups.len(), "group"));
+    let summary = summary.join(" · ");
     let stage = Stage {
         micros: Some(cx.micros.build),
         nodes,
@@ -134,6 +142,22 @@ fn decl_node<T>(
         ));
     }
     node.child(value(ids, cx, mint, &decl.value))
+}
+
+/// One target-provided declaration: the target remains data, never a term.
+fn extern_node(ids: &mut Ids, _: &Cx, _: &Mint, external: &Extern) -> Node {
+    Node::new(
+        ids.next(),
+        "Target",
+        external
+            .target
+            .segments
+            .iter()
+            .map(|segment| segment.tracked.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+    .at(external.target.span())
 }
 
 /// One `effect` declaration's cases: an operation with its two sides under it,

@@ -7,6 +7,8 @@ pub type Token = Tracked<Kind>;
 #[derive(Debug, Clone)]
 pub enum Kind {
     Let,
+    /// `extern`, declaring a target-provided top-level value.
+    Extern,
     In,
     Type,
     End,
@@ -331,6 +333,7 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 let span = file_id.span(start, ident.len());
                 let kind = match ident.as_str() {
                     "let" => Kind::Let,
+                    "extern" => Kind::Extern,
                     "in" => Kind::In,
                     "type" => Kind::Type,
                     "end" => Kind::End,
@@ -404,8 +407,15 @@ fn sigilled(
     // exactly what was written.
     let width = name.len() + 1;
     match name.chars().next() {
-        Some(c) if c.is_alphabetic() || c == '_' => (Ok(kind(name)), width),
+        Some(c) if identifier_start(c) => (Ok(kind(name)), width),
         _ => (Err(ErrorKind::Unrecognized), width),
+    }
+}
+
+fn identifier_start(c: char) -> bool {
+    match c {
+        '_' => true,
+        _ => c.is_alphabetic(),
     }
 }
 
@@ -442,7 +452,7 @@ fn string(chars: &mut Peekable<CharIndices<'_>>) -> (Result<String, ErrorKind>, 
 fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
     let mut word = String::new();
     while let Some(&(_, c)) = chars.peek() {
-        if c.is_alphanumeric() || c == '_' {
+        if identifier_continue(c) {
             word.push(c);
             chars.next();
         } else {
@@ -450,6 +460,13 @@ fn word(chars: &mut Peekable<CharIndices<'_>>) -> String {
         }
     }
     word
+}
+
+fn identifier_continue(c: char) -> bool {
+    match c {
+        '_' => true,
+        _ => c.is_alphanumeric(),
+    }
 }
 
 /// Consume one numeric literal, including its optional fractional part and
@@ -480,7 +497,7 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
         }
     }
     while let Some(&(_, c)) = chars.peek() {
-        if c.is_alphanumeric() || c == '_' {
+        if identifier_continue(c) {
             literal.push(c);
             chars.next();
         } else {
@@ -498,9 +515,9 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
             None => (literal, None),
         },
     };
-    if digits.is_empty()
-        || !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.')
-        || digits.bytes().filter(|&c| c == b'.').count() > 1
+    // `number` is entered on a digit and admits at most one decimal point, so
+    // emptiness and a second point are construction invariants here.
+    if !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.')
         || suffix.is_some_and(|_| digits.contains('.'))
     {
         return Err(ErrorKind::MalformedNatural);

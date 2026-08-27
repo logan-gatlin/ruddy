@@ -77,6 +77,31 @@ fn rows(ids: &mut Ids, constraints: &[Constraint]) -> Vec<Node> {
                 ConstraintKind::Let { value, body, .. } => {
                     node.children(rows(ids, value)).children(rows(ids, body))
                 }
+                ConstraintKind::Match { arms, .. } => node.children(
+                    arms.iter()
+                        .enumerate()
+                        .map(|(at, arm)| {
+                            let arm_node = Node::new(
+                                ids.next(),
+                                format!("arm {at}"),
+                                format!("{} -> {}", arm.raw, arm.effective),
+                            )
+                            .at(arm.span);
+                            let arm_node =
+                                arm.requirements.iter().fold(arm_node, |node, requirement| {
+                                    node.child(
+                                        Node::new(
+                                            ids.next(),
+                                            requirement.batch.origin.code(),
+                                            requirement.batch.formula.to_string(),
+                                        )
+                                        .at(requirement.batch.span),
+                                    )
+                                });
+                            arm_node.children(rows(ids, &arm.constraints))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 ConstraintKind::Equal { .. }
                 | ConstraintKind::Instance { .. }
                 | ConstraintKind::Performs { .. } => node,
@@ -93,6 +118,12 @@ fn counted(constraints: &[Constraint]) -> usize {
         .iter()
         .map(|constraint| match &constraint.kind {
             ConstraintKind::Let { value, body, .. } => 1 + counted(value) + counted(body),
+            ConstraintKind::Match { arms, .. } => {
+                1 + arms
+                    .iter()
+                    .map(|arm| arm.requirements.len() + counted(&arm.constraints))
+                    .sum::<usize>()
+            }
             ConstraintKind::Equal { .. }
             | ConstraintKind::Instance { .. }
             | ConstraintKind::Performs { .. } => 1,

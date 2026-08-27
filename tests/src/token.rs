@@ -36,6 +36,17 @@ fn lexes_numeric_literals() {
         kinds(&format!("{}n", u64::MAX))[..],
         [Kind::Natural(u64::MAX)]
     ));
+    assert_eq!(errors("1.5n")[0].kind, ErrorKind::MalformedNatural);
+}
+
+#[test]
+fn strings_finish_and_fail_at_every_boundary() {
+    assert!(
+        matches!(&kinds("\"hello\\nworld\"")[..], [Kind::String(value)] if value == "hello\nworld")
+    );
+    for malformed in ["\"unterminated", "\"slash\\", "\"bad\\q\""] {
+        assert_eq!(errors(malformed)[0].kind, ErrorKind::MalformedString);
+    }
 }
 
 #[test]
@@ -493,4 +504,12 @@ fn the_module_keyword_is_reserved() {
     assert!(matches!(kinds("module")[..], [Kind::Module]));
     assert!(matches!(&kinds("bundles")[..], [Kind::Identifier(name)] if name == "bundles"));
     assert!(matches!(&kinds("modules")[..], [Kind::Identifier(name)] if name == "modules"));
+}
+
+#[test]
+fn extern_is_reserved_as_a_declaration_keyword() {
+    assert!(
+        matches!(&kinds("extern log")[..], [Kind::Extern, Kind::Identifier(name)] if name == "log")
+    );
+    assert!(matches!(&kinds("external")[..], [Kind::Identifier(name)] if name == "external"));
 }

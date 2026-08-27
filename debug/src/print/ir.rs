@@ -154,6 +154,23 @@ impl fmt::Display for Show<'_, Program> {
             }
             write!(f, " = {}", self.show(&decl.value))?;
         }
+        for (symbol, decl) in &self.node.externs {
+            if !first {
+                f.write_str("\n")?;
+            }
+            first = false;
+            write!(f, "extern {} : ", self.mint.name(*symbol))?;
+            if let Some(annotation) = &decl.annotation {
+                write!(f, "{}", self.show(annotation))?;
+            }
+            f.write_str(" = ")?;
+            for (at, segment) in decl.value.target.segments.iter().enumerate() {
+                if at > 0 {
+                    f.write_str(".")?;
+                }
+                f.write_str(&segment.tracked)?;
+            }
+        }
         for (symbol, decl) in &self.node.terms {
             if !first {
                 f.write_str("\n")?;

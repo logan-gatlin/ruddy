@@ -135,18 +135,19 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
 /// canonical form is read off. [`eliminate`] finds it a product at a time and
 /// [`minimized`] writes it as few products as it knows how.
 ///
-/// The canonical form is a sum of products over the kept atoms in
-/// first-appearance order, with the two-variable `a = b` and `a != b` cases
+/// The canonical form is a sum of products over the kept atoms in the caller's
+/// order (normally their first appearance in a type), with the two-variable
+/// `a = b` and `a != b` cases
 /// recognized first because those are what a reader wrote and what R12 asks to
 /// see. Deterministic throughout: the atom order fixes the literal order inside
 /// a product, and the products are sorted by it.
 pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
     let mut named = Vec::new();
     formula.atoms(&mut named);
-    let kept: Vec<Atom> = named
+    let kept: Vec<Atom> = keep
         .iter()
         .copied()
-        .filter(|atom| keep.contains(atom))
+        .filter(|atom| named.contains(atom))
         .collect();
     let Some(cover) = eliminate(formula, &kept) else {
         // More products than [`CUBES`] allows, so what comes back errs the one

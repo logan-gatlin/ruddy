@@ -72,6 +72,7 @@ fn text(kind: &Kind) -> String {
 pub fn label(kind: &Kind) -> &'static str {
     match kind {
         Kind::Let => "Let",
+        Kind::Extern => "Extern",
         Kind::In => "In",
         Kind::Type => "Type",
         Kind::End => "End",

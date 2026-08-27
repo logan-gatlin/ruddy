@@ -127,12 +127,16 @@ fn declarations(cx: &Cx) -> HashMap<Symbol, FileID> {
         return HashMap::new();
     };
     let terms = program.terms.iter().map(|(s, d)| (*s, d.name_span.file_id));
+    let externs = program
+        .externs
+        .iter()
+        .map(|(s, d)| (*s, d.name_span.file_id));
     let types = program.types.iter().map(|(s, d)| (*s, d.name_span.file_id));
     let effects = program
         .effects
         .iter()
         .map(|(s, d)| (*s, d.name_span.file_id));
-    terms.chain(types).chain(effects).collect()
+    terms.chain(externs).chain(types).chain(effects).collect()
 }
 
 /// Demangle a symbol's mangled name and check it describes the same symbol.
