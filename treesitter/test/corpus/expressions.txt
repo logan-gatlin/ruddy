@@ -266,3 +266,60 @@ let a = f (g x)
         (application
           (identifier)
           (identifier))))))
+
+================================================================================
+Quoted struct fields work in construction and projection
+================================================================================
+
+let record = { "field name": 1, "line\nname": 2 }
+let value = record."field name"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (struct_expression
+      (struct_field
+        (string)
+        (natural))
+      (struct_field
+        (string)
+        (natural))))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (string))))
+
+================================================================================
+Quoted tags form one adjacent constructor token
+================================================================================
+
+let wrapped = #"some case" #"inner case" 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (tag_expression
+      (tag)
+      (tag_expression
+        (tag)
+        (natural)))))
+
+================================================================================
+A quoted tag's sigil cannot be separated from its quote
+================================================================================
+
+let invalid = # "case"
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (ERROR
+      (UNEXPECTED ' '))
+    (string)))

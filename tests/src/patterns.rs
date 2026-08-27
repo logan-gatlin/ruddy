@@ -1256,3 +1256,42 @@ fn other_primitive_literal_sets_need_a_wildcard() {
         );
     }
 }
+
+#[test]
+fn quoted_struct_fields_are_exhaustive_by_their_decoded_names() {
+    let checks = clean(
+        r###"let f = fn value => match value with | { "field name": x } => x | { "let": y } => y end"###,
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+}
+
+#[test]
+fn quoted_sum_variants_are_exhaustive_by_their_decoded_names() {
+    let checks = clean(
+        r###"let f : (#"some case" Nat | #"let" | #"line\n\"quote\"\\tail") -> Nat = fn value => match value with | #"some case" n => n | #"let" => 0n | #"line\n\"quote\"\\tail" => 0n end"###,
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+}
+
+#[test]
+fn witnesses_render_quoted_field_and_variant_names_canonically() {
+    let source = r###"let f = fn value => match value with | { "left side": #"a case", "let": #"x ray" } => 1n | { "left side": #"bee", "let": #"why" } => 2n end"###;
+    let (_, inferred, checks) = checked(source);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(checks.errors.len(), 1, "{checks:#?}");
+    assert_eq!(
+        witness_of(&checks),
+        r###"{ "left side": #"a case", "let": #why }"###
+    );
+
+    // A hole in a quoted case keeps that case's canonical spelling around the
+    // payload witness.
+    let source = r###"let g = fn value => match value with | #"some case" 0n => 0n end"###;
+    let (_, inferred, checks) = checked(source);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert_eq!(witness_of(&checks), r###"#"some case" 1n"###);
+}

@@ -349,7 +349,7 @@ module.exports = grammar({
     _atom_projection: $ => prec.left(PREC.projection, seq(
       field('base', choice($._atom, alias($._atom_projection, $.projection))),
       '.',
-      field('field', $.identifier),
+      field('field', choice($.identifier, $.string)),
     )),
 
     _atom: $ => choice(
@@ -375,7 +375,7 @@ module.exports = grammar({
         $.handle_expression,
       )),
       '.',
-      field('field', $.identifier),
+      field('field', choice($.identifier, $.string)),
     )),
 
     /** `fn <arg>+ => <expr>` — the body runs as far right as it can. */
@@ -473,7 +473,7 @@ module.exports = grammar({
     ),
 
     struct_field: $ => seq(
-      field('name', $.identifier),
+      field('name', choice($.identifier, $.string)),
       ':',
       field('value', $._expression),
     ),
@@ -523,10 +523,20 @@ module.exports = grammar({
       ),
     ),
 
-    /** A field, or a bare name punning one to itself. */
-    struct_pattern_field: $ => seq(
-      field('name', $.identifier),
-      optional(seq(':', field('pattern', $._pattern))),
+    /**
+     * A field, or a bare identifier punning one to itself. Quoted labels never
+     * pun: `{"field name": p}` must say which pattern receives the field.
+     */
+    struct_pattern_field: $ => choice(
+      seq(
+        field('name', $.identifier),
+        optional(seq(':', field('pattern', $._pattern))),
+      ),
+      seq(
+        field('name', $.string),
+        ':',
+        field('pattern', $._pattern),
+      ),
     ),
 
     /** The `..` that makes a struct pattern match on at least its fields. */
@@ -658,14 +668,14 @@ module.exports = grammar({
     ),
 
     struct_type_field: $ => seq(
-      field('name', $.identifier),
+      field('name', choice($.identifier, $.string)),
       optional(field('when', $.when_clause)),
       ':',
       field('type', $._type),
     ),
 
     /** `\name` — the label is definitely not there. */
-    absent_field: $ => seq('\\', field('name', $.identifier)),
+    absent_field: $ => seq('\\', field('name', choice($.identifier, $.string))),
 
     /**
      * `..` or `..'r` — what is known about the labels not written out. Bare it
@@ -724,8 +734,14 @@ module.exports = grammar({
 
     identifier: _ => new RegExp(IDENT.source, 'u'),
 
-    /** `#Some` — one case of a sum, named. The `#` is not part of the name. */
-    tag: _ => new RegExp(TAG.source, 'u'),
+    /**
+     * `#Some` or `#"some case"` — one case of a sum, named. A quoted tag is
+     * one token so whitespace may not separate its `#` from the opening quote.
+     */
+    tag: _ => choice(
+      new RegExp(TAG.source, 'u'),
+      token(seq('#', '"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),
+    ),
 
     /** `!Log` — an effect, named. The `!` is not part of the name. */
     effect_label: _ => new RegExp(EFFECT.source, 'u'),

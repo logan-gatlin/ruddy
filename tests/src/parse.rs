@@ -593,6 +593,60 @@ fn arrows_are_right_associative() {
     );
 }
 
+/// String literals are labels in every field position. Printing keeps only
+/// labels that are valid ordinary field names bare, and the printed tree is
+/// reparsed by `parse_one`, so these also pin the canonical fixed point.
+#[test]
+fn quoted_field_labels_parse_everywhere_and_print_canonically() {
+    for (src, printed) in [
+        (
+            r###"let v = {"field name": x, "plain": y, "let": z, "if": a, "then": b, "else": c}"###,
+            r###"let v = { "field name": x, plain: y, "let": z, "if": a, "then": b, "else": c }"###,
+        ),
+        (
+            r###"let v = record."field name"."plain""###,
+            r###"let v = record."field name".plain"###,
+        ),
+        (
+            r###"let x : { "field name" when 'p: Nat, "plain": Nat, \"gone field", .. } = y"###,
+            r###"let x : { "field name" when 'p: Nat, plain: Nat, \"gone field", .. } = y"###,
+        ),
+        (
+            r###"let v = match x with | { "field name": y, "plain": z } => y end"###,
+            r###"let v = match x with | { "field name": y, plain: z } => y end"###,
+        ),
+        // Decoding happens before label identity and rendering. Unicode is a
+        // valid identifier start, while punctuation and the empty label are not.
+        (
+            r###"let v = {"λ": x, "line\nname": y, "": z}"###,
+            "let v = { λ: x, \"line\\nname\": y, \"\": z }",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
+/// Unlike an identifier field, a quoted pattern label cannot pun: no source
+/// binding can have the arbitrary decoded spelling, so `:` and a subpattern
+/// are required. Identifier puns remain unchanged.
+#[test]
+fn a_quoted_pattern_field_requires_a_colon() {
+    assert_eq!(
+        parse_one("let v = match x with | { plain } => plain end"),
+        "let v = match x with | { plain } => plain end"
+    );
+
+    for src in [
+        r###"let v = match x with | { "plain" } => x end"###,
+        r###"let v = match x with | { "field name", rest: y } => y end"###,
+        r###"let v = match x with | { "field name": } => x end"###,
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+}
+
 #[test]
 fn projection_binds_tighter_than_application() {
     assert_eq!(parse_one("let a = p.x"), "let a = p.x");
@@ -931,6 +985,33 @@ fn a_case_carries_one_atom() {
 /// A tag takes one operand, and takes it greedily: `f #A 1` is `f` applied
 /// to the case rather than the case applied to `1`. A tag carries one thing, so
 /// there is nothing the other reading could mean.
+/// Quoted tags occupy every place a bare tag does. They decode to the same
+/// case names, and printing chooses a bare spelling exactly when the decoded
+/// label satisfies the tag-name lexical rule.
+#[test]
+fn quoted_tags_parse_everywhere_and_print_canonically() {
+    for (src, printed) in [
+        (
+            r###"let v = #"Some case" 1n"###,
+            r###"let v = #"Some case" 1n"###,
+        ),
+        (r###"let v = #"Some""###, "let v = #Some"),
+        (
+            r###"let v = match x with | #"Some case" y => y | #"None" => 0n end"###,
+            r###"let v = match x with | #"Some case" y => y | #None => 0n end"###,
+        ),
+        (
+            r###"let x : #"Some case" Nat | #"None" | \#"gone case" | .. = y"###,
+            r###"let x : #"Some case" Nat | #None | \#"gone case" | .. = y"###,
+        ),
+        (r###"let v = #"""###, r###"let v = #"""###),
+        (r###"let v = #"λ""###, "let v = #λ"),
+        (r###"let v = #"line\ncase""###, "let v = #\"line\\ncase\""),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
 #[test]
 fn a_tag_binds_tighter_than_application() {
     assert_eq!(parse_one("let v = #Some 1n"), "let v = #Some 1n");

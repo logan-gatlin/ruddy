@@ -2626,7 +2626,7 @@ impl Table {
         if !formula.is_true() {
             let mut labels = IndexMap::new();
             self.labels_in(&ty, &mut labels);
-            let labels = labels.into_iter().collect();
+            let labels = labels.into_values().collect();
             self.require(span, Origin::Instance(Named { labels }), formula);
         }
         ty
@@ -2669,12 +2669,12 @@ impl Table {
     /// order the type names them — what a use-site complaint quotes its formula
     /// in. The first spelling of a label wins, which is the one a reader
     /// reading the type left to right meets.
-    fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, Presence>) {
+    fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, (String, Presence)>) {
         let ty = self.resolve(ty);
         for (name, field) in &ty.fields {
             found
                 .entry(name.clone())
-                .or_insert_with(|| self.presence_of(&field.presence));
+                .or_insert_with(|| (name.clone(), self.presence_of(&field.presence)));
             let held = field.ty.clone();
             self.labels_in(&held, found);
         }
@@ -2684,16 +2684,19 @@ impl Table {
                 self.labels_in(&from, found);
                 self.labels_in(&to, found);
                 for (name, field) in &self.canon(&effects).labels {
-                    found
-                        .entry(name.clone())
-                        .or_insert_with(|| self.presence_of(&field.presence));
+                    found.entry(name.clone()).or_insert_with(|| {
+                        let shown = name
+                            .split_once('\u{1f}')
+                            .map_or(name.as_str(), |(name, _)| name);
+                        (shown.to_string(), self.presence_of(&field.presence))
+                    });
                 }
             }
             Core::Sum(cases) => {
                 for (name, field) in &self.canon(cases).labels {
                     found
                         .entry(name.clone())
-                        .or_insert_with(|| self.presence_of(&field.presence));
+                        .or_insert_with(|| (name.clone(), self.presence_of(&field.presence)));
                     let held = field.ty.clone();
                     self.labels_in(&held, found);
                 }

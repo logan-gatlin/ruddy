@@ -759,6 +759,60 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
     assert!(nodes[2].span.is_none(), "{:#?}", nodes[2]);
 }
 
+/// Arbitrary row labels keep the canonical source spelling in both trees and
+/// in LIR. In particular, the unit separator used inside structural effect keys
+/// is still ordinary data in a quoted user field.
+#[test]
+fn quoted_sum_labels_and_separator_fields_reach_the_debugger_tabs() {
+    let separator = '\u{1f}';
+    let source = format!(
+        "type Choice 'r = #\"case name\" Nat | \\#\"gone case\" | ..'r\n\
+         let record = {{ \"left{separator}right\": 1n }}\n\
+         let read = record.\"left{separator}right\"\n\
+         let choose = fn x => match x with | #\"case name\" n => n | other => 0n end\n\
+         let tagged = #\"case name\" 1n\n"
+    );
+
+    for id in ["ast", "ir"] {
+        let tree = tab(id, &source);
+        let rows = flatten(&tree);
+        assert!(
+            rows.iter().any(|node| node.label == "#\"case name\""),
+            "{id}: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|node| node.label == "\\#\"gone case\""),
+            "{id}: {rows:#?}"
+        );
+    }
+
+    let tree = tab("lir", &source);
+    let lir = flatten(&tree);
+    let field = format!("\"left{separator}right\"");
+    assert!(
+        lir.iter()
+            .any(|node| node.text.contains(&format!("struct {{ {field}: %"))),
+        "{lir:#?}"
+    );
+    assert!(
+        lir.iter().any(|node| {
+            node.text.contains("project %")
+                && node.text.contains("left")
+                && node.text.contains("right")
+        }),
+        "{lir:#?}"
+    );
+    assert!(
+        lir.iter()
+            .any(|node| node.text.contains("tag #\"case name\"")),
+        "{lir:#?}"
+    );
+    assert!(
+        lir.iter().any(|node| node.text == "#\"case name\" =>"),
+        "{lir:#?}"
+    );
+}
+
 /// Evidence is plumbing rather than prose: the record of a handler's operations
 /// and the bundle a call builds for an effect-polymorphic callee are rows the
 /// reader never wrote, so they are marked generated and point at no source. The

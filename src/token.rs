@@ -99,15 +99,16 @@ pub enum Kind {
     /// and `_1` remain ordinary identifiers, read by the keyword rule that
     /// already keeps `matches` a name.
     Underscore,
-    /// `#Some` — one of a sum type's cases, named. One token rather than a `#`
-    /// beside a name, because that is what it is: a label with no spaces
-    /// allowed inside it, and a span a reader can select in one go. The `#` is
-    /// not part of the name it carries, the way a struct's braces are not part
-    /// of its field names.
+    /// `#Some` or `#"some case"` — one of a sum type's cases, named. One
+    /// token rather than a `#` beside another token, because that is what it
+    /// is: one structural label and one span a reader can select. The `#` and
+    /// any source quotes are not part of the decoded name it carries, the way
+    /// a struct's braces are not part of its field names.
     Tag(String),
-    /// `!Log` — an effect, named. A [`Tag`](Kind::Tag)'s twin in every way but
-    /// the character that heads it, and one token for the same reason: a label
-    /// with no spaces inside it and a span a reader can select in one go.
+    /// `!Log` — an effect, named. Like a [`Tag`](Kind::Tag), it keeps its
+    /// sigil and name in one token so its span can be selected in one go.
+    /// Effect labels remain identifier-shaped; unlike sum variants, they do
+    /// not have a quoted form.
     ///
     /// Its own kind rather than a `Tag`, because the two name different things
     /// and are never written in the same position: a tag is a case a value may
@@ -291,7 +292,38 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             // it can be is the head of something longer, and a lone one is
             // reported where it was written.
             '#' => {
-                let (kind, width) = sigilled(&mut chars, Kind::Tag);
+                // A quoted tag is one contiguous sigilled label. Decode its
+                // string with exactly the same rules as an ordinary literal,
+                // while keeping the `#` in the token's span.
+                let (kind, width) = if matches!(chars.clone().nth(1), Some((_, '"'))) {
+                    chars.next();
+                    let (value, mut string_width) = string(&mut chars);
+                    // On an unsupported escape `string` stops at that escape.
+                    // A quoted tag is nevertheless one sigilled lexeme, so
+                    // consume through its closing quote for one complete error
+                    // span rather than lexing the remainder as another string.
+                    if value.is_err() {
+                        // Recovery still observes escapes: a `\"` after the
+                        // malformed escape is content, not the quote ending
+                        // this tag. The validity of those later escapes no
+                        // longer matters; the one error already owns the
+                        // complete lexeme.
+                        let mut escaped = false;
+                        for (_, c) in chars.by_ref() {
+                            string_width += c.len_utf8();
+                            if escaped {
+                                escaped = false;
+                            } else if c == '\\' {
+                                escaped = true;
+                            } else if c == '"' {
+                                break;
+                            }
+                        }
+                    }
+                    (value.map(Kind::Tag), string_width + 1)
+                } else {
+                    sigilled(&mut chars, Kind::Tag)
+                };
                 let span = file_id.span(start, width);
                 match kind {
                     Ok(kind) => tokens.push(span.track(kind)),

@@ -356,7 +356,14 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             ..node
         }
         .child(term_node(ids, cx, mint, base, trace))
-        .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
+        .child(
+            Node::new(
+                ids.next(),
+                "Field",
+                print::label(Shape::Struct, &field.tracked),
+            )
+            .at(field.span),
+        ),
         // The scrutinee, then each written arm: its normalized pattern — the
         // binders symbols like a lambda's argument, so they cross-highlight
         // with their uses — and its body. Reading this beside the AST tab's
@@ -448,7 +455,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 .map(|(name, field)| {
                     Node::new(
                         ids.next(),
-                        format!("{name}:"),
+                        format!("{}:", print::label(Shape::Struct, name)),
                         print::ir::term(&field.value.kind, mint).to_string(),
                     )
                     .at(field.name_span)
@@ -606,7 +613,7 @@ fn pattern_node(ids: &mut Ids, cx: &Cx, mint: &Mint, pattern: &Pattern) -> Node 
                 .map(|(name, field)| {
                     Node::new(
                         ids.next(),
-                        format!("{name}:"),
+                        format!("{}:", print::label(Shape::Struct, name)),
                         print::ir::pattern(&field.value.tracked, mint).to_string(),
                     )
                     .at(field.name_span)
@@ -834,8 +841,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                         let text = payload.as_ref().map_or(String::new(), |ty| {
                             print::ir::ty(&ty.tracked, mint).to_string()
                         });
-                        let node =
-                            Node::new(ids.next(), format!("#{name}{mark}"), text).at(*name_span);
+                        let node = Node::new(
+                            ids.next(),
+                            format!("{}{mark}", print::label(Shape::Sum, name)),
+                            text,
+                        )
+                        .at(*name_span);
                         match payload {
                             Some(payload) => node.child(type_node(ids, cx, mint, payload, scope)),
                             None => node,
@@ -843,9 +854,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                     }
                     // An absent case is a leaf wearing the `\`, spanning the
                     // whole `\#Name` for cross-highlighting.
-                    SumCase::Absent { name_span } => {
-                        Node::new(ids.next(), format!("\\#{name}"), String::new()).at(*name_span)
-                    }
+                    SumCase::Absent { name_span } => Node::new(
+                        ids.next(),
+                        format!("\\{}", print::label(Shape::Sum, name)),
+                        String::new(),
+                    )
+                    .at(*name_span),
                 })
                 .collect();
             if let Some(tail) = tail {
@@ -884,7 +898,7 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                         let mark = when_text(when);
                         Node::new(
                             ids.next(),
-                            format!("{name}{mark}:"),
+                            format!("{}{mark}:", print::label(Shape::Struct, name)),
                             print::ir::ty(&value.tracked, mint).to_string(),
                         )
                         .at(*name_span)
@@ -892,9 +906,12 @@ fn type_node(ids: &mut Ids, cx: &Cx, mint: &Mint, ty: &Type, scope: &[Variable])
                     }
                     // An absent field is a leaf: there is no type under it,
                     // and the span covers the whole `\name`.
-                    TypeField::Absent { name_span } => {
-                        Node::new(ids.next(), format!("\\{name}"), String::new()).at(*name_span)
-                    }
+                    TypeField::Absent { name_span } => Node::new(
+                        ids.next(),
+                        format!("\\{}", print::label(Shape::Struct, name)),
+                        String::new(),
+                    )
+                    .at(*name_span),
                 })
                 .collect();
             // The tail is a row of its own: it stands for the labels not

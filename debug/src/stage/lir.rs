@@ -33,6 +33,9 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         return crate::stage::skipped(spec, "lowering to LIR did not run");
     };
 
+    let labels = cx
+        .program
+        .map_or_else(Default::default, print::lir::Labels::new);
     let mut ids = Ids::default();
     let mut nodes = Vec::new();
     for external in &output.externs {
@@ -42,11 +45,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     }
     for global in &output.globals {
         let node = Node::new(ids.next(), "global", print::lir::header(global)).at(global.span);
-        nodes.push(node.children(rows(output, &global.body, &mut ids)));
+        nodes.push(node.children(rows(output, &labels, &global.body, &mut ids)));
     }
     for function in &output.functions {
         let node = Node::new(ids.next(), "fn", print::lir::signature(function)).at(function.span);
-        nodes.push(node.children(rows(output, &function.body, &mut ids)));
+        nodes.push(node.children(rows(output, &labels, &function.body, &mut ids)));
     }
 
     Stage {
@@ -73,11 +76,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
 }
 
 /// One block's rows: its instructions, then the terminator that ends it.
-fn rows(output: &Output, block: &Block, ids: &mut Ids) -> Vec<Node> {
+fn rows(output: &Output, labels: &print::lir::Labels, block: &Block, ids: &mut Ids) -> Vec<Node> {
     let mut nodes: Vec<Node> = block
         .instrs
         .iter()
-        .map(|instr| row(output, instr, ids))
+        .map(|instr| row(output, labels, instr, ids))
         .collect();
     nodes.push(end(&block.end, ids));
     nodes
@@ -86,20 +89,20 @@ fn rows(output: &Output, block: &Block, ids: &mut Ids) -> Vec<Node> {
 /// One instruction, with whatever blocks it owns nested under it. A `catch`'s
 /// single body hangs directly off the instruction; a dispatch's blocks each hang
 /// off the answer that selects them.
-fn row(output: &Output, instr: &Instr, ids: &mut Ids) -> Node {
+fn row(output: &Output, labels: &print::lir::Labels, instr: &Instr, ids: &mut Ids) -> Node {
     let mut node = Node::new(
         ids.next(),
         print::lir::opcode(&instr.op),
-        print::lir::instruction(output, instr),
+        print::lir::instruction(output, labels, instr),
     )
     .at(instr.span);
     for (label, block) in print::lir::arms(&instr.op) {
         node = match label {
             Some(label) => {
                 let case = Node::new(ids.next(), "case", format!("{label} =>")).at(instr.span);
-                node.child(case.children(rows(output, block, ids)))
+                node.child(case.children(rows(output, labels, block, ids)))
             }
-            None => node.children(rows(output, block, ids)),
+            None => node.children(rows(output, labels, block, ids)),
         };
     }
     node

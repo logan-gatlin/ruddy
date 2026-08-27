@@ -935,6 +935,27 @@ impl Parser {
         }
     }
 
+    /// Read a structural field label. Unlike bindings and paths, field labels
+    /// may be arbitrary decoded strings; both spellings share the same map-key
+    /// representation so duplicate detection naturally equates `foo` and
+    /// `"foo"`.
+    fn field_label(&mut self) -> Option<TrackedString> {
+        let name = match self.peek() {
+            Some(tok) => match &tok.tracked {
+                Kind::Identifier(name) | Kind::String(name) => Some(tok.span.track(name.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        match name {
+            Some(name) => {
+                self.advance();
+                Some(name)
+            }
+            None => self.unexpected(),
+        }
+    }
+
     /// Consume the next token if it is a tag, and hand back the name it
     /// carries without the `#`. Silent on anything else, unlike
     /// [`ident`](Self::ident): both callers have somewhere else to go — the
@@ -1427,7 +1448,7 @@ impl Parser {
             if self.at_wildcard() {
                 return self.wildcard(Place::Projection);
             }
-            let field = self.ident()?;
+            let field = self.field_label()?;
             let span = base.span.merge(field.span);
             base = span.track(ExprKind::Project {
                 base: Box::new(base),
@@ -1517,7 +1538,7 @@ impl Parser {
             if self.at_wildcard() {
                 return self.wildcard(Place::Field);
             }
-            let name = self.ident()?;
+            let name = self.field_label()?;
             self.eat(&Kind::Colon)?;
             let value = self.expr()?;
             fields.insert(name, value);
@@ -1922,13 +1943,19 @@ impl Parser {
                 };
                 return self.wildcard(place);
             }
-            let name = self.ident()?;
-            // A colon gives the field a sub-pattern; its absence puns, binding
-            // the field to its own name. What punning means is not decided
-            // here: the parser records that nothing was written.
-            let value = match self.eat_if(&Kind::Colon) {
-                Some(_) => Some(self.pattern()?),
-                None => None,
+            let quoted = matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::String(_)));
+            let name = self.field_label()?;
+            // Only identifiers may pun. A quoted label always introduces an
+            // explicit sub-pattern, even when its decoded value is identifier-
+            // shaped, so quote provenance need not survive this point.
+            let value = if quoted {
+                self.eat(&Kind::Colon)?;
+                Some(self.pattern()?)
+            } else {
+                match self.eat_if(&Kind::Colon) {
+                    Some(_) => Some(self.pattern()?),
+                    None => None,
+                }
             };
             fields.insert(name, value);
 
@@ -2656,11 +2683,11 @@ impl Parser {
                 // The key's span is the whole `\name`, so a complaint about
                 // the entry — a repeat, a `\` in a closed struct — underlines
                 // the absence mark along with the name it marks.
-                let name = self.ident()?;
+                let name = self.field_label()?;
                 let key = slash.span.merge(name.span).track(name.tracked);
                 fields.insert(key, TypeField::Absent);
             } else {
-                let name = self.ident()?;
+                let name = self.field_label()?;
                 // One token of lookahead is the whole disambiguation: after a
                 // field's name, a `when` can only be the clause, because
                 // `{when: Nat}` has already spent its `when` on the name.
