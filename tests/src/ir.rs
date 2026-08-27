@@ -5292,6 +5292,20 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
     }
 }
 
+fn local_effect_interface(source: &str, effect: &str) -> String {
+    let (mint, out) = built(source);
+    out.program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == effect).then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface.clone(),
+                ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+            })
+        })
+        .unwrap_or_else(|| panic!("no effect named {effect}"))
+}
+
 #[test]
 fn imported_unnamed_operation_selectors_are_preserved() {
     let mut dependency = effect_artifact("dep", "u");
@@ -5313,6 +5327,188 @@ fn imported_unnamed_operation_selectors_are_preserved() {
             .external_operations
             .keys()
             .any(|(_, selector)| *selector == OperationSelector::Unnamed)
+    );
+}
+
+#[test]
+fn imported_unnamed_handlers_are_complete_without_panicking() {
+    let mut dependency = effect_artifact("dep", "u");
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Unnamed,
+        from: artifact_type(a::Core::Nat),
+        to: artifact_type(a::Core::Unit),
+    });
+    let src = "let main = fn n => handle dep::!IO n with | dep::!IO value => () end";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut node = term_value(&mint, &out, "main");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected imported unnamed handler")
+    };
+    assert_eq!(handler.arms.len(), 1);
+    assert_eq!(handler.discharges.len(), 1);
+    assert_eq!(handler.discharges[0], handler.arms[0].effect);
+}
+
+#[test]
+fn imported_named_handler_coverage_and_diagnostics_use_artifact_selectors() {
+    let dependency = named_io_artifact("dep", "artifact-interface");
+    let build = |src: &str| {
+        let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty());
+        let mut mint = dummy_mint();
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency.clone()]);
+        (mint, out)
+    };
+    let complete = "let main = fn n => handle dep::!IO.write n with\n\
+                    | dep::!IO.write value => ()\n\
+                    | dep::!IO.flush unit => ()\n\
+                    end";
+    let (mint, out) = build(complete);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut node = term_value(&mint, &out, "main");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected imported named handler")
+    };
+    assert_eq!(handler.arms.len(), 2);
+    assert_eq!(handler.discharges.len(), 1);
+
+    let (_, partial) =
+        build("let main = fn n => handle dep::!IO.write n with | dep::!IO.write value => () end");
+    assert!(matches!(
+        &partial.errors[..],
+        [ruddy::ir::Error {
+            kind: ErrorKind::PartialHandler { missing, .. },
+            ..
+        }] if missing == &["flush".to_string()]
+    ));
+
+    let (_, duplicate) = build(
+        "let main = fn n => handle dep::!IO.write n with\n\
+         | dep::!IO.write first => ()\n\
+         | dep::!IO.write second => ()\n\
+         | dep::!IO.flush unit => () end",
+    );
+    assert_eq!(
+        duplicate
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-arm"]
+    );
+}
+
+fn named_io_artifact(bundle: &str, interface: &str) -> a::Artifact {
+    let mut dependency = effect_artifact(bundle, interface);
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.extend([
+        a::Operation {
+            selector: a::OperationSelector::Named("write".into()),
+            from: artifact_type(a::Core::Nat),
+            to: artifact_type(a::Core::Unit),
+        },
+        a::Operation {
+            selector: a::OperationSelector::Named("flush".into()),
+            from: artifact_type(a::Core::Unit),
+            to: artifact_type(a::Core::Unit),
+        },
+    ]);
+    dependency
+}
+
+#[test]
+fn dependency_and_local_structural_handlers_share_one_discharge() {
+    let declaration = "effect IO = { write: Nat -> (), flush: () -> () }";
+    let interface = local_effect_interface(declaration, "IO");
+    let dependency = named_io_artifact("dep", &interface);
+    let src = format!(
+        "{declaration}\n\
+         let main = fn n => handle dep::!IO.write n with\n\
+           | dep::!IO.write value => ()\n\
+           | !IO.flush unit => ()\n\
+         end"
+    );
+    let parsed = parse::parse(lex(&src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut node = term_value(&mint, &out, "main");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected structural dependency handler")
+    };
+    assert_ne!(
+        handler.arms[0].effect.tracked,
+        handler.arms[1].effect.tracked
+    );
+    assert_eq!(handler.discharges, [handler.arms[0].effect]);
+}
+
+#[test]
+fn structurally_equivalent_dependencies_share_coverage_and_duplicates() {
+    let declaration = "effect IO = { write: Nat -> (), flush: () -> () }";
+    let interface = local_effect_interface(declaration, "IO");
+    let first = named_io_artifact("first", &interface);
+    let second = named_io_artifact("second", &interface);
+    let build = |src: &str| {
+        let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+        assert!(parsed.errors.is_empty());
+        let mut mint = dummy_mint();
+        let out =
+            build_with_dependencies(&mut mint, parsed.stmts, &[first.clone(), second.clone()]);
+        (mint, out)
+    };
+
+    let (mint, out) = build(
+        "let main = fn n => handle first::!IO.write n with\n\
+         | first::!IO.write value => ()\n\
+         | second::!IO.flush unit => () end",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let mut node = term_value(&mint, &out, "main");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected dependency handler")
+    };
+    assert_ne!(
+        handler.arms[0].effect.tracked,
+        handler.arms[1].effect.tracked
+    );
+    assert_eq!(handler.discharges, [handler.arms[0].effect]);
+
+    let (_, duplicate) = build(
+        "let main = fn n => handle first::!IO.write n with\n\
+         | first::!IO.write value => ()\n\
+         | second::!IO.write again => ()\n\
+         | second::!IO.flush unit => () end",
+    );
+    assert_eq!(
+        duplicate
+            .errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-arm"]
     );
 }
 

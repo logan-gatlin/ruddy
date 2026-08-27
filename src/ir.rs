@@ -2340,14 +2340,34 @@ fn build_with_dependency_imports_inner(
     // the identities already computed before inference sees them. Handler
     // coverage is finalized here too, now that nominal declarations can be
     // grouped by those identities.
-    let operation_sets: HashMap<Symbol, IndexSet<OperationSelector>> = program
-        .effects
-        .iter()
-        .filter_map(|(symbol, declaration)| match &declaration.value {
-            Effect::Operations(operations) => Some((*symbol, operations.keys().cloned().collect())),
-            Effect::Alias(_) => None,
-        })
+    // Keep coverage keyed by the same structural identities as effect rows.
+    // `Builder::operations` is the complete selector registry assembled while
+    // resolving terms: imports install their artifact selectors there before
+    // local declarations extend it. Borrow it rather than reconstructing a
+    // local-only view from `Program::effects`; this also leaves ownership of
+    // the builder and its error accumulator explicit during rekeying below.
+    //
+    // Seed every known identity so indexing remains total even for recovery
+    // identities which declare no usable operations. Structurally equivalent
+    // declarations merge their selector sets, whether they came from source,
+    // dependencies, or both.
+    let mut operation_sets: HashMap<EffectId, IndexSet<OperationSelector>> = program
+        .effect_ids
+        .values()
+        .cloned()
+        .map(|identity| (identity, IndexSet::new()))
         .collect();
+    // Walk the identity table rather than the hash-based selector registry so
+    // a partial-handler diagnostic keeps declaration order. Imported identities
+    // precede locals, and each selector set itself preserves interface order.
+    for (symbol, identity) in &program.effect_ids {
+        if let Some(selectors) = b.operations.get(symbol) {
+            operation_sets
+                .entry(identity.clone())
+                .or_default()
+                .extend(selectors.iter().cloned());
+        }
+    }
     for decl in program.terms.values_mut() {
         if let Some(annotation) = &mut decl.annotation {
             rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
@@ -3298,7 +3318,7 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
 fn rekey_term(
     term: &mut Term,
     ids: &IndexMap<Symbol, EffectId>,
-    operations: &HashMap<Symbol, IndexSet<OperationSelector>>,
+    operations: &HashMap<EffectId, IndexSet<OperationSelector>>,
     errors: &mut Vec<Error>,
 ) {
     match &mut term.kind {
@@ -3377,7 +3397,7 @@ fn rekey_term(
             handler.arms = unique;
             handler.discharges.clear();
             for (effect, (representative, arms)) in covered {
-                let missing: Vec<String> = operations[&representative.tracked]
+                let missing: Vec<String> = operations[&effect]
                     .iter()
                     .filter(|selector| !arms.contains(*selector))
                     .map(OperationSelector::source_name)

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use ruddy::{
-    inference, ir, lir, parse, patterns,
+    artifact as a, inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
@@ -25,6 +25,18 @@ fn lowered_after_check(
     source: &str,
     adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
 ) -> lir::Output {
+    lowered_with_dependencies_after_check(source, &[], adjust)
+}
+
+fn lowered_with_dependencies(source: &str, dependencies: &[a::Artifact]) -> lir::Output {
+    lowered_with_dependencies_after_check(source, dependencies, |_, _| {})
+}
+
+fn lowered_with_dependencies_after_check(
+    source: &str,
+    dependencies: &[a::Artifact],
+    adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
+) -> lir::Output {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
     let lexed = token::lex(source, file);
@@ -34,7 +46,7 @@ fn lowered_after_check(
 
     let bundle = Bundle::new("tests", Version::new(0, 1, 0)).expect("the bundle name is valid");
     let mut mint = Mint::new(bundle);
-    let mut built = ir::build(&mut mint, parsed.stmts);
+    let mut built = ir::build_with_dependencies(&mut mint, parsed.stmts, dependencies);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
     let mut inferred = inference::infer(&mint, &mut built.program);
     assert!(
@@ -47,6 +59,21 @@ fn lowered_after_check(
     adjust(&mut built.program, &mut inferred);
 
     lir::lower(&mint, &built.program, &inferred)
+}
+
+fn local_effect_interface(source: &str) -> String {
+    let lexed = token::lex(source, ruddy::tracking::FileID::GENERATED);
+    assert!(lexed.errors.is_empty(), "{:#?}", lexed.errors);
+    let parsed = parse::parse(lexed.tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let bundle = Bundle::new("interface", Version::new(0, 1, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let built = ir::build(&mut mint, parsed.stmts);
+    assert!(built.errors.is_empty(), "{:#?}", built.errors);
+    match built.program.effect_ids.values().next().unwrap() {
+        ruddy::types::EffectId::Structural { interface, .. } => interface.clone(),
+        ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+    }
 }
 
 /// The canonical listing of one source, which is what most of these tests read:
@@ -646,6 +673,67 @@ fn structurally_equivalent_handler_arms_build_one_complete_record() {
     assert_eq!(printed.matches("struct = struct {").count(), 1, "{printed}");
     assert!(printed.contains("project %"), "{printed}");
     assert!(printed.contains("\"write\""), "{printed}");
+}
+
+#[test]
+fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
+    let declaration = "effect Log = { write: Nat -> (), flush: () -> () }";
+    let interface = local_effect_interface(declaration);
+    let plain = |core| a::Type {
+        core,
+        fields: Vec::new(),
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: vec![a::DeclaredEffect {
+                name: "dep@1.0.0::Log".into(),
+                identity: Some(a::EffectIdentity {
+                    name: "Log".into(),
+                    interface,
+                }),
+                kind: a::EffectKind::Operations(vec![
+                    a::Operation {
+                        selector: a::OperationSelector::Named("write".into()),
+                        from: plain(a::Core::Nat),
+                        to: plain(a::Core::Unit),
+                    },
+                    a::Operation {
+                        selector: a::OperationSelector::Named("flush".into()),
+                        from: plain(a::Core::Unit),
+                        to: plain(a::Core::Unit),
+                    },
+                ]),
+            }],
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let source = format!(
+        "{declaration}\n\
+         let main = fn n => handle dep::!Log.write n with\n\
+           | dep::!Log.write value => ()\n\
+           | !Log.flush unit => ()\n\
+         end"
+    );
+    let printed = print::lir::program(&lowered_with_dependencies(&source, &[dependency]));
+    let main = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn main("))
+        .unwrap_or_else(|| panic!("missing main in:\n{printed}"));
+    assert!(main.contains("struct { write:"), "{main}");
+    assert!(main.contains(", flush:"), "{main}");
+    assert_eq!(main.matches("struct = struct {").count(), 1, "{main}");
+    assert!(main.contains("project %"), "{main}");
+    assert!(main.contains("\"write\""), "{main}");
 }
 
 /// The `return` arm is applied inline to the body's value on the normal path:
