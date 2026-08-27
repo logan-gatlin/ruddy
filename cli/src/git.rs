@@ -1,9 +1,9 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ pub const LOCKFILE: &str = "Ruddy.lock";
 #[serde(deny_unknown_fields)]
 pub struct Lockfile {
     pub version: u32,
-    #[serde(default, rename = "git")]
+    #[serde(default, rename = "git", skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<LockedGit>,
 }
 
@@ -45,9 +45,11 @@ pub(crate) struct Resolver {
     lock_path: PathBuf,
     locked: BTreeMap<(String, LockedSelectorKey), String>,
     resolved: BTreeMap<(String, LockedSelectorKey), String>,
-    // A checkout is restored while holding this marker and remains protected
-    // until compilation has finished reading it.
-    cache_locks: Vec<gix_lock::Marker>,
+    had_lockfile: bool,
+    // The global advisory lock protects cache installation and restored
+    // worktrees until compilation has finished reading them. The OS releases
+    // it if the process exits, including after a crash.
+    cache_lock: Option<File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +90,7 @@ impl Resolver {
                 lock_path.display()
             )));
         }
+        let had_lockfile = lock.is_some();
         let mut locked = BTreeMap::new();
         for entry in lock.into_iter().flat_map(|lock| lock.entries) {
             if !entry.url.starts_with("https://") {
@@ -135,7 +138,8 @@ impl Resolver {
             lock_path,
             locked,
             resolved: BTreeMap::new(),
-            cache_locks: Vec::new(),
+            had_lockfile,
+            cache_lock: None,
         })
     }
 
@@ -151,7 +155,10 @@ impl Resolver {
         if let Some(commit) = self.resolved.get(&key) {
             return Ok(checkout_path(home, url, selector, commit));
         }
-        let marker = acquire_cache_lock(home, url, selector)?;
+        if self.cache_lock.is_none() {
+            self.cache_lock = Some(acquire_cache_lock(home)?);
+        }
+        clean_stale_temporary_checkouts(home, url, selector)?;
         let locked = self.locked.get(&key).cloned();
         let (checkout, commit) = if let Some(commit) = locked {
             let checkout = checkout_path(home, url, selector, &commit);
@@ -172,12 +179,11 @@ impl Resolver {
             clone_unlocked(home, url, selector)?
         };
         self.resolved.insert(key, commit);
-        self.cache_locks.push(marker);
         Ok(checkout)
     }
 
     pub(crate) fn write_if_changed(&self) -> Result<(), CompileError> {
-        if self.resolved.is_empty() {
+        if self.resolved.is_empty() && !self.had_lockfile {
             return Ok(());
         }
         let entries = self
@@ -261,24 +267,34 @@ pub fn ruddy_home() -> Result<PathBuf, CompileError> {
         })
 }
 
-fn acquire_cache_lock(
-    home: &Path,
-    url: &str,
-    selector: GitSelector<'_>,
-) -> Result<gix_lock::Marker, CompileError> {
-    let locks = home.join("git/locks");
-    let resource = locks.join(cache_key(url, selector));
-    gix_lock::Marker::acquire_to_hold_resource(
-        &resource,
-        gix_lock::acquire::Fail::AfterDurationWithBackoff(Duration::from_secs(120)),
-        Some(home.join("git")),
-    )
-    .map_err(|error| {
+fn acquire_cache_lock(home: &Path) -> Result<File, CompileError> {
+    let git = home.join("git");
+    fs::create_dir_all(&git).map_err(|error| {
         CompileError::one(format!(
-            "could not lock Git cache entry {}: {error}",
-            resource.display()
+            "could not create Git cache directory {}: {error}",
+            git.display()
         ))
-    })
+    })?;
+    let path = git.join("cache.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| {
+            CompileError::one(format!(
+                "could not open Git cache lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|error| {
+        CompileError::one(format!(
+            "could not acquire Git cache lock {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
 }
 
 fn clone_unlocked(
@@ -286,9 +302,9 @@ fn clone_unlocked(
     url: &str,
     selector: GitSelector<'_>,
 ) -> Result<(PathBuf, String), CompileError> {
-    let temp = temporary_path(home, url, selector);
-    clone_to(url, selector, None, &temp)?;
-    let repo = gix::open(&temp).map_err(|e| {
+    let temp = temporary_checkout(home, url, selector)?;
+    clone_to(url, selector, None, temp.path())?;
+    let repo = gix::open(temp.path()).map_err(|e| {
         CompileError::one(format!(
             "could not open fetched Git dependency `{url}`: {e}"
         ))
@@ -327,7 +343,7 @@ fn clone_unlocked(
     })?;
     drop(repo);
     let final_path = checkout_path(home, url, selector, &commit);
-    install_checkout(&temp, &final_path, &commit)?;
+    install_checkout(temp.path(), &final_path, &commit)?;
     Ok((final_path, commit))
 }
 
@@ -338,9 +354,9 @@ fn clone_locked(
     commit: &str,
 ) -> Result<PathBuf, CompileError> {
     let final_path = checkout_path(home, url, selector, commit);
-    let temp = temporary_path(home, url, selector);
-    clone_to(url, selector, Some(commit), &temp)?;
-    install_checkout(&temp, &final_path, commit)?;
+    let temp = temporary_checkout(home, url, selector)?;
+    clone_to(url, selector, Some(commit), temp.path())?;
+    install_checkout(temp.path(), &final_path, commit)?;
     Ok(final_path)
 }
 
@@ -371,7 +387,6 @@ fn clone_to(
             GitSelector::Default | GitSelector::Rev(_) => prepare,
         };
     }
-    let requested_commit = locked.map(str::to_owned);
     prepare = prepare.configure_remote(move |remote| {
         let effective = remote
             .url(gix::remote::Direction::Fetch)
@@ -382,11 +397,10 @@ fn clone_to(
             )
             .into());
         }
-        if let Some(commit) = requested_commit.as_deref() {
-            Ok(remote.with_refspecs([commit], gix::remote::Direction::Fetch)?)
-        } else {
-            Ok(remote)
-        }
+        // Fetch only normally advertised branch and tag refs. In particular,
+        // never request a lock's raw object ID: many servers reject wants for
+        // unadvertised objects. All tags are needed for tag-only revisions.
+        Ok(remote.with_fetch_tags(gix::remote::fetch::Tags::All))
     });
     let result = (|| {
         let (mut checkout, _) =
@@ -449,7 +463,11 @@ fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(),
             destination.display()
         ))
     })?;
-    restore_checkout(destination, commit)
+    if let Err(error) = restore_checkout(destination, commit) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn restore_checkout(path: &Path, commit: &str) -> Result<(), CompileError> {
@@ -596,13 +614,97 @@ fn checkout_path(home: &Path, url: &str, selector: GitSelector<'_>, commit: &str
 
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn temporary_path(home: &Path, url: &str, selector: GitSelector<'_>) -> PathBuf {
-    home.join("git/tmp").join(format!(
-        "{}-{}-{}",
-        cache_key(url, selector),
-        std::process::id(),
-        TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
+struct TemporaryCheckout(PathBuf);
+
+impl TemporaryCheckout {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryCheckout {
+    fn drop(&mut self) {
+        let _ = remove_cache_entry(&self.0);
+    }
+}
+
+fn temporary_checkout(
+    home: &Path,
+    url: &str,
+    selector: GitSelector<'_>,
+) -> Result<TemporaryCheckout, CompileError> {
+    let directory = home.join("git/tmp");
+    clean_stale_temporary_checkouts(home, url, selector)?;
+    let prefix = format!("{}-", cache_key(url, selector));
+    for _ in 0..100 {
+        let path = directory.join(format!(
+            "{}{}-{}",
+            prefix,
+            std::process::id(),
+            TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        if !path.exists() {
+            return Ok(TemporaryCheckout(path));
+        }
+    }
+    Err(CompileError::one(format!(
+        "could not allocate a temporary Git checkout in {}",
+        directory.display()
+    )))
+}
+
+fn clean_stale_temporary_checkouts(
+    home: &Path,
+    url: &str,
+    selector: GitSelector<'_>,
+) -> Result<(), CompileError> {
+    let directory = home.join("git/tmp");
+    fs::create_dir_all(&directory).map_err(|error| {
+        CompileError::one(format!(
+            "could not create Git temporary directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let prefix = format!("{}-", cache_key(url, selector));
+    for entry in fs::read_dir(&directory).map_err(|error| {
+        CompileError::one(format!(
+            "could not inspect Git temporary directory {}: {error}",
+            directory.display()
+        ))
+    })? {
+        let path = entry
+            .map_err(|error| {
+                CompileError::one(format!(
+                    "could not inspect Git temporary directory {}: {error}",
+                    directory.display()
+                ))
+            })?
+            .path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            remove_cache_entry(&path).map_err(|error| {
+                CompileError::one(format!(
+                    "could not clean stale Git temporary checkout {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_cache_entry(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn hash(value: &str) -> u64 {

@@ -545,7 +545,14 @@ fn locked_cached_git_dependency_child() {
         "version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {uppercase:?}\n"
     );
     fs::write(app.join("Ruddy.lock"), &lock).unwrap();
+    let stale = home
+        .join("git/tmp")
+        .join(format!("{hash:016x}-stale-crashed-process"));
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("partial"), "incomplete clone").unwrap();
+    fs::write(home.join("git/cache.lock"), "left behind by a crash").unwrap();
     let first = compile(&app).unwrap();
+    assert!(!stale.exists());
     assert_eq!(first.header.dependencies[0].name, "base");
 
     // Every use restores both tracked and untracked cache contents while the
@@ -610,6 +617,26 @@ fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let found = error(&directory);
     assert!(found.contains("7 to 40 hexadecimal digits"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
+}
+
+#[test]
+fn a_successful_build_removes_stale_git_entries_from_an_existing_lockfile() {
+    let directory = project();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Ruddy.lock"),
+        "version = 1\n\n[[git]]\nurl = \"https://example.test/repo\"\nbranch = \"main\"\ncommit = \"0123456789abcdef0123456789abcdef01234567\"\n",
+    )
+    .unwrap();
+    compile(directory.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(directory.path().join("Ruddy.lock")).unwrap(),
+        "version = 1\n"
+    );
 }
 
 #[test]
