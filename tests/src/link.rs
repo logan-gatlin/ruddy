@@ -1,6 +1,6 @@
 use ruddy::{
     artifact as a,
-    link::{self, LinkError},
+    link::{self, DeclarationNamespace, LinkError},
 };
 
 fn artifact(
@@ -57,6 +57,18 @@ fn global(name: &str, body: a::Block) -> a::Global {
     a::Global {
         name: name.into(),
         body,
+    }
+}
+
+fn scheme() -> a::Scheme {
+    a::Scheme {
+        count: 0,
+        presences: 0,
+        formula: a::Formula::True,
+        body: a::Type {
+            core: a::Core::Unit,
+            fields: vec![],
+        },
     }
 }
 
@@ -235,6 +247,14 @@ fn rejects_invalid_graph_structure() {
         ));
     }
 
+    let noncanonical_identity = artifact("app", &[], vec![], vec![]);
+    let mut noncanonical_identity = noncanonical_identity;
+    noncanonical_identity.header.identity.version = "1".into();
+    assert!(matches!(
+        link::link(&[noncanonical_identity]),
+        Err(LinkError::MalformedIdentity { .. })
+    ));
+
     let malformed_dependency = artifact("app", &[("dep", "bad")], vec![], vec![]);
     assert!(matches!(
         link::link(&[malformed_dependency]),
@@ -399,6 +419,89 @@ fn rejects_bad_global_definitions_and_references() {
 }
 
 #[test]
+fn validates_public_declarations_in_every_namespace_and_artifact() {
+    let mut valid = artifact("app", &[], vec![], vec![]);
+    let shared = "app@1.0.0::Shared";
+    valid.header.values.push(a::Value {
+        name: shared.into(),
+        scheme: scheme(),
+    });
+    valid.header.types.push(a::DeclaredType {
+        name: shared.into(),
+        params: vec![],
+        scheme: scheme(),
+    });
+    valid.header.effects.push(a::DeclaredEffect {
+        name: shared.into(),
+        identity: None,
+        kind: a::EffectKind::Alias(vec![]),
+    });
+    link::link(&[valid]).expect("the same spelling is valid in distinct namespaces");
+
+    for namespace in [
+        DeclarationNamespace::Value,
+        DeclarationNamespace::Type,
+        DeclarationNamespace::Effect,
+    ] {
+        let make = |name: &str| {
+            let mut artifact = artifact("dep", &[], vec![], vec![]);
+            match namespace {
+                DeclarationNamespace::Value => artifact.header.values.push(a::Value {
+                    name: name.into(),
+                    scheme: scheme(),
+                }),
+                DeclarationNamespace::Type => artifact.header.types.push(a::DeclaredType {
+                    name: name.into(),
+                    params: vec![],
+                    scheme: scheme(),
+                }),
+                DeclarationNamespace::Effect => artifact.header.effects.push(a::DeclaredEffect {
+                    name: name.into(),
+                    identity: None,
+                    kind: a::EffectKind::Alias(vec![]),
+                }),
+            }
+            artifact
+        };
+
+        let malformed = make("dep@1.0.0::bad-name");
+        let root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+        assert!(matches!(
+            link::link(&[malformed, root]),
+            Err(LinkError::MalformedDeclaration { namespace: found, .. }) if found == namespace
+        ));
+
+        let wrong = make("other@1.0.0::name");
+        let root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+        assert!(matches!(
+            link::link(&[wrong, root]),
+            Err(LinkError::WrongDeclarationOwner { namespace: found, .. }) if found == namespace
+        ));
+
+        let mut duplicate = make("dep@1.0.0::name");
+        match namespace {
+            DeclarationNamespace::Value => duplicate
+                .header
+                .values
+                .push(duplicate.header.values[0].clone()),
+            DeclarationNamespace::Type => duplicate
+                .header
+                .types
+                .push(duplicate.header.types[0].clone()),
+            DeclarationNamespace::Effect => duplicate
+                .header
+                .effects
+                .push(duplicate.header.effects[0].clone()),
+        }
+        let root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+        assert!(matches!(
+            link::link(&[duplicate, root]),
+            Err(LinkError::DuplicateDeclaration { namespace: found, .. }) if found == namespace
+        ));
+    }
+}
+
+#[test]
 fn every_link_error_has_a_user_facing_message() {
     let errors = [
         LinkError::EmptyGraph,
@@ -431,6 +534,19 @@ fn every_link_error_has_a_user_facing_message() {
         },
         LinkError::DuplicateGlobal {
             name: "a@1.0.0::x".into(),
+        },
+        LinkError::MalformedDeclaration {
+            namespace: DeclarationNamespace::Value,
+            name: "bad".into(),
+        },
+        LinkError::WrongDeclarationOwner {
+            namespace: DeclarationNamespace::Type,
+            name: "b@1.0.0::T".into(),
+            owner: "a@1.0.0".into(),
+        },
+        LinkError::DuplicateDeclaration {
+            namespace: DeclarationNamespace::Effect,
+            name: "a@1.0.0::E".into(),
         },
         LinkError::MissingGlobal {
             owner: "a".into(),

@@ -199,7 +199,7 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         rendered: error.to_string(),
         usage: false,
     })?;
-    let linked = graph.link().map_err(|error| CliError {
+    let linked = link_rooted(&graph).map_err(|error| CliError {
         rendered: error.to_string(),
         usage: false,
     })?;
@@ -598,33 +598,33 @@ pub struct CompiledProject {
     pub artifact: Artifact,
 }
 
-/// A successfully compiled graph, in unique dependency-first order. The root
-/// project is always last.
+/// Successfully compiled projects in unique dependency-first order.
+///
+/// APIs that accept several roots return a forest, so the final project is not
+/// necessarily a root whose closure contains every preceding project.
 #[derive(Debug, Clone)]
 pub struct CompiledGraph {
     pub projects: Vec<CompiledProject>,
 }
 
-impl CompiledGraph {
-    /// Link the dependency-first per-project artifacts into a self-contained root.
-    pub fn link(&self) -> Result<Artifact, CompileError> {
-        let artifacts: Vec<_> = self
-            .projects
-            .iter()
-            .map(|project| project.artifact.clone())
-            .collect();
-        ruddy::link::link(&artifacts).map_err(|error| CompileError::one(error.to_string()))
-    }
+fn link_rooted(graph: &CompiledGraph) -> Result<Artifact, CompileError> {
+    let artifacts: Vec<_> = graph
+        .projects
+        .iter()
+        .map(|project| project.artifact.clone())
+        .collect();
+    ruddy::link::link(&artifacts).map_err(|error| CompileError::one(error.to_string()))
 }
 
 /// Compile and statically link the project in `directory`.
 /// Git dependencies may populate the Ruddy cache and a successful resolution may
 /// atomically update the root `Ruddy.lock`; no build artifacts are written.
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
-    compile_graph(directory)?.link()
+    link_rooted(&compile_graph(directory)?)
 }
 
 /// Compile every unique project reachable from `directory`, dependencies first.
+/// This single-root graph ends with the requested project.
 pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, CompileError> {
     let root = canonical_project(directory.as_ref())?;
     let resolver = git::Resolver::new(&root)?;

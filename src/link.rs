@@ -52,6 +52,19 @@ pub enum LinkError {
     DuplicateGlobal {
         name: String,
     },
+    MalformedDeclaration {
+        namespace: DeclarationNamespace,
+        name: String,
+    },
+    WrongDeclarationOwner {
+        namespace: DeclarationNamespace,
+        name: String,
+        owner: String,
+    },
+    DuplicateDeclaration {
+        namespace: DeclarationNamespace,
+        name: String,
+    },
     MissingGlobal {
         owner: String,
         target: String,
@@ -65,6 +78,24 @@ pub enum LinkError {
         index: u64,
         functions: usize,
     },
+}
+
+/// One public interface namespace validated by the linker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclarationNamespace {
+    Value,
+    Type,
+    Effect,
+}
+
+impl fmt::Display for DeclarationNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Value => "value",
+            Self::Type => "type",
+            Self::Effect => "effect",
+        })
+    }
 }
 
 impl fmt::Display for LinkError {
@@ -101,6 +132,21 @@ impl fmt::Display for LinkError {
             Self::DuplicateGlobal { name } => {
                 write!(f, "artifact graph defines global `{name}` more than once")
             }
+            Self::MalformedDeclaration { namespace, name } => {
+                write!(f, "malformed qualified public {namespace} name `{name}`")
+            }
+            Self::WrongDeclarationOwner {
+                namespace,
+                name,
+                owner,
+            } => write!(
+                f,
+                "public {namespace} `{name}` is stored in artifact `{owner}` but has a different owner"
+            ),
+            Self::DuplicateDeclaration { namespace, name } => write!(
+                f,
+                "artifact defines public {namespace} `{name}` more than once"
+            ),
             Self::MissingGlobal { owner, target } => {
                 write!(f, "artifact `{owner}` references missing global `{target}`")
             }
@@ -193,6 +239,7 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let mut globals = HashSet::new();
     for artifact in artifacts {
         let owner = identity(artifact);
+        validate_declarations(artifact, &owner)?;
         for global in &artifact.lir.globals {
             let parsed_owner = qualified_owner(&global.name)?;
             if parsed_owner != owner {
@@ -263,7 +310,7 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
 fn valid_identity(name: &str, version: &str) -> bool {
     Version::parse(version)
         .ok()
-        .filter(|version| version.build.is_empty())
+        .filter(|parsed| parsed.build.is_empty() && parsed.to_string() == version)
         .and_then(|version| Bundle::new(name, version))
         .is_some()
 }
@@ -276,22 +323,105 @@ fn identity(artifact: &Artifact) -> String {
 }
 
 fn qualified_owner(name: &str) -> Result<&str, LinkError> {
-    let Some((owner, path)) = name.split_once("::") else {
-        return Err(LinkError::MalformedGlobal {
-            name: name.to_string(),
-        });
-    };
-    let Some((bundle, version)) = owner.split_once('@') else {
-        return Err(LinkError::MalformedGlobal {
-            name: name.to_string(),
-        });
-    };
-    if !valid_identity(bundle, version) || path.split("::").any(str::is_empty) {
-        return Err(LinkError::MalformedGlobal {
-            name: name.to_string(),
-        });
+    parse_qualified_owner(name).ok_or_else(|| LinkError::MalformedGlobal {
+        name: name.to_string(),
+    })
+}
+
+fn parse_qualified_owner(name: &str) -> Option<&str> {
+    let (owner, path) = name.split_once("::")?;
+    let (bundle, version) = owner.split_once('@')?;
+    (valid_identity(bundle, version) && path.split("::").all(canonical_component)).then_some(owner)
+}
+
+fn canonical_component(name: &str) -> bool {
+    source_identifier(name) || name == "_" || name.strip_prefix('%').is_some_and(source_identifier)
+}
+
+fn source_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+        && !matches!(
+            name,
+            "_" | "let"
+                | "in"
+                | "type"
+                | "end"
+                | "with"
+                | "match"
+                | "fn"
+                | "effect"
+                | "handle"
+                | "raise"
+                | "and"
+                | "or"
+                | "xor"
+                | "not"
+                | "module"
+                | "true"
+                | "false"
+        )
+}
+
+fn validate_declarations(artifact: &Artifact, owner: &str) -> Result<(), LinkError> {
+    validate_declaration_names(
+        artifact
+            .header
+            .values
+            .iter()
+            .map(|declaration| declaration.name.as_str()),
+        DeclarationNamespace::Value,
+        owner,
+    )?;
+    validate_declaration_names(
+        artifact
+            .header
+            .types
+            .iter()
+            .map(|declaration| declaration.name.as_str()),
+        DeclarationNamespace::Type,
+        owner,
+    )?;
+    validate_declaration_names(
+        artifact
+            .header
+            .effects
+            .iter()
+            .map(|declaration| declaration.name.as_str()),
+        DeclarationNamespace::Effect,
+        owner,
+    )
+}
+
+fn validate_declaration_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    namespace: DeclarationNamespace,
+    owner: &str,
+) -> Result<(), LinkError> {
+    let mut seen = HashSet::new();
+    for name in names {
+        let Some(parsed_owner) = parse_qualified_owner(name) else {
+            return Err(LinkError::MalformedDeclaration {
+                namespace,
+                name: name.to_string(),
+            });
+        };
+        if parsed_owner != owner {
+            return Err(LinkError::WrongDeclarationOwner {
+                namespace,
+                name: name.to_string(),
+                owner: owner.to_string(),
+            });
+        }
+        if !seen.insert(name) {
+            return Err(LinkError::DuplicateDeclaration {
+                namespace,
+                name: name.to_string(),
+            });
+        }
     }
-    Ok(owner)
+    Ok(())
 }
 
 fn relocate_block(

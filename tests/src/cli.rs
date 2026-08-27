@@ -61,7 +61,7 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
         .map(|dependency| (dependency.name.as_str(), dependency.version.as_str()))
         .collect();
     assert_eq!(identities, [("zeta", "2.0.0"), ("alpha", "1.2.3-beta.1")]);
-    let built = graph.link().unwrap();
+    let built = compile(directory.path()).unwrap();
     assert_eq!(built.header.identity.name, "app");
     assert!(built.header.dependencies.is_empty());
     assert!(!directory.path().join("zeta/build/zeta.artifact").exists());
@@ -120,7 +120,13 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
         graph.projects.last().unwrap().artifact.header.dependencies[0].name,
         "http-core"
     );
-    assert!(graph.link().unwrap().header.dependencies.is_empty());
+    assert!(
+        compile(directory.path())
+            .unwrap()
+            .header
+            .dependencies
+            .is_empty()
+    );
 
     fs::write(
         directory.path().join("Ruddy.toml"),
@@ -864,6 +870,16 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
     let (dependencies, direct) =
         ruddy_cli::compile_dependency_graph([("left", &left), ("right", &right)]).unwrap();
     assert_eq!(dependencies.projects.len(), 3);
+    assert_eq!(
+        dependencies
+            .projects
+            .iter()
+            .map(|project| project.artifact.header.identity.name.as_str())
+            .collect::<Vec<_>>(),
+        ["shared", "left", "right"]
+    );
+    assert!(dependencies.projects[1].artifact.header.dependencies.len() == 1);
+    assert!(dependencies.projects[2].artifact.header.dependencies.len() == 1);
     assert_eq!(
         direct
             .iter()
