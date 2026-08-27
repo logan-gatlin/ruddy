@@ -508,10 +508,16 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
 }
 
 fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
+    #[derive(Clone, Copy)]
+    enum Suffix {
+        Integer,
+        Natural,
+    }
+
     let (digits, suffix) = match literal.strip_suffix('i') {
-        Some(digits) => (digits, Some('i')),
+        Some(digits) => (digits, Some(Suffix::Integer)),
         None => match literal.strip_suffix('n') {
-            Some(digits) => (digits, Some('n')),
+            Some(digits) => (digits, Some(Suffix::Natural)),
             None => (literal, None),
         },
     };
@@ -523,11 +529,11 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
         return Err(ErrorKind::MalformedNatural);
     }
     match suffix {
-        Some('n') => digits
+        Some(Suffix::Natural) => digits
             .parse()
             .map(Kind::Natural)
             .map_err(|_| ErrorKind::NaturalTooLarge),
-        Some('i') => digits
+        Some(Suffix::Integer) => digits
             .parse()
             .map(Kind::Integer)
             .map_err(|_| ErrorKind::NaturalTooLarge),
@@ -537,6 +543,5 @@ fn numeric(literal: &str) -> Result<Kind, ErrorKind> {
             .filter(|value| value.is_finite())
             .map(Kind::Real)
             .ok_or(ErrorKind::NaturalTooLarge),
-        _ => unreachable!(),
     }
 }

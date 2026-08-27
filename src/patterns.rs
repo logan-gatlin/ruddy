@@ -196,6 +196,23 @@ enum Mode {
     Exhaustiveness,
 }
 
+/// The primitive cores accepted by [`Check::scalars`]. Keeping this narrower
+/// than [`Core`] makes the scalar witness match exhaustive without an
+/// untestable fallback for cores its caller can never pass.
+#[derive(Clone, Copy)]
+enum Scalar {
+    Infinite(InfiniteScalar),
+    Boolean,
+}
+
+#[derive(Clone, Copy)]
+enum InfiniteScalar {
+    Nat,
+    Int,
+    Real,
+    String,
+}
+
 /// What a usefulness walk carries down its recursion: which question it is
 /// answering, and what the path to this point has assumed about the presences
 /// it passed through.
@@ -1265,9 +1282,19 @@ impl Check<'_> {
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
         match &ty.core {
-            Core::Nat | Core::Int | Core::Real | Core::String | Core::Boolean => {
-                self.scalars(rows, &ty.core, later, q, walk)
+            Core::Nat => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Nat), later, q, walk),
+            Core::Int => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Int), later, q, walk),
+            Core::Real => {
+                self.scalars(rows, Scalar::Infinite(InfiniteScalar::Real), later, q, walk)
             }
+            Core::String => self.scalars(
+                rows,
+                Scalar::Infinite(InfiniteScalar::String),
+                later,
+                q,
+                walk,
+            ),
+            Core::Boolean => self.scalars(rows, Scalar::Boolean, later, q, walk),
             Core::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
@@ -1288,7 +1315,7 @@ impl Check<'_> {
     fn scalars(
         &self,
         rows: &[Vec<Cell>],
-        core: &Core,
+        core: Scalar,
         later: &[Col],
         q: &[Cell],
         walk: &Walk,
@@ -1329,17 +1356,21 @@ impl Check<'_> {
                     }
                 }
 
-                if matches!(core, Core::Boolean) {
-                    // There are no values other than true and false. They
-                    // were each considered above if written, but ask both so
-                    // an empty matrix has the same finite universe.
-                    for value in [Literal::Boolean(false), Literal::Boolean(true)] {
-                        if let Some(wits) = ask(&value) {
-                            return Some(wits);
+                let core = match core {
+                    Scalar::Boolean => {
+                        // There are no boolean values other than true and
+                        // false. They were each considered above if written,
+                        // but ask both so an empty matrix has the same finite
+                        // universe.
+                        for value in [Literal::Boolean(false), Literal::Boolean(true)] {
+                            if let Some(wits) = ask(&value) {
+                                return Some(wits);
+                            }
                         }
+                        return None;
                     }
-                    return None;
-                }
+                    Scalar::Infinite(core) => core,
+                };
 
                 // The value outside every listed literal is accepted only by
                 // a wildcard. For naturals choose a printable one, preserving
@@ -1352,7 +1383,7 @@ impl Check<'_> {
                     .collect();
                 let wits = self.useful(&rows, later, &q[1..], walk)?;
                 let witness = match core {
-                    Core::Nat => {
+                    InfiniteScalar::Nat => {
                         let unlisted = (0..)
                             .find(|value| {
                                 !listed.iter().any(|literal| {
@@ -1362,24 +1393,23 @@ impl Check<'_> {
                             .expect("a finite set of naturals leaves one out");
                         Witness::Natural(unlisted)
                     }
-                    Core::Int => Witness::Literal(Literal::Integer(
+                    InfiniteScalar::Int => Witness::Literal(Literal::Integer(
                         (0..)
                             .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::Integer(found) if found == value)))
                             .expect("a finite set of integers leaves one out"),
                     )),
-                    Core::Real => Witness::Literal(Literal::Real(
+                    InfiniteScalar::Real => Witness::Literal(Literal::Real(
                         (0..)
                             .map(|value| value as f64)
                             .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::Real(found) if found.to_bits() == value.to_bits())))
                             .expect("a finite set of reals leaves one out"),
                     )),
-                    Core::String => Witness::Literal(Literal::String(
+                    InfiniteScalar::String => Witness::Literal(Literal::String(
                         (0..)
                             .map(|size| "\0".repeat(size))
                             .find(|value| !listed.iter().any(|literal| matches!(literal, Literal::String(found) if found == value)))
                             .expect("a finite set of strings leaves one out"),
                     )),
-                    _ => unreachable!("scalars is called only for scalar primitive cores"),
                 };
                 Some(std::iter::once(Some(witness)).chain(wits).collect())
             }

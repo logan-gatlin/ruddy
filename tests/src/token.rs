@@ -44,6 +44,9 @@ fn strings_finish_and_fail_at_every_boundary() {
     assert!(
         matches!(&kinds("\"hello\\nworld\"")[..], [Kind::String(value)] if value == "hello\nworld")
     );
+    assert!(
+        matches!(&kinds(r#""\"\\\n\r\t""#)[..], [Kind::String(value)] if value == "\"\\\n\r\t")
+    );
     for malformed in ["\"unterminated", "\"slash\\", "\"bad\\q\""] {
         assert_eq!(errors(malformed)[0].kind, ErrorKind::MalformedString);
     }

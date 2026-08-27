@@ -134,7 +134,7 @@ install:
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
 cov *args:
-    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug)/src/|/rustlib/' {{args}}
+    cargo +nightly llvm-cov --branch --workspace --ignore-filename-regex '/(tests|debug|cli)/src/|/rustlib/' {{args}}
 
 clippy:
     cargo clippy --workspace --all-targets

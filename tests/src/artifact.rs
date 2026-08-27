@@ -1,19 +1,24 @@
 //! Tests for the span-free, canonical bundle artifact.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    rc::Rc,
+};
 
+use indexmap::IndexMap;
 use ruddy::{
     artifact::{
         self, Artifact, Block, Callee, Core, End, Formula, Global, Instr, Lir, Literal, Op, Param,
         Presence, Rep, Rest, Row, RowField, Scheme, Type,
     },
     inference, ir, lir, parse, patterns,
-    symbol::{Bundle, Mint, Version},
+    symbol::{Bundle, Mint, Namespace, Version},
     token,
-    tracking::FileManager,
+    tracking::{FileManager, Span},
+    types,
 };
 
-fn built(source: &str) -> Artifact {
+fn compiled(source: &str) -> (Mint, ir::Program, inference::Output, lir::Output) {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
     let lexed = token::lex(source, file);
@@ -28,6 +33,11 @@ fn built(source: &str) -> Artifact {
     let checked = patterns::check(&program, &inferred);
     assert!(checked.errors.is_empty(), "{:#?}", checked.errors);
     let lowered = lir::lower(&mint, &program, &inferred);
+    (mint, program, inferred, lowered)
+}
+
+fn built(source: &str) -> Artifact {
+    let (mint, program, inferred, lowered) = compiled(source);
     Artifact::build(&mint, &program, &inferred, &lowered)
 }
 
@@ -381,6 +391,46 @@ fn assert_bad_replacement(text: &str, from: &str, to: &str) {
     assert_malformed(&malformed);
 }
 
+/// Replace the balanced list beginning at `needle`. This lets malformed model
+/// tests put an atom where a whole nested list normally sits without depending
+/// on the pretty-printer's line wrapping.
+fn replace_balanced(text: &str, needle: &str, replacement: &str) -> String {
+    let start = text
+        .find(needle)
+        .expect("missing balanced replacement path");
+    assert_eq!(text.as_bytes()[start], b'(');
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (offset, character) in text[start..].char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset + character.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.expect("replacement path is not a balanced list");
+    format!("{}{}{}", &text[..start], replacement, &text[end..])
+}
+
 /// Collapse layout whitespace without touching quoted strings. Malformed-input
 /// tests target grammar tags rather than the pretty-printer's line choices.
 fn compact(text: &str) -> String {
@@ -519,6 +569,294 @@ fn dependencies_round_trip_in_canonical_text() {
 #[test]
 fn every_semantic_type_scheme_and_lir_variant_round_trips() {
     assert_round_trip(&model_artifact());
+}
+
+#[test]
+fn building_translates_every_compiler_semantic_and_lir_variant() {
+    let (mut mint, program, mut inferred, _) = compiled(
+        "type OpenCases 'r = #A | ..'r\n\
+         type Runner 'e = Nat -> Nat + ..'e\n\
+         let value = 0\n",
+    );
+    let symbol = *program.terms.keys().next().expect("source has one term");
+    let type_symbol = *program
+        .types
+        .keys()
+        .next()
+        .expect("source has declared types");
+    mint.register_external(type_symbol, "dependency@1.0.0::OpenCases");
+    let local_symbol = mint.local(None, Namespace::Terms, "wildcard");
+    let compiler_plain = |core| Rc::new(types::Ty::plain(core));
+    let compiler_field = |presence, core| types::RowField {
+        presence,
+        ty: compiler_plain(core),
+    };
+
+    let mut fields = IndexMap::new();
+    fields.insert(
+        "int".to_string(),
+        compiler_field(types::Presence::Var(0), types::Core::Int),
+    );
+    fields.insert(
+        "real".to_string(),
+        compiler_field(types::Presence::Undecided, types::Core::Real),
+    );
+    fields.insert(
+        "boolean".to_string(),
+        compiler_field(types::Presence::Absent, types::Core::Boolean),
+    );
+    fields.insert(
+        "var".to_string(),
+        compiler_field(types::Presence::Present, types::Core::Var(1)),
+    );
+    fields.insert(
+        "rigid".to_string(),
+        compiler_field(
+            types::Presence::Bound(2),
+            types::Core::Rigid {
+                id: 3,
+                name: Rc::from("rigid"),
+            },
+        ),
+    );
+    fields.insert(
+        "var-rest".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Core::Sum(types::Row::of(types::Rest::Var(4))),
+        ),
+    );
+    fields.insert(
+        "bound-rest".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Core::Sum(types::Row::of(types::Rest::Bound(5))),
+        ),
+    );
+    fields.insert(
+        "undecided-rest".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Core::Sum(types::Row::of(types::Rest::Undecided)),
+        ),
+    );
+    fields.insert(
+        "named".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Core::Named {
+                symbol: type_symbol,
+                name: Rc::from("OpenCases"),
+                args: vec![compiler_plain(types::Core::Undecided)].into(),
+            },
+        ),
+    );
+
+    let mut inner_labels = IndexMap::new();
+    inner_labels.insert(
+        "effect".to_string(),
+        compiler_field(types::Presence::Present, types::Core::String),
+    );
+    let inner_row = types::Row {
+        labels: inner_labels,
+        rest: types::Rest::Rigid {
+            id: 5,
+            name: Rc::from("effects"),
+        },
+    };
+    let effects = types::Row::of(types::Rest::More(Rc::new(inner_row)));
+    let body = Rc::new(types::Ty {
+        core: types::Core::Arrow(
+            compiler_plain(types::Core::Int),
+            compiler_plain(types::Core::Real),
+            effects,
+        ),
+        fields,
+    });
+    let formula = types::Formula::Iff(
+        Rc::new(types::Formula::False),
+        Rc::new(types::Formula::Xor(
+            Rc::new(types::Formula::Atom(types::Atom::Var(6))),
+            Rc::new(types::Formula::And(
+                Rc::new(types::Formula::True),
+                Rc::new(types::Formula::Or(
+                    Rc::new(types::Formula::Atom(types::Atom::Bound(0))),
+                    Rc::new(types::Formula::Not(Rc::new(types::Formula::False))),
+                )),
+            )),
+        )),
+    );
+    inferred
+        .schemes
+        .insert(symbol, types::Scheme::constrained(7, 1, body, formula));
+
+    let span = Span::default();
+    let nested = |kind| lir::Block {
+        instrs: Vec::new(),
+        end: lir::Terminator { span, kind },
+    };
+    let yielded = nested(lir::End::Yield(90));
+    let thrown = nested(lir::End::Throw { tag: 91, value: 92 });
+    let ops = vec![
+        lir::Op::Const(ir::Literal::Natural(u64::MAX)),
+        lir::Op::Const(ir::Literal::Integer(i64::MIN)),
+        lir::Op::Const(ir::Literal::Real(-0.0)),
+        lir::Op::Const(ir::Literal::String("text".to_string())),
+        lir::Op::Const(ir::Literal::Boolean(false)),
+        lir::Op::Neg(1),
+        lir::Op::Not(2),
+        lir::Op::And { left: 1, right: 2 },
+        lir::Op::Or { left: 1, right: 2 },
+        lir::Op::Xor { left: 1, right: 2 },
+        lir::Op::Add { left: 1, right: 2 },
+        lir::Op::Sub { left: 1, right: 2 },
+        lir::Op::Mul { left: 1, right: 2 },
+        lir::Op::Div { left: 1, right: 2 },
+        lir::Op::Struct(IndexMap::from([("x".to_string(), 1)])),
+        lir::Op::Merge(vec![1, 2]),
+        lir::Op::Project {
+            base: 1,
+            field: "x".to_string(),
+        },
+        lir::Op::Tag {
+            name: "None".to_string(),
+            payload: None,
+        },
+        lir::Op::Tag {
+            name: "Some".to_string(),
+            payload: Some(2),
+        },
+        lir::Op::Payload(2),
+        lir::Op::Closure {
+            func: 0,
+            captures: vec![1, 2],
+        },
+        lir::Op::Call {
+            callee: lir::Callee::Direct(0),
+            args: vec![1],
+        },
+        lir::Op::Call {
+            callee: lir::Callee::Indirect(2),
+            args: vec![3],
+        },
+        lir::Op::Global {
+            symbol,
+            name: "value".to_string(),
+        },
+        lir::Op::NewTag,
+        lir::Op::Catch {
+            tag: 1,
+            body: Box::new(thrown.clone()),
+        },
+        lir::Op::SwitchTag {
+            on: 1,
+            cases: vec![lir::TagCase {
+                name: "A".to_string(),
+                block: yielded.clone(),
+            }],
+            fallback: Some(Box::new(thrown.clone())),
+        },
+        lir::Op::SwitchPrim {
+            on: 1,
+            cases: vec![lir::PrimCase {
+                value: ir::Literal::Boolean(true),
+                block: yielded.clone(),
+            }],
+            fallback: Some(Box::new(thrown.clone())),
+        },
+        lir::Op::SwitchPresence {
+            on: 1,
+            field: "x".to_string(),
+            present: Box::new(yielded.clone()),
+            absent: Box::new(thrown.clone()),
+        },
+        lir::Op::SwitchRest {
+            on: 1,
+            fields: vec!["x".to_string()],
+            none: Box::new(yielded.clone()),
+            some: Box::new(thrown.clone()),
+        },
+    ];
+    let reps = [
+        lir::Rep::Nat,
+        lir::Rep::Int,
+        lir::Rep::Real,
+        lir::Rep::String,
+        lir::Rep::Boolean,
+        lir::Rep::Unit,
+        lir::Rep::Struct,
+        lir::Rep::Sum,
+        lir::Rep::Fn,
+        lir::Rep::Any,
+    ];
+    let lowered = lir::Output {
+        externs: Vec::new(),
+        functions: vec![lir::Function {
+            name: "all".to_string(),
+            params: reps
+                .iter()
+                .enumerate()
+                .map(|(temp, rep)| lir::Param {
+                    temp: temp as u32,
+                    rep: *rep,
+                })
+                .collect(),
+            body: lir::Block {
+                instrs: ops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(temp, op)| lir::Instr {
+                        temp: temp as u32,
+                        rep: reps[temp % reps.len()],
+                        span,
+                        op,
+                    })
+                    .collect(),
+                end: lir::Terminator {
+                    span,
+                    kind: lir::End::Ret(0),
+                },
+            },
+            span,
+        }],
+        globals: vec![
+            lir::Global {
+                symbol,
+                name: "value".to_string(),
+                body: thrown.clone(),
+                span,
+            },
+            lir::Global {
+                symbol: local_symbol,
+                name: "wildcard".to_string(),
+                body: thrown,
+                span,
+            },
+        ],
+    };
+
+    let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+    assert_round_trip(&artifact);
+}
+
+#[test]
+fn building_rejects_a_pending_effect_identity() {
+    let (mint, mut program, inferred, lowered) = compiled("effect Log = write : Nat -> ()\n");
+    let symbol = *program
+        .effects
+        .keys()
+        .next()
+        .expect("source has one effect");
+    program
+        .effect_ids
+        .insert(symbol, types::EffectId::pending(symbol));
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            Artifact::build(&mint, &program, &inferred, &lowered)
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -683,6 +1021,70 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
     ] {
         assert_bad_replacement(&valid, from, to);
     }
+}
+
+#[test]
+fn malformed_text_exercises_every_parser_and_reader_error_shape() {
+    let valid = compact(&model_artifact().print());
+
+    // A parsed root can itself be a string or atom, and text after a complete
+    // root is a distinct syntax error from text inside that root.
+    assert_malformed("\"root\"");
+    assert_malformed("root");
+    assert_malformed(&format!("{valid} trailing"));
+    assert_malformed("\"truncated\\");
+    assert_malformed("\"\\u001");
+
+    // Invalid values of each S-expression shape reach reader paths that a tag
+    // miss or arity error does not.
+    assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
+    assert_malformed(&replace_balanced(
+        &valid,
+        "(operations (operation",
+        "operations",
+    ));
+    assert_malformed(&replace_balanced(&valid, "(named \"other@", "(named)"));
+    assert_bad_replacement(&valid, "(ty unit (fields", "(ty \"wrong\" (fields");
+    assert_bad_replacement(&valid, "field present", "field (wrong)");
+    assert_bad_replacement(&valid, " 7 true ", " 7 \"wrong\" ");
+    assert_bad_replacement(&valid, " 7 true ", " 7 wrong ");
+
+    // Recursive LIR collections distinguish malformed entries, both optional
+    // block cardinalities, and a non-list call target.
+    let fallback_block = "(block (instrs) (throw 97 96))";
+    assert_bad_replacement(
+        &valid,
+        &format!("(fallback {fallback_block})"),
+        &format!("(fallback {fallback_block} {fallback_block})"),
+    );
+    let without_tag_fallback =
+        valid.replacen(&format!("(fallback {fallback_block})"), "(fallback)", 1);
+    assert_ne!(without_tag_fallback, valid);
+    assert!(Artifact::try_parse(&without_tag_fallback).is_ok());
+    assert_malformed(&replace_balanced(&valid, "(\"A\" (block", "bad-tag-case"));
+    assert_malformed(&replace_balanced(
+        &valid,
+        "((bool false) (block",
+        "bad-primitive-case",
+    ));
+    assert_bad_replacement(&valid, "(direct 0)", "bad-call-target");
+    assert_bad_replacement(&valid, "(tag \"Case\")", "(tag)");
+    assert_malformed(&replace_balanced(
+        &valid,
+        "(\"present\" (field",
+        "bad-type-field",
+    ));
+    assert_malformed(&replace_balanced(
+        &valid,
+        "(\"label\" (field",
+        "bad-row-label",
+    ));
+    assert_malformed(&replace_balanced(
+        &valid,
+        "(\"first\" 1)",
+        "bad-struct-entry",
+    ));
+    assert_bad_replacement(&valid, "new-tag", "(())");
 }
 
 #[test]

@@ -651,19 +651,15 @@ impl Solve<'_> {
         let mut inputs = IndexSet::new();
         self.table.presences_in(result, &mut outputs);
         self.table.presences_in(scrutinee, &mut inputs);
+        // `presences_in` canonicalizes each presence before collecting it, so
+        // both sets contain only still-unbound variables. Relating an output to
+        // an input binds the output to the input, never the other way round, so
+        // the input set remains canonical throughout this loop.
         for output in outputs {
-            let output = match self.table.presence_of(&Presence::Var(output)) {
-                Presence::Var(output) => output,
-                _ => continue,
-            };
             for input in &inputs {
-                let input = match self.table.presence_of(&Presence::Var(*input)) {
-                    Presence::Var(input) => input,
-                    _ => continue,
-                };
-                let equal = Formula::var(output).iff(Formula::var(input));
+                let equal = Formula::var(output).iff(Formula::var(*input));
                 if crate::inference::sat::entails(&known, &equal) {
-                    self.presences(span, &Presence::Var(output), &Presence::Var(input));
+                    self.presences(span, &Presence::Var(output), &Presence::Var(*input));
                     break;
                 }
             }
@@ -1474,22 +1470,15 @@ impl Solve<'_> {
     /// answer with different machinery.
     fn tails(&mut self, span: Span, lhs: &Tail, rhs: &Tail) {
         match (lhs, rhs) {
-            // Both rows, whichever of the two readings: what is past a set of
-            // labels is a row either way, and which shape it was is the
-            // wording's business rather than the rule's.
-            (
-                Tail::Rest(left) | Tail::Effects { rest: left, .. },
-                Tail::Rest(right) | Tail::Effects { rest: right, .. },
-            ) => {
-                // Which reading the pair is, for the one complaint down there
-                // that quotes it: a rigid rest broken in a sum is quoted as the
-                // sum it refused, and one broken in an effect row as the arrow
-                // that would carry it.
-                let shape = match (lhs, rhs) {
-                    (Tail::Effects { .. }, _) | (_, Tail::Effects { .. }) => Shape::Effect,
-                    _ => Shape::Sum,
-                };
-                self.rests(span, left, right, shape);
+            // What is past either kind of row is a row again. Kept as two arms
+            // because the two sides always have one shape: a mixed sum/effect
+            // pair cannot be produced, and treating the four pattern
+            // alternatives as a cartesian product would suggest otherwise.
+            (Tail::Rest(left), Tail::Rest(right)) => {
+                self.rests(span, left, right, Shape::Sum);
+            }
+            (Tail::Effects { rest: left, .. }, Tail::Effects { rest: right, .. }) => {
+                self.rests(span, left, right, Shape::Effect);
             }
             // Two cores, and nothing else can reach here: which shape a set of
             // labels is, is decided by the syntax that wrote it, and the two
@@ -2083,10 +2072,13 @@ impl Solve<'_> {
         // core/tail shape, but no presence constant or alias from this arm may
         // hitch a ride and become global. Give every such slot a shared fresh
         // presence and relate it to the arm's view under the premise.
-        let value = if self.guard.is_some() {
-            self.guarded_value(span, &value)
-        } else {
-            value
+        let value = match (self.guard.is_some(), value) {
+            (true, Assigned::Ty(ty)) => Assigned::Ty(self.guarded_type(span, &ty)),
+            (true, Assigned::Row(row)) => Assigned::Row(Rc::new(self.guarded_row(span, &row))),
+            // Direct presence equality is intercepted by `presences`, so a
+            // guarded assignment never has a presence value to abstract. The
+            // fallback is also the ordinary, unguarded assignment path.
+            (_, value) => value,
         };
         if let Some((shape, named)) = self.table.lacked(var, &value) {
             // One complaint per binding, not per label: a tail that would have
@@ -2129,16 +2121,6 @@ impl Solve<'_> {
         self.table.demote(var, &value);
         self.table.vars[var as usize] = Slot::Bound(value.clone());
         self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
-    }
-
-    fn guarded_value(&mut self, span: Span, value: &Assigned) -> Assigned {
-        match value {
-            Assigned::Ty(ty) => Assigned::Ty(self.guarded_type(span, ty)),
-            Assigned::Row(row) => Assigned::Row(Rc::new(self.guarded_row(span, row))),
-            // Direct presence equality is intercepted by `presences`, so an
-            // assignment of this sort carries no structural slots to abstract.
-            Assigned::Presence(presence) => Assigned::Presence(presence.clone()),
-        }
     }
 
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {

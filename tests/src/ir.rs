@@ -3107,6 +3107,24 @@ fn a_sole_catch_all_keeps_its_shape() {
     );
 }
 
+/// Refining a later tag compares it with every earlier arm, including scalar
+/// tests nested in other tags. Each primitive keeps its exact representation
+/// while the matrix asks which cases remain possible.
+#[test]
+fn matrix_refinement_reads_every_nested_scalar_pattern() {
+    let (mint, mut out) = built(
+        "let f = fn value => match value with \
+         | #Integer 1i => 0n \
+         | #Real 1.5 => 0n \
+         | #String \"x\" => 0n \
+         | #Done x => 0n \
+         | rest => 0n \
+         end",
+    );
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
 /// The empty match survives as a match with no arms: the empty sum's
 /// eliminator, with nothing for the matrix checks to say — no value exists
 /// to go unhandled.
@@ -5401,6 +5419,63 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
 }
 
 #[test]
+fn recovery_signatures_keep_every_normalized_source_form_structural() {
+    let src = "effect IO = run : () -> ()\n\
+               type Record 'r = { value: Nat, \\hidden, ..'r }\n\
+               type Choice 'r = #Some Nat | #None | \\#Hidden | ..'r\n\
+               type Runner 'e = () -> () + \\!IO + ..'e\n\
+               effect Alias = !IO\n\
+               effect CycleA = !CycleB\n\
+               effect CycleB = !CycleA\n\
+               effect Probe =\n\
+                 record : Record { extra: String } -> ()\n\
+               | choice : Choice (#Other Boolean) -> ()\n\
+               | runner : Runner (!IO) -> ()\n\
+               | anonymous : (() -> () + !IO (when _)) -> ()\n\
+               | named : (() -> () + !IO (when 'p)) -> ()\n\
+               | aliased : (() -> () + !Alias) -> ()\n\
+               | recursive : (() -> () + !Probe) -> ()\n\
+               let uses_alias : () -> () + !Alias = fn x => x";
+    let (mint, out) = build_src(src);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    assert!(
+        out.program
+            .effect_ids
+            .keys()
+            .any(|symbol| mint.name(*symbol) == "Probe"),
+        "recovery still gives the malformed signatures an identity"
+    );
+
+    let TypeKind::Arrow { effects, .. } = &out.program.types[&type_symbol(&mint, &out, "Runner")]
+        .value
+        .tracked
+    else {
+        panic!("Runner is an arrow");
+    };
+    let absent = effects
+        .effects
+        .values()
+        .next()
+        .expect("the absent IO label");
+    assert!(!absent.expanded());
+    assert!(absent.name_span().width > 0);
+
+    let TypeKind::Arrow { effects, .. } = &annotation_of(&mint, &out, "uses_alias").ty.tracked
+    else {
+        panic!("uses_alias is an arrow");
+    };
+    let expanded = effects.effects.values().next().expect("expanded IO label");
+    assert!(expanded.expanded());
+    assert!(expanded.name_span().width > 0);
+}
+
+#[test]
 fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
     let src = "type Record 'r = { x: Nat, ..'r }\n\
                type Cases 'r = #X | ..'r\n\
@@ -5856,21 +5931,233 @@ fn imported_effects_in_recovery_signatures_compare_structurally() {
 }
 
 #[test]
+fn imported_declared_types_exercise_every_semantic_identity_form() {
+    let field = |presence, ty| a::RowField { presence, ty };
+    let unit = || artifact_type(a::Core::Unit);
+    let row_type = |name: &str, labels, rest| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_type(a::Core::Sum(a::Row { labels, rest }))),
+    };
+    let declared = |name: &str, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(body),
+    };
+    let mut types = vec![
+        declared("Int", artifact_type(a::Core::Int)),
+        declared("Real", artifact_type(a::Core::Real)),
+        declared("Boolean", artifact_type(a::Core::Boolean)),
+        declared("Var", artifact_type(a::Core::Var(7))),
+        declared(
+            "Rigid",
+            artifact_type(a::Core::Rigid {
+                id: 8,
+                name: "rigid".into(),
+            }),
+        ),
+        declared("Undecided", artifact_type(a::Core::Undecided)),
+        declared("Bound", artifact_type(a::Core::Bound(10))),
+        declared(
+            "Arrow",
+            artifact_type(a::Core::Arrow(
+                Box::new(artifact_type(a::Core::Int)),
+                Box::new(artifact_type(a::Core::Boolean)),
+                a::Row {
+                    labels: vec![(
+                        "IO\u{1f}run:{}->{}".into(),
+                        field(a::Presence::Present, unit()),
+                    )],
+                    rest: a::Rest::Closed,
+                },
+            )),
+        ),
+        declared(
+            "Fields",
+            a::Type {
+                core: a::Core::Unit,
+                fields: vec![
+                    ("variable".into(), field(a::Presence::Var(1), unit())),
+                    ("bound".into(), field(a::Presence::Bound(2), unit())),
+                    ("unknown".into(), field(a::Presence::Undecided, unit())),
+                ],
+            },
+        ),
+        row_type(
+            "RowPresences",
+            vec![
+                ("Variable".into(), field(a::Presence::Var(3), unit())),
+                ("Bound".into(), field(a::Presence::Bound(4), unit())),
+                ("Unknown".into(), field(a::Presence::Undecided, unit())),
+            ],
+            a::Rest::Closed,
+        ),
+        row_type("RowVar", Vec::new(), a::Rest::Var(5)),
+        row_type("RowBound", Vec::new(), a::Rest::Bound(6)),
+        row_type(
+            "RowRigid",
+            Vec::new(),
+            a::Rest::Rigid {
+                id: 9,
+                name: "tail".into(),
+            },
+        ),
+        row_type("RowUnknown", Vec::new(), a::Rest::Undecided),
+    ];
+    // A malformed semantic row-composition cycle is still finite: flattening
+    // visits the self edge once rather than recursing forever.
+    types.push(declared(
+        "RowCycle",
+        a::Type {
+            core: a::Core::Named {
+                name: "dep@1.0.0::RowCycle".into(),
+                args: Vec::new(),
+            },
+            fields: vec![("x".into(), field(a::Presence::Present, unit()))],
+        },
+    ));
+    types.push(declared(
+        "BareCycle",
+        artifact_type(a::Core::Named {
+            name: "dep@1.0.0::BareCycle".into(),
+            args: Vec::new(),
+        }),
+    ));
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types,
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "effect Probe = inspect : {\n\
+                 int: dep::Int, real: dep::Real, boolean: dep::Boolean,\n\
+                 variable: dep::Var, rigid: dep::Rigid, unknown: dep::Undecided,\n\
+                 bound: dep::Bound, arrow: dep::Arrow,\n\
+                 fields: dep::Fields, presences: dep::RowPresences,\n\
+                 row_var: dep::RowVar, row_bound: dep::RowBound,\n\
+                 row_rigid: dep::RowRigid, row_unknown: dep::RowUnknown,\n\
+                 cycle: dep::RowCycle, bare_cycle: dep::BareCycle\n\
+               } -> ()";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    assert_eq!(out.program.effect_ids.len(), 1);
+}
+
+#[test]
+fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
+    let mut dependency = effect_artifact("dep", "read:{}->Nat");
+    let value = a::Value {
+        name: "dep@1.0.0::answer".into(),
+        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+    };
+    dependency.header.values = vec![value.clone(), value];
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+    });
+    dependency.header.types.push(a::DeclaredType {
+        name: "other@1.0.0::Ignored".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+    });
+    dependency.header.effects.push(a::DeclaredEffect {
+        name: "other@1.0.0::Ignored".into(),
+        identity: Some(a::EffectIdentity {
+            name: "Ignored".into(),
+            interface: String::new(),
+        }),
+        kind: a::EffectKind::Operations(Vec::new()),
+    });
+    let parsed = parse::parse(lex("let value = dep::answer", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(out.program.external_schemes.len(), 1);
+    assert!(
+        out.program
+            .external_names
+            .values()
+            .all(|name| !name.contains("Ignored"))
+    );
+}
+
+#[test]
+fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: Vec::new(),
+            effects: [("A", "dep@1.0.0::B"), ("B", "dep@1.0.0::A")]
+                .into_iter()
+                .map(|(name, target)| a::DeclaredEffect {
+                    name: format!("dep@1.0.0::{name}"),
+                    identity: None,
+                    kind: a::EffectKind::Alias(vec![target.into()]),
+                })
+                .collect(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "type Runner = () -> () + dep::!A\n\
+               effect Probe = op : Runner -> ()\n\
+               effect Local = dep::!A";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(out.program.effect_ids.len(), 1);
+    assert!(matches!(effect_of(&mint, &out, "Local"), Effect::Alias(_)));
+}
+
+#[test]
 fn ir_dependency_aliases_reject_reserved_identifiers() {
     let dependency = effect_artifact("dep", "read:{}->Nat");
-    let import = DependencyImport {
-        alias: "let",
+    let imports = ["let", "1dep", "a-b"].map(|alias| DependencyImport {
+        alias,
         artifact: &dependency,
-    };
+    });
     let mut mint = dummy_mint();
-    let out = build_with_dependency_imports(&mut mint, Vec::new(), &[import], &[]);
-    assert!(matches!(
-        out.errors.as_slice(),
-        [ruddy::ir::Error {
-            kind: ErrorKind::InvalidDependencyAlias { alias },
-            ..
-        }] if alias == "let"
-    ));
+    let out = build_with_dependency_imports(&mut mint, Vec::new(), &imports, &[]);
+    assert_eq!(out.errors.len(), 3);
+    for (error, alias) in out.errors.iter().zip(["let", "1dep", "a-b"]) {
+        assert!(matches!(
+            error,
+            ruddy::ir::Error {
+                kind: ErrorKind::InvalidDependencyAlias { alias: found },
+                ..
+            } if found == alias
+        ));
+    }
 }
 
 #[test]

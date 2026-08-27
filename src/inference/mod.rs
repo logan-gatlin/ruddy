@@ -1544,11 +1544,19 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
 /// model. The other two are inference's own, and both are about a contradiction
 /// unification could never have found — each half is consistent, and only the
 /// two together are not.
-fn unguarded_origin(mut origin: &Origin) -> &Origin {
-    while let Origin::Guarded(guarded) = origin {
-        origin = &guarded.origin;
+enum UnguardedOrigin<'a> {
+    Coverage,
+    Annotation(&'a Named),
+    Required(&'a Named),
+}
+
+fn unguarded_origin(origin: &Origin) -> UnguardedOrigin<'_> {
+    match origin {
+        Origin::Coverage(_) => UnguardedOrigin::Coverage,
+        Origin::Annotation(named) => UnguardedOrigin::Annotation(named),
+        Origin::Instance(named) | Origin::Refinement(named) => UnguardedOrigin::Required(named),
+        Origin::Guarded(guarded) => unguarded_origin(&guarded.origin),
     }
-    origin
 }
 
 fn unguarded_formula<'a>(origin: &'a Origin, formula: &'a Formula) -> &'a Formula {
@@ -1570,8 +1578,8 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
     let batch = table.store.batches[at].clone();
     let base = unguarded_origin(&batch.origin);
     let kind = match base {
-        Origin::Coverage(_) => return,
-        Origin::Instance(named) | Origin::Annotation(named) | Origin::Refinement(named) => {
+        UnguardedOrigin::Coverage => return,
+        UnguardedOrigin::Annotation(named) => {
             // Which of the two annotation complaints it is: a clause with no
             // model of its own is wrong by itself, and the body under it —
             // which may do nothing with the type at all — has no part in it.
@@ -1583,13 +1591,15 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
             // check is one of the fixed boundaries where SAT may run.
             let alone = sat::satisfiable(unguarded_formula(&batch.origin, &batch.formula));
             let formula = crate::ui::in_labels(&batch.formula, &named.labels);
-            match base {
-                Origin::Annotation(_) if alone => ErrorKind::PresenceImpossible { formula },
-                Origin::Annotation(_) => ErrorKind::ClauseImpossible { formula },
-                _ => ErrorKind::PresenceRequired { formula },
+            match alone {
+                true => ErrorKind::PresenceImpossible { formula },
+                false => ErrorKind::ClauseImpossible { formula },
             }
         }
-        Origin::Guarded(_) => unreachable!("guarded origins are unwrapped recursively"),
+        UnguardedOrigin::Required(named) => {
+            let formula = crate::ui::in_labels(&batch.formula, &named.labels);
+            ErrorKind::PresenceRequired { formula }
+        }
     };
     errors.push(Error {
         span: batch.span,
@@ -2225,8 +2235,13 @@ impl Table {
     /// arm, which is the one caller and the whole of the rule.
     fn aim(&mut self, from: usize, at: Span, span: Span) {
         for batch in &mut self.store.batches[from..] {
-            if matches!(batch.origin, Origin::Instance(_)) && batch.span == at {
-                batch.span = span;
+            match batch {
+                Batch {
+                    origin: Origin::Instance(_),
+                    span: batch_span,
+                    ..
+                } if *batch_span == at => *batch_span = span,
+                _ => {}
             }
         }
     }
@@ -2617,9 +2632,10 @@ impl Table {
         ty
     }
 
-    /// Every nested struct-field path a type names and the presence deciding
-    /// it. Unlike diagnostic labels, paths retain their parents so `x.a` and
-    /// `y.a` remain two readable facts in a refinement trace.
+    /// Every nested struct-field path a match demand names and the presence
+    /// deciding it. Unlike diagnostic labels, paths retain their parents so
+    /// `x.a` and `y.a` remain two readable facts in a refinement trace. Match
+    /// demands are structural, so a declared name cannot reach this walk.
     fn presence_paths(&self, ty: &Rc<Ty>, prefix: &str, found: &mut IndexMap<String, Presence>) {
         let ty = self.resolve(ty);
         for (name, field) in &ty.fields {
@@ -2633,11 +2649,6 @@ impl Table {
             self.presence_paths(&field.ty, &path, found);
         }
         match &ty.core {
-            Core::Named { args, .. } => {
-                for arg in args.iter() {
-                    self.presence_paths(arg, prefix, found);
-                }
-            }
             Core::Arrow(_, _, _)
             | Core::Sum(_)
             | Core::Unit
@@ -2649,6 +2660,7 @@ impl Table {
             | Core::Var(_)
             | Core::Bound(_)
             | Core::Rigid { .. }
+            | Core::Named { .. }
             | Core::Undecided => {}
         }
     }

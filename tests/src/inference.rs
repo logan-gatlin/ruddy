@@ -5333,6 +5333,71 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
 }
 
 #[test]
+fn structural_families_ignore_unknown_core_contributors() {
+    inferred(
+        "type Box 'a = { value: 'a }\n\
+         let boxed : Box Nat = { value: 1n }\n\
+         let arrows = fn v => match v with\n\
+         | {x} => fn z => z | {y} => y end\n\
+         let sums = fn v => match v with\n\
+         | {x} => #A x | {y} => y end\n\
+         let names = fn v => match v with\n\
+         | {x} => boxed | {y} => y end",
+    );
+}
+
+#[test]
+fn failed_nominal_congruence_rolls_back_active_refinement_state() {
+    let (_, _, output) = infer_src(
+        "type Pair 'a 'b = { first: 'a, second: 'b }\n\
+         let take : Pair Nat Nat -> Nat = fn p => p.first\n\
+         let wrong : Pair Nat {} = { first: 1n, second: {} }\n\
+         let f = fn v => match v with\n\
+         | {x} => take wrong | {y} => 0n end",
+    );
+
+    assert_eq!(output.refinements.len(), 2);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Pair Nat Nat`, found `Pair Nat {}`"
+    );
+}
+
+#[test]
+fn an_undecided_presence_survives_guarded_local_instantiation() {
+    let (_, out, output) = infer_src(
+        "let f =\n\
+         let bad : { y when 'a: Nat } = nope in\n\
+         fn v => match v with | {x} => bad | {z} => {} end",
+    );
+
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
+fn a_guarded_presence_clash_becomes_a_false_obligation() {
+    let (_, _, output) = infer_src(
+        "let absent : { \\a, .. } = {}\n\
+         let need : { a: Nat } -> Nat = fn r => r.a\n\
+         let f = fn v => match v with | {x} => need absent | {y} => 0n end",
+    );
+
+    assert!(
+        output.steps.iter().any(|step| {
+            matches!(
+                &step.effect,
+                Effect::Guarded { obligation, .. } if matches!(obligation, Formula::False)
+            )
+        }),
+        "steps: {:#?}\nerrors: {:#?}",
+        output.steps,
+        output.errors
+    );
+}
+
+#[test]
 fn a_shared_tail_respects_guarded_absence_without_an_occurs_error() {
     inferred(
         "let compare : { x when 'a: Nat, ..'r } -> { ..'r } -> {} = fn a b => {}\n\
@@ -7008,6 +7073,22 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
     );
     assert_eq!(output.errors.len(), 1);
     assert!(output.errors[0].kind.to_string().contains("String"));
+}
+
+#[test]
+fn an_impossible_extern_clause_is_refused_at_the_declaration() {
+    let src = "extern impossible : { x when 'x: Nat } where 'x and not 'x = host.impossible";
+    let (_, out, output) = infer_src(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "clause-impossible");
+    assert_eq!(
+        error.span.start,
+        src.find("{ x when").expect("the annotation")
+    );
 }
 
 #[test]

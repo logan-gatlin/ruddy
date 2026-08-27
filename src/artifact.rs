@@ -478,13 +478,10 @@ pub fn build_with_dependencies(
                     .params
                     .iter()
                     .map(|param| Parameter {
-                        sense: match param.kind.sense() {
-                            types::Sense::Type => Sense::Type,
-                            types::Sense::Cases => Sense::Cases,
-                            types::Sense::Effects => Sense::Effects,
-                            types::Sense::Presence => {
-                                panic!("a type parameter cannot be a presence")
-                            }
+                        sense: match &param.kind {
+                            types::ParamKind::Type { .. } => Sense::Type,
+                            types::ParamKind::Cases { .. } => Sense::Cases,
+                            types::ParamKind::Effects { .. } => Sense::Effects,
                         },
                         lacks: param.kind.lacks().iter().cloned().collect(),
                         relevant: param.relevant,
@@ -1446,7 +1443,6 @@ pub mod text {
             // lists on the heap lets a valid artifact be as deep as memory
             // permits and lets malformed deep input fail normally.
             let mut lists: Vec<Vec<S>> = Vec::new();
-            let mut root = None;
             loop {
                 self.space();
                 match self.peek() {
@@ -1463,10 +1459,8 @@ pub mod text {
                         let value = L(values);
                         if let Some(parent) = lists.last_mut() {
                             parent.push(value);
-                        } else if root.replace(value).is_some() {
-                            return Err(ParseError::syntax("trailing artifact text", close_at));
                         } else {
-                            return Ok(root.expect("root was just installed"));
+                            return Ok(value);
                         }
                     }
                     Some('"') => {
@@ -1495,7 +1489,7 @@ pub mod text {
             }
         }
         fn peek(&self) -> Option<char> {
-            self.input.get(self.at..)?.chars().next()
+            self.input[self.at..].chars().next()
         }
         fn atom(&mut self) -> S {
             let start = self.at;
@@ -1581,26 +1575,6 @@ pub mod text {
         match &mut value {
             L(values) => Some(std::mem::take(values)),
             _ => None,
-        }
-    }
-
-    fn plain_fallback() -> Type {
-        Type {
-            core: Core::Undecided,
-            fields: Vec::new(),
-        }
-    }
-    fn row_fallback() -> Row {
-        Row {
-            labels: Vec::new(),
-            rest: Rest::Undecided,
-        }
-    }
-
-    fn block_fallback() -> Block {
-        Block {
-            instrs: Vec::new(),
-            end: End::Ret(0),
         }
     }
 
@@ -1996,15 +1970,15 @@ pub mod text {
                 BuildMore,
                 BuildField(Presence),
             }
-            enum Out {
-                Ty(Type),
-                Core(Core),
-                Row(Row),
-                Rest(Rest),
-                Field(RowField),
-            }
             let mut tasks = vec![Task::Ty(value)];
-            let mut out = Vec::new();
+            // Each task has one statically known result sort. Keep those sorts
+            // on separate stacks so an impossible internal mismatch is not
+            // modeled as malformed artifact input with a semantic fallback.
+            let mut tys = Vec::new();
+            let mut cores = Vec::new();
+            let mut rows = Vec::new();
+            let mut rests = Vec::new();
+            let mut fields_out = Vec::new();
             while let Some(task) = tasks.pop() {
                 match task {
                     Task::Ty(value) => {
@@ -2027,7 +2001,7 @@ pub mod text {
                         tasks.push(Task::Core(core));
                     }
                     Task::Core(mut value) => match &mut value {
-                        A(value) => out.push(Out::Core(match value.as_str() {
+                        A(value) => cores.push(match value.as_str() {
                             "unit" => Core::Unit,
                             "nat" => Core::Nat,
                             "int" => Core::Int,
@@ -2036,7 +2010,7 @@ pub mod text {
                             "boolean" => Core::Boolean,
                             "undecided" => Core::Undecided,
                             _ => self.invalid("invalid type core", Core::Undecided),
-                        })),
+                        }),
                         L(values) => {
                             let mut values = std::mem::take(values);
                             let tag = self.atom(self.take(&mut values));
@@ -2056,17 +2030,17 @@ pub mod text {
                                     tasks.push(Task::BuildSum);
                                     tasks.push(Task::Row(value));
                                 }
-                                "var" => out.push(Out::Core(Core::Var(
+                                "var" => cores.push(Core::Var(
                                     self.number(self.exact(values, 1, "var").remove(0)),
-                                ))),
-                                "bound" => out.push(Out::Core(Core::Bound(
+                                )),
+                                "bound" => cores.push(Core::Bound(
                                     self.number(self.exact(values, 1, "bound").remove(0)),
-                                ))),
+                                )),
                                 "rigid" => {
                                     let mut values = self.exact(values, 2, "rigid");
                                     let id = self.number(self.take(&mut values));
                                     let name = self.string(self.take(&mut values));
-                                    out.push(Out::Core(Core::Rigid { id, name }));
+                                    cores.push(Core::Rigid { id, name });
                                 }
                                 "named" => {
                                     if values.is_empty() {
@@ -2079,14 +2053,10 @@ pub mod text {
                                         tasks.push(Task::Ty(value));
                                     }
                                 }
-                                _ => out.push(Out::Core(
-                                    self.invalid("invalid type core", Core::Undecided),
-                                )),
+                                _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
                             }
                         }
-                        _ => out.push(Out::Core(
-                            self.invalid("invalid type core", Core::Undecided),
-                        )),
+                        _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
                     },
                     Task::Row(value) => {
                         let mut values = self.exact(self.list(value, "row"), 2, "row");
@@ -2108,34 +2078,32 @@ pub mod text {
                         }
                     }
                     Task::Rest(mut value) => match &mut value {
-                        A(value) if value == "closed" => out.push(Out::Rest(Rest::Closed)),
-                        A(value) if value == "undecided" => out.push(Out::Rest(Rest::Undecided)),
+                        A(value) if value == "closed" => rests.push(Rest::Closed),
+                        A(value) if value == "undecided" => rests.push(Rest::Undecided),
                         L(values) => {
                             let mut values = std::mem::take(values);
                             match self.atom(self.take(&mut values)).as_str() {
-                                "var" => out.push(Out::Rest(Rest::Var(
+                                "var" => rests.push(Rest::Var(
                                     self.number(self.exact(values, 1, "rest var").remove(0)),
-                                ))),
-                                "bound" => out.push(Out::Rest(Rest::Bound(
+                                )),
+                                "bound" => rests.push(Rest::Bound(
                                     self.number(self.exact(values, 1, "rest bound").remove(0)),
-                                ))),
+                                )),
                                 "rigid" => {
                                     let mut values = self.exact(values, 2, "rest rigid");
                                     let id = self.number(self.take(&mut values));
                                     let name = self.string(self.take(&mut values));
-                                    out.push(Out::Rest(Rest::Rigid { id, name }));
+                                    rests.push(Rest::Rigid { id, name });
                                 }
                                 "more" => {
                                     let value = self.exact(values, 1, "more").remove(0);
                                     tasks.push(Task::BuildMore);
                                     tasks.push(Task::Row(value));
                                 }
-                                _ => out.push(Out::Rest(
-                                    self.invalid("invalid row rest", Rest::Undecided),
-                                )),
+                                _ => rests.push(self.invalid("invalid row rest", Rest::Undecided)),
                             }
                         }
-                        _ => out.push(Out::Rest(self.invalid("invalid row rest", Rest::Undecided))),
+                        _ => rests.push(self.invalid("invalid row rest", Rest::Undecided)),
                     },
                     Task::Field(value) => {
                         let mut values = self.exact(self.list(value, "field"), 2, "field");
@@ -2145,104 +2113,49 @@ pub mod text {
                         tasks.push(Task::Ty(ty));
                     }
                     Task::BuildField(presence) => {
-                        let ty = match out.pop() {
-                            Some(Out::Ty(value)) => value,
-                            _ => plain_fallback(),
-                        };
-                        out.push(Out::Field(RowField { presence, ty }));
+                        let ty = tys.pop().expect("a field task produces a type");
+                        fields_out.push(RowField { presence, ty });
                     }
                     Task::BuildTy { fields } => {
-                        let mut decoded = Vec::with_capacity(fields.len());
-                        for _ in 0..fields.len() {
-                            decoded.push(match out.pop() {
-                                Some(Out::Field(value)) => value,
-                                _ => RowField {
-                                    presence: Presence::Undecided,
-                                    ty: plain_fallback(),
-                                },
-                            });
-                        }
-                        decoded.reverse();
-                        let core = match out.pop() {
-                            Some(Out::Core(value)) => value,
-                            _ => Core::Undecided,
-                        };
-                        out.push(Out::Ty(Type {
+                        let split = fields_out.len() - fields.len();
+                        let decoded = fields_out.split_off(split);
+                        let core = cores.pop().expect("a type task produces a core");
+                        tys.push(Type {
                             core,
                             fields: fields.into_iter().zip(decoded).collect(),
-                        }));
+                        });
                     }
                     Task::BuildArrow => {
-                        let effects = match out.pop() {
-                            Some(Out::Row(v)) => v,
-                            _ => row_fallback(),
-                        };
-                        let to = match out.pop() {
-                            Some(Out::Ty(v)) => v,
-                            _ => plain_fallback(),
-                        };
-                        let from = match out.pop() {
-                            Some(Out::Ty(v)) => v,
-                            _ => plain_fallback(),
-                        };
-                        out.push(Out::Core(Core::Arrow(
-                            Box::new(from),
-                            Box::new(to),
-                            effects,
-                        )));
+                        let effects = rows.pop().expect("an arrow task produces an effects row");
+                        let to = tys.pop().expect("an arrow task produces a result type");
+                        let from = tys.pop().expect("an arrow task produces an argument type");
+                        cores.push(Core::Arrow(Box::new(from), Box::new(to), effects));
                     }
                     Task::BuildSum => {
-                        let row = match out.pop() {
-                            Some(Out::Row(v)) => v,
-                            _ => row_fallback(),
-                        };
-                        out.push(Out::Core(Core::Sum(row)));
+                        let row = rows.pop().expect("a sum task produces a row");
+                        cores.push(Core::Sum(row));
                     }
                     Task::BuildNamed { name, count } => {
-                        let mut args = Vec::with_capacity(count);
-                        for _ in 0..count {
-                            args.push(match out.pop() {
-                                Some(Out::Ty(v)) => v,
-                                _ => plain_fallback(),
-                            });
-                        }
-                        args.reverse();
-                        out.push(Out::Core(Core::Named { name, args }));
+                        let split = tys.len() - count;
+                        let args = tys.split_off(split);
+                        cores.push(Core::Named { name, args });
                     }
                     Task::BuildRow { labels } => {
-                        let rest = match out.pop() {
-                            Some(Out::Rest(v)) => v,
-                            _ => Rest::Undecided,
-                        };
-                        let mut fields = Vec::with_capacity(labels.len());
-                        for _ in 0..labels.len() {
-                            fields.push(match out.pop() {
-                                Some(Out::Field(v)) => v,
-                                _ => RowField {
-                                    presence: Presence::Undecided,
-                                    ty: plain_fallback(),
-                                },
-                            });
-                        }
-                        fields.reverse();
-                        out.push(Out::Row(Row {
+                        let rest = rests.pop().expect("a row task produces a rest");
+                        let split = fields_out.len() - labels.len();
+                        let fields = fields_out.split_off(split);
+                        rows.push(Row {
                             labels: labels.into_iter().zip(fields).collect(),
                             rest,
-                        }));
+                        });
                     }
                     Task::BuildMore => {
-                        let row = match out.pop() {
-                            Some(Out::Row(v)) => v,
-                            _ => row_fallback(),
-                        };
-                        out.push(Out::Rest(Rest::More(Box::new(row))));
+                        let row = rows.pop().expect("a more task produces a row");
+                        rests.push(Rest::More(Box::new(row)));
                     }
                 }
             }
-            match out.pop() {
-                Some(Out::Ty(value)) => value,
-                _ => plain_fallback(),
-            }
+            tys.pop().expect("the root type task produces a type")
         }
         fn read_presence(&self, mut value: S) -> Presence {
             match &mut value {
@@ -2401,13 +2314,21 @@ pub mod text {
                     fields: Vec<String>,
                 },
             }
-            enum Out {
-                Block(Block),
-                Instr(Instr),
-                Op(Op),
+            #[derive(Clone, Copy)]
+            enum Recursive {
+                Catch,
+                SwitchTag,
+                SwitchPrim,
+                SwitchPresence,
+                SwitchRest,
             }
             let mut tasks = vec![Task::Block(value)];
-            let mut out = Vec::new();
+            // As in semantic type decoding, a task's result sort is fixed by
+            // the task itself. Separate stacks make an impossible internal
+            // sort mismatch unrepresentable as a malformed-input fallback.
+            let mut blocks_out = Vec::new();
+            let mut instrs_out = Vec::new();
+            let mut ops = Vec::new();
             while let Some(task) = tasks.pop() {
                 match task {
                     Task::Block(value) => {
@@ -2432,26 +2353,34 @@ pub mod text {
                     }
                     Task::Op(value) => {
                         let recursive = match &value {
-                            L(values) => {
-                                matches!(values.first(), Some(A(tag)) if matches!(tag.as_str(), "catch" | "switch-tag" | "switch-prim" | "switch-presence" | "switch-rest"))
-                            }
-                            _ => false,
+                            L(values) => match values.first() {
+                                Some(A(tag)) => match tag.as_str() {
+                                    "catch" => Some(Recursive::Catch),
+                                    "switch-tag" => Some(Recursive::SwitchTag),
+                                    "switch-prim" => Some(Recursive::SwitchPrim),
+                                    "switch-presence" => Some(Recursive::SwitchPresence),
+                                    "switch-rest" => Some(Recursive::SwitchRest),
+                                    _ => None,
+                                },
+                                _ => None,
+                            },
+                            _ => None,
                         };
-                        if !recursive {
-                            out.push(Out::Op(self.read_leaf_op(value)));
+                        let Some(recursive) = recursive else {
+                            ops.push(self.read_leaf_op(value));
                             continue;
-                        }
+                        };
                         let mut values = list_contents(value).expect("recursive op is a list");
-                        let tag = self.atom(self.take(&mut values));
-                        match tag.as_str() {
-                            "catch" => {
+                        self.take(&mut values);
+                        match recursive {
+                            Recursive::Catch => {
                                 let mut values = self.exact(values, 2, "catch");
                                 let tag = self.number(self.take(&mut values));
                                 let body = self.take(&mut values);
                                 tasks.push(Task::Catch { tag });
                                 tasks.push(Task::Block(body));
                             }
-                            "switch-tag" => {
+                            Recursive::SwitchTag => {
                                 let mut values = self.exact(values, 3, "switch-tag");
                                 let on = self.number(self.take(&mut values));
                                 let cases = self.many(self.take(&mut values), "cases");
@@ -2482,7 +2411,7 @@ pub mod text {
                                     tasks.push(Task::Block(block));
                                 }
                             }
-                            "switch-prim" => {
+                            Recursive::SwitchPrim => {
                                 let mut values = self.exact(values, 3, "switch-prim");
                                 let on = self.number(self.take(&mut values));
                                 let cases = self.many(self.take(&mut values), "cases");
@@ -2513,7 +2442,7 @@ pub mod text {
                                     tasks.push(Task::Block(block));
                                 }
                             }
-                            "switch-presence" => {
+                            Recursive::SwitchPresence => {
                                 let mut values = self.exact(values, 4, "switch-presence");
                                 let on = self.number(self.take(&mut values));
                                 let field = self.string(self.take(&mut values));
@@ -2523,7 +2452,7 @@ pub mod text {
                                 tasks.push(Task::Block(absent));
                                 tasks.push(Task::Block(present));
                             }
-                            "switch-rest" => {
+                            Recursive::SwitchRest => {
                                 let mut values = self.exact(values, 4, "switch-rest");
                                 let on = self.number(self.take(&mut values));
                                 let fields = self
@@ -2537,49 +2466,35 @@ pub mod text {
                                 tasks.push(Task::Block(some));
                                 tasks.push(Task::Block(none));
                             }
-                            _ => unreachable!(),
                         }
                     }
                     Task::BuildInstr { temp, rep } => {
-                        let op = match out.pop() {
-                            Some(Out::Op(v)) => v,
-                            _ => Op::NewTag,
-                        };
-                        out.push(Out::Instr(Instr { temp, rep, op }));
+                        let op = ops
+                            .pop()
+                            .expect("an instruction task produces an operation");
+                        instrs_out.push(Instr { temp, rep, op });
                     }
                     Task::BuildBlock { count, end } => {
-                        let mut instrs = Vec::with_capacity(count);
-                        for _ in 0..count {
-                            instrs.push(match out.pop() {
-                                Some(Out::Instr(v)) => v,
-                                _ => Instr {
-                                    temp: 0,
-                                    rep: Rep::Any,
-                                    op: Op::NewTag,
-                                },
-                            });
-                        }
-                        instrs.reverse();
-                        out.push(Out::Block(Block { instrs, end }));
+                        let split = instrs_out.len() - count;
+                        let instrs = instrs_out.split_off(split);
+                        blocks_out.push(Block { instrs, end });
                     }
                     Task::Catch { tag } => {
-                        let body = pop_block(&mut out);
-                        out.push(Out::Op(Op::Catch {
+                        let body = pop_block(&mut blocks_out);
+                        ops.push(Op::Catch {
                             tag,
                             body: Box::new(body),
-                        }));
+                        });
                     }
                     Task::SwitchTag {
                         on,
                         names,
                         fallback,
                     } => {
-                        let fallback = fallback.then(|| Box::new(pop_block(&mut out)));
-                        let mut blocks = (0..names.len())
-                            .map(|_| pop_block(&mut out))
-                            .collect::<Vec<_>>();
-                        blocks.reverse();
-                        out.push(Out::Op(Op::SwitchTag {
+                        let fallback = fallback.then(|| Box::new(pop_block(&mut blocks_out)));
+                        let split = blocks_out.len() - names.len();
+                        let blocks = blocks_out.split_off(split);
+                        ops.push(Op::SwitchTag {
                             on,
                             cases: names
                                 .into_iter()
@@ -2587,19 +2502,17 @@ pub mod text {
                                 .map(|(name, block)| TagCase { name, block })
                                 .collect(),
                             fallback,
-                        }));
+                        });
                     }
                     Task::SwitchPrim {
                         on,
                         values,
                         fallback,
                     } => {
-                        let fallback = fallback.then(|| Box::new(pop_block(&mut out)));
-                        let mut blocks = (0..values.len())
-                            .map(|_| pop_block(&mut out))
-                            .collect::<Vec<_>>();
-                        blocks.reverse();
-                        out.push(Out::Op(Op::SwitchPrim {
+                        let fallback = fallback.then(|| Box::new(pop_block(&mut blocks_out)));
+                        let split = blocks_out.len() - values.len();
+                        let blocks = blocks_out.split_off(split);
+                        ops.push(Op::SwitchPrim {
                             on,
                             cases: values
                                 .into_iter()
@@ -2607,40 +2520,34 @@ pub mod text {
                                 .map(|(value, block)| PrimCase { value, block })
                                 .collect(),
                             fallback,
-                        }));
+                        });
                     }
                     Task::SwitchPresence { on, field } => {
-                        let absent = pop_block(&mut out);
-                        let present = pop_block(&mut out);
-                        out.push(Out::Op(Op::SwitchPresence {
+                        let absent = pop_block(&mut blocks_out);
+                        let present = pop_block(&mut blocks_out);
+                        ops.push(Op::SwitchPresence {
                             on,
                             field,
                             present: Box::new(present),
                             absent: Box::new(absent),
-                        }));
+                        });
                     }
                     Task::SwitchRest { on, fields } => {
-                        let some = pop_block(&mut out);
-                        let none = pop_block(&mut out);
-                        out.push(Out::Op(Op::SwitchRest {
+                        let some = pop_block(&mut blocks_out);
+                        let none = pop_block(&mut blocks_out);
+                        ops.push(Op::SwitchRest {
                             on,
                             fields,
                             none: Box::new(none),
                             some: Box::new(some),
-                        }));
+                        });
                     }
                 }
             }
-            return match out.pop() {
-                Some(Out::Block(v)) => v,
-                _ => block_fallback(),
-            };
+            return pop_block(&mut blocks_out);
 
-            fn pop_block(out: &mut Vec<Out>) -> Block {
-                match out.pop() {
-                    Some(Out::Block(v)) => v,
-                    _ => block_fallback(),
-                }
+            fn pop_block(out: &mut Vec<Block>) -> Block {
+                out.pop().expect("a block task produces a block")
             }
         }
         fn read_rep(&self, value: S) -> Rep {

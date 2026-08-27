@@ -1,10 +1,13 @@
 //! Tests for [`ruddy::lir`].
 
+use std::rc::Rc;
+
 use ruddy::{
     inference, ir, lir, parse, patterns,
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
+    types::{Formula, Presence},
 };
 use ruddy_debug::print;
 
@@ -12,6 +15,16 @@ use ruddy_debug::print;
 /// lowering runs on accepted programs alone, so a source that does not type is
 /// a test about nothing.
 fn lowered(source: &str) -> lir::Output {
+    lowered_after_check(source, |_, _| {})
+}
+
+/// One accepted pipeline whose checked inputs a test may adjust before LIR.
+/// This is for defensive branches at LIR's public boundary: ordinary tests use
+/// [`lowered`] and therefore pass the accepted program through unchanged.
+fn lowered_after_check(
+    source: &str,
+    adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
+) -> lir::Output {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
     let lexed = token::lex(source, file);
@@ -23,7 +36,7 @@ fn lowered(source: &str) -> lir::Output {
     let mut mint = Mint::new(bundle);
     let mut built = ir::build(&mut mint, parsed.stmts);
     assert!(built.errors.is_empty(), "{source}: {:#?}", built.errors);
-    let inferred = inference::infer(&mint, &mut built.program);
+    let mut inferred = inference::infer(&mint, &mut built.program);
     assert!(
         inferred.errors.is_empty(),
         "{source}: {:#?}",
@@ -31,6 +44,7 @@ fn lowered(source: &str) -> lir::Output {
     );
     let checked = patterns::check(&built.program, &inferred);
     assert!(checked.errors.is_empty(), "{source}: {:#?}", checked.errors);
+    adjust(&mut built.program, &mut inferred);
 
     lir::lower(&mint, &built.program, &inferred)
 }
@@ -377,6 +391,62 @@ fn an_optional_field_becomes_a_presence_test() {
          \x20     yield %1\n\
          \x20 ret %3"
     );
+}
+
+/// An undecided presence only occurs after an earlier type failure, so an
+/// accepted pipeline cannot carry one into LIR. Its public boundary still
+/// lowers that recovery value conservatively: both answers remain possible,
+/// without adding a SAT assumption for a variable that does not exist.
+#[test]
+fn an_undecided_presence_is_tested_both_ways() {
+    let output = lowered_after_check(
+        "let f = fn s => match s with | { x, y } => y | { x } => x end",
+        |program, _| set_match_field_presence(program, "y", Presence::Undecided),
+    );
+    let printed = print::lir::program(&output);
+    assert_eq!(printed.matches("switch_presence").count(), 1, "{printed}");
+    assert!(
+        printed.contains("present =>\n      %2: any = project %0, \"y\""),
+        "{printed}"
+    );
+    assert!(printed.contains("absent =>\n      yield %1"), "{printed}");
+}
+
+/// The SAT pair can only be false/false if a caller violates LIR's accepted-
+/// pipeline precondition by supplying a definition promise with no model. Keep
+/// the invariant check loud rather than silently manufacturing dead LIR.
+#[test]
+#[should_panic(expected = "the inferred definition promise has a model on every emitted path")]
+fn an_impossible_presence_path_is_rejected() {
+    let _ = lowered_after_check(
+        "let f = fn s => match s with | { x, y } => y | { x } => x end",
+        |program, inferred| {
+            let symbol = *program.terms.keys().next().expect("the source defines f");
+            inferred.promises.insert(symbol, Formula::False);
+        },
+    );
+}
+
+/// Replace the named field on the sole match scrutinee in the small defensive
+/// fixtures above. Pattern checking happens before this adjustment.
+fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Presence) {
+    let definition = &mut program
+        .terms
+        .values_mut()
+        .next()
+        .expect("the fixture has one definition")
+        .value;
+    let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+        panic!("the fixture definition is a function")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("the fixture function immediately matches")
+    };
+    Rc::make_mut(&mut scrutinee.ty)
+        .fields
+        .get_mut(field)
+        .expect("the scrutinee type names the tested field")
+        .presence = presence;
 }
 
 #[test]

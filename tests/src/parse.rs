@@ -1,7 +1,11 @@
 //! Tests for [`ruddy::parse`].
 
+use std::fmt::{self, Write};
+
 use ruddy::{
-    parse::{ErrorKind, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse},
+    parse::{
+        ErrorKind, ForeignPath, Path, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse,
+    },
     token::lex,
     tracking::FileID,
 };
@@ -980,11 +984,30 @@ fn a_sum_and_a_struct_nest_without_help() {
 /// of, and a position with no case here is one whose failure nothing watches.
 #[test]
 fn every_position_that_can_fail_reports_before_it_does() {
+    // An effect's `=` commits to a case list, but keeps the empty declaration
+    // for lowering after reporting a token that cannot begin a case.
+    let out = parse(lex("effect E = 1n", FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 1, "{:#?}", out.stmts);
+
     for src in [
+        // Declaration and path heads, including each dotted/path-qualified
+        // production after it has committed to reading one.
+        "module",
+        "effect",
+        "extern",
+        "extern x :",
+        "extern x : Nat =",
+        "let x = A::",
+        "type T = A::",
         // A definition's own name, and the two halves of an ascription.
         "let = 1n",
         "let x : = 1n",
         "let x : Nat",
+        // Each expression operator after it has consumed the operator.
+        "let x = y |>",
+        "let x = 1n +",
+        "let x = -",
         // An application's argument: the token begins an atom, and the atom
         // still does not parse.
         "let v = f {",
@@ -995,6 +1018,12 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "let v = { x: 1n",
         // A case's payload, which is an atom taken greedily.
         "let v = #A {",
+        // Pattern atoms, nested pattern payloads, and delimiters.
+        "let #A ( = value",
+        "let { 1n } = value",
+        "let { field: } = value",
+        "let ( = value",
+        "let (name = value",
         // Parentheses, around an expression that is not one and around one
         // that is never closed.
         "let v = (let)",
@@ -1010,6 +1039,26 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "type X = { a: }",
         "type X = (let)",
         "type X = (Nat",
+        "type X = #A (when)",
+        "let x : !E (when) = value",
+        // Boolean-clause operators and grouping after each has committed.
+        "let x : Nat where ; = value",
+        "type X = Nat where 'a or",
+        "type X = Nat where 'a and",
+        "type X = Nat where not",
+        "type X = Nat where ('a",
+        // Match, handler, arm, and raise positions.
+        "let x = match with end",
+        "let x = match value end",
+        "let x = handle with end",
+        "let x = handle value end",
+        "let x = handle value with",
+        "let x = handle value with !E end",
+        "let x = handle value with !E. end",
+        "let x = handle value with return arg end",
+        "let x = handle value with return arg =>",
+        "let x = handle value with return arg => result",
+        "let x = raise",
     ] {
         let out = parse(lex(src, FileID::GENERATED).tokens);
         assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
@@ -1019,6 +1068,40 @@ fn every_position_that_can_fail_reports_before_it_does() {
             out.stmts
         );
     }
+}
+
+/// Display implementations must propagate failures from the caller's writer,
+/// including failures between and within qualified path segments.
+#[test]
+fn paths_propagate_formatter_failures() {
+    struct FailsAfter(usize);
+
+    impl Write for FailsAfter {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            if self.0 == 0 {
+                return Err(fmt::Error);
+            }
+            self.0 -= 1;
+            Ok(())
+        }
+    }
+
+    let segment = |name: &str| {
+        FileID::GENERATED
+            .span(0, name.len())
+            .track(name.to_string())
+    };
+    let foreign = ForeignPath {
+        segments: vec![segment("host"), segment("call")],
+    };
+    assert!(write!(&mut FailsAfter(0), "{foreign}").is_err());
+    assert!(write!(&mut FailsAfter(1), "{foreign}").is_err());
+
+    let qualified = Path {
+        modules: vec![segment("Module")],
+        name: segment("value"),
+    };
+    assert!(write!(&mut FailsAfter(0), "{qualified}").is_err());
 }
 
 /// `let <name> [: <type>] = <value> in <body>` is an expression, and it prints

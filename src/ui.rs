@@ -1378,24 +1378,11 @@ fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row, shape: Shape) -> fmt::Resu
     // See R18.
     match shape {
         Shape::Effect => {
-            let effects: Vec<Entry<String, ()>> = marked
+            let effects: Vec<Entry<&str, ()>> = marked
                 .map(|(name, mark, _)| Entry::Written {
-                    name: name.split('\u{1f}').next().unwrap_or(name).to_string(),
+                    name: name.split('\u{1f}').next().unwrap_or(name),
                     mark,
                     holds: (),
-                })
-                .collect();
-            let effects: Vec<Entry<&str, ()>> = effects
-                .iter()
-                .map(|entry| match entry {
-                    Entry::Written { name, mark, .. } => Entry::Written {
-                        name: name.as_str(),
-                        mark: mark.clone(),
-                        holds: (),
-                    },
-                    Entry::Absent { name } => Entry::Absent {
-                        name: name.as_str(),
-                    },
                 })
                 .collect();
             write_effects(f, &effects, tail)
@@ -2297,6 +2284,22 @@ pub fn write_struct<K: fmt::Display, V: fmt::Display>(
     write_row(f, fields, None)
 }
 
+// These pieces do not depend on `K` or `V`. Keeping them outside `write_row`
+// also keeps one monomorphization from owning a form only another one renders.
+fn write_row_mark(f: &mut fmt::Formatter<'_>, mark: Option<&Mark>) -> fmt::Result {
+    match mark {
+        Some(Mark::Undecided) => f.write_str("?"),
+        // Bare between the label and the colon: the colon is what ends the
+        // clause, which is why a struct's needs no parentheses.
+        Some(Mark::When(name)) => write!(f, " when {name}"),
+        None => Ok(()),
+    }
+}
+
+fn write_row_tail(f: &mut fmt::Formatter<'_>, tail: &dyn fmt::Display) -> fmt::Result {
+    write!(f, "..{tail}")
+}
+
 /// Render a `{ name: value, name?: value, \name, ..tail }` row: fields, each
 /// possibly marked optional — or written `\name`, explicitly absent, with no
 /// value at all — and then whatever is known about the fields not named.
@@ -2324,13 +2327,11 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
         }
         first = false;
         match field {
-            Entry::Written { name, mark, holds } => match mark {
-                Some(Mark::Undecided) => write!(f, "{name}?: {holds}")?,
-                // Bare between the label and the colon: the colon is what ends
-                // the clause, which is why a struct's needs no parentheses.
-                Some(Mark::When(name_of)) => write!(f, "{name} when {name_of}: {holds}")?,
-                None => write!(f, "{name}: {holds}")?,
-            },
+            Entry::Written { name, mark, holds } => {
+                write!(f, "{name}")?;
+                write_row_mark(f, mark.as_ref())?;
+                write!(f, ": {holds}")?;
+            }
             Entry::Absent { name } => write!(f, "\\{name}")?,
         }
     }
@@ -2338,7 +2339,7 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
         if !first {
             f.write_str(", ")?;
         }
-        write!(f, "..{tail}")?;
+        write_row_tail(f, tail)?;
     }
     f.write_str(" }")
 }
@@ -2447,6 +2448,19 @@ pub fn write_effects(
     }
 }
 
+// Marks do not depend on the payload type, so do not duplicate their writer
+// across every payload monomorphization.
+fn write_tag_mark(f: &mut fmt::Formatter<'_>, mark: Option<&Mark>) -> fmt::Result {
+    // A case has no colon to end a bare clause, so its `when` takes
+    // parentheses — one token of lookahead would otherwise not tell
+    // `#A (when a)` from `#A when` carrying a type called `when`.
+    match mark {
+        Some(Mark::Undecided) => f.write_str("?"),
+        Some(Mark::When(name_of)) => write!(f, " (when {name_of})"),
+        None => Ok(()),
+    }
+}
+
 /// Render one case of a sum — `#Name`, the mark it may wear, and what it
 /// carries — grouped so that a payload nothing can be appended to is left
 /// bare and anything else is bracketed.
@@ -2466,14 +2480,7 @@ pub fn write_tag<V: Grouped>(
     payload: Option<V>,
 ) -> fmt::Result {
     write!(f, "#{}", name.split('\u{1f}').next().unwrap_or(name))?;
-    // A case has no colon to end a bare clause, so its `when` takes
-    // parentheses — one token of lookahead would otherwise not tell
-    // `#A (when a)` from `#A when` carrying a type called `when`.
-    match mark {
-        Some(Mark::Undecided) => f.write_str("?")?,
-        Some(Mark::When(name_of)) => write!(f, " (when {name_of})")?,
-        None => {}
-    }
+    write_tag_mark(f, mark)?;
     match payload {
         Some(payload) => {
             f.write_str(" ")?;

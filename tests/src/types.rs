@@ -3,10 +3,31 @@
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use ruddy::symbol::{Bundle, Mint, Namespace, Version};
 use ruddy::types::{
-    Assigned, Atom, Core, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
-    Shape, Ty,
+    Assigned, Atom, Core, EffectId, Formula, ParamKind, Presence, Prim, Rest, Row, RowField,
+    Scheme, Sense, Shape, Ty,
 };
+
+fn pending_effect() -> EffectId {
+    let bundle = Bundle::new("test", Version::new(1, 0, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let symbol = mint
+        .global(None, Namespace::Effects, "Log")
+        .expect("fresh effect");
+    EffectId::pending(symbol)
+}
+
+#[test]
+fn a_pending_effect_has_an_unresolved_name() {
+    assert_eq!(pending_effect().name(), "<unresolved effect>");
+}
+
+#[test]
+#[should_panic(expected = "effect row reached inference before structuralization")]
+fn a_pending_effect_has_no_semantic_row_key() {
+    let _ = pending_effect().row_key();
+}
 
 #[test]
 fn every_primitive_round_trips_through_its_name() {

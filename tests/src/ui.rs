@@ -40,6 +40,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         LexError::Unrecognized,
         LexError::MalformedNatural,
         LexError::NaturalTooLarge,
+        LexError::MalformedString,
     ] {
         all.push(("lex", kind.code(), kind.to_string()));
     }
@@ -97,6 +98,16 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         all.push(("ir", kind.code(), kind.to_string()));
     }
     for kind in [
+        IrError::InvalidDependencyAlias {
+            alias: "bad-alias".to_string(),
+        },
+        IrError::DuplicateDependencyAlias {
+            alias: "math".to_string(),
+        },
+        IrError::DuplicateDependency {
+            name: "math".to_string(),
+            version: "1.2.3".to_string(),
+        },
         IrError::DuplicateField,
         IrError::AbsentInClosed {
             shape: Shape::Struct,
@@ -903,21 +914,38 @@ fn a_mixed_parameter_names_both_readings() {
 fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
     let fixed = [
         TokenKind::Let,
+        TokenKind::Extern,
         TokenKind::In,
         TokenKind::Type,
         TokenKind::End,
         TokenKind::With,
         TokenKind::Match,
         TokenKind::Fn,
+        TokenKind::Effect,
+        TokenKind::Handle,
+        TokenKind::Raise,
+        TokenKind::And,
+        TokenKind::Or,
+        TokenKind::Xor,
+        TokenKind::Not,
+        TokenKind::Module,
         TokenKind::Equal,
         TokenKind::FatArrow,
         TokenKind::Arrow,
         TokenKind::Colon,
+        TokenKind::ColonColon,
         TokenKind::Comma,
+        TokenKind::Semicolon,
         TokenKind::Dot,
         TokenKind::DotDot,
         TokenKind::NotEqual,
+        TokenKind::Plus,
+        TokenKind::Minus,
+        TokenKind::Star,
+        TokenKind::Slash,
+        TokenKind::Backslash,
         TokenKind::Pipe,
+        TokenKind::PipeForward,
         TokenKind::Underscore,
         TokenKind::LeftBrace,
         TokenKind::RightBrace,
@@ -936,18 +964,41 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
         assert_eq!(out.tokens[0].tracked.to_string(), printed);
     }
 
-    // The three that carry something print it, and re-lex to themselves as
-    // well: the `#` stays on, and a number keeps its value.
+    // The kinds that carry something print it, and re-lex to themselves as
+    // well: each sigil stays on and each literal keeps its value.
     for kind in [
         TokenKind::Tag("Some".to_string()),
+        TokenKind::EffectLabel("Log".to_string()),
+        TokenKind::Variable("a".to_string()),
         TokenKind::Identifier("x".to_string()),
         TokenKind::Natural(4096),
+        TokenKind::Integer(42),
+        TokenKind::Real(1.25),
+        TokenKind::String("a\nstring".to_string()),
+        TokenKind::Boolean(true),
     ] {
         let printed = kind.to_string();
         let out = token::lex(&printed, FileID::GENERATED);
         assert!(out.errors.is_empty(), "{printed}: {:#?}", out.errors);
         assert_eq!(out.tokens.len(), 1, "{printed}");
         assert_eq!(out.tokens[0].tracked.to_string(), printed);
+    }
+}
+
+/// Literal patterns use the same spellings as literal expressions, so the
+/// debugger's parsed-tree view shows source rather than Rust's representation.
+#[test]
+fn literal_patterns_print_as_written() {
+    for (pattern, printed) in [
+        (parse::PatternKind::Integer(-2), "-2i"),
+        (parse::PatternKind::Real(1.5), "1.5"),
+        (
+            parse::PatternKind::String("a\nstring".to_string()),
+            "\"a\\nstring\"",
+        ),
+        (parse::PatternKind::Boolean(false), "false"),
+    ] {
+        assert_eq!(pattern.to_string(), printed);
     }
 }
 
@@ -1049,6 +1100,20 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
 /// against a failure at every point it has one.
 struct Failing {
     left: usize,
+}
+
+/// A direct display wrapper for the effect-row writer. Reaching it only through
+/// a whole type puts another formatter between the refusing sink and these
+/// writes, which cannot exercise each of this writer's own propagation points.
+struct ShownEffects<'a> {
+    effects: &'a [ui::Entry<&'a str, ()>],
+    tail: Option<&'a dyn fmt::Display>,
+}
+
+impl fmt::Display for ShownEffects<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        ui::write_effects(f, self.effects, self.tail)
+    }
 }
 
 impl fmt::Write for Failing {
@@ -1199,6 +1264,100 @@ fn a_printer_reports_a_writer_that_refuses_it() {
         every_failure_is_reported(what, &ty);
     }
 
+    // Compound displays of their own, including every recursive formula form
+    // and every piece of a witness, report a refusal at any depth.
+    let witness = ir::Witness::Struct(
+        [
+            ("a".to_string(), ir::Witness::Any),
+            (
+                "b".to_string(),
+                ir::Witness::Other(vec!["X".to_string(), "Y".to_string()]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    every_failure_is_reported("a witness", &witness);
+
+    let formula = Formula::Iff(
+        Rc::new(Formula::And(
+            Rc::new(Formula::True),
+            Rc::new(Formula::var(0)),
+        )),
+        Rc::new(Formula::Xor(
+            Rc::new(Formula::Not(Rc::new(Formula::False))),
+            Rc::new(Formula::Or(
+                Rc::new(Formula::var(1)),
+                Rc::new(Formula::var(2)),
+            )),
+        )),
+    );
+    every_failure_is_reported("a presence formula", &formula);
+    every_failure_is_reported(
+        "a constrained scheme",
+        &ruddy::types::Scheme::constrained(1, 1, nat.clone(), Formula::bound(0)),
+    );
+    every_failure_is_reported(
+        "a let constraint",
+        &ConstraintKind::Let {
+            symbol: local,
+            bound: nat.clone(),
+            level: 1,
+            promised: Formula::var(0),
+            rigids: Vec::new(),
+            value: Vec::new(),
+            body: Vec::new(),
+        },
+    );
+
+    let effects = [
+        ui::Entry::Written {
+            name: "Log",
+            mark: None,
+            holds: (),
+        },
+        ui::Entry::Written {
+            name: "IO",
+            mark: Some(ui::Mark::Undecided),
+            holds: (),
+        },
+        ui::Entry::Written {
+            name: "Net",
+            mark: Some(ui::Mark::When("'a".to_string())),
+            holds: (),
+        },
+        ui::Entry::Absent { name: "Gone" },
+    ];
+    let effect_tail = Rest::Var(3);
+    every_failure_is_reported(
+        "an effect row",
+        &ShownEffects {
+            effects: &effects,
+            tail: Some(&effect_tail),
+        },
+    );
+    every_failure_is_reported(
+        "an effect-row tail",
+        &ShownEffects {
+            effects: &[],
+            tail: Some(&effect_tail),
+        },
+    );
+    every_failure_is_reported(
+        "an empty effect row",
+        &ShownEffects {
+            effects: &[],
+            tail: None,
+        },
+    );
+    every_failure_is_reported(
+        "a closed effect row",
+        &ShownEffects {
+            effects: &effects[..1],
+            tail: None,
+        },
+    );
+
     // And the term printers, which have forms of their own: an application and
     // a projection, neither of which a type can be.
     // And a nested `let`, which writes its name, its ascription and its two
@@ -1208,6 +1367,7 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     let source = "type Pair 'a 'b = { first: 'a, second: 'b }\n\
                   let f = fn g => fn p => g p.first\n\
                   let h = let n : Nat = 1n in n\n\
+                  let arithmetic = -1i + 2i\n\
                   let v : { first: Nat, second: Nat } = { first: 1n, second: 2n }\n\
                   type Gap 'r = { first: Nat, \\hole, ..'r }\n\
                   let w : #Ok Nat | \\#Err | .. = #Ok 1n";
@@ -1227,13 +1387,15 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // written row can take, so a refusal at any of its writes comes back
     // whichever form is being written.
     let source = "let x : { first: Nat, opt when 'b: Nat, \\hole, .. } \
-                  -> (|) -> (| ..'r) -> (#Ok Nat | #Err (when 'a) | \\#B | ..) -> (#A | #B) = 1n";
+                  -> (|) -> (| ..'r) -> (#Ok Nat | #Err (when 'a) | \\#B | ..) \
+                  -> (Nat -> Nat + !Log (when 'e) + \\!Gone + ..) = 1n\n\
+                  let y = match (-x + 2i * 3i) |> fn z => z with \
+                  | { a: true, b, .. } => 1n | _ => 2n end";
     let parsed = parse::parse(token::lex(source, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
-    every_failure_is_reported(
-        "a parsed statement",
-        &print::ast::stmt(&parsed.stmts[0].tracked),
-    );
+    for stmt in &parsed.stmts {
+        every_failure_is_reported("a parsed statement", &print::ast::stmt(&stmt.tracked));
+    }
 }
 
 /// A type carrying fields, whatever its core: the shape no source syntax writes
@@ -2026,6 +2188,14 @@ fn the_pattern_complaints_say_what_was_written() {
         number.to_string(),
         "this binding has to accept every value, but the number `0` makes it able to fail"
     );
+    let string = IrError::RefutableBinding {
+        found: ir::Refuter::Literal(ir::Literal::String("x".to_string())),
+    };
+    assert_eq!(string.code(), number.code());
+    assert_eq!(
+        string.to_string(),
+        "this binding has to accept every value, but `String(\"x\")` makes it able to fail"
+    );
 
     assert_eq!(PatternError::UnreachableArm.code(), "unreachable-arm");
     assert_eq!(
@@ -2103,6 +2273,15 @@ fn the_pattern_complaints_say_what_was_written() {
 #[test]
 fn a_witness_renders_in_source_syntax() {
     assert_eq!(ir::Witness::Natural(2).to_string(), "2n");
+    for (literal, printed) in [
+        (ir::Literal::Natural(3), "3n"),
+        (ir::Literal::Integer(-4), "-4i"),
+        (ir::Literal::Real(1.5), "1.5"),
+        (ir::Literal::String("x".to_string()), "\"x\""),
+        (ir::Literal::Boolean(true), "true"),
+    ] {
+        assert_eq!(ir::Witness::Literal(literal).to_string(), printed);
+    }
     assert_eq!(ir::Witness::Any.to_string(), "anything");
     assert_eq!(
         ir::Witness::Tag {

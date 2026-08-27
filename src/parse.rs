@@ -2026,8 +2026,9 @@ impl Parser {
     fn clause_stmt(&mut self, defined: bool) -> Option<Clause> {
         if defined {
             let mark = (self.pos, self.errors.len());
-            if let Some(clause) = self.clause(false)
-                && matches!(self.peek().map(|tok| &tok.tracked), Some(Kind::Semicolon))
+            let clause = self.clause(false);
+            if self.at(&Kind::Semicolon)
+                && let Some(clause) = clause
             {
                 return Some(clause);
             }

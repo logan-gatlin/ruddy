@@ -1397,9 +1397,15 @@ type Defined = (Option<Module>, Box<parse::Pattern>, Option<Annotated>, Body);
 /// One extern declaration, paired with the module it belongs to.
 type External = (Option<Module>, TrackedString, Annotated, parse::ForeignPath);
 
-enum ValueSymbols {
-    Term(Vec<Option<Symbol>>),
-    Extern(Option<Symbol>),
+enum DeclaredValue {
+    Term {
+        at: usize,
+        symbols: Vec<Option<Symbol>>,
+    },
+    Extern {
+        at: usize,
+        symbol: Option<Symbol>,
+    },
 }
 
 /// A written annotation, as the parser read it. Named so [`Flat`]'s rows fit on
@@ -2129,7 +2135,7 @@ fn build_with_dependency_imports_inner(
     // second definition.
     // Terms and externs share the same declaration pass, in written order:
     // a duplicate belongs to whichever one appeared first, just as two lets do.
-    let declared: Vec<ValueSymbols> = flat
+    let declared: Vec<DeclaredValue> = flat
         .values
         .iter()
         .map(|value| match value {
@@ -2139,8 +2145,9 @@ fn build_with_dependency_imports_inner(
                 let mut names = Vec::new();
                 pattern_names(pattern, &mut names);
                 let mut seen: Vec<String> = Vec::new();
-                ValueSymbols::Term(
-                    names
+                DeclaredValue::Term {
+                    at: *at,
+                    symbols: names
                         .iter()
                         .map(|name| {
                             if seen.contains(&name.tracked) {
@@ -2150,18 +2157,21 @@ fn build_with_dependency_imports_inner(
                             b.declare(Scope::Terms, name)
                         })
                         .collect(),
-                )
+                }
             }
             FlatValue::Extern(at) => {
                 let (module, name, _, _) = &flat.externs[*at];
                 b.module = *module;
-                ValueSymbols::Extern(b.declare(Scope::Terms, name))
+                DeclaredValue::Extern {
+                    at: *at,
+                    symbol: b.declare(Scope::Terms, name),
+                }
             }
         })
         .collect();
-    for (value, symbols) in flat.values.into_iter().zip(declared) {
-        match (value, symbols) {
-            (FlatValue::Extern(at), ValueSymbols::Extern(symbol)) => {
+    for value in declared {
+        match value {
+            DeclaredValue::Extern { at, symbol } => {
                 let (module, name, annotation, target) = flat.externs[at].clone();
                 b.module = module;
                 let annotation = b.written(annotation, Place::Annotation);
@@ -2181,7 +2191,10 @@ fn build_with_dependency_imports_inner(
                     );
                 }
             }
-            (FlatValue::Term(at), ValueSymbols::Term(declared)) => {
+            DeclaredValue::Term {
+                at,
+                symbols: declared,
+            } => {
                 let (module, pattern, ty, body) = flat.terms[at].clone();
                 b.module = module;
                 match pattern.tracked {
@@ -2250,7 +2263,6 @@ fn build_with_dependency_imports_inner(
                     }
                 }
             }
-            _ => unreachable!("value declarations preserve their kind"),
         }
     }
     // The term half of the loop refused above, and refused for the same
@@ -2299,9 +2311,11 @@ fn build_with_dependency_imports_inner(
         rekey_term(&mut decl.value, &program.effect_ids, &mut b.errors);
     }
     for decl in program.externs.values_mut() {
-        if let Some(annotation) = &mut decl.annotation {
-            rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
-        }
+        let annotation = decl
+            .annotation
+            .as_mut()
+            .expect("an extern always has a written annotation");
+        rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
     }
     // Which definitions have to be typed together, read off the values as they
     // finally stand — so a refused loop is a group of one naming nobody rather
@@ -2346,7 +2360,8 @@ fn dependency_path(dependency: &artifact::Artifact, qualified: &str) -> Option<V
     );
     let path = qualified.strip_prefix(&prefix)?;
     let parts: Vec<String> = path.split("::").map(str::to_owned).collect();
-    (!parts.is_empty() && parts.iter().all(|part| !part.is_empty())).then_some(parts)
+    // `split` always returns at least one part, including for the empty input.
+    parts.iter().all(|part| !part.is_empty()).then_some(parts)
 }
 
 fn imported_symbol(
@@ -2529,7 +2544,6 @@ fn structuralize_effects(
                     let mut interface: Vec<_> = operations
                         .iter()
                         .map(|(name, op)| {
-                            let mut types_seen = HashSet::new();
                             let mut effects_seen = HashSet::new();
                             format!(
                                 "{name}:{}->{}",
@@ -2540,8 +2554,6 @@ fn structuralize_effects(
                                     &program.external_types,
                                     &program.effect_ids,
                                     mint,
-                                    &[],
-                                    &mut types_seen,
                                     &mut effects_seen,
                                 ),
                                 canonical_type(
@@ -2551,8 +2563,6 @@ fn structuralize_effects(
                                     &program.external_types,
                                     &program.effect_ids,
                                     mint,
-                                    &[],
-                                    &mut types_seen,
                                     &mut effects_seen,
                                 )
                             )
@@ -2607,17 +2617,6 @@ fn structuralize_effects(
     }
     for decl in program.types.values_mut() {
         rekey_type(&mut decl.value, &ids, errors);
-    }
-    for decl in program.terms.values_mut() {
-        for annotation in decl.annotation.iter_mut() {
-            rekey_type(&mut annotation.ty, &ids, errors);
-        }
-        rekey_term(&mut decl.value, &ids, errors);
-    }
-    for decl in program.externs.values_mut() {
-        if let Some(annotation) = &mut decl.annotation {
-            rekey_type(&mut annotation.ty, &ids, errors);
-        }
     }
 }
 
@@ -2734,38 +2733,31 @@ impl RegularType<'_> {
                 let applied = applied.iter().map(|arg| self.source(arg, args)).collect();
                 self.named(*head, applied)
             }
-            TypeKind::Param { index, .. } => args
-                .get(*index as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'{}", index))),
+            TypeKind::Param { index, .. } => args[*index as usize],
             TypeKind::Prim(prim) => self.atom(format!("{prim:?}")),
             TypeKind::Effects(row) => self.source_effect_row(row, args),
-            TypeKind::Var(name) => self.atom(format!("'{name}")),
-            TypeKind::Hole | TypeKind::Error => self.atom("?"),
+            // Free variables and recovery nodes cannot survive in a declared
+            // operation signature; both share the recovery spelling here.
+            _ => self.atom("?"),
         }
     }
 
     fn source_core_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
         match tail.as_ref().map(|tail| &tail.of) {
-            None => self.atom("Unit"),
-            Some(Row::Anything) => self.atom("?"),
-            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
-            Some(Row::Param { index, .. }) => args
-                .get(*index as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'{index}"))),
+            Some(Row::Param { index, .. }) => args[*index as usize],
+            // Canonicalized source types are declarations: an open or named
+            // annotation tail never reaches this walk.
+            _ => self.atom("Unit"),
         }
     }
 
     fn source_row_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
         match tail.as_ref().map(|tail| &tail.of) {
-            None => self.atom("closed"),
             Some(Row::Anything) => self.atom("?"),
-            Some(Row::Named(name)) => self.atom(format!("'r{name}")),
-            Some(Row::Param { index, .. }) => args
-                .get(*index as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'#{index}"))),
+            Some(Row::Param { index, .. }) => args[*index as usize],
+            // A free named row tail belongs only to an annotation, while a
+            // canonicalized declaration is otherwise closed.
+            _ => self.atom("closed"),
         }
     }
 
@@ -2779,7 +2771,6 @@ impl RegularType<'_> {
                 self.external_types,
                 self.effect_ids,
                 self.mint,
-                &mut HashSet::new(),
                 self.effects_seen,
             );
             let presence = match label {
@@ -2809,7 +2800,13 @@ impl RegularType<'_> {
         self.named.insert(key, id);
         let body = if let Some(decl) = self.types.get(&symbol) {
             self.source(&decl.value, &args)
-        } else if let Some(decl) = self.external_types.get(&symbol) {
+        } else {
+            // Every imported named type is installed before structuralization;
+            // a missing transitive declaration has an explicit recovery entry.
+            let decl = self
+                .external_types
+                .get(&symbol)
+                .expect("a named type has a local or imported declaration");
             if let Some(name) = &decl.unresolved {
                 self.node(
                     format!("unresolved:{name}"),
@@ -2822,15 +2819,6 @@ impl RegularType<'_> {
             } else {
                 self.semantic(decl.scheme.body(), &args)
             }
-        } else {
-            self.node(
-                format!("external:{}", self.mint.name(symbol)),
-                args.iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(index, argument)| (format!("arg:{index}"), argument))
-                    .collect(),
-            )
         };
         if body != id {
             self.nodes[id] = self.nodes[body].clone();
@@ -3076,7 +3064,6 @@ fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn canonical_type(
     ty: &Type,
     types: &IndexMap<Symbol, Decl<Type>>,
@@ -3084,8 +3071,6 @@ fn canonical_type(
     external_types: &IndexMap<Symbol, ExternalType>,
     effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
-    args: &[String],
-    _types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
     let mut graph = RegularType {
@@ -3098,8 +3083,7 @@ fn canonical_type(
         nodes: Vec::new(),
         named: HashMap::new(),
     };
-    let args: Vec<_> = args.iter().map(|arg| graph.atom(arg.clone())).collect();
-    let root = graph.source(ty, &args);
+    let root = graph.source(ty, &[]);
     graph.encode(root)
 }
 
@@ -3129,7 +3113,6 @@ fn canonical_effect(
     external_types: &IndexMap<Symbol, ExternalType>,
     effect_ids: &IndexMap<Symbol, EffectId>,
     mint: &Mint,
-    types_seen: &mut HashSet<Symbol>,
     effects_seen: &mut HashSet<Symbol>,
 ) -> String {
     let name = match effect_ids.get(&symbol) {
@@ -3153,8 +3136,6 @@ fn canonical_effect(
                             external_types,
                             effect_ids,
                             mint,
-                            &[],
-                            types_seen,
                             effects_seen,
                         ),
                         canonical_type(
@@ -3164,8 +3145,6 @@ fn canonical_effect(
                             external_types,
                             effect_ids,
                             mint,
-                            &[],
-                            types_seen,
                             effects_seen,
                         )
                     )
@@ -3187,7 +3166,6 @@ fn canonical_effect(
                         external_types,
                         effect_ids,
                         mint,
-                        types_seen,
                         effects_seen,
                     )
                 })
@@ -3196,7 +3174,12 @@ fn canonical_effect(
             named.join("+")
         }
         None => match effect_ids.get(&symbol) {
+            // Imported operation effects carry the interface published by
+            // their artifact (or the recovery identity synthesized at import).
             Some(EffectId::Structural { interface, .. }) => interface.clone(),
+            // An imported alias cycle has no finite structural identity. It
+            // may still occur in a recovery type, which remains total and gets
+            // the same unknown spelling as any other missing identity.
             _ => "?".to_string(),
         },
     };
@@ -3314,9 +3297,9 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
             // arms naming one source effect are.
             let mut seen = HashSet::new();
             for arm in &handler.arms {
-                let Some(effect) = ids.get(&arm.effect.tracked) else {
-                    continue;
-                };
+                // Unresolved operations are dropped while lowering the
+                // handler, so every retained arm has a structural identity.
+                let effect = &ids[&arm.effect.tracked];
                 if !seen.insert((effect.clone(), arm.op.tracked.clone())) {
                     errors.push(Error {
                         span: arm.op.span,
@@ -3836,31 +3819,18 @@ impl Chain<'_> {
 /// exactly for an irrefutable pattern, which is the syntactic rule of R3: a
 /// pattern is refutable iff it contains a tag or literal anywhere inside it.
 fn refuter(pattern: &Pattern) -> Option<(Span, Refuter)> {
+    let literal = |value| Some((pattern.span, Refuter::Literal(value)));
     match &pattern.tracked {
         PatternKind::Bind(_) | PatternKind::Wildcard | PatternKind::Unit => None,
         PatternKind::Tag { name, .. } => Some((name.span, Refuter::Case(name.tracked.clone()))),
         PatternKind::Struct { fields, .. } => {
             fields.values().find_map(|field| refuter(&field.value))
         }
-        kind => literal(kind).map(|value| (pattern.span, Refuter::Literal(value))),
-    }
-}
-
-/// The scalar value a primitive pattern tests, if this is one. Keeping this
-/// translation in one place makes every consumer use the same representation
-/// equality for real literals.
-fn literal(pattern: &PatternKind) -> Option<Literal> {
-    match pattern {
-        PatternKind::Natural(value) => Some(Literal::Natural(*value)),
-        PatternKind::Integer(value) => Some(Literal::Integer(*value)),
-        PatternKind::Real(value) => Some(Literal::Real(*value)),
-        PatternKind::String(value) => Some(Literal::String(value.clone())),
-        PatternKind::Boolean(value) => Some(Literal::Boolean(*value)),
-        PatternKind::Bind(_)
-        | PatternKind::Wildcard
-        | PatternKind::Struct { .. }
-        | PatternKind::Tag { .. }
-        | PatternKind::Unit => None,
+        PatternKind::Natural(value) => literal(Literal::Natural(*value)),
+        PatternKind::Integer(value) => literal(Literal::Integer(*value)),
+        PatternKind::Real(value) => literal(Literal::Real(*value)),
+        PatternKind::String(value) => literal(Literal::String(value.clone())),
+        PatternKind::Boolean(value) => literal(Literal::Boolean(*value)),
     }
 }
 
@@ -4003,7 +3973,11 @@ fn mat(pattern: &Pattern) -> Mat {
                 .map(|(name, field)| (name.clone(), mat(&field.value)))
                 .collect(),
         ),
-        pattern => Mat::Literal(literal(pattern).expect("only primitive patterns remain")),
+        PatternKind::Natural(value) => Mat::Literal(Literal::Natural(*value)),
+        PatternKind::Integer(value) => Mat::Literal(Literal::Integer(*value)),
+        PatternKind::Real(value) => Mat::Literal(Literal::Real(*value)),
+        PatternKind::String(value) => Mat::Literal(Literal::String(value.clone())),
+        PatternKind::Boolean(value) => Mat::Literal(Literal::Boolean(*value)),
     }
 }
 
@@ -4057,14 +4031,22 @@ impl Matrix {
                     path.pop();
                 }
             }
-            pattern => {
-                self.tests
-                    .entry(path.clone())
-                    .or_default()
-                    .literals
-                    .insert(literal(pattern).expect("only primitive patterns remain"));
+            PatternKind::Natural(value) => self.collect_literal(path, Literal::Natural(*value)),
+            PatternKind::Integer(value) => self.collect_literal(path, Literal::Integer(*value)),
+            PatternKind::Real(value) => self.collect_literal(path, Literal::Real(*value)),
+            PatternKind::String(value) => {
+                self.collect_literal(path, Literal::String(value.clone()))
             }
+            PatternKind::Boolean(value) => self.collect_literal(path, Literal::Boolean(*value)),
         }
+    }
+
+    fn collect_literal(&mut self, path: &[Step], literal: Literal) {
+        self.tests
+            .entry(path.to_vec())
+            .or_default()
+            .literals
+            .insert(literal);
     }
 
     /// Whether the earlier arms alone leave no unhandled value carrying this
@@ -4164,15 +4146,14 @@ impl Matrix {
                 self.useful(&rows, &cols, &q)
             }
             // q accepts everything here — [`handled`](Self::handled)'s forced
-            // rows are tags and structs down to a wildcard, so no literal
-            // ever arrives at the head of one, and the widening above took
-            // every column holding a struct — so it is useful if any value of
-            // the position's universe escapes the rows. Tags draw from their
-            // listed cases; scalar literals draw from their listed values and,
-            // except for booleans, an unlisted value; and an open tag position
-            // also has an "anything else" value.
-            Mat::Literal(value) => self.useful(&specialize_literal(rows, value), later, &q[1..]),
-            Mat::Wild => {
+            // rows are tags and structs down to a wildcard, so the only
+            // non-tag query that reaches this point is a wildcard: widening
+            // above has already consumed every struct. It is useful if any
+            // value of the position's universe escapes the rows. Tags draw
+            // from their listed cases; scalar literals draw from their listed
+            // values and, except for booleans, an unlisted value; and an open
+            // tag position also has an "anything else" value.
+            _ => {
                 let empty = Tests::default();
                 let tests = self.tests.get(pos).unwrap_or(&empty);
                 if !tests.tags.is_empty() {
@@ -4214,8 +4195,6 @@ impl Matrix {
                     self.useful(&defaults(rows), later, &q[1..])
                 }
             }
-            // Every struct was widened into its core and field columns above.
-            Mat::Struct(_) => unreachable!("struct patterns are widened before usefulness"),
         }
     }
 
@@ -4960,9 +4939,12 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         });
     }
     for decl in program.externs.values_mut() {
-        if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
-            walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
-        }
+        let annotation = &mut decl
+            .annotation
+            .as_mut()
+            .expect("an extern always has a written annotation")
+            .ty;
+        walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
     }
     out
 }
@@ -5756,18 +5738,15 @@ impl Builder<'_> {
         for import in &valid {
             let dependency = import.artifact;
             let root_name = import.alias;
-            let root = match self.modules.get(&(None, root_name.to_string())) {
-                Some(&(module, _)) => module,
-                None => {
-                    let module = self
-                        .mint
-                        .module(None, root_name)
-                        .expect("a dependency root was checked before minting");
-                    self.modules
-                        .insert((None, root_name.to_string()), (module, Span::default()));
-                    module
-                }
-            };
+            // Valid dependency aliases are unique, and imports are installed
+            // before source modules are flattened, so this root is necessarily
+            // new. Modeling an existing branch here only hid that invariant.
+            let root = self
+                .mint
+                .module(None, root_name)
+                .expect("a dependency root was checked before minting");
+            self.modules
+                .insert((None, root_name.to_string()), (root, Span::default()));
             for (namespace, qualified) in dependency
                 .header
                 .values
@@ -6476,13 +6455,14 @@ impl Builder<'_> {
         let variables = self
             .vars
             .iter()
-            .filter_map(|(name, declared)| {
-                Some(Variable {
-                    span: declared.span,
-                    name: name.clone(),
-                    sense: declared.sense?.0,
-                    id: declared.id,
-                })
+            .map(|(name, declared)| Variable {
+                span: declared.span,
+                name: name.clone(),
+                sense: declared
+                    .sense
+                    .expect("an annotation variable was minted by a typed use")
+                    .0,
+                id: declared.id,
             })
             .collect();
         Annotation {
