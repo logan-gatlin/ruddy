@@ -37,6 +37,25 @@ fn printed(source: &str) -> (String, String) {
     (ast, print::ir::program(&built.program, &mint).to_string())
 }
 
+/// The surface printer keeps conditionals recognizable while the IR printer
+/// honestly shows the ordinary Boolean match they become. A chain remains a
+/// single-final-`end` chain in the surface tree and nests in the false branch
+/// after lowering.
+#[test]
+fn an_if_prints_as_surface_syntax_and_ir_match() {
+    let (ast, ir) = printed("let choose = if true then 1n else 2n end");
+    assert_eq!(ast, "let choose = if true then 1n else 2n end");
+    assert_eq!(
+        ir,
+        "let choose = match true with | true => 1n | false => 2n end"
+    );
+
+    let source = "let choose = if p then 1n else if q then 2n else 3n end";
+    let ast = ast_of(source);
+    assert_eq!(ast, source);
+    assert_eq!(ast_of(&ast), ast, "conditional printing is a fixed point");
+}
+
 /// Rendering `{ name: value }` is one rule, in `print`, that both printers
 /// read. It used to be a copy each, so the AST tab and the IR tab could come to
 /// disagree about the same braces without anything noticing.

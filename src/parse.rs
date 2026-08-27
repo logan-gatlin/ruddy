@@ -235,6 +235,16 @@ pub enum ExprKind {
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
     },
+    /// `if <predicate> then <consequent> else <alternative> end`.
+    ///
+    /// An unparenthesized `else if` is represented by another `If` in the
+    /// alternative. Every node in that chain spans through the one shared
+    /// final `end`.
+    If {
+        predicate: Box<Expr>,
+        consequent: Box<Expr>,
+        alternative: Box<Expr>,
+    },
     Struct(IndexMap<TrackedString, Expr>),
     /// `#Some 1` — one case of a sum, with what it carries.
     ///
@@ -1439,6 +1449,10 @@ impl Parser {
             // is not `f` applied to a match. Projection off the `end` works
             // because the projection loop sits above this call.
             Kind::Match => self.match_expr(),
+            // A conditional is self-delimiting like `match`: it can head an
+            // application or projection, but must be parenthesized as an
+            // application argument because it is absent from `at_expr_atom`.
+            Kind::If => self.if_expr(),
             // Reachable from atom position for the reason a `match` is, and
             // absent from `at_expr_atom` for the same one: `f handle ... end`
             // is not `f` applied to a handler.
@@ -1659,6 +1673,41 @@ impl Parser {
             scrutinee: Box::new(scrutinee),
             arms,
         }))
+    }
+
+    /// `if <predicate> then <consequent> else <alternative> end`.
+    ///
+    /// An `else if` tail recursively builds a nested surface node without
+    /// consuming another `end`; the deepest clause consumes the one delimiter
+    /// shared by the complete chain and passes its span back outward.
+    fn if_expr(&mut self) -> Option<Expr> {
+        self.if_clause().map(|(expr, _)| expr)
+    }
+
+    /// Parse one clause and return both its node and the shared closing span.
+    fn if_clause(&mut self) -> Option<(Expr, Span)> {
+        let kw = self.eat(&Kind::If).expect("the caller peeked `if`");
+        let predicate = self.expr()?;
+        self.eat(&Kind::Then)?;
+        let consequent = self.expr()?;
+        self.eat(&Kind::Else)?;
+        let (alternative, close) =
+            if matches!(self.peek().map(|token| &token.tracked), Some(Kind::If)) {
+                self.if_clause()?
+            } else {
+                let alternative = self.expr()?;
+                let close = self.eat(&Kind::End)?.span;
+                (alternative, close)
+            };
+        let span = kw.span.merge(close);
+        Some((
+            span.track(ExprKind::If {
+                predicate: Box::new(predicate),
+                consequent: Box::new(consequent),
+                alternative: Box::new(alternative),
+            }),
+            close,
+        ))
     }
 
     /// `handle <expr> with [|] <arm> (| <arm>)* end`, where an arm is

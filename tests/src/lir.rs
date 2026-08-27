@@ -95,6 +95,26 @@ fn section(source: &str, header: &str) -> String {
 }
 
 #[test]
+fn an_if_uses_the_existing_boolean_primitive_dispatch() {
+    let printed = section(
+        "let choose = fn p => if p then 1n else 2n end",
+        "fn choose(",
+    );
+    assert_eq!(printed.matches("switch_prim").count(), 1, "{printed}");
+    assert!(printed.contains("true =>"), "{printed}");
+    assert!(printed.contains("false =>"), "{printed}");
+    assert!(!printed.contains("else =>"), "{printed}");
+    assert!(printed.contains("const 1n"), "{printed}");
+    assert!(printed.contains("const 2n"), "{printed}");
+
+    let chained = section(
+        "let choose = fn p q => if p then 1n else if q then 2n else 3n end",
+        "fn choose(",
+    );
+    assert_eq!(chained.matches("switch_prim").count(), 2, "{chained}");
+}
+
+#[test]
 fn pipeline_lowers_as_an_application() {
     let printed = listing("let f = fn x => x\nlet value = 1 |> f");
     assert!(

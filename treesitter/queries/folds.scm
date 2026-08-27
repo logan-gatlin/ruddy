@@ -3,6 +3,7 @@
 [
   (function)
   (let_expression)
+  (if_expression)
   (match_expression)
   (handle_expression)
   (struct_expression)

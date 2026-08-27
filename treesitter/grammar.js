@@ -66,6 +66,9 @@ module.exports = grammar({
       'let',
       'extern',
       'in',
+      'if',
+      'then',
+      'else',
       'type',
       'end',
       'with',
@@ -309,14 +312,15 @@ module.exports = grammar({
     ),
 
     /**
-     * The expressions an application may be built from. A `match` or a
-     * `handle` reaches here — both may be applied and projected off — but
-     * neither begins an argument, which is what keeps `f match ... end` from
-     * being an application of `f`.
+     * The expressions an application may be built from. An `if`, `match`, or
+     * `handle` reaches here — each may be applied and projected off — but none
+     * begins an argument, which is what keeps `f match ... end` from being an
+     * application of `f`.
      */
     _head_expression: $ => choice(
       $._atom,
       $.projection,
+      $.if_expression,
       $.match_expression,
       $.handle_expression,
     ),
@@ -366,6 +370,7 @@ module.exports = grammar({
       field('base', choice(
         $._atom,
         $.projection,
+        $.if_expression,
         $.match_expression,
         $.handle_expression,
       )),
@@ -390,6 +395,35 @@ module.exports = grammar({
       field('value', $._expression),
       'in',
       field('body', $._expression),
+    )),
+
+    /**
+     * `if <condition> then <expr> (else if <condition> then <expr>)*
+     * else <expr> end`.
+     *
+     * An else-if chain is one expression with one final `end`; individual
+     * arms deliberately have no terminator of their own.
+     */
+    if_expression: $ => seq(
+      'if',
+      field('condition', $._expression),
+      'then',
+      field('consequent', $._expression),
+      repeat(field('else_if', $.else_if_arm)),
+      'else',
+      field('alternative', $._expression),
+      'end',
+    ),
+
+    // Prefer closing an arm when another `else` arrives. A nested `if` in an
+    // arm still owns its `else` because its required `end` makes that reading
+    // unambiguous once the rest of the input is seen.
+    else_if_arm: $ => prec.left(seq(
+      'else',
+      'if',
+      field('condition', $._expression),
+      'then',
+      field('consequent', $._expression),
     )),
 
     /** `match <expr> with [|] <arm> (| <arm>)* end` */

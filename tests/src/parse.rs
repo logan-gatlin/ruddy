@@ -1235,6 +1235,97 @@ fn a_let_expression_reports_where_it_fails() {
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
 }
 
+/// A conditional is a self-delimiting expression whose three positions each
+/// accept a full expression. Its printer preserves the surface construct
+/// rather than exposing the match used by lowering.
+#[test]
+fn parses_if_expressions_and_full_branches() {
+    for src in [
+        "let a = if true then 1n else 2n end",
+        "let a = if not false and true then f 1n else let x = 2n in x end",
+        "let a = if p then fn x => x else fn y => y end",
+        "let a = { value: if p then a else b end }",
+    ] {
+        assert_eq!(parse_one(src), src);
+    }
+}
+
+/// An ungrouped `else if` is one chain and spends one final `end`. The nested
+/// node is the outer alternative, so a longer chain associates to the right.
+/// A grouped conditional with its own `end` remains accepted as the explicit
+/// nested spelling and canonicalizes to the chain.
+#[test]
+fn else_if_chains_share_the_final_end() {
+    assert_eq!(
+        parse_one("let a = if p then x else if q then y else z end"),
+        "let a = if p then x else if q then y else z end"
+    );
+    assert_eq!(
+        parse_one("let a = if p then w else if q then x else if r then y else z end"),
+        "let a = if p then w else if q then x else if r then y else z end"
+    );
+    assert_eq!(
+        parse_one("let a = if p then x else (if q then y else z end) end"),
+        "let a = if p then x else if q then y else z end"
+    );
+    // A conditional in the consequent is independent and therefore closes
+    // before the outer `else`.
+    assert_eq!(
+        parse_one("let a = if p then if q then x else y end else z end"),
+        "let a = if p then if q then x else y end else z end"
+    );
+}
+
+/// Like `match`, an if-expression can head application and projection, but an
+/// application must parenthesize one used as its argument.
+#[test]
+fn an_if_has_match_expression_precedence() {
+    assert_eq!(
+        parse_one("let a = if p then f else g end x"),
+        "let a = if p then f else g end x"
+    );
+    assert_eq!(
+        parse_one("let a = if p then x else y end.field"),
+        "let a = (if p then x else y end).field"
+    );
+    assert_eq!(
+        parse_one("let a = f (if p then x else y end)"),
+        "let a = f (if p then x else y end)"
+    );
+
+    let src = "let a = f if p then x else y end";
+    let out = parse(lex(src, FileID::GENERATED).tokens);
+    assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    assert_eq!(out.errors[0].span.start, src.find("if").unwrap());
+}
+
+/// Every promised part of a conditional is mandatory. In particular there is
+/// no implicit unit branch and no optional `else`.
+#[test]
+fn an_if_reports_each_missing_part() {
+    for src in [
+        "let a = if then x else y end",
+        "let a = if p x else y end",
+        "let a = if p then else y end",
+        "let a = if p then x y end",
+        "let a = if p then x else end",
+        "let a = if p then x else y",
+        // Failure from a clause entered through the else-if recursion is
+        // propagated to the outer conditional too.
+        "let a = if p then x else if",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+
+    // All three words are globally reserved rather than contextual binders.
+    for src in ["let if = 1n", "let then = 1n", "let else = 1n"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+    }
+}
+
 /// The match expression, printed back as written: leading `|` on every arm —
 /// the grammar makes the first one optional, so both spellings read back to
 /// one printed form — zero arms, a sole arm, and projection off the `end`.

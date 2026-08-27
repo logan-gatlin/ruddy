@@ -56,6 +56,41 @@ fn built(src: &str) -> (Mint, Output) {
     (mint, out)
 }
 
+/// Surface conditionals deliberately disappear at the IR boundary. The
+/// existing match node receives true and false arms in source order, and an
+/// else-if is another match in the outer false body.
+#[test]
+fn if_expressions_lower_to_boolean_matches() {
+    let (mint, out) = built("let choose = if true then 1n else 2n end");
+    let TermKind::Match { scrutinee, arms } = term_value(&mint, &out, "choose") else {
+        panic!("an if lowers to a match");
+    };
+    assert!(matches!(scrutinee.kind, TermKind::Boolean(true)));
+    assert_eq!(arms.len(), 2);
+    assert!(matches!(arms[0].0.tracked, PatternKind::Boolean(true)));
+    assert_eq!(arms[0].0.span, scrutinee.span);
+    assert!(matches!(arms[0].1.kind, TermKind::Natural(1)));
+    assert!(matches!(arms[1].0.tracked, PatternKind::Boolean(false)));
+    assert_eq!(arms[1].0.span, scrutinee.span);
+    assert!(matches!(arms[1].1.kind, TermKind::Natural(2)));
+
+    let (mint, out) = built("let choose = if true then 1n else if false then 2n else 3n end");
+    let TermKind::Match { arms, .. } = term_value(&mint, &out, "choose") else {
+        panic!("the outer if lowers to a match");
+    };
+    let TermKind::Match {
+        scrutinee,
+        arms: nested,
+    } = &arms[1].1.kind
+    else {
+        panic!("the else-if lowers in the false branch");
+    };
+    assert!(matches!(scrutinee.kind, TermKind::Boolean(false)));
+    assert_eq!(nested.len(), 2);
+    assert!(matches!(nested[0].0.tracked, PatternKind::Boolean(true)));
+    assert!(matches!(nested[1].0.tracked, PatternKind::Boolean(false)));
+}
+
 /// The lowered annotation of a top-level definition, which is where the
 /// variables a `where 'let` declared and the sorts lowering read them at live.
 fn annotation_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Annotation {

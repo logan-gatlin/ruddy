@@ -7025,6 +7025,28 @@ impl Builder<'_> {
                 }
             },
             ExprKind::Match { scrutinee, arms } => self.match_term(span, *scrutinee, arms),
+            // A conditional is surface syntax for the ordinary exhaustive
+            // Boolean match. Keeping the desugaring here means inference,
+            // coverage checking, pattern compilation, and LIR all use their
+            // existing match paths; no conditional reaches the IR.
+            ExprKind::If {
+                predicate,
+                consequent,
+                alternative,
+            } => {
+                let pattern_span = predicate.span;
+                let arms = vec![
+                    parse::Arm {
+                        pattern: pattern_span.track(parse::PatternKind::Boolean(true)),
+                        body: *consequent,
+                    },
+                    parse::Arm {
+                        pattern: pattern_span.track(parse::PatternKind::Boolean(false)),
+                        body: *alternative,
+                    },
+                ];
+                self.match_term(span, *predicate, arms)
+            }
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
             }
