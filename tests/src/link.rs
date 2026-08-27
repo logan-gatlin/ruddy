@@ -684,6 +684,106 @@ fn validates_qualified_references_through_every_interface_shape() {
     link::link(&[input]).expect("all nested references resolve with their declared arities");
 }
 
+fn interface_artifact(
+    name: &str,
+    dependencies: &[(&str, &str)],
+    namespace: DeclarationNamespace,
+    target: Option<&str>,
+) -> a::Artifact {
+    let mut artifact = artifact(name, dependencies, vec![], vec![]);
+    match namespace {
+        DeclarationNamespace::Type => artifact.header.types.push(a::DeclaredType {
+            name: format!("{name}@1.0.0::T"),
+            params: vec![],
+            scheme: a::Scheme {
+                body: target.map_or_else(|| scheme().body, named),
+                ..scheme()
+            },
+        }),
+        DeclarationNamespace::Effect => artifact.header.effects.push(a::DeclaredEffect {
+            name: format!("{name}@1.0.0::E"),
+            identity: None,
+            kind: target.map_or_else(
+                || a::EffectKind::Operations(vec![]),
+                |target| a::EffectKind::Alias(vec![target.into()]),
+            ),
+        }),
+        DeclarationNamespace::Value => unreachable!(),
+    }
+    artifact
+}
+
+#[test]
+fn embedded_interface_references_allow_self_direct_and_transitive_dependencies() {
+    for namespace in [DeclarationNamespace::Type, DeclarationNamespace::Effect] {
+        let suffix = match namespace {
+            DeclarationNamespace::Type => "T",
+            DeclarationNamespace::Effect => "E",
+            DeclarationNamespace::Value => unreachable!(),
+        };
+        let base_name = format!("base@1.0.0::{suffix}");
+        let base = interface_artifact("base", &[], namespace, Some(&base_name));
+        let middle =
+            interface_artifact("middle", &[("base", "1.0.0")], namespace, Some(&base_name));
+        let root = interface_artifact("app", &[("middle", "1.0.0")], namespace, Some(&base_name));
+
+        link::link(&[base, middle, root])
+            .expect("self, direct, and transitive dependency references are valid");
+    }
+}
+
+#[test]
+fn embedded_interface_references_reject_backward_dependent_owners() {
+    for namespace in [DeclarationNamespace::Type, DeclarationNamespace::Effect] {
+        let suffix = match namespace {
+            DeclarationNamespace::Type => "T",
+            DeclarationNamespace::Effect => "E",
+            DeclarationNamespace::Value => unreachable!(),
+        };
+        let target = format!("app@1.0.0::{suffix}");
+        let dependency = interface_artifact("dep", &[], namespace, Some(&target));
+        let root = interface_artifact("app", &[("dep", "1.0.0")], namespace, None);
+
+        assert_eq!(
+            link::link(&[dependency, root]),
+            Err(LinkError::DeclarationReferenceOutsideDependencyClosure {
+                owner: "dep@1.0.0".into(),
+                namespace,
+                name: target,
+            })
+        );
+    }
+}
+
+#[test]
+fn embedded_interface_references_reject_sibling_owners() {
+    for namespace in [DeclarationNamespace::Type, DeclarationNamespace::Effect] {
+        let suffix = match namespace {
+            DeclarationNamespace::Type => "T",
+            DeclarationNamespace::Effect => "E",
+            DeclarationNamespace::Value => unreachable!(),
+        };
+        let target = format!("right@1.0.0::{suffix}");
+        let left = interface_artifact("left", &[], namespace, Some(&target));
+        let right = interface_artifact("right", &[], namespace, None);
+        let root = artifact(
+            "app",
+            &[("left", "1.0.0"), ("right", "1.0.0")],
+            vec![],
+            vec![],
+        );
+
+        assert_eq!(
+            link::link(&[left, right, root]),
+            Err(LinkError::DeclarationReferenceOutsideDependencyClosure {
+                owner: "left@1.0.0".into(),
+                namespace,
+                name: target,
+            })
+        );
+    }
+}
+
 #[test]
 fn validates_named_type_application_arity_across_artifacts() {
     let mut dep = artifact("dep", &[], vec![], vec![]);
@@ -1020,6 +1120,11 @@ fn every_link_error_has_a_user_facing_message() {
             owner: "a@1.0.0".into(),
             namespace: DeclarationNamespace::Effect,
             name: "b@1.0.0::E".into(),
+        },
+        LinkError::DeclarationReferenceOutsideDependencyClosure {
+            owner: "a@1.0.0".into(),
+            namespace: DeclarationNamespace::Type,
+            name: "b@1.0.0::T".into(),
         },
         LinkError::NamedTypeArityMismatch {
             owner: "a@1.0.0".into(),

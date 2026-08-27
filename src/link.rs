@@ -83,6 +83,11 @@ pub enum LinkError {
         namespace: DeclarationNamespace,
         name: String,
     },
+    DeclarationReferenceOutsideDependencyClosure {
+        owner: String,
+        namespace: DeclarationNamespace,
+        name: String,
+    },
     NamedTypeArityMismatch {
         owner: String,
         name: String,
@@ -194,6 +199,14 @@ impl fmt::Display for LinkError {
             } => write!(
                 f,
                 "artifact `{owner}` interface references missing {namespace} declaration `{name}`"
+            ),
+            Self::DeclarationReferenceOutsideDependencyClosure {
+                owner,
+                namespace,
+                name,
+            } => write!(
+                f,
+                "artifact `{owner}` interface references {namespace} declaration `{name}` outside its declared dependency closure"
             ),
             Self::NamedTypeArityMismatch {
                 owner,
@@ -359,8 +372,23 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
                 .map(|item| item.name.as_str()),
         );
     }
+    let mut dependency_closures = HashMap::<String, HashSet<String>>::new();
     for artifact in artifacts {
-        validate_declaration_references(artifact, &declared_types, &declared_effects)?;
+        let owner = identity(artifact);
+        let mut closure = HashSet::from([owner.clone()]);
+        for dependency in &artifact.header.dependencies {
+            let dependency = format!("{}@{}", dependency.name, dependency.version);
+            closure.extend(dependency_closures[&dependency].iter().cloned());
+        }
+        dependency_closures.insert(owner, closure);
+    }
+    for artifact in artifacts {
+        validate_declaration_references(
+            artifact,
+            &declared_types,
+            &declared_effects,
+            &dependency_closures[&identity(artifact)],
+        )?;
     }
 
     let mut functions = Vec::new();
@@ -576,6 +604,7 @@ fn validate_declaration_references(
     artifact: &Artifact,
     declared_types: &HashMap<&str, usize>,
     declared_effects: &HashSet<&str>,
+    dependency_closure: &HashSet<String>,
 ) -> Result<(), LinkError> {
     let owner = identity(artifact);
     let mut pending = Vec::new();
@@ -608,6 +637,7 @@ fn validate_declaration_references(
                         DeclarationNamespace::Effect,
                         target,
                         declared_effects,
+                        dependency_closure,
                     )?;
                 }
             }
@@ -645,6 +675,15 @@ fn validate_declaration_references(
                                 name: name.clone(),
                             });
                         };
+                        let target_owner = parse_source_qualified_owner(name)
+                            .expect("qualified type reference was validated above");
+                        if !dependency_closure.contains(target_owner) {
+                            return Err(LinkError::DeclarationReferenceOutsideDependencyClosure {
+                                owner,
+                                namespace: DeclarationNamespace::Type,
+                                name: name.clone(),
+                            });
+                        }
                         if args.len() != *expected {
                             return Err(LinkError::NamedTypeArityMismatch {
                                 owner,
@@ -683,16 +722,24 @@ fn validate_declaration_reference(
     namespace: DeclarationNamespace,
     name: &str,
     declarations: &HashSet<&str>,
+    dependency_closure: &HashSet<String>,
 ) -> Result<(), LinkError> {
-    if parse_source_qualified_owner(name).is_none() {
+    let Some(target_owner) = parse_source_qualified_owner(name) else {
         return Err(LinkError::MalformedDeclarationReference {
             owner: owner.to_string(),
             namespace,
             name: name.to_string(),
         });
-    }
+    };
     if !declarations.contains(name) {
         return Err(LinkError::MissingDeclarationReference {
+            owner: owner.to_string(),
+            namespace,
+            name: name.to_string(),
+        });
+    }
+    if !dependency_closure.contains(target_owner) {
+        return Err(LinkError::DeclarationReferenceOutsideDependencyClosure {
             owner: owner.to_string(),
             namespace,
             name: name.to_string(),
