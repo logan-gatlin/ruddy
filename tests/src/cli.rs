@@ -608,6 +608,31 @@ fn locked_cached_git_dependency_child() {
     let artifact = ruddy_cli::build_project(&app).unwrap();
     assert!(artifact.is_file());
     assert!(!checkout.join("build").exists());
+
+    // Cache provenance follows the canonical location, even when a local path
+    // specification reaches an already-seeded checkout instead of a Git spec.
+    let path_app = home.join("path-app");
+    fs::create_dir(&path_app).unwrap();
+    fs::write(path_app.join("main.hc"), "let main = base::value\n").unwrap();
+    fs::write(
+        path_app.join("Ruddy.toml"),
+        format!(
+            "name = \"path-app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {{ path = {:?} }}\n",
+            checkout
+        ),
+    )
+    .unwrap();
+    let graph = ruddy_cli::compile_graph(&path_app).unwrap();
+    assert_eq!(graph.projects[0].source, ruddy_cli::ProjectSource::GitCache);
+    assert_eq!(graph.projects[1].source, ruddy_cli::ProjectSource::Local);
+    assert!(ruddy_cli::build_project(&path_app).unwrap().is_file());
+    assert!(!checkout.join("build").exists());
+
+    // An explicitly invoked root remains buildable, even when it is located
+    // beneath the cache root.
+    let checkout_artifact = ruddy_cli::build_project(&checkout).unwrap();
+    assert_eq!(checkout_artifact, checkout.join("build/base.artifact"));
+    assert!(checkout_artifact.is_file());
 }
 
 #[test]

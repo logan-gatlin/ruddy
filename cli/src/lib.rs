@@ -570,9 +570,9 @@ impl From<&str> for DependencySpec {
 /// The storage provenance of a compiled project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectSource {
-    /// A root or path dependency owned by the user.
+    /// An explicitly compiled root or a dependency outside Ruddy's Git cache.
     Local,
-    /// A project inside Ruddy's immutable global Git cache.
+    /// A non-root project inside Ruddy's immutable global Git cache.
     GitCache,
 }
 
@@ -610,6 +610,7 @@ pub fn compile_graph(directory: impl AsRef<Path>) -> Result<CompiledGraph, Compi
     let root = canonical_project(directory.as_ref())?;
     let resolver = git::Resolver::new(&root)?;
     let mut compiler = GraphCompiler {
+        root: Some(root.clone()),
         resolver: Some(resolver),
         ..GraphCompiler::default()
     };
@@ -812,15 +813,32 @@ where
     ))
 }
 
-#[derive(Default)]
 struct GraphCompiler {
     sandbox: Option<PathBuf>,
     resolver: Option<git::Resolver>,
+    root: Option<PathBuf>,
+    git_cache_root: Option<PathBuf>,
     git_roots: Vec<PathBuf>,
     completed: HashMap<PathBuf, usize>,
     identities: HashMap<(String, String), PathBuf>,
     active: Vec<(PathBuf, String)>,
     projects: Vec<CompiledProject>,
+}
+
+impl Default for GraphCompiler {
+    fn default() -> Self {
+        Self {
+            sandbox: None,
+            resolver: None,
+            root: None,
+            git_cache_root: git::canonical_checkouts_root(),
+            git_roots: Vec::new(),
+            completed: HashMap::new(),
+            identities: HashMap::new(),
+            active: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
 }
 
 impl GraphCompiler {
@@ -956,10 +974,16 @@ impl GraphCompiler {
         self.active.pop();
         let index = self.projects.len();
         self.projects.push(CompiledProject {
-            source: if self
+            source: if self.root.as_ref() == Some(&directory) {
+                ProjectSource::Local
+            } else if self
                 .git_roots
                 .iter()
                 .any(|root| directory.starts_with(root))
+                || self
+                    .git_cache_root
+                    .as_ref()
+                    .is_some_and(|root| directory.starts_with(root))
             {
                 ProjectSource::GitCache
             } else {

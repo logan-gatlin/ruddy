@@ -252,6 +252,13 @@ fn selector_to_locked(key: &LockedSelectorKey) -> LockedSelector {
     }
 }
 
+pub(crate) fn canonical_checkouts_root() -> Option<PathBuf> {
+    ruddy_home()
+        .ok()
+        .and_then(|home| fs::canonicalize(home.join("git/checkouts")).ok())
+        .filter(|path| path.is_dir())
+}
+
 pub fn ruddy_home() -> Result<PathBuf, CompileError> {
     if let Some(path) = env::var_os("RUDDY_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
