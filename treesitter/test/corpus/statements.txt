@@ -113,6 +113,33 @@ effect Log = { write: Nat -> (), flush: () -> (), }
           (unit))))))
 
 ================================================================================
+Grouped effect operation signatures
+================================================================================
+
+effect Grouped = ((Nat -> ()))
+effect Named = { op: (Nat -> ()) }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    (identifier)
+    (parenthesized_effect_operation_signature
+      (parenthesized_effect_operation_signature
+        (function_type
+          (identifier)
+          (unit)))))
+  (effect_definition
+    (identifier)
+    (named_effect_interface
+      (effect_operation_field
+        (identifier)
+        (parenthesized_effect_operation_signature
+          (function_type
+            (identifier)
+            (unit)))))))
+
+================================================================================
 An effect standing for the effects it names
 ================================================================================
 
@@ -259,6 +286,7 @@ Rejected legacy and row-like effect interfaces recover locally
 effect Empty = {}
 effect Open = { op: Nat -> (), .. }
 effect Old = op : Nat -> () | flush : () -> ()
+effect GroupedNonFunction = (Nat)
 let after = 1n
 
 --------------------------------------------------------------------------------
@@ -293,6 +321,11 @@ let after = 1n
           (ERROR)
           (unit))
         (unit))))
+  (effect_definition
+    (identifier))
+  (ERROR
+    (parenthesized_type
+      (identifier)))
   (let_definition
     (identifier)
     (natural)))

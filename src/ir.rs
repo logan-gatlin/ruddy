@@ -1211,7 +1211,7 @@ pub enum ErrorKind {
     /// stands, the way a duplicate anything else is.
     DuplicateArm {
         effect: String,
-        op: String,
+        selector: OperationSelector,
     },
     /// Two `return` arms in one handler. Reported at the second; the first is
     /// the one that stands.
@@ -2337,12 +2337,27 @@ fn build_with_dependency_imports_inner(
         );
     }
     // Terms were lowered after the type declarations above; give their rows
-    // the identities already computed before inference sees them.
+    // the identities already computed before inference sees them. Handler
+    // coverage is finalized here too, now that nominal declarations can be
+    // grouped by those identities.
+    let operation_sets: HashMap<Symbol, IndexSet<OperationSelector>> = program
+        .effects
+        .iter()
+        .filter_map(|(symbol, declaration)| match &declaration.value {
+            Effect::Operations(operations) => Some((*symbol, operations.keys().cloned().collect())),
+            Effect::Alias(_) => None,
+        })
+        .collect();
     for decl in program.terms.values_mut() {
         if let Some(annotation) = &mut decl.annotation {
             rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
         }
-        rekey_term(&mut decl.value, &program.effect_ids, &mut b.errors);
+        rekey_term(
+            &mut decl.value,
+            &program.effect_ids,
+            &operation_sets,
+            &mut b.errors,
+        );
     }
     for decl in program.externs.values_mut() {
         let annotation = decl
@@ -3280,18 +3295,25 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
     }
 }
 
-fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
+fn rekey_term(
+    term: &mut Term,
+    ids: &IndexMap<Symbol, EffectId>,
+    operations: &HashMap<Symbol, IndexSet<OperationSelector>>,
+    errors: &mut Vec<Error>,
+) {
     match &mut term.kind {
-        TermKind::Unary { value, .. } => rekey_term(value, ids, errors),
+        TermKind::Unary { value, .. } => rekey_term(value, ids, operations, errors),
         TermKind::Binary { left, right, .. } => {
-            rekey_term(left, ids, errors);
-            rekey_term(right, ids, errors);
+            rekey_term(left, ids, operations, errors);
+            rekey_term(right, ids, operations, errors);
         }
         TermKind::Apply { func, arg } => {
-            rekey_term(func, ids, errors);
-            rekey_term(arg, ids, errors);
+            rekey_term(func, ids, operations, errors);
+            rekey_term(arg, ids, operations, errors);
         }
-        TermKind::Fn { body, .. } | TermKind::Raise(body) => rekey_term(body, ids, errors),
+        TermKind::Fn { body, .. } | TermKind::Raise(body) => {
+            rekey_term(body, ids, operations, errors)
+        }
         TermKind::Let {
             annotation,
             value,
@@ -3301,47 +3323,73 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
             if let Some(annotation) = annotation {
                 rekey_type(&mut annotation.ty, ids, errors);
             }
-            rekey_term(value, ids, errors);
-            rekey_term(body, ids, errors);
+            rekey_term(value, ids, operations, errors);
+            rekey_term(body, ids, operations, errors);
         }
         TermKind::Struct(fields) => {
             for field in fields.values_mut() {
-                rekey_term(&mut field.value, ids, errors);
+                rekey_term(&mut field.value, ids, operations, errors);
             }
         }
         TermKind::Tag {
             payload: Some(payload),
             ..
-        } => rekey_term(payload, ids, errors),
-        TermKind::Project { base, .. } => rekey_term(base, ids, errors),
+        } => rekey_term(payload, ids, operations, errors),
+        TermKind::Project { base, .. } => rekey_term(base, ids, operations, errors),
         TermKind::Match { scrutinee, arms } => {
-            rekey_term(scrutinee, ids, errors);
+            rekey_term(scrutinee, ids, operations, errors);
             for (_, body) in arms {
-                rekey_term(body, ids, errors);
+                rekey_term(body, ids, operations, errors);
             }
         }
         TermKind::Handle { body, handler } => {
-            rekey_term(body, ids, errors);
+            rekey_term(body, ids, operations, errors);
             for arm in &mut handler.arms {
-                rekey_term(&mut arm.body, ids, errors);
+                rekey_term(&mut arm.body, ids, operations, errors);
             }
             if let Some(ret) = &mut handler.ret {
-                rekey_term(&mut ret.body, ids, errors);
+                rekey_term(&mut ret.body, ids, operations, errors);
             }
-            // Structural effect identity makes arms for equivalent effects
-            // duplicate implementations of the same operation, just as two
-            // arms naming one source effect are.
-            let mut seen = HashSet::new();
-            for arm in &handler.arms {
-                // Unresolved operations are dropped while lowering the
-                // handler, so every retained arm has a structural identity.
-                let effect = &ids[&arm.effect.tracked];
-                if !seen.insert((effect.clone(), arm.selector.tracked.clone())) {
+
+            // Coverage is structural, not nominal. Equivalent declarations may
+            // contribute different selectors to one evidence record, while a
+            // repeated selector across either spelling is still one duplicate.
+            let mut covered: IndexMap<EffectId, (Tracked<Symbol>, IndexSet<OperationSelector>)> =
+                IndexMap::new();
+            let mut unique = Vec::new();
+            for arm in std::mem::take(&mut handler.arms) {
+                let effect = ids[&arm.effect.tracked].clone();
+                let group = covered
+                    .entry(effect.clone())
+                    .or_insert_with(|| (arm.effect, IndexSet::new()));
+                if group.1.insert(arm.selector.tracked.clone()) {
+                    unique.push(arm);
+                } else {
                     errors.push(Error {
                         span: arm.selector.span,
                         kind: ErrorKind::DuplicateArm {
                             effect: effect.name().to_string(),
-                            op: arm.selector.tracked.source_name(),
+                            selector: arm.selector.tracked,
+                        },
+                    });
+                }
+            }
+            handler.arms = unique;
+            handler.discharges.clear();
+            for (effect, (representative, arms)) in covered {
+                let missing: Vec<String> = operations[&representative.tracked]
+                    .iter()
+                    .filter(|selector| !arms.contains(*selector))
+                    .map(OperationSelector::source_name)
+                    .collect();
+                if missing.is_empty() {
+                    handler.discharges.push(representative);
+                } else {
+                    errors.push(Error {
+                        span: representative.span,
+                        kind: ErrorKind::PartialHandler {
+                            effect: effect.name().to_string(),
+                            missing,
                         },
                     });
                 }
@@ -7061,11 +7109,11 @@ impl Builder<'_> {
     ///
     /// The handled expression first, then the arms, each with its binder in
     /// scope for its own body and released after it — the shape a `match`
-    /// keeps. What is decided here rather than typed is R15's coverage: every
-    /// effect an arm names has to have an arm for each of its operations, so
-    /// which effects the handler discharges is known before a constraint is
-    /// generated. And the answer is what R16 hands the body as a larger
-    /// ambient.
+    /// keeps. R15's coverage is decided by this phase rather than inference,
+    /// but only after structural effect identities have been computed: arms
+    /// using equivalent declarations can then contribute to one interface.
+    /// The resulting discharges are still known before constraints are
+    /// generated, and are what R16 hands the body as a larger ambient.
     fn handle_term(&mut self, span: Span, body: Expr, arms: Vec<parse::HandlerArm>) -> Term {
         let body = self.term(body);
         // An arm's body runs where the `handle` was written rather than inside
@@ -7074,9 +7122,6 @@ impl Builder<'_> {
         let outer = std::mem::replace(&mut self.answering, Answering::Arm);
         let mut lowered: Vec<HandlerArm> = Vec::new();
         let mut ret: Option<ReturnArm> = None;
-        // Which effects the arms name, and which of their operations have an
-        // arm, in the order the arms first named them.
-        let mut covered: IndexMap<Symbol, (Span, IndexSet<OperationSelector>)> = IndexMap::new();
         for arm in arms {
             match arm.head {
                 parse::ArmHead::Return { span: at } => {
@@ -7109,19 +7154,6 @@ impl Builder<'_> {
                     let Some(symbol) = symbol else {
                         continue;
                     };
-                    let seen = covered
-                        .entry(symbol)
-                        .or_insert_with(|| (effect.span(), IndexSet::new()));
-                    if !seen.1.insert(selector.tracked.clone()) {
-                        self.error(
-                            selector.span,
-                            ErrorKind::DuplicateArm {
-                                effect: effect.name.tracked.clone(),
-                                op: selector.tracked.source_name(),
-                            },
-                        );
-                        continue;
-                    }
                     lowered.push(HandlerArm {
                         effect: effect.span().track(symbol),
                         selector,
@@ -7132,37 +7164,15 @@ impl Builder<'_> {
             }
         }
         self.answering = outer;
-        // Every effect an arm names must be fully covered: a half-handled
-        // effect leaves it undecidable which effects the body may still
-        // perform, and there is no answer for inference to fall back on.
-        let mut discharges = Vec::new();
-        for (symbol, (at, arms)) in covered {
-            let missing: Vec<String> = self
-                .operations
-                .get(&symbol)
-                .into_iter()
-                .flatten()
-                .filter(|selector| !arms.contains(*selector))
-                .map(OperationSelector::source_name)
-                .collect();
-            if missing.is_empty() {
-                discharges.push(at.track(symbol));
-                continue;
-            }
-            self.error(
-                at,
-                ErrorKind::PartialHandler {
-                    effect: self.mint.name(symbol).to_string(),
-                    missing,
-                },
-            );
-        }
+        // Coverage and duplicate selection are finalized after structural
+        // effect identities have been computed. Until then, source symbols do
+        // not tell us which arms belong to one semantic interface.
         TermKind::Handle {
             body: Box::new(body),
             handler: Handler {
                 arms: lowered,
                 ret,
-                discharges,
+                discharges: Vec::new(),
             },
         }
         .with_span(span)

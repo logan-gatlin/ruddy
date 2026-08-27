@@ -1146,6 +1146,10 @@
           {
             "type": "named_effect_interface",
             "named": true
+          },
+          {
+            "type": "parenthesized_effect_operation_signature",
+            "named": true
           }
         ]
       },
@@ -1181,6 +1185,10 @@
         "types": [
           {
             "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_effect_operation_signature",
             "named": true
           }
         ]
@@ -2782,6 +2790,26 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "parenthesized_effect_operation_signature",
+    "named": true,
+    "fields": {
+      "signature": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "parenthesized_effect_operation_signature",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {

@@ -160,11 +160,15 @@ fn model_artifact() -> Artifact {
         Op::Sub { left: 1, right: 2 },
         Op::Mul { left: 1, right: 2 },
         Op::Div { left: 1, right: 2 },
-        Op::Struct(vec![("first".to_string(), 1), ("second".to_string(), 2)]),
+        Op::Struct(vec![
+            (artifact::FieldKey::Named("first".to_string()), 1),
+            (artifact::FieldKey::Named("second".to_string()), 2),
+            (artifact::FieldKey::UnnamedOperation, 3),
+        ]),
         Op::Merge(vec![1, 2]),
         Op::Project {
             base: 1,
-            field: "field".to_string(),
+            field: artifact::FieldKey::Named("field".to_string()),
         },
         Op::Tag {
             name: "Case".to_string(),
@@ -731,11 +735,14 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         lir::Op::Sub { left: 1, right: 2 },
         lir::Op::Mul { left: 1, right: 2 },
         lir::Op::Div { left: 1, right: 2 },
-        lir::Op::Struct(IndexMap::from([("x".to_string(), 1)])),
+        lir::Op::Struct(IndexMap::from([
+            (lir::FieldKey::Named("x".to_string()), 1),
+            (lir::FieldKey::UnnamedOperation, 2),
+        ])),
         lir::Op::Merge(vec![1, 2]),
         lir::Op::Project {
             base: 1,
-            field: "x".to_string(),
+            field: lir::FieldKey::Named("x".to_string()),
         },
         lir::Op::Tag {
             name: "None".to_string(),
@@ -1108,9 +1115,26 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     ));
     assert_malformed(&replace_balanced(
         &valid,
-        "(\"first\" 1)",
+        "((field-key named \"first\") 1)",
         "bad-struct-entry",
     ));
+    assert_bad_replacement(
+        &valid,
+        "(field-key named \"first\")",
+        "\"legacy-string-key\"",
+    );
+    assert_bad_replacement(
+        &valid,
+        "(field-key unnamed-operation)",
+        "(field-key unnamed-operation extra)",
+    );
+    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key named)");
+    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key mystery)");
+    assert_bad_replacement(
+        &valid,
+        "(field-key named \"first\")",
+        "(wrong-key named \"first\")",
+    );
     assert_bad_replacement(&valid, "new-tag", "(())");
 }
 

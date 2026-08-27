@@ -636,6 +636,8 @@ fn both_trees_render_the_effect_forms() {
     for source in [
         "effect Log = Nat -> {}",
         "effect Log = { value: Nat } -> {}",
+        "effect Apply = (Nat -> Nat) -> {}",
+        "effect Apply = { run: (Nat -> Nat) -> {} }",
         "effect Log = { write: Nat -> {} }",
         "effect Log = { write: Nat -> {}, flush: {} -> {} }",
         "effect Nil",

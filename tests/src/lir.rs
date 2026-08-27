@@ -632,6 +632,22 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
     );
 }
 
+#[test]
+fn structurally_equivalent_handler_arms_build_one_complete_record() {
+    let source = "module Foo =\n  effect Log = { write: Nat -> (), flush: () -> () }\nend\n\
+                  module Bar =\n  effect Log = { write: Nat -> (), flush: () -> () }\nend\n\
+                  let main = fn n => handle Foo::!Log.write n with\n\
+                    | Foo::!Log.write value => ()\n\
+                    | Bar::!Log.flush unit => ()\n\
+                  end";
+    let printed = section(source, "fn main(");
+    assert!(printed.contains("struct { write:"), "{printed}");
+    assert!(printed.contains(", flush:"), "{printed}");
+    assert_eq!(printed.matches("struct = struct {").count(), 1, "{printed}");
+    assert!(printed.contains("project %"), "{printed}");
+    assert!(printed.contains("\"write\""), "{printed}");
+}
+
 /// The `return` arm is applied inline to the body's value on the normal path:
 /// it binds that value, and the catch yields what it answers.
 #[test]

@@ -180,7 +180,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
         },
         IrError::DuplicateArm {
             effect: "Log".to_string(),
-            op: "write".to_string(),
+            selector: ir::OperationSelector::Named("write".to_string()),
         },
         IrError::DuplicateReturn { previous: span },
         IrError::RaiseOutsideArm,
@@ -2644,9 +2644,16 @@ fn the_effect_complaints_are_read_in_effects() {
         (
             IrError::DuplicateArm {
                 effect: "Log".to_string(),
-                op: "write".to_string(),
+                selector: ir::OperationSelector::Named("write".to_string()),
             },
             "duplicate arm for `!Log.write`",
+        ),
+        (
+            IrError::DuplicateArm {
+                effect: "Log".to_string(),
+                selector: ir::OperationSelector::Unnamed,
+            },
+            "duplicate arm for `!Log`",
         ),
         (
             IrError::DuplicateReturn {

@@ -25,6 +25,8 @@
 (sum_case payload: (identifier) @type)
 (effect_operation_field signature: (function_type from: (identifier) @type))
 (effect_operation_field signature: (function_type to: (identifier) @type))
+(parenthesized_effect_operation_signature signature: (function_type from: (identifier) @type))
+(parenthesized_effect_operation_signature signature: (function_type to: (identifier) @type))
 (extern_definition type: (annotation type: (identifier) @type))
 
 ; A path written where a type goes: the name at the end of it is the type, and
@@ -39,6 +41,8 @@
 (sum_case payload: (path name: (identifier) @type))
 (effect_operation_field signature: (function_type from: (path name: (identifier) @type)))
 (effect_operation_field signature: (function_type to: (path name: (identifier) @type)))
+(parenthesized_effect_operation_signature signature: (function_type from: (path name: (identifier) @type)))
+(parenthesized_effect_operation_signature signature: (function_type to: (path name: (identifier) @type)))
 (extern_definition type: (annotation type: (path name: (identifier) @type)))
 
 (type_definition name: (identifier) @type.definition)

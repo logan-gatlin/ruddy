@@ -123,11 +123,12 @@ impl fmt::Display for Show<'_, Program> {
                 Effect::Operations(operations) => {
                     if let Some(operation) = operations.get(&ruddy::ir::OperationSelector::Unnamed)
                     {
-                        write!(
+                        f.write_str(" = ")?;
+                        write_arrow(
                             f,
-                            " = {} -> {}",
-                            self.show(&operation.from),
-                            self.show(&operation.to)
+                            &self.show(&operation.from),
+                            &self.show(&operation.to),
+                            None,
                         )?;
                     } else {
                         f.write_str(" = {")?;
@@ -138,11 +139,12 @@ impl fmt::Display for Show<'_, Program> {
                             let ruddy::ir::OperationSelector::Named(name) = selector else {
                                 continue;
                             };
-                            write!(
+                            write!(f, " {name}: ")?;
+                            write_arrow(
                                 f,
-                                " {name}: {} -> {}",
-                                self.show(&operation.from),
-                                self.show(&operation.to)
+                                &self.show(&operation.from),
+                                &self.show(&operation.to),
+                                None,
                             )?;
                         }
                         f.write_str(" }")?;

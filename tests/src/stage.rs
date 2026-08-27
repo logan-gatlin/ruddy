@@ -964,7 +964,9 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         artifact_stage.summary
     );
 
-    let unnamed = stage("artifact", "effect Log = Nat -> ()\n");
+    let source = "effect Log = Nat -> ()\n\
+                  let main = fn n => handle !Log n with | !Log value => () end\n";
+    let unnamed = stage("artifact", source);
     let effect = unnamed.nodes[0]
         .children
         .iter()
@@ -972,6 +974,12 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         .expect("artifact outline includes the effect");
     assert_eq!(effect.children[0].label, "selector");
     assert_eq!(effect.children[0].text, "unnamed");
+    let text = unnamed.text.as_deref().expect("canonical artifact text");
+    assert!(text.contains("(field-key unnamed-operation)"), "{text}");
+    assert!(!text.contains("ruddy:unnamed-operation"), "{text}");
+    assert!(!unnamed.debug.contains("ruddy:unnamed-operation"));
+    let lowered = stage("lir", source);
+    assert!(!lowered.debug.contains("ruddy:unnamed-operation"));
 
     let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);

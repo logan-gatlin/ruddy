@@ -3801,6 +3801,29 @@ fn a_handler_must_cover_every_effect_it_names() {
         error.kind,
         ErrorKind::PartialHandler { ref missing, .. } if missing == &["flush".to_string()]
     ));
+
+    // Equivalent declarations are one semantic interface. Its coverage may be
+    // split across their source spellings, and complete coverage discharges one
+    // representative row label.
+    let structural = "module Foo =\n  effect Log = { write: Nat -> (), flush: () -> () }\nend\n\
+                      module Bar =\n  effect Log = { write: Nat -> (), flush: () -> () }\nend\n\
+                      let p : () -> Nat + Foo::!Log = fn _ => 0n\n\
+                      let h = fn _ => handle p () with | Foo::!Log.write n => () | Bar::!Log.flush u => () end";
+    let (mint, out) = built(structural);
+    let mut node = term_value(&mint, &out, "h");
+    while let TermKind::Fn { body, .. } = node {
+        node = &body.kind;
+    }
+    let TermKind::Handle { handler, .. } = node else {
+        panic!("expected a structural handler");
+    };
+    assert_eq!(handler.arms.len(), 2);
+    assert_ne!(
+        handler.arms[0].effect.tracked,
+        handler.arms[1].effect.tracked
+    );
+    assert_eq!(handler.discharges.len(), 1);
+    assert_eq!(mint.name(handler.discharges[0].tracked), "Log");
 }
 
 /// A duplicate arm and a second `return` arm are refused where a duplicate
@@ -3816,6 +3839,15 @@ fn a_handler_takes_each_arm_once() {
     };
     assert_eq!(error.kind.code(), "duplicate-arm");
     assert_eq!(error.kind.to_string(), "duplicate arm for `!Log.write`");
+
+    let bare = "effect Log = Nat -> ()\n\
+                let h = fn n => handle !Log n with | !Log _ => () | !Log _ => () end";
+    let (_, out) = build_src(bare);
+    let [error] = &out.errors[..] else {
+        panic!("{:#?}", out.errors);
+    };
+    assert_eq!(error.kind.to_string(), "duplicate arm for `!Log`");
+    assert_eq!(OperationSelector::Unnamed.source_name(), "<unnamed>");
 
     // Source paths resolve operations, but equivalent interfaces are one
     // effect in rows, so their operation arms must not choose competing

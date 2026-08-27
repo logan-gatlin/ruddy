@@ -848,9 +848,9 @@ impl fmt::Display for ir::ErrorKind {
                 label(Shape::Effect, effect),
                 listed(missing),
             ),
-            ir::ErrorKind::DuplicateArm { effect, op } => write!(
+            ir::ErrorKind::DuplicateArm { effect, selector } => write!(
                 f,
-                "duplicate arm for `{}.{op}`",
+                "duplicate arm for `{}{selector}`",
                 label(Shape::Effect, effect),
             ),
             ir::ErrorKind::DuplicateReturn { .. } => f.write_str("duplicate return arm"),

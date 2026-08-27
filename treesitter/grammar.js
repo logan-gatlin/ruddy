@@ -101,7 +101,7 @@ module.exports = grammar({
     // so both readings are carried until one of them fails — the speculative
     // read `Parser::clause_stmt` does, spelled as a conflict.
     [$._clause, $.clause_comparison],
-    [$.effect_operation_field, $._type],
+    [$._effect_operation_signature, $._type],
   ],
 
   rules: {
@@ -176,7 +176,7 @@ module.exports = grammar({
       field('name', $.identifier),
       optional(seq('=', field('body', choice(
         prec(1, $.effect_alias_union),
-        $.function_type,
+        $._effect_operation_signature,
         $.named_effect_interface,
       )))),
     ),
@@ -194,7 +194,20 @@ module.exports = grammar({
     effect_operation_field: $ => seq(
       field('name', $.identifier),
       ':',
-      field('signature', $.function_type),
+      field('signature', $._effect_operation_signature),
+    ),
+
+    // Grouping around an operation arrow is transparent and may nest, but its
+    // recursive base is still an arrow: `(Nat)` is not an operation signature.
+    _effect_operation_signature: $ => choice(
+      $.function_type,
+      $.parenthesized_effect_operation_signature,
+    ),
+
+    parenthesized_effect_operation_signature: $ => seq(
+      '(',
+      field('signature', $._effect_operation_signature),
+      ')',
     ),
 
     /** `!Log`, or `Sys::!Log` — an effect this declaration stands for. */

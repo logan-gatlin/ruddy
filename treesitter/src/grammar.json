@@ -289,7 +289,7 @@
                       },
                       {
                         "type": "SYMBOL",
-                        "name": "function_type"
+                        "name": "_effect_operation_signature"
                       },
                       {
                         "type": "SYMBOL",
@@ -397,8 +397,42 @@
           "name": "signature",
           "content": {
             "type": "SYMBOL",
-            "name": "function_type"
+            "name": "_effect_operation_signature"
           }
+        }
+      ]
+    },
+    "_effect_operation_signature": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "function_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "parenthesized_effect_operation_signature"
+        }
+      ]
+    },
+    "parenthesized_effect_operation_signature": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "FIELD",
+          "name": "signature",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_effect_operation_signature"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ")"
         }
       ]
     },
@@ -2786,7 +2820,7 @@
       "clause_comparison"
     ],
     [
-      "effect_operation_field",
+      "_effect_operation_signature",
       "_type"
     ]
   ],
