@@ -51,6 +51,18 @@
 //! constrained scheme in the HM(X) sense: it is what makes a principal type
 //! exist for the programs above.
 //!
+//! Presence refinement keeps the same staging discipline. A qualifying match
+//! adds one finite constraint node per written arm. Its ordered guards are
+//! built by one fold over those arms, and nesting follows the finite AST.
+//! Guarded equality decomposes by the ordinary finite type-size/occurs-check
+//! measure; it only replaces a presence binding with one finite implication.
+//! SAT is asked only at fixed arm and publishing boundaries, after the formulas
+//! involved already exist, and its answer never regenerates constraints or starts another solve
+//! pass. Recursive aliases retain the existing finite assumption stack, store
+//! growth is bounded by the written arms and structural presence comparisons,
+//! and projection retains its explicit cube/minterm budgets. There is therefore
+//! no solve → refine → regenerate cycle.
+//!
 //! Inference runs after lowering and mutates the [`Program`] it is handed:
 //! every [`Term`]'s `ty` goes from [`Core::Undecided`] to what was inferred for
 //! it, fully resolved, so nothing downstream ever needs the solver's variable
@@ -160,6 +172,9 @@ pub struct Output {
     /// store with no model entails everything, and asking it would call every
     /// arm of every match unreachable.
     pub promises: IndexMap<Symbol, Formula>,
+    /// The branch-local presence assumptions inference used, one report per
+    /// arm of every qualifying match, in solve order.
+    pub refinements: Vec<Refinement>,
     pub errors: Vec<Error>,
 }
 
@@ -184,6 +199,8 @@ pub struct Store {
 /// said.
 #[derive(Debug, Clone)]
 pub struct Batch {
+    /// Top-level definition whose generation/solve emitted this batch.
+    pub definition: Option<Symbol>,
     /// Where the program said it: the match, the use site, or the annotation.
     pub span: Span,
     pub origin: Origin,
@@ -208,6 +225,20 @@ pub enum Origin {
     Instance(Named),
     /// An annotation's own `where` clause.
     Annotation(Named),
+    /// A presence relation produced by guarded structural equality.
+    Refinement(Named),
+    /// An existing obligation made conditional on a branch assumption. The
+    /// original origin is retained so patterns and diagnostics keep their
+    /// attribution instead of seeing an opaque simplified implication.
+    Guarded(GuardedOrigin),
+}
+
+/// The metadata retained around an implication emitted in a qualifying arm.
+#[derive(Debug, Clone)]
+pub struct GuardedOrigin {
+    pub premise: Formula,
+    pub obligation: Formula,
+    pub origin: Box<Origin>,
 }
 
 /// What a match-coverage batch carries beyond its formula, so that the two
@@ -222,6 +253,73 @@ pub struct Coverage {
     /// The scrutinee's labels and what decides whether each is there, so a
     /// model of `store ∧ ¬covered` can be written out as a value.
     pub fields: Vec<(String, Presence)>,
+    /// Every nested struct path and its presence, for translating the raw
+    /// formulas into the zonked alphabet used while walking nested terms.
+    pub paths: Vec<(String, Presence)>,
+}
+
+/// Ordered effective arm conditions, in one linear fold.
+///
+/// If arm `i` covers `C_i`, the returned condition is `C_i` together with the
+/// negation of everything written before it. This is the single definition
+/// shared by inference and pattern reachability.
+pub fn effective_conditions(raw: &[Formula]) -> Vec<Formula> {
+    let mut earlier = Formula::False;
+    raw.iter()
+        .cloned()
+        .map(|covered| {
+            let effective = covered.clone().and(earlier.clone().not());
+            earlier = earlier.clone().or(covered);
+            effective
+        })
+        .collect()
+}
+
+/// One arm inside a qualifying match constraint.
+#[derive(Debug, Clone)]
+pub struct GuardedArm {
+    pub span: Span,
+    pub raw: Formula,
+    pub effective: Formula,
+    pub constraints: Vec<Constraint>,
+    pub requirements: Vec<DeferredRequirement>,
+    pub ty: Rc<Ty>,
+}
+
+/// A generation-time store batch held inert in its original source-order slot
+/// until the solver reaches the arm that owns it.
+#[derive(Debug, Clone)]
+pub struct DeferredRequirement {
+    pub at: usize,
+    pub batch: Batch,
+}
+
+/// What guarded solving learned about one qualifying arm.
+#[derive(Debug, Clone)]
+pub struct Refinement {
+    pub definition: Symbol,
+    pub match_span: Span,
+    pub arm_span: Span,
+    pub raw: Formula,
+    pub effective: Formula,
+    pub reachable: bool,
+    pub fields: Vec<(String, Presence)>,
+    pub facts: Vec<RefinementFact>,
+    pub obligations: Vec<GuardedObligation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefinementFact {
+    pub field: String,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuardedObligation {
+    pub span: Span,
+    pub premise: Formula,
+    pub obligation: Formula,
+    pub formula: Formula,
 }
 
 /// What a batch carries so that a complaint about it can be worded in the
@@ -347,6 +445,9 @@ pub enum Rule {
     /// so it is over a struct against a struct, as it always was, and over the
     /// `Nat` carrying an `x` that only a declaration can reach.
     Struct,
+    /// Presence equality under an arm premise. No solver variable is bound;
+    /// the implication recorded in the store is the effect.
+    Refine,
     /// [`Rule::Struct`] about the other shape: two sums, the cases both name
     /// against each other and the cases only one names into what the other's
     /// tail allows.
@@ -395,6 +496,11 @@ pub enum Effect {
     /// the halves of an arrow, the fields of a struct, or the same goal asked
     /// again about what a name stands for.
     Decomposed,
+    /// A guarded presence equality was recorded as an implication.
+    Guarded {
+        premise: Formula,
+        obligation: Formula,
+    },
     /// Reported, and the goal abandoned.
     Failed(ErrorKind),
 }
@@ -449,7 +555,24 @@ pub enum ConstraintKind {
     },
     /// A use of a let-bound name: `ty` is a fresh copy of whatever scheme the
     /// enclosing [`ConstraintKind::Let`] published for `symbol`.
-    Instance { symbol: Symbol, ty: Rc<Ty> },
+    Instance {
+        symbol: Symbol,
+        ty: Rc<Ty>,
+        /// Source-order store slot reserved during generation for the scheme
+        /// requirement solving may discover.
+        requirement: usize,
+    },
+    /// A qualifying presence-only match. Each arm owns the constraints and
+    /// store requirements generated by its body; solving applies its ordered
+    /// condition as a premise and constructs one structural result family.
+    Match {
+        scrutinee: Rc<Ty>,
+        result: Rc<Ty>,
+        arms: Vec<GuardedArm>,
+        /// The first store slot generated after this match. Arm-boundary
+        /// reachability ignores later source requirements.
+        store_end: usize,
+    },
     /// An application: what calling the function may perform, and what the
     /// place it is written in allows.
     ///
@@ -747,6 +870,8 @@ struct Scoped {
 struct Annotated {
     /// The annotation's span, which is the line the reader has to change.
     span: Span,
+    /// Ordered qualifying-arm premise in force where it was written.
+    guard: Formula,
     /// The `where` clause it promised, or [`Formula::True`] where none was
     /// written. The clause the value under it is held to, exactly as a
     /// definition's own is. See [`Scoped::promised`].
@@ -864,6 +989,17 @@ struct Table {
     /// variable that reaches two schemes it does not belong to is still one
     /// annotation to rewrite. See [`ErrorKind::RigidEscapes`].
     escaped: HashSet<u32>,
+    /// Top-level definition currently being generated or solved, stamped onto
+    /// store batches for source-order cascade decisions downstream.
+    definition: Option<Symbol>,
+    /// Generation-time batch slots currently held inert by qualifying arms.
+    /// Nested arms claim their own slots first; an enclosing arm claims only
+    /// the still-unclaimed coverage/requirements around them.
+    deferred: HashSet<usize>,
+    /// Reserved local-instance slots whose eventual scheme required nothing.
+    /// They stay as inert internal placeholders until publication, when they
+    /// are omitted from the store readers see.
+    empty_batches: HashSet<usize>,
     /// Whether some batch has already flipped the store unsatisfiable. The
     /// cascade rule: that batch owns the single resulting error, and every
     /// later SAT-dependent complaint — a use-site violation, an annotation
@@ -988,6 +1124,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut constraints = IndexMap::new();
     let mut promises = IndexMap::new();
     let mut steps = Vec::new();
+    let mut refinements = Vec::new();
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
     // a fact about the lowered program that nothing here changes.
@@ -1019,6 +1156,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         let scoped: Vec<Scoped> = members
             .iter()
             .map(|symbol| {
+                table.definition = Some(*symbol);
                 // The annotation is the contract: the body is checked against
                 // it, and it — not whatever the body's constraints worked out
                 // along the way — is what the definition means to everyone
@@ -1094,6 +1232,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         let bodies = table.store.batches.len();
 
         for scoped in scoped {
+            table.definition = Some(scoped.symbol);
             let decl = &mut program.terms[&scoped.symbol];
             let mut constrain = Constrain {
                 table: &mut table,
@@ -1113,6 +1252,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                     inside: false,
                 },
                 answer: None,
+                presence_guard: Formula::True,
             };
             // Checked against exactly what the rest of the group sees this
             // definition as. For an annotated one that is the annotation, as it
@@ -1130,6 +1270,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             let reported = errors.len();
             let published = locals.len();
 
+            let generated_end = table.store.batches.len();
             Solve {
                 table: &mut table,
                 errors: &mut errors,
@@ -1141,6 +1282,10 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 assumed: Vec::new(),
                 schemes: HashMap::new(),
                 locals: &mut locals,
+                guard: None,
+                active_refinement: None,
+                refinements: &mut refinements,
+                generated_end,
             }
             .run(&generated);
 
@@ -1216,6 +1361,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 && let Some((allowed, required)) = table.disagreement(
                     &member.scoped.promised,
                     &member.scoped.names,
+                    &Formula::True,
                     bodies.clone(),
                 )
             {
@@ -1239,8 +1385,12 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
                 // nested value costs nothing but the walk over it.
                 if from == to
                     && !table.unsat
-                    && let Some((allowed, required)) =
-                        table.disagreement(&annotated.promised, &annotated.names, bodies.clone())
+                    && let Some((allowed, required)) = table.disagreement(
+                        &annotated.promised,
+                        &annotated.names,
+                        &annotated.guard,
+                        bodies.clone(),
+                    )
                 {
                     errors.push(Error {
                         span: annotated.span,
@@ -1333,6 +1483,17 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // brought up to date, which is the difference between `a != b` as it was
     // emitted and the contradiction it turned out to be.
     let store = table.settled();
+    let mut refinements: Vec<Refinement> = refinements
+        .iter()
+        .map(|refinement| table.settled_refinement(refinement))
+        .collect();
+    refinements.sort_by_key(|refinement| {
+        (
+            position[&refinement.definition],
+            refinement.match_span.start,
+            refinement.arm_span.start,
+        )
+    });
 
     Output {
         aliases,
@@ -1344,6 +1505,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         steps,
         store,
         promises,
+        refinements,
         errors,
     }
 }
@@ -1356,6 +1518,20 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
 /// model. The other two are inference's own, and both are about a contradiction
 /// unification could never have found — each half is consistent, and only the
 /// two together are not.
+fn unguarded_origin(mut origin: &Origin) -> &Origin {
+    while let Origin::Guarded(guarded) = origin {
+        origin = &guarded.origin;
+    }
+    origin
+}
+
+fn unguarded_formula<'a>(origin: &'a Origin, formula: &'a Formula) -> &'a Formula {
+    match origin {
+        Origin::Guarded(guarded) => unguarded_formula(&guarded.origin, &guarded.obligation),
+        _ => formula,
+    }
+}
+
 fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
     if table.unsat {
         return;
@@ -1366,9 +1542,10 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
     table.unsat = true;
     table.store.batches[at].flipped = true;
     let batch = table.store.batches[at].clone();
-    let kind = match &batch.origin {
+    let base = unguarded_origin(&batch.origin);
+    let kind = match base {
         Origin::Coverage(_) => return,
-        Origin::Instance(named) | Origin::Annotation(named) => {
+        Origin::Instance(named) | Origin::Annotation(named) | Origin::Refinement(named) => {
             // Which of the two annotation complaints it is: a clause with no
             // model of its own is wrong by itself, and the body under it —
             // which may do nothing with the type at all — has no part in it.
@@ -1377,16 +1554,16 @@ fn report_flip(table: &mut Table, errors: &mut Vec<Error>) {
             // substitutes what the solve decided, so a clause the definition
             // ruled out and one that rules itself out would come back the
             // same, and every clause would blame the clause. An annotation
-            // check is one of the three places R8 lets the solver run, so
-            // this widens nothing.
-            let alone = sat::satisfiable(&batch.formula);
+            // check is one of the fixed boundaries where SAT may run.
+            let alone = sat::satisfiable(unguarded_formula(&batch.origin, &batch.formula));
             let formula = crate::ui::in_labels(&batch.formula, &named.labels);
-            match &batch.origin {
+            match base {
                 Origin::Annotation(_) if alone => ErrorKind::PresenceImpossible { formula },
                 Origin::Annotation(_) => ErrorKind::ClauseImpossible { formula },
                 _ => ErrorKind::PresenceRequired { formula },
             }
         }
+        Origin::Guarded(_) => unreachable!("guarded origins are unwrapped recursively"),
     };
     errors.push(Error {
         span: batch.span,
@@ -2009,6 +2186,7 @@ impl Table {
     /// arms happened to relate anything.
     fn require(&mut self, span: Span, origin: Origin, formula: Formula) {
         self.store.batches.push(Batch {
+            definition: self.definition,
             span,
             origin,
             formula,
@@ -2047,25 +2225,72 @@ impl Table {
             .store
             .batches
             .iter()
-            .map(|batch| Batch {
+            .enumerate()
+            .filter(|(at, _)| !self.empty_batches.contains(at))
+            .map(|(_, batch)| Batch {
+                definition: batch.definition,
                 span: batch.span,
-                origin: match &batch.origin {
-                    Origin::Coverage(coverage) => Origin::Coverage(Coverage {
-                        arms: coverage.arms.iter().map(|arm| self.resolved(arm)).collect(),
-                        fields: coverage
-                            .fields
-                            .iter()
-                            .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
-                            .collect(),
-                    }),
-                    Origin::Instance(named) => Origin::Instance(self.settled_names(named)),
-                    Origin::Annotation(named) => Origin::Annotation(self.settled_names(named)),
-                },
+                origin: self.settled_origin(&batch.origin),
                 formula: self.resolved(&batch.formula),
                 flipped: batch.flipped,
             })
             .collect();
         Store { batches }
+    }
+
+    /// One origin with every presence alias followed, retaining guarded
+    /// attribution recursively.
+    fn settled_origin(&self, origin: &Origin) -> Origin {
+        match origin {
+            Origin::Coverage(coverage) => Origin::Coverage(Coverage {
+                arms: coverage.arms.iter().map(|arm| self.resolved(arm)).collect(),
+                fields: coverage
+                    .fields
+                    .iter()
+                    .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
+                    .collect(),
+                paths: coverage
+                    .paths
+                    .iter()
+                    .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
+                    .collect(),
+            }),
+            Origin::Instance(named) => Origin::Instance(self.settled_names(named)),
+            Origin::Annotation(named) => Origin::Annotation(self.settled_names(named)),
+            Origin::Refinement(named) => Origin::Refinement(self.settled_names(named)),
+            Origin::Guarded(guarded) => Origin::Guarded(GuardedOrigin {
+                premise: self.resolved(&guarded.premise),
+                obligation: self.resolved(&guarded.obligation),
+                origin: Box::new(self.settled_origin(&guarded.origin)),
+            }),
+        }
+    }
+
+    fn settled_refinement(&self, refinement: &Refinement) -> Refinement {
+        Refinement {
+            definition: refinement.definition,
+            match_span: refinement.match_span,
+            arm_span: refinement.arm_span,
+            raw: self.resolved(&refinement.raw),
+            effective: self.resolved(&refinement.effective),
+            reachable: refinement.reachable,
+            fields: refinement
+                .fields
+                .iter()
+                .map(|(name, presence)| (name.clone(), self.presence_of(presence)))
+                .collect(),
+            facts: refinement.facts.clone(),
+            obligations: refinement
+                .obligations
+                .iter()
+                .map(|obligation| GuardedObligation {
+                    span: obligation.span,
+                    premise: self.resolved(&obligation.premise),
+                    obligation: self.resolved(&obligation.obligation),
+                    formula: self.resolved(&obligation.formula),
+                })
+                .collect(),
+        }
     }
 
     /// One batch's label pairs with every presence followed to what the solve
@@ -2088,6 +2313,25 @@ impl Table {
                 .iter()
                 .map(|batch| self.resolved(&batch.formula)),
         )
+    }
+
+    /// The longest satisfiable prefix of the store. Arm-boundary queries use
+    /// this rather than an already contradictory whole: the first flip owns the
+    /// one error, and treating every later arm as unreachable would cascade it
+    /// into unrelated typing decisions before [`report_flip`] can mark it.
+    fn consistent_known(&self, upto: usize, runtime_from: usize) -> Formula {
+        let mut known = Formula::True;
+        for batch in self.store.batches[..upto]
+            .iter()
+            .chain(self.store.batches[runtime_from..].iter())
+        {
+            let next = known.clone().and(self.resolved(&batch.formula));
+            if !sat::satisfiable(&next) {
+                break;
+            }
+            known = next;
+        }
+        known
     }
 
     /// The first batch conjoining which leaves the store with no model, if the
@@ -2170,27 +2414,38 @@ impl Table {
     /// the premise of the entailment already carries this definition's own
     /// clause — only who the second half of the complaint is about.
     ///
-    /// The body's side is projected onto the clause's own variables first:
-    /// a match inside the definition may relate presences the annotation never
-    /// mentions, and those are its own business.
+    /// The body's side is projected onto the clause's variables and any
+    /// enclosing arm premise. Keeping the latter until after entailment is what
+    /// prevents `E -> Q` from becoming `true` merely because `E` belongs to the
+    /// enclosing value rather than the local annotation.
     fn disagreement(
         &self,
         promised: &Formula,
         names: &[(String, Presence)],
+        guard: &Formula,
         batches: Range<usize>,
     ) -> Option<(String, String)> {
-        let allowed = self.resolved(promised);
-        let needed = Formula::all(
+        let promised = self.resolved(promised);
+        let guard = self.resolved(guard);
+        let allowed = guard.clone().and(promised.clone());
+        let body = Formula::all(
             self.store.batches[batches]
                 .iter()
                 .map(|batch| self.resolved(&batch.formula)),
         );
-        let mut atoms = Vec::new();
-        allowed.atoms(&mut atoms);
-        let needed = sat::project(&needed, &atoms);
+        let mut promised_atoms = Vec::new();
+        promised.atoms(&mut promised_atoms);
+        let mut check_atoms = promised_atoms.clone();
+        let mut guard_atoms = Vec::new();
+        guard.atoms(&mut guard_atoms);
+        // A local annotation mints its own presences, disjoint from the
+        // enclosing arm's. Both sets stay in the entailment alphabet.
+        check_atoms.extend(guard_atoms);
+        let needed = sat::project(&body, &check_atoms);
         if sat::entails(&allowed, &needed) {
             return None;
         }
+        let required = sat::project(&guard.and(needed), &promised_atoms);
         // Both halves are quoted in the names the reader wrote, which means
         // looking each one up by the presence it decides — as the solve now has
         // it, not as the annotation minted it. A variable unified with another
@@ -2200,8 +2455,8 @@ impl Table {
             labels: names.to_vec(),
         });
         Some((
-            crate::ui::in_labels(&sat::project(&allowed, &atoms), &named.labels),
-            crate::ui::in_labels(&needed, &named.labels),
+            crate::ui::in_labels(&sat::project(&promised, &promised_atoms), &named.labels),
+            crate::ui::in_labels(&required, &named.labels),
         ))
     }
 
@@ -2334,6 +2589,42 @@ impl Table {
             self.require(span, Origin::Instance(Named { labels }), formula);
         }
         ty
+    }
+
+    /// Every nested struct-field path a type names and the presence deciding
+    /// it. Unlike diagnostic labels, paths retain their parents so `x.a` and
+    /// `y.a` remain two readable facts in a refinement trace.
+    fn presence_paths(&self, ty: &Rc<Ty>, prefix: &str, found: &mut IndexMap<String, Presence>) {
+        let ty = self.resolve(ty);
+        for (name, field) in &ty.fields {
+            let path = match prefix.is_empty() {
+                true => name.clone(),
+                false => format!("{prefix}.{name}"),
+            };
+            found
+                .entry(path.clone())
+                .or_insert_with(|| self.presence_of(&field.presence));
+            self.presence_paths(&field.ty, &path, found);
+        }
+        match &ty.core {
+            Core::Named { args, .. } => {
+                for arg in args.iter() {
+                    self.presence_paths(arg, prefix, found);
+                }
+            }
+            Core::Arrow(_, _, _)
+            | Core::Sum(_)
+            | Core::Unit
+            | Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Var(_)
+            | Core::Bound(_)
+            | Core::Rigid { .. }
+            | Core::Undecided => {}
+        }
     }
 
     /// Every label a type names and what decides whether it is there, in the
@@ -2695,13 +2986,21 @@ impl Table {
     /// A `where false` on every scheme downstream of one contradiction is the
     /// same mistake said in as many places as the program has definitions.
     fn required(&self, ty: &Rc<Ty>) -> Formula {
+        self.required_given(ty, &Formula::True)
+    }
+
+    /// What a type generalized inside a reachable arm requires while that arm's
+    /// premise holds. Conjoining the premise before projection prevents
+    /// existential elimination from turning `E -> Q(local)` into `true`.
+    fn required_given(&self, ty: &Rc<Ty>, premise: &Formula) -> Formula {
         if self.unsat {
             return Formula::True;
         }
         let mut presences = IndexSet::new();
         self.presences_in(ty, &mut presences);
         let atoms: Vec<Atom> = presences.into_iter().map(Atom::Var).collect();
-        sat::project(&self.component(&atoms), &atoms)
+        let needed = self.component(&atoms).and(self.resolved(premise));
+        sat::project(&needed, &atoms)
     }
 
     /// What the store says about every presence variable `subst` numbered, in

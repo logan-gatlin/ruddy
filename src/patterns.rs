@@ -38,12 +38,12 @@
 //! scrutinee type, a verdict per arm, and the coverage — which is what the
 //! debugger's Patterns tab renders.
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use indexmap::IndexMap;
 
 use crate::{
-    inference::{self, Coverage as Covers, Origin, Store, sat, unfold},
+    inference::{self, Coverage as Covers, Origin, Store, effective_conditions, sat, unfold},
     ir::{Literal, Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
     tracking::Span,
@@ -230,6 +230,8 @@ struct Check<'a> {
     /// every match reads unhandled, which is one mistake said in as many places
     /// as the program has matches.
     flipped: Option<usize>,
+    definition_at: usize,
+    flipped_definition_at: Option<usize>,
     /// What the definition being walked may assume about its presences: the
     /// store's word about every presence its terms can name, nested bindings
     /// included. See [`inference::Output::promises`].
@@ -250,6 +252,18 @@ struct Check<'a> {
 struct Constrained<'a> {
     at: usize,
     coverage: &'a Covers,
+    premise: Formula,
+}
+
+fn constrained_origin(origin: &Origin) -> Option<(Formula, &Covers)> {
+    match origin {
+        Origin::Coverage(coverage) => Some((Formula::True, coverage)),
+        Origin::Guarded(guarded) => {
+            let (inside, coverage) = constrained_origin(&guarded.origin)?;
+            Some((guarded.premise.clone().and(inside), coverage))
+        }
+        Origin::Instance(_) | Origin::Annotation(_) | Origin::Refinement(_) => None,
+    }
 }
 
 /// Run the checks over every match in the program. `inferred` is read for its
@@ -264,16 +278,29 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
         reports: Vec::new(),
         errors: Vec::new(),
     };
+    let definitions: HashMap<Symbol, usize> = program
+        .terms
+        .keys()
+        .enumerate()
+        .map(|(at, symbol)| (*symbol, at))
+        .collect();
+    let flipped_definition_at = flipped.and_then(|at| {
+        inferred.store.batches[at]
+            .definition
+            .and_then(|symbol| definitions.get(&symbol).copied())
+    });
     // One definition at a time, because the presences its types name are its
     // own: the promise inference published for it is what the store came to
     // about them, and it is the only reading of the store the walk inside it
     // can use.
-    for (symbol, decl) in &program.terms {
+    for (definition_at, (symbol, decl)) in program.terms.iter().enumerate() {
         let check = Check {
             aliases: &inferred.aliases,
             errors: &inferred.errors,
             store: &inferred.store,
             flipped,
+            definition_at,
+            flipped_definition_at,
             promise: inferred
                 .promises
                 .get(symbol)
@@ -291,52 +318,61 @@ pub fn check(program: &Program, inferred: &inference::Output) -> Output {
 
 /// Every match in one term, outermost first, each checked where it is found.
 fn walk(check: &Check, term: &Term, out: &mut Output) {
+    walk_under(check, term, &Formula::True, out);
+}
+
+fn walk_under(check: &Check, term: &Term, assumed: &Formula, out: &mut Output) {
     match &term.kind {
         TermKind::Match { scrutinee, arms } => {
-            check.matched(term.span, scrutinee, arms, out);
-            walk(check, scrutinee, out);
-            for (_, body) in arms {
-                walk(check, body, out);
+            check.matched(term.span, scrutinee, arms, assumed, out);
+            walk_under(check, scrutinee, assumed, out);
+            let guards = check.arm_assumptions(term.span, scrutinee);
+            for (at, (_, body)) in arms.iter().enumerate() {
+                let inside = guards.as_ref().map_or_else(
+                    || assumed.clone(),
+                    |guards| assumed.clone().and(guards[at].clone()),
+                );
+                walk_under(check, body, &inside, out);
             }
         }
-        TermKind::Unary { value, .. } => walk(check, value, out),
+        TermKind::Unary { value, .. } => walk_under(check, value, assumed, out),
         TermKind::Binary { left, right, .. } => {
-            walk(check, left, out);
-            walk(check, right, out);
+            walk_under(check, left, assumed, out);
+            walk_under(check, right, assumed, out);
         }
         TermKind::Apply { func, arg } => {
-            walk(check, func, out);
-            walk(check, arg, out);
+            walk_under(check, func, assumed, out);
+            walk_under(check, arg, assumed, out);
         }
-        TermKind::Fn { body, .. } => walk(check, body, out),
+        TermKind::Fn { body, .. } => walk_under(check, body, assumed, out),
         TermKind::Let { value, body, .. } => {
-            walk(check, value, out);
-            walk(check, body, out);
+            walk_under(check, value, assumed, out);
+            walk_under(check, body, assumed, out);
         }
         TermKind::Struct(fields) => {
             for field in fields.values() {
-                walk(check, &field.value, out);
+                walk_under(check, &field.value, assumed, out);
             }
         }
         TermKind::Tag { payload, .. } => {
             if let Some(payload) = payload {
-                walk(check, payload, out);
+                walk_under(check, payload, assumed, out);
             }
         }
-        TermKind::Project { base, .. } => walk(check, base, out),
+        TermKind::Project { base, .. } => walk_under(check, base, assumed, out),
         // A handler's arms are not value patterns and nothing here changes for
         // them: what they hold is ordinary terms, and a match written inside
         // one is checked exactly as a match written anywhere else is.
         TermKind::Handle { body, handler } => {
-            walk(check, body, out);
+            walk_under(check, body, assumed, out);
             for arm in &handler.arms {
-                walk(check, &arm.body, out);
+                walk_under(check, &arm.body, assumed, out);
             }
             if let Some(ret) = &handler.ret {
-                walk(check, &ret.body, out);
+                walk_under(check, &ret.body, assumed, out);
             }
         }
-        TermKind::Raise(value) => walk(check, value, out),
+        TermKind::Raise(value) => walk_under(check, value, assumed, out),
         TermKind::Operation { .. }
         | TermKind::Ident(_)
         | TermKind::Natural(_)
@@ -446,11 +482,8 @@ fn wild_row(row: &[Cell]) -> Vec<Cell> {
 
 impl Walk {
     /// A walk about to begin: the question it answers, and nothing assumed yet.
-    fn start(mode: Mode) -> Self {
-        Walk {
-            mode,
-            assumed: Formula::True,
-        }
+    fn start(mode: Mode, assumed: Formula) -> Self {
+        Walk { mode, assumed }
     }
 }
 
@@ -463,7 +496,14 @@ impl Check<'_> {
 
     /// Check one match and push its report — and whatever the checks have to
     /// say — onto the output.
-    fn matched(&self, span: Span, scrutinee: &Term, arms: &[(Pattern, Term)], out: &mut Output) {
+    fn matched(
+        &self,
+        span: Span,
+        scrutinee: &Term,
+        arms: &[(Pattern, Term)],
+        assumed: &Formula,
+        out: &mut Output,
+    ) {
         let ty = scrutinee.ty.clone();
         // The empty match stays silent: it constrained the scrutinee to the
         // empty sum, which has no values to leave unhandled — unless the
@@ -527,31 +567,31 @@ impl Check<'_> {
             return;
         }
 
-        // The misplaced catch-all, first in the order of ownership: one error
-        // at the first arm that accepts everything and is not last. The arms
-        // it starves are its to explain, so they are not additionally
-        // flagged, however unreachable they are. Syntactic, and staying so:
-        // the dedicated wording is reserved for arms irrefutable on their face,
-        // whatever the store makes of them.
-        let misplaced = arms[..arms.len() - 1]
-            .iter()
-            .position(|(pattern, _)| catch_all(pattern));
-        if let Some(at) = misplaced {
-            out.errors.push(Error {
-                span: spans[at],
-                kind: ErrorKind::MisplacedCatchAll,
-            });
-        }
-
         // A column whose coverage inference converted to a formula is decided
         // by the store; anything else keeps the matrix walk it always had.
         let constrained = self.constrained(span);
-        // The cascade rule: a match whose coverage comes after the batch that
-        // flipped the store cannot be reasoned about from a store with no
-        // model, so it stands aside rather than reporting every arm dead.
-        if let Some(found) = &constrained
-            && self.flipped.is_some_and(|first| first < found.at)
-        {
+        // The cascade rule applies to both paths. A converted match has a store
+        // index to compare directly; for a legacy literal/tag column, source
+        // position identifies one following the flipping batch in the same
+        // file.
+        let cascaded = self.flipped.is_some_and(|first| match &constrained {
+            Some(found) => first < found.at,
+            None => match self.flipped_definition_at {
+                Some(flipped) if flipped < self.definition_at => true,
+                Some(flipped) if flipped > self.definition_at => false,
+                _ => {
+                    let flipped = &self.store.batches[first];
+                    matches!(
+                        (
+                            flipped.span.file_id == span.file_id,
+                            flipped.span.start < span.start,
+                        ),
+                        (true, true)
+                    )
+                }
+            },
+        });
+        if cascaded {
             out.reports.push(Report {
                 span,
                 scrutinee: ty,
@@ -568,6 +608,20 @@ impl Check<'_> {
                 coverage: Coverage::Skipped,
             });
             return;
+        }
+
+        // The misplaced catch-all, first in the order of ownership once the
+        // cascade check has allowed this match to speak. One error at the first
+        // arm that accepts everything and is not last; the arms it starves are
+        // not additionally flagged.
+        let misplaced = arms[..arms.len() - 1]
+            .iter()
+            .position(|(pattern, _)| catch_all(pattern));
+        if let Some(at) = misplaced {
+            out.errors.push(Error {
+                span: spans[at],
+                kind: ErrorKind::MisplacedCatchAll,
+            });
         }
 
         // A verdict per arm, and the unreachable complaints. Reachability is
@@ -590,7 +644,7 @@ impl Check<'_> {
                         // without a model, every arm of it would read dead,
                         // and the arms are not what went wrong.
                         Some(found) if self.flipped == Some(found.at) => true,
-                        Some(found) => self.reaches(&found.coverage.arms, at),
+                        Some(found) => self.reaches(found, at),
                         None => {
                             let rows: Vec<Vec<Cell>> =
                                 cells[..at].iter().map(|cell| vec![cell.clone()]).collect();
@@ -598,7 +652,7 @@ impl Check<'_> {
                                 &rows,
                                 &cols,
                                 &[cells[at].clone()],
-                                &Walk::start(Mode::Reachability),
+                                &Walk::start(Mode::Reachability, assumed.clone()),
                             )
                             .is_some()
                         }
@@ -651,7 +705,7 @@ impl Check<'_> {
                     &rows,
                     &cols,
                     &[Cell::Wild],
-                    &Walk::start(Mode::Exhaustiveness),
+                    &Walk::start(Mode::Exhaustiveness, assumed.clone()),
                 ) {
                     Some(mut wits) => {
                         let witness = wits.remove(0).unwrap_or(Witness::Any);
@@ -678,6 +732,52 @@ impl Check<'_> {
         });
     }
 
+    /// The local ordered arm assumptions translated from inference's solver
+    /// variables into the bound presences the zonked term types use. These are
+    /// carried into nested non-qualifying matches, whose literal/tag matrix
+    /// still needs to know which outer presence branch it sits in.
+    fn arm_assumptions(&self, span: Span, scrutinee: &Term) -> Option<Vec<Formula>> {
+        let found = self.constrained(span)?;
+        let raw: Vec<Formula> = found
+            .coverage
+            .arms
+            .iter()
+            .map(|arm| {
+                arm.rename(&|var| {
+                    found
+                        .coverage
+                        .paths
+                        .iter()
+                        .find_map(|(path, presence)| match presence {
+                            Presence::Var(found) if *found == var => self
+                                .presence_at(&scrutinee.ty, path)
+                                .map(|presence| presence.formula()),
+                            _ => None,
+                        })
+                        // An unnamed nested atom stays independent rather than
+                        // being defaulted true or false in the bound alphabet.
+                        .unwrap_or_else(|| Formula::var(var))
+                })
+            })
+            .collect();
+        Some(effective_conditions(&raw))
+    }
+
+    fn presence_at(&self, ty: &Rc<Ty>, path: &str) -> Option<Presence> {
+        match path.split_once('.') {
+            Some((name, below)) => {
+                let shaped = self.shape(ty);
+                let field = shaped.fields.get(name)?;
+                self.presence_at(&field.ty, below)
+            }
+            None => self
+                .shape(ty)
+                .fields
+                .get(path)
+                .map(|field| field.presence.clone()),
+        }
+    }
+
     /// The store's coverage batch for the match at `span`, when inference
     /// converted that match's column.
     ///
@@ -688,11 +788,15 @@ impl Check<'_> {
             .batches
             .iter()
             .enumerate()
-            .find_map(|(at, batch)| match &batch.origin {
-                Origin::Coverage(coverage) if batch.span == span => {
-                    Some(Constrained { at, coverage })
-                }
-                _ => None,
+            .find_map(|(at, batch)| {
+                (batch.span == span)
+                    .then(|| constrained_origin(&batch.origin))
+                    .flatten()
+                    .map(|(premise, coverage)| Constrained {
+                        at,
+                        coverage,
+                        premise,
+                    })
             })
     }
 
@@ -702,10 +806,14 @@ impl Check<'_> {
     /// Maranget's usefulness, said propositionally. The two agree wherever both
     /// can be asked; where only this one can, it is because the column tests
     /// nothing but which labels are there, and that is what the store is about.
-    fn reaches(&self, arms: &[Formula], at: usize) -> bool {
-        let earlier = Formula::any(arms[..at].iter().cloned());
-        let reach = arms[at].clone().and(earlier.not());
-        sat::satisfiable(&self.known().and(reach))
+    fn reaches(&self, found: &Constrained<'_>, at: usize) -> bool {
+        let effective = effective_conditions(&found.coverage.arms);
+        sat::satisfiable(
+            &self
+                .known()
+                .and(found.premise.clone())
+                .and(effective[at].clone()),
+        )
     }
 
     /// The walk with one more presence literal assumed, or `None` when what the
@@ -763,7 +871,7 @@ impl Check<'_> {
                 .map(|batch| batch.formula.clone()),
         );
         let covered = Formula::any(found.coverage.arms.iter().cloned());
-        let model = sat::model(&before.and(covered.not()))
+        let model = sat::model(&before.and(found.premise.clone()).and(covered.not()))
             .expect("the store had a model before the batch that flipped it");
         let there = |presence: &Presence| match presence {
             Presence::Present => true,

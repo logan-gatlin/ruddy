@@ -1856,6 +1856,25 @@ fn a_file_with_no_header_parses_without_one() {
 /// reported where the third would have gone, and the file after it is still
 /// read — the recovery every malformed statement gets.
 #[test]
+fn integral_reals_are_recovered_as_version_parts() {
+    let tokens = |major: &str| {
+        ["bundle demo", major, ".", "2", ".", "3"]
+            .into_iter()
+            .flat_map(|part| lex(part, FileID::GENERATED).tokens)
+            .collect()
+    };
+    let out = parse(tokens("1"));
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert_eq!(
+        out.header.expect("a recovered header").version.tracked,
+        Version::new(1, 2, 3)
+    );
+
+    let out = parse(tokens("1.5"));
+    assert!(!out.errors.is_empty());
+}
+
+#[test]
 fn a_version_with_two_parts_is_unexpected() {
     let source = "bundle demo 0.1\nlet x = 1n";
     let out = parse(lex(source, FileID::GENERATED).tokens);

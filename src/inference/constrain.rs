@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::{
-    Annotated, Binding, Constraint, ConstraintKind, Coverage, Named, Origin, Table,
-    lower_annotation, same_field_set,
+    Annotated, Binding, Constraint, ConstraintKind, Coverage, DeferredRequirement, GuardedArm,
+    Named, Origin, Table, effective_conditions, lower_annotation, same_field_set,
 };
 
 /// Pass one: the walk that says what has to hold, and solves nothing.
@@ -70,6 +70,10 @@ pub struct Constrain<'a> {
     /// because the outer handler is still on the stack while the inner one
     /// runs.
     pub answer: Option<Rc<Ty>>,
+    /// Syntactic conjunction of qualifying arm conditions enclosing the walk.
+    /// It is recorded on nested annotations for their post-solve contract
+    /// check; generation never asks whether it is satisfiable.
+    pub presence_guard: Formula,
 }
 
 /// What every effect's operations were declared to be, by the effect and the
@@ -146,6 +150,17 @@ type Cover = Option<IndexMap<usize, Formula>>;
 /// A binder or a wildcard covers the position outright, which is the empty
 /// conjunction — and a disjunction with that in it is [`Formula::True`], so a
 /// column with one emits nothing, exactly as R6 says.
+fn presence_paths(ty: &Rc<Ty>, prefix: &str, found: &mut Vec<(String, Presence)>) {
+    for (name, field) in &ty.fields {
+        let path = match prefix.is_empty() {
+            true => name.clone(),
+            false => format!("{prefix}.{name}"),
+        };
+        found.push((path.clone(), field.presence.clone()));
+        presence_paths(&field.ty, &path, found);
+    }
+}
+
 fn covered(
     entries: &[(usize, Col)],
     named: &IndexMap<String, RowField>,
@@ -209,6 +224,23 @@ impl Constrain<'_> {
                 actual: actual.clone(),
             },
         });
+    }
+
+    /// Hold every as-yet unowned batch generated since `from` inert in its
+    /// source-order slot. A nested qualifying arm has already claimed its own
+    /// slots, so an enclosing arm naturally takes only the nested coverage and
+    /// direct requirements around them.
+    fn defer_requirements(&mut self, from: usize) -> Vec<DeferredRequirement> {
+        let mut requirements = Vec::new();
+        for at in from..self.table.store.batches.len() {
+            if !self.table.deferred.insert(at) {
+                continue;
+            }
+            let batch = self.table.store.batches[at].clone();
+            self.table.store.batches[at].formula = Formula::True;
+            requirements.push(DeferredRequirement { at, batch });
+        }
+        requirements
     }
 
     /// Infer a type for `term` and write it into `term.ty`.
@@ -290,6 +322,7 @@ impl Constrain<'_> {
                         }
                         self.annotated.push(Annotated {
                             span: annotation.ty.span,
+                            guard: self.presence_guard.clone(),
                             promised: lowered.formula.clone(),
                             names: lowered.names,
                         });
@@ -565,6 +598,7 @@ impl Constrain<'_> {
             TermKind::Match { scrutinee, arms } => {
                 self.infer_term(scrutinee);
                 let result = self.table.fresh_type();
+                let mut qualifying = None;
                 let expected = match arms.is_empty() {
                     true => Rc::new(Ty::plain(Core::Sum(Row {
                         labels: IndexMap::new(),
@@ -583,14 +617,12 @@ impl Constrain<'_> {
                             .map(|(arm, pattern)| (arm, Col::Pattern(pattern)))
                             .collect();
                         let (demand, cover) = self.position(&columns, &mut Vec::new(), &root);
-                        // The column-to-constraint conversion, R6: what the
-                        // arms between them cover, as a formula over the
-                        // presences the demand just minted. Emitted for the
-                        // whole match rather than per position — a nested
-                        // column's literals are already inside the enclosing
-                        // arm's disjunct.
+                        // The column-to-constraint conversion: what the arms
+                        // cover between them, over the finite presences the
+                        // demand just minted. Its ordered per-arm forms also
+                        // become the explicit guarded constraint below.
                         if let Some(cover) = cover {
-                            let arms: Vec<Formula> = (0..arms.len())
+                            let raw: Vec<Formula> = (0..arms.len())
                                 .map(|arm| cover.get(&arm).cloned().unwrap_or(Formula::True))
                                 .collect();
                             let fields = demand
@@ -598,24 +630,73 @@ impl Constrain<'_> {
                                 .iter()
                                 .map(|(name, field)| (name.clone(), field.presence.clone()))
                                 .collect();
-                            let formula = Formula::any(arms.clone());
+                            let mut paths = Vec::new();
+                            presence_paths(&demand, "", &mut paths);
+                            let formula = Formula::any(raw.clone());
                             self.table.require(
                                 span,
-                                Origin::Coverage(Coverage { arms, fields }),
+                                Origin::Coverage(Coverage {
+                                    arms: raw.clone(),
+                                    fields,
+                                    paths,
+                                }),
                                 formula,
                             );
+                            qualifying = Some(raw);
                         }
                         demand
                     }
                 };
                 let actual = scrutinee.ty.clone();
                 self.checks(scrutinee.span, &actual, &expected);
-                // Whichever arm a value picks is what the match comes to, so
-                // every body is the one type the match has.
-                for (_, body) in arms.iter_mut() {
-                    self.infer_term(body);
-                    let actual = body.ty.clone();
-                    self.checks(body.span, &actual, &result);
+
+                match qualifying {
+                    Some(raw) => {
+                        let effective = effective_conditions(&raw);
+                        let mut guarded = Vec::with_capacity(arms.len());
+                        for (((pattern, body), raw), effective) in
+                            arms.iter_mut().zip(raw).zip(effective)
+                        {
+                            // The arm is a scope in the generated constraint
+                            // tree. Store batches emitted while walking it are
+                            // held inert in their source-order slots and travel
+                            // with it, so solving can put the premise around them.
+                            let outer = std::mem::take(&mut self.out);
+                            let required = self.table.store.batches.len();
+                            let combined = self.presence_guard.clone().and(effective.clone());
+                            let enclosing = std::mem::replace(&mut self.presence_guard, combined);
+                            self.infer_term(body);
+                            self.presence_guard = enclosing;
+                            let constraints = std::mem::replace(&mut self.out, outer);
+                            let requirements = self.defer_requirements(required);
+                            guarded.push(GuardedArm {
+                                span: pattern.span.merge(body.span),
+                                raw,
+                                effective,
+                                constraints,
+                                requirements,
+                                ty: body.ty.clone(),
+                            });
+                        }
+                        self.out.push(Constraint {
+                            span,
+                            kind: ConstraintKind::Match {
+                                scrutinee: expected,
+                                result: result.clone(),
+                                arms: guarded,
+                                store_end: self.table.store.batches.len(),
+                            },
+                        });
+                    }
+                    // A mixed tag/literal column keeps the old flat equality
+                    // constraints exactly.
+                    None => {
+                        for (_, body) in arms.iter_mut() {
+                            self.infer_term(body);
+                            let actual = body.ty.clone();
+                            self.checks(body.span, &actual, &result);
+                        }
+                    }
                 }
                 result
             }
@@ -1095,11 +1176,24 @@ impl Constrain<'_> {
             // construct that would otherwise have to wait for a solve.
             Binding::Local => {
                 let ty = self.table.fresh_type();
+                // The scheme does not exist yet, but its possible store batch
+                // still has a source position. Reserve an inert slot now; the
+                // solver fills it (under any active arm premise) once the local
+                // has been generalized, or omits it at publication if the
+                // scheme requires nothing.
+                let requirement = self.table.store.batches.len();
+                self.table.require(
+                    span,
+                    Origin::Instance(Named { labels: Vec::new() }),
+                    Formula::True,
+                );
+                self.table.deferred.insert(requirement);
                 self.out.push(Constraint {
                     span,
                     kind: ConstraintKind::Instance {
                         symbol,
                         ty: ty.clone(),
+                        requirement,
                     },
                 });
                 ty

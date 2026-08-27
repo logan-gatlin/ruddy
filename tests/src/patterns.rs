@@ -94,6 +94,107 @@ fn the_motivating_program_is_exhaustive() {
     assert_eq!(verdicts(report), [Verdict::Reachable; 4]);
 }
 
+#[test]
+fn annotated_and_inferred_swap_are_exhaustive_with_shared_conditions() {
+    for src in [
+        "let swap : { a when 'a: Nat, b when 'b: Nat } -> \
+         { a when 'b: Nat, b when 'a: Nat } where 'a != 'b = fn v =>\n\
+         match v with | {a} => { b: a } | {b} => { a: b } end",
+        "let swap = fn v => match v with \
+         | {a} => { b: a } | {b} => { a: b } end",
+    ] {
+        let (out, inferred, checks) = checked(src);
+        assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+        assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+        let report = sole_report(&checks);
+        assert!(matches!(report.coverage, Coverage::Exhaustive));
+        assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+        let coverage = inferred
+            .store
+            .batches
+            .iter()
+            .find_map(|batch| match &batch.origin {
+                inference::Origin::Coverage(coverage) => Some(coverage),
+                _ => None,
+            })
+            .expect("the qualifying match publishes coverage");
+        let effective = inference::effective_conditions(&coverage.arms);
+        assert_eq!(effective.len(), inferred.refinements.len());
+        for (shared, traced) in effective.iter().zip(&inferred.refinements) {
+            assert!(inference::sat::entails(shared, &traced.effective));
+            assert!(inference::sat::entails(&traced.effective, shared));
+        }
+    }
+}
+
+#[test]
+fn scalar_witnesses_step_past_a_listed_zero_value() {
+    for src in [
+        "let f = fn v => match v with | 0i => 1n end",
+        "let f = fn v => match v with | 0 => 1n end",
+        "let f = fn v => match v with | \"\" => 1n end",
+    ] {
+        let (_, inferred, checks) = checked(src);
+        assert!(inferred.errors.is_empty(), "{src}: {:#?}", inferred.errors);
+        assert!(!witness_of(&checks).is_empty());
+    }
+}
+
+#[test]
+fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
+    clean("let paths = fn v => match v with | {box: {x}} => 1n | {other} => 2n end");
+
+    let checks = clean(
+        "let f = fn v => match v with\n\
+         | {x} => match v with | {x: 0n} => 0n | {x: n} => 1n end\n\
+         | {y} => 2n end",
+    );
+    assert_eq!(checks.reports.len(), 2);
+    assert!(
+        checks
+            .reports
+            .iter()
+            .all(|report| matches!(report.coverage, Coverage::Exhaustive))
+    );
+}
+
+#[test]
+fn ordered_overlap_and_nested_guards_agree_with_pattern_reachability() {
+    let (out, inferred, checks) =
+        checked("let f = fn v => match v with | {x, ..} => 1n | rest => 2n end");
+    assert!(out.errors.is_empty());
+    assert!(inferred.errors.is_empty());
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    assert_eq!(verdicts(sole_report(&checks)), [Verdict::Reachable; 2]);
+    assert!(
+        inferred.refinements[1]
+            .facts
+            .iter()
+            .any(|fact| fact.field == "x" && !fact.present)
+    );
+
+    let checks = clean(
+        "let nested = fn v => match v with\n\
+         | {left} => match left with | {x} => 1n | {y} => 2n end\n\
+         | {right} => 3n end",
+    );
+    assert_eq!(checks.reports.len(), 2);
+    assert!(
+        checks
+            .reports
+            .iter()
+            .all(|report| matches!(report.coverage, Coverage::Exhaustive))
+    );
+    assert!(checks.reports.iter().all(|report| {
+        report
+            .arms
+            .iter()
+            .all(|arm| arm.verdict == Verdict::Reachable)
+    }));
+}
+
 /// A qualifying column no longer leaves a hole: `{a, b}` and `{}` between them
 /// say the two presences agree, that goes into the store as the column's
 /// coverage, and every value the store allows is one of the two arms.
@@ -750,6 +851,25 @@ fn a_match_after_the_flip_stands_aside() {
     let last = checks.reports.last().expect("two matches were checked");
     assert!(matches!(last.coverage, Coverage::Skipped));
     assert_eq!(verdicts(last), [Verdict::Skipped; 2]);
+
+    let src = "let early : Nat -> Nat = fn n => match n with | 0n => 0n | x => x end\n\
+               let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let bad = p {}\n\
+               let q = fn n => match n with | 0n => 1n end";
+    let (_, inferred, checks) = checked(src);
+    assert_eq!(inferred.errors.len(), 1);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let last = checks.reports.last().expect("the later natural match");
+    assert!(matches!(last.coverage, Coverage::Skipped));
+    assert_eq!(verdicts(last), [Verdict::Skipped]);
+
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let f = let _ = p {} in match 0n with | 0n => 1n end";
+    let (_, inferred, checks) = checked(src);
+    assert_eq!(inferred.errors.len(), 1);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let last = checks.reports.last().expect("the same-definition match");
+    assert!(matches!(last.coverage, Coverage::Skipped));
 }
 
 /// The catch-all placement rule stays syntactic: an arm irrefutable on its face

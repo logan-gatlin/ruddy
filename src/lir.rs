@@ -29,7 +29,7 @@ use crate::{
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Presence, Rest, Row, Ty},
+    types::{Core, Formula, Presence, Rest, Row, Ty},
 };
 
 /// A value the instruction stream names. Numbered by one program-wide counter,
@@ -505,6 +505,11 @@ struct Line {
 struct Matrix {
     cols: Vec<Col>,
     lines: Vec<Line>,
+    /// Presence literals selected on the path to this matrix. They let the
+    /// decision tree skip combinations the inferred definition promise rules
+    /// out, while still emitting ordinary `SwitchPresence` instructions for
+    /// the alternatives that can both occur.
+    assumed: Formula,
 }
 
 /// What every leaf of one match's tree needs: the arms to emit, the
@@ -516,6 +521,7 @@ struct Tree<'a> {
     rep: Rep,
     ty: Rc<Ty>,
     span: Span,
+    allowed: Formula,
 }
 
 /// The lowering itself: the program being read, everything emitted so far, and
@@ -552,6 +558,12 @@ struct Lower<'a> {
     stem: String,
     serial: u32,
     globals: Vec<Global>,
+    /// The top-level definition currently being lowered, whose quantified
+    /// presence promise governs every nested match decision tree.
+    definition: Option<Symbol>,
+    /// Presence literals selected by enclosing match decision trees while an
+    /// arm body is lowered. A nested match begins under this path condition.
+    assumed: Formula,
 }
 
 /// Lower a typed, checked program.
@@ -573,6 +585,8 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         stem: String::new(),
         serial: 0,
         globals: Vec::new(),
+        definition: None,
+        assumed: Formula::True,
     };
     let order = low.order();
     low.reserve(&order);
@@ -807,6 +821,7 @@ impl Matrix {
                 .filter(|line| keep(line))
                 .cloned()
                 .collect(),
+            assumed: self.assumed.clone(),
         }
     }
 
@@ -816,6 +831,7 @@ impl Matrix {
         Matrix {
             cols: self.cols,
             lines: self.lines.into_iter().map(Line::dropped).collect(),
+            assumed: self.assumed,
         }
     }
 
@@ -828,6 +844,7 @@ impl Matrix {
                 .into_iter()
                 .map(|line| line.consumed(temp))
                 .collect(),
+            assumed: self.assumed,
         }
     }
 
@@ -840,6 +857,7 @@ impl Matrix {
         Matrix {
             cols,
             lines: self.lines,
+            assumed: self.assumed,
         }
     }
 
@@ -862,6 +880,7 @@ impl Matrix {
                     Some(line)
                 })
                 .collect(),
+            assumed: self.assumed.clone(),
         }
     }
 
@@ -870,6 +889,11 @@ impl Matrix {
     fn absent(&self) -> Matrix {
         self.kept(|line| matches!(&line.cells[0], Cell::Absent | Cell::Wild(_)))
             .dropped()
+    }
+
+    fn assuming(mut self, literal: Formula) -> Matrix {
+        self.assumed = self.assumed.and(literal);
+        self
     }
 }
 
@@ -1122,6 +1146,7 @@ impl Lower<'_> {
     /// Lower one top-level definition: its functions, and the global that gives
     /// its value.
     fn define(&mut self, symbol: Symbol) {
+        self.definition = Some(symbol);
         let program = self.program;
         let decl = &program.terms[&symbol];
         let name = self.mint.name(symbol).to_string();
@@ -2255,11 +2280,16 @@ impl Lower<'_> {
                 },
             );
         }
+        let allowed = self
+            .definition
+            .and_then(|symbol| self.inference.promises.get(&symbol).cloned())
+            .unwrap_or(Formula::True);
         let tree = Tree {
             arms,
             rep,
             ty: term.ty.clone(),
             span: term.span,
+            allowed,
         };
         let matrix = Matrix {
             cols: vec![Col::Value(Value {
@@ -2275,6 +2305,7 @@ impl Lower<'_> {
                     binds: Vec::new(),
                 })
                 .collect(),
+            assumed: self.assumed.clone(),
         };
         self.tree(matrix, &tree, body)
     }
@@ -2288,7 +2319,7 @@ impl Lower<'_> {
                 .into_iter()
                 .next()
                 .expect("the pattern checks proved the match exhaustive");
-            return self.leaf(line, tree, body);
+            return self.leaf(line, matrix.assumed, tree, body);
         };
         match col {
             Col::Value(col) => self.column(&col, matrix, tree, body),
@@ -2302,7 +2333,7 @@ impl Lower<'_> {
     /// An arm reachable from several leaves is emitted at each of them, so its
     /// binders are bound afresh every time — which is why they are written into the
     /// frame here rather than once for the whole match.
-    fn leaf(&mut self, line: Line, tree: &Tree, body: &mut Body) -> Temp {
+    fn leaf(&mut self, line: Line, assumed: Formula, tree: &Tree, body: &mut Body) -> Temp {
         for (symbol, temp) in &line.binds {
             self.top().locals.insert(*symbol, *temp);
         }
@@ -2310,7 +2341,9 @@ impl Lower<'_> {
         // function value is fitted from the shape it holds to the match's own
         // type — which is the shape everything downstream reads the temp at.
         let arm = &tree.arms[line.arm].1;
+        let outer = std::mem::replace(&mut self.assumed, assumed);
         let value = self.term(arm, body);
+        self.assumed = outer;
         let have = self.holding(value, &arm.ty);
         self.fitted(&tree.ty, &have, value, body)
     }
@@ -2460,6 +2493,7 @@ impl Lower<'_> {
                             Some(line)
                         })
                         .collect(),
+                    assumed: matrix.assumed.clone(),
                 };
                 let reads = !kept.untested();
                 let block = self.child(tree.span, |low, inner| match reads {
@@ -2603,6 +2637,7 @@ impl Lower<'_> {
                     Line { cells, ..line }
                 })
                 .collect(),
+            assumed: matrix.assumed,
         };
         self.tree(widened.under(cols), tree, body)
     }
@@ -2621,21 +2656,61 @@ impl Lower<'_> {
             Presence::Present => self.field(col, matrix.present(), tree, body),
             Presence::Absent => self.tree(matrix.absent(), tree, body),
             _ => {
-                let kept = matrix.present();
-                let present = self.child(tree.span, |low, inner| low.field(col, kept, tree, inner));
-                let missing = matrix.absent();
-                let absent = self.child(tree.span, |low, inner| low.tree(missing, tree, inner));
-                self.emit(
-                    body,
-                    tree.span,
-                    tree.rep,
-                    Op::SwitchPresence {
-                        on: col.base,
-                        field: col.name.clone(),
-                        present: Box::new(present),
-                        absent: Box::new(absent),
-                    },
-                )
+                let literal = match &col.presence {
+                    Presence::Var(_) | Presence::Bound(_) => Some(col.presence.formula()),
+                    Presence::Present | Presence::Absent | Presence::Undecided => None,
+                };
+                let path = tree.allowed.clone().and(matrix.assumed.clone());
+                let can_present = literal.as_ref().is_none_or(|literal| {
+                    inference::sat::satisfiable(&path.clone().and(literal.clone()))
+                });
+                let can_absent = literal.as_ref().is_none_or(|literal| {
+                    inference::sat::satisfiable(&path.clone().and(literal.clone().not()))
+                });
+                match (can_present, can_absent) {
+                    (true, false) => {
+                        let kept = matrix
+                            .present()
+                            .assuming(literal.expect("a decided branch has a literal"));
+                        self.field(col, kept, tree, body)
+                    }
+                    (false, true) => {
+                        let missing = matrix
+                            .absent()
+                            .assuming(literal.expect("a decided branch has a literal").not());
+                        self.tree(missing, tree, body)
+                    }
+                    (true, true) => {
+                        let kept = match &literal {
+                            Some(literal) => matrix.present().assuming(literal.clone()),
+                            None => matrix.present(),
+                        };
+                        let present =
+                            self.child(tree.span, |low, inner| low.field(col, kept, tree, inner));
+                        let missing = match &literal {
+                            Some(literal) => matrix.absent().assuming(literal.clone().not()),
+                            None => matrix.absent(),
+                        };
+                        let absent =
+                            self.child(tree.span, |low, inner| low.tree(missing, tree, inner));
+                        self.emit(
+                            body,
+                            tree.span,
+                            tree.rep,
+                            Op::SwitchPresence {
+                                on: col.base,
+                                field: col.name.clone(),
+                                present: Box::new(present),
+                                absent: Box::new(absent),
+                            },
+                        )
+                    }
+                    (false, false) => {
+                        unreachable!(
+                            "the inferred definition promise has a model on every emitted path"
+                        )
+                    }
+                }
             }
         }
     }

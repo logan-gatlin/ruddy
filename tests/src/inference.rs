@@ -9,7 +9,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Core, Presence, Rest, Sense, Shape, Ty, TyVar},
+    types::{Core, Formula, Presence, Rest, Sense, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -4948,6 +4948,16 @@ fn field_types_unify_across_arms() {
 /// covers the payload — the numbers never run out — so the catch-all's view
 /// keeps the case present, and the whole thing types clean.
 #[test]
+fn both_booleans_fully_handle_a_case_before_the_catch_all() {
+    let (mint, _, output) = inferred(
+        "let keep = fn r => 0n\n\
+         let f = fn e => match e with\n\
+         | #A false => 1n | #A true => 2n | rest => keep rest end",
+    );
+    assert_eq!(scheme(&mint, &output, "f"), "#A Boolean | ..'a -> Nat");
+}
+
+#[test]
 fn a_case_tested_by_numbers_stays_present_for_the_catch_all() {
     let (mint, _, output) = inferred(
         "let keep = fn r => 0n\n\
@@ -5002,6 +5012,486 @@ fn the_motivating_programs_infer_their_constraints() {
     assert_eq!(
         scheme(&mint, &output, "r"),
         "{ x when 'a: 'c, y when 'b: 'd, ..'e } -> {} where 'a or 'b"
+    );
+}
+
+#[test]
+fn a_presence_match_refines_annotated_and_inferred_results() {
+    let annotated = "let swap : { a when 'a: Nat, b when 'b: Nat } -> \
+         { a when 'b: Nat, b when 'a: Nat } where 'a != 'b = fn v =>\n\
+         \x20 match v with | {a} => { b: a } | {b} => { a: b } end";
+    let (mint, _, output) = inferred(annotated);
+    assert_eq!(
+        scheme(&mint, &output, "swap"),
+        "{ a when 'a: Nat, b when 'b: Nat } -> { a when 'b: Nat, b when 'a: Nat } where 'a != 'b"
+    );
+
+    let (mint, _, output) = inferred(
+        "let swap = fn v => match v with \
+         | {a} => { b: a } | {b} => { a: b } end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "swap"),
+        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+    );
+}
+
+#[test]
+fn ordered_presence_conditions_are_shared_and_linear() {
+    let a = Formula::var(1);
+    let b = Formula::var(2);
+    assert!(inference::effective_conditions(&[]).is_empty());
+    assert_eq!(
+        inference::effective_conditions(&[a.clone(), b.clone()]),
+        [a.clone(), b.clone().and(a.clone().not())]
+    );
+    assert_eq!(
+        inference::effective_conditions(&[a.clone(), Formula::True]),
+        [a.clone(), a.clone().not()]
+    );
+    let outer = Formula::var(3);
+    let nested: Vec<Formula> = inference::effective_conditions(&[a, b])
+        .into_iter()
+        .map(|guard| outer.clone().and(guard))
+        .collect();
+    assert!(
+        nested
+            .iter()
+            .all(|guard| { ruddy::inference::sat::entails(guard, &outer) })
+    );
+}
+
+#[test]
+fn a_presence_arm_refines_scrutinee_uses_and_exact_absence() {
+    let (mint, _, output) = inferred(
+        "let only_a : { a: Nat } -> Nat = fn r => r.a\n\
+         let only_b : { b: Nat } -> Nat = fn r => r.b\n\
+         let direct = fn v => match v with | {a} => v.a | {b} => v.b end\n\
+         let whole = fn v => match v with | {a} => only_a v | {b} => only_b v end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "direct"),
+        "{ a when 'a: 'c, b when 'b: 'c } -> 'c where 'a != 'b"
+    );
+    assert_eq!(
+        scheme(&mint, &output, "whole"),
+        "{ a when 'a: Nat, b when 'b: Nat } -> Nat where 'a != 'b"
+    );
+}
+
+#[test]
+fn ordered_fallback_facts_discharge_indirect_and_constrained_calls() {
+    let (mint, _, output) = inferred(
+        "let any : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a or 'b = fn v => {}\n\
+         let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+         let same : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a = 'b = fn v => {}\n\
+         let route = fn v => match v with\n\
+         | {x, ..} => any v\n\
+         | {y, ..} => one v\n\
+         | rest => same rest\n\
+         end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "route"),
+        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> {}"
+    );
+
+    let (mint, _, output) = inferred(
+        "let need_y : { y: Nat, .. } -> Nat = fn v => v.y\n\
+         let fallback : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v =>\n\
+         \x20 match v with | {x, ..} => 0n | rest => need_y rest end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "fallback"),
+        "{ x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b"
+    );
+}
+
+#[test]
+fn an_undischarged_arm_requirement_escapes_only_as_an_implication() {
+    let (mint, _, output) = inferred(
+        "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+         let route = fn v => match v with | {x, ..} => one v | rest => {} end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "route"),
+        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> {} where not 'a or not 'b"
+    );
+    assert!(
+        output
+            .store
+            .batches
+            .iter()
+            .any(|batch| { matches!(batch.origin, inference::Origin::Guarded(_)) })
+    );
+}
+
+#[test]
+fn nested_presence_guards_conjoin_and_name_nested_paths() {
+    let (_, _, output) = inferred(
+        "let one : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b = fn v => 1n\n\
+         let nested = fn v => match v with\n\
+         | {left} => match left with | {x} => one left | {y} => 2n end\n\
+         | {right} => 3n\n\
+         end",
+    );
+    assert_eq!(output.refinements.len(), 4, "{:#?}", output.refinements);
+    let outer_match = output.refinements[0].match_span;
+    let outer = output.refinements[0].effective.clone();
+    let inner = output
+        .refinements
+        .iter()
+        .find(|refinement| refinement.match_span != outer_match)
+        .expect("the nested match report");
+    assert!(ruddy::inference::sat::entails(&inner.effective, &outer));
+    assert!(inner.fields.iter().any(|(name, _)| name == "x"));
+
+    let (_, _, output) =
+        inferred("let paths = fn v => match v with | {box: {x}} => 1n | {other} => 2n end");
+    assert!(
+        output.refinements[0]
+            .fields
+            .iter()
+            .any(|(name, _)| name == "box.x")
+    );
+}
+
+#[test]
+fn refinement_reports_are_published_in_source_definition_order() {
+    let (mint, _, output) = inferred(
+        "let first = fn v => let _ = second v in\n\
+         match v with | {x} => 1n | {y} => 2n end\n\
+         let second = fn v => match v with | {x} => {} | {y} => {} end",
+    );
+    let mut definitions: Vec<&str> = output
+        .refinements
+        .iter()
+        .map(|refinement| mint.name(refinement.definition))
+        .collect();
+    definitions.dedup();
+    assert_eq!(definitions, ["first", "second"]);
+}
+
+#[test]
+fn overlap_uses_exclusion_and_arm_assumptions_do_not_leak() {
+    let (_, _, output) =
+        inferred("let overlap = fn v => match v with | {x, ..} => 1n | rest => 2n end");
+    assert_eq!(output.refinements.len(), 2);
+    let second = &output.refinements[1];
+    assert!(
+        second
+            .facts
+            .iter()
+            .any(|fact| fact.field == "x" && !fact.present)
+    );
+
+    let (mint, _, output) = inferred(
+        "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+         let f = fn v => let _ = match v with\n\
+         | {x, ..} => {} | {y, ..} => one v | _ => {} end in one v",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "f"),
+        "{ x when 'a: Nat, y when 'b: Nat, ..'c } -> {} where 'a != 'b"
+    );
+}
+
+#[test]
+fn refinement_stays_presence_only_and_mixed_matches_stay_flat() {
+    let (_, _, output) = infer_src("let bad = fn v => match v with | {x} => 1n | {y} => {} end");
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Mismatch { .. }))
+    );
+
+    let (_, _, output) =
+        infer_src("let bad = fn v => match v with | {x} => { out: 1n } | {y} => { out: {} } end");
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Mismatch { .. }))
+    );
+
+    let (_, _, output) =
+        inferred("let mixed = fn v => match v with | {x: 0n} => 1n | rest => 2n end");
+    assert!(output.refinements.is_empty());
+    assert!(
+        output
+            .constraints
+            .values()
+            .flatten()
+            .all(|constraint| !matches!(constraint.kind, ConstraintKind::Match { .. }))
+    );
+}
+
+#[test]
+fn non_identifier_scrutinees_and_unrelated_presences_remain_total() {
+    let (mint, _, output) = inferred(
+        "let swap = fn v => match (fn x => x) v with\n\
+         | {a} => { b: a } | {b} => { a: b } end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "swap"),
+        "{ a when 'a: 'c, b when 'b: 'd } -> { b when 'a: 'c, a when 'b: 'd } where 'a != 'b"
+    );
+
+    let (mint, _, output) = inferred(
+        "let unrelated : { x when 'a: Nat, y when 'b: Nat, z when 'c: Nat, .. } ->\n\
+         Nat where 'a != 'b = fn v =>\n\
+         match v with | {x, ..} => 1n | {y, ..} => 2n end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "unrelated"),
+        "{ x when 'a: Nat, y when 'b: Nat, z when 'c: Nat, ..'d } -> Nat where 'a != 'b"
+    );
+}
+
+#[test]
+fn an_unreachable_arm_is_checked_without_its_contradictory_assumption() {
+    let src = "let f : { x when 'a: Nat, .. } -> Nat where 'a = fn v =>\n\
+               \x20 match v with | {x, ..} => 0n | rest => 1n {} end";
+    let (_, _, output) = infer_src(src);
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Mismatch { .. }))
+    );
+    assert_eq!(output.refinements.len(), 2);
+    assert!(!output.refinements[1].reachable);
+}
+
+#[test]
+fn structural_result_families_cover_arrows_sums_names_and_absence() {
+    inferred(
+        "let arrows = fn v => match v with\n\
+         | {x} => fn z => { a: z }\n\
+         | {y} => fn z => { b: z } end\n\
+         let sums = fn v => match v with | {x} => #A x | {y} => #B y end",
+    );
+
+    inferred(
+        "let left = fn z => z\n\
+         let right = fn z => z\n\
+         let closed_arrows = fn v => match v with | {x} => left | {y} => right end\n\
+         let a : #A Nat = #A 1n\n\
+         let b : #B Nat = #B 2n\n\
+         let closed_sums = fn v => match v with | {x} => a | {y} => b end",
+    );
+
+    let (mint, _, output) = inferred(
+        "type Box 'a = { value: 'a }\n\
+         type Crate 'a = { value: 'a }\n\
+         let one : Box { a: Nat } = { value: { a: 1n } }\n\
+         let two : Crate { b: Nat } = { value: { b: 2n } }\n\
+         let three : Box { b: Nat } = { value: { b: 3n } }\n\
+         let named = fn v => match v with | {x} => one | {y} => two end\n\
+         let same_named = fn v => match v with | {x} => one | {y} => three end\n\
+         let mixed_named = fn v => match v with\n\
+         | {x} => one | {y} => { value: { b: 4n } } end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "named"),
+        "{ x when 'a: 'c, y when 'b: 'd } -> { value: { a when 'a: Nat, b when 'b: Nat } } where 'a != 'b"
+    );
+    for name in ["same_named", "mixed_named"] {
+        let printed = scheme(&mint, &output, name);
+        assert!(printed.contains("a when"), "{name}: {printed}");
+        assert!(printed.contains("b when"), "{name}: {printed}");
+    }
+
+    let (mint, _, output) = inferred(
+        "type A 'a = { value: 'a }\n\
+         type B 'a = { value: 'a }\n\
+         let aa : A (A { a: Nat }) = { value: { value: { a: 1n } } }\n\
+         let bb : B (B { b: Nat }) = { value: { value: { b: 2n } } }\n\
+         let finite = fn v => match v with | {x} => aa | {y} => bb end",
+    );
+    let finite = scheme(&mint, &output, "finite");
+    assert!(finite.contains("a when"), "{finite}");
+    assert!(finite.contains("b when"), "{finite}");
+
+    inferred(
+        "type LoopA = { next: LoopA }\n\
+         type LoopB = { next: LoopB }\n\
+         let a : LoopA = { next: a }\n\
+         let b : LoopB = { next: b }\n\
+         let loops = fn v => match v with | {x} => a | {y} => b end",
+    );
+
+    let (mint, _, output) = inferred(
+        "let absent : { x when 'a: Nat, y when 'b: Nat } -> { \\out, .. } -> { \\out, .. } where 'a != 'b =\n\
+         fn v q => match v with | {x} => q | {y} => q end",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "absent"),
+        "{ x when 'a: Nat, y when 'b: Nat } -> { ..'c } -> { ..'c } where 'a != 'b"
+    );
+}
+
+#[test]
+fn a_shared_tail_respects_guarded_absence_without_an_occurs_error() {
+    inferred(
+        "let compare : { x when 'a: Nat, ..'r } -> { ..'r } -> {} = fn a b => {}\n\
+         let f = fn v => match v with\n\
+         | {x, ..} => {}\n\
+         | rest => compare rest rest end",
+    );
+}
+
+#[test]
+fn tautological_guarded_relations_and_unreachable_requirements_are_recorded_safely() {
+    let (_, _, output) = inferred(
+        "let exact : { a: Nat } -> { a: Nat } = fn v => v\n\
+         let f = fn v => match v with\n\
+         | {x} => exact { a: 1n }\n\
+         | {y} => exact { a: 2n } end",
+    );
+    assert!(output.steps.iter().any(|step| {
+        matches!(
+            &step.effect,
+            Effect::Guarded { obligation, .. } if obligation.is_true()
+        )
+    }));
+
+    let (_, _, output) = infer_src(
+        "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+         let f : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a = fn v =>\n\
+         match v with | {x, ..} => {} | rest => one rest end",
+    );
+    assert!(!output.refinements[1].reachable);
+    assert!(
+        output
+            .store
+            .batches
+            .iter()
+            .any(|batch| matches!(batch.origin, inference::Origin::Instance(_)))
+    );
+}
+
+#[test]
+fn a_guarded_local_annotation_is_checked_under_its_arm_premise() {
+    let src = "let need : { x when 'x: Nat, y when 'y: Nat } -> {} where 'x != 'y = fn v => {}\n\
+               let f = fn tag => match tag with\n\
+               | {a} => let g : { x when 'x: Nat, y when 'y: Nat } -> {} where 'x or 'y =\n\
+               fn v => need v in g { x: 1n, y: 2n }\n\
+               | {b} => {} end";
+    let (_, _, output) = infer_src(src);
+    let annotation = src.find("{ x when 'x").expect("need's annotation");
+    let local = src[annotation + 1..]
+        .find("{ x when 'x")
+        .map(|at| annotation + 1 + at)
+        .expect("the local annotation");
+    assert!(
+        output.errors.iter().any(|error| {
+            error.span.start == local && matches!(error.kind, ErrorKind::AnnotationAllows { .. })
+        }),
+        "{:#?}",
+        output.errors
+    );
+}
+
+#[test]
+fn an_inferred_local_keeps_the_requirement_of_its_arm() {
+    let src = "let choose : { x when 'a: Nat, y when 'b: Nat } -> Nat where 'a != 'b =\n\
+               fn v => match v with | {x} => x | {y} => y end\n\
+               let f = fn tag => match tag with\n\
+               | {a} => let g = fn w => choose w in g {}\n\
+               | {b} => 0n end\n\
+               let bad = f { a: 1n }";
+    let (_, _, output) = infer_src(src);
+    let bad = src.rfind("{ a: 1n }").expect("the bad call");
+    assert!(
+        !output.errors.is_empty() && output.errors.iter().all(|error| error.span.start == bad),
+        "{:#?}",
+        output.errors
+    );
+}
+
+#[test]
+fn local_instance_requirements_keep_their_reserved_source_slot() {
+    let src = "let p = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let f = let g = fn a => match a with | {x} => {} | {y} => {} end in\n\
+               let _ = g {} in p {}";
+    let (_, _, output) = infer_src(src);
+    let flipped = output
+        .store
+        .batches
+        .iter()
+        .find(|batch| batch.flipped)
+        .expect("the first bad local use owns the flip");
+    let first_empty = src.find("g {}").expect("the local call") + "g ".len();
+    assert_eq!(flipped.span.start, first_empty, "{:#?}", output.store);
+    assert_eq!(output.errors[0].span.start, first_empty);
+}
+
+#[test]
+fn captured_arm_requirements_keep_their_source_order() {
+    let src = "let equal : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a = 'b = fn v => {}\n\
+               let different : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+               let f = fn v => let _ = match v with | _ => equal v end in different v";
+    let (_, _, output) = infer_src(src);
+    let flipped = output
+        .store
+        .batches
+        .iter()
+        .find(|batch| batch.flipped)
+        .expect("the contradictory later call owns the flip");
+    assert!(matches!(flipped.origin, inference::Origin::Instance(_)));
+    assert_eq!(
+        flipped.span.start,
+        src.rfind("different v").expect("the later call") + "different ".len()
+    );
+}
+
+#[test]
+fn a_guarded_batch_can_own_the_single_store_flip() {
+    let src = "let one : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a != 'b = fn v => {}\n\
+               let bad : { x when 'a: Nat, y when 'b: Nat, .. } -> {} where 'a and 'b = fn v =>\n\
+               match v with | {x, ..} => one v | rest => {} end";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    let flipped = output
+        .store
+        .batches
+        .iter()
+        .find(|batch| batch.flipped)
+        .expect("one batch owns the flip");
+    assert!(matches!(flipped.origin, inference::Origin::Guarded(_)));
+
+    let src = "let f : { x when 'a: Nat, .. } -> {} where 'a = fn v =>\n\
+               match v with\n\
+               | {x, ..} => let g : { z when 'p: Nat, .. } where 'p and not 'p =\n\
+               { z: 1n } in {}\n\
+               | rest => {} end";
+    let (_, _, output) = infer_src(src);
+    assert!(
+        output
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::ClauseImpossible { .. }))
+    );
+}
+
+#[test]
+fn a_prior_store_flip_does_not_turn_later_arms_into_a_cascade() {
+    let src = "let one = fn a => match a with | {x} => {} | {y} => {} end\n\
+               let f = fn v => let _ = one {} in\n\
+               match v with | {x} => 1n | {y} => 2n end";
+    let (_, _, output) = infer_src(src);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(output.refinements.iter().all(|arm| arm.reachable));
+    assert_eq!(
+        output
+            .store
+            .batches
+            .iter()
+            .filter(|batch| batch.flipped)
+            .count(),
+        1
     );
 }
 

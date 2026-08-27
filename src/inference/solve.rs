@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     symbol::Symbol,
@@ -16,7 +16,9 @@ use crate::{
 };
 
 use super::{
-    Constraint, ConstraintKind, Effect, Error, ErrorKind, Goal, Rule, Side, Slot, Step, Table,
+    Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorKind, Goal,
+    GuardedArm, GuardedObligation, GuardedOrigin, Named, Origin, Refinement, RefinementFact, Rule,
+    Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -288,6 +290,16 @@ pub struct Solve<'a> {
     pub schemes: HashMap<Symbol, Scheme>,
     /// Every scheme published, kept. [`Output::locals`](super::Output::locals).
     pub locals: &'a mut IndexMap<Symbol, Scheme>,
+    /// The reachable ordered arm premise currently in force. `None` is the
+    /// ordinary solver, including an arm whose premise is contradictory.
+    pub guard: Option<Formula>,
+    /// The arm report guarded obligations are appended to.
+    pub active_refinement: Option<usize>,
+    pub refinements: &'a mut Vec<Refinement>,
+    /// End of generation-time store slots for this definition. Guarded
+    /// structural relations appended while solving participate in later arm
+    /// boundaries separately.
+    pub generated_end: usize,
 }
 
 impl Solve<'_> {
@@ -319,7 +331,17 @@ impl Solve<'_> {
                         body,
                     },
                 ),
-                ConstraintKind::Instance { symbol, ty } => self.instance(span, *symbol, ty),
+                ConstraintKind::Instance {
+                    symbol,
+                    ty,
+                    requirement,
+                } => self.instance(span, *symbol, ty, *requirement),
+                ConstraintKind::Match {
+                    scrutinee,
+                    result,
+                    arms,
+                    store_end,
+                } => self.matched(span, scrutinee, result, arms, *store_end),
                 ConstraintKind::Performs {
                     performed,
                     ambient,
@@ -327,6 +349,379 @@ impl Solve<'_> {
                 } => self.performs(span, performed, ambient, *inside),
             }
         }
+    }
+
+    /// Solve one qualifying match as a finite tree of arm-local constraints.
+    /// SAT is read at the fixed arm boundary and only decides whether the
+    /// already built effective condition is used as a premise; it never
+    /// regenerates a constraint or asks unification to run again.
+    fn matched(
+        &mut self,
+        span: Span,
+        scrutinee: &Rc<Ty>,
+        result: &Rc<Ty>,
+        arms: &[GuardedArm],
+        store_end: usize,
+    ) {
+        let enclosing_guard = self.guard.clone();
+        let enclosing_refinement = self.active_refinement;
+        let mut guards = Vec::with_capacity(arms.len());
+        let mut reports = Vec::with_capacity(arms.len());
+
+        for arm in arms {
+            let combined = match &enclosing_guard {
+                Some(outer) => outer.clone().and(arm.effective.clone()),
+                None => arm.effective.clone(),
+            };
+            let effective = self.table.resolved(&combined);
+            let allowed = self
+                .table
+                .consistent_known(store_end, self.generated_end)
+                .and(effective.clone());
+            let reachable = crate::inference::sat::satisfiable(&allowed);
+
+            let mut named = IndexMap::new();
+            self.table.presence_paths(scrutinee, "", &mut named);
+            let fields: Vec<(String, Presence)> = named.into_iter().collect();
+            let facts = if reachable {
+                fields
+                    .iter()
+                    .filter_map(|(field, presence)| {
+                        let literal = self.table.presence_of(presence).formula();
+                        if crate::inference::sat::entails(&allowed, &literal) {
+                            Some(RefinementFact {
+                                field: field.clone(),
+                                present: true,
+                            })
+                        } else if crate::inference::sat::entails(&allowed, &literal.not()) {
+                            Some(RefinementFact {
+                                field: field.clone(),
+                                present: false,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let report = self.refinements.len();
+            self.refinements.push(Refinement {
+                definition: self.definition,
+                match_span: span,
+                arm_span: arm.span,
+                raw: self.table.resolved(&arm.raw),
+                effective: effective.clone(),
+                reachable,
+                fields,
+                facts,
+                obligations: Vec::new(),
+            });
+            reports.push(report);
+
+            // A contradictory assumption is deliberately not installed. The
+            // arm keeps today's ordinary typing and still contributes to the
+            // result family.
+            // `true -> Q` is just `Q`. Keeping that arm on the ordinary path
+            // preserves direct aliases and diagnostics for a sole catch-all
+            // while changing no logical requirement.
+            let guard = (reachable && !effective.is_true()).then_some(effective);
+            guards.push(guard.clone());
+            self.guard = guard;
+            self.active_refinement = Some(report);
+            for requirement in &arm.requirements {
+                self.commit_deferred(requirement.clone());
+            }
+            self.run(&arm.constraints);
+        }
+
+        // Build the structural family after every body-local constraint has
+        // had its ordinary say. Its finite label unions carry fresh presences;
+        // relating those to each arm under that arm's premise is where the
+        // input/output relationship is published.
+        self.guard = None;
+        self.active_refinement = enclosing_refinement;
+        let body_types: Vec<Rc<Ty>> = arms.iter().map(|arm| arm.ty.clone()).collect();
+        let family = self.family_type(&body_types);
+        self.unify(span, result, &family);
+        for ((arm, guard), report) in arms.iter().zip(guards).zip(reports) {
+            self.guard = guard;
+            self.active_refinement = Some(report);
+            self.unify(arm.span, &family, &arm.ty);
+        }
+        self.guard = None;
+        self.active_refinement = enclosing_refinement;
+        self.alias_result_presences(span, &family, scrutinee);
+
+        self.guard = enclosing_guard;
+        self.active_refinement = enclosing_refinement;
+    }
+
+    /// A finite structural family for the arm body types. Every label in the
+    /// finite union gets one fresh result presence; cores, tails and payloads
+    /// remain ordinary structural types and are checked by the unifications
+    /// that follow.
+    fn family_type(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
+        self.family_type_with(types, &mut Vec::new())
+    }
+
+    fn family_type_with(&mut self, types: &[Rc<Ty>], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Rc<Ty> {
+        // Every call starts from at least one written arm, field, arrow half or
+        // named argument. Keeping that invariant here avoids inventing a
+        // structure for a family no source term contributed to.
+        let _ = types
+            .first()
+            .expect("a structural family has a contributor");
+        let resolved: Vec<Rc<Ty>> = types.iter().map(|ty| self.table.resolve(ty)).collect();
+
+        // Different names are still structural types. Build their family from
+        // what they stand for rather than from one declaration's arguments;
+        // otherwise a label appearing only under the other name is lost. A
+        // repeated full application state is a recursive position, where
+        // preserving the finite names lets ordinary unification's assumption
+        // stack finish the comparison. Constructor names alone are not enough:
+        // `A (A {})` is a finite inner application, not a back edge.
+        let mut symbols = Vec::new();
+        let mut other_concrete = false;
+        for ty in &resolved {
+            match &ty.core {
+                Core::Named { symbol, .. } => {
+                    if !symbols.contains(symbol) {
+                        symbols.push(*symbol);
+                    }
+                }
+                Core::Var(_) | Core::Undecided => {}
+                _ => other_concrete = true,
+            }
+        }
+        let repeated = unfolding.iter().any(|earlier| {
+            earlier.len() == resolved.len()
+                && earlier
+                    .iter()
+                    .zip(&resolved)
+                    .all(|(one, other)| self.table.alike(one, other))
+        });
+        if !symbols.is_empty() && (symbols.len() > 1 || other_concrete) && !repeated {
+            unfolding.push(resolved.clone());
+            let expanded: Vec<Rc<Ty>> = resolved
+                .iter()
+                .map(|ty| self.table.unfolded(self.aliases, ty))
+                .collect();
+            let family = self.family_type_with(&expanded, unfolding);
+            unfolding.pop();
+            return family;
+        }
+
+        let maps: Vec<IndexMap<String, RowField>> =
+            resolved.iter().map(|ty| ty.fields.clone()).collect();
+        let fields = self.family_labels(&maps, unfolding);
+        let core = self.family_core(&resolved, unfolding);
+        let family = Rc::new(Ty { core, fields });
+        self.table.note_lacks(&family);
+        family
+    }
+
+    fn family_labels(
+        &mut self,
+        maps: &[IndexMap<String, RowField>],
+        unfolding: &mut Vec<Vec<Rc<Ty>>>,
+    ) -> IndexMap<String, RowField> {
+        let mut names = Vec::new();
+        for labels in maps {
+            for name in labels.keys() {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let fields: Vec<RowField> = maps
+                    .iter()
+                    .filter_map(|labels| labels.get(&name).cloned())
+                    .collect();
+                let payloads: Vec<Rc<Ty>> = fields
+                    .iter()
+                    .filter(|field| {
+                        !matches!(self.table.presence_of(&field.presence), Presence::Absent)
+                    })
+                    .map(|field| field.ty.clone())
+                    .collect();
+                let ty = match payloads.is_empty() {
+                    true => Rc::new(Ty::default()),
+                    false => self.family_type_with(&payloads, unfolding),
+                };
+                (
+                    name,
+                    RowField {
+                        presence: self.table.fresh_presence(),
+                        ty,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn family_core(&mut self, types: &[Rc<Ty>], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Core {
+        let Some(chosen) = types
+            .iter()
+            .find(|ty| !matches!(ty.core, Core::Var(_) | Core::Undecided))
+        else {
+            return Core::Var(self.table.fresh_core());
+        };
+        match &chosen.core {
+            Core::Arrow(_, _, _) => {
+                let arrows: Vec<_> = types
+                    .iter()
+                    .filter_map(|ty| match &ty.core {
+                        Core::Arrow(arg, result, does) => {
+                            Some((arg.clone(), result.clone(), does.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let from: Vec<_> = arrows.iter().map(|(arg, _, _)| arg.clone()).collect();
+                let to: Vec<_> = arrows.iter().map(|(_, result, _)| result.clone()).collect();
+                let effects: Vec<_> = arrows.iter().map(|(_, _, does)| does.clone()).collect();
+                Core::Arrow(
+                    self.family_type_with(&from, unfolding),
+                    self.family_type_with(&to, unfolding),
+                    self.family_row(&effects, unfolding),
+                )
+            }
+            Core::Sum(_) => {
+                let rows: Vec<Row> = types
+                    .iter()
+                    .filter_map(|ty| match &ty.core {
+                        Core::Sum(row) => Some(row.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Core::Sum(self.family_row(&rows, unfolding))
+            }
+            Core::Named { symbol, name, args } => {
+                let merged = (0..args.len())
+                    .map(|at| {
+                        let candidates: Vec<Rc<Ty>> = types
+                            .iter()
+                            .filter_map(|ty| match &ty.core {
+                                Core::Named { args, .. } => args.get(at).cloned(),
+                                _ => None,
+                            })
+                            .collect();
+                        self.family_type_with(&candidates, unfolding)
+                    })
+                    .collect();
+                Core::Named {
+                    symbol: *symbol,
+                    name: name.clone(),
+                    args: merged,
+                }
+            }
+            core => core.clone(),
+        }
+    }
+
+    fn family_row(&mut self, rows: &[Row], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Row {
+        let _ = rows.first().expect("a row family has a contributor");
+        let flat: Vec<Row> = rows.iter().map(|row| self.table.canon(row)).collect();
+        let maps: Vec<IndexMap<String, RowField>> =
+            flat.iter().map(|row| row.labels.clone()).collect();
+        let labels = self.family_labels(&maps, unfolding);
+        let rest = if flat.iter().any(|row| matches!(row.rest, Rest::Var(_))) {
+            self.table.fresh_row()
+        } else {
+            flat[0].rest.clone()
+        };
+        Row { labels, rest }
+    }
+
+    /// Where the completed store proves a synthesized result presence is the
+    /// same variable as one on the scrutinee, publish that sharing directly in
+    /// the type. This is a fixed match-end boundary, not feedback: it only
+    /// folds an already entailed alias and never creates another constraint.
+    fn alias_result_presences(&mut self, span: Span, result: &Rc<Ty>, scrutinee: &Rc<Ty>) {
+        let known = self.table.known();
+        if !crate::inference::sat::satisfiable(&known) {
+            return;
+        }
+        let mut outputs = IndexSet::new();
+        let mut inputs = IndexSet::new();
+        self.table.presences_in(result, &mut outputs);
+        self.table.presences_in(scrutinee, &mut inputs);
+        for output in outputs {
+            let output = match self.table.presence_of(&Presence::Var(output)) {
+                Presence::Var(output) => output,
+                _ => continue,
+            };
+            for input in &inputs {
+                let input = match self.table.presence_of(&Presence::Var(*input)) {
+                    Presence::Var(input) => input,
+                    _ => continue,
+                };
+                let equal = Formula::var(output).iff(Formula::var(input));
+                if crate::inference::sat::entails(&known, &equal) {
+                    self.presences(span, &Presence::Var(output), &Presence::Var(input));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Activate one generation-time batch in the exact store slot source order
+    /// gave it, wrapping it in the arm implication where the assumption is in
+    /// force.
+    fn commit_deferred(&mut self, requirement: DeferredRequirement) {
+        let DeferredRequirement { at, batch } = requirement;
+        let replacement = self.guarded_batch(batch);
+        self.table.store.batches[at] = replacement;
+        self.table.deferred.remove(&at);
+    }
+
+    fn guarded_batch(&mut self, batch: Batch) -> Batch {
+        let Some(premise) = self.guard.clone() else {
+            return batch;
+        };
+        let obligation = batch.formula.clone();
+        let formula = premise.clone().not().or(obligation.clone());
+        let origin = Origin::Guarded(GuardedOrigin {
+            premise: premise.clone(),
+            obligation: obligation.clone(),
+            origin: Box::new(batch.origin),
+        });
+        self.record_obligation(
+            batch.span,
+            premise.clone(),
+            obligation.clone(),
+            formula.clone(),
+        );
+        Batch {
+            definition: batch.definition,
+            span: batch.span,
+            origin,
+            formula,
+            flipped: false,
+        }
+    }
+
+    fn record_obligation(
+        &mut self,
+        span: Span,
+        premise: Formula,
+        obligation: Formula,
+        formula: Formula,
+    ) {
+        let at = self
+            .active_refinement
+            .expect("a guarded obligation belongs to the active arm");
+        self.refinements[at].obligations.push(GuardedObligation {
+            span,
+            premise,
+            obligation,
+            formula,
+        });
     }
 
     /// An application: make the place it was written in allow what calling the
@@ -453,6 +848,8 @@ impl Solve<'_> {
         // [`Table::required`](super::Table) does for the unannotated case.
         let required = if !promised.is_true() && !self.table.unsat {
             self.table.resolved(promised)
+        } else if let Some(guard) = &self.guard {
+            self.table.required_given(bound, guard)
         } else {
             self.table.required(bound)
         };
@@ -475,12 +872,27 @@ impl Solve<'_> {
     /// diagnostic: generation emits this only for a name it bound itself, and
     /// the constraint sits inside the body of the `let` that bound it, so a
     /// symbol with no scheme in scope cannot arise.
-    fn instance(&mut self, span: Span, symbol: Symbol, ty: &Rc<Ty>) {
+    fn instance(&mut self, span: Span, symbol: Symbol, ty: &Rc<Ty>, requirement: usize) {
         let scheme = self.schemes[&symbol].clone();
         // At the level of the use site, which is where the table is: a copy is
         // as new as the place it was made, whatever the scheme was generalized
         // at.
+        let required = self.table.store.batches.len();
         let copy = self.table.instantiate(span, &scheme);
+        let mut batches: Vec<Batch> = self.table.store.batches.drain(required..).collect();
+        match batches.pop() {
+            Some(mut batch) => {
+                // Application generation may have aimed the reserved slot at
+                // the argument; retain that source attribution.
+                batch.span = self.table.store.batches[requirement].span;
+                let replacement = self.guarded_batch(batch);
+                self.table.store.batches[requirement] = replacement;
+            }
+            None => {
+                self.table.empty_batches.insert(requirement);
+            }
+        }
+        self.table.deferred.remove(&requirement);
         self.unify(span, &copy, ty);
     }
 
@@ -744,6 +1156,12 @@ impl Solve<'_> {
                 // undecided type.
                 let reported = self.errors.len();
                 let stepped = self.steps.len();
+                let stored = self.table.store.batches.len();
+                let traced: Vec<usize> = self
+                    .refinements
+                    .iter()
+                    .map(|refinement| refinement.obligations.len())
+                    .collect();
                 let known = self.table.snapshot();
                 self.step(span, Rule::Congruent, goal.clone(), Effect::Decomposed);
                 self.depth += 1;
@@ -756,6 +1174,10 @@ impl Solve<'_> {
                 }
                 self.errors.truncate(reported);
                 self.steps.truncate(stepped);
+                self.table.store.batches.truncate(stored);
+                for (refinement, obligations) in self.refinements.iter_mut().zip(traced) {
+                    refinement.obligations.truncate(obligations);
+                }
                 self.table.restore(known);
                 self.mismatch(span, goal, lhs, rhs)
             }
@@ -956,13 +1378,20 @@ impl Solve<'_> {
             && a == b
             && !(only_want.is_empty() && only_have.is_empty())
         {
+            let guarded = self.guard.is_some();
             let absent = |field: &RowField| {
                 matches!(self.table.presence_of(&field.presence), Presence::Absent)
             };
-            if only_want.values().all(&absent) && only_have.values().all(&absent) {
+            if guarded || only_want.values().all(&absent) && only_have.values().all(&absent) {
                 let labels: Vec<String> =
                     only_want.keys().chain(only_have.keys()).cloned().collect();
                 self.table.forbidden(a, lhs.shape(), labels);
+                if guarded {
+                    for field in only_want.values().chain(only_have.values()) {
+                        let presence = self.table.presence_of(&field.presence);
+                        self.presences(span, &Presence::Absent, &presence);
+                    }
+                }
                 only_want.clear();
                 only_have.clear();
             } else {
@@ -1213,6 +1642,17 @@ impl Solve<'_> {
             expected: p1.clone(),
             actual: p2.clone(),
         };
+        if self.guard.is_some() {
+            self.guarded_presence(span, &p1, &p2);
+            // Payload/core typing is not dependent on the branch premise. An
+            // explicitly absent slot carries no payload to compare; everything
+            // else keeps ordinary structural compatibility.
+            match (&p1, &p2) {
+                (Presence::Absent, _) | (_, Presence::Absent) => {}
+                _ => self.unify(span, &want.ty, &have.ty),
+            }
+            return;
+        }
         match (&p1, &p2) {
             // The common case: certainly there on both sides, so presence
             // has nothing to say and the types carry the whole question.
@@ -1270,6 +1710,10 @@ impl Solve<'_> {
     /// [`Rule::Presence`] because that rule is worded about the label whose
     /// presence it is deciding, and here there is no row in sight to have one.
     fn presences(&mut self, span: Span, lhs: &Presence, rhs: &Presence) {
+        if self.guard.is_some() {
+            self.guarded_presence(span, lhs, rhs);
+            return;
+        }
         let goal = Goal::Presence {
             expected: lhs.clone(),
             actual: rhs.clone(),
@@ -1296,6 +1740,56 @@ impl Solve<'_> {
             }
             _ => self.step(span, Rule::Same, goal, Effect::None),
         }
+    }
+
+    /// Record presence equality under the active arm premise without binding
+    /// either presence globally.
+    fn guarded_presence(&mut self, span: Span, lhs: &Presence, rhs: &Presence) {
+        let premise = self
+            .guard
+            .clone()
+            .expect("guarded presence equality has an active premise");
+        let lhs = self.table.presence_of(lhs);
+        let rhs = self.table.presence_of(rhs);
+        let obligation = match (&lhs, &rhs) {
+            (Presence::Undecided, _) | (_, Presence::Undecided) => Formula::True,
+            (Presence::Present, Presence::Present) | (Presence::Absent, Presence::Absent) => {
+                Formula::True
+            }
+            (Presence::Present, Presence::Absent) | (Presence::Absent, Presence::Present) => {
+                Formula::False
+            }
+            (Presence::Present, other) | (other, Presence::Present) => other.formula(),
+            (Presence::Absent, other) | (other, Presence::Absent) => other.formula().not(),
+            _ => lhs.formula().iff(rhs.formula()),
+        };
+        let formula = premise.clone().not().or(obligation.clone());
+        let labels = self
+            .active_refinement
+            .map(|at| self.refinements[at].fields.clone())
+            .unwrap_or_default();
+        let origin = Origin::Guarded(GuardedOrigin {
+            premise: premise.clone(),
+            obligation: obligation.clone(),
+            origin: Box::new(Origin::Refinement(Named { labels })),
+        });
+        if !obligation.is_true() {
+            self.table.require(span, origin, formula.clone());
+        }
+        let goal = Goal::Presence {
+            expected: lhs,
+            actual: rhs,
+        };
+        self.step(
+            span,
+            Rule::Refine,
+            goal,
+            Effect::Guarded {
+                premise: premise.clone(),
+                obligation: obligation.clone(),
+            },
+        );
+        self.record_obligation(span, premise, obligation, formula);
     }
 
     /// Push the labels only one side names into what the other side allows
@@ -1585,6 +2079,15 @@ impl Solve<'_> {
             self.fail(span, Rule::Occurs, goal, error, &abandoned);
             return;
         }
+        // Binding a shared structural variable still installs the ordinary
+        // core/tail shape, but no presence constant or alias from this arm may
+        // hitch a ride and become global. Give every such slot a shared fresh
+        // presence and relate it to the arm's view under the premise.
+        let value = if self.guard.is_some() {
+            self.guarded_value(span, &value)
+        } else {
+            value
+        };
         if let Some((shape, named)) = self.table.lacked(var, &value) {
             // One complaint per binding, not per label: a tail that would have
             // to repeat two fields is one thing gone wrong with one row, and
@@ -1626,6 +2129,75 @@ impl Solve<'_> {
         self.table.demote(var, &value);
         self.table.vars[var as usize] = Slot::Bound(value.clone());
         self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
+    }
+
+    fn guarded_value(&mut self, span: Span, value: &Assigned) -> Assigned {
+        match value {
+            Assigned::Ty(ty) => Assigned::Ty(self.guarded_type(span, ty)),
+            Assigned::Row(row) => Assigned::Row(Rc::new(self.guarded_row(span, row))),
+            // Direct presence equality is intercepted by `presences`, so an
+            // assignment of this sort carries no structural slots to abstract.
+            Assigned::Presence(presence) => Assigned::Presence(presence.clone()),
+        }
+    }
+
+    fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
+        let ty = self.table.resolve(ty);
+        let fields = self.guarded_labels(span, &ty.fields);
+        let core = match &ty.core {
+            Core::Arrow(from, to, effects) => Core::Arrow(
+                self.guarded_type(span, from),
+                self.guarded_type(span, to),
+                self.guarded_row(span, effects),
+            ),
+            Core::Sum(cases) => Core::Sum(self.guarded_row(span, cases)),
+            Core::Named { symbol, name, args } => Core::Named {
+                symbol: *symbol,
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| self.guarded_type(span, arg))
+                    .collect(),
+            },
+            core => core.clone(),
+        };
+        Rc::new(Ty { core, fields })
+    }
+
+    fn guarded_row(&mut self, span: Span, row: &Row) -> Row {
+        let row = self.table.canon(row);
+        Row {
+            labels: self.guarded_labels(span, &row.labels),
+            rest: row.rest,
+        }
+    }
+
+    fn guarded_labels(
+        &mut self,
+        span: Span,
+        labels: &IndexMap<String, RowField>,
+    ) -> IndexMap<String, RowField> {
+        labels
+            .iter()
+            .map(|(name, field)| {
+                let resolved = self.table.presence_of(&field.presence);
+                let presence = match resolved {
+                    Presence::Undecided => Presence::Undecided,
+                    resolved => {
+                        let shared = self.table.fresh_presence();
+                        self.guarded_presence(span, &shared, &resolved);
+                        shared
+                    }
+                };
+                (
+                    name.clone(),
+                    RowField {
+                        presence,
+                        ty: self.guarded_type(span, &field.ty),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Report a failure and abandon what it was about, in one act: the

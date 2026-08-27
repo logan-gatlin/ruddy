@@ -878,15 +878,28 @@ impl Parser {
     /// wording — a field name, a pun, a projection, a type — say so before
     /// falling through to here.
     fn unexpected<T>(&mut self) -> Option<T> {
+        let (span, kind) = self.unexpected_error();
+        self.error(span, kind);
+        None
+    }
+
+    /// The non-generic decision behind [`unexpected`](Self::unexpected). Kept
+    /// separate so every return type shares the one wildcard/value branch.
+    fn unexpected_error(&self) -> (Span, ErrorKind) {
         if self.at_wildcard() {
-            return self.wildcard(Place::Value);
+            let span = self.peek().expect("the cursor is on a wildcard").span;
+            return (
+                span,
+                ErrorKind::Wildcard {
+                    place: Place::Value,
+                },
+            );
         }
         let span = match self.peek() {
             Some(tok) => tok.span,
             None => self.eof_span(),
         };
-        self.error(span, ErrorKind::Unexpected);
-        None
+        (span, ErrorKind::Unexpected)
     }
 
     /// Whether the next token is the wildcard `_`.

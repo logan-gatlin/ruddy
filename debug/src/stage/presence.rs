@@ -19,7 +19,8 @@
 //! use site or the annotation it came from, exactly as the other stages do.
 
 use ruddy::{
-    inference::{Origin, sat},
+    inference::{Origin, effective_conditions, sat},
+    tracking::Span,
     types::Formula,
 };
 
@@ -27,6 +28,49 @@ use crate::{
     stage::{Cx, Ids, Spec, plural, with_symbol},
     wire::{Node, Stage},
 };
+
+fn origin_details(ids: &mut Ids, origin: &Origin, span: Span) -> Vec<Node> {
+    match origin {
+        Origin::Coverage(coverage) => {
+            let effective = effective_conditions(&coverage.arms);
+            let mut rows = Vec::new();
+            for (arm, (raw, ordered)) in coverage.arms.iter().zip(effective).enumerate() {
+                rows.push(
+                    Node::new(ids.next(), format!("arm {arm} raw"), raw.to_string()).at(span),
+                );
+                rows.push(
+                    Node::new(
+                        ids.next(),
+                        format!("arm {arm} effective"),
+                        ordered.to_string(),
+                    )
+                    .at(span),
+                );
+            }
+            for (name, presence) in &coverage.fields {
+                rows.push(
+                    Node::new(ids.next(), format!("field {name}"), presence.to_string()).at(span),
+                );
+            }
+            rows
+        }
+        Origin::Instance(named) | Origin::Annotation(named) | Origin::Refinement(named) => named
+            .labels
+            .iter()
+            .map(|(name, presence)| {
+                Node::new(ids.next(), format!("label {name}"), presence.to_string()).at(span)
+            })
+            .collect(),
+        Origin::Guarded(guarded) => {
+            let mut rows = vec![
+                Node::new(ids.next(), "premise", guarded.premise.to_string()).at(span),
+                Node::new(ids.next(), "obligation", guarded.obligation.to_string()).at(span),
+            ];
+            rows.extend(origin_details(ids, &guarded.origin, span));
+            rows
+        }
+    }
+}
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(mint) = cx.mint else {
@@ -95,35 +139,81 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             .error(),
         };
         node = node.child(verdict.at(batch.span));
-        // A match's coverage carries one disjunct per arm and the labels its
-        // presences decide; both are what the patterns phase asks its questions
-        // of, so both are shown rather than only their disjunction.
-        if let Origin::Coverage(coverage) = &batch.origin {
-            for (arm, formula) in coverage.arms.iter().enumerate() {
-                node = node.child(
-                    Node::new(ids.next(), format!("arm {arm}"), formula.to_string()).at(batch.span),
-                );
-            }
-            for (name, presence) in &coverage.fields {
-                node = node.child(
-                    Node::new(ids.next(), format!("field {name}"), presence.to_string())
-                        .at(batch.span),
-                );
-            }
-        }
-        // A use site carries which label each of its presences decides, and an
-        // annotation the names its own `when`s bound — which is how each one's
-        // complaint is worded, and so what a reader needs to read the formula
-        // above.
-        if let Origin::Instance(named) | Origin::Annotation(named) = &batch.origin {
-            for (name, presence) in &named.labels {
-                node = node.child(
-                    Node::new(ids.next(), format!("label {name}"), presence.to_string())
-                        .at(batch.span),
-                );
-            }
-        }
+        node = node.children(origin_details(&mut ids, &batch.origin, batch.span));
         nodes.push(node);
+    }
+
+    // The readable refinement trace: one match group and one row per written
+    // arm, with the raw coverage beside its ordered (and, when nested,
+    // conjoined) assumption, the boundary SAT verdict, entailed named facts,
+    // and every implication structural solving emitted.
+    let mut groups: Vec<(Span, Vec<&ruddy::inference::Refinement>)> = Vec::new();
+    for refinement in &output.refinements {
+        match groups
+            .iter_mut()
+            .find(|(span, _)| *span == refinement.match_span)
+        {
+            Some((_, arms)) => arms.push(refinement),
+            None => groups.push((refinement.match_span, vec![refinement])),
+        }
+    }
+    for (span, arms) in groups {
+        let mut matched =
+            Node::new(ids.next(), "match refinement", plural(arms.len(), "arm")).at(span);
+        for (arm_at, refinement) in arms.into_iter().enumerate() {
+            let mut arm = Node::new(
+                ids.next(),
+                format!("arm {arm_at}"),
+                match refinement.reachable {
+                    true => "assumption satisfiable",
+                    false => "assumption unreachable — solved without refinement",
+                },
+            )
+            .at(refinement.arm_span)
+            .child(
+                Node::new(ids.next(), "raw coverage", refinement.raw.to_string())
+                    .at(refinement.arm_span),
+            )
+            .child(
+                Node::new(
+                    ids.next(),
+                    "effective assumption",
+                    refinement.effective.to_string(),
+                )
+                .at(refinement.arm_span),
+            );
+            for (name, presence) in &refinement.fields {
+                arm = arm.child(
+                    Node::new(ids.next(), format!("presence {name}"), presence.to_string())
+                        .at(refinement.arm_span),
+                );
+            }
+            for fact in &refinement.facts {
+                arm = arm.child(
+                    Node::new(
+                        ids.next(),
+                        "entailed",
+                        format!("{}{}", if fact.present { "" } else { "not " }, fact.field),
+                    )
+                    .at(refinement.arm_span),
+                );
+            }
+            for obligation in &refinement.obligations {
+                arm = arm.child(
+                    Node::new(
+                        ids.next(),
+                        "guarded obligation",
+                        format!(
+                            "{} -> {} ({})",
+                            obligation.premise, obligation.obligation, obligation.formula
+                        ),
+                    )
+                    .at(obligation.span),
+                );
+            }
+            matched = matched.child(arm);
+        }
+        nodes.push(matched);
     }
 
     // And what each definition ended up promising: the `where` clause on its
@@ -159,7 +249,10 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     Stage {
         micros: Some(cx.micros.infer),
         nodes,
-        debug: format!("{:#?}", output.store),
+        debug: format!(
+            "store: {:#?}\nrefinements: {:#?}",
+            output.store, output.refinements
+        ),
         ..spec.stage(
             cx.status(),
             plural(output.store.batches.len(), "constraint"),
