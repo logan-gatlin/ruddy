@@ -87,7 +87,7 @@ pub struct Constrain<'a> {
 /// Insertion-ordered, because a third reader publishes it: [`Output::operations`](crate::inference::Output::operations)
 /// hands the same table on to [`lir`](crate::lir), and a map whose order came
 /// out of a hash would print differently from one run to the next.
-pub type Operations = IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>;
+pub type Operations = IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>;
 
 /// Where a term sits, as far as effects are concerned: what may be performed
 /// there, and whether a `fn` encloses it.
@@ -481,12 +481,12 @@ impl Constrain<'_> {
             // the effect's own label as the row of its outermost arrow, closed.
             // So performing it is applying it, and the application's opening
             // rule is what puts the label in the ambient.
-            TermKind::Operation { effect, op } => {
+            TermKind::Operation { effect, selector } => {
                 // Indexed rather than looked up: lowering refuses every
                 // operation reference it cannot resolve, and a signature that
                 // failed to lower is still a signature — the two sides absorb
                 // as the undecided type rather than going missing.
-                let (from, to) = &self.operations[&(effect.tracked, op.tracked.clone())];
+                let (from, to) = &self.operations[&(effect.tracked, selector.tracked.clone())];
                 let does = Row {
                     labels: [(
                         self.effect_ids[&effect.tracked].row_key(),
@@ -755,7 +755,8 @@ impl Constrain<'_> {
             // Indexed rather than looked up, for the reason an operation
             // reference is: lowering keeps no arm whose operation it could not
             // resolve.
-            let (from, to) = self.operations[&(arm.effect.tracked, arm.op.tracked.clone())].clone();
+            let (from, to) =
+                self.operations[&(arm.effect.tracked, arm.selector.tracked.clone())].clone();
             self.env.insert(arm.binder.tracked, Binding::Mono(from));
             self.infer_term(&mut arm.body);
             let actual = arm.body.ty.clone();

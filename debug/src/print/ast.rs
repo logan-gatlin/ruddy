@@ -10,7 +10,7 @@ use std::fmt;
 use indexmap::IndexMap;
 use ruddy::{
     parse::{
-        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectCase, EffectLabel, EffectRow,
+        Annotation, Arg, ArgKind, ArmHead, ClauseKind, EffectBody, EffectLabel, EffectRow,
         ExprKind, HandlerArm, Path, PatternKind, Rest, StmtKind, SumCase, TypeField, TypeKind,
         When, Where,
     },
@@ -144,31 +144,34 @@ impl fmt::Display for Ast<'_, StmtKind> {
                 }
                 write!(f, " = {}", annotation(body))
             }
-            // The `|` is written before every operation, first included: the
-            // grammar makes the leading one optional, so the printed form
-            // re-parses. An empty effect has no `=` or cases. An alias list
-            // writes its `+`s between its effects instead, which is where a
-            // row writes them.
-            StmtKind::Effect { name, cases } => {
+            StmtKind::Effect { name, body } => {
                 write!(f, "effect {}", name.tracked)?;
-                if cases.is_empty() {
-                    return Ok(());
-                }
-                f.write_str(" =")?;
-                for (at, (name, case)) in cases.iter().enumerate() {
-                    match case {
-                        // An operation is a name and the signature it declares,
-                        // written after the `|` that separates declarations; an
-                        // alias is the effect it names, unioned onto the last
-                        // with the `+` a row writes.
-                        EffectCase::Operation { signature } => {
-                            write!(f, " | {} : {}", name.name.tracked, Ast(&signature.tracked))?
+                match body {
+                    EffectBody::Empty => Ok(()),
+                    EffectBody::Alias(cases) => {
+                        f.write_str(" = ")?;
+                        for (at, effect) in cases.keys().enumerate() {
+                            if at > 0 {
+                                f.write_str(" + ")?;
+                            }
+                            write!(f, "{}", labelled(effect))?;
                         }
-                        EffectCase::Alias if at == 0 => write!(f, " {}", labelled(name))?,
-                        EffectCase::Alias => write!(f, " + {}", labelled(name))?,
+                        Ok(())
+                    }
+                    EffectBody::Unnamed { signature } => {
+                        write!(f, " = {}", Ast(&signature.tracked))
+                    }
+                    EffectBody::Named(fields) => {
+                        f.write_str(" = {")?;
+                        for (at, (name, signature)) in fields.iter().enumerate() {
+                            if at > 0 {
+                                f.write_str(",")?;
+                            }
+                            write!(f, " {}: {}", name.tracked, Ast(&signature.tracked))?;
+                        }
+                        f.write_str(" }")
                     }
                 }
-                Ok(())
             }
         }
     }
@@ -386,8 +389,8 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 f.write_str(" end")
             }
             ExprKind::Raise(value) => write!(f, "raise {}", Ast(&value.tracked)),
-            ExprKind::Operation { effect, op } => {
-                write!(f, "{}.{}", labelled(effect), op.tracked)
+            ExprKind::Operation { effect, selector } => {
+                write!(f, "{}{}", labelled(effect), selector.tracked)
             }
             ExprKind::Ident { name } => write!(f, "{name}"),
             ExprKind::Natural(value) => write!(f, "{value}n"),
@@ -552,7 +555,9 @@ fn mark(when: &Option<Box<When>>) -> Option<Mark> {
 fn write_arm(f: &mut fmt::Formatter<'_>, arm: &HandlerArm) -> fmt::Result {
     f.write_str(" | ")?;
     match &arm.head {
-        ArmHead::Operation { effect, op } => write!(f, "{}.{}", labelled(effect), op.tracked)?,
+        ArmHead::Operation { effect, selector } => {
+            write!(f, "{}{}", labelled(effect), selector.tracked)?
+        }
         ArmHead::Return { .. } => f.write_str("return")?,
     }
     let binder = match &arm.binder.tracked {

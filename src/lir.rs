@@ -44,6 +44,28 @@ pub type Temp = u32;
 /// happens to be called `map#1`.
 pub type FuncId = usize;
 
+/// A field in a lowered record. User/effect names remain ordinary named fields;
+/// an unnamed operation has its own unforgeable slot and is never encoded as a
+/// private string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FieldKey {
+    Named(String),
+    UnnamedOperation,
+}
+
+impl FieldKey {
+    fn named(name: impl Into<String>) -> Self {
+        Self::Named(name.into())
+    }
+}
+
+fn named_fields(fields: IndexMap<String, Temp>) -> IndexMap<FieldKey, Temp> {
+    fields
+        .into_iter()
+        .map(|(name, value)| (FieldKey::Named(name), value))
+        .collect()
+}
+
 /// The lowered program: every function, and every global in the order a backend
 /// must initialize them.
 ///
@@ -161,7 +183,7 @@ pub enum Op {
         right: Temp,
     },
     /// A struct literal. Empty is the unit value.
-    Struct(IndexMap<String, Temp>),
+    Struct(IndexMap<FieldKey, Temp>),
     /// One record carrying every field of each of these, laid over one another
     /// in order: a later one wins wherever two of them name the same field.
     ///
@@ -172,7 +194,7 @@ pub enum Op {
     /// Read one field of a struct.
     Project {
         base: Temp,
-        field: String,
+        field: FieldKey,
     },
     /// One case of a sum. A bare case carries no payload temp.
     Tag {
@@ -1437,7 +1459,7 @@ impl Lower<'_> {
                         Rep::Struct,
                         Op::Project {
                             base: bundle,
-                            field: name.clone(),
+                            field: FieldKey::named(name.clone()),
                         },
                     )
                 }
@@ -1460,7 +1482,7 @@ impl Lower<'_> {
                         &mut lifted,
                         Span::default(),
                         Rep::Struct,
-                        Op::Struct(records),
+                        Op::Struct(named_fields(records)),
                     );
                     self.emit(
                         &mut lifted,
@@ -1473,7 +1495,7 @@ impl Lower<'_> {
                     &mut lifted,
                     Span::default(),
                     Rep::Struct,
-                    Op::Struct(records),
+                    Op::Struct(named_fields(records)),
                 ),
             };
             args.push(bundle);
@@ -1602,7 +1624,12 @@ impl Lower<'_> {
                     (name, temp)
                 })
                 .collect();
-            let record = self.emit(body, Span::default(), Rep::Struct, Op::Struct(entries));
+            let record = self.emit(
+                body,
+                Span::default(),
+                Rep::Struct,
+                Op::Struct(named_fields(entries)),
+            );
             layers.push(record);
         }
         match layers.as_slice() {
@@ -1719,7 +1746,7 @@ impl Lower<'_> {
                         .unwrap_or_else(|| field.value.ty.clone());
                     let have = self.holding(temp, &field.value.ty);
                     let temp = self.fitted(&want, &have, temp, body);
-                    entries.insert(name.clone(), temp);
+                    entries.insert(FieldKey::named(name.clone()), temp);
                 }
                 let temp = self.emit(body, span, rep, Op::Struct(entries));
                 self.contain(temp, &term.ty);
@@ -1741,7 +1768,7 @@ impl Lower<'_> {
                     self.rep(&have),
                     Op::Project {
                         base: temp,
-                        field: field.tracked.clone(),
+                        field: FieldKey::named(field.tracked.clone()),
                     },
                 );
                 self.contain(read, &have);
@@ -1827,7 +1854,9 @@ impl Lower<'_> {
             },
             TermKind::Fn { arg, body: inner } => self.lambda(term, arg.tracked, inner, body),
             TermKind::Apply { .. } => self.apply(term, body),
-            TermKind::Operation { op, .. } => self.operation_value(term, &op.tracked, body),
+            TermKind::Operation { selector, .. } => {
+                self.operation_value(term, Self::operation_slot(&selector.tracked), body)
+            }
             TermKind::Match { scrutinee, arms } => self.matched(term, scrutinee, arms, body),
             TermKind::Handle {
                 body: handled,
@@ -1895,7 +1924,14 @@ impl Lower<'_> {
     ///
     /// Its own evidence parameter is what puts the effect in the wrapper's arrow
     /// row, exactly as the inferred type `From -> To + !E` says it should be.
-    fn operation_value(&mut self, term: &Term, op: &str, body: &mut Body) -> Temp {
+    fn operation_slot(selector: &crate::ir::OperationSelector) -> FieldKey {
+        match selector {
+            crate::ir::OperationSelector::Unnamed => FieldKey::UnnamedOperation,
+            crate::ir::OperationSelector::Named(name) => FieldKey::named(name.clone()),
+        }
+    }
+
+    fn operation_value(&mut self, term: &Term, op: FieldKey, body: &mut Body) -> Temp {
         let (from, to, _) = self.arrow(&term.ty);
         let evidence = self.fresh(Rep::Struct);
         let rep = self.rep(&from);
@@ -1907,7 +1943,7 @@ impl Lower<'_> {
             Rep::Fn,
             Op::Project {
                 base: evidence,
-                field: op.to_string(),
+                field: op,
             },
         );
         let value = self.emit(
@@ -1961,8 +1997,14 @@ impl Lower<'_> {
     /// closure. Everything else is an ordinary indirect call per argument.
     fn apply(&mut self, term: &Term, body: &mut Body) -> Temp {
         let (head, applies) = spine(term);
-        if let TermKind::Operation { effect, op } = &head.kind {
-            return self.perform(head, *effect, &op.tracked, &applies, body);
+        if let TermKind::Operation { effect, selector } = &head.kind {
+            return self.perform(
+                head,
+                *effect,
+                Self::operation_slot(&selector.tracked),
+                &applies,
+                body,
+            );
         }
         if let TermKind::Ident(symbol) = &head.kind
             && let Some(known) = self.known.get(symbol).cloned()
@@ -2048,7 +2090,7 @@ impl Lower<'_> {
         &mut self,
         head: &Term,
         effect: crate::tracking::Tracked<Symbol>,
-        op: &str,
+        op: FieldKey,
         applies: &[Apply],
         body: &mut Body,
     ) -> Temp {
@@ -2060,7 +2102,7 @@ impl Lower<'_> {
             Rep::Fn,
             Op::Project {
                 base: record,
-                field: op.to_string(),
+                field: op,
             },
         );
         let first = applies[0];
@@ -2165,15 +2207,16 @@ impl Lower<'_> {
         let mut records: Vec<(String, Temp)> = Vec::new();
         for effect in &handler.discharges {
             let name = self.program.effect_ids[&effect.tracked].row_key();
-            let mut entries: IndexMap<String, Temp> = IndexMap::new();
+            let mut entries: IndexMap<FieldKey, Temp> = IndexMap::new();
+            let identity = &self.program.effect_ids[&effect.tracked];
             let arms: Vec<&HandlerArm> = handler
                 .arms
                 .iter()
-                .filter(|arm| arm.effect.tracked == effect.tracked)
+                .filter(|arm| self.program.effect_ids[&arm.effect.tracked] == *identity)
                 .collect();
             for arm in arms {
                 let closure = self.arm(arm, body);
-                entries.insert(arm.op.tracked.clone(), closure);
+                entries.insert(Self::operation_slot(&arm.selector.tracked), closure);
             }
             // The record itself is evidence plumbing: the arms in it are the
             // reader's, the record holding them is this pass's own.
@@ -2230,7 +2273,7 @@ impl Lower<'_> {
         let payload = self
             .inference
             .operations
-            .get(&(arm.effect.tracked, arm.op.tracked.clone()))
+            .get(&(arm.effect.tracked, arm.selector.tracked.clone()))
             .map(|(from, _)| from.clone())
             .unwrap_or_default();
         self.frames.push(Frame::default());
@@ -2259,7 +2302,7 @@ impl Lower<'_> {
         );
         self.emit(
             body,
-            arm.op.span,
+            arm.selector.span,
             Rep::Fn,
             Op::Closure { func: id, captures },
         )
@@ -2736,7 +2779,7 @@ impl Lower<'_> {
             rep,
             Op::Project {
                 base: col.base,
-                field: col.name.clone(),
+                field: FieldKey::named(col.name.clone()),
             },
         );
         let read = vec![Col::Value(Value {

@@ -118,7 +118,7 @@ pub struct Output {
     /// binder is the operation's argument, and how a value of it is held is
     /// nowhere else to be found, since the binder has no term of its own to
     /// carry a solved type.
-    pub operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
+    pub operations: IndexMap<(Symbol, ir::OperationSelector), (Rc<Ty>, Rc<Ty>)>,
     /// The scheme each target-provided top-level value declared. Externs have
     /// no body and are therefore intentionally separate from `schemes`, whose
     /// entries each correspond to a term initializer.
