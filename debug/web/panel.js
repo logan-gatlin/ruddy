@@ -253,9 +253,10 @@ function createPane(root, app, index) {
       visible = [];
       return;
     }
-    if (stage.status === "skipped" || !stage.nodes.length) {
-      const why = stage.status === "skipped" ? stage.summary : "nothing to show";
-      setRows(`<div class="pane-note">${esc(why)}</div>`);
+    if (stage.status === "error" || stage.status === "skipped" || !stage.nodes.length) {
+      const why = stage.status === "error" || stage.status === "skipped" ? stage.summary : "nothing to show";
+      const bad = stage.status === "error" ? " bad" : "";
+      setRows(`<div class="pane-note${bad}">${esc(why)}</div>`);
       visible = [];
       return;
     }
@@ -499,7 +500,12 @@ function createPane(root, app, index) {
       .filter((s) => !s.annotates)
       .map((s, i) => {
         const on = s.id === stage.id ? " on" : "";
-        const bad = s.status === "panicked" ? " bad" : s.status === "partial" ? " warn" : "";
+        const bad =
+          s.status === "panicked" || s.status === "error"
+            ? " bad"
+            : s.status === "partial"
+              ? " warn"
+              : "";
         return (
           `<button class="tab${on}${bad}" data-stage="${s.id}" title="${esc(s.summary)}">` +
           `<span class="key">${i + 1}</span>${esc(s.title)}</button>`

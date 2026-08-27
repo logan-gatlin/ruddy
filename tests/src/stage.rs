@@ -773,6 +773,7 @@ fn artifact_stage_renders_one_dependency() {
         dependency_interfaces: &[],
         dependencies_valid: false,
         artifact_panicked: false,
+        link_error: None,
         link_panicked: false,
         mint: None,
         symbols: &symbols,
@@ -866,6 +867,25 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
     assert!(skipped.nodes.is_empty());
     assert!(skipped.text.is_none());
     assert!(skipped.micros.is_none());
+}
+
+#[test]
+fn link_failure_is_distinct_from_a_skip_and_a_panic() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "linked")
+        .expect("linked stage is registered");
+    let failed = ruddy_debug::stage::linked::missing(spec, false, Some("bad graph"));
+    assert_eq!(failed.status, Status::Error);
+    assert_eq!(failed.summary, "bad graph");
+    assert_eq!(
+        ruddy_debug::stage::linked::missing(spec, true, Some("bad graph")).status,
+        Status::Panicked
+    );
+    assert_eq!(
+        ruddy_debug::stage::linked::missing(spec, false, None).status,
+        Status::Skipped
+    );
 }
 
 #[test]

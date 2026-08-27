@@ -389,6 +389,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // Linking is a distinct final phase. Dependency artifacts remain separate
     // compilation boundaries above; this output copies their code into the
     // active root and therefore needs no external artifacts at execution time.
+    let mut link_error = None;
     let mut link_panicked = false;
     let linked = artifact.as_ref().and_then(|artifact| {
         let started = Instant::now();
@@ -400,12 +401,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         match out {
             Some(Ok(linked)) => Some(linked),
             Some(Err(error)) => {
-                diagnostics.push(raw(
-                    "link",
-                    "invalid-artifact-graph",
-                    error.to_string(),
-                    None,
-                ));
+                let message = error.to_string();
+                diagnostics.push(raw("link", "invalid-artifact-graph", message.clone(), None));
+                link_error = Some(message);
                 None
             }
             None => None,
@@ -451,6 +449,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             .iter()
             .any(|diagnostic| diagnostic.stage == "dependencies"),
         artifact_panicked,
+        link_error: link_error.as_deref(),
         link_panicked,
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,

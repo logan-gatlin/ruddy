@@ -61,6 +61,8 @@ pub struct Cx<'a> {
     pub dependencies_valid: bool,
     /// Artifact construction ran but panicked, rather than being skipped.
     pub artifact_panicked: bool,
+    /// Static linking ran but rejected its artifact graph.
+    pub link_error: Option<&'a str>,
     /// Static linking ran but panicked, rather than being skipped.
     pub link_panicked: bool,
     pub mint: Option<&'a Mint>,
@@ -472,4 +474,9 @@ pub fn skipped(spec: &Spec, why: &str) -> Stage {
 /// at the top level of the snapshot.
 pub fn panicked(spec: &Spec) -> Stage {
     spec.stage(Status::Panicked, "panicked")
+}
+
+/// A stage that ran and rejected its input normally.
+pub fn failed(spec: &Spec, why: &str) -> Stage {
+    spec.stage(Status::Error, why)
 }

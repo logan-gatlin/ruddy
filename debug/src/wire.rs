@@ -172,6 +172,8 @@ pub enum Status {
     Partial,
     /// Its input never arrived, so there was nothing to render.
     Skipped,
+    /// It ran normally but rejected its input.
+    Error,
     Panicked,
 }
 

@@ -7,11 +7,17 @@ use crate::{
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(linked) = cx.linked else {
-        return if cx.link_panicked {
-            crate::stage::panicked(spec)
-        } else {
-            crate::stage::skipped(spec, "static linking did not run")
-        };
+        return missing(spec, cx.link_panicked, cx.link_error);
     };
     super::artifact::render(spec, cx, linked, cx.micros.link)
+}
+
+pub fn missing(spec: &Spec, panicked: bool, error: Option<&str>) -> Stage {
+    if panicked {
+        crate::stage::panicked(spec)
+    } else if let Some(error) = error {
+        crate::stage::failed(spec, error)
+    } else {
+        crate::stage::skipped(spec, "static linking did not run")
+    }
 }

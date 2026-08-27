@@ -38,6 +38,10 @@ pub enum LinkError {
         owner: String,
         dependency: String,
     },
+    UnreachableArtifact {
+        identity: String,
+        root: String,
+    },
     MalformedGlobal {
         name: String,
     },
@@ -49,6 +53,10 @@ pub enum LinkError {
         name: String,
     },
     MissingGlobal {
+        owner: String,
+        target: String,
+    },
+    UndeclaredGlobalDependency {
         owner: String,
         target: String,
     },
@@ -81,6 +89,10 @@ impl fmt::Display for LinkError {
                 f,
                 "artifact `{owner}` appears before its dependency `{dependency}`"
             ),
+            Self::UnreachableArtifact { identity, root } => write!(
+                f,
+                "artifact `{identity}` is not reachable from root artifact `{root}`"
+            ),
             Self::MalformedGlobal { name } => write!(f, "malformed qualified global name `{name}`"),
             Self::WrongGlobalOwner { name, owner } => write!(
                 f,
@@ -92,6 +104,10 @@ impl fmt::Display for LinkError {
             Self::MissingGlobal { owner, target } => {
                 write!(f, "artifact `{owner}` references missing global `{target}`")
             }
+            Self::UndeclaredGlobalDependency { owner, target } => write!(
+                f,
+                "artifact `{owner}` references global `{target}` without declaring its owner as a direct dependency"
+            ),
             Self::FunctionIndexOutOfBounds {
                 owner,
                 index,
@@ -152,6 +168,28 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
         }
     }
 
+    let root_identity = identity(root);
+    let mut reachable = HashSet::from([root_identity.clone()]);
+    let mut pending = vec![root_identity.clone()];
+    while let Some(owner) = pending.pop() {
+        let artifact = &artifacts[positions[&owner]];
+        for dependency in &artifact.header.dependencies {
+            let dependency = format!("{}@{}", dependency.name, dependency.version);
+            if reachable.insert(dependency.clone()) {
+                pending.push(dependency);
+            }
+        }
+    }
+    if let Some(artifact) = artifacts
+        .iter()
+        .find(|artifact| !reachable.contains(&identity(artifact)))
+    {
+        return Err(LinkError::UnreachableArtifact {
+            identity: identity(artifact),
+            root: root_identity,
+        });
+    }
+
     let mut globals = HashSet::new();
     for artifact in artifacts {
         let owner = identity(artifact);
@@ -175,18 +213,38 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     let mut linked_globals = Vec::new();
     for artifact in artifacts {
         let owner = identity(artifact);
+        let dependencies: HashSet<String> = artifact
+            .header
+            .dependencies
+            .iter()
+            .map(|dependency| format!("{}@{}", dependency.name, dependency.version))
+            .collect();
         // Artifact indices are u64 and Rust vectors cannot exceed u64::MAX
         // entries on supported targets.
         let offset = functions.len() as u64;
         let count = artifact.lir.functions.len();
         for function in &artifact.lir.functions {
             let mut function = function.clone();
-            relocate_block(&mut function.body, offset, count, &owner, &globals)?;
+            relocate_block(
+                &mut function.body,
+                offset,
+                count,
+                &owner,
+                &dependencies,
+                &globals,
+            )?;
             functions.push(function);
         }
         for global in &artifact.lir.globals {
             let mut global = global.clone();
-            relocate_block(&mut global.body, offset, count, &owner, &globals)?;
+            relocate_block(
+                &mut global.body,
+                offset,
+                count,
+                &owner,
+                &dependencies,
+                &globals,
+            )?;
             linked_globals.push(global);
         }
     }
@@ -241,6 +299,7 @@ fn relocate_block(
     offset: u64,
     count: usize,
     owner: &str,
+    dependencies: &HashSet<String>,
     globals: &HashSet<String>,
 ) -> Result<(), LinkError> {
     for instruction in &mut block.instrs {
@@ -251,7 +310,13 @@ fn relocate_block(
                 ..
             } => relocate_index(func, offset, count, owner)?,
             Op::Global { target } => {
-                qualified_owner(target)?;
+                let target_owner = qualified_owner(target)?;
+                if target_owner != owner && !dependencies.contains(target_owner) {
+                    return Err(LinkError::UndeclaredGlobalDependency {
+                        owner: owner.to_string(),
+                        target: target.clone(),
+                    });
+                }
                 if !globals.contains(target) {
                     return Err(LinkError::MissingGlobal {
                         owner: owner.to_string(),
@@ -259,36 +324,38 @@ fn relocate_block(
                     });
                 }
             }
-            Op::Catch { body, .. } => relocate_block(body, offset, count, owner, globals)?,
+            Op::Catch { body, .. } => {
+                relocate_block(body, offset, count, owner, dependencies, globals)?
+            }
             Op::SwitchTag {
                 cases, fallback, ..
             } => {
                 for case in cases {
-                    relocate_block(&mut case.block, offset, count, owner, globals)?;
+                    relocate_block(&mut case.block, offset, count, owner, dependencies, globals)?;
                 }
                 if let Some(block) = fallback {
-                    relocate_block(block, offset, count, owner, globals)?;
+                    relocate_block(block, offset, count, owner, dependencies, globals)?;
                 }
             }
             Op::SwitchPrim {
                 cases, fallback, ..
             } => {
                 for case in cases {
-                    relocate_block(&mut case.block, offset, count, owner, globals)?;
+                    relocate_block(&mut case.block, offset, count, owner, dependencies, globals)?;
                 }
                 if let Some(block) = fallback {
-                    relocate_block(block, offset, count, owner, globals)?;
+                    relocate_block(block, offset, count, owner, dependencies, globals)?;
                 }
             }
             Op::SwitchPresence {
                 present, absent, ..
             } => {
-                relocate_block(present, offset, count, owner, globals)?;
-                relocate_block(absent, offset, count, owner, globals)?;
+                relocate_block(present, offset, count, owner, dependencies, globals)?;
+                relocate_block(absent, offset, count, owner, dependencies, globals)?;
             }
             Op::SwitchRest { none, some, .. } => {
-                relocate_block(none, offset, count, owner, globals)?;
-                relocate_block(some, offset, count, owner, globals)?;
+                relocate_block(none, offset, count, owner, dependencies, globals)?;
+                relocate_block(some, offset, count, owner, dependencies, globals)?;
             }
             _ => {}
         }

@@ -265,6 +265,21 @@ fn rejects_invalid_graph_structure() {
         link::link(&[dep, repeated]),
         Err(LinkError::DuplicateDependency { .. })
     ));
+
+    let orphan = artifact("orphan", &[], vec![], vec![]);
+    let root = artifact("app", &[], vec![], vec![]);
+    assert!(matches!(
+        link::link(&[orphan, root]),
+        Err(LinkError::UnreachableArtifact { .. })
+    ));
+
+    let first_root = artifact("first", &[], vec![], vec![]);
+    let dep = artifact("dep", &[], vec![], vec![]);
+    let final_root = artifact("app", &[("dep", "1.0.0")], vec![], vec![]);
+    assert!(matches!(
+        link::link(&[first_root, dep, final_root]),
+        Err(LinkError::UnreachableArtifact { .. })
+    ));
 }
 
 #[test]
@@ -275,6 +290,7 @@ fn rejects_bad_global_definitions_and_references() {
         "@1::x",
         "app@::x",
         "app@1::",
+        "app@1.0.0::",
         "app@1::x::",
         "app@1@2::x",
     ] {
@@ -357,6 +373,29 @@ fn rejects_bad_global_definitions_and_references() {
         link::link(&[malformed]),
         Err(LinkError::MalformedGlobal { .. })
     ));
+
+    let base = artifact(
+        "base",
+        &[],
+        vec![],
+        vec![global("base@1.0.0::x", block(vec![]))],
+    );
+    let middle = artifact("middle", &[("base", "1.0.0")], vec![], vec![]);
+    let bypass = artifact(
+        "app",
+        &[("middle", "1.0.0")],
+        vec![],
+        vec![global(
+            "app@1.0.0::x",
+            block(vec![a::Op::Global {
+                target: "base@1.0.0::x".into(),
+            }]),
+        )],
+    );
+    assert!(matches!(
+        link::link(&[base, middle, bypass]),
+        Err(LinkError::UndeclaredGlobalDependency { .. })
+    ));
 }
 
 #[test]
@@ -381,6 +420,10 @@ fn every_link_error_has_a_user_facing_message() {
             owner: "a".into(),
             dependency: "b".into(),
         },
+        LinkError::UnreachableArtifact {
+            identity: "a@1.0.0".into(),
+            root: "b@1.0.0".into(),
+        },
         LinkError::MalformedGlobal { name: "bad".into() },
         LinkError::WrongGlobalOwner {
             name: "b@1.0.0::x".into(),
@@ -390,6 +433,10 @@ fn every_link_error_has_a_user_facing_message() {
             name: "a@1.0.0::x".into(),
         },
         LinkError::MissingGlobal {
+            owner: "a".into(),
+            target: "b@1.0.0::x".into(),
+        },
+        LinkError::UndeclaredGlobalDependency {
             owner: "a".into(),
             target: "b@1.0.0::x".into(),
         },
