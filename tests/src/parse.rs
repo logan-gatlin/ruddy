@@ -986,7 +986,7 @@ fn a_sum_and_a_struct_nest_without_help() {
 fn every_position_that_can_fail_reports_before_it_does() {
     // An effect's `=` commits to a case list, but keeps the empty declaration
     // for lowering after reporting a token that cannot begin a case.
-    let out = parse(lex("effect E = 1n", FileID::GENERATED).tokens);
+    let out = parse(lex("effect E = {}", FileID::GENERATED).tokens);
     assert!(!out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(out.stmts.len(), 1, "{:#?}", out.stmts);
 
@@ -1597,48 +1597,43 @@ fn a_rest_must_end_the_struct_pattern() {
     assert_eq!(out.errors[0].span.width, 0);
 }
 
-/// Both forms of an `effect` declaration, printed back as they were written.
-/// Which of the two a declaration is, is not the parser's to say — it records
-/// the cases and lowering reads the `:`s — so a mixed one parses too.
+/// Every accepted effect body is disjoint and round-trips canonically.
 #[test]
 fn effect_declarations() {
     assert_eq!(
-        parse_one("effect Log = write : Nat -> ()"),
-        "effect Log = | write : Nat -> ()"
+        parse_one("effect Log = String -> ()"),
+        "effect Log = String -> ()"
     );
     assert_eq!(
-        parse_one("effect Log = write : Nat -> () | flush : () -> ()"),
-        "effect Log = | write : Nat -> () | flush : () -> ()"
+        parse_one("effect Log = { write: Nat -> () }"),
+        "effect Log = { write: Nat -> () }"
     );
-    // An alias: effects, no signatures, unioned with the `+` a row writes —
-    // and no leading mark, since a union has nothing to lead with.
+    assert_eq!(
+        parse_one("effect Log = { write: Nat -> (), flush: () -> (), }"),
+        "effect Log = { write: Nat -> (), flush: () -> () }"
+    );
+    assert_eq!(
+        parse_one("effect StructInput = { value: Nat } -> ()"),
+        "effect StructInput = { value: Nat } -> ()"
+    );
     assert_eq!(
         parse_one("effect Console = !Log + !IO"),
         "effect Console = !Log + !IO"
     );
-    // A bar between aliases is the union too, and prints back as the `+` it
-    // means: the leading one is still optional, as it is on a sum.
-    assert_eq!(
-        parse_one("effect Console = | !Log | !IO"),
-        "effect Console = !Log + !IO"
-    );
-    assert_eq!(
-        parse_one("effect Console = | !Log"),
-        "effect Console = !Log"
-    );
-    // The empty effect has neither an assignment nor cases.
     assert_eq!(parse_one("effect Nil"), "effect Nil");
-    for source in ["effect Nil = |", "effect Nil ="] {
+    for source in [
+        "effect Nil = |",
+        "effect Nil =",
+        "effect Old = write : Nat -> () | flush : () -> ()",
+        "effect Empty = {}",
+        "effect NonFunction = { op: Nat }",
+        "effect MissingColon = { op Nat -> () }",
+        "effect Unclosed = {",
+        "effect Open = { op: Nat -> (), .. }",
+    ] {
         let out = parse(lex(source, FileID::GENERATED).tokens);
-        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
-        assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+        assert!(!out.errors.is_empty(), "{source}: {:#?}", out.errors);
     }
-    // A mix of the two forms parses; refusing it is lowering's. Each case
-    // prints with the mark its own form writes, which is what re-parses.
-    assert_eq!(
-        parse_one("effect Bad = !Log | w : Nat -> ()"),
-        "effect Bad = !Log | w : Nat -> ()"
-    );
 }
 
 /// A mark between cases promises another one, so nothing after it is reported
@@ -1825,11 +1820,8 @@ fn an_operation_is_told_from_a_projection_by_the_sigil() {
     // printed form brackets the case, which is how a tag carrying a payload is
     // told from one being read off.
     assert_eq!(parse_one("let a = #Ok.x"), "let a = (#Ok).x");
-    // An effect is a value of nothing, so one written alone is refused where
-    // it stands rather than lowered into a complaint about a term.
-    let out = parse(lex("let a = !Log", FileID::GENERATED).tokens);
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind, ErrorKind::Unexpected);
+    // A bare effect label is the unnamed selector and is first-class.
+    assert_eq!(parse_one("let a = !Log"), "let a = !Log");
 }
 
 /// One statement's parsed tree, for the tests that assert about the shape
@@ -1869,9 +1861,9 @@ fn the_effect_grammar_reports_what_it_cannot_read() {
         ("let a = !Log.1", "1"),
         // An operation declares a signature, so the `:` is not optional: a
         // case with no `:` is the alias it does not look like.
-        ("effect E = op | w : Nat -> ()", "|"),
+        ("effect E = op | w : Nat -> ()", "op |"),
         // And the signature is a type, whatever else was written there.
-        ("effect E = op : ,", ","),
+        ("effect E = { op: , }", ","),
         // A `\` promises an effect, so anything but one after it is
         // reported — the rule a sum's absent case keeps.
         ("let f : A -> B + \\x = g", "x"),

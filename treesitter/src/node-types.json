@@ -1083,6 +1083,21 @@
     }
   },
   {
+    "type": "effect_alias_union",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "effect_alias",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "effect_case",
     "named": true,
     "fields": {
@@ -1116,6 +1131,24 @@
     "type": "effect_definition",
     "named": true,
     "fields": {
+      "body": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "effect_alias_union",
+            "named": true
+          },
+          {
+            "type": "function_type",
+            "named": true
+          },
+          {
+            "type": "named_effect_interface",
+            "named": true
+          }
+        ]
+      },
       "name": {
         "multiple": false,
         "required": true,
@@ -1126,20 +1159,32 @@
           }
         ]
       }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "effect_alias",
-          "named": true
-        },
-        {
-          "type": "operation_declaration",
-          "named": true
-        }
-      ]
+    }
+  },
+  {
+    "type": "effect_operation_field",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "signature": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "function_type",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -2660,6 +2705,21 @@
     }
   },
   {
+    "type": "named_effect_interface",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "effect_operation_field",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "operation",
     "named": true,
     "fields": {
@@ -2679,76 +2739,10 @@
       },
       "name": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "identifier",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "operation_declaration",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "identifier",
-            "named": true
-          }
-        ]
-      },
-      "signature": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "effect_type",
-            "named": true
-          },
-          {
-            "type": "function_type",
-            "named": true
-          },
-          {
-            "type": "hole",
-            "named": true
-          },
-          {
-            "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "parenthesized_type",
-            "named": true
-          },
-          {
-            "type": "path",
-            "named": true
-          },
-          {
-            "type": "struct_type",
-            "named": true
-          },
-          {
-            "type": "sum_type",
-            "named": true
-          },
-          {
-            "type": "type_application",
-            "named": true
-          },
-          {
-            "type": "type_variable",
-            "named": true
-          },
-          {
-            "type": "unit",
             "named": true
           }
         ]

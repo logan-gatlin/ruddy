@@ -237,7 +237,11 @@ fn block(output: &Output, block: &Block, indent: usize, out: &mut String) {
 /// Hide the internal structural interface when an effect label reaches LIR
 /// evidence. Ordinary field names never contain this separator.
 fn effect_name(name: &str) -> &str {
-    name.split('\u{1f}').next().unwrap_or(name)
+    if name == "\0ruddy:unnamed-operation" {
+        "<unnamed>"
+    } else {
+        name.split('\u{1f}').next().unwrap_or(name)
+    }
 }
 
 /// Render a primitive literal exactly as source syntax would spell it.

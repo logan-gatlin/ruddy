@@ -93,23 +93,24 @@ type Pair 'A 'B = { first: 'A, second: 'B }
 An effect declaring its operations
 ================================================================================
 
-effect Log = write : Nat -> () | flush : () -> ()
+effect Log = { write: Nat -> (), flush: () -> (), }
 
 --------------------------------------------------------------------------------
 
 (source_file
   (effect_definition
     (identifier)
-    (operation_declaration
-      (identifier)
-      (function_type
+    (named_effect_interface
+      (effect_operation_field
         (identifier)
-        (unit)))
-    (operation_declaration
-      (identifier)
-      (function_type
-        (unit)
-        (unit)))))
+        (function_type
+          (identifier)
+          (unit)))
+      (effect_operation_field
+        (identifier)
+        (function_type
+          (unit)
+          (unit))))))
 
 ================================================================================
 An effect standing for the effects it names
@@ -122,10 +123,11 @@ effect Console = !Log + !IO
 (source_file
   (effect_definition
     (identifier)
-    (effect_alias
-      (effect_label))
-    (effect_alias
-      (effect_label))))
+    (effect_alias_union
+      (effect_alias
+        (effect_label))
+      (effect_alias
+        (effect_label)))))
 
 ================================================================================
 The empty effect
@@ -190,3 +192,107 @@ extern log : String -> () = console.log
     target: (foreign_path
       segment: (identifier)
       segment: (identifier))))
+
+================================================================================
+Unnamed and struct-input singleton effects
+================================================================================
+
+effect Log = String -> ()
+effect Structured = { value: Nat } -> ()
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    (identifier)
+    (function_type
+      (identifier)
+      (unit)))
+  (effect_definition
+    (identifier)
+    (function_type
+      (struct_type
+        (struct_type_field
+          (identifier)
+          (identifier)))
+      (unit))))
+
+================================================================================
+Bare and qualified unnamed operations
+================================================================================
+
+let write = !Log
+let call = Sys::!Log "message"
+let handled = handle call with | Sys::!Log message => () end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (operation
+      (effect_label)))
+  (let_definition
+    (identifier)
+    (application
+      (operation
+        (effect_path
+          (identifier)
+          (effect_label)))
+      (string)))
+  (let_definition
+    (identifier)
+    (handle_expression
+      (identifier)
+      (handler_arm
+        (operation
+          (effect_path
+            (identifier)
+            (effect_label)))
+        (identifier)
+        (unit)))))
+
+================================================================================
+Rejected legacy and row-like effect interfaces recover locally
+================================================================================
+
+effect Empty = {}
+effect Open = { op: Nat -> (), .. }
+effect Old = op : Nat -> () | flush : () -> ()
+let after = 1n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    (identifier))
+  (ERROR
+    (struct_type))
+  (effect_definition
+    (identifier))
+  (ERROR
+    (struct_type
+      (struct_type_field
+        (identifier)
+        (function_type
+          (identifier)
+          (unit)))
+      (rest)))
+  (effect_definition
+    (identifier)
+    (function_type
+      (type_application
+        (identifier)
+        (ERROR)
+        (identifier))
+      (function_type
+        (type_application
+          (unit)
+          (ERROR)
+          (identifier)
+          (ERROR)
+          (unit))
+        (unit))))
+  (let_definition
+    (identifier)
+    (natural)))

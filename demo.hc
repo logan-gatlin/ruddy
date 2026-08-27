@@ -150,35 +150,35 @@ let unwrap = fn opt => match opt with
   | _ => 0
   end
 
-effect Log = write : Nat -> ()
+effect Log = Nat -> ()
 
-effect IO = print : Nat -> ()
+effect IO = { print: Nat -> () }
 
 effect Console = !Log + !IO
 
 let greet : () -> Nat + !Log = fn _ =>
-  let _ = !Log.write 1 in
+  let _ = !Log 1 in
   0
 
 let quiet : () -> Nat = fn _ =>
   handle greet () with
-    | !Log.write s => ()
+    | !Log s => ()
     | return x => x
   end
 
 let loud : () -> Nat + !Console = fn _ =>
   handle greet () with
-    | !Log.write s => !IO.print s
+    | !Log s => !IO.print s
   end
 
-effect Fail = oops : () -> Nat
+effect Fail = { oops: () -> Nat }
 
 let recover : () -> Nat = fn _ =>
   handle !Fail.oops () with
     | !Fail.oops _ => raise 0
   end
 
-let runs = fn g => handle g () with | !Log.write s => () end
+let runs = fn g => handle g () with | !Log s => () end
 
 let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g n => g n
 

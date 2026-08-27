@@ -309,7 +309,7 @@ fn model_artifact() -> Artifact {
                         interface: "write".to_string(),
                     }),
                     kind: artifact::EffectKind::Operations(vec![artifact::Operation {
-                        name: "write".to_string(),
+                        selector: artifact::OperationSelector::Named("write".to_string()),
                         from: plain(Core::Nat),
                         to: plain(Core::Unit),
                     }]),
@@ -472,7 +472,7 @@ fn compact(text: &str) -> String {
 fn a_compiled_bundle_round_trips_through_canonical_text() {
     let artifact = built(
         "type Box 'a = { value: 'a }\n\
-         effect Log = write : Nat -> ()\n\
+         effect Log = { write: Nat -> () }\n\
          effect Console = !Log\n\
          let id = fn x => x\n\
          let main = fn n => handle id n with | !Log.write x => {} end\n",
@@ -504,6 +504,10 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
     assert!(
         !printed.contains("<test>"),
         "source paths must not cross the disk boundary"
+    );
+    assert!(
+        printed.contains("(selector named \"write\")"),
+        "named selectors use the strict selector subform: {printed}"
     );
     assert!(
         !printed.contains("Span"),
@@ -552,6 +556,21 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (effects))\n\
          \x20 (lir (functions) (globals)))\n"
     );
+}
+
+#[test]
+fn unnamed_operation_selectors_round_trip_strictly() {
+    let artifact = built(
+        "effect Log = String -> ()\n\
+         let main = fn message => handle !Log message with | !Log text => () end",
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(selector unnamed)"), "{printed}");
+    let effect = &artifact.header.effects[0];
+    let artifact::EffectKind::Operations(operations) = &effect.kind else {
+        panic!("expected operations")
+    };
+    assert_eq!(operations[0].selector, artifact::OperationSelector::Unnamed);
 }
 
 #[test]
@@ -841,7 +860,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
 
 #[test]
 fn building_rejects_a_pending_effect_identity() {
-    let (mint, mut program, inferred, lowered) = compiled("effect Log = write : Nat -> ()\n");
+    let (mint, mut program, inferred, lowered) = compiled("effect Log = { write: Nat -> () }\n");
     let symbol = *program
         .effects
         .keys()
@@ -1038,6 +1057,14 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     // Invalid values of each S-expression shape reach reader paths that a tag
     // miss or arity error does not.
     assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
+    assert_bad_replacement(&valid, "(selector named \"write\")", "\"write\"");
+    assert_bad_replacement(
+        &valid,
+        "(selector named \"write\")",
+        "(selector unnamed extra)",
+    );
+    assert_bad_replacement(&valid, "(selector named \"write\")", "(selector named)");
+    assert_bad_replacement(&valid, "(selector named \"write\")", "(selector mystery)");
     assert_malformed(&replace_balanced(
         &valid,
         "(operations (operation",

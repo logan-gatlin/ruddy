@@ -587,7 +587,7 @@ fn a_match_with_no_arms_dispatches_over_nothing() {
 fn performing_an_operation_reads_it_out_of_the_evidence() {
     assert_eq!(
         section(
-            "effect Log = write : Nat -> ()\nlet shout = fn x => !Log.write x",
+            "effect Log = { write: Nat -> () }\nlet shout = fn x => !Log.write x",
             "fn shout("
         ),
         "fn shout(%0: struct, %1: nat):\n\
@@ -597,6 +597,17 @@ fn performing_an_operation_reads_it_out_of_the_evidence() {
     );
 }
 
+#[test]
+fn unnamed_operations_use_the_private_evidence_slot_without_leaking_it() {
+    let printed = section(
+        "effect Log = Nat -> ()\n\
+         let main = fn n => handle !Log n with | !Log value => () end",
+        "fn main(",
+    );
+    assert!(printed.contains("<unnamed>"), "{printed}");
+    assert!(!printed.contains("ruddy:unnamed-operation"), "{printed}");
+}
+
 /// A handler mints an identity, builds one record of operation closures per
 /// effect it discharges, and runs its body under a `catch` on that identity —
 /// with the direct call out of the body handed the record.
@@ -604,7 +615,7 @@ fn performing_an_operation_reads_it_out_of_the_evidence() {
 fn a_handler_builds_evidence_and_catches_its_own_tag() {
     assert_eq!(
         section(
-            "effect Log = write : Nat -> ()\n\
+            "effect Log = { write: Nat -> () }\n\
              let shout = fn x => !Log.write x\n\
              let main = fn w => handle shout 5n with | !Log.write n => {} end",
             "fn main("
@@ -626,7 +637,7 @@ fn a_handler_builds_evidence_and_catches_its_own_tag() {
 #[test]
 fn a_return_arm_is_applied_on_the_normal_path() {
     let printed = section(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let main = fn w => handle 1n with | !Log.write n => {} | return r => { got: r } end",
         "fn main(",
     );
@@ -639,7 +650,7 @@ fn a_return_arm_is_applied_on_the_normal_path() {
 /// yields the thrown value directly, so the `return` arm never sees it.
 #[test]
 fn a_raise_throws_to_the_tag_its_arm_captured() {
-    let source = "effect Fail = oops : () -> Nat\n\
+    let source = "effect Fail = { oops: () -> Nat }\n\
          let recover = fn w =>\n\
            handle !Fail.oops () with | !Fail.oops z => raise 0n | return r => r end";
     assert_eq!(
@@ -658,7 +669,7 @@ fn a_raise_throws_to_the_tag_its_arm_captured() {
 #[test]
 fn nested_handlers_of_one_effect_shadow_and_stay_apart() {
     let printed = section(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let nest = fn w =>\n\
            handle (handle !Log.write 1n with | !Log.write a => {} end)\n\
            with | !Log.write b => {} end",
@@ -699,7 +710,7 @@ fn an_effect_polymorphic_call_forwards_its_bundle() {
 /// bundle, is wrapped in an adapter that reads its record back out.
 #[test]
 fn a_bundle_is_built_where_none_can_be_forwarded() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => n\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end";
@@ -735,7 +746,7 @@ fn a_bundle_is_built_where_none_can_be_forwarded() {
 /// built — rather than the bundle holding it.
 #[test]
 fn a_function_receives_the_evidence_it_projects() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end";
@@ -773,7 +784,7 @@ fn a_function_receives_the_evidence_it_projects() {
 /// row — and the call site hands that evidence in like any other.
 #[test]
 fn an_operation_used_as_a_value_gets_a_wrapper() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let op = !Log.write\n\
          let go = fn w => handle op 1n with | !Log.write n => {} end";
     assert_eq!(
@@ -797,7 +808,7 @@ fn an_operation_used_as_a_value_gets_a_wrapper() {
 fn a_definite_effect_and_an_open_rest_are_both_passed() {
     assert_eq!(
         section(
-            "effect Log = write : Nat -> ()\n\
+            "effect Log = { write: Nat -> () }\n\
              let both = fn g => let z = !Log.write 1n in g 2n",
             "fn both("
         ),
@@ -972,7 +983,7 @@ fn a_field_every_arm_ignores_is_tested_but_not_read() {
 #[test]
 fn an_operation_returning_a_function_keeps_applying() {
     let printed = section(
-        "effect Mk = mk : Nat -> (Nat -> Nat)\n\
+        "effect Mk = { mk: Nat -> (Nat -> Nat) }\n\
          let go = fn w => handle !Mk.mk 1n 2n with | !Mk.mk n => fn z => z end",
         "fn go(",
     );
@@ -1004,10 +1015,10 @@ fn a_nested_binding_takes_a_bundle_of_its_own() {
 fn every_temp_is_defined_once_in_the_whole_listing() {
     for source in [
         "let three = fn a => fn b => fn c => a\nlet p = three 1n",
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let shout = fn x => fn y => !Log.write x\n\
          let go = fn w => handle shout 1n with | !Log.write n => {} end",
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end",
@@ -1058,7 +1069,7 @@ fn definitions(printed: &str) -> Vec<String> {
 /// across as it is, with no adapter between.
 #[test]
 fn evidence_of_the_same_shape_is_handed_straight_over() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let noisy = fn n => let z = !Log.write n in n\n\
          let same = fn w => handle takes noisy with | !Log.write s => {} end";
@@ -1099,7 +1110,7 @@ fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
 /// effect's name, and hands the record itself over unchanged.
 #[test]
 fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
          let openish : Nat -> Nat + !Log + ..'r = fn n => let z = !Log.write n in n\n\
          let packed = fn w => handle takes openish with | !Log.write s => {} end";
@@ -1142,7 +1153,7 @@ fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
 /// was given rather than the named part alone.
 #[test]
 fn an_adapter_forwards_the_bundle_it_was_handed() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let hof2 : ((Nat -> Nat + ..'r) -> Nat + ..'r) -> Nat + ..'r =\n\
            fn k => k (fn m => m)\n\
          let both : (Nat -> Nat + !Log + ..'s) -> Nat + !Log + ..'s =\n\
@@ -1182,7 +1193,7 @@ fn an_adapter_forwards_the_bundle_it_was_handed() {
 /// the wrapper expects.
 #[test]
 fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let two : Nat -> Nat -> Nat + !Log + ..'s =\n\
            fn a => fn b => let z = !Log.write a in b\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
@@ -1215,7 +1226,7 @@ fn a_partial_application_is_fitted_to_the_shape_its_wrapper_takes() {
 /// it goes straight across with no adapter between them.
 #[test]
 fn a_full_application_stands_for_what_it_came_to() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let pick : Nat -> Nat -> (Nat -> Nat + !Log) = fn a => fn b => noisy\n\
          let takes : (Nat -> Nat + !Log) -> Nat + !Log = fn f => f 1n\n\
@@ -1242,8 +1253,8 @@ fn a_full_application_stands_for_what_it_came_to() {
 /// `run` is handing over a function `run` can call.
 #[test]
 fn a_definition_read_through_a_binding_arrives_callable() {
-    let source = "effect A = a : Nat -> ()\n\
-         effect B = b : Nat -> ()\n\
+    let source = "effect A = { a: Nat -> () }\n\
+         effect B = { b: Nat -> () }\n\
          let poly : Nat -> Nat + ..'e = fn n => n\n\
          let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1n\n\
          let go = fn w => handle handle\n\
@@ -1286,8 +1297,8 @@ fn a_definition_read_through_a_binding_arrives_callable() {
 /// inside `get` and the caller has nothing left to do.
 #[test]
 fn a_definition_returned_from_a_function_arrives_callable() {
-    let source = "effect A = a : Nat -> ()\n\
-         effect B = b : Nat -> ()\n\
+    let source = "effect A = { a: Nat -> () }\n\
+         effect B = { b: Nat -> () }\n\
          let poly : Nat -> Nat + ..'e = fn n => n\n\
          let get : {} -> (Nat -> Nat + !A + !B) = fn u => poly\n\
          let run : (Nat -> Nat + !A + !B) -> Nat + !A + !B = fn f => f 1n\n\
@@ -1327,8 +1338,8 @@ fn a_definition_returned_from_a_function_arrives_callable() {
 /// makes without the binding in the way.
 #[test]
 fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
-    let source = "effect A = a : Nat -> ()\n\
-         effect B = b : Nat -> ()\n\
+    let source = "effect A = { a: Nat -> () }\n\
+         effect B = { b: Nat -> () }\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
          let app = fn g => g 1n\n\
          let direct = fn w => handle handle app both\n\
@@ -1386,7 +1397,7 @@ fn a_polymorphic_value_bound_by_a_let_is_called_at_the_shape_it_holds() {
 /// adapter.
 #[test]
 fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let pure = fn n => n\n\
          let go = fn w => handle (let h = fn g => g 1n in { a: h noisy, b: h pure })\n\
@@ -1432,8 +1443,8 @@ fn a_parameter_is_called_at_one_shape_however_the_uses_instantiate_it() {
 /// named on the spot.
 #[test]
 fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
-    let source = "effect A = a : Nat -> ()\n\
-         effect B = b : Nat -> ()\n\
+    let source = "effect A = { a: Nat -> () }\n\
+         effect B = { b: Nat -> () }\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
          let app = fn g => g 1n\n\
          let pick = fn u => app\n\
@@ -1467,8 +1478,8 @@ fn a_value_returned_from_a_call_is_called_at_the_shape_it_holds() {
 /// back into the records `both` was compiled to take.
 #[test]
 fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds() {
-    let source = "effect Log = write : Nat -> ()\n\
-         effect Fail = oops : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
          let s = { f: fn g => fn n => g n }\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
            let a = !Log.write n in let b = !Fail.oops n in n\n\
@@ -1517,8 +1528,8 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
 /// match binder holds a value fitted from that shape to the use's own.
 #[test]
 fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
-    let source = "effect Log = write : Nat -> ()\n\
-         effect Fail = oops : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
          let wrap = #F (fn g => fn n => g n)\n\
          let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
            let a = !Log.write n in let b = !Fail.oops n in n\n\
@@ -1548,8 +1559,8 @@ fn a_function_carried_as_a_sum_payload_is_called_at_the_shape_the_case_holds() {
 /// actually takes.
 #[test]
 fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
-    let source = "effect A = a : Nat -> ()\n\
-         effect B = b : Nat -> ()\n\
+    let source = "effect A = { a: Nat -> () }\n\
+         effect B = { b: Nat -> () }\n\
          let both : Nat -> Nat + !A + !B = fn n => let x = !A.a n in let y = !B.b n in n\n\
          let app = fn g => g 1n\n\
          let pick = fn u => app\n\
@@ -1578,7 +1589,7 @@ fn a_match_arm_yields_a_function_fitted_to_what_the_match_stands_for() {
 /// listing carries not one instruction beyond the ones the source wrote.
 #[test]
 fn a_value_already_at_the_containers_shape_goes_in_and_out_untouched() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let s : { f: Nat -> Nat + !Log } = { f: fn n => let z = !Log.write n in n }\n\
          let go = fn w => handle s.f 1n with | !Log.write x => {} end";
     assert_eq!(
@@ -1654,7 +1665,7 @@ fn a_case_the_production_type_never_named_reads_at_the_uses_word() {
 /// it once however many frames between here and the handler carry it.
 #[test]
 fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let idn = fn n => n\n\
          let outer : Nat -> Nat + !Log = fn n =>\n\
@@ -1688,7 +1699,7 @@ fn a_bundle_names_an_effect_once_however_many_frames_hold_it() {
 /// The evidence goes across; the identity does not.
 #[test]
 fn a_bundle_with_no_identity_hands_over_what_it_holds() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let idn = fn n => n\n\
          let maybe : Nat -> Nat + !Log (when 'a) = fn n => piped idn n";
@@ -1715,7 +1726,7 @@ fn a_bundle_with_no_identity_hands_over_what_it_holds() {
 /// one really is forwarded — nothing is built for it at all.
 #[test]
 fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
-    let source = "effect Log = write : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let noisy : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let caller : (Nat -> Nat + ..'r) -> Nat -> Nat + ..'r =\n\
@@ -1752,7 +1763,7 @@ fn a_bundle_is_forwarded_only_where_the_use_shares_the_variable() {
 fn nothing_after_a_raise_is_emitted() {
     assert_eq!(
         section(
-            "effect Fail = oops : () -> Nat\n\
+            "effect Fail = { oops: () -> Nat }\n\
              let recover = fn w =>\n\
                handle !Fail.oops () with\n\
                | !Fail.oops z => let q = raise 0n in raise 1n\n\

@@ -7,7 +7,7 @@ use std::fmt;
 
 use ruddy::{
     parse::{
-        Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectCase, EffectLabel, EffectRow, Expr,
+        Annotation, ArgKind, ArmHead, Clause, ClauseKind, EffectBody, EffectLabel, EffectRow, Expr,
         ExprKind, Pattern, PatternKind, Rest, Stmt, StmtKind, SumCase, Type, TypeField, TypeKind,
         When,
     },
@@ -175,29 +175,46 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             type_node_.child(annotation_node(ids, body))
         }
-        // The name, then one row per case: an operation with its signature
-        // under it, and an alias's case as the leaf it is. The empty effect
-        // has the name and nothing else.
-        StmtKind::Effect { name, cases } => {
+        StmtKind::Effect { name, body } => {
             let mut effect_node = Node {
                 label: "Effect".into(),
                 ..node
             }
             .child(Node::new(ids.next(), "Name", name.tracked.clone()).at(name.span));
-            for (op, case) in cases {
-                let row = match case {
-                    EffectCase::Operation { signature } => Node::new(
-                        ids.next(),
-                        format!("{}:", op.name.tracked),
-                        print::ast::ty(&signature.tracked).to_string(),
-                    )
-                    .at(op.span())
-                    .child(type_node(ids, signature)),
-                    EffectCase::Alias => {
-                        Node::new(ids.next(), "Names", print::ast::effect(op)).at(op.span())
+            match body {
+                EffectBody::Empty => {}
+                EffectBody::Alias(cases) => {
+                    for effect in cases.keys() {
+                        effect_node = effect_node.child(
+                            Node::new(ids.next(), "Names", print::ast::effect(effect))
+                                .at(effect.span()),
+                        );
                     }
-                };
-                effect_node = effect_node.child(row);
+                }
+                EffectBody::Unnamed { signature } => {
+                    effect_node = effect_node.child(
+                        Node::new(
+                            ids.next(),
+                            "Unnamed",
+                            print::ast::ty(&signature.tracked).to_string(),
+                        )
+                        .at(signature.span)
+                        .child(type_node(ids, signature)),
+                    );
+                }
+                EffectBody::Named(fields) => {
+                    for (name, signature) in fields {
+                        effect_node = effect_node.child(
+                            Node::new(
+                                ids.next(),
+                                format!("{}:", name.tracked),
+                                print::ast::ty(&signature.tracked).to_string(),
+                            )
+                            .at(name.span.merge(signature.span))
+                            .child(type_node(ids, signature)),
+                        );
+                    }
+                }
             }
             effect_node
         }
@@ -344,9 +361,9 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             .child(expr_node(ids, body));
             for arm in arms {
                 let (label, at) = match &arm.head {
-                    ArmHead::Operation { effect, op } => (
-                        format!("{}.{}", print::ast::effect(effect), op.tracked),
-                        effect.span().merge(op.span),
+                    ArmHead::Operation { effect, selector } => (
+                        format!("{}{}", print::ast::effect(effect), selector.tracked),
+                        effect.span().merge(selector.span),
                     ),
                     ArmHead::Return { span } => ("return".to_string(), *span),
                 };
@@ -370,11 +387,11 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         // The effect is a name and the operation a label scoped to it, so the
         // row carries the span the two were written at and no symbol — the
         // parse tree resolves nothing.
-        ExprKind::Operation { effect, op } => Node {
+        ExprKind::Operation { effect, selector } => Node {
             label: "Operation".into(),
             ..node
         }
-        .at(effect.span().merge(op.span)),
+        .at(effect.span().merge(selector.span)),
         ExprKind::Ident { name } => Node {
             label: "Ident".into(),
             ..node

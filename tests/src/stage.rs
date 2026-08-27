@@ -767,7 +767,7 @@ fn the_lir_tab_renders_the_listing_as_a_tree() {
 fn the_lir_tab_marks_the_evidence_it_plumbs_as_generated() {
     let nodes = tab(
         "lir",
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let piped : (Nat -> Nat + ..'e) -> Nat -> Nat + ..'e = fn g => fn n => g n\n\
          let logger : Nat -> Nat + !Log = fn n => let z = !Log.write n in n\n\
          let use = fn w => handle piped logger 1n with | !Log.write s => {} end\n",
@@ -963,6 +963,15 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
         "{}",
         artifact_stage.summary
     );
+
+    let unnamed = stage("artifact", "effect Log = Nat -> ()\n");
+    let effect = unnamed.nodes[0]
+        .children
+        .iter()
+        .find(|node| node.label == "effect")
+        .expect("artifact outline includes the effect");
+    assert_eq!(effect.children[0].label, "selector");
+    assert_eq!(effect.children[0].text, "unnamed");
 
     let skipped = stage("artifact", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);

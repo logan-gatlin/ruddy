@@ -542,7 +542,7 @@ fn a_scheme_prints_the_clause_it_requires() {
 /// arrow on re-reading; the round trip is what says so.
 #[test]
 fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
-    let effects = "effect Log = | write : Nat -> {}\n";
+    let effects = "effect Log = { write: Nat -> {} }\n";
     for body in [
         // A row, and a result that is not an arrow: no parentheses.
         "Nat -> Nat + !Log",
@@ -571,7 +571,7 @@ fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
 /// bare either way.
 #[test]
 fn a_printed_effect_row_re_lowers_to_itself() {
-    let effects = "effect Log = write : Nat -> ()\neffect IO = print : Nat -> ()\n";
+    let effects = "effect Log = { write: Nat -> () }\neffect IO = { print: Nat -> () }\n";
     // A scheme's quantified tail prints `..'a`, which is a letter the writer
     // did not choose and no re-lowering could recover — the rule every other
     // quantified variable already keeps. So what is re-lowered is the concrete
@@ -618,8 +618,8 @@ fn a_printed_effect_row_re_lowers_to_itself() {
 /// re-lowers.
 #[test]
 fn an_alias_prints_as_the_effects_it_names() {
-    let source = "effect Log = write : Nat -> ()\n\
-                  effect IO = print : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect IO = { print: Nat -> () }\n\
                   effect Console = !Log + !IO\n\
                   let f : Nat -> Nat + !Console = fn x => x";
     let (written, scheme) = types_of(source);
@@ -634,14 +634,16 @@ fn an_alias_prints_as_the_effects_it_names() {
 #[test]
 fn both_trees_render_the_effect_forms() {
     for source in [
-        "effect Log = | write : Nat -> {}",
-        "effect Log = | write : Nat -> {} | flush : {} -> {}",
+        "effect Log = Nat -> {}",
+        "effect Log = { value: Nat } -> {}",
+        "effect Log = { write: Nat -> {} }",
+        "effect Log = { write: Nat -> {}, flush: {} -> {} }",
         "effect Nil",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
-        "effect Log = | write : Nat -> {}\n\
+        "effect Log = { write: Nat -> {} }\n\
          let f : Nat -> Nat + \\!Log + ..'e = fn x => x",
-        "effect Log = | write : Nat -> {}\n\
+        "effect Log = { write: Nat -> {} }\n\
          let f : Nat -> Nat + !Log (when 'a) + ..'e = fn x => x",
     ] {
         let (ast, ir) = printed(source);
@@ -649,7 +651,7 @@ fn both_trees_render_the_effect_forms() {
         assert_eq!(ir, source, "{source}");
     }
 
-    let source = "effect Log = | write : Nat -> {}\n\
+    let source = "effect Log = { write: Nat -> {} }\n\
                   let h = fn n => handle !Log.write n with | !Log.write s => {} | return x => x end";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);

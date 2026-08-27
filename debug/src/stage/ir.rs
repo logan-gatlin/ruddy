@@ -172,7 +172,10 @@ fn effect_node(ids: &mut Ids, cx: &Cx, mint: &Mint, effect: &Effect) -> Node {
                 .map(|(name, operation)| {
                     Node::new(
                         ids.next(),
-                        format!("{name}:"),
+                        match name {
+                            ruddy::ir::OperationSelector::Unnamed => "Unnamed".to_string(),
+                            ruddy::ir::OperationSelector::Named(name) => format!("{name}:"),
+                        },
                         format!(
                             "{} -> {}",
                             print::ir::ty(&operation.from.tracked, mint),
@@ -388,7 +391,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
                 let head = Node::new(
                     ids.next(),
                     "Arm",
-                    format!("!{}.{}", mint.name(arm.effect.tracked), arm.op.tracked),
+                    format!("!{}{}", mint.name(arm.effect.tracked), arm.selector.tracked),
                 )
                 .at(named(arm.effect.span, mint.name(arm.effect.tracked)))
                 .child(with_symbol(

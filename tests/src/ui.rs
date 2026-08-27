@@ -159,7 +159,14 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
             name: "here".to_string(),
         },
         IrError::ImpureOperation,
-        IrError::MixedEffectForm,
+        IrError::BareOperationUnavailable {
+            effect: "Log".to_string(),
+            suggestion: Some("write".to_string()),
+        },
+        IrError::NamedOperationOnUnnamed {
+            effect: "Log".to_string(),
+            op: "write".to_string(),
+        },
         IrError::OperationOnAlias {
             effect: "Console".to_string(),
         },
@@ -2615,10 +2622,6 @@ fn the_effect_complaints_are_read_in_effects() {
             "an operation's signature must be plain; `+`, `..` and `when` belong in annotations",
         ),
         (
-            IrError::MixedEffectForm,
-            "an effect either declares operations or names other effects, not both",
-        ),
-        (
             IrError::OperationOnAlias {
                 effect: "Console".to_string(),
             },
@@ -2669,6 +2672,15 @@ fn the_effect_complaints_are_read_in_effects() {
     ] {
         assert_eq!(kind.to_string(), message, "{}", kind.code());
     }
+
+    assert_eq!(
+        IrError::BareOperationUnavailable {
+            effect: "Nil".to_string(),
+            suggestion: None,
+        }
+        .to_string(),
+        "empty effect `!Nil` has no operation"
+    );
 
     for (kind, message) in [
         (

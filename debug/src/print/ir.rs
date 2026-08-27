@@ -121,14 +121,31 @@ impl fmt::Display for Show<'_, Program> {
             match &decl.value {
                 Effect::Operations(operations) if operations.is_empty() => {}
                 Effect::Operations(operations) => {
-                    f.write_str(" =")?;
-                    for (name, operation) in operations {
+                    if let Some(operation) = operations.get(&ruddy::ir::OperationSelector::Unnamed)
+                    {
                         write!(
                             f,
-                            " | {name} : {} -> {}",
+                            " = {} -> {}",
                             self.show(&operation.from),
-                            self.show(&operation.to),
+                            self.show(&operation.to)
                         )?;
+                    } else {
+                        f.write_str(" = {")?;
+                        for (at, (selector, operation)) in operations.iter().enumerate() {
+                            if at > 0 {
+                                f.write_str(",")?;
+                            }
+                            let ruddy::ir::OperationSelector::Named(name) = selector else {
+                                continue;
+                            };
+                            write!(
+                                f,
+                                " {name}: {} -> {}",
+                                self.show(&operation.from),
+                                self.show(&operation.to)
+                            )?;
+                        }
+                        f.write_str(" }")?;
                     }
                 }
                 Effect::Alias(named) if named.is_empty() => {}
@@ -409,8 +426,8 @@ impl fmt::Display for Show<'_, TermKind> {
             // kept, because nothing depends on it.
             TermKind::Handle { body, handler } => self.write_handle(f, body, handler),
             TermKind::Raise(value) => write!(f, "raise {}", self.show(&**value)),
-            TermKind::Operation { effect, op } => {
-                write!(f, "!{}.{}", self.mint.name(effect.tracked), op.tracked)
+            TermKind::Operation { effect, selector } => {
+                write!(f, "!{}{}", self.mint.name(effect.tracked), selector.tracked)
             }
         }
     }
@@ -431,9 +448,9 @@ impl Show<'_, TermKind> {
         for arm in &handler.arms {
             write!(
                 f,
-                " | !{}.{} {} => {}",
+                " | !{}{} {} => {}",
                 self.mint.name(arm.effect.tracked),
-                arm.op.tracked,
+                arm.selector.tracked,
                 self.mint.name(arm.binder.tracked),
                 self.show(&arm.body),
             )?;

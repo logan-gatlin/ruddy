@@ -4,9 +4,9 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, Field, Output, PatternKind,
-        SumCase, Term, TermKind, TypeField, TypeKind, build, build_with_dependencies,
-        build_with_dependency_imports,
+        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, Field, OperationSelector,
+        Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind, build,
+        build_with_dependencies, build_with_dependency_imports,
     },
     parse,
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
@@ -3541,15 +3541,18 @@ fn effect_of<'a>(mint: &Mint, out: &'a Output, name: &str) -> &'a Effect {
 /// effect declares nothing and is still an effect a row may name.
 #[test]
 fn an_effect_declares_its_operations() {
-    let (mint, out) = built("effect Log = write : Nat -> () | flush : () -> ()");
+    let (mint, out) = built("effect Log = { write: Nat -> (), flush: () -> () }");
     let Effect::Operations(operations) = effect_of(&mint, &out, "Log") else {
         panic!("expected an operation declaration");
     };
     assert_eq!(
         operations.keys().collect::<Vec<_>>(),
-        ["write", "flush"].iter().collect::<Vec<_>>()
+        [
+            &OperationSelector::Named("write".to_string()),
+            &OperationSelector::Named("flush".to_string()),
+        ]
     );
-    let write = &operations["write"];
+    let write = &operations[&OperationSelector::Named("write".to_string())];
     assert!(matches!(write.from.tracked, TypeKind::Prim(Prim::Nat)));
     assert!(matches!(
         write.to.tracked,
@@ -3567,7 +3570,7 @@ fn an_effect_declares_its_operations() {
 fn recursive_types_have_a_finite_structural_effect_signature() {
     let (_, out) = built(
         "type Rec = { next: Rec }\n\
-         effect Visit = run : Rec -> Rec",
+         effect Visit = { run: Rec -> Rec }",
     );
     assert_eq!(out.program.effect_ids.len(), 1);
 }
@@ -3577,8 +3580,8 @@ fn recursive_types_have_a_finite_structural_effect_signature() {
 /// definition is checked against, and none can be performed through.
 #[test]
 fn an_alias_expands_to_the_effects_it_names() {
-    let src = "effect Log = write : Nat -> ()\n\
-               effect IO = print : Nat -> ()\n\
+    let src = "effect Log = { write: Nat -> () }\n\
+               effect IO = { print: Nat -> () }\n\
                effect Console = !Log + !IO\n\
                effect All = !Console\n\
                let f : Nat -> Nat + !All = fn x => x";
@@ -3646,27 +3649,22 @@ fn a_bare_arrow_is_pure() {
 #[test]
 fn an_effect_declaration_is_held_to_its_form() {
     assert_eq!(
-        codes_of("effect Log = write : Nat -> () | write : () -> ()"),
+        codes_of("effect Log = { write: Nat -> (), write: () -> () }"),
         ["duplicate-operation"]
     );
-    assert_eq!(codes_of("effect Log = here : Nat"), ["not-an-operation"]);
     assert_eq!(
-        codes_of("effect IO = print : Nat -> ()\neffect Log = w : Nat -> () + !IO"),
+        codes_of("effect IO = { print: Nat -> () }\neffect Log = { w: Nat -> () + !IO }"),
         ["impure-operation"]
     );
     // The three an operation's signature may not leave open are one complaint,
     // because one sentence naming all three is what a reader can act on.
     for source in [
-        "effect Log = w : { x: Nat, .. } -> ()",
-        "effect Log = w : { x when 'a: Nat } -> ()",
-        "effect Log = w : Nat -> (#A | ..'r)",
+        "effect Log = { w: { x: Nat, .. } -> () }",
+        "effect Log = { w: { x when 'a: Nat } -> () }",
+        "effect Log = { w: Nat -> (#A | ..'r) }",
     ] {
         assert_eq!(codes_of(source), ["impure-operation"], "{source}");
     }
-    assert_eq!(
-        codes_of("effect Log = write : Nat -> ()\neffect Bad = !Log + w : Nat -> ()"),
-        ["mixed-effect-form"]
-    );
     // A repeated effect name is a duplicate like any other, in its own
     // namespace.
     let out = build_src("effect Log\neffect Log").1;
@@ -3685,7 +3683,7 @@ fn an_effect_declaration_is_held_to_its_form() {
 #[test]
 fn effects_have_a_namespace_of_their_own() {
     let (mint, out) = built(
-        "type Log = Nat\neffect Log = write : Nat -> ()\nlet f : Log -> Log + !Log = fn x => x",
+        "type Log = Nat\neffect Log = { write: Nat -> () }\nlet f : Log -> Log + !Log = fn x => x",
     );
     assert_eq!(annotation_effects(&mint, &out, "f"), ["Log"]);
     assert_eq!(
@@ -3699,8 +3697,8 @@ fn effects_have_a_namespace_of_their_own() {
 /// which declares nothing — and an effect with no such operation.
 #[test]
 fn an_operation_reference_resolves_through_its_effect() {
-    let base = "effect Log = write : Nat -> ()\n\
-                effect IO = print : Nat -> ()\n\
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect IO = { print: Nat -> () }\n\
                 effect Console = !Log + !IO\n";
     let (mint, out) = built(&format!("{base}let g = fn _ => !Log.write 1n"));
     let mut node = term_value(&mint, &out, "g");
@@ -3710,11 +3708,14 @@ fn an_operation_reference_resolves_through_its_effect() {
     let TermKind::Apply { func, .. } = node else {
         panic!("expected an application");
     };
-    let TermKind::Operation { effect, op } = &func.kind else {
+    let TermKind::Operation { effect, selector } = &func.kind else {
         panic!("expected an operation, got {:?}", func.kind);
     };
     assert_eq!(mint.name(effect.tracked), "Log");
-    assert_eq!(op.tracked, "write");
+    assert_eq!(
+        selector.tracked,
+        OperationSelector::Named("write".to_string())
+    );
 
     assert_eq!(
         codes_of(&format!("{base}let g = fn _ => !Lg.write 1n")),
@@ -3728,6 +3729,34 @@ fn an_operation_reference_resolves_through_its_effect() {
         codes_of(&format!("{base}let g = fn _ => !Console.write 1n")),
         ["operation-on-alias"]
     );
+    assert_eq!(
+        codes_of(&format!("{base}let g = !Log")),
+        ["bare-operation-unavailable"]
+    );
+    assert_eq!(
+        codes_of("effect Log = Nat -> ()\nlet g = !Log.write"),
+        ["named-operation-on-unnamed"]
+    );
+    assert_eq!(
+        codes_of("effect Nil\nlet g = !Nil"),
+        ["bare-operation-unavailable"]
+    );
+
+    let (mint, out) = built(
+        "module Sys = effect Log = Nat -> () end\n\
+         let g = Sys::!Log",
+    );
+    let TermKind::Operation { selector, .. } = term_value(&mint, &out, "g") else {
+        panic!("expected qualified bare operation")
+    };
+    assert_eq!(selector.tracked, OperationSelector::Unnamed);
+    assert_eq!(
+        codes_of(
+            "effect Log = Nat -> ()\n\
+             let g = handle 0n with | !Log x => () | !Log y => () end"
+        ),
+        ["duplicate-arm"]
+    );
 }
 
 /// Which effects a handler discharges is settled here, before inference: every
@@ -3735,7 +3764,7 @@ fn an_operation_reference_resolves_through_its_effect() {
 /// half-covered one leaves the set undecidable.
 #[test]
 fn a_handler_must_cover_every_effect_it_names() {
-    let base = "effect Log = write : Nat -> () | flush : () -> ()\n\
+    let base = "effect Log = { write: Nat -> (), flush: () -> () }\n\
                 let p : () -> Nat + !Log = fn _ => 0n\n";
     let (mint, out) = built(&format!(
         "{base}let h = fn _ => handle p () with | !Log.write s => () | !Log.flush u => () end"
@@ -3778,7 +3807,7 @@ fn a_handler_must_cover_every_effect_it_names() {
 /// anything else is: at the repeat, with the first the one that stands.
 #[test]
 fn a_handler_takes_each_arm_once() {
-    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0n\n";
+    let base = "effect Log = { write: Nat -> () }\nlet p : () -> Nat + !Log = fn _ => 0n\n";
     let (_, out) = build_src(&format!(
         "{base}let h = fn _ => handle p () with | !Log.write s => () | !Log.write t => () end"
     ));
@@ -3791,8 +3820,8 @@ fn a_handler_takes_each_arm_once() {
     // Source paths resolve operations, but equivalent interfaces are one
     // effect in rows, so their operation arms must not choose competing
     // implementations for the same evidence entry.
-    let structural = "module Foo =\n  effect Log = write : Nat -> ()\nend\n\
-                      module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+    let structural = "module Foo =\n  effect Log = { write: Nat -> () }\nend\n\
+                      module Bar =\n  effect Log = { write: Nat -> () }\nend\n\
                       let h = fn n => handle Foo::!Log.write n with | Foo::!Log.write _ => () | Bar::!Log.write _ => () end";
     let (_, out) = build_src(structural);
     let [error] = &out.errors[..] else {
@@ -3824,7 +3853,7 @@ fn a_handler_takes_each_arm_once() {
 /// `fn` between the two is a closure that could outlive the handler.
 #[test]
 fn raise_belongs_to_the_arm_around_it() {
-    let base = "effect Log = write : Nat -> ()\nlet p : () -> Nat + !Log = fn _ => 0n\n";
+    let base = "effect Log = { write: Nat -> () }\nlet p : () -> Nat + !Log = fn _ => 0n\n";
     let arm =
         |body: &str| format!("{base}let h = fn _ => handle p () with | !Log.write s => {body} end");
     // No arm anywhere.
@@ -3893,7 +3922,7 @@ fn raise_belongs_to_the_arm_around_it() {
 #[test]
 fn a_declaration_may_write_and_take_effects() {
     let (mint, out) = built(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          type Logger = Nat -> Nat + !Log\n\
          type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e",
     );
@@ -3926,7 +3955,7 @@ fn a_declaration_may_write_and_take_effects() {
 /// use rather than decided here.
 #[test]
 fn a_declared_effect_row_must_be_closed() {
-    let base = "effect Log = write : Nat -> ()\n";
+    let base = "effect Log = { write: Nat -> () }\n";
     for source in [
         "type T = Nat -> Nat + ..",
         "type T = Nat -> Nat + !Log (when 'a)",
@@ -3970,7 +3999,7 @@ fn out_message(src: &str) -> String {
 /// another is the mixed parameter it always was, with the third reading named.
 #[test]
 fn a_parameter_read_two_ways_names_both() {
-    let src = "effect Log = write : Nat -> ()\n\
+    let src = "effect Log = { write: Nat -> () }\n\
                type M 'e = { f: 'e, g: (Nat -> Nat + ..'e) }";
     let (_, out) = build_src(src);
     let [error] = &out.errors[..] else {
@@ -3990,7 +4019,7 @@ fn a_parameter_read_two_ways_names_both() {
     );
 
     // And a name given two rests in one *annotation* is the same mistake.
-    let src = "effect Log = write : Nat -> ()\n\
+    let src = "effect Log = { write: Nat -> () }\n\
                let f : { x: Nat, ..'r } -> Nat -> Nat + ..'r = fn p => fn n => n";
     let (_, out) = build_src(src);
     let mixed: Vec<&str> = out
@@ -4007,7 +4036,7 @@ fn a_parameter_read_two_ways_names_both() {
 /// it does not name is not performed.
 #[test]
 fn an_absent_effect_needs_a_tail() {
-    let src = "effect Log = write : Nat -> ()\nlet f : Nat -> Nat + \\!Log = fn x => x";
+    let src = "effect Log = { write: Nat -> () }\nlet f : Nat -> Nat + \\!Log = fn x => x";
     let (_, out) = build_src(src);
     let [error] = &out.errors[..] else {
         panic!("{:#?}", out.errors);
@@ -4023,8 +4052,29 @@ fn an_absent_effect_needs_a_tail() {
 /// two names of an alias that overlap another label included.
 #[test]
 fn an_effect_row_names_each_effect_once() {
-    let src = "effect Log = write : Nat -> ()\nlet f : Nat -> Nat + !Log + !Log = fn x => x";
+    let src = "effect Log = { write: Nat -> () }\nlet f : Nat -> Nat + !Log + !Log = fn x => x";
     assert_eq!(codes_of(src), ["duplicate-case"]);
+}
+
+#[test]
+fn structural_identity_distinguishes_empty_unnamed_and_named_effects() {
+    let (mint, out) = built(
+        "module Empty = effect E end\n\
+         module Unnamed = effect E = Nat -> () end\n\
+         module Named = effect E = { op: Nat -> () } end\n\
+         effect All = Empty::!E + Unnamed::!E + Named::!E",
+    );
+    let ids: Vec<_> = out
+        .program
+        .effects
+        .keys()
+        .filter(|symbol| mint.name(**symbol) == "E")
+        .map(|symbol| &out.program.effect_ids[symbol])
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(ids[0], ids[2]);
+    assert_ne!(ids[1], ids[2]);
 }
 
 /// Structural identities coalesce same-named, same-interface declarations,
@@ -4033,8 +4083,8 @@ fn an_effect_row_names_each_effect_once() {
 #[test]
 fn structural_effect_duplicates_are_rejected() {
     let src = "type Payload = Nat\n\
-               module Foo =\n  effect Log = write : Payload -> ()\nend\n\
-               module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+               module Foo =\n  effect Log = { write: Payload -> () }\nend\n\
+               module Bar =\n  effect Log = { write: Nat -> () }\nend\n\
                effect Both = Foo::!Log + Bar::!Log\n\
                let f : Nat -> Nat + Foo::!Log + Bar::!Log = fn n => n";
     let (_, out) = build_src(src);
@@ -4051,8 +4101,8 @@ fn structural_effect_duplicates_are_rejected() {
 /// times a recursive declaration was unrolled before its back edge.
 #[test]
 fn recursive_effect_interfaces_ignore_finite_unrolling() {
-    let src = "module A =\n  type a = { n: a }\n  effect Loop = step : a -> ()\nend\n\
-               module B =\n  type b = { n: { n: b } }\n  effect Loop = step : b -> ()\nend\n\
+    let src = "module A =\n  type a = { n: a }\n  effect Loop = { step: a -> () }\nend\n\
+               module B =\n  type b = { n: { n: b } }\n  effect Loop = { step: b -> () }\nend\n\
                effect Both = A::!Loop + B::!Loop";
     assert_eq!(codes_of(src), ["duplicate-case"]);
 }
@@ -4061,8 +4111,8 @@ fn recursive_effect_interfaces_ignore_finite_unrolling() {
 /// a branch at the root cannot be confused with a loop at the root's child.
 #[test]
 fn recursive_effect_interfaces_preserve_branching_back_edges() {
-    let src = "module A =\n  type a = { left: middle, right: Nat }\n  type middle = { next: a }\n  effect Loop = step : a -> ()\nend\n\
-               module B =\n  type b = { left: middle, right: Nat }\n  type middle = { next: middle }\n  effect Loop = step : b -> ()\nend\n\
+    let src = "module A =\n  type a = { left: middle, right: Nat }\n  type middle = { next: a }\n  effect Loop = { step: a -> () }\nend\n\
+               module B =\n  type b = { left: middle, right: Nat }\n  type middle = { next: middle }\n  effect Loop = { step: b -> () }\nend\n\
                effect Both = A::!Loop + B::!Loop";
     let (_, out) = build_src(src);
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
@@ -4070,7 +4120,7 @@ fn recursive_effect_interfaces_preserve_branching_back_edges() {
 
 #[test]
 fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
-    let src = "effect Log = write : Nat -> ()\n\
+    let src = "effect Log = { write: Nat -> () }\n\
                effect A = !Log\n\
                effect B = !Log\n\
                effect Both = !A + !B";
@@ -4084,10 +4134,10 @@ fn transitive_alias_overlap_is_rejected_at_the_overlapping_case() {
 /// source module that declared them.
 #[test]
 fn effectful_operation_signatures_compare_their_dependencies_structurally() {
-    let src = "module Foo =\n  effect IO = run : () -> ()\n  effect Log = call : (() -> Nat + !IO) -> ()\nend\n\
-               module Bar =\n  effect IO = run : () -> ()\n  effect Log = call : (() -> Nat + !IO) -> ()\nend\n\
-               module Other =\n  effect Other = run : () -> ()\nend\n\
-               module Quux =\n  effect Log = call : (() -> Nat + Other::!Other) -> ()\nend";
+    let src = "module Foo =\n  effect IO = { run: () -> () }\n  effect Log = { call: (() -> Nat + !IO) -> () }\nend\n\
+               module Bar =\n  effect IO = { run: () -> () }\n  effect Log = { call: (() -> Nat + !IO) -> () }\nend\n\
+               module Other =\n  effect Other = { run: () -> () }\nend\n\
+               module Quux =\n  effect Log = { call: (() -> Nat + Other::!Other) -> () }\nend";
     let (mint, out) = build_src(src);
     // Impure operation signatures remain rejected, but their recovered
     // interfaces must still be complete enough to distinguish effects.
@@ -4112,8 +4162,8 @@ fn effectful_operation_signatures_compare_their_dependencies_structurally() {
 /// their declarations live in different modules.
 #[test]
 fn same_named_effects_in_different_modules_do_not_collide() {
-    let src = "module A =\n  effect Log = write : Nat -> ()\nend\n\
-               module B =\n  effect Log = flush : () -> ()\nend\n\
+    let src = "module A =\n  effect Log = { write: Nat -> () }\nend\n\
+               module B =\n  effect Log = { flush: () -> () }\nend\n\
                effect Both = A::!Log + B::!Log\n\
                let f : Nat -> Nat + A::!Log + B::!Log = fn x => x";
     let (_, out) = build_src(src);
@@ -4132,10 +4182,10 @@ fn same_named_effects_in_different_modules_do_not_collide() {
 #[test]
 fn an_aliass_cases_are_resolved_and_deduplicated() {
     assert_eq!(
-        codes_of("effect Log = write : Nat -> ()\neffect Console = !Log + !Nope"),
+        codes_of("effect Log = { write: Nat -> () }\neffect Console = !Log + !Nope"),
         ["undefined-effect"]
     );
-    let (mint, out) = build_src("effect Log = write : Nat -> ()\neffect Console = !Log + !Log");
+    let (mint, out) = build_src("effect Log = { write: Nat -> () }\neffect Console = !Log + !Log");
     assert_eq!(
         out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
         ["duplicate-case"]
@@ -4152,7 +4202,7 @@ fn an_aliass_cases_are_resolved_and_deduplicated() {
 #[test]
 fn a_row_may_only_name_declared_effects() {
     let (mint, out) =
-        build_src("effect Log = write : Nat -> ()\nlet f : Nat -> Nat + !Log + !Lg = fn x => x");
+        build_src("effect Log = { write: Nat -> () }\nlet f : Nat -> Nat + !Log + !Lg = fn x => x");
     assert_eq!(
         out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
         ["undefined-effect"]
@@ -4171,7 +4221,7 @@ fn a_row_may_only_name_declared_effects() {
 #[test]
 fn an_arm_that_does_not_resolve_covers_nothing() {
     let (mint, out) = build_src(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let p : () -> Nat + !Log = fn _ => 0n\n\
          let h = fn _ => handle p () with | !Log.writ s => () end",
     );
@@ -4195,44 +4245,8 @@ fn an_arm_that_does_not_resolve_covers_nothing() {
 /// no `..` to speak about is told about too.
 #[test]
 fn a_declared_effect_row_refuses_an_absence() {
-    let codes = codes_of("effect Log = write : Nat -> ()\ntype T = Nat -> Nat + \\!Log");
+    let codes = codes_of("effect Log = { write: Nat -> () }\ntype T = Nat -> Nat + \\!Log");
     assert_eq!(codes, ["absent-in-closed"]);
-}
-
-/// A declaration that mixes the two forms is read as whichever form its first
-/// case is, and every case of the other form is dropped — reported once, at
-/// the first of them, so one mistake makes one complaint however many cases
-/// went the wrong way.
-#[test]
-fn a_mixed_effect_declaration_keeps_the_form_it_opened_with() {
-    // Opening with an operation, so the bare tags are what is dropped.
-    let (mint, out) = build_src(
-        "effect Log = write : Nat -> ()\n\
-         effect Bad = w : Nat -> () | !Log | !Log",
-    );
-    assert_eq!(
-        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
-        ["mixed-effect-form"]
-    );
-    let Effect::Operations(operations) = effect_of(&mint, &out, "Bad") else {
-        panic!("the first case decided the form");
-    };
-    assert_eq!(operations.keys().collect::<Vec<_>>(), ["w"]);
-
-    // And opening with a bare tag, so the signatures are — including a second
-    // one, which says nothing new.
-    let (mint, out) = build_src(
-        "effect Log = write : Nat -> ()\n\
-         effect Bad = !Log + w : Nat -> () | v : Nat -> ()",
-    );
-    assert_eq!(
-        out.errors.iter().map(|e| e.kind.code()).collect::<Vec<_>>(),
-        ["mixed-effect-form"]
-    );
-    let Effect::Alias(named) = effect_of(&mint, &out, "Bad") else {
-        panic!("the first case decided the form");
-    };
-    assert_eq!(named.keys().collect::<Vec<_>>(), ["Log"]);
 }
 
 /// A signature that failed to lower is already a complaint, so it is not told a
@@ -4240,7 +4254,30 @@ fn a_mixed_effect_declaration_keeps_the_form_it_opened_with() {
 /// everywhere.
 #[test]
 fn a_signature_that_did_not_lower_is_not_told_twice() {
-    assert_eq!(codes_of("effect Log = write : Bogus"), ["undefined-type"]);
+    assert_eq!(
+        codes_of("effect Log = { write: Bogus -> () }"),
+        ["undefined-type"]
+    );
+
+    // Lowering remains total when a consumer deliberately passes the retained
+    // AST from a failed parse through the public API.
+    let parsed = parse::parse(lex("effect Log = { write: Nat }", FileID::GENERATED).tokens);
+    assert_eq!(parsed.errors.len(), 1);
+    let mut mint = dummy_mint();
+    let out = build(&mut mint, parsed.stmts);
+    assert_eq!(out.errors[0].kind.code(), "not-an-operation");
+
+    let parsed = parse::parse(lex("effect Log = { write: Bogus }", FileID::GENERATED).tokens);
+    assert_eq!(parsed.errors.len(), 1);
+    let mut mint = dummy_mint();
+    let out = build(&mut mint, parsed.stmts);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["undefined-type"]
+    );
 }
 
 /// A row that names nothing may still say something: `+ ..'e` ends in a tail,
@@ -4265,7 +4302,7 @@ fn a_row_that_is_only_a_tail_says_something() {
 #[test]
 fn an_effect_tail_makes_an_argument_grow() {
     let codes = codes_of(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          type T 'a = { next: T (Nat -> Nat + ..'a) }",
     );
     assert_eq!(codes, ["growing-recursion"]);
@@ -4276,7 +4313,7 @@ fn an_effect_tail_makes_an_argument_grow() {
 #[test]
 fn return_is_a_name_everywhere_but_an_arms_head() {
     let (mint, out) = built(
-        "effect Log = write : Nat -> ()\n\
+        "effect Log = { write: Nat -> () }\n\
          let return = 1n\n\
          let p : () -> Nat + !Log = fn _ => return\n\
          let h = fn _ => handle p () with | !Log.write s => () | return x => x end",
@@ -4301,7 +4338,7 @@ fn return_is_a_name_everywhere_but_an_arms_head() {
 /// in the effect reading.
 #[test]
 fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
-    let base = "effect Log = write : Nat -> ()\n\
+    let base = "effect Log = { write: Nat -> () }\n\
                 type Runner 'e = (Nat -> Nat + !Log + ..'e) -> Nat\n";
     // Something a row cannot hold.
     let (_, out) = build_src(&format!("{base}let f : Runner Nat -> Nat = fn r => 1n"));
@@ -4342,8 +4379,8 @@ fn an_argument_at_an_effect_parameter_has_to_be_a_row() {
 /// an arrow — because it goes through the same lowering.
 #[test]
 fn a_row_of_effects_may_be_an_argument() {
-    let base = "effect Log = write : Nat -> ()\n\
-                effect IO = print : Nat -> ()\n\
+    let base = "effect Log = { write: Nat -> () }\n\
+                effect IO = { print: Nat -> () }\n\
                 effect Console = !Log + !IO\n\
                 type Runner 'e = (Nat -> Nat + ..'e) -> Nat\n";
 
@@ -4407,7 +4444,7 @@ fn a_row_of_effects_may_be_an_argument() {
     // An operation's signature carries no effects, and a row written as an
     // argument in one is exactly that: refused, and the argument absorbs.
     let (_, out) = build_src(&format!(
-        "{base}effect Bad = op : Runner (!Log + ..) -> Nat"
+        "{base}effect Bad = {{ op: Runner (!Log + ..) -> Nat }}"
     ));
     assert!(
         out.errors
@@ -4454,7 +4491,7 @@ fn a_row_of_effects_may_be_an_argument() {
 /// who wrote one wrong is told about that too.
 #[test]
 fn a_row_of_effects_is_refused_where_a_type_goes() {
-    let base = "effect Log = write : Nat -> ()\n";
+    let base = "effect Log = { write: Nat -> () }\n";
     for source in [
         "let x : !Log = 1n",
         "let x : { f: !Log } = { f: 1n }",
@@ -4775,9 +4812,9 @@ fn a_declaration_may_declare_nothing_in_its_where() {
     // `..` and the `when` are refused by the same sentence.
     for (src, code) in [
         ("type Bad = { x: 'a }", "variable-in-declaration"),
-        ("effect E = op : 'a -> Nat", "impure-operation"),
+        ("effect E = { op: 'a -> Nat }", "impure-operation"),
         (
-            "effect E = op : { x: Nat, ..'r } -> Nat",
+            "effect E = { op: { x: Nat, ..'r } -> Nat }",
             "impure-operation",
         ),
     ] {
@@ -5121,7 +5158,7 @@ fn a_middle_segment_naming_no_module_is_reported_once() {
 #[test]
 fn paths_resolve_in_every_position() {
     let src = "module Math =\n  type Pair 'a 'b = { first: 'a, second: 'b }\nend\n\
-               module Sys =\n  effect Log = write : Nat -> ()\nend\n\
+               module Sys =\n  effect Log = { write: Nat -> () }\nend\n\
                let p : Math::Pair Nat Nat = { first: 1n, second: 2n }\n\
                let greet : () -> Nat + Sys::!Log = fn _ => let _ = Sys::!Log.write 1n in 0n\n\
                let quiet : () -> Nat = fn _ =>\n\
@@ -5223,6 +5260,30 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
     }
 }
 
+#[test]
+fn imported_unnamed_operation_selectors_are_preserved() {
+    let mut dependency = effect_artifact("dep", "u");
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Unnamed,
+        from: artifact_type(a::Core::Nat),
+        to: artifact_type(a::Core::Unit),
+    });
+    let parsed = parse::parse(lex("let operation = dep::!IO", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty());
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(
+        out.program
+            .external_operations
+            .keys()
+            .any(|(_, selector)| *selector == OperationSelector::Unnamed)
+    );
+}
+
 /// Artifact headers are the semantic boundary, so importing exercises every
 /// portable type/formula/row form rather than relying on source re-lowering.
 #[test]
@@ -5293,8 +5354,8 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
             globals: Vec::new(),
         },
     };
-    let src = "module N =\n  effect Pick = get : dep::Natural -> ()\nend\n\
-               module S =\n  effect Pick = get : dep::Text -> ()\nend";
+    let src = "module N =\n  effect Pick = { get: dep::Natural -> () }\nend\n\
+               module S =\n  effect Pick = { get: dep::Text -> () }\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
@@ -5312,7 +5373,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
 fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
     let (mint, out) = build_src(
         "type T 'a = { next: T Nat }\n\
-         effect E = op : T String -> ()",
+         effect E = { op: T String -> () }",
     );
     assert!(out.errors.is_empty(), "{:#?}", out.errors);
     assert_eq!(
@@ -5420,21 +5481,22 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
 
 #[test]
 fn recovery_signatures_keep_every_normalized_source_form_structural() {
-    let src = "effect IO = run : () -> ()\n\
+    let src = "effect IO = { run: () -> () }\n\
                type Record 'r = { value: Nat, \\hidden, ..'r }\n\
                type Choice 'r = #Some Nat | #None | \\#Hidden | ..'r\n\
                type Runner 'e = () -> () + \\!IO + ..'e\n\
                effect Alias = !IO\n\
                effect CycleA = !CycleB\n\
                effect CycleB = !CycleA\n\
-               effect Probe =\n\
-                 record : Record { extra: String } -> ()\n\
-               | choice : Choice (#Other Boolean) -> ()\n\
-               | runner : Runner (!IO) -> ()\n\
-               | anonymous : (() -> () + !IO (when _)) -> ()\n\
-               | named : (() -> () + !IO (when 'p)) -> ()\n\
-               | aliased : (() -> () + !Alias) -> ()\n\
-               | recursive : (() -> () + !Probe) -> ()\n\
+               effect Probe = {\n\
+                 record: Record { extra: String } -> (),\n\
+                 choice: Choice (#Other Boolean) -> (),\n\
+                 runner: Runner (!IO) -> (),\n\
+                 anonymous: (() -> () + !IO (when _)) -> (),\n\
+                 named: (() -> () + !IO (when 'p)) -> (),\n\
+                 aliased: (() -> () + !Alias) -> (),\n\
+                 recursive: (() -> () + !Probe) -> (),\n\
+               }\n\
                let uses_alias : () -> () + !Alias = fn x => x";
     let (mint, out) = build_src(src);
     assert!(
@@ -5479,11 +5541,11 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
 fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
     let src = "type Record 'r = { x: Nat, ..'r }\n\
                type Cases 'r = #X | ..'r\n\
-               effect A = a : () -> ()\n\
-               effect B = b : () -> ()\n\
+               effect A = { a: () -> () }\n\
+               effect B = { b: () -> () }\n\
                type Runs 'e = () -> () + ..'e\n\
-               module Y =\n  effect RecordPick = get : Record { y: Nat } -> ()\n  effect CasePick = get : Cases (#Y) -> ()\n  effect RunPick = get : Runs (!A) -> ()\nend\n\
-               module Z =\n  effect RecordPick = get : Record { z: Nat } -> ()\n  effect CasePick = get : Cases (#Z) -> ()\n  effect RunPick = get : Runs (!B) -> ()\nend";
+               module Y =\n  effect RecordPick = { get: Record { y: Nat } -> () }\n  effect CasePick = { get: Cases (#Y) -> () }\n  effect RunPick = { get: Runs (!A) -> () }\nend\n\
+               module Z =\n  effect RecordPick = { get: Record { z: Nat } -> () }\n  effect CasePick = { get: Cases (#Z) -> () }\n  effect RunPick = { get: Runs (!B) -> () }\nend";
     let (mint, out) = build_src(src);
     assert_eq!(
         out.errors
@@ -5509,13 +5571,13 @@ fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
 fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels() {
     let src = "type Record 'r = { x: Nat, ..'r }\n\
                type Cases 'r = #X | ..'r\n\
-               effect A = a : () -> ()\n\
-               effect B = b : () -> ()\n\
-               effect C = c : () -> ()\n\
+               effect A = { a: () -> () }\n\
+               effect B = { b: () -> () }\n\
+               effect C = { c: () -> () }\n\
                type Runs 'r = () -> () + !A + ..'r\n\
-               module Flat =\n  effect Record = get : { x: Nat, y: Nat } -> ()\n  effect Cases = get : (#X | #Y) -> ()\n  effect Runs = get : (() -> () + !A + !B) -> ()\nend\n\
-               module Composed =\n  effect Record = get : Record { y: Nat } -> ()\n  effect Cases = get : Cases (#Y) -> ()\n  effect Runs = get : Runs (!B) -> ()\nend\n\
-               module Different =\n  effect Record = get : Record { z: Nat } -> ()\n  effect Cases = get : Cases (#Z) -> ()\n  effect Runs = get : Runs (!C) -> ()\nend";
+               module Flat =\n  effect Record = { get: { x: Nat, y: Nat } -> () }\n  effect Cases = { get: (#X | #Y) -> () }\n  effect Runs = { get: (() -> () + !A + !B) -> () }\nend\n\
+               module Composed =\n  effect Record = { get: Record { y: Nat } -> () }\n  effect Cases = { get: Cases (#Y) -> () }\n  effect Runs = { get: Runs (!B) -> () }\nend\n\
+               module Different =\n  effect Record = { get: Record { z: Nat } -> () }\n  effect Cases = { get: Cases (#Z) -> () }\n  effect Runs = { get: Runs (!C) -> () }\nend";
     let (mint, out) = build_src(src);
     assert_eq!(
         out.errors
@@ -5614,9 +5676,9 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
     };
     let src = "type LocalRecord = { x: Nat, y: Nat }\n\
                type LocalCases = #X | #Y\n\
-               module L =\n  effect Record = get : LocalRecord -> ()\n  effect Cases = get : LocalCases -> ()\nend\n\
-               module I =\n  effect Record = get : dep::Record -> ()\n  effect Cases = get : dep::Cases -> ()\nend\n\
-               module D =\n  effect Record = get : dep::OtherRecord -> ()\n  effect Cases = get : dep::OtherCases -> ()\nend";
+               module L =\n  effect Record = { get: LocalRecord -> () }\n  effect Cases = { get: LocalCases -> () }\nend\n\
+               module I =\n  effect Record = { get: dep::Record -> () }\n  effect Cases = { get: dep::Cases -> () }\nend\n\
+               module D =\n  effect Record = { get: dep::OtherRecord -> () }\n  effect Cases = { get: dep::OtherCases -> () }\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
@@ -5686,8 +5748,8 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
             globals: Vec::new(),
         },
     };
-    let src = "module A =\n  effect Record = get : dep::Record1 -> ()\n  effect Cases = get : dep::Cases1 -> ()\nend\n\
-               module B =\n  effect Record = get : dep::Record2 -> ()\n  effect Cases = get : dep::Cases2 -> ()\nend";
+    let src = "module A =\n  effect Record = { get: dep::Record1 -> () }\n  effect Cases = { get: dep::Cases1 -> () }\nend\n\
+               module B =\n  effect Record = { get: dep::Record2 -> () }\n  effect Cases = { get: dep::Cases2 -> () }\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
@@ -5762,9 +5824,9 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
     let src = "type LocalRecord = { x: Nat }\n\
                type LocalCases = #X\n\
                type LocalAlias = LocalRecord\n\
-               module L =\n  effect Record = get : LocalRecord -> ()\n  effect Cases = get : LocalCases -> ()\n  effect Alias = get : LocalAlias -> ()\nend\n\
-               module I =\n  effect Record = get : dep::Record -> ()\n  effect Cases = get : dep::Cases -> ()\n  effect Alias = get : dep::Alias -> ()\nend\n\
-               module D =\n  effect Record = get : dep::Different -> ()\nend";
+               module L =\n  effect Record = { get: LocalRecord -> () }\n  effect Cases = { get: LocalCases -> () }\n  effect Alias = { get: LocalAlias -> () }\nend\n\
+               module I =\n  effect Record = { get: dep::Record -> () }\n  effect Cases = { get: dep::Cases -> () }\n  effect Alias = { get: dep::Alias -> () }\nend\n\
+               module D =\n  effect Record = { get: dep::Different -> () }\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
@@ -5848,8 +5910,8 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
     };
     let src = "type Wrap 'a = dep::Box 'a\n\
                type Deep 'a = Wrap (Wrap 'a)\n\
-               module N =\n  effect Pick = get : Wrap Nat -> ()\n  effect DeepPick = get : Deep Nat -> ()\n  effect Recover = run : (() -> () + dep::!IO) -> ()\nend\n\
-               module S =\n  effect Pick = get : Wrap String -> ()\n  effect DeepPick = get : Deep String -> ()\n  effect Recover = run : (() -> () + dep::!Net) -> ()\nend\n\
+               module N =\n  effect Pick = { get: Wrap Nat -> () }\n  effect DeepPick = { get: Deep Nat -> () }\n  effect Recover = { run: (() -> () + dep::!IO) -> () }\nend\n\
+               module S =\n  effect Pick = { get: Wrap String -> () }\n  effect DeepPick = { get: Deep String -> () }\n  effect Recover = { run: (() -> () + dep::!Net) -> () }\nend\n\
                effect Both = dep::!A + dep::!B";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
@@ -5904,9 +5966,9 @@ fn imported_effects_in_recovery_signatures_compare_structurally() {
             artifact: &distinct,
         },
     ];
-    let src = "module A =\n  effect Recover = run : (() -> () + first::!IO) -> ()\nend\n\
-               module B =\n  effect Recover = run : (() -> () + second::!IO) -> ()\nend\n\
-               module C =\n  effect Recover = run : (() -> () + distinct::!IO) -> ()\nend";
+    let src = "module A =\n  effect Recover = { run: (() -> () + first::!IO) -> () }\nend\n\
+               module B =\n  effect Recover = { run: (() -> () + second::!IO) -> () }\nend\n\
+               module C =\n  effect Recover = { run: (() -> () + distinct::!IO) -> () }\nend";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
     let mut mint = dummy_mint();
@@ -6039,7 +6101,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             globals: Vec::new(),
         },
     };
-    let src = "effect Probe = inspect : {\n\
+    let src = "effect Probe = { inspect: {\n\
                  int: dep::Int, real: dep::Real, boolean: dep::Boolean,\n\
                  variable: dep::Var, rigid: dep::Rigid, unknown: dep::Undecided,\n\
                  bound: dep::Bound, arrow: dep::Arrow,\n\
@@ -6047,7 +6109,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
                  row_var: dep::RowVar, row_bound: dep::RowBound,\n\
                  row_rigid: dep::RowRigid, row_unknown: dep::RowUnknown,\n\
                  cycle: dep::RowCycle, bare_cycle: dep::BareCycle\n\
-               } -> ()";
+               } -> () }";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
@@ -6128,7 +6190,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
         },
     };
     let src = "type Runner = () -> () + dep::!A\n\
-               effect Probe = op : Runner -> ()\n\
+               effect Probe = { op: Runner -> () }\n\
                effect Local = dep::!A";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
@@ -6350,7 +6412,7 @@ fn dependency_interfaces_import_every_semantic_form() {
                         interface: "get:{}->Nat".to_string(),
                     }),
                     kind: a::EffectKind::Operations(vec![a::Operation {
-                        name: "get".to_string(),
+                        selector: a::OperationSelector::Named("get".to_string()),
                         from: unit(),
                         to: artifact_type(a::Core::Nat),
                     }]),
@@ -6448,7 +6510,7 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
 #[test]
 fn externs_accept_every_annotation_type() {
     let (_, output) = build_src(
-        "effect Log = write : () -> ()\n\
+        "effect Log = { write: () -> () }\n\
          extern count : Nat = host.count\n\
          extern point : { x: Nat } = host.point\n\
          extern log : String -> () + !Log = console.log",

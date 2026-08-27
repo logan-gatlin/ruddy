@@ -2648,8 +2648,8 @@ fn a_misplaced_wildcard_reaches_the_strip() {
 /// effect rows the compiler prints them with.
 #[test]
 fn every_stage_reports_on_a_source_using_effects() {
-    let source = "effect Log = write : Nat -> ()\n\
-                  effect IO = print : Nat -> ()\n\
+    let source = "effect Log = { write: Nat -> () }\n\
+                  effect IO = { print: Nat -> () }\n\
                   effect Console = !Log + !IO\n\
                   type Logger = Nat -> Nat + !Log\n\
                   type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e\n\

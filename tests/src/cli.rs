@@ -75,7 +75,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     write_project(&dependency, "std", "0.1.0", &[]);
     fs::write(
         dependency.join("main.hc"),
-        "module Nested =\n  type Number = Nat\n  effect Read = get : {} -> Nat\n  let foo = 1n\nend\n",
+        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  let foo = 1n\nend\n",
     )
     .unwrap();
     fs::write(
@@ -912,7 +912,7 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
     write_project(&base, "base", "1.0.0", &[]);
     fs::write(
         base.join("main.hc"),
-        "effect Read = get : {} -> Nat\n\
+        "effect Read = { get: {} -> Nat }\n\
          type Cases 'r = #A Nat | ..'r\n\
          let read : {} -> Nat + !Read = fn _ => !Read.get {}\n",
     )
@@ -975,8 +975,8 @@ fn imported_signature_types_participate_in_effect_identity() {
     write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
     fs::write(
         app.join("main.hc"),
-        "module X = effect Same = op : dep::A -> {} end\n\
-         module Y = effect Same = op : dep::B -> {} end\n",
+        "module X = effect Same = { op: dep::A -> {} } end\n\
+         module Y = effect Same = { op: dep::B -> {} } end\n",
     )
     .unwrap();
     let artifact = compile(&app).unwrap();

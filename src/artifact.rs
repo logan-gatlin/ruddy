@@ -156,9 +156,15 @@ pub enum EffectKind {
 /// One operation's public signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
-    pub name: String,
+    pub selector: OperationSelector,
     pub from: Type,
     pub to: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationSelector {
+    Unnamed,
+    Named(String),
 }
 
 /// A normalized scheme.  Quantifier positions use the compiler's one shared
@@ -503,7 +509,14 @@ pub fn build_with_dependencies(
                             .map(|(name, _)| {
                                 let (from, to) = &inference.operations[&(*symbol, name.clone())];
                                 Operation {
-                                    name: name.clone(),
+                                    selector: match name {
+                                        ir::OperationSelector::Unnamed => {
+                                            OperationSelector::Unnamed
+                                        }
+                                        ir::OperationSelector::Named(name) => {
+                                            OperationSelector::Named(name.clone())
+                                        }
+                                    },
                                     from: ty(mint, from),
                                     to: ty(mint, to),
                                 }
@@ -1072,9 +1085,17 @@ pub mod text {
         ])
     }
     fn operation(value: &Operation) -> S {
+        let selector = match &value.selector {
+            OperationSelector::Unnamed => L(vec![A("selector".into()), A("unnamed".into())]),
+            OperationSelector::Named(name) => L(vec![
+                A("selector".into()),
+                A("named".into()),
+                Q(name.clone()),
+            ]),
+        };
         L(vec![
             A("operation".into()),
-            Q(value.name.clone()),
+            selector,
             ty(&value.from),
             ty(&value.to),
         ])
@@ -1940,8 +1961,22 @@ pub mod text {
         }
         fn read_operation(&self, value: S) -> Operation {
             let mut value = self.exact(self.list(value, "operation"), 3, "operation");
+            let selector = self.take(&mut value);
+            let mut selector = self.list(selector, "selector");
+            let tag = self.atom(self.take(&mut selector));
+            let selector = match tag.as_str() {
+                "unnamed" => {
+                    self.exact(selector, 0, "selector unnamed");
+                    OperationSelector::Unnamed
+                }
+                "named" => {
+                    let mut selector = self.exact(selector, 1, "selector named");
+                    OperationSelector::Named(self.string(self.take(&mut selector)))
+                }
+                _ => self.invalid("invalid operation selector", OperationSelector::Unnamed),
+            };
             Operation {
-                name: self.string(self.take(&mut value)),
+                selector,
                 from: self.read_ty(self.take(&mut value)),
                 to: self.read_ty(self.take(&mut value)),
             }
