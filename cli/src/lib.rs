@@ -190,9 +190,10 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
 }
 
-/// Compile the complete project graph, then write each project's canonical
-/// artifact to that project's own `build/` directory, dependencies first.
-/// No artifact is touched unless the entire graph compiles successfully.
+/// Compile the complete project graph, then write each local project's canonical
+/// artifact to its own `build/` directory, dependencies first. Immutable Git
+/// cache checkouts are never modified. No artifact is touched unless the entire
+/// graph compiles successfully.
 pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let graph = compile_graph(directory).map_err(|error| CliError {
         rendered: error.to_string(),
@@ -200,6 +201,9 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     })?;
     let mut root = None;
     for project in graph.projects {
+        if project.source == ProjectSource::GitCache {
+            continue;
+        }
         let build = project.directory.join(BUILD_DIRECTORY);
         fs::create_dir_all(&build).map_err(|error| {
             CliError::one(format!(
@@ -217,10 +221,10 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     root.ok_or_else(|| CliError::one("the project graph was empty"))
 }
 
-/// Write beside the old artifact first, so a failed write cannot truncate the
-/// last successful build. Replacing the destination is atomic where the host's
-/// rename operation supports replacement; Windows uses a recoverable backup.
-fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+/// Write beside the destination first, so a failed write cannot truncate the
+/// previous contents. Installation atomically replaces an existing file on
+/// Unix and Windows.
+pub(crate) fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
     let name = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -282,77 +286,44 @@ fn replace_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
     }
 }
 
-/// Windows does not replace an existing file with `rename`. Move the old
-/// regular file aside first, restore it if installation fails, and never move
-/// a blocking directory out of the way.
+/// Windows' standard `rename` doesn't replace an existing file. `MoveFileExW`
+/// supplies the same-volume atomic replacement needed by artifacts and locks.
 #[cfg(windows)]
 fn replace_existing_windows(
     path: &Path,
     temporary_path: &Path,
-    initial_error: std::io::Error,
+    _initial_error: std::io::Error,
 ) -> Result<(), CliError> {
-    let is_file = fs::metadata(path).is_ok_and(|metadata| metadata.is_file());
-    if !is_file {
-        let _ = fs::remove_file(temporary_path);
-        return Err(CliError::one(format!(
-            "could not write artifact {}: {initial_error}",
-            path.display()
-        )));
-    }
-
-    let name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("artifact");
-    let mut backup = None;
-    for attempt in 0..100 {
-        let candidate =
-            path.with_file_name(format!(".{name}.old-{}-{attempt}", std::process::id()));
-        match fs::rename(path, &candidate) {
-            Ok(()) => {
-                backup = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                let _ = fs::remove_file(temporary_path);
-                return Err(CliError::one(format!(
-                    "could not replace artifact {}: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    let Some(backup) = backup else {
-        let _ = fs::remove_file(temporary_path);
-        return Err(CliError::one(format!(
-            "could not replace artifact {}: no backup filename was available",
-            path.display()
-        )));
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    if let Err(error) = fs::rename(temporary_path, path) {
+    let source: Vec<u16> = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both pointers address NUL-terminated UTF-16 buffers for the
+    // duration of the call, and the flags require no additional structures.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced != 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
         let _ = fs::remove_file(temporary_path);
-        if let Err(restore_error) = fs::rename(&backup, path) {
-            return Err(CliError::one(format!(
-                "could not replace artifact {}: {error}; the previous artifact remains at {} because restoring it failed: {restore_error}",
-                path.display(),
-                backup.display()
-            )));
-        }
-        return Err(CliError::one(format!(
+        Err(CliError::one(format!(
             "could not replace artifact {}: {error}",
             path.display()
-        )));
+        )))
     }
-
-    fs::remove_file(&backup).map_err(|error| {
-        CliError::one(format!(
-            "replaced artifact {}, but could not remove backup {}: {error}",
-            path.display(),
-            backup.display()
-        ))
-    })
 }
 
 /// A user-facing failure while loading a manifest or compiling its bundle.
@@ -596,11 +567,22 @@ impl From<&str> for DependencySpec {
     }
 }
 
+/// The storage provenance of a compiled project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectSource {
+    /// A root or path dependency owned by the user.
+    Local,
+    /// A project inside Ruddy's immutable global Git cache.
+    GitCache,
+}
+
 /// One successfully compiled project in a dependency graph.
 #[derive(Debug, Clone)]
 pub struct CompiledProject {
     /// Canonical project directory containing `Ruddy.toml`.
     pub directory: PathBuf,
+    /// Whether this project is local or from the immutable Git cache.
+    pub source: ProjectSource,
     /// The project's canonical in-memory artifact.
     pub artifact: Artifact,
 }
@@ -974,6 +956,15 @@ impl GraphCompiler {
         self.active.pop();
         let index = self.projects.len();
         self.projects.push(CompiledProject {
+            source: if self
+                .git_roots
+                .iter()
+                .any(|root| directory.starts_with(root))
+            {
+                ProjectSource::GitCache
+            } else {
+                ProjectSource::Local
+            },
             directory: directory.clone(),
             artifact,
         });

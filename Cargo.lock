@@ -181,10 +181,12 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-lock",
  "indexmap",
  "ruddy",
  "serde",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1068,13 +1070,16 @@ version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "885075c3c21eb9c06e0be3b3728ba5932c04e1c1011dcee7c81801980e3e986f"
 dependencies = [
+ "bitflags 2.13.1",
  "bstr",
  "gix-commitgraph",
  "gix-date",
  "gix-error",
  "gix-hash",
+ "gix-hashtable",
  "gix-object",
  "gix-revwalk",
+ "gix-trace",
  "nonempty",
 ]
 

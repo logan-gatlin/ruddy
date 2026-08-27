@@ -491,6 +491,9 @@ function parseDependencies(input) {
     }
     if (Object.hasOwn(dependencies, alias)) throw new Error(`Dependency ${alias} is declared more than once.`);
 
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(source) && !source.startsWith("https://")) {
+      throw new Error(`Dependency ${alias} uses an unsupported URL scheme; Git dependencies must use HTTPS.`);
+    }
     if (source.startsWith("https://")) {
       const detail = { git: source };
       const selector = source.match(/#(branch|tag|rev)=([^#]+)$/);

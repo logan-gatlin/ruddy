@@ -1,9 +1,9 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::Write,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,9 @@ pub(crate) struct Resolver {
     lock_path: PathBuf,
     locked: BTreeMap<(String, LockedSelectorKey), String>,
     resolved: BTreeMap<(String, LockedSelectorKey), String>,
+    // A checkout is restored while holding this marker and remains protected
+    // until compilation has finished reading it.
+    cache_locks: Vec<gix_lock::Marker>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,32 +96,35 @@ impl Resolver {
                     entry.url
                 )));
             }
-            validate_commit(&entry.commit).map_err(|message| {
+            validate_full_commit(&entry.commit).map_err(|message| {
                 CompileError::one(format!(
                     "invalid lockfile entry for {}: {message}",
                     entry.url
                 ))
             })?;
             let selector = selector_from_locked(&entry.selector)?;
-            if matches!(
-                selector,
-                GitSelector::Branch("") | GitSelector::Tag("") | GitSelector::Rev("")
-            ) {
-                return Err(CompileError::one(format!(
-                    "invalid lockfile entry for {}: selector must not be empty",
+            validate_selector(selector).map_err(|message| {
+                CompileError::one(format!(
+                    "invalid lockfile entry for {}: {message}",
                     entry.url
-                )));
-            }
+                ))
+            })?;
             if let GitSelector::Rev(revision) = selector
-                && !revision.eq_ignore_ascii_case(&entry.commit)
+                && !entry
+                    .commit
+                    .to_ascii_lowercase()
+                    .starts_with(&revision.to_ascii_lowercase())
             {
                 return Err(CompileError::one(format!(
-                    "invalid lockfile entry for {}: exact revision `{revision}` does not match commit `{}`",
+                    "invalid lockfile entry for {}: exact revision `{revision}` is not a prefix of commit `{}`",
                     entry.url, entry.commit
                 )));
             }
             let key = (entry.url, LockedSelectorKey::new(selector));
-            if locked.insert(key, entry.commit).is_some() {
+            if locked
+                .insert(key, entry.commit.to_ascii_lowercase())
+                .is_some()
+            {
                 return Err(CompileError::one(
                     "lockfile contains a duplicate Git source selector",
                 ));
@@ -129,38 +135,44 @@ impl Resolver {
             lock_path,
             locked,
             resolved: BTreeMap::new(),
+            cache_locks: Vec::new(),
         })
     }
 
     pub(crate) fn resolve(&mut self, spec: &DependencySpec) -> Result<PathBuf, CompileError> {
         let url = spec.git().expect("called for a Git dependency");
         let selector = spec.selector()?;
+        validate_selector(selector).map_err(CompileError::one)?;
         if self.home.is_none() {
             self.home = Some(ruddy_home()?);
         }
         let home = self.home.as_deref().expect("initialized above");
         let key = (url.to_string(), LockedSelectorKey::new(selector));
-        let locked = self.locked.get(&key).cloned();
-        if let Some(commit) = locked.as_deref() {
-            let checkout = checkout_path(home, url, selector, commit);
-            if valid_checkout(&checkout, commit) {
-                self.resolved.insert(key, commit.into());
-                return Ok(checkout);
-            }
-            if checkout.exists() {
-                fs::remove_dir_all(&checkout).map_err(|error| {
-                    CompileError::one(format!(
-                        "could not replace invalid Git cache checkout {}: {error}",
-                        checkout.display()
-                    ))
-                })?;
-            }
-            let checkout = clone_commit(home, url, selector, Some(commit))?;
-            self.resolved.insert(key, commit.into());
-            return Ok(checkout);
+        if let Some(commit) = self.resolved.get(&key) {
+            return Ok(checkout_path(home, url, selector, commit));
         }
-        let (checkout, commit) = clone_unlocked(home, url, selector)?;
+        let marker = acquire_cache_lock(home, url, selector)?;
+        let locked = self.locked.get(&key).cloned();
+        let (checkout, commit) = if let Some(commit) = locked {
+            let checkout = checkout_path(home, url, selector, &commit);
+            if checkout.exists() && restore_checkout(&checkout, &commit).is_ok() {
+                (checkout, commit)
+            } else {
+                if checkout.exists() {
+                    fs::remove_dir_all(&checkout).map_err(|error| {
+                        CompileError::one(format!(
+                            "could not replace invalid Git cache checkout {}: {error}",
+                            checkout.display()
+                        ))
+                    })?;
+                }
+                (clone_locked(home, url, selector, &commit)?, commit)
+            }
+        } else {
+            clone_unlocked(home, url, selector)?
+        };
         self.resolved.insert(key, commit);
+        self.cache_locks.push(marker);
         Ok(checkout)
     }
 
@@ -185,7 +197,7 @@ impl Resolver {
         if fs::read_to_string(&self.lock_path).ok().as_deref() == Some(&source) {
             return Ok(());
         }
-        atomic_write(&self.lock_path, source.as_bytes()).map_err(|error| {
+        crate::replace_file(&self.lock_path, source.as_bytes()).map_err(|error| {
             CompileError::one(format!(
                 "could not write lockfile {}: {error}",
                 self.lock_path.display()
@@ -215,6 +227,7 @@ fn selector_from_locked(selector: &LockedSelector) -> Result<GitSelector<'_>, Co
         GitSelector::Default
     })
 }
+
 fn selector_to_locked(key: &LockedSelectorKey) -> LockedSelector {
     match key.0.as_str() {
         "branch" => LockedSelector {
@@ -248,6 +261,26 @@ pub fn ruddy_home() -> Result<PathBuf, CompileError> {
         })
 }
 
+fn acquire_cache_lock(
+    home: &Path,
+    url: &str,
+    selector: GitSelector<'_>,
+) -> Result<gix_lock::Marker, CompileError> {
+    let locks = home.join("git/locks");
+    let resource = locks.join(cache_key(url, selector));
+    gix_lock::Marker::acquire_to_hold_resource(
+        &resource,
+        gix_lock::acquire::Fail::AfterDurationWithBackoff(Duration::from_secs(120)),
+        Some(home.join("git")),
+    )
+    .map_err(|error| {
+        CompileError::one(format!(
+            "could not lock Git cache entry {}: {error}",
+            resource.display()
+        ))
+    })
+}
+
 fn clone_unlocked(
     home: &Path,
     url: &str,
@@ -260,32 +293,57 @@ fn clone_unlocked(
             "could not open fetched Git dependency `{url}`: {e}"
         ))
     })?;
-    let commit = repo
-        .head_id()
-        .map_err(|e| {
+    let id = match selector {
+        GitSelector::Rev(revision) => repo.rev_parse_single(revision).map_err(|error| {
+            CompileError::one(format!(
+                "could not resolve Git revision `{revision}` from `{url}`: {error}"
+            ))
+        })?,
+        _ => repo.head_id().map_err(|e| {
             CompileError::one(format!(
                 "Git dependency `{url}` has no resolved commit: {e}"
             ))
+        })?,
+    };
+    let object = id.object().map_err(|error| {
+        CompileError::one(format!(
+            "could not read resolved Git object for `{url}`: {error}"
+        ))
+    })?;
+    let commit = object
+        .peel_to_commit()
+        .map_err(|error| {
+            CompileError::one(format!(
+                "Git dependency `{url}` did not resolve to a commit: {error}"
+            ))
         })?
+        .id
         .to_hex()
         .to_string();
+    checkout_commit(&repo, &commit).map_err(|error| {
+        CompileError::one(format!(
+            "could not check out Git dependency `{url}` at `{commit}`: {error}"
+        ))
+    })?;
+    drop(repo);
     let final_path = checkout_path(home, url, selector, &commit);
     install_checkout(&temp, &final_path, &commit)?;
     Ok((final_path, commit))
 }
-fn clone_commit(
+
+fn clone_locked(
     home: &Path,
     url: &str,
     selector: GitSelector<'_>,
-    commit: Option<&str>,
+    commit: &str,
 ) -> Result<PathBuf, CompileError> {
-    let commit = commit.expect("locked commit");
     let final_path = checkout_path(home, url, selector, commit);
     let temp = temporary_path(home, url, selector);
     clone_to(url, selector, Some(commit), &temp)?;
     install_checkout(&temp, &final_path, commit)?;
     Ok(final_path)
 }
+
 fn clone_to(
     url: &str,
     selector: GitSelector<'_>,
@@ -300,40 +358,41 @@ fn clone_to(
             ))
         })?;
     }
-    let _ = fs::remove_dir_all(destination);
     let mut prepare = gix::prepare_clone(url, destination)
         .map_err(|e| CompileError::one(format!("could not prepare Git dependency `{url}`: {e}")))?;
-    let tag_ref = match selector {
-        GitSelector::Tag(value) => Some(format!("refs/tags/{value}")),
-        _ => None,
-    };
-    prepare = match selector {
-        GitSelector::Branch(value) => prepare
-            .with_ref_name(Some(value))
-            .map_err(|e| CompileError::one(format!("invalid branch `{value}`: {e}")))?,
-        GitSelector::Tag(value) => prepare
-            .with_ref_name(tag_ref.as_deref())
-            .map_err(|e| CompileError::one(format!("invalid tag `{value}`: {e}")))?,
-        _ => prepare,
-    };
-    let requested_commit = locked.or(match selector {
-        GitSelector::Rev(value) => Some(value),
-        _ => None,
-    });
-    if let Some(revision) = requested_commit {
-        validate_commit(revision).map_err(|message| {
-            CompileError::one(format!("invalid revision `{revision}`: {message}"))
-        })?;
-        let revision = revision.to_string();
-        prepare = prepare.configure_remote(move |remote| {
-            Ok(remote.with_refspecs([revision.as_str()], gix::remote::Direction::Fetch)?)
-        });
+    if locked.is_none() {
+        prepare = match selector {
+            GitSelector::Branch(value) => prepare
+                .with_ref_name(Some(format!("refs/heads/{value}").as_str()))
+                .map_err(|e| CompileError::one(format!("invalid branch `{value}`: {e}")))?,
+            GitSelector::Tag(value) => prepare
+                .with_ref_name(Some(format!("refs/tags/{value}").as_str()))
+                .map_err(|e| CompileError::one(format!("invalid tag `{value}`: {e}")))?,
+            GitSelector::Default | GitSelector::Rev(_) => prepare,
+        };
     }
+    let requested_commit = locked.map(str::to_owned);
+    prepare = prepare.configure_remote(move |remote| {
+        let effective = remote
+            .url(gix::remote::Direction::Fetch)
+            .ok_or("Git remote has no fetch URL")?;
+        if effective.scheme != gix::url::Scheme::Https {
+            return Err(format!(
+                "effective Git remote URL must use HTTPS after configuration rewriting, found `{effective}`"
+            )
+            .into());
+        }
+        if let Some(commit) = requested_commit.as_deref() {
+            Ok(remote.with_refspecs([commit], gix::remote::Direction::Fetch)?)
+        } else {
+            Ok(remote)
+        }
+    });
     let result = (|| {
         let (mut checkout, _) =
             prepare.fetch_then_checkout(gix::progress::Discard, &AtomicBool::new(false))?;
         let (repo, _) = checkout.main_worktree(gix::progress::Discard, &AtomicBool::new(false))?;
-        if let Some(commit) = requested_commit {
+        if let Some(commit) = locked {
             checkout_commit(&repo, commit)?;
         }
         Ok::<_, Box<dyn std::error::Error>>(())
@@ -341,14 +400,39 @@ fn clone_to(
     if let Err(error) = result {
         let _ = fs::remove_dir_all(destination);
         return Err(CompileError::one(format!(
-            "could not fetch or check out Git dependency `{url}`: {error}"
+            "could not fetch or check out Git dependency `{url}`: {}",
+            error_chain(error.as_ref())
         )));
     }
     Ok(())
 }
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
 fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(), CompileError> {
+    let parent = destination.parent().ok_or_else(|| {
+        CompileError::one(format!(
+            "Git cache checkout {} has no parent directory",
+            destination.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        CompileError::one(format!(
+            "could not create Git checkout directory {}: {error}",
+            parent.display()
+        ))
+    })?;
     if destination.exists() {
-        if valid_checkout(destination, commit) {
+        if restore_checkout(destination, commit).is_ok() {
             fs::remove_dir_all(temp).ok();
             return Ok(());
         }
@@ -364,24 +448,73 @@ fn install_checkout(temp: &Path, destination: &Path, commit: &str) -> Result<(),
             "could not install Git checkout {}: {e}",
             destination.display()
         ))
-    })
+    })?;
+    restore_checkout(destination, commit)
 }
+
+fn restore_checkout(path: &Path, commit: &str) -> Result<(), CompileError> {
+    let git_dir = path.join(".git");
+    let metadata = fs::symlink_metadata(&git_dir).map_err(|error| {
+        CompileError::one(format!(
+            "cached Git checkout {} has no safe repository directory: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(CompileError::one(format!(
+            "cached Git checkout {} has an unsafe repository directory",
+            path.display()
+        )));
+    }
+    let repo = gix::open(path).map_err(|error| {
+        CompileError::one(format!(
+            "could not open cached Git checkout {}: {error}",
+            path.display()
+        ))
+    })?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        CompileError::one(format!(
+            "could not resolve cached Git checkout {}: {error}",
+            path.display()
+        ))
+    })?;
+    let canonical_git = fs::canonicalize(&git_dir).map_err(|error| {
+        CompileError::one(format!(
+            "could not resolve cached Git repository {}: {error}",
+            git_dir.display()
+        ))
+    })?;
+    if repo.workdir() != Some(canonical_path.as_path())
+        || repo.git_dir() != canonical_git.as_path()
+        || !canonical_git.starts_with(&canonical_path)
+    {
+        return Err(CompileError::one(format!(
+            "cached Git checkout {} points outside its cache directory",
+            path.display()
+        )));
+    }
+    checkout_commit(&repo, commit).map_err(|error| {
+        CompileError::one(format!(
+            "could not restore cached Git checkout {} at `{commit}`: {error}",
+            path.display()
+        ))
+    })?;
+    if !path.join("Ruddy.toml").is_file() {
+        return Err(CompileError::one(format!(
+            "cached Git checkout {} contains no Ruddy.toml at `{commit}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn checkout_commit(repo: &gix::Repository, commit: &str) -> Result<(), Box<dyn std::error::Error>> {
     use gix::NestedProgress as _;
     let id = gix::hash::ObjectId::from_hex(commit.as_bytes())?;
-    let tree = repo.find_object(id)?.peel_to_tree()?.id;
+    let commit = repo.find_object(id)?.peel_to_commit()?;
+    let tree = commit.tree_id()?;
     let workdir = repo.workdir().ok_or("Git dependency has no worktree")?;
-    for entry in fs::read_dir(workdir)? {
-        let path = entry?.path();
-        if path.file_name().is_some_and(|n| n == ".git") {
-            continue;
-        }
-        if path.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-    }
+    clear_worktree(workdir)?;
     let state = gix::index::State::from_tree(&tree, &repo.objects, Default::default())?;
     let mut index = gix::index::File::from_state(state, repo.index_path());
     let mut options =
@@ -402,74 +535,78 @@ fn checkout_commit(repo: &gix::Repository, commit: &str) -> Result<(), Box<dyn s
     index.write(Default::default())?;
     repo.reference(
         "HEAD",
-        id,
+        commit.id,
         gix::refs::transaction::PreviousValue::Any,
         "ruddy checkout",
     )?;
     Ok(())
 }
-fn valid_checkout(path: &Path, commit: &str) -> bool {
-    gix::open(path)
-        .ok()
-        .and_then(|r| r.head_id().ok().map(|id| id.to_hex().to_string()))
-        .is_some_and(|id| id == commit)
-        && path.join("Ruddy.toml").is_file()
+
+fn clear_worktree(workdir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(workdir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
+        if fs::symlink_metadata(&path)?.file_type().is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
-fn validate_commit(commit: &str) -> Result<(), &'static str> {
+
+fn validate_selector(selector: GitSelector<'_>) -> Result<(), &'static str> {
+    match selector {
+        GitSelector::Default => Ok(()),
+        GitSelector::Rev(value) => (value.len() >= 7
+            && value.len() <= 40
+            && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(())
+        .ok_or("revision must contain 7 to 40 hexadecimal digits"),
+        GitSelector::Branch("") | GitSelector::Tag("") => Err("selector must not be empty"),
+        GitSelector::Branch(value) => gix::refs::FullName::try_from(format!("refs/heads/{value}"))
+            .map(|_| ())
+            .map_err(|_| "branch and tag selectors must be valid Git reference names"),
+        GitSelector::Tag(value) => gix::refs::FullName::try_from(format!("refs/tags/{value}"))
+            .map(|_| ())
+            .map_err(|_| "branch and tag selectors must be valid Git reference names"),
+    }
+}
+
+fn validate_full_commit(commit: &str) -> Result<(), &'static str> {
     (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
         .then_some(())
         .ok_or("commit must be a full 40-digit object ID")
 }
+
+fn cache_key(url: &str, selector: GitSelector<'_>) -> String {
+    format!(
+        "{:016x}",
+        hash(&(url.to_owned() + &format!("{selector:?}")))
+    )
+}
+
 fn checkout_path(home: &Path, url: &str, selector: GitSelector<'_>, commit: &str) -> PathBuf {
     home.join("git/checkouts")
-        .join(format!(
-            "{:016x}",
-            hash(&(url.to_owned() + &format!("{:?}", selector)))
-        ))
-        .join(commit)
+        .join(cache_key(url, selector))
+        .join(commit.to_ascii_lowercase())
 }
+
+static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temporary_path(home: &Path, url: &str, selector: GitSelector<'_>) -> PathBuf {
     home.join("git/tmp").join(format!(
-        "{:016x}-{}",
-        hash(&(url.to_owned() + &format!("{:?}", selector))),
-        std::process::id()
+        "{}-{}-{}",
+        cache_key(url, selector),
+        std::process::id(),
+        TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
 fn hash(value: &str) -> u64 {
     value.bytes().fold(0xcbf29ce484222325, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
-}
-fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("Ruddy.lock");
-    for i in 0..100 {
-        let tmp = parent.join(format!(".{name}.tmp-{}-{i}", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
-                    fs::remove_file(&tmp).ok();
-                    return Err(e);
-                }
-                if let Err(e) = fs::rename(&tmp, path) {
-                    fs::remove_file(&tmp).ok();
-                    return Err(e);
-                }
-                return Ok(());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "no temporary lockfile name available",
-    ))
 }

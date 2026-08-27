@@ -369,6 +369,10 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
             "conflicting",
         ),
         (
+            "{ git = \"https://example.test/repo\", branch = \"bad..name\" }",
+            "valid Git reference names",
+        ),
+        (
             "{ git = \"https://example.test/repo\", unknown = true }",
             "unknown field `unknown`",
         ),
@@ -381,6 +385,52 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
         }
         assert!(!directory.path().join("Ruddy.lock").exists());
     }
+}
+
+#[test]
+fn ambient_git_configuration_cannot_rewrite_https_to_an_unsafe_transport() {
+    let parent = tempfile::tempdir().unwrap();
+    let app = parent.path().join("app");
+    let home = parent.path().join("home");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(app.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(app.join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://example.invalid/repository\" }\n").unwrap();
+    let config = home.join("hostile.gitconfig");
+    fs::write(
+        &config,
+        "[url \"file:///tmp/hostile/\"]\n\tinsteadOf = https://example.invalid/\n",
+    )
+    .unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "cli::hostile_git_configuration_child",
+        ])
+        .env("RUDDY_TEST_GIT_APP", &app)
+        .env("RUDDY_HOME", parent.path().join("ruddy-home"))
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in an isolated process with hostile Git configuration"]
+fn hostile_git_configuration_child() {
+    let app = PathBuf::from(std::env::var_os("RUDDY_TEST_GIT_APP").unwrap());
+    let found = compile(app).unwrap_err().to_string();
+    assert!(
+        found.contains("effective Git remote URL must use HTTPS"),
+        "{found}"
+    );
 }
 
 #[test]
@@ -428,8 +478,26 @@ fn locked_cached_git_dependency_child() {
     let seed = home.join("seed");
     fs::create_dir_all(&seed).unwrap();
     let repository = gix::init(&seed).unwrap();
+    let manifest = repository
+        .write_blob(b"name = \"base\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\n")
+        .unwrap()
+        .detach();
+    let source = repository.write_blob(b"let value = 2n\n").unwrap().detach();
     let tree = repository
-        .write_object(gix::objs::Tree::empty())
+        .write_object(gix::objs::Tree {
+            entries: vec![
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "Ruddy.toml".into(),
+                    oid: manifest,
+                },
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "main.hc".into(),
+                    oid: source,
+                },
+            ],
+        })
         .unwrap()
         .detach();
     let signature = gix::actor::Signature {
@@ -469,32 +537,95 @@ fn locked_cached_git_dependency_child() {
         .join(&commit);
     fs::create_dir_all(checkout.parent().unwrap()).unwrap();
     fs::rename(seed, &checkout).unwrap();
-    fs::write(
-        checkout.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
-    )
-    .unwrap();
-    fs::write(checkout.join("main.hc"), "let value = 2n\n").unwrap();
     fs::create_dir_all(&app).unwrap();
     fs::write(app.join("main.hc"), "let main = base::value\n").unwrap();
     fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
-    let lock =
-        format!("version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {commit:?}\n");
+    let uppercase = commit.to_ascii_uppercase();
+    let lock = format!(
+        "version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {uppercase:?}\n"
+    );
     fs::write(app.join("Ruddy.lock"), &lock).unwrap();
     let first = compile(&app).unwrap();
+    assert_eq!(first.header.dependencies[0].name, "base");
+
+    // Every use restores both tracked and untracked cache contents while the
+    // cross-process cache lock remains held for compilation.
+    fs::write(
+        checkout.join("Ruddy.toml"),
+        "name = \"poison\"\nversion = \"9.9.9\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        checkout.join("main.hc"),
+        "mod injected\nlet value = injected::value\n",
+    )
+    .unwrap();
+    fs::write(checkout.join("injected.hc"), "let value = false\n").unwrap();
     let second = compile(&app).unwrap();
     assert_eq!(first, second);
-    assert_eq!(first.header.dependencies[0].name, "base");
-    assert_eq!(fs::read_to_string(app.join("Ruddy.lock")).unwrap(), lock);
+    assert!(!checkout.join("injected.hc").exists());
+    assert_eq!(
+        fs::read_to_string(checkout.join("main.hc")).unwrap(),
+        "let value = 2n\n"
+    );
+    assert!(
+        fs::read_to_string(checkout.join("Ruddy.toml"))
+            .unwrap()
+            .starts_with("name = \"base\"")
+    );
+    assert!(
+        fs::read_to_string(app.join("Ruddy.lock"))
+            .unwrap()
+            .contains(&format!("commit = {commit:?}"))
+    );
+
+    let concurrent: Vec<_> = (0..8)
+        .map(|_| {
+            let app = app.clone();
+            std::thread::spawn(move || compile(app).unwrap())
+        })
+        .collect();
+    for handle in concurrent {
+        assert_eq!(handle.join().unwrap(), first);
+    }
+    assert!(
+        fs::read_dir(home.join("git/tmp"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    );
+
+    let graph = ruddy_cli::compile_graph(&app).unwrap();
+    assert_eq!(graph.projects.len(), 2);
+    assert_eq!(graph.projects[0].source, ruddy_cli::ProjectSource::GitCache);
+    assert_eq!(graph.projects[1].source, ruddy_cli::ProjectSource::Local);
+    let artifact = ruddy_cli::build_project(&app).unwrap();
+    assert!(artifact.is_file());
+    assert!(!checkout.join("build").exists());
 }
 
 #[test]
-fn exact_revisions_require_full_commit_ids_before_network_access() {
+fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let directory = project();
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
     let found = error(&directory);
-    assert!(found.contains("full 40-digit object ID"), "{found}");
+    assert!(found.contains("7 to 40 hexadecimal digits"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
+}
+
+#[test]
+fn abbreviated_revision_lock_entries_accept_the_matching_full_commit() {
+    let directory = project();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("Ruddy.lock"),
+        "version = 1\n\n[[git]]\nurl = \"https://example.test/repo\"\nrev = \"0123456\"\ncommit = \"0123456789abcdef0123456789abcdef01234567\"\n",
+    )
+    .unwrap();
+    compile(directory.path()).unwrap();
 }
 
 #[test]
