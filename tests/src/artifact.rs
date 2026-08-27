@@ -160,11 +160,15 @@ fn model_artifact() -> Artifact {
         Op::Sub { left: 1, right: 2 },
         Op::Mul { left: 1, right: 2 },
         Op::Div { left: 1, right: 2 },
-        Op::Struct(vec![("first".to_string(), 1), ("second".to_string(), 2)]),
+        Op::Struct(vec![
+            (artifact::FieldKey::Named("first".to_string()), 1),
+            (artifact::FieldKey::Named("second".to_string()), 2),
+            (artifact::FieldKey::UnnamedOperation, 3),
+        ]),
         Op::Merge(vec![1, 2]),
         Op::Project {
             base: 1,
-            field: "field".to_string(),
+            field: artifact::FieldKey::Named("field".to_string()),
         },
         Op::Tag {
             name: "Case".to_string(),
@@ -309,7 +313,7 @@ fn model_artifact() -> Artifact {
                         interface: "write".to_string(),
                     }),
                     kind: artifact::EffectKind::Operations(vec![artifact::Operation {
-                        name: "write".to_string(),
+                        selector: artifact::OperationSelector::Named("write".to_string()),
                         from: plain(Core::Nat),
                         to: plain(Core::Unit),
                     }]),
@@ -472,7 +476,7 @@ fn compact(text: &str) -> String {
 fn a_compiled_bundle_round_trips_through_canonical_text() {
     let artifact = built(
         "type Box 'a = { value: 'a }\n\
-         effect Log = write : Nat -> ()\n\
+         effect Log = { write: Nat -> () }\n\
          effect Console = !Log\n\
          let id = fn x => x\n\
          let main = fn n => handle id n with | !Log.write x => {} end\n",
@@ -504,6 +508,10 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
     assert!(
         !printed.contains("<test>"),
         "source paths must not cross the disk boundary"
+    );
+    assert!(
+        printed.contains("(selector named \"write\")"),
+        "named selectors use the strict selector subform: {printed}"
     );
     assert!(
         !printed.contains("Span"),
@@ -552,6 +560,21 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (effects))\n\
          \x20 (lir (functions) (globals)))\n"
     );
+}
+
+#[test]
+fn unnamed_operation_selectors_round_trip_strictly() {
+    let artifact = built(
+        "effect Log = String -> ()\n\
+         let main = fn message => handle !Log message with | !Log text => () end",
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(selector unnamed)"), "{printed}");
+    let effect = &artifact.header.effects[0];
+    let artifact::EffectKind::Operations(operations) = &effect.kind else {
+        panic!("expected operations")
+    };
+    assert_eq!(operations[0].selector, artifact::OperationSelector::Unnamed);
 }
 
 #[test]
@@ -712,11 +735,14 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         lir::Op::Sub { left: 1, right: 2 },
         lir::Op::Mul { left: 1, right: 2 },
         lir::Op::Div { left: 1, right: 2 },
-        lir::Op::Struct(IndexMap::from([("x".to_string(), 1)])),
+        lir::Op::Struct(IndexMap::from([
+            (lir::FieldKey::Named("x".to_string()), 1),
+            (lir::FieldKey::UnnamedOperation, 2),
+        ])),
         lir::Op::Merge(vec![1, 2]),
         lir::Op::Project {
             base: 1,
-            field: "x".to_string(),
+            field: lir::FieldKey::Named("x".to_string()),
         },
         lir::Op::Tag {
             name: "None".to_string(),
@@ -841,7 +867,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
 
 #[test]
 fn building_rejects_a_pending_effect_identity() {
-    let (mint, mut program, inferred, lowered) = compiled("effect Log = write : Nat -> ()\n");
+    let (mint, mut program, inferred, lowered) = compiled("effect Log = { write: Nat -> () }\n");
     let symbol = *program
         .effects
         .keys()
@@ -1038,6 +1064,14 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     // Invalid values of each S-expression shape reach reader paths that a tag
     // miss or arity error does not.
     assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
+    assert_bad_replacement(&valid, "(selector named \"write\")", "\"write\"");
+    assert_bad_replacement(
+        &valid,
+        "(selector named \"write\")",
+        "(selector unnamed extra)",
+    );
+    assert_bad_replacement(&valid, "(selector named \"write\")", "(selector named)");
+    assert_bad_replacement(&valid, "(selector named \"write\")", "(selector mystery)");
     assert_malformed(&replace_balanced(
         &valid,
         "(operations (operation",
@@ -1081,9 +1115,26 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     ));
     assert_malformed(&replace_balanced(
         &valid,
-        "(\"first\" 1)",
+        "((field-key named \"first\") 1)",
         "bad-struct-entry",
     ));
+    assert_bad_replacement(
+        &valid,
+        "(field-key named \"first\")",
+        "\"legacy-string-key\"",
+    );
+    assert_bad_replacement(
+        &valid,
+        "(field-key unnamed-operation)",
+        "(field-key unnamed-operation extra)",
+    );
+    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key named)");
+    assert_bad_replacement(&valid, "(field-key named \"first\")", "(field-key mystery)");
+    assert_bad_replacement(
+        &valid,
+        "(field-key named \"first\")",
+        "(wrong-key named \"first\")",
+    );
     assert_bad_replacement(&valid, "new-tag", "(())");
 }
 

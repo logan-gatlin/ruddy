@@ -7,7 +7,9 @@ use std::{
 };
 
 use ruddy::artifact::Artifact;
-use ruddy_cli::{Lockfile, Outcome, build_project, compile, new_project, run};
+use ruddy_cli::{
+    Lockfile, Outcome, build_project, check_project, clean_project, compile, new_project, run,
+};
 use tempfile::TempDir;
 
 fn project() -> TempDir {
@@ -75,7 +77,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     write_project(&dependency, "std", "0.1.0", &[]);
     fs::write(
         dependency.join("main.hc"),
-        "module Nested =\n  type Number = Nat\n  effect Read = get : {} -> Nat\n  let foo = 1n\nend\n",
+        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  let foo = 1n\nend\n",
     )
     .unwrap();
     fs::write(
@@ -912,7 +914,7 @@ fn dependency_effects_aliases_and_constructor_kinds_survive_import() {
     write_project(&base, "base", "1.0.0", &[]);
     fs::write(
         base.join("main.hc"),
-        "effect Read = get : {} -> Nat\n\
+        "effect Read = { get: {} -> Nat }\n\
          type Cases 'r = #A Nat | ..'r\n\
          let read : {} -> Nat + !Read = fn _ => !Read.get {}\n",
     )
@@ -975,8 +977,8 @@ fn imported_signature_types_participate_in_effect_identity() {
     write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
     fs::write(
         app.join("main.hc"),
-        "module X = effect Same = op : dep::A -> {} end\n\
-         module Y = effect Same = op : dep::B -> {} end\n",
+        "module X = effect Same = { op: dep::A -> {} } end\n\
+         module Y = effect Same = { op: dep::B -> {} } end\n",
     )
     .unwrap();
     let artifact = compile(&app).unwrap();
@@ -1237,26 +1239,142 @@ fn build_surfaces_compile_directory_and_artifact_write_failures() {
 }
 
 #[test]
-fn command_arguments_are_cargo_like_and_build_uses_the_current_directory() {
+fn clap_commands_support_aliases_help_and_strict_arguments() {
     let current = tempfile::tempdir().unwrap();
     assert_eq!(
-        run(["new", "app"], current.path()).unwrap(),
+        run(["n", "app"], current.path()).unwrap(),
         Outcome::Created(current.path().join("app"))
     );
     assert_eq!(
-        run(["build"], current.path().join("app")).unwrap(),
+        run(["b"], current.path().join("app")).unwrap(),
         Outcome::Built(current.path().join("app/build/app.artifact"))
     );
+    assert_eq!(
+        run(["check"], current.path().join("app")).unwrap(),
+        Outcome::Checked(current.path().join("app"))
+    );
+    assert_eq!(
+        run(["clean"], current.path().join("app")).unwrap(),
+        Outcome::Cleaned(
+            fs::canonicalize(current.path().join("app/build").parent().unwrap())
+                .unwrap()
+                .join("build")
+        )
+    );
+    assert!(!current.path().join("app/build").exists());
 
-    for (arguments, expected) in [
-        (vec![], "expected a subcommand"),
-        (vec!["new"], "requires a project path"),
-        (vec!["new", "one", "two"], "exactly one project path"),
-        (vec!["build", "elsewhere"], "does not accept arguments"),
-        (vec!["compile"], "unknown subcommand `compile`"),
+    for arguments in [
+        vec![],
+        vec!["new"],
+        vec!["new", "one", "two"],
+        vec!["build", "elsewhere"],
+        vec!["clean", "elsewhere"],
+        vec!["check", "elsewhere"],
+        vec!["compile"],
     ] {
         let error = run(arguments, current.path()).unwrap_err();
-        assert!(error.is_usage());
-        assert!(error.to_string().contains(expected), "{error}");
+        assert!(error.is_usage(), "{error}");
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(error.to_string().contains("Usage:"), "{error}");
     }
+
+    for arguments in [vec!["--help"], vec!["new", "--help"], vec!["--version"]] {
+        let information = run(arguments, current.path()).unwrap_err();
+        assert!(information.is_success(), "{information}");
+        assert_eq!(information.exit_code(), 0, "{information}");
+        assert!(!information.is_usage(), "{information}");
+    }
+}
+
+#[test]
+fn check_compiles_without_build_output_and_reports_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    new_project(&app).unwrap();
+
+    check_project(&app).unwrap();
+    assert!(!app.join("build").exists());
+
+    fs::write(app.join("main.hc"), "let bad : Nat = false\n").unwrap();
+    let error = check_project(&app).unwrap_err();
+    assert!(!error.is_usage());
+    assert_eq!(error.exit_code(), 1);
+    assert!(error.to_string().contains("error[types/"), "{error}");
+    assert!(!app.join("build").exists());
+}
+
+#[test]
+fn clean_removes_build_directories_and_other_stale_entries_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    fs::create_dir(&app).unwrap();
+    // Cleaning needs only the project marker, not a parseable manifest.
+    fs::write(app.join("Ruddy.toml"), "this is not valid TOML").unwrap();
+    let expected = fs::canonicalize(&app).unwrap().join("build");
+
+    assert_eq!(clean_project(&app).unwrap(), expected);
+    fs::create_dir(&expected).unwrap();
+    fs::write(expected.join("artifact"), "stale").unwrap();
+    assert_eq!(clean_project(&app).unwrap(), expected);
+    assert!(!expected.exists());
+
+    fs::write(&expected, "blocked old output").unwrap();
+    assert_eq!(clean_project(&app).unwrap(), expected);
+    assert!(!expected.exists());
+
+    let missing = directory.path().join("missing");
+    let error = clean_project(&missing).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("could not resolve project folder")
+    );
+    assert!(!error.is_usage());
+    assert_eq!(error.exit_code(), 1);
+}
+
+#[test]
+fn clean_rejects_non_projects_without_deleting_their_build_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let build = directory.path().join("build");
+    fs::create_dir(&build).unwrap();
+    fs::write(build.join("keep"), "not Ruddy build data").unwrap();
+
+    let error = clean_project(directory.path()).unwrap_err();
+    assert!(error.to_string().contains("project marker"), "{error}");
+    assert_eq!(
+        fs::read_to_string(build.join("keep")).unwrap(),
+        "not Ruddy build data"
+    );
+
+    // A path named like the marker is insufficient unless it is a regular file.
+    fs::create_dir(directory.path().join("Ruddy.toml")).unwrap();
+    let error = clean_project(directory.path()).unwrap_err();
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+    assert_eq!(
+        fs::read_to_string(build.join("keep")).unwrap(),
+        "not Ruddy build data"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_unlinks_build_symlinks_without_touching_their_targets() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    let output = directory.path().join("shared-output");
+    fs::create_dir(&app).unwrap();
+    fs::write(app.join("Ruddy.toml"), "malformed is fine").unwrap();
+    fs::create_dir(&output).unwrap();
+    fs::write(output.join("keep"), "must remain").unwrap();
+    symlink(&output, app.join("build")).unwrap();
+
+    clean_project(&app).unwrap();
+    assert!(!app.join("build").exists());
+    assert_eq!(
+        fs::read_to_string(output.join("keep")).unwrap(),
+        "must remain"
+    );
 }

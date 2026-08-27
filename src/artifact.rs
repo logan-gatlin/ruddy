@@ -156,9 +156,15 @@ pub enum EffectKind {
 /// One operation's public signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
-    pub name: String,
+    pub selector: OperationSelector,
     pub from: Type,
     pub to: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationSelector {
+    Unnamed,
+    Named(String),
 }
 
 /// A normalized scheme.  Quantifier positions use the compiler's one shared
@@ -295,6 +301,13 @@ pub struct Instr {
     pub op: Op,
 }
 
+/// A typed key in a span-free LIR record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKey {
+    Named(String),
+    UnnamedOperation,
+}
+
 /// A span-free LIR operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -329,11 +342,11 @@ pub enum Op {
         left: u32,
         right: u32,
     },
-    Struct(Vec<(String, u32)>),
+    Struct(Vec<(FieldKey, u32)>),
     Merge(Vec<u32>),
     Project {
         base: u32,
-        field: String,
+        field: FieldKey,
     },
     Tag {
         name: String,
@@ -503,7 +516,14 @@ pub fn build_with_dependencies(
                             .map(|(name, _)| {
                                 let (from, to) = &inference.operations[&(*symbol, name.clone())];
                                 Operation {
-                                    name: name.clone(),
+                                    selector: match name {
+                                        ir::OperationSelector::Unnamed => {
+                                            OperationSelector::Unnamed
+                                        }
+                                        ir::OperationSelector::Named(name) => {
+                                            OperationSelector::Named(name.clone())
+                                        }
+                                    },
                                     from: ty(mint, from),
                                     to: ty(mint, to),
                                 }
@@ -752,6 +772,13 @@ fn block(mint: &Mint, value: &lir::Block) -> Block {
     }
 }
 
+fn field_key(value: &lir::FieldKey) -> FieldKey {
+    match value {
+        lir::FieldKey::Named(name) => FieldKey::Named(name.clone()),
+        lir::FieldKey::UnnamedOperation => FieldKey::UnnamedOperation,
+    }
+}
+
 fn op(mint: &Mint, value: &lir::Op) -> Op {
     use lir::Op as Source;
     match value {
@@ -789,13 +816,13 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
         Source::Struct(fields) => Op::Struct(
             fields
                 .iter()
-                .map(|(name, temp)| (name.clone(), *temp))
+                .map(|(field, temp)| (field_key(field), *temp))
                 .collect(),
         ),
         Source::Merge(values) => Op::Merge(values.clone()),
         Source::Project { base, field } => Op::Project {
             base: *base,
-            field: field.clone(),
+            field: field_key(field),
         },
         Source::Tag { name, payload } => Op::Tag {
             name: name.clone(),
@@ -1072,9 +1099,17 @@ pub mod text {
         ])
     }
     fn operation(value: &Operation) -> S {
+        let selector = match &value.selector {
+            OperationSelector::Unnamed => L(vec![A("selector".into()), A("unnamed".into())]),
+            OperationSelector::Named(name) => L(vec![
+                A("selector".into()),
+                A("named".into()),
+                Q(name.clone()),
+            ]),
+        };
         L(vec![
             A("operation".into()),
-            Q(value.name.clone()),
+            selector,
             ty(&value.from),
             ty(&value.to),
         ])
@@ -1235,6 +1270,18 @@ pub mod text {
             op(&value.op),
         ])
     }
+    fn field_key(value: &FieldKey) -> S {
+        match value {
+            FieldKey::Named(name) => L(vec![
+                A("field-key".into()),
+                A("named".into()),
+                Q(name.clone()),
+            ]),
+            FieldKey::UnnamedOperation => {
+                L(vec![A("field-key".into()), A("unnamed-operation".into())])
+            }
+        }
+    }
     fn op(value: &Op) -> S {
         match value {
             Op::Const(value) => L(vec![A("const".into()), literal(value)]),
@@ -1251,7 +1298,7 @@ pub mod text {
                 .chain(
                     fields
                         .iter()
-                        .map(|(name, value)| L(vec![Q(name.clone()), A(value.to_string())])),
+                        .map(|(field, value)| L(vec![field_key(field), A(value.to_string())])),
                 )
                 .collect()),
             Op::Merge(values) => L(std::iter::once(A("merge".into()))
@@ -1260,7 +1307,7 @@ pub mod text {
             Op::Project { base, field } => L(vec![
                 A("project".into()),
                 A(base.to_string()),
-                Q(field.clone()),
+                field_key(field),
             ]),
             Op::Tag { name, payload } => L(std::iter::once(A("tag".into()))
                 .chain(std::iter::once(Q(name.clone())))
@@ -1940,8 +1987,22 @@ pub mod text {
         }
         fn read_operation(&self, value: S) -> Operation {
             let mut value = self.exact(self.list(value, "operation"), 3, "operation");
+            let selector = self.take(&mut value);
+            let mut selector = self.list(selector, "selector");
+            let tag = self.atom(self.take(&mut selector));
+            let selector = match tag.as_str() {
+                "unnamed" => {
+                    self.exact(selector, 0, "selector unnamed");
+                    OperationSelector::Unnamed
+                }
+                "named" => {
+                    let mut selector = self.exact(selector, 1, "selector named");
+                    OperationSelector::Named(self.string(self.take(&mut selector)))
+                }
+                _ => self.invalid("invalid operation selector", OperationSelector::Unnamed),
+            };
             Operation {
-                name: self.string(self.take(&mut value)),
+                selector,
                 from: self.read_ty(self.take(&mut value)),
                 to: self.read_ty(self.take(&mut value)),
             }
@@ -2565,6 +2626,26 @@ pub mod text {
                 _ => self.invalid("invalid representation", Rep::Any),
             }
         }
+        fn read_field_key(&self, value: S) -> FieldKey {
+            let Some(values) = list_contents(value) else {
+                return self.invalid("invalid field key", FieldKey::UnnamedOperation);
+            };
+            let mut values = values;
+            if self.atom(self.take(&mut values)) != "field-key" {
+                return self.invalid("invalid field key", FieldKey::UnnamedOperation);
+            }
+            match self.atom(self.take(&mut values)).as_str() {
+                "named" => {
+                    let mut values = self.exact(values, 1, "named field key");
+                    FieldKey::Named(self.string(self.take(&mut values)))
+                }
+                "unnamed-operation" => {
+                    self.exact(values, 0, "unnamed operation field key");
+                    FieldKey::UnnamedOperation
+                }
+                _ => self.invalid("invalid field key", FieldKey::UnnamedOperation),
+            }
+        }
         fn read_leaf_op(&self, value: S) -> Op {
             if matches!(&value, A(atom) if atom == "new-tag") {
                 return Op::NewTag;
@@ -2592,7 +2673,7 @@ pub mod text {
                                 .unwrap_or_else(|| self.invalid("bad struct entry", Vec::new()));
                             let mut value = self.exact(value, 2, "struct entry");
                             (
-                                self.string(self.take(&mut value)),
+                                self.read_field_key(self.take(&mut value)),
                                 self.number(self.take(&mut value)),
                             )
                         })
@@ -2603,7 +2684,7 @@ pub mod text {
                     let mut values = self.exact(values, 2, "project");
                     Op::Project {
                         base: self.number(self.take(&mut values)),
-                        field: self.string(self.take(&mut values)),
+                        field: self.read_field_key(self.take(&mut values)),
                     }
                 }
                 "tag" => {

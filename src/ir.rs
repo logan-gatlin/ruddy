@@ -27,7 +27,7 @@ pub struct Program {
     pub external_names: IndexMap<Symbol, artifact::QualifiedName>,
     pub external_schemes: IndexMap<Symbol, Scheme>,
     pub external_types: IndexMap<Symbol, ExternalType>,
-    pub external_operations: IndexMap<(Symbol, String), (Rc<Ty>, Rc<Ty>)>,
+    pub external_operations: IndexMap<(Symbol, OperationSelector), (Rc<Ty>, Rc<Ty>)>,
     /// The effects declared, in the order they were written, each with the
     /// operations it declares or the effects it stands for.
     pub effects: IndexMap<Symbol, Decl<Effect>>,
@@ -49,10 +49,10 @@ pub struct Program {
 /// stands for itself alone.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// `effect Log = write : Nat -> ()` — the operations, by name, in the
-    /// order they were written. Empty for the empty effect, `effect Nil`,
+    /// An unnamed singleton or named interface, keyed by selector in source
+    /// order. Empty for the empty effect, `effect Nil`,
     /// which declares nothing.
-    Operations(IndexMap<String, Operation>),
+    Operations(IndexMap<OperationSelector, Operation>),
     /// `effect Console = !Log + !IO` — the effects this name stands for.
     ///
     /// Kept as it was written, though nothing downstream reads an alias: a row
@@ -69,11 +69,43 @@ pub enum Effect {
 /// and has body type `B`, and neither half is ever read as a whole arrow.
 #[derive(Debug, Clone)]
 pub struct Operation {
-    /// Where the operation's name was written, the [`Field`] split every other
-    /// label keeps.
+    /// Where the selector (or the unnamed signature) was written.
     pub name_span: Span,
     pub from: Type,
     pub to: Type,
+}
+
+/// An operation's source-visible selector. Empty and named interfaces remain
+/// distinct from unnamed singleton effects throughout the compiler.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OperationSelector {
+    Unnamed,
+    Named(String),
+}
+
+impl std::fmt::Display for OperationSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unnamed => Ok(()),
+            Self::Named(name) => write!(f, ".{name}"),
+        }
+    }
+}
+
+impl OperationSelector {
+    pub fn source_name(&self) -> String {
+        match self {
+            Self::Unnamed => "<unnamed>".to_string(),
+            Self::Named(name) => name.clone(),
+        }
+    }
+
+    fn canonical(&self) -> String {
+        match self {
+            Self::Unnamed => "u".to_string(),
+            Self::Named(name) => format!("n{}:{name}", name.len()),
+        }
+    }
 }
 
 /// One effect named by another: the symbol it resolved to, and where it was
@@ -310,7 +342,7 @@ pub enum TermKind {
     /// effect's.
     Operation {
         effect: Tracked<Symbol>,
-        op: TrackedString,
+        selector: Tracked<OperationSelector>,
     },
     Ident(Symbol),
     /// Numeric literals carry no symbol: a literal names nothing, so there is
@@ -367,7 +399,7 @@ pub struct Handler {
 #[derive(Debug, Clone)]
 pub struct HandlerArm {
     pub effect: Tracked<Symbol>,
-    pub op: TrackedString,
+    pub selector: Tracked<OperationSelector>,
     /// The binder, as a symbol. A `_` gets a fresh one nothing can name, the
     /// way a `fn` header's wildcard does.
     pub binder: Tracked<Symbol>,
@@ -1097,14 +1129,14 @@ pub enum ErrorKind {
         name: String,
     },
     /// A second operation of a name in one effect:
-    /// `effect Log = write : Nat -> () | write : () -> ()`.
+    /// `effect Log = { write: Nat -> (), write: () -> () }`.
     ///
     /// [`ErrorKind::DuplicateCase`]'s twin, and scoped the same way: an
     /// operation belongs to its own declaration, so two effects may each
     /// declare a `write` and two `write` in one may not.
     DuplicateOperation,
-    /// An operation whose signature is not a function, as in
-    /// `effect Log = write : Nat`.
+    /// An operation whose signature is not a function, retained after the
+    /// parser rejects `effect Log = { write: Nat }`.
     ///
     /// Performing an operation is applying it, so an operation that is not an
     /// arrow would be performed by mention — there would be nowhere for the
@@ -1125,14 +1157,6 @@ pub enum ErrorKind {
     /// nowhere else, and one sentence naming all three is what a reader can act
     /// on.
     ImpureOperation,
-    /// An effect declaration whose cases mix the two forms:
-    /// `effect Bad = !Log + write : Nat -> ()`.
-    ///
-    /// The sigil is what tells an operation from an effect, so a declaration
-    /// with some of each says two things at once and neither of them wholly.
-    /// Refused rather than read one way: which of the two was meant is the
-    /// writer's to say.
-    MixedEffectForm,
     /// A row of effects written where a type goes: `let x : !Log = 1`.
     ///
     /// A row is not a type. The one place one may be written without an arrow
@@ -1161,6 +1185,16 @@ pub enum ErrorKind {
         effect: String,
         op: String,
     },
+    /// Bare access to an empty or named-only effect.
+    BareOperationUnavailable {
+        effect: String,
+        suggestion: Option<String>,
+    },
+    /// Dotted access to an unnamed singleton effect.
+    NamedOperationOnUnnamed {
+        effect: String,
+        op: String,
+    },
     /// A handler naming an effect it does not fully cover, as in
     /// `handle p () with | !Log.write s => () end` where `Log` also
     /// declares `flush`.
@@ -1177,7 +1211,7 @@ pub enum ErrorKind {
     /// stands, the way a duplicate anything else is.
     DuplicateArm {
         effect: String,
-        op: String,
+        selector: OperationSelector,
     },
     /// Two `return` arms in one handler. Reported at the second; the first is
     /// the one that stands.
@@ -1322,7 +1356,7 @@ struct Builder<'a> {
     /// An alias has no entry at all, which is what tells `!Console.write`
     /// from `!Log.writ`: one names something that declares no operations,
     /// and the other an operation the effect does not have.
-    operations: HashMap<Symbol, IndexSet<String>>,
+    operations: HashMap<Symbol, IndexSet<OperationSelector>>,
     /// Which handler arm, if any, lexically encloses the term being lowered.
     /// What R17's `raise` placement check reads; see [`Answering`].
     answering: Answering,
@@ -1376,7 +1410,7 @@ struct Builder<'a> {
 #[derive(Default)]
 struct Flat {
     types: Vec<(Option<Module>, TrackedString, Vec<TrackedString>, Annotated)>,
-    effects: Vec<(Option<Module>, TrackedString, Cases)>,
+    effects: Vec<(Option<Module>, TrackedString, EffectBody)>,
     terms: Vec<Defined>,
     externs: Vec<External>,
     /// Shared term/extern source order, which preserves duplicate precedence.
@@ -1413,7 +1447,7 @@ enum DeclaredValue {
 type Annotated = parse::Annotation;
 
 /// One `effect` declaration's cases, as the parser read them.
-type Cases = IndexMap<parse::Path, parse::EffectCase>;
+type EffectBody = parse::EffectBody;
 
 /// One definition's value, as the parser read it.
 type Body = Tracked<Expr>;
@@ -2303,12 +2337,47 @@ fn build_with_dependency_imports_inner(
         );
     }
     // Terms were lowered after the type declarations above; give their rows
-    // the identities already computed before inference sees them.
+    // the identities already computed before inference sees them. Handler
+    // coverage is finalized here too, now that nominal declarations can be
+    // grouped by those identities.
+    // Keep coverage keyed by the same structural identities as effect rows.
+    // `Builder::operations` is the complete selector registry assembled while
+    // resolving terms: imports install their artifact selectors there before
+    // local declarations extend it. Borrow it rather than reconstructing a
+    // local-only view from `Program::effects`; this also leaves ownership of
+    // the builder and its error accumulator explicit during rekeying below.
+    //
+    // Seed every known identity so indexing remains total even for recovery
+    // identities which declare no usable operations. Structurally equivalent
+    // declarations merge their selector sets, whether they came from source,
+    // dependencies, or both.
+    let mut operation_sets: HashMap<EffectId, IndexSet<OperationSelector>> = program
+        .effect_ids
+        .values()
+        .cloned()
+        .map(|identity| (identity, IndexSet::new()))
+        .collect();
+    // Walk the identity table rather than the hash-based selector registry so
+    // a partial-handler diagnostic keeps declaration order. Imported identities
+    // precede locals, and each selector set itself preserves interface order.
+    for (symbol, identity) in &program.effect_ids {
+        if let Some(selectors) = b.operations.get(symbol) {
+            operation_sets
+                .entry(identity.clone())
+                .or_default()
+                .extend(selectors.iter().cloned());
+        }
+    }
     for decl in program.terms.values_mut() {
         if let Some(annotation) = &mut decl.annotation {
             rekey_type(&mut annotation.ty, &program.effect_ids, &mut b.errors);
         }
-        rekey_term(&mut decl.value, &program.effect_ids, &mut b.errors);
+        rekey_term(
+            &mut decl.value,
+            &program.effect_ids,
+            &operation_sets,
+            &mut b.errors,
+        );
     }
     for decl in program.externs.values_mut() {
         let annotation = decl
@@ -2546,7 +2615,8 @@ fn structuralize_effects(
                         .map(|(name, op)| {
                             let mut effects_seen = HashSet::new();
                             format!(
-                                "{name}:{}->{}",
+                                "{}:{}->{}",
+                                name.canonical(),
                                 canonical_type(
                                     &op.from,
                                     &program.types,
@@ -3128,7 +3198,8 @@ fn canonical_effect(
                 .iter()
                 .map(|(name, operation)| {
                     format!(
-                        "{name}:{}->{}",
+                        "{}:{}->{}",
+                        name.canonical(),
                         canonical_type(
                             &operation.from,
                             types,
@@ -3244,18 +3315,25 @@ fn rekey_type(ty: &mut Type, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<
     }
 }
 
-fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
+fn rekey_term(
+    term: &mut Term,
+    ids: &IndexMap<Symbol, EffectId>,
+    operations: &HashMap<EffectId, IndexSet<OperationSelector>>,
+    errors: &mut Vec<Error>,
+) {
     match &mut term.kind {
-        TermKind::Unary { value, .. } => rekey_term(value, ids, errors),
+        TermKind::Unary { value, .. } => rekey_term(value, ids, operations, errors),
         TermKind::Binary { left, right, .. } => {
-            rekey_term(left, ids, errors);
-            rekey_term(right, ids, errors);
+            rekey_term(left, ids, operations, errors);
+            rekey_term(right, ids, operations, errors);
         }
         TermKind::Apply { func, arg } => {
-            rekey_term(func, ids, errors);
-            rekey_term(arg, ids, errors);
+            rekey_term(func, ids, operations, errors);
+            rekey_term(arg, ids, operations, errors);
         }
-        TermKind::Fn { body, .. } | TermKind::Raise(body) => rekey_term(body, ids, errors),
+        TermKind::Fn { body, .. } | TermKind::Raise(body) => {
+            rekey_term(body, ids, operations, errors)
+        }
         TermKind::Let {
             annotation,
             value,
@@ -3265,47 +3343,73 @@ fn rekey_term(term: &mut Term, ids: &IndexMap<Symbol, EffectId>, errors: &mut Ve
             if let Some(annotation) = annotation {
                 rekey_type(&mut annotation.ty, ids, errors);
             }
-            rekey_term(value, ids, errors);
-            rekey_term(body, ids, errors);
+            rekey_term(value, ids, operations, errors);
+            rekey_term(body, ids, operations, errors);
         }
         TermKind::Struct(fields) => {
             for field in fields.values_mut() {
-                rekey_term(&mut field.value, ids, errors);
+                rekey_term(&mut field.value, ids, operations, errors);
             }
         }
         TermKind::Tag {
             payload: Some(payload),
             ..
-        } => rekey_term(payload, ids, errors),
-        TermKind::Project { base, .. } => rekey_term(base, ids, errors),
+        } => rekey_term(payload, ids, operations, errors),
+        TermKind::Project { base, .. } => rekey_term(base, ids, operations, errors),
         TermKind::Match { scrutinee, arms } => {
-            rekey_term(scrutinee, ids, errors);
+            rekey_term(scrutinee, ids, operations, errors);
             for (_, body) in arms {
-                rekey_term(body, ids, errors);
+                rekey_term(body, ids, operations, errors);
             }
         }
         TermKind::Handle { body, handler } => {
-            rekey_term(body, ids, errors);
+            rekey_term(body, ids, operations, errors);
             for arm in &mut handler.arms {
-                rekey_term(&mut arm.body, ids, errors);
+                rekey_term(&mut arm.body, ids, operations, errors);
             }
             if let Some(ret) = &mut handler.ret {
-                rekey_term(&mut ret.body, ids, errors);
+                rekey_term(&mut ret.body, ids, operations, errors);
             }
-            // Structural effect identity makes arms for equivalent effects
-            // duplicate implementations of the same operation, just as two
-            // arms naming one source effect are.
-            let mut seen = HashSet::new();
-            for arm in &handler.arms {
-                // Unresolved operations are dropped while lowering the
-                // handler, so every retained arm has a structural identity.
-                let effect = &ids[&arm.effect.tracked];
-                if !seen.insert((effect.clone(), arm.op.tracked.clone())) {
+
+            // Coverage is structural, not nominal. Equivalent declarations may
+            // contribute different selectors to one evidence record, while a
+            // repeated selector across either spelling is still one duplicate.
+            let mut covered: IndexMap<EffectId, (Tracked<Symbol>, IndexSet<OperationSelector>)> =
+                IndexMap::new();
+            let mut unique = Vec::new();
+            for arm in std::mem::take(&mut handler.arms) {
+                let effect = ids[&arm.effect.tracked].clone();
+                let group = covered
+                    .entry(effect.clone())
+                    .or_insert_with(|| (arm.effect, IndexSet::new()));
+                if group.1.insert(arm.selector.tracked.clone()) {
+                    unique.push(arm);
+                } else {
                     errors.push(Error {
-                        span: arm.op.span,
+                        span: arm.selector.span,
                         kind: ErrorKind::DuplicateArm {
                             effect: effect.name().to_string(),
-                            op: arm.op.tracked.clone(),
+                            selector: arm.selector.tracked,
+                        },
+                    });
+                }
+            }
+            handler.arms = unique;
+            handler.discharges.clear();
+            for (effect, (representative, arms)) in covered {
+                let missing: Vec<String> = operations[&effect]
+                    .iter()
+                    .filter(|selector| !arms.contains(*selector))
+                    .map(OperationSelector::source_name)
+                    .collect();
+                if missing.is_empty() {
+                    handler.discharges.push(representative);
+                } else {
+                    errors.push(Error {
+                        span: representative.span,
+                        kind: ErrorKind::PartialHandler {
+                            effect: effect.name().to_string(),
+                            missing,
                         },
                     });
                 }
@@ -5596,7 +5700,7 @@ impl Builder<'_> {
                 StmtKind::Type { name, params, body } => {
                     flat.types.push((outer, name, params, body))
                 }
-                StmtKind::Effect { name, cases } => flat.effects.push((outer, name, cases)),
+                StmtKind::Effect { name, body } => flat.effects.push((outer, name, body)),
                 StmtKind::Let { pattern, ty, body } => {
                     let at = flat.terms.len();
                     flat.terms.push((outer, pattern, ty, body));
@@ -5888,7 +5992,14 @@ impl Builder<'_> {
                             symbol,
                             operations
                                 .iter()
-                                .map(|operation| operation.name.clone())
+                                .map(|operation| match &operation.selector {
+                                    artifact::OperationSelector::Unnamed => {
+                                        OperationSelector::Unnamed
+                                    }
+                                    artifact::OperationSelector::Named(name) => {
+                                        OperationSelector::Named(name.clone())
+                                    }
+                                })
                                 .collect(),
                         );
                         for operation in operations {
@@ -5904,9 +6015,15 @@ impl Builder<'_> {
                                 &mut symbols,
                                 &mut program.external_names,
                             );
+                            let selector = match &operation.selector {
+                                artifact::OperationSelector::Unnamed => OperationSelector::Unnamed,
+                                artifact::OperationSelector::Named(name) => {
+                                    OperationSelector::Named(name.clone())
+                                }
+                            };
                             program
                                 .external_operations
-                                .insert((symbol, operation.name.clone()), (from, to));
+                                .insert((symbol, selector), (from, to));
                         }
                     }
                     artifact::EffectKind::Alias(names) => {
@@ -6195,45 +6312,17 @@ impl Builder<'_> {
         }
     }
 
-    /// Lower one `effect` declaration's cases into the operations they declare
-    /// or the effects they name.
-    ///
-    /// Which of the two forms it is, is decided by the `:`s: all of them is an
-    /// operation declaration, none of them an alias, and a mix is refused —
-    /// where the majority is not the point, so a mixed declaration is read as
-    /// whichever form its *first* case is and every case of the other form is
-    /// dropped, leaving one complaint and a declaration that still stands for
-    /// something. The empty declaration, `effect Nil`, has no first case and
-    /// declares nothing.
-    fn effect(&mut self, cases: Cases) -> Effect {
-        // The empty declaration takes the operation form: `effect Nil` is an
-        // effect a row may name that declares nothing, rather than a name
-        // standing for no effects at all.
-        let aliasing = matches!(cases.values().next(), Some(parse::EffectCase::Alias));
-        let mut mixed = false;
-        let mut operations: IndexMap<String, Operation> = IndexMap::new();
-        let mut names: IndexMap<String, Named> = IndexMap::new();
-        for (name, case) in cases {
-            match (case, aliasing) {
-                (parse::EffectCase::Operation { signature }, false) => {
-                    // An operation is declared here, so its key is a bare name
-                    // and the path around it is empty.
-                    let op = name.name;
-                    let lowered = self.operation(&op, *signature);
-                    if operations.contains_key(&op.tracked) {
-                        self.error(op.span, ErrorKind::DuplicateOperation);
-                        continue;
-                    }
-                    operations.insert(op.tracked, lowered);
-                }
-                (parse::EffectCase::Alias, true) => {
+    /// Lower one of the four disjoint effect declaration bodies.
+    fn effect(&mut self, body: EffectBody) -> Effect {
+        match body {
+            parse::EffectBody::Empty => Effect::Operations(IndexMap::new()),
+            parse::EffectBody::Alias(cases) => {
+                let mut names = IndexMap::new();
+                for (name, ()) in cases {
                     let at = name.span();
                     let Some(symbol) = self.resolve(&name, Namespace::Effects) else {
                         continue;
                     };
-                    // Keyed by the effect's full module path, so two spellings
-                    // of one effect are one case but `A::!Log` and `B::!Log`
-                    // remain distinct.
                     let label = effect_key(self.mint, symbol);
                     if names.contains_key(&label) {
                         self.error(at, ErrorKind::DuplicateCase);
@@ -6247,23 +6336,27 @@ impl Builder<'_> {
                         },
                     );
                 }
-                // A case of the other form. Reported once, at the first of
-                // them, and dropped: the declaration still stands for what its
-                // own form says, so nothing downstream is told a second time.
-                (case, _) => {
-                    if let parse::EffectCase::Operation { signature } = case {
-                        self.ty(*signature, Place::Operation);
-                    }
-                    if !mixed {
-                        mixed = true;
-                        self.error(name.span(), ErrorKind::MixedEffectForm);
-                    }
-                }
+                Effect::Alias(names)
             }
-        }
-        match aliasing {
-            true => Effect::Alias(names),
-            false => Effect::Operations(operations),
+            parse::EffectBody::Unnamed { signature } => {
+                let span = signature.span;
+                let selector = OperationSelector::Unnamed;
+                let operation = self.operation(&span.track("<unnamed>".to_string()), *signature);
+                Effect::Operations([(selector, operation)].into_iter().collect())
+            }
+            parse::EffectBody::Named(fields) => {
+                let mut operations = IndexMap::new();
+                for (name, signature) in fields {
+                    let selector = OperationSelector::Named(name.tracked.clone());
+                    let operation = self.operation(&name, *signature);
+                    if operations.contains_key(&selector) {
+                        self.error(name.span, ErrorKind::DuplicateOperation);
+                        continue;
+                    }
+                    operations.insert(selector, operation);
+                }
+                Effect::Operations(operations)
+            }
         }
     }
 
@@ -6972,14 +7065,20 @@ impl Builder<'_> {
             // An operation is an ordinary value: what it resolves to is the
             // effect and the label, and the type it gets is the declared
             // signature with the effect's own label on its outermost arrow.
-            ExprKind::Operation { effect, op } => match self.operation_of(&effect, &op) {
-                Some(symbol) => TermKind::Operation {
-                    effect: effect.span().track(symbol),
-                    op,
+            ExprKind::Operation { effect, selector } => {
+                let selector = selector.span.track(match selector.tracked {
+                    parse::OperationSelector::Unnamed => OperationSelector::Unnamed,
+                    parse::OperationSelector::Named(name) => OperationSelector::Named(name),
+                });
+                match self.operation_of(&effect, &selector) {
+                    Some(symbol) => TermKind::Operation {
+                        effect: effect.span().track(symbol),
+                        selector,
+                    }
+                    .with_span(span),
+                    None => TermKind::Error.with_span(span),
                 }
-                .with_span(span),
-                None => TermKind::Error.with_span(span),
-            },
+            }
             ExprKind::Handle { body, arms } => self.handle_term(span, *body, arms),
             // The check R17 is: a `raise` answers the innermost arm around it,
             // and a `fn` between the two is a closure that could outlive the
@@ -7005,21 +7104,35 @@ impl Builder<'_> {
     /// Three ways to fail and a complaint apiece: the head names no effect at
     /// all, the head is an alias — which declares no operations, so there is
     /// nothing there to perform — or the effect declares no such operation.
-    fn operation_of(&mut self, effect: &parse::Path, op: &TrackedString) -> Option<Symbol> {
+    fn operation_of(
+        &mut self,
+        effect: &parse::Path,
+        selector: &Tracked<OperationSelector>,
+    ) -> Option<Symbol> {
         let symbol = self.resolve(effect, Namespace::Effects)?;
         match self.operations.get(&symbol) {
-            Some(operations) if operations.contains(&op.tracked) => Some(symbol),
-            Some(_) => {
-                self.error(
-                    op.span,
-                    ErrorKind::UnknownOperation {
-                        // The name it was declared under, not the path that
-                        // reached it: the complaint is about the effect, and
-                        // the span already shows how it was written.
-                        effect: self.mint.name(symbol).to_string(),
-                        op: op.tracked.clone(),
+            Some(operations) if operations.contains(&selector.tracked) => Some(symbol),
+            Some(operations) => {
+                let effect_name = self.mint.name(symbol).to_string();
+                let kind = match &selector.tracked {
+                    OperationSelector::Unnamed => ErrorKind::BareOperationUnavailable {
+                        effect: effect_name,
+                        suggestion: operations.iter().next().map(OperationSelector::source_name),
                     },
-                );
+                    OperationSelector::Named(op)
+                        if operations.contains(&OperationSelector::Unnamed) =>
+                    {
+                        ErrorKind::NamedOperationOnUnnamed {
+                            effect: effect_name,
+                            op: op.clone(),
+                        }
+                    }
+                    OperationSelector::Named(op) => ErrorKind::UnknownOperation {
+                        effect: effect_name,
+                        op: op.clone(),
+                    },
+                };
+                self.error(selector.span, kind);
                 None
             }
             None => {
@@ -7038,11 +7151,11 @@ impl Builder<'_> {
     ///
     /// The handled expression first, then the arms, each with its binder in
     /// scope for its own body and released after it — the shape a `match`
-    /// keeps. What is decided here rather than typed is R15's coverage: every
-    /// effect an arm names has to have an arm for each of its operations, so
-    /// which effects the handler discharges is known before a constraint is
-    /// generated. And the answer is what R16 hands the body as a larger
-    /// ambient.
+    /// keeps. R15's coverage is decided by this phase rather than inference,
+    /// but only after structural effect identities have been computed: arms
+    /// using equivalent declarations can then contribute to one interface.
+    /// The resulting discharges are still known before constraints are
+    /// generated, and are what R16 hands the body as a larger ambient.
     fn handle_term(&mut self, span: Span, body: Expr, arms: Vec<parse::HandlerArm>) -> Term {
         let body = self.term(body);
         // An arm's body runs where the `handle` was written rather than inside
@@ -7051,9 +7164,6 @@ impl Builder<'_> {
         let outer = std::mem::replace(&mut self.answering, Answering::Arm);
         let mut lowered: Vec<HandlerArm> = Vec::new();
         let mut ret: Option<ReturnArm> = None;
-        // Which effects the arms name, and which of their operations have an
-        // arm, in the order the arms first named them.
-        let mut covered: IndexMap<Symbol, (Span, IndexSet<String>)> = IndexMap::new();
         for arm in arms {
             match arm.head {
                 parse::ArmHead::Return { span: at } => {
@@ -7076,28 +7186,19 @@ impl Builder<'_> {
                         });
                     }
                 }
-                parse::ArmHead::Operation { effect, op } => {
-                    let symbol = self.operation_of(&effect, &op);
+                parse::ArmHead::Operation { effect, selector } => {
+                    let selector = selector.span.track(match selector.tracked {
+                        parse::OperationSelector::Unnamed => OperationSelector::Unnamed,
+                        parse::OperationSelector::Named(name) => OperationSelector::Named(name),
+                    });
+                    let symbol = self.operation_of(&effect, &selector);
                     let (binder, body) = self.arm_body(arm.binder, arm.body);
                     let Some(symbol) = symbol else {
                         continue;
                     };
-                    let seen = covered
-                        .entry(symbol)
-                        .or_insert_with(|| (effect.span(), IndexSet::new()));
-                    if !seen.1.insert(op.tracked.clone()) {
-                        self.error(
-                            op.span,
-                            ErrorKind::DuplicateArm {
-                                effect: effect.name.tracked.clone(),
-                                op: op.tracked.clone(),
-                            },
-                        );
-                        continue;
-                    }
                     lowered.push(HandlerArm {
                         effect: effect.span().track(symbol),
-                        op,
+                        selector,
                         binder,
                         body,
                     });
@@ -7105,37 +7206,15 @@ impl Builder<'_> {
             }
         }
         self.answering = outer;
-        // Every effect an arm names must be fully covered: a half-handled
-        // effect leaves it undecidable which effects the body may still
-        // perform, and there is no answer for inference to fall back on.
-        let mut discharges = Vec::new();
-        for (symbol, (at, arms)) in covered {
-            let missing: Vec<String> = self
-                .operations
-                .get(&symbol)
-                .into_iter()
-                .flatten()
-                .filter(|name| !arms.contains(*name))
-                .cloned()
-                .collect();
-            if missing.is_empty() {
-                discharges.push(at.track(symbol));
-                continue;
-            }
-            self.error(
-                at,
-                ErrorKind::PartialHandler {
-                    effect: self.mint.name(symbol).to_string(),
-                    missing,
-                },
-            );
-        }
+        // Coverage and duplicate selection are finalized after structural
+        // effect identities have been computed. Until then, source symbols do
+        // not tell us which arms belong to one semantic interface.
         TermKind::Handle {
             body: Box::new(body),
             handler: Handler {
                 arms: lowered,
                 ret,
-                discharges,
+                discharges: Vec::new(),
             },
         }
         .with_span(span)

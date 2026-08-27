@@ -17,7 +17,9 @@ use std::fmt::Write;
 
 use ruddy::{
     ir::Literal,
-    lir::{Block, Callee, End, Extern, Function, Global, Instr, Op, Output, Rep, Terminator},
+    lir::{
+        Block, Callee, End, Extern, FieldKey, Function, Global, Instr, Op, Output, Rep, Terminator,
+    },
 };
 
 /// How far one level of nesting indents. An arm label sits one level under its
@@ -240,6 +242,13 @@ fn effect_name(name: &str) -> &str {
     name.split('\u{1f}').next().unwrap_or(name)
 }
 
+fn field_name(field: &FieldKey) -> &str {
+    match field {
+        FieldKey::Named(name) => effect_name(name),
+        FieldKey::UnnamedOperation => "<unnamed>",
+    }
+}
+
 /// Render a primitive literal exactly as source syntax would spell it.
 /// Debug formatting keeps string delimiters and escapes intact.
 fn literal(value: &Literal) -> String {
@@ -269,7 +278,7 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Struct(fields) => {
             let entries: Vec<String> = fields
                 .iter()
-                .map(|(name, temp)| format!("{}: %{temp}", effect_name(name)))
+                .map(|(field, temp)| format!("{}: %{temp}", field_name(field)))
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
         }
@@ -277,7 +286,7 @@ fn operation(output: &Output, op: &Op) -> String {
             let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();
             format!("merge {}", laid.join(", "))
         }
-        Op::Project { base, field } => format!("project %{base}, {:?}", effect_name(field)),
+        Op::Project { base, field } => format!("project %{base}, {:?}", field_name(field)),
         Op::Tag {
             name,
             payload: None,

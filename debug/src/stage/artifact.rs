@@ -59,7 +59,24 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         interface.push(Node::new(ids.next(), "type", &ty.name));
     }
     for effect in &artifact.header.effects {
-        interface.push(Node::new(ids.next(), "effect", &effect.name));
+        let mut node = Node::new(ids.next(), "effect", &effect.name);
+        if let ruddy::artifact::EffectKind::Operations(operations) = &effect.kind {
+            node = node.children(
+                operations
+                    .iter()
+                    .map(|operation| {
+                        let selector = match &operation.selector {
+                            ruddy::artifact::OperationSelector::Unnamed => "unnamed".to_string(),
+                            ruddy::artifact::OperationSelector::Named(name) => {
+                                format!("named {name}")
+                            }
+                        };
+                        Node::new(ids.next(), "selector", selector)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        interface.push(node);
     }
     let header = Node::new(
         ids.next(),

@@ -6107,8 +6107,8 @@ fn infer_codes(src: &str) -> Vec<&'static str> {
 }
 
 /// The three effect declarations every example in the spec is written against.
-const EFFECTS: &str = "effect Log = write : Nat -> ()\n\
-                       effect IO = print : Nat -> ()\n";
+const EFFECTS: &str = "effect Log = { write: Nat -> () }\n\
+                       effect IO = { print: Nat -> () }\n";
 
 /// R23's closing rule, over the four schemes the spec names. An effect row
 /// variable the solver learned nothing about sits on one arrow and no other, so
@@ -6169,8 +6169,8 @@ fn a_handler_discharges_what_its_arms_cover() {
 /// discharges it.
 #[test]
 fn same_interface_effects_are_interchangeable_across_modules() {
-    let src = "module Foo =\n  effect Log = write : Nat -> ()\nend\n\
-               module Bar =\n  effect Log = write : Nat -> ()\nend\n\
+    let src = "module Foo =\n  effect Log = { write: Nat -> () }\nend\n\
+               module Bar =\n  effect Log = { write: Nat -> () }\nend\n\
                let foo : Nat -> {} + Foo::!Log = fn n => let _ = Foo::!Log.write n in {}\n\
                let bar : Nat -> {} + Bar::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
                let cross : Nat -> {} + Foo::!Log = fn n => let _ = Bar::!Log.write n in {}\n\
@@ -6189,7 +6189,7 @@ fn same_interface_effects_are_interchangeable_across_modules() {
 #[test]
 fn an_arm_resumes_and_raise_aborts() {
     let (mint, _, output) = inferred(
-        "effect Fail = oops : () -> Nat\n\
+        "effect Fail = { oops: () -> Nat }\n\
          let fallback : () -> Nat = fn _ =>\n\
            handle !Fail.oops () with | !Fail.oops _ => 0n end\n\
          let recover : () -> Nat = fn _ =>\n\

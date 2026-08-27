@@ -159,12 +159,13 @@ let greet : () -> Nat + Sys::!Log + \Sys::!IO = f
 (source_file
   (effect_definition
     (identifier)
-    (effect_alias
-      (effect_path
-        (identifier)
-        (effect_label)))
-    (effect_alias
-      (effect_label)))
+    (effect_alias_union
+      (effect_alias
+        (effect_path
+          (identifier)
+          (effect_label)))
+      (effect_alias
+        (effect_label))))
   (let_definition
     (identifier)
     (annotation

@@ -114,29 +114,11 @@ pub enum StmtKind {
         /// already refuses the `..` beside them for the same reason.
         body: Annotation,
     },
-    /// `effect Log = write : Nat -> () | flush : () -> ()` — an effect and
-    /// the operations it declares — or `effect Console = !Log + !IO`,
-    /// a name standing for the effects it lists.
-    ///
-    /// One node for the two forms, because the parser judges nothing: which of
-    /// them a declaration is, is decided by whether its cases carry a `:`, and
-    /// a declaration that mixes them is refused where the rest of the rules
-    /// about what an effect may be live. See
-    /// [`ir::ErrorKind::MixedEffectForm`](crate::ir::ErrorKind).
-    ///
-    /// `effect` takes no parameters, so there is no list here for one: an
-    /// effect stands for the same thing wherever it is written.
+    /// An effect declaration: empty, an alias union, an unnamed singleton, or
+    /// a closed named interface.
     Effect {
         name: TrackedString,
-        /// The cases, in the order they were written. Empty for an empty
-        /// effect, `effect Nil`, which declares nothing and is legal.
-        ///
-        /// Keyed by [`Path`] because an alias names an effect from elsewhere,
-        /// and elsewhere may be another module: `effect Console = Sys::!Log`.
-        /// An operation is declared here rather than named, so its key is a
-        /// path with no segments — the parser reads a bare name at that
-        /// position and nothing else.
-        cases: IndexMap<Path, EffectCase>,
+        body: EffectBody,
     },
     /// `module A = <stmts> end`, or `module A` for one whose body is another
     /// file.
@@ -152,24 +134,29 @@ pub enum StmtKind {
     },
 }
 
-/// One case of an `effect` declaration: an operation and its signature, or an
-/// effect named for this one to stand for.
-///
-/// Told apart by the sigil and by nothing else, which is what makes the two
-/// forms of the declaration a question about its cases rather than about a
-/// keyword.
+/// The four deliberately disjoint surface forms of an effect declaration.
 #[derive(Debug, Clone)]
-pub enum EffectCase {
-    /// `write : Nat -> ()` — an operation, with the signature performing it
-    /// has. Whether that signature is the plain closed arrow R3 requires is
-    /// lowering's to say.
-    ///
-    /// Boxed for the reason [`ExprKind::Let`] boxes its ascription: a signature
-    /// is a whole written type, and inlining one here would grow every case of
-    /// every declaration to the size of the ones that have one.
-    Operation { signature: Box<Type> },
-    /// `!Log` — an effect this one stands for.
-    Alias,
+pub enum EffectBody {
+    Empty,
+    Alias(IndexMap<Path, ()>),
+    Unnamed { signature: Box<Type> },
+    Named(Vec<(TrackedString, Box<Type>)>),
+}
+
+/// How an operation is selected within an effect.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OperationSelector {
+    Unnamed,
+    Named(String),
+}
+
+impl fmt::Display for OperationSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unnamed => Ok(()),
+            Self::Named(name) => write!(f, ".{name}"),
+        }
+    }
 }
 
 pub type Expr = Tracked<ExprKind>;
@@ -303,7 +290,7 @@ pub enum ExprKind {
         /// in `Sys`. The path qualifies the whole sigilled label, so the
         /// segments come before the `!`.
         effect: Path,
-        op: TrackedString,
+        selector: Tracked<OperationSelector>,
     },
     Ident {
         name: Path,
@@ -343,7 +330,10 @@ pub enum ArmHead {
     /// `!Log.write s => ...` — one operation, whose declared signature is
     /// the arm's own. The effect is a whole path, exactly as
     /// [`ExprKind::Operation`] holds one.
-    Operation { effect: Path, op: TrackedString },
+    Operation {
+        effect: Path,
+        selector: Tracked<OperationSelector>,
+    },
     /// `return x => ...` — the value arm, which may appear at most once and in
     /// any position. `return` is contextual: it heads an arm here and is an
     /// ordinary name everywhere else. The span is the keyword's, which is where
@@ -760,14 +750,6 @@ struct Parser {
 }
 
 impl Path {
-    /// A bare name: a path with no modules to walk.
-    pub fn bare(name: TrackedString) -> Self {
-        Self {
-            modules: Vec::new(),
-            name,
-        }
-    }
-
     /// Where the whole path was written: the first segment, when there is one,
     /// through the name at the end.
     pub fn span(&self) -> Span {
@@ -934,13 +916,6 @@ impl Parser {
             self.advance();
         }
         name
-    }
-
-    /// Whether the next token is a name. What an effect declaration's case list
-    /// asks before reading an operation: the list ending and a name coming next
-    /// are two different answers, and only one of them is an error.
-    fn at_ident(&self) -> bool {
-        matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::Identifier(_)))
     }
 
     fn ident(&mut self) -> Option<TrackedString> {
@@ -1124,92 +1099,100 @@ impl Parser {
         )
     }
 
-    /// `effect <name> [= [|] <case> ('|' <case>)*]`, where a case is an operation
-    /// — a bare name and the `: <signature>` that says what performing it does
-    /// — or `!Other`, an effect this one names.
-    ///
-    /// The two are told apart by the sigil and by nothing else, which is what
-    /// the `!` buys: an operation is declared here, so it is a name, and an
-    /// effect is named from elsewhere, so it wears the mark that says so.
-    /// Whether a declaration may mix them is not decided here — the parser
-    /// records the cases and lowering refuses the mixture; see
-    /// [`ir::ErrorKind::MixedEffectForm`](crate::ir::ErrorKind).
-    ///
-    /// The same `|` convention a sum type keeps: the leading bar is optional
-    /// when there are cases, and a mark *between* cases promises another one,
-    /// so nothing after one is reported at the mark. No cases means no `=`:
-    /// `effect Nil` is the empty effect. An alias takes the `+` an effect row
-    /// writes as well, since a declaration naming effects is the union of them
-    /// that a row is.
+    /// `effect E`, `effect E = !A + !B`, `effect E = A -> B`, or
+    /// `effect E = { op: A -> B, ... }`.
     fn effect_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `effect`");
         if self.at_wildcard() {
             return self.wildcard(Place::Type);
         }
         let name = self.ident()?;
-        let mut cases = IndexMap::new();
         let mut span = kw.span.merge(name.span);
-        let Some(equal) = self.eat_if(&Kind::Equal) else {
-            return Some(span.track(StmtKind::Effect { name, cases }));
-        };
-        // A leading bar is allowed only before a case. Unlike the separator
-        // below, it does not promise a case by itself, but `effect Nil = |` is
-        // no longer the spelling of the empty effect, so diagnose that bar.
-        let leading = self.eat_if(&Kind::Pipe);
-        // The `|` that separated the last case from what comes next, once one
-        // has been read.
-        let mut separator = None;
-        loop {
-            // An effect named here is an alias case, whole; anything else has
-            // to be an operation, which is a name and the signature it must
-            // carry. A bare name with no `:` after it is the missing signature
-            // it looks like, reported where the `:` should have been.
-            let (name, case) = match self.effect() {
-                Some(name) => (name, EffectCase::Alias),
-                None if self.at_ident() => {
-                    let op = self.ident().expect("just peeked a name");
-                    self.eat(&Kind::Colon)?;
-                    let signature = self.type_expr()?;
-                    span = span.merge(signature.span);
-                    (
-                        // An operation is declared here rather than named, so
-                        // it is a bare name and the path around it is empty.
-                        Path::bare(op),
-                        EffectCase::Operation {
-                            signature: Box::new(signature),
-                        },
-                    )
-                }
-                None => {
-                    if let Some(bar) = separator.or(leading.map(|bar| bar.span)) {
-                        self.error(bar, ErrorKind::Unexpected);
-                    } else {
-                        // An `=` starts a case list, so it needs a case.
-                        self.error(equal.span, ErrorKind::Unexpected);
-                    }
+        if self.eat_if(&Kind::Equal).is_none() {
+            return Some(span.track(StmtKind::Effect {
+                name,
+                body: EffectBody::Empty,
+            }));
+        }
+
+        let body = if self.at_effect_label(self.pos) {
+            let mut aliases = IndexMap::new();
+            loop {
+                let effect = self
+                    .effect()
+                    .expect("the branch established an effect label");
+                span = span.merge(effect.span());
+                aliases.insert(effect, ());
+                let Some(plus) = self.eat_if(&Kind::Plus) else {
+                    break;
+                };
+                if !self.at_effect_label(self.pos) {
+                    self.error(plus.span, ErrorKind::Unexpected);
                     break;
                 }
-            };
-            span = span.merge(name.span());
-            // An alias may be unioned onto the last with the `+` an effect row
-            // writes — the two say the same thing, and this is the one form of
-            // the declaration that is a union of effects. An operation's
-            // separator is the `|` alone: its signature is a type, and a `+`
-            // after one is that type's own effect row.
-            let aliasing = matches!(case, EffectCase::Alias);
-            cases.insert(name, case);
-            let mark = match aliasing {
-                true => self
-                    .eat_if(&Kind::Plus)
-                    .or_else(|| self.eat_if(&Kind::Pipe)),
-                false => self.eat_if(&Kind::Pipe),
-            };
-            match mark {
-                Some(mark) => separator = Some(mark.span),
-                None => break,
+            }
+            EffectBody::Alias(aliases)
+        } else if matches!(self.peek().map(|t| &t.tracked), Some(Kind::LeftBrace))
+            && !self.brace_heads_arrow()
+        {
+            let open = self.advance().expect("just peeked `{`");
+            let mut fields = Vec::new();
+            if matches!(self.peek().map(|t| &t.tracked), Some(Kind::RightBrace)) {
+                self.error(open.span, ErrorKind::Unexpected);
+            }
+            while !matches!(
+                self.peek().map(|t| &t.tracked),
+                Some(Kind::RightBrace) | None
+            ) {
+                let field = self.ident()?;
+                self.eat(&Kind::Colon)?;
+                let signature = self.type_expr()?;
+                span = span.merge(signature.span);
+                if !matches!(&signature.tracked, TypeKind::Arrow { .. }) {
+                    self.error(signature.span, ErrorKind::Unexpected);
+                }
+                fields.push((field, Box::new(signature)));
+                if self.eat_if(&Kind::Comma).is_none() {
+                    break;
+                }
+            }
+            let close = self.eat(&Kind::RightBrace)?;
+            span = span.merge(close.span);
+            EffectBody::Named(fields)
+        } else {
+            let signature = self.type_expr()?;
+            span = span.merge(signature.span);
+            if !matches!(&signature.tracked, TypeKind::Arrow { .. }) {
+                self.error(signature.span, ErrorKind::Unexpected);
+            }
+            EffectBody::Unnamed {
+                signature: Box::new(signature),
+            }
+        };
+        Some(span.track(StmtKind::Effect { name, body }))
+    }
+
+    /// Whether the brace-delimited type at the cursor is immediately the input
+    /// of an arrow. This is the only ambiguity between a named interface and
+    /// an unnamed operation whose input is a struct.
+    fn brace_heads_arrow(&self) -> bool {
+        let mut depth = 0usize;
+        for (at, token) in self.toks.iter().enumerate().skip(self.pos) {
+            match token.tracked {
+                Kind::LeftBrace => depth += 1,
+                Kind::RightBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.toks.get(at + 1).map(|t| &t.tracked),
+                            Some(Kind::Arrow)
+                        );
+                    }
+                }
+                _ => {}
             }
         }
-        Some(span.track(StmtKind::Effect { name, cases }))
+        false
     }
 
     /// `extern <name> : <annotation> = <target>` — a target-supplied value.
@@ -1581,28 +1564,21 @@ impl Parser {
         }))
     }
 
-    /// `!Log.write` — one operation of an effect, as an ordinary value.
-    ///
-    /// An atom rather than a projection, which is what the `!` buys. An effect
-    /// is a value of nothing, so `!Log` heads this and nothing else, and the
-    /// operation after the `.` can be a plain name without ever being read as a
-    /// field: there is no record on the left for it to be read off.
-    ///
-    /// The `.` is required. An effect on its own is not a value — there is
-    /// nothing it could evaluate to — so `let x = !Log` is refused here rather
-    /// than lowered into a complaint about a term the reader never wrote.
+    /// `!Log` or `!State.get` — an operation as an ordinary value.
     fn operation_expr(&mut self) -> Option<Expr> {
         let effect = self.effect().expect("the caller peeked an effect");
         let at = effect.span();
-        self.eat(&Kind::Dot)?;
-        // `!Log._` names an operation nothing: the complaint is the wildcard's,
-        // worded for the projection it most nearly is.
-        if self.at_wildcard() {
-            return self.wildcard(Place::Projection);
-        }
-        let op = self.ident()?;
-        let span = at.merge(op.span);
-        Some(span.track(ExprKind::Operation { effect, op }))
+        let selector = if self.eat_if(&Kind::Dot).is_some() {
+            if self.at_wildcard() {
+                return self.wildcard(Place::Projection);
+            }
+            let op = self.ident()?;
+            op.span.track(OperationSelector::Named(op.tracked))
+        } else {
+            at.track(OperationSelector::Unnamed)
+        };
+        let span = at.merge(selector.span);
+        Some(span.track(ExprKind::Operation { effect, selector }))
     }
 
     /// `( <expr> )` — grouping only. The parentheses override application's
@@ -1779,9 +1755,14 @@ impl Parser {
                 let Some(effect) = self.effect() else {
                     return self.unexpected();
                 };
-                self.eat(&Kind::Dot)?;
-                let op = self.ident()?;
-                ArmHead::Operation { effect, op }
+                let at = effect.span();
+                let selector = if self.eat_if(&Kind::Dot).is_some() {
+                    let op = self.ident()?;
+                    op.span.track(OperationSelector::Named(op.tracked))
+                } else {
+                    at.track(OperationSelector::Unnamed)
+                };
+                ArmHead::Operation { effect, selector }
             }
         };
         let binder = self.binder()?;

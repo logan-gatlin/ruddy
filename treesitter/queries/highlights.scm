@@ -23,7 +23,10 @@
 (parenthesized_type (identifier) @type)
 (struct_type_field type: (identifier) @type)
 (sum_case payload: (identifier) @type)
-(operation_declaration signature: (identifier) @type)
+(effect_operation_field signature: (function_type from: (identifier) @type))
+(effect_operation_field signature: (function_type to: (identifier) @type))
+(parenthesized_effect_operation_signature signature: (function_type from: (identifier) @type))
+(parenthesized_effect_operation_signature signature: (function_type to: (identifier) @type))
 (extern_definition type: (annotation type: (identifier) @type))
 
 ; A path written where a type goes: the name at the end of it is the type, and
@@ -36,7 +39,10 @@
 (parenthesized_type (path name: (identifier) @type))
 (struct_type_field type: (path name: (identifier) @type))
 (sum_case payload: (path name: (identifier) @type))
-(operation_declaration signature: (path name: (identifier) @type))
+(effect_operation_field signature: (function_type from: (path name: (identifier) @type)))
+(effect_operation_field signature: (function_type to: (path name: (identifier) @type)))
+(parenthesized_effect_operation_signature signature: (function_type from: (path name: (identifier) @type)))
+(parenthesized_effect_operation_signature signature: (function_type to: (path name: (identifier) @type)))
 (extern_definition type: (annotation type: (path name: (identifier) @type)))
 
 (type_definition name: (identifier) @type.definition)
@@ -62,7 +68,7 @@
 (effect_label) @module @namespace
 
 (effect_definition name: (identifier) @module @namespace)
-(operation_declaration name: (identifier) @function)
+(effect_operation_field name: (identifier) @function)
 (operation name: (identifier) @function)
 (extern_definition name: (identifier) @function)
 (foreign_path segment: (identifier) @module @namespace)
