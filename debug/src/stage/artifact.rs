@@ -24,6 +24,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let Some(artifact) = cx.artifact else {
         return missing(spec, cx.artifact_panicked);
     };
+    render(spec, cx, artifact, cx.micros.artifact)
+}
+
+/// Render an artifact-shaped compiler boundary for artifact and link stages.
+pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     let text = Artifact::print(artifact);
     let mut ids = Ids::default();
 
@@ -90,7 +95,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     };
 
     Stage {
-        micros: Some(cx.micros.artifact),
+        micros: Some(micros),
         nodes: vec![header, lir],
         text: Some(text),
         debug: format!("{artifact:#?}"),

@@ -544,6 +544,7 @@ fn every_stage_reports_on_the_demo() {
             "patterns",
             "lir",
             "artifact",
+            "linked",
             "symbols",
             "types-ir"
         ]
@@ -554,7 +555,7 @@ fn every_stage_reports_on_the_demo() {
         // The demo ends in three deliberate mistakes, and LIR runs on accepted
         // programs alone — so its tab is the one that reports `Skipped` here,
         // with a summary saying so and no rows behind it.
-        if matches!(stage.id, "lir" | "artifact") {
+        if matches!(stage.id, "lir" | "artifact" | "linked") {
             assert_eq!(stage.status, Status::Skipped);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -588,6 +589,7 @@ fn every_stage_reports_on_the_demo() {
             "Patterns",
             "LIR",
             "Artifact",
+            "Linked Artifact",
             "Symbols"
         ]
     );
@@ -1842,7 +1844,14 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     // no duration to report rather than no phase to have one.
     assert_eq!(
         ids(false),
-        ["constraints", "solve", "lir", "artifact", "types-ir"]
+        [
+            "constraints",
+            "solve",
+            "lir",
+            "artifact",
+            "linked",
+            "types-ir"
+        ]
     );
 
     // On a program with nothing wrong with it, it reports one like everybody
@@ -1862,6 +1871,13 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         .expect("the artifact stage is registered");
     assert_eq!(artifact.status, Status::Ok);
     assert!(artifact.micros.is_some());
+    let linked = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "linked")
+        .expect("the link stage is registered");
+    assert_eq!(linked.status, Status::Ok);
+    assert!(linked.micros.is_some());
     assert!(
         artifact
             .text

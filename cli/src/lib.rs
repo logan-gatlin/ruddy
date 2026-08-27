@@ -199,8 +199,13 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         rendered: error.to_string(),
         usage: false,
     })?;
+    let linked = graph.link().map_err(|error| CliError {
+        rendered: error.to_string(),
+        usage: false,
+    })?;
+    let last = graph.projects.len().checked_sub(1);
     let mut root = None;
-    for project in graph.projects {
+    for (index, project) in graph.projects.into_iter().enumerate() {
         if project.source == ProjectSource::GitCache {
             continue;
         }
@@ -215,8 +220,14 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
             "{}.artifact",
             project.artifact.header.identity.name
         ));
-        replace_file(&path, project.artifact.print().as_bytes())?;
-        root = Some(path);
+        let artifact = match Some(index) == last {
+            true => &linked,
+            false => &project.artifact,
+        };
+        replace_file(&path, artifact.print().as_bytes())?;
+        if Some(index) == last {
+            root = Some(path);
+        }
     }
     root.ok_or_else(|| CliError::one("the project graph was empty"))
 }
@@ -594,15 +605,23 @@ pub struct CompiledGraph {
     pub projects: Vec<CompiledProject>,
 }
 
-/// Compile the project in `directory` recursively and return only its artifact.
+impl CompiledGraph {
+    /// Link the dependency-first per-project artifacts into a self-contained root.
+    pub fn link(&self) -> Result<Artifact, CompileError> {
+        let artifacts: Vec<_> = self
+            .projects
+            .iter()
+            .map(|project| project.artifact.clone())
+            .collect();
+        ruddy::link::link(&artifacts).map_err(|error| CompileError::one(error.to_string()))
+    }
+}
+
+/// Compile and statically link the project in `directory`.
 /// Git dependencies may populate the Ruddy cache and a successful resolution may
 /// atomically update the root `Ruddy.lock`; no build artifacts are written.
 pub fn compile(directory: impl AsRef<Path>) -> Result<Artifact, CompileError> {
-    compile_graph(directory)?
-        .projects
-        .pop()
-        .map(|project| project.artifact)
-        .ok_or_else(|| CompileError::one("the project graph was empty"))
+    compile_graph(directory)?.link()
 }
 
 /// Compile every unique project reachable from `directory`, dependencies first.

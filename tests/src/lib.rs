@@ -15,6 +15,7 @@ mod cli;
 mod docs;
 mod inference;
 mod ir;
+mod link;
 mod lir;
 mod parse;
 mod patterns;

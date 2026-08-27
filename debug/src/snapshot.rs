@@ -386,6 +386,36 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         _ => None,
     };
 
+    // Linking is a distinct final phase. Dependency artifacts remain separate
+    // compilation boundaries above; this output copies their code into the
+    // active root and therefore needs no external artifacts at execution time.
+    let mut link_panicked = false;
+    let linked = artifact.as_ref().and_then(|artifact| {
+        let started = Instant::now();
+        let mut graph = linked_interfaces.clone();
+        graph.push(artifact.clone());
+        let out = guard("link", &mut panicked, || ruddy::link::link(&graph));
+        link_panicked = out.is_none();
+        micros.link = started.elapsed().as_micros() as u64;
+        match out {
+            Some(Ok(linked)) => Some(linked),
+            Some(Err(error)) => {
+                diagnostics.push(raw(
+                    "link",
+                    "invalid-artifact-graph",
+                    error.to_string(),
+                    None,
+                ));
+                None
+            }
+            None => None,
+        }
+    });
+    diagnostics.sort_by_key(|d| d.span.map(|at| (at.file, at.range[0])).unwrap_or((0, 0)));
+    for (i, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic.id = i as u32;
+    }
+
     // Every file the loader read, in load order, with what the page needs to
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
@@ -412,6 +442,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         patterns: checked.as_ref(),
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
+        linked: linked.as_ref(),
         dependency_declarations: &req.dependencies,
         dependency_aliases: &dependency_aliases,
         dependencies: &dependency_artifacts,
@@ -420,6 +451,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
             .iter()
             .any(|diagnostic| diagnostic.stage == "dependencies"),
         artifact_panicked,
+        link_panicked,
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,

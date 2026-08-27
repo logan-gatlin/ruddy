@@ -766,12 +766,14 @@ fn artifact_stage_renders_one_dependency() {
         patterns: None,
         lir: None,
         artifact: Some(&artifact),
+        linked: None,
         dependency_declarations: &declarations,
         dependency_aliases: &["base".to_string()],
         dependencies: &artifact.header.dependencies,
         dependency_interfaces: &[],
         dependencies_valid: false,
         artifact_panicked: false,
+        link_panicked: false,
         mint: None,
         symbols: &symbols,
         micros: Phases::default(),
@@ -864,6 +866,24 @@ fn the_artifact_tab_exposes_canonical_text_and_skips_with_errors() {
     assert!(skipped.nodes.is_empty());
     assert!(skipped.text.is_none());
     assert!(skipped.micros.is_none());
+}
+
+#[test]
+fn linked_artifact_is_a_distinct_final_phase_tab() {
+    let linked = stage("linked", "let id = fn x => x\n");
+    assert_eq!(linked.title, "Linked Artifact");
+    assert_eq!(linked.status, Status::Ok);
+    assert_eq!(linked.view, View::Text);
+    assert!(
+        linked
+            .text
+            .as_ref()
+            .is_some_and(|text| text.contains("(dependencies)"))
+    );
+
+    let skipped = stage("linked", "let bad : Nat = fn x => x\n");
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.summary, "static linking did not run");
 }
 
 /// The Tokens tab is one row per file with that file's own stream under it. A

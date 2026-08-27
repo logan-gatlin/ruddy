@@ -49,18 +49,21 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     )
     .expect("write the manifest");
 
-    let built = compile(directory.path()).expect("compile the project");
-    let identities: Vec<_> = built
+    let graph = ruddy_cli::compile_graph(directory.path()).expect("compile the project graph");
+    let identities: Vec<_> = graph
+        .projects
+        .last()
+        .unwrap()
+        .artifact
         .header
         .dependencies
         .iter()
         .map(|dependency| (dependency.name.as_str(), dependency.version.as_str()))
         .collect();
     assert_eq!(identities, [("zeta", "2.0.0"), ("alpha", "1.2.3-beta.1")]);
+    let built = graph.link().unwrap();
     assert_eq!(built.header.identity.name, "app");
-    let printed = built.print();
-    assert!(printed.contains("(dependency \"zeta\" \"2.0.0\")"));
-    assert!(printed.contains("(dependency \"alpha\" \"1.2.3-beta.1\")"));
+    assert!(built.header.dependencies.is_empty());
     assert!(!directory.path().join("zeta/build/zeta.artifact").exists());
     assert!(!directory.path().join("alpha/build/alpha.artifact").exists());
 }
@@ -112,8 +115,12 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     )
     .unwrap();
 
-    let built = compile(directory.path()).expect("the source alias resolves");
-    assert_eq!(built.header.dependencies[0].name, "http-core");
+    let graph = ruddy_cli::compile_graph(directory.path()).expect("the source alias resolves");
+    assert_eq!(
+        graph.projects.last().unwrap().artifact.header.dependencies[0].name,
+        "http-core"
+    );
+    assert!(graph.link().unwrap().header.dependencies.is_empty());
 
     fs::write(
         directory.path().join("Ruddy.toml"),
@@ -617,7 +624,7 @@ fn locked_cached_git_dependency_child() {
     fs::write(home.join("cache/git/cache.lock"), "left behind by a crash").unwrap();
     let first = compile(&app).unwrap();
     assert!(!stale.exists());
-    assert_eq!(first.header.dependencies[0].name, "base");
+    assert!(first.header.dependencies.is_empty());
 
     // Every use restores both tracked and untracked cache contents while the
     // cross-process cache lock remains held for compilation.
@@ -867,6 +874,9 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
 
     let path = build_project(&app).unwrap();
     assert_eq!(path, app.join("build/app.artifact"));
+    let linked = Artifact::try_parse(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(linked.header.dependencies.is_empty());
+    assert_eq!(linked.lir.globals.len(), 4);
     for (dir, name) in [
         (&shared, "shared"),
         (&left, "left"),

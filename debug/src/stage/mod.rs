@@ -10,6 +10,7 @@ pub mod ast;
 pub mod constraints;
 pub mod dependencies;
 pub mod ir;
+pub mod linked;
 pub mod lir;
 pub mod patterns;
 pub mod presence;
@@ -47,8 +48,10 @@ pub struct Cx<'a> {
     /// `None` whenever an earlier phase reported anything: LIR runs on accepted
     /// programs alone, which is what lets it be infallible.
     pub lir: Option<&'a ruddy::lir::Output>,
-    /// The canonical, span-free disk boundary built from accepted LIR.
+    /// The canonical, span-free per-project disk boundary built from accepted LIR.
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
+    /// The self-contained artifact produced by statically linking the graph.
+    pub linked: Option<&'a ruddy::artifact::Artifact>,
     /// Direct dependency artifacts successfully resolved for the active project.
     pub dependency_declarations: &'a indexmap::IndexMap<String, crate::wire::DependencySpec>,
     /// Aliases for successfully resolved direct dependencies, in request order.
@@ -58,6 +61,8 @@ pub struct Cx<'a> {
     pub dependencies_valid: bool,
     /// Artifact construction ran but panicked, rather than being skipped.
     pub artifact_panicked: bool,
+    /// Static linking ran but panicked, rather than being skipped.
+    pub link_panicked: bool,
     pub mint: Option<&'a Mint>,
     /// Stable index per symbol, so a node can point at a row of the symbols
     /// stage and the page can highlight every occurrence of one symbol.
@@ -83,6 +88,7 @@ pub struct Phases {
     pub patterns: u64,
     pub lir: u64,
     pub artifact: u64,
+    pub link: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -282,6 +288,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(artifact::build),
+    },
+    Spec {
+        id: "linked",
+        title: "Linked Artifact",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(linked::build),
     },
     Spec {
         id: "symbols",
