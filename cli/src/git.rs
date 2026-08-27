@@ -255,7 +255,7 @@ fn selector_to_locked(key: &LockedSelectorKey) -> LockedSelector {
 pub(crate) fn canonical_checkouts_root() -> Option<PathBuf> {
     ruddy_home()
         .ok()
-        .and_then(|home| fs::canonicalize(home.join("git/checkouts")).ok())
+        .and_then(|home| fs::canonicalize(git_cache(&home).join("checkouts")).ok())
         .filter(|path| path.is_dir())
 }
 
@@ -263,19 +263,18 @@ pub fn ruddy_home() -> Result<PathBuf, CompileError> {
     if let Some(path) = env::var_os("RUDDY_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path).join("ruddy"));
-    }
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join(".cache/ruddy"))
-        .ok_or_else(|| {
-            CompileError::one("could not determine Ruddy cache directory; set RUDDY_HOME")
-        })
+        .map(|home| PathBuf::from(home).join(".ruddy"))
+        .ok_or_else(|| CompileError::one("could not determine Ruddy home; set RUDDY_HOME"))
+}
+
+fn git_cache(home: &Path) -> PathBuf {
+    home.join("cache/git")
 }
 
 fn acquire_cache_lock(home: &Path) -> Result<File, CompileError> {
-    let git = home.join("git");
+    let git = git_cache(home);
     fs::create_dir_all(&git).map_err(|error| {
         CompileError::one(format!(
             "could not create Git cache directory {}: {error}",
@@ -614,7 +613,8 @@ fn cache_key(url: &str, selector: GitSelector<'_>) -> String {
 }
 
 fn checkout_path(home: &Path, url: &str, selector: GitSelector<'_>, commit: &str) -> PathBuf {
-    home.join("git/checkouts")
+    git_cache(home)
+        .join("checkouts")
         .join(cache_key(url, selector))
         .join(commit.to_ascii_lowercase())
 }
@@ -640,7 +640,7 @@ fn temporary_checkout(
     url: &str,
     selector: GitSelector<'_>,
 ) -> Result<TemporaryCheckout, CompileError> {
-    let directory = home.join("git/tmp");
+    let directory = git_cache(home).join("tmp");
     clean_stale_temporary_checkouts(home, url, selector)?;
     let prefix = format!("{}-", cache_key(url, selector));
     for _ in 0..100 {
@@ -665,7 +665,7 @@ fn clean_stale_temporary_checkouts(
     url: &str,
     selector: GitSelector<'_>,
 ) -> Result<(), CompileError> {
-    let directory = home.join("git/tmp");
+    let directory = git_cache(home).join("tmp");
     fs::create_dir_all(&directory).map_err(|error| {
         CompileError::one(format!(
             "could not create Git temporary directory {}: {error}",

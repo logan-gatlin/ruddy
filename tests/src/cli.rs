@@ -434,6 +434,70 @@ fn hostile_git_configuration_child() {
 }
 
 #[test]
+fn ruddy_home_uses_an_explicit_override_or_defaults_to_dot_ruddy() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("home");
+    let explicit = parent.path().join("explicit-ruddy-home");
+    let default = home.join(".ruddy");
+    let xdg = parent.path().join("xdg-must-be-ignored");
+    for (override_home, expected) in [
+        (Some(explicit.as_path()), explicit.as_path()),
+        (Some(Path::new("")), default.as_path()),
+        (None, default.as_path()),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "cli::ruddy_home_layout_child"])
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &xdg)
+            .env("RUDDY_TEST_EXPECTED_HOME", expected);
+        match override_home {
+            Some(path) => {
+                command.env("RUDDY_HOME", path);
+            }
+            None => {
+                command.env_remove("RUDDY_HOME");
+            }
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "cli::ruddy_home_layout_child"])
+        .env("RUDDY_HOME", "")
+        .env_remove("HOME")
+        .env("XDG_CACHE_HOME", &xdg)
+        .env_remove("RUDDY_TEST_EXPECTED_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with controlled home environment variables"]
+fn ruddy_home_layout_child() {
+    match std::env::var_os("RUDDY_TEST_EXPECTED_HOME") {
+        Some(expected) => assert_eq!(ruddy_cli::ruddy_home().unwrap(), PathBuf::from(expected)),
+        None => assert!(
+            ruddy_cli::ruddy_home()
+                .unwrap_err()
+                .to_string()
+                .contains("set RUDDY_HOME")
+        ),
+    }
+}
+
+#[test]
 fn https_fetch_failures_are_contextual_and_do_not_create_a_lockfile() {
     let directory = project();
     fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
@@ -532,7 +596,7 @@ fn locked_cached_git_dependency_child() {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     });
     let checkout = home
-        .join("git/checkouts")
+        .join("cache/git/checkouts")
         .join(format!("{hash:016x}"))
         .join(&commit);
     fs::create_dir_all(checkout.parent().unwrap()).unwrap();
@@ -546,11 +610,11 @@ fn locked_cached_git_dependency_child() {
     );
     fs::write(app.join("Ruddy.lock"), &lock).unwrap();
     let stale = home
-        .join("git/tmp")
+        .join("cache/git/tmp")
         .join(format!("{hash:016x}-stale-crashed-process"));
     fs::create_dir_all(&stale).unwrap();
     fs::write(stale.join("partial"), "incomplete clone").unwrap();
-    fs::write(home.join("git/cache.lock"), "left behind by a crash").unwrap();
+    fs::write(home.join("cache/git/cache.lock"), "left behind by a crash").unwrap();
     let first = compile(&app).unwrap();
     assert!(!stale.exists());
     assert_eq!(first.header.dependencies[0].name, "base");
@@ -596,7 +660,7 @@ fn locked_cached_git_dependency_child() {
         assert_eq!(handle.join().unwrap(), first);
     }
     assert!(
-        fs::read_dir(home.join("git/tmp"))
+        fs::read_dir(home.join("cache/git/tmp"))
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true)
     );
