@@ -29,9 +29,6 @@ const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const INITIAL_VERSION: &str = "0.1.0";
 
-/// A compact description of the command-line syntax accepted by [`run`].
-pub const USAGE: &str = "ruddy <new|build|clean|check>";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "ruddy",
@@ -243,7 +240,8 @@ pub fn check_project(directory: impl AsRef<Path>) -> Result<(), CliError> {
 /// Remove the current project's `build/` entry, if one exists.
 ///
 /// A malformed source file or manifest does not prevent stale output from being
-/// cleaned. The project directory itself must still exist.
+/// cleaned. The project directory itself must still exist and contain a regular
+/// `Ruddy.toml` file; the marker is deliberately not parsed.
 pub fn clean_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let directory = fs::canonicalize(directory.as_ref()).map_err(|error| {
         CliError::one(format!(
@@ -255,6 +253,19 @@ pub fn clean_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         return Err(CliError::one(format!(
             "project path {} is not a folder",
             directory.display()
+        )));
+    }
+    let manifest = directory.join(MANIFEST);
+    let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        CliError::one(format!(
+            "project marker {} is not a regular file: {error}",
+            manifest.display()
+        ))
+    })?;
+    if !manifest_metadata.file_type().is_file() {
+        return Err(CliError::one(format!(
+            "project marker {} is not a regular file",
+            manifest.display()
         )));
     }
     let build = directory.join(BUILD_DIRECTORY);

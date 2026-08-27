@@ -1308,6 +1308,8 @@ fn clean_removes_build_directories_and_other_stale_entries_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("app");
     fs::create_dir(&app).unwrap();
+    // Cleaning needs only the project marker, not a parseable manifest.
+    fs::write(app.join("Ruddy.toml"), "this is not valid TOML").unwrap();
     let expected = fs::canonicalize(&app).unwrap().join("build");
 
     assert_eq!(clean_project(&app).unwrap(), expected);
@@ -1331,6 +1333,30 @@ fn clean_removes_build_directories_and_other_stale_entries_idempotently() {
     assert_eq!(error.exit_code(), 1);
 }
 
+#[test]
+fn clean_rejects_non_projects_without_deleting_their_build_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let build = directory.path().join("build");
+    fs::create_dir(&build).unwrap();
+    fs::write(build.join("keep"), "not Ruddy build data").unwrap();
+
+    let error = clean_project(directory.path()).unwrap_err();
+    assert!(error.to_string().contains("project marker"), "{error}");
+    assert_eq!(
+        fs::read_to_string(build.join("keep")).unwrap(),
+        "not Ruddy build data"
+    );
+
+    // A path named like the marker is insufficient unless it is a regular file.
+    fs::create_dir(directory.path().join("Ruddy.toml")).unwrap();
+    let error = clean_project(directory.path()).unwrap_err();
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+    assert_eq!(
+        fs::read_to_string(build.join("keep")).unwrap(),
+        "not Ruddy build data"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn clean_unlinks_build_symlinks_without_touching_their_targets() {
@@ -1340,6 +1366,7 @@ fn clean_unlinks_build_symlinks_without_touching_their_targets() {
     let app = directory.path().join("app");
     let output = directory.path().join("shared-output");
     fs::create_dir(&app).unwrap();
+    fs::write(app.join("Ruddy.toml"), "malformed is fine").unwrap();
     fs::create_dir(&output).unwrap();
     fs::write(output.join("keep"), "must remain").unwrap();
     symlink(&output, app.join("build")).unwrap();
