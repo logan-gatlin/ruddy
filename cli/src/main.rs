@@ -10,12 +10,21 @@ fn main() -> ExitCode {
             println!("Built `{}`", path.display());
             ExitCode::SUCCESS
         }
+        Ok(ruddy_cli::Outcome::Cleaned(path)) => {
+            println!("Cleaned `{}`", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(ruddy_cli::Outcome::Checked(path)) => {
+            println!("Checked `{}`", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) if error.is_success() => {
+            println!("{error}");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("{error}");
-            if error.is_usage() {
-                eprintln!("usage: {}", ruddy_cli::USAGE);
-            }
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_code())
         }
     }
 }

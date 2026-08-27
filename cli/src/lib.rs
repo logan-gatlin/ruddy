@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
@@ -28,8 +29,34 @@ const GITIGNORE: &str = ".gitignore";
 const BUILD_DIRECTORY: &str = "build";
 const INITIAL_VERSION: &str = "0.1.0";
 
-/// The command-line syntax accepted by [`run`].
-pub const USAGE: &str = "ruddy new <path> | ruddy build";
+#[derive(Debug, Parser)]
+#[command(
+    name = "ruddy",
+    version,
+    about = "The compiler and project manager for Ruddy",
+    subcommand_required = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a new Ruddy project.
+    #[command(alias = "n")]
+    New {
+        /// Directory to create.
+        path: PathBuf,
+    },
+    /// Compile a project and write its artifacts.
+    #[command(alias = "b")]
+    Build,
+    /// Remove a project's build output.
+    Clean,
+    /// Type-check a project without writing build artifacts.
+    Check,
+}
 
 /// The successful filesystem action performed by [`run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +65,10 @@ pub enum Outcome {
     Created(PathBuf),
     /// An artifact was written to this path.
     Built(PathBuf),
+    /// Build output was removed from this path.
+    Cleaned(PathBuf),
+    /// This project was checked successfully.
+    Checked(PathBuf),
 }
 
 /// A user-facing command-line or filesystem failure.
@@ -45,6 +76,7 @@ pub enum Outcome {
 pub struct CliError {
     rendered: String,
     usage: bool,
+    exit_code: u8,
 }
 
 impl CliError {
@@ -52,19 +84,31 @@ impl CliError {
         Self {
             rendered: format!("error: {}", message.into()),
             usage: false,
+            exit_code: 1,
         }
     }
 
-    fn usage(message: impl Into<String>) -> Self {
+    fn clap(error: clap::Error) -> Self {
         Self {
-            rendered: format!("error: {}", message.into()),
-            usage: true,
+            rendered: error.to_string().trim_end().to_owned(),
+            usage: error.use_stderr(),
+            exit_code: u8::try_from(error.exit_code()).unwrap_or(1),
         }
     }
 
-    /// Whether the command's usage should be printed after this error.
+    /// Whether this is an argument error accompanied by command usage.
     pub const fn is_usage(&self) -> bool {
         self.usage
+    }
+
+    /// Whether this value represents informational help or version output.
+    pub const fn is_success(&self) -> bool {
+        self.exit_code == 0
+    }
+
+    /// The process exit code recommended for this failure or information.
+    pub const fn exit_code(&self) -> u8 {
+        self.exit_code
     }
 }
 
@@ -78,38 +122,32 @@ impl std::error::Error for CliError {}
 
 /// Parse and execute a Ruddy command relative to `current_directory`.
 ///
-/// The iterator contains arguments after the executable name. Only `new
-/// <path>` and `build` are accepted.
+/// The iterator contains arguments after the executable name. Argument syntax,
+/// aliases, help, and version output are provided by `clap`.
 pub fn run<I, S>(arguments: I, current_directory: impl AsRef<Path>) -> Result<Outcome, CliError>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let mut arguments = arguments.into_iter().map(Into::into);
-    let Some(command) = arguments.next() else {
-        return Err(CliError::usage("expected a subcommand (`new` or `build`)"));
-    };
+    let arguments =
+        std::iter::once(OsString::from("ruddy")).chain(arguments.into_iter().map(Into::into));
+    let command = Cli::try_parse_from(arguments)
+        .map_err(CliError::clap)?
+        .command;
+    let current_directory = current_directory.as_ref();
 
-    if command == OsStr::new("new") {
-        let Some(path) = arguments.next() else {
-            return Err(CliError::usage("`new` requires a project path"));
-        };
-        if arguments.next().is_some() {
-            return Err(CliError::usage("`new` accepts exactly one project path"));
+    match command {
+        Command::New { path } => {
+            let path = current_directory.join(path);
+            new_project(&path)?;
+            Ok(Outcome::Created(path))
         }
-        let path = current_directory.as_ref().join(path);
-        new_project(&path)?;
-        Ok(Outcome::Created(path))
-    } else if command == OsStr::new("build") {
-        if arguments.next().is_some() {
-            return Err(CliError::usage("`build` does not accept arguments"));
+        Command::Build => build_project(current_directory).map(Outcome::Built),
+        Command::Clean => clean_project(current_directory).map(Outcome::Cleaned),
+        Command::Check => {
+            check_project(current_directory)?;
+            Ok(Outcome::Checked(current_directory.to_path_buf()))
         }
-        build_project(current_directory).map(Outcome::Built)
-    } else {
-        Err(CliError::usage(format!(
-            "unknown subcommand `{}`; expected `new` or `build`",
-            command.to_string_lossy()
-        )))
     }
 }
 
@@ -190,6 +228,76 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), CliError> {
         .map_err(|error| CliError::one(format!("could not write {}: {error}", path.display())))
 }
 
+/// Type-check and link a project without writing build artifacts.
+pub fn check_project(directory: impl AsRef<Path>) -> Result<(), CliError> {
+    compile(directory).map(|_| ()).map_err(|error| CliError {
+        rendered: error.to_string(),
+        usage: false,
+        exit_code: 1,
+    })
+}
+
+/// Remove the current project's `build/` entry, if one exists.
+///
+/// A malformed source file or manifest does not prevent stale output from being
+/// cleaned. The project directory itself must still exist and contain a regular
+/// `Ruddy.toml` file; the marker is deliberately not parsed.
+pub fn clean_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let directory = fs::canonicalize(directory.as_ref()).map_err(|error| {
+        CliError::one(format!(
+            "could not resolve project folder {}: {error}",
+            directory.as_ref().display()
+        ))
+    })?;
+    if !directory.is_dir() {
+        return Err(CliError::one(format!(
+            "project path {} is not a folder",
+            directory.display()
+        )));
+    }
+    let manifest = directory.join(MANIFEST);
+    let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        CliError::one(format!(
+            "project marker {} is not a regular file: {error}",
+            manifest.display()
+        ))
+    })?;
+    if !manifest_metadata.file_type().is_file() {
+        return Err(CliError::one(format!(
+            "project marker {} is not a regular file",
+            manifest.display()
+        )));
+    }
+    let build = directory.join(BUILD_DIRECTORY);
+    let metadata = match fs::symlink_metadata(&build) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(build),
+        Err(error) => {
+            return Err(CliError::one(format!(
+                "could not inspect build output {}: {error}",
+                build.display()
+            )));
+        }
+    };
+    let removed = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(&build)
+    } else if metadata.file_type().is_symlink() {
+        // Unix removes either kind of symlink as a file. Windows requires
+        // directory symlinks to be removed with `remove_dir`; the failed first
+        // attempt does not traverse or alter the target.
+        fs::remove_file(&build).or_else(|_| fs::remove_dir(&build))
+    } else {
+        fs::remove_file(&build)
+    };
+    removed.map_err(|error| {
+        CliError::one(format!(
+            "could not remove build output {}: {error}",
+            build.display()
+        ))
+    })?;
+    Ok(build)
+}
+
 /// Compile the complete project graph, then write each local project's canonical
 /// artifact to its own `build/` directory, dependencies first. Immutable Git
 /// cache checkouts are never modified. No artifact is touched unless the entire
@@ -198,10 +306,12 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let graph = compile_graph(directory).map_err(|error| CliError {
         rendered: error.to_string(),
         usage: false,
+        exit_code: 1,
     })?;
     let linked = link_rooted(&graph).map_err(|error| CliError {
         rendered: error.to_string(),
         usage: false,
+        exit_code: 1,
     })?;
     let last = graph.projects.len().checked_sub(1);
     let mut root = None;
