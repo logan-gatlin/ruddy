@@ -15,6 +15,10 @@ use ruddy_debug::print;
 /// lowering runs on accepted programs alone, so a source that does not type is
 /// a test about nothing.
 fn lowered(source: &str) -> lir::Output {
+    lowered_labelled(source).0
+}
+
+fn lowered_labelled(source: &str) -> (lir::Output, print::lir::Labels) {
     lowered_after_check(source, |_, _| {})
 }
 
@@ -24,7 +28,7 @@ fn lowered(source: &str) -> lir::Output {
 fn lowered_after_check(
     source: &str,
     adjust: impl FnOnce(&mut ir::Program, &mut inference::Output),
-) -> lir::Output {
+) -> (lir::Output, print::lir::Labels) {
     let mut files = FileManager::new();
     let file = files.register_new_file("<test>".to_string(), source.to_string());
     let lexed = token::lex(source, file);
@@ -46,14 +50,16 @@ fn lowered_after_check(
     assert!(checked.errors.is_empty(), "{source}: {:#?}", checked.errors);
     adjust(&mut built.program, &mut inferred);
 
-    lir::lower(&mint, &built.program, &inferred)
+    let labels = print::lir::Labels::new(&built.program);
+    (lir::lower(&mint, &built.program, &inferred), labels)
 }
 
 /// The canonical listing of one source, which is what most of these tests read:
 /// the printed form carries the temps, the representations and the nesting all
 /// at once, and it is the form the spec pins.
 fn listing(source: &str) -> String {
-    print::lir::program(&lowered(source))
+    let (output, labels) = lowered_labelled(source);
+    print::lir::program(&output, &labels)
 }
 
 /// One section of a listing, by its header line.
@@ -399,11 +405,11 @@ fn an_optional_field_becomes_a_presence_test() {
 /// without adding a SAT assumption for a variable that does not exist.
 #[test]
 fn an_undecided_presence_is_tested_both_ways() {
-    let output = lowered_after_check(
+    let (output, labels) = lowered_after_check(
         "let f = fn s => match s with | { x, y } => y | { x } => x end",
         |program, _| set_match_field_presence(program, "y", Presence::Undecided),
     );
-    let printed = print::lir::program(&output);
+    let printed = print::lir::program(&output, &labels);
     assert_eq!(printed.matches("switch_presence").count(), 1, "{printed}");
     assert!(
         printed.contains("present =>\n      %2: any = project %0, \"y\""),
@@ -846,10 +852,10 @@ fn the_listing_is_the_canonical_format() {
 /// one empty thing.
 #[test]
 fn an_empty_program_lowers_to_an_empty_output() {
-    let output = lowered("");
+    let (output, labels) = lowered_labelled("");
     assert!(output.globals.is_empty());
     assert!(output.functions.is_empty());
-    assert_eq!(print::lir::program(&output), "");
+    assert_eq!(print::lir::program(&output, &labels), "");
 }
 
 /// A declared sum applied to more cases is one row by the time the dispatch is
@@ -1881,7 +1887,7 @@ fn a_function_an_indirect_call_returns_is_called_in_turn() {
 
 #[test]
 fn extern_values_are_imports_not_global_initializers() {
-    let output = lowered("extern answer : Nat = host.answer\nlet next = answer");
+    let (output, labels) = lowered_labelled("extern answer : Nat = host.answer\nlet next = answer");
     assert_eq!(output.externs.len(), 1);
     let external = &output.externs[0];
     assert_eq!(external.name, "answer");
@@ -1889,9 +1895,49 @@ fn extern_values_are_imports_not_global_initializers() {
     assert_eq!(external.rep, lir::Rep::Nat);
     assert_eq!(output.globals.len(), 1, "externs have no initializer block");
     assert_eq!(output.globals[0].name, "next");
-    let printed = print::lir::program(&output);
+    let printed = print::lir::program(&output, &labels);
     assert!(
         printed.contains("global answer"),
         "the use reads the import:\n{printed}"
     );
+}
+
+#[test]
+fn struct_and_project_instructions_preserve_quoted_field_names() {
+    let source = r###"let pick = fn ignored => let record = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n } in record."line\n\"quote\"\\tail""###;
+    let printed = section(source, "fn pick(");
+    assert!(
+        printed.contains(r###"struct { "field name": %"###),
+        "{printed}"
+    );
+    assert!(printed.contains(r###", "let": %"###), "{printed}");
+    assert!(
+        printed.contains(r###", "line\n\"quote\"\\tail": %"###),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(r###"project %4, "line\n\"quote\"\\tail""###),
+        "{printed}"
+    );
+}
+
+#[test]
+fn tag_and_switch_instructions_preserve_quoted_variant_names() {
+    let source = r###"let tagged = #"some case" 1n
+let choose : (#"some case" Nat | #"let" | #"line\n\"quote\"\\tail") -> Nat = fn value => match value with | #"some case" n => n | #"let" => 0n | #"line\n\"quote\"\\tail" => 1n end"###;
+    let tagged = section(source, "global tagged");
+    assert!(tagged.contains(r###"tag #"some case","###), "{tagged}");
+
+    let switched = section(source, "fn choose(");
+    assert!(switched.contains("switch_tag"), "{switched}");
+    for case in [
+        r###"#"some case" =>"###,
+        r###"#let =>"###,
+        r###"#"line\n\"quote\"\\tail" =>"###,
+    ] {
+        assert!(
+            switched.contains(case),
+            "missing {case:?} from:\n{switched}"
+        );
+    }
 }

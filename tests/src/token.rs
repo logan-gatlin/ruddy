@@ -305,6 +305,69 @@ fn lexes_a_tag_as_one_token() {
     assert!(matches!(&kinds("#_a")[..], [Kind::Tag(name)] if name == "_a"));
 }
 
+/// A quoted tag is still one tag token: its `#` must touch the string, and the
+/// ordinary string decoder supplies the structural label carried by the token.
+#[test]
+fn lexes_quoted_tags_as_one_decoded_token() {
+    for (src, expected) in [
+        (r###"#"Some case""###, "Some case"),
+        (r###"#"""###, ""),
+        (r###"#"λ case""###, "λ case"),
+        (r###"#"line\n\"quote\"\\tail""###, "line\n\"quote\"\\tail"),
+    ] {
+        let out = lex(src, FileID::GENERATED);
+        assert!(out.errors.is_empty(), "{src:?}: {:#?}", out.errors);
+        assert_eq!(out.tokens.len(), 1, "{src:?}");
+        assert!(matches!(&out.tokens[0].tracked, Kind::Tag(name) if name == expected));
+        assert_eq!(out.tokens[0].span.start, 0, "{src:?}");
+        assert_eq!(out.tokens[0].span.width, src.len(), "{src:?}");
+    }
+}
+
+/// Quoting is part of the tag lexeme, not whitespace-sensitive punctuation
+/// followed by an ordinary string. Malformed quoted tags report the same
+/// string error and cover the complete sigilled lexeme.
+#[test]
+fn a_quoted_tag_must_be_adjacent_and_well_formed() {
+    let separated = lex(r###"# "Case""###, FileID::GENERATED);
+    assert_eq!(separated.errors.len(), 1, "{:#?}", separated.errors);
+    assert_eq!(separated.errors[0].kind, ErrorKind::Unrecognized);
+    assert_eq!(separated.errors[0].span.width, 1);
+    assert!(
+        matches!(&separated.tokens[..], [token] if matches!(&token.tracked, Kind::String(value) if value == "Case"))
+    );
+
+    let unterminated = r###"#"unterminated"###;
+    let out = lex(unterminated, FileID::GENERATED);
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind, ErrorKind::MalformedString);
+    assert_eq!(out.errors[0].span.start, 0);
+    assert_eq!(out.errors[0].span.width, unterminated.len());
+    assert!(out.tokens.is_empty());
+
+    // The quoted tag remains one malformed lexeme after an unsupported escape,
+    // including when an escaped quote occurs before its real closing quote.
+    for malformed_escape in [
+        r###"#"bad\q""###,
+        r###"#"bad\q\"still inside""###,
+        r###"#"bad\q\\still inside""###,
+        r###"#"bad\qwithout a close"###,
+        r###"#"bad\qtrailing\"###,
+    ] {
+        let out = lex(malformed_escape, FileID::GENERATED);
+        assert_eq!(
+            out.errors.len(),
+            1,
+            "{malformed_escape:?}: {:#?}",
+            out.errors
+        );
+        assert_eq!(out.errors[0].kind, ErrorKind::MalformedString);
+        assert_eq!(out.errors[0].span.start, 0);
+        assert_eq!(out.errors[0].span.width, malformed_escape.len());
+        assert!(out.tokens.is_empty());
+    }
+}
+
 #[test]
 fn a_tag_is_spanned_and_printed_as_written() {
     let out = lex("let v = #Some 1n", FileID::GENERATED);

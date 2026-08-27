@@ -23,11 +23,15 @@
 (handler_arm binder: (identifier) @local.definition.parameter)
 
 ; Every name inside a pattern binds, whichever shape took the value apart. A
-; bare field name puns, binding the field to itself.
+; bare identifier field puns, binding the field to itself; an explicit field's
+; label does not bind. In particular, quoted fields are always explicit, so
+; only the identifier in their subpattern is a definition.
 (match_arm pattern: (identifier) @local.definition.var)
 (tag_pattern payload: (identifier) @local.definition.var)
 (parenthesized_pattern (identifier) @local.definition.var)
-(struct_pattern_field name: (identifier) @local.definition.var)
+(struct_pattern_field
+  name: (identifier) @local.definition.var
+  !pattern)
 (struct_pattern_field pattern: (identifier) @local.definition.var)
 
 ; ── what a name may resolve to ───────────────────────────────────────────────

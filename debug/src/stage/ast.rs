@@ -287,7 +287,7 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
         .children(fields.iter().map(|(name, value)| {
             Node::new(
                 ids.next(),
-                format!("{}:", name.tracked),
+                format!("{}:", print::label(print::Shape::Struct, &name.tracked)),
                 print::ast::expr(&value.tracked).to_string(),
             )
             .at(name.span)
@@ -314,7 +314,14 @@ fn expr_node(ids: &mut Ids, expr: &Expr) -> Node {
             ..node
         }
         .child(expr_node(ids, base))
-        .child(Node::new(ids.next(), "Field", field.tracked.clone()).at(field.span)),
+        .child(
+            Node::new(
+                ids.next(),
+                "Field",
+                print::label(print::Shape::Struct, &field.tracked),
+            )
+            .at(field.span),
+        ),
         // The scrutinee first, then one wrapper per arm holding the arm's
         // pattern and body — the shape the reader wrote, before flattening.
         ExprKind::Match { scrutinee, arms } => {
@@ -470,12 +477,17 @@ fn pattern_node(ids: &mut Ids, pattern: &Pattern) -> Node {
                 .map(|(name, sub)| match sub {
                     Some(sub) => Node::new(
                         ids.next(),
-                        format!("{}:", name.tracked),
+                        format!("{}:", print::label(print::Shape::Struct, &name.tracked)),
                         sub.tracked.to_string(),
                     )
                     .at(name.span)
                     .child(pattern_node(ids, sub)),
-                    None => Node::new(ids.next(), "Bind", name.tracked.clone()).at(name.span),
+                    None => Node::new(
+                        ids.next(),
+                        "Bind",
+                        print::label(print::Shape::Struct, &name.tracked),
+                    )
+                    .at(name.span),
                 })
                 .collect();
             // The `..` that makes the pattern open is a row of its own, the
@@ -615,7 +627,10 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                         let mark = when_text(when);
                         Node::new(
                             ids.next(),
-                            format!("{}{mark}:", name.tracked),
+                            format!(
+                                "{}{mark}:",
+                                print::label(print::Shape::Struct, &name.tracked)
+                            ),
                             print::ast::ty(&value.tracked).to_string(),
                         )
                         .at(name.span)
@@ -623,10 +638,12 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                     }
                     // An absent field is a leaf: there is no type under it,
                     // and the key's span covers the whole `\name`.
-                    TypeField::Absent => {
-                        Node::new(ids.next(), format!("\\{}", name.tracked), String::new())
-                            .at(name.span)
-                    }
+                    TypeField::Absent => Node::new(
+                        ids.next(),
+                        format!("\\{}", print::label(print::Shape::Struct, &name.tracked)),
+                        String::new(),
+                    )
+                    .at(name.span),
                 })
                 .collect();
             // The tail is a row of its own: it stands for the fields not
@@ -651,8 +668,12 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                         let text = payload
                             .as_ref()
                             .map_or(String::new(), |ty| print::ast::ty(&ty.tracked).to_string());
-                        let node = Node::new(ids.next(), format!("#{}{mark}", name.tracked), text)
-                            .at(name.span);
+                        let node = Node::new(
+                            ids.next(),
+                            format!("{}{mark}", print::label(print::Shape::Sum, &name.tracked)),
+                            text,
+                        )
+                        .at(name.span);
                         match payload {
                             Some(payload) => node.child(type_node(ids, payload)),
                             None => node,
@@ -660,10 +681,12 @@ fn type_node(ids: &mut Ids, ty: &Type) -> Node {
                     }
                     // The struct's absent field again: a leaf wearing the `\`,
                     // spanning the whole `\#Name`.
-                    SumCase::Absent => {
-                        Node::new(ids.next(), format!("\\#{}", name.tracked), String::new())
-                            .at(name.span)
-                    }
+                    SumCase::Absent => Node::new(
+                        ids.next(),
+                        format!("\\{}", print::label(print::Shape::Sum, &name.tracked)),
+                        String::new(),
+                    )
+                    .at(name.span),
                 })
                 .collect();
             if let Some(tail) = tail {

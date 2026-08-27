@@ -324,6 +324,35 @@ fn a_projected_field_is_a_label_and_not_a_name() {
     assert_eq!(out.errors[0].span.start, 8);
 }
 
+/// Lowering keeps the decoded projection key and the complete quoted label
+/// span. The label is structural data, never a term name to resolve.
+#[test]
+fn a_quoted_projection_lowers_to_its_decoded_label() {
+    let src = r###"let a = fn p => p."field name""###;
+    let (mint, out) = built(src);
+
+    let TermKind::Fn { body, .. } = term_value(&mint, &out, "a") else {
+        panic!("expected a function");
+    };
+    let TermKind::Project { base, field } = &body.kind else {
+        panic!("expected a projection, got {:?}", body.kind);
+    };
+    assert_eq!(field.tracked, "field name");
+    assert_eq!(field.span.start, src.find('"').expect("the quote"));
+    assert_eq!(field.span.width, r###""field name""###.len());
+    assert!(matches!(base.kind, TermKind::Ident(s) if mint.name(s) == "p"));
+
+    // Only the base is a name lookup.
+    let (_, out) = build_src(r###"let b = q."field name""###);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(
+        out.errors[0].kind,
+        ErrorKind::Undefined {
+            namespace: Namespace::Terms
+        }
+    ));
+}
+
 #[test]
 fn displays_ascriptions() {
     assert_eq!(display_program("let x : () = ()"), "let x : {} = {}");
@@ -653,6 +682,37 @@ fn fields_are_keyed_by_name_in_source_order() {
     assert_eq!(fields["x"].name_span.start, 10);
     assert_eq!(fields["x"].name_span.width, 1);
     assert_eq!(fields["y"].name_span.start, 17);
+}
+
+/// Quoted struct labels become the same decoded map keys as bare fields. Their
+/// source spans still include the quotes, and IR printing chooses the minimal
+/// unambiguous spelling.
+#[test]
+fn quoted_fields_lower_to_decoded_keys_and_render_canonically() {
+    let src = r###"let p = fn x y z => {"field name": x, "plain": y, "line\nname": z}"###;
+    let (mint, out) = built(src);
+    let fields = term_fields(&mint, &out, "p");
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["field name", "plain", "line\nname"]
+    );
+    assert_eq!(
+        fields["field name"].name_span.start,
+        src.find(r###""field name""###).expect("the field")
+    );
+    assert_eq!(
+        fields["field name"].name_span.width,
+        r###""field name""###.len()
+    );
+    assert_eq!(
+        display_program(src),
+        "let p = fn x => fn y => fn z => { \"field name\": x, plain: y, \"line\\nname\": z }"
+    );
+
+    let (mint, out) = built(r###"type T 'r = { "field name": Nat, \"gone field", ..'r }"###);
+    let fields = type_fields(&mint, &out, "T");
+    assert!(matches!(fields["field name"], TypeField::Written { .. }));
+    assert!(matches!(fields["gone field"], TypeField::Absent { .. }));
 }
 
 #[test]
@@ -1667,6 +1727,75 @@ fn a_repeated_case_is_reported_once() {
         panic!("expected a sum");
     };
     assert_eq!(cases.len(), 1);
+}
+
+/// Quoted tags and sum cases lower to decoded labels in terms, patterns, and
+/// rows. The sigilled token's span includes both the `#` and quoted spelling.
+#[test]
+fn quoted_tags_lower_to_decoded_labels_everywhere() {
+    let src = r###"let v = #"case name" 1n"###;
+    let (mint, out) = built(src);
+    let TermKind::Tag { name, payload } = term_value(&mint, &out, "v") else {
+        panic!("expected a tag");
+    };
+    assert_eq!(name.tracked, "case name");
+    assert_eq!(name.span.start, src.find('#').expect("the tag"));
+    assert_eq!(name.span.width, r###"#"case name""###.len());
+    assert!(matches!(
+        payload.as_deref().map(|term| &term.kind),
+        Some(TermKind::Natural(1))
+    ));
+
+    let src = r###"let f = fn x => match x with | #"case name" y => y end"###;
+    let (mint, out) = built(src);
+    let TermKind::Fn { body, .. } = term_value(&mint, &out, "f") else {
+        panic!("expected a function");
+    };
+    let TermKind::Match { arms, .. } = &body.kind else {
+        panic!("expected a match");
+    };
+    let PatternKind::Tag { name, payload } = &arms[0].0.tracked else {
+        panic!("expected a tag pattern");
+    };
+    assert_eq!(name.tracked, "case name");
+    assert!(payload.is_some());
+
+    let (mint, out) = built(r###"type T 'r = #"case name" Nat | \#"gone case" | ..'r"###);
+    let TypeKind::Sum { cases, .. } = &out.program.types[&type_symbol(&mint, &out, "T")]
+        .value
+        .tracked
+    else {
+        panic!("expected a sum");
+    };
+    assert!(matches!(cases["case name"], SumCase::Written { .. }));
+    assert!(matches!(cases["gone case"], SumCase::Absent { .. }));
+}
+
+/// Bare and quoted aliases are one structural key, so duplicate checking must
+/// reject mixed spellings just as it rejects two bare spellings.
+#[test]
+fn bare_and_quoted_labels_are_duplicates() {
+    for src in [
+        r###"let p = fn a b => { same: a, "same": b }"###,
+        r###"type T = { same: Nat, "same": Nat }"###,
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "{src:?}: {:#?}", out.errors);
+        assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+        assert_eq!(
+            out.errors[0].span.start,
+            src.rfind(r###""same""###).unwrap()
+        );
+    }
+
+    let src = r###"type T = #Same Nat | #"Same" Nat"###;
+    let (_, out) = build_src(src);
+    assert_eq!(out.errors.len(), 1, "errors: {:#?}", out.errors);
+    assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateCase));
+    assert_eq!(
+        out.errors[0].span.start,
+        src.rfind(r###"#"Same""###).unwrap()
+    );
 }
 
 /// A declaration holds for every definition, so it cannot leave a question a

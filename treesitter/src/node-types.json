@@ -46,6 +46,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "string",
+            "named": true
           }
         ]
       }
@@ -3291,6 +3295,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "string",
+            "named": true
           }
         ]
       }
@@ -3482,6 +3490,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "string",
+            "named": true
           }
         ]
       },
@@ -3619,6 +3631,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "string",
+            "named": true
           }
         ]
       },
@@ -3699,6 +3715,10 @@
         "types": [
           {
             "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "string",
             "named": true
           }
         ]
@@ -3847,6 +3867,11 @@
         }
       ]
     }
+  },
+  {
+    "type": "tag",
+    "named": true,
+    "fields": {}
   },
   {
     "type": "tag_expression",
@@ -4377,10 +4402,6 @@
   },
   {
     "type": "string",
-    "named": true
-  },
-  {
-    "type": "tag",
     "named": true
   },
   {

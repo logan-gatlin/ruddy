@@ -7105,3 +7105,37 @@ fn an_extern_can_publish_a_non_function_scheme() {
     assert_eq!(declared.to_string(), "Nat");
     assert_eq!(scheme(&mint, &output, "next"), "Nat");
 }
+
+/// Decoded quoted fields are structural keys all the way through checking and
+/// unification. Their source spelling is recovered only when the type prints.
+#[test]
+fn quoted_struct_fields_keep_their_identity_and_types() {
+    let source = r###"let identity : { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean } -> { "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean } = fn value => value
+let projected = (identity { "let": "ok", "line\n\"quote\"\\tail": true, "field name": 1n })."field name""###;
+    let (mint, out, output) = inferred(source);
+    let record = r###"{ "field name": Nat, "let": String, "line\n\"quote\"\\tail": Boolean }"###;
+    assert_eq!(
+        scheme(&mint, &output, "identity"),
+        format!("{record} -> {record}")
+    );
+    assert_eq!(scheme(&mint, &output, "projected"), "Nat");
+    assert_eq!(
+        term_decl(&mint, &out, "projected").value.ty.to_string(),
+        "Nat"
+    );
+}
+
+/// Quoted cases have the same structural identity in annotations, literals and
+/// patterns, including names which could never be bare tag tokens.
+#[test]
+fn quoted_sum_variants_keep_their_identity_and_payload_types() {
+    let source = r###"let identity : (#"some value" Nat | #"let" String | #"line\n\"quote\"\\tail") -> (#"some value" Nat | #"let" String | #"line\n\"quote\"\\tail") = fn value => value
+let payload = match identity (#"some value" 1n) with | #"some value" n => n | #"let" _ => 0n | #"line\n\"quote\"\\tail" => 0n end"###;
+    let (mint, _, output) = inferred(source);
+    let sum = r###"#"some value" Nat | #let String | #"line\n\"quote\"\\tail""###;
+    assert_eq!(
+        scheme(&mint, &output, "identity"),
+        format!("{sum} -> {sum}")
+    );
+    assert_eq!(scheme(&mint, &output, "payload"), "Nat");
+}

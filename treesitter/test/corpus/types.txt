@@ -201,3 +201,52 @@ let identical : 'a -> 'a = fn x => x
     (function
       (identifier)
       (identifier))))
+
+================================================================================
+Quoted labels work in struct types and absences
+================================================================================
+
+type Record 'r = { "field name": Nat, "guarded field" when 'p: String, \"gone field", ..'r }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (type_variable)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (string)
+          (identifier))
+        (struct_type_field
+          (string)
+          (when_clause
+            (type_variable))
+          (identifier))
+        (absent_field
+          (string))
+        (rest
+          (type_variable))))))
+
+================================================================================
+Quoted tags work in sum cases and absent cases
+================================================================================
+
+type Cases 'r = #"some case" Nat | \#"gone case" | ..'r
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (type_variable)
+    (annotation
+      (sum_type
+        (sum_case
+          (tag)
+          (identifier))
+        (absent_case
+          (tag))
+        (rest
+          (type_variable))))))

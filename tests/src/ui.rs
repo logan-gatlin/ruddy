@@ -634,6 +634,67 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     }
 }
 
+/// Effect rows temporarily use sum-shaped arguments internally. Their opaque
+/// identity suffixes are hidden only at that boundary; ordinary labels carrying
+/// the same control character remain user data.
+#[test]
+fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
+    let nat = Rc::new(Ty::plain(Core::Nat));
+    let unit = Rc::new(Ty::unit());
+    let row = Row {
+        labels: [
+            (
+                "Log\u{1f}write:Nat".to_string(),
+                RowField::present(unit.clone()),
+            ),
+            (
+                "Gone\u{1f}gone:Nat".to_string(),
+                RowField {
+                    presence: Presence::Absent,
+                    ty: unit.clone(),
+                },
+            ),
+            ("plain".to_string(), RowField::present(unit)),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    let effect_argument = Rc::new(Ty::plain(Core::Sum(row.clone())));
+    let ordinary_sum_argument = Rc::new(Ty::plain(Core::Sum(Row {
+        labels: [(
+            "ordinary".to_string(),
+            RowField::present(Rc::new(Ty::unit())),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    })));
+    let fielded_argument = Rc::new(Ty {
+        core: Core::Sum(row),
+        fields: [("x".to_string(), RowField::present(nat))]
+            .into_iter()
+            .collect(),
+    });
+
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
+    let symbol = mint
+        .global(None, Namespace::Types, "Runner")
+        .expect("a fresh name");
+    let applied = Ty::plain(Core::Named {
+        symbol,
+        name: "Runner".into(),
+        args: Rc::from([effect_argument, ordinary_sum_argument, fielded_argument]),
+    })
+    .to_string();
+
+    assert!(
+        applied.starts_with("Runner (#Log | #plain) (#ordinary) "),
+        "{applied:?}"
+    );
+    assert!(applied.contains("Log\u{1f}write:Nat"), "{applied:?}");
+}
+
 /// An open row prints in the surface notation too, and cannot be read back
 /// from it — so these are pinned as printing and nothing more.
 ///
@@ -968,13 +1029,22 @@ fn every_fixed_token_prints_as_the_spelling_it_lexes_from() {
     // well: each sigil stays on and each literal keeps its value.
     for kind in [
         TokenKind::Tag("Some".to_string()),
+        TokenKind::Tag("case name".to_string()),
+        TokenKind::Tag("1leading".to_string()),
+        // Keywords and the lone underscore are valid bare names after `#`.
+        TokenKind::Tag("let".to_string()),
+        TokenKind::Tag("true".to_string()),
+        TokenKind::Tag("_".to_string()),
+        TokenKind::Tag("with_underscore".to_string()),
+        // The effect-identity separator has no special meaning in a sum label.
+        TokenKind::Tag("left\u{1f}right".to_string()),
         TokenKind::EffectLabel("Log".to_string()),
         TokenKind::Variable("a".to_string()),
         TokenKind::Identifier("x".to_string()),
         TokenKind::Natural(4096),
         TokenKind::Integer(42),
         TokenKind::Real(1.25),
-        TokenKind::String("a\nstring".to_string()),
+        TokenKind::String("quote\" slash\\ newline\n carriage\r tab\t".to_string()),
         TokenKind::Boolean(true),
     ] {
         let printed = kind.to_string();
@@ -1185,6 +1255,10 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     // A path, which writes the bundle, a module, and the anonymous segment a
     // local is shown under.
     every_failure_is_reported("a path", &mint.path(local));
+    every_failure_is_reported(
+        "an escaped string",
+        &TokenKind::String("quote\" slash\\ newline\n carriage\r tab\t".to_string()),
+    );
 
     let optional = RowField {
         presence: Presence::Undecided,
@@ -2353,6 +2427,15 @@ fn a_witness_renders_in_source_syntax() {
         ir::Witness::Struct([("a".to_string(), ir::Witness::Any)].into_iter().collect())
             .to_string(),
         "{ a }"
+    );
+    assert_eq!(
+        ir::Witness::Struct(
+            [("field name".to_string(), ir::Witness::Any)]
+                .into_iter()
+                .collect()
+        )
+        .to_string(),
+        "{ \"field name\": anything }"
     );
     assert_eq!(
         ir::Witness::Struct(

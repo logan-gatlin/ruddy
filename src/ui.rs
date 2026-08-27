@@ -264,6 +264,80 @@ impl token::ErrorKind {
     }
 }
 
+/// Whether a decoded label has the lexical shape of a sigilled name.
+/// Keywords are allowed behind `#`: the sigil has already told the lexer that
+/// `#let` is a tag rather than the `let` token.
+fn bare_tag(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic()) && chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// Whether a decoded label can be written as an ordinary identifier token.
+/// This mirrors the lexer's Unicode identifier rule and excludes every word
+/// that lexes as a keyword or another dedicated token.
+fn bare_identifier(name: &str) -> bool {
+    bare_tag(name)
+        && !matches!(
+            name,
+            "_" | "let"
+                | "extern"
+                | "in"
+                | "type"
+                | "end"
+                | "with"
+                | "match"
+                | "fn"
+                | "effect"
+                | "handle"
+                | "raise"
+                | "and"
+                | "or"
+                | "xor"
+                | "not"
+                | "module"
+                | "true"
+                | "false"
+        )
+}
+
+/// Write one decoded Ruddy string with the escapes accepted by the lexer.
+pub fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
+    f.write_str("\"")?;
+    for c in value.chars() {
+        match c {
+            '"' => f.write_str("\\\"")?,
+            '\\' => f.write_str("\\\\")?,
+            '\n' => f.write_str("\\n")?,
+            '\r' => f.write_str("\\r")?,
+            '\t' => f.write_str("\\t")?,
+            c => write!(f, "{c}")?,
+        }
+    }
+    f.write_str("\"")
+}
+
+/// Write a field label in its shortest unambiguous source spelling.
+pub fn write_field_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+    if bare_identifier(name) {
+        f.write_str(name)
+    } else {
+        write_string(f, name)
+    }
+}
+
+/// Write a union tag, including its sigil, in canonical source spelling.
+pub fn write_tag_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+    f.write_str("#")?;
+    if bare_tag(name) {
+        f.write_str(name)
+    } else {
+        write_string(f, name)
+    }
+}
+
 impl fmt::Display for token::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -319,7 +393,7 @@ impl fmt::Display for Kind {
             // The sigil is written back on: it is how the token was spelled,
             // and either of these printing as a bare name would re-lex as an
             // identifier.
-            Kind::Tag(name) => write!(f, "#{name}"),
+            Kind::Tag(name) => write_tag_label(f, name),
             Kind::EffectLabel(name) => write!(f, "!{name}"),
             Kind::Variable(name) => write!(f, "'{name}"),
             Kind::LeftBrace => f.write_str("{"),
@@ -331,7 +405,7 @@ impl fmt::Display for Kind {
             Kind::Natural(value) => write!(f, "{value}n"),
             Kind::Integer(value) => write!(f, "{value}i"),
             Kind::Real(value) => write!(f, "{value}"),
-            Kind::String(value) => write!(f, "{value:?}"),
+            Kind::String(value) => write_string(f, value),
             Kind::Boolean(value) => write!(f, "{value}"),
         }
     }
@@ -415,7 +489,7 @@ impl fmt::Display for parse::PatternKind {
             parse::PatternKind::Natural(value) => write!(f, "{value}n"),
             parse::PatternKind::Integer(value) => write!(f, "{value}i"),
             parse::PatternKind::Real(value) => write!(f, "{value}"),
-            parse::PatternKind::String(value) => write!(f, "{value:?}"),
+            parse::PatternKind::String(value) => write_string(f, value),
             parse::PatternKind::Boolean(value) => write!(f, "{value}"),
             parse::PatternKind::Unit => f.write_str("()"),
             parse::PatternKind::Tag { name, payload } => write_tag(
@@ -435,9 +509,9 @@ impl fmt::Display for parse::PatternKind {
                         f.write_str(", ")?;
                     }
                     first = false;
-                    match sub {
-                        Some(sub) => write!(f, "{}: {}", name.tracked, sub.tracked)?,
-                        None => f.write_str(&name.tracked)?,
+                    write_field_label(f, &name.tracked)?;
+                    if let Some(sub) = sub {
+                        write!(f, ": {}", sub.tracked)?;
                     }
                 }
                 // The `..` that makes the pattern open, last as it was
@@ -489,7 +563,7 @@ impl fmt::Display for ir::Witness {
                 ir::Literal::Natural(value) => write!(f, "{value}n"),
                 ir::Literal::Integer(value) => write!(f, "{value}i"),
                 ir::Literal::Real(value) => write!(f, "{value}"),
-                ir::Literal::String(value) => write!(f, "{value:?}"),
+                ir::Literal::String(value) => write_string(f, value),
                 ir::Literal::Boolean(value) => write!(f, "{value}"),
             },
             ir::Witness::Tag { name, payload } => write_tag(f, name, None, payload.as_deref()),
@@ -505,9 +579,9 @@ impl fmt::Display for ir::Witness {
                     if at > 0 {
                         f.write_str(", ")?;
                     }
-                    match witness {
-                        ir::Witness::Any => f.write_str(name)?,
-                        witness => write!(f, "{name}: {witness}")?,
+                    write_field_label(f, name)?;
+                    if !matches!(witness, ir::Witness::Any) || !bare_identifier(name) {
+                        write!(f, ": {witness}")?;
                     }
                 }
                 f.write_str(" }")
@@ -518,7 +592,7 @@ impl fmt::Display for ir::Witness {
                     if at > 0 {
                         f.write_str(" or ")?;
                     }
-                    write!(f, "#{case}")?;
+                    write_tag_label(f, case)?;
                 }
                 Ok(())
             }
@@ -1038,9 +1112,21 @@ fn about(shape: Shape, name: &str) -> (&'static str, String) {
 /// Three shapes and three spellings, which is what the effect's own sigil
 /// buys: a complaint about `!Log` and one about `#Log` no longer read alike.
 pub fn label(shape: Shape, name: &str) -> String {
+    struct Field<'a>(&'a str);
+    impl fmt::Display for Field<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_field_label(f, self.0)
+        }
+    }
+    struct Tag<'a>(&'a str);
+    impl fmt::Display for Tag<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_tag_label(f, self.0)
+        }
+    }
     match shape {
-        Shape::Struct => name.to_string(),
-        Shape::Sum => format!("#{name}"),
+        Shape::Struct => Field(name).to_string(),
+        Shape::Sum => Tag(name).to_string(),
         // Structural effect keys carry an opaque interface after this
         // separator. Source paths never participate in row identity, and the
         // interface is deliberately not user-facing: coalesced effects render
@@ -1240,6 +1326,48 @@ fn core_tail(core: &Core) -> Option<Option<String>> {
     }
 }
 
+/// One argument of a declared type application.
+///
+/// Effect rows are represented as sum-shaped types while they travel through a
+/// declaration parameter. Their generated keys carry an opaque interface after
+/// a unit separator; keep hiding that implementation detail here, at the one
+/// erased-shape boundary that needs it, rather than truncating ordinary sum
+/// labels everywhere they are printed.
+struct AppliedArgument<'a>(&'a Ty);
+
+impl Grouped for AppliedArgument<'_> {
+    fn prec(&self) -> Prec {
+        self.0.prec()
+    }
+}
+
+impl fmt::Display for AppliedArgument<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Core::Sum(row) = &self.0.core else {
+            return self.0.fmt(f);
+        };
+        if !self.0.fields.is_empty() || !row.labels.keys().any(|name| name.contains('\u{1f}')) {
+            return self.0.fmt(f);
+        }
+
+        let entries = row
+            .labels
+            .iter()
+            .filter_map(|(name, field)| match mark(&field.presence) {
+                Absence::Absent => None,
+                Absence::There(mark) => Some(Entry::Written {
+                    name: name
+                        .split_once('\u{1f}')
+                        .map_or(name.as_str(), |(name, _)| name),
+                    mark,
+                    holds: payload(&field.ty),
+                }),
+            });
+        let tail = tail_of(Shape::Sum, &row.rest);
+        write_sum(f, entries, tail.as_ref().map(shown))
+    }
+}
+
 /// A core prints as the whole type would if it carried no fields, which is what
 /// [`Display for Ty`](Ty) writes it as.
 impl fmt::Display for Core {
@@ -1265,7 +1393,7 @@ impl fmt::Display for Core {
             // that names itself can be printed at all.
             Core::Named { name, args, .. } if args.is_empty() => f.write_str(name),
             Core::Named { name, args, .. } => {
-                write_applied(f, &**name, args.iter().map(|arg| &**arg))
+                write_applied(f, &**name, args.iter().map(|arg| AppliedArgument(arg)))
             }
             // A solver variable has no name, only an index; it is numbered so
             // that two different unknowns in one message stay distinguishable.
@@ -2328,11 +2456,14 @@ pub fn write_row<K: fmt::Display, V: fmt::Display>(
         first = false;
         match field {
             Entry::Written { name, mark, holds } => {
-                write!(f, "{name}")?;
+                write_field_label(f, &name.to_string())?;
                 write_row_mark(f, mark.as_ref())?;
                 write!(f, ": {holds}")?;
             }
-            Entry::Absent { name } => write!(f, "\\{name}")?,
+            Entry::Absent { name } => {
+                f.write_str("\\")?;
+                write_field_label(f, &name.to_string())?;
+            }
         }
     }
     if let Some(tail) = tail {
@@ -2373,7 +2504,10 @@ pub fn write_sum<K: fmt::Display, V: Grouped>(
             Entry::Written { name, mark, holds } => {
                 write_tag(f, &name.to_string(), mark.as_ref(), holds)?
             }
-            Entry::Absent { name } => write!(f, "\\#{name}")?,
+            Entry::Absent { name } => {
+                f.write_str("\\")?;
+                write_tag_label(f, &name.to_string())?;
+            }
         }
     }
     // The empty sum, and the sum that is nothing but its tail: neither writes a
@@ -2479,7 +2613,7 @@ pub fn write_tag<V: Grouped>(
     mark: Option<&Mark>,
     payload: Option<V>,
 ) -> fmt::Result {
-    write!(f, "#{}", name.split('\u{1f}').next().unwrap_or(name))?;
+    write_tag_label(f, name)?;
     write_tag_mark(f, mark)?;
     match payload {
         Some(payload) => {
@@ -2538,7 +2672,8 @@ pub fn write_match<P: fmt::Display, B: fmt::Display>(
 /// space, so only the forms that extend rightward need grouping.
 pub fn write_project(f: &mut fmt::Formatter<'_>, base: &impl Grouped, field: &str) -> fmt::Result {
     write_grouped(f, base.prec() < Prec::Atom, base)?;
-    write!(f, ".{field}")
+    f.write_str(".")?;
+    write_field_label(f, field)
 }
 
 /// Render `body`, wrapping it in parentheses when leaving them off would make

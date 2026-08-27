@@ -105,6 +105,14 @@
 (string) @string
 (boolean) @boolean
 
+; A quoted field is lexically a string, but its syntactic role is a property.
+; These come after the catch-all string capture so the contextual class wins.
+(struct_field name: (string) @property)
+(struct_type_field name: (string) @property)
+(struct_pattern_field name: (string) @property)
+(absent_field name: (string) @property)
+(projection field: (string) @property)
+
 ; ── keywords ─────────────────────────────────────────────────────────────────
 
 [

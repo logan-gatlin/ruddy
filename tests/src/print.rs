@@ -844,6 +844,41 @@ fn the_ast_printer_round_trips_modules_and_paths() {
     }
 }
 
+#[test]
+fn quoted_fields_and_variants_round_trip_canonically_in_ast_and_ir() {
+    for source in [
+        r###"let value : { "field name": Nat, "let": Nat, "line\n\"quote\"\\tail": Nat } = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n }"###,
+        r###"let get = fn record => record."field name"."let""###,
+        r###"let get = fn record => match record with | { "field name": x, "let": y } => x end"###,
+        r###"type Choice = #"some case" Nat | #let | #"line\n\"quote\"\\tail""###,
+        r###"let get = fn choice => match choice with | #"some case" n => n | #let => 0n | #"line\n\"quote\"\\tail" => 1n end"###,
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}: AST canonical form");
+        assert_eq!(ir, source, "{source}: IR canonical form");
+        let (ast_again, ir_again) = printed(&ir);
+        assert_eq!(ast_again, ast, "{source}: AST fixed point");
+        assert_eq!(ir_again, ir, "{source}: IR fixed point");
+    }
+
+    // Quotes which are unnecessary disappear, while field keywords keep them.
+    // The result is still accepted as the same decoded structural labels.
+    for (source, canonical) in [
+        (
+            r###"let value = { "plain": 1n, "let": 2n }"###,
+            r###"let value = { plain: 1n, "let": 2n }"###,
+        ),
+        (r###"let value = #"Plain""###, "let value = #Plain"),
+        (r###"let value = #"let""###, "let value = #let"),
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, canonical, "{source}: AST canonicalized");
+        assert_eq!(ir, canonical, "{source}: IR canonicalized");
+        let (_, again) = printed(canonical);
+        assert_eq!(again, canonical, "{source}: canonical form round-trips");
+    }
+}
+
 /// Print one source through the AST printer and read the result back, so a
 /// printed tree that needs a bracket it did not write is caught here rather
 /// than by a reader pasting it into a file.

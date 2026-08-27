@@ -445,9 +445,10 @@ impl fmt::Display for Ast<'_, PatternKind> {
                         f.write_str(", ")?;
                     }
                     first = false;
+                    let name = label(Shape::Struct, &name.tracked);
                     match pattern {
-                        Some(pattern) => write!(f, " {}: {}", name.tracked, Ast(&pattern.tracked))?,
-                        None => write!(f, " {}", name.tracked)?,
+                        Some(pattern) => write!(f, " {name}: {}", Ast(&pattern.tracked))?,
+                        None => write!(f, " {name}")?,
                     }
                 }
                 if rest.is_some() {

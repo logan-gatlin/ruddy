@@ -13,12 +13,46 @@
 //! rather than two that could drift. [`arms`] is why: the tree the tab builds
 //! and the text this file writes walk the same child blocks in the same order.
 
-use std::fmt::Write;
+use std::{collections::HashSet, fmt::Write};
 
 use ruddy::{
-    ir::Literal,
+    ir::{Literal, Program},
     lir::{Block, Callee, End, Extern, Function, Global, Instr, Op, Output, Rep, Terminator},
+    types::{EffectId, Shape},
 };
+
+/// The structural effect keys that are internal to one lowered program.
+///
+/// A unit separator has no intrinsic meaning in an LIR struct field: quoted
+/// source fields may contain one. Only generated evidence operations naming
+/// keys minted for effects hide the opaque interface following that separator.
+#[derive(Default)]
+pub struct Labels {
+    effects: HashSet<String>,
+}
+
+impl Labels {
+    pub fn new(program: &Program) -> Self {
+        let effects = program
+            .effect_ids
+            .values()
+            .filter_map(|effect| match effect {
+                EffectId::Structural { name, interface } => {
+                    Some(format!("{name}\u{1f}{interface}"))
+                }
+                EffectId::Pending(_) => None,
+            })
+            .collect();
+        Self { effects }
+    }
+
+    fn field<'a>(&self, name: &'a str, generated: bool) -> &'a str {
+        match generated && self.effects.contains(name) {
+            true => name.split_once('\u{1f}').map_or(name, |(name, _)| name),
+            false => name,
+        }
+    }
+}
 
 /// How far one level of nesting indents. An arm label sits one level under its
 /// instruction and the arm's block one level under that, which is what makes a
@@ -28,7 +62,7 @@ const STEP: usize = 2;
 /// The whole listing: imports, functions, then initialized globals, one blank
 /// line apart. Imports lead because they have no initializer block; functions
 /// precede globals because a global may refer to a lifted wrapper above it.
-pub fn program(output: &Output) -> String {
+pub fn program(output: &Output, labels: &Labels) -> String {
     let mut out = String::new();
     let mut first = true;
     for external in &output.externs {
@@ -44,7 +78,7 @@ pub fn program(output: &Output) -> String {
         }
         first = false;
         let _ = writeln!(out, "{}", signature(function));
-        block(output, &function.body, STEP, &mut out);
+        block(output, labels, &function.body, STEP, &mut out);
     }
     for global in &output.globals {
         if !first {
@@ -52,7 +86,7 @@ pub fn program(output: &Output) -> String {
         }
         first = false;
         let _ = writeln!(out, "{}", header(global));
-        block(output, &global.body, STEP, &mut out);
+        block(output, labels, &global.body, STEP, &mut out);
     }
     out
 }
@@ -87,12 +121,12 @@ pub fn header(global: &Global) -> String {
 /// One instruction, without its child blocks: the temp it assigns, how that temp
 /// is held, and what it does. A block-valued instruction ends in the `:` its
 /// blocks hang under.
-pub fn instruction(output: &Output, instr: &Instr) -> String {
+pub fn instruction(output: &Output, labels: &Labels, instr: &Instr) -> String {
     format!(
         "%{}: {} = {}",
         instr.temp,
         rep(instr.rep),
-        operation(output, &instr.op)
+        operation(output, labels, instr.span.is_generated(), &instr.op)
     )
 }
 
@@ -173,7 +207,12 @@ pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
             cases, fallback, ..
         } => cases
             .iter()
-            .map(|case| (Some(format!("#{}", case.name)), &case.block))
+            .map(|case| {
+                (
+                    Some(crate::print::label(Shape::Sum, &case.name)),
+                    &case.block,
+                )
+            })
             .chain(
                 fallback
                     .iter()
@@ -206,22 +245,22 @@ pub fn arms(op: &Op) -> Vec<(Option<String>, &Block)> {
 }
 
 /// One block, indented: its instructions, then the terminator that ends it.
-fn block(output: &Output, block: &Block, indent: usize, out: &mut String) {
+fn block(output: &Output, labels: &Labels, block: &Block, indent: usize, out: &mut String) {
     for instr in &block.instrs {
         let _ = writeln!(
             out,
             "{:indent$}{}",
             "",
-            instruction(output, instr),
+            instruction(output, labels, instr),
             indent = indent
         );
         for (label, child) in arms(&instr.op) {
             match label {
                 Some(label) => {
                     let _ = writeln!(out, "{:indent$}{label} =>", "", indent = indent + STEP);
-                    self::block(output, child, indent + STEP * 2, out);
+                    self::block(output, labels, child, indent + STEP * 2, out);
                 }
-                None => self::block(output, child, indent + STEP, out),
+                None => self::block(output, labels, child, indent + STEP, out),
             }
         }
     }
@@ -232,12 +271,6 @@ fn block(output: &Output, block: &Block, indent: usize, out: &mut String) {
         terminator(&block.end),
         indent = indent
     );
-}
-
-/// Hide the internal structural interface when an effect label reaches LIR
-/// evidence. Ordinary field names never contain this separator.
-fn effect_name(name: &str) -> &str {
-    name.split('\u{1f}').next().unwrap_or(name)
 }
 
 /// Render a primitive literal exactly as source syntax would spell it.
@@ -253,7 +286,7 @@ fn literal(value: &Literal) -> String {
 }
 
 /// What one instruction does, with its operands.
-fn operation(output: &Output, op: &Op) -> String {
+fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> String {
     match op {
         Op::Const(value) => format!("const {}", literal(value)),
         Op::Neg(value) => format!("neg %{value}"),
@@ -269,7 +302,12 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::Struct(fields) => {
             let entries: Vec<String> = fields
                 .iter()
-                .map(|(name, temp)| format!("{}: %{temp}", effect_name(name)))
+                .map(|(name, temp)| {
+                    format!(
+                        "{}: %{temp}",
+                        crate::print::label(Shape::Struct, labels.field(name, generated))
+                    )
+                })
                 .collect();
             format!("struct {{ {} }}", entries.join(", "))
         }
@@ -277,15 +315,17 @@ fn operation(output: &Output, op: &Op) -> String {
             let laid: Vec<String> = records.iter().map(|temp| format!("%{temp}")).collect();
             format!("merge {}", laid.join(", "))
         }
-        Op::Project { base, field } => format!("project %{base}, {:?}", effect_name(field)),
+        Op::Project { base, field } => {
+            format!("project %{base}, {:?}", labels.field(field, generated))
+        }
         Op::Tag {
             name,
             payload: None,
-        } => format!("tag #{name}"),
+        } => format!("tag {}", crate::print::label(Shape::Sum, name)),
         Op::Tag {
             name,
             payload: Some(temp),
-        } => format!("tag #{name}, %{temp}"),
+        } => format!("tag {}, %{temp}", crate::print::label(Shape::Sum, name)),
         Op::Payload(temp) => format!("payload %{temp}"),
         Op::Closure { func, captures } => {
             let held: Vec<String> = captures.iter().map(|temp| format!("%{temp}")).collect();
@@ -310,12 +350,15 @@ fn operation(output: &Output, op: &Op) -> String {
         Op::SwitchTag { on, .. } => format!("switch_tag %{on}:"),
         Op::SwitchPrim { on, .. } => format!("switch_prim %{on}:"),
         Op::SwitchPresence { on, field, .. } => {
-            format!("switch_presence %{on}, {:?}:", effect_name(field))
+            format!(
+                "switch_presence %{on}, {:?}:",
+                labels.field(field, generated)
+            )
         }
         Op::SwitchRest { on, fields, .. } => {
             let names: Vec<String> = fields
                 .iter()
-                .map(|name| format!("{:?}", effect_name(name)))
+                .map(|name| format!("{:?}", labels.field(name, generated)))
                 .collect();
             format!("switch_rest %{on}, [{}]:", names.join(", "))
         }

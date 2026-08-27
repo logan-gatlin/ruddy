@@ -25,6 +25,7 @@ use ruddy::{
 };
 
 use crate::{
+    print,
     stage::{Cx, Ids, Spec, plural, with_symbol},
     wire::{Node, Stage},
 };
@@ -49,7 +50,12 @@ fn origin_details(ids: &mut Ids, origin: &Origin, span: Span) -> Vec<Node> {
             }
             for (name, presence) in &coverage.fields {
                 rows.push(
-                    Node::new(ids.next(), format!("field {name}"), presence.to_string()).at(span),
+                    Node::new(
+                        ids.next(),
+                        format!("field {}", print::label(print::Shape::Struct, name)),
+                        presence.to_string(),
+                    )
+                    .at(span),
                 );
             }
             rows
@@ -184,8 +190,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             );
             for (name, presence) in &refinement.fields {
                 arm = arm.child(
-                    Node::new(ids.next(), format!("presence {name}"), presence.to_string())
-                        .at(refinement.arm_span),
+                    Node::new(
+                        ids.next(),
+                        format!("presence {}", print::label(print::Shape::Struct, name)),
+                        presence.to_string(),
+                    )
+                    .at(refinement.arm_span),
                 );
             }
             for fact in &refinement.facts {
@@ -193,7 +203,11 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                     Node::new(
                         ids.next(),
                         "entailed",
-                        format!("{}{}", if fact.present { "" } else { "not " }, fact.field),
+                        format!(
+                            "{}{}",
+                            if fact.present { "" } else { "not " },
+                            print::label(print::Shape::Struct, &fact.field)
+                        ),
                     )
                     .at(refinement.arm_span),
                 );
