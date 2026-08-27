@@ -89,6 +89,18 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
     .children(interface);
 
     let mut lowered = Vec::new();
+    for external in &artifact.lir.externs {
+        lowered.push(Node::new(
+            ids.next(),
+            "extern",
+            format!(
+                "{} = {} · {:?}",
+                external.name,
+                external.target.join("."),
+                external.rep
+            ),
+        ));
+    }
     for function in &artifact.lir.functions {
         lowered.push(Node::new(ids.next(), "function", &function.name));
     }
@@ -99,7 +111,8 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         ids.next(),
         "lir",
         format!(
-            "{} functions · {} globals",
+            "{} externs · {} functions · {} globals",
+            artifact.lir.externs.len(),
             artifact.lir.functions.len(),
             artifact.lir.globals.len()
         ),
@@ -119,11 +132,12 @@ pub fn render(spec: &Spec, cx: &Cx, artifact: &Artifact, micros: u64) -> Stage {
         ..spec.stage(
             cx.status(),
             format!(
-                "{} · {} values · {} types · {} effects · {} functions · {} globals",
+                "{} · {} values · {} types · {} effects · {} externs · {} functions · {} globals",
                 dependencies,
                 artifact.header.values.len(),
                 artifact.header.types.len(),
                 artifact.header.effects.len(),
+                artifact.lir.externs.len(),
                 artifact.lir.functions.len(),
                 artifact.lir.globals.len(),
             ),

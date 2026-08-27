@@ -2739,7 +2739,7 @@ fn stage_named<'a>(snapshot: &'a Snapshot, id: &str) -> &'a Stage {
 }
 
 #[test]
-fn extern_values_reach_the_import_and_type_views() {
+fn extern_values_reach_every_import_and_artifact_view() {
     let source = "extern answer : Nat = host.answer\nlet next = answer";
     let snapshot = snapshot(source);
     assert!(
@@ -2772,4 +2772,27 @@ fn extern_values_reach_the_import_and_type_views() {
             .iter()
             .any(|node| node.label == "extern" && node.text.contains("host.answer"))
     );
+    for id in ["artifact", "linked"] {
+        let artifact = stage(id);
+        assert!(
+            artifact.summary.contains("1 externs"),
+            "{id}: {}",
+            artifact.summary
+        );
+        assert!(
+            nodes(artifact)
+                .iter()
+                .any(|node| node.label == "extern" && node.text.contains("host.answer")),
+            "{id}: {:#?}",
+            artifact.nodes
+        );
+        assert!(
+            artifact
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("(target \"host\" \"answer\")")),
+            "{id}: {:?}",
+            artifact.text
+        );
+    }
 }
