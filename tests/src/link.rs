@@ -1,6 +1,6 @@
 use ruddy::{
     artifact as a, inference, ir,
-    link::{self, DeclarationNamespace, LinkError},
+    link::{self, DeclarationNamespace, LinkError, SchemeProblem},
     lir, parse, patterns,
     symbol::{Bundle, Mint, Namespace, Version},
     token,
@@ -95,6 +95,16 @@ fn scheme() -> a::Scheme {
         presences: 0,
         formula: a::Formula::True,
         body: a::Type {
+            core: a::Core::Unit,
+            fields: vec![],
+        },
+    }
+}
+
+fn presence_field(presence: a::Presence) -> a::RowField {
+    a::RowField {
+        presence,
+        ty: a::Type {
             core: a::Core::Unit,
             fields: vec![],
         },
@@ -702,7 +712,10 @@ fn interface_artifact(
         }),
         DeclarationNamespace::Effect => artifact.header.effects.push(a::DeclaredEffect {
             name: format!("{name}@1.0.0::E"),
-            identity: None,
+            identity: target.is_none().then(|| a::EffectIdentity {
+                name: "E".into(),
+                interface: format!("{name}@1.0.0"),
+            }),
             kind: target.map_or_else(
                 || a::EffectKind::Operations(vec![]),
                 |target| a::EffectKind::Alias(vec![target.into()]),
@@ -1057,6 +1070,221 @@ fn qualified_validation_is_namespace_sensitive_and_synthetic_names_are_exact() {
 }
 
 #[test]
+fn validates_shared_scheme_binder_space() {
+    let mut valid = artifact(
+        "app",
+        &[],
+        vec![],
+        vec![global("app@1.0.0::x", block(vec![]))],
+    );
+    let scheme = &mut valid.header.values[0].scheme;
+    scheme.count = 3;
+    scheme.presences = 1;
+    scheme.formula = a::Formula::And(
+        Box::new(a::Formula::Not(Box::new(a::Formula::Bound(0)))),
+        Box::new(a::Formula::Or(
+            Box::new(a::Formula::Iff(
+                Box::new(a::Formula::True),
+                Box::new(a::Formula::Var(9)),
+            )),
+            Box::new(a::Formula::Xor(
+                Box::new(a::Formula::False),
+                Box::new(a::Formula::True),
+            )),
+        )),
+    );
+    scheme.body = a::Type {
+        core: a::Core::Bound(1),
+        fields: vec![("x".into(), presence_field(a::Presence::Bound(0)))],
+    };
+    link::link(&[valid.clone()]).expect("presence binders occupy the shared low prefix");
+
+    let cases = [
+        (
+            4,
+            1,
+            Some(a::Formula::Bound(1)),
+            a::Core::Unit,
+            SchemeProblem::FormulaBound(1),
+        ),
+        (1, 2, None, a::Core::Unit, SchemeProblem::PresenceCount),
+        (1, 1, None, a::Core::Bound(0), SchemeProblem::TypeBound(0)),
+        (2, 1, None, a::Core::Bound(2), SchemeProblem::TypeBound(2)),
+    ];
+    for (count, presences, formula, core, expected) in cases {
+        let mut input = valid.clone();
+        let scheme = &mut input.header.values[0].scheme;
+        scheme.count = count;
+        scheme.presences = presences;
+        scheme.formula = formula.unwrap_or(a::Formula::True);
+        scheme.body = a::Type {
+            core,
+            fields: vec![],
+        };
+        assert!(
+            matches!(link::link(&[input]), Err(LinkError::MalformedScheme { problem, .. }) if problem == expected)
+        );
+    }
+
+    let mut presence = valid.clone();
+    presence.header.values[0].scheme.body.fields[0].1.presence = a::Presence::Bound(1);
+    assert!(matches!(
+        link::link(&[presence]),
+        Err(LinkError::MalformedScheme {
+            problem: SchemeProblem::PresenceBound(1),
+            ..
+        })
+    ));
+    let mut row_presence = valid.clone();
+    row_presence.header.values[0].scheme.body.core = a::Core::Sum(a::Row {
+        labels: vec![("case".into(), presence_field(a::Presence::Bound(1)))],
+        rest: a::Rest::Closed,
+    });
+    assert!(matches!(
+        link::link(&[row_presence]),
+        Err(LinkError::MalformedScheme {
+            problem: SchemeProblem::PresenceBound(1),
+            ..
+        })
+    ));
+
+    for at in [0, 3] {
+        let mut row = valid.clone();
+        row.header.values[0].scheme.body.core = a::Core::Sum(a::Row {
+            labels: vec![],
+            rest: a::Rest::Bound(at),
+        });
+        assert!(
+            matches!(link::link(&[row]), Err(LinkError::MalformedScheme { problem: SchemeProblem::RowBound(found), .. }) if found == at)
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_effects_operations_and_duplicate_structural_labels() {
+    let effect = |identity, kind| a::DeclaredEffect {
+        name: "app@1.0.0::E".into(),
+        identity,
+        kind,
+    };
+    for malformed in [
+        effect(None, a::EffectKind::Operations(vec![])),
+        effect(
+            Some(a::EffectIdentity {
+                name: "E".into(),
+                interface: "app@1.0.0".into(),
+            }),
+            a::EffectKind::Alias(vec![]),
+        ),
+    ] {
+        let mut input = artifact("app", &[], vec![], vec![]);
+        input.header.effects.push(malformed);
+        assert!(matches!(
+            link::link(&[input]),
+            Err(LinkError::MalformedEffect { .. })
+        ));
+    }
+    let identity = Some(a::EffectIdentity {
+        name: "E".into(),
+        interface: "app@1.0.0".into(),
+    });
+    for (names, duplicate) in [(["bad-name", "ok"], false), (["op", "op"], true)] {
+        let operations = names
+            .into_iter()
+            .map(|name| a::Operation {
+                name: name.into(),
+                from: scheme().body,
+                to: scheme().body,
+            })
+            .collect();
+        let mut input = artifact("app", &[], vec![], vec![]);
+        input.header.effects.push(effect(
+            identity.clone(),
+            a::EffectKind::Operations(operations),
+        ));
+        let error = link::link(&[input]).unwrap_err();
+        assert_eq!(
+            matches!(error, LinkError::DuplicateEffectOperation { .. }),
+            duplicate
+        );
+        assert_eq!(
+            matches!(error, LinkError::MalformedEffectOperation { .. }),
+            !duplicate
+        );
+    }
+    let bad_type = a::Type {
+        core: a::Core::Bound(0),
+        fields: vec![],
+    };
+    for in_result in [false, true] {
+        let operation = a::Operation {
+            name: "op".into(),
+            from: if in_result {
+                scheme().body
+            } else {
+                bad_type.clone()
+            },
+            to: if in_result {
+                bad_type.clone()
+            } else {
+                scheme().body
+            },
+        };
+        let mut input = artifact("app", &[], vec![], vec![]);
+        input.header.effects.push(effect(
+            identity.clone(),
+            a::EffectKind::Operations(vec![operation]),
+        ));
+        assert!(matches!(
+            link::link(&[input]),
+            Err(LinkError::MalformedScheme {
+                problem: SchemeProblem::TypeBound(0),
+                ..
+            })
+        ));
+    }
+
+    let duplicate = |row: bool| {
+        let mut input = artifact(
+            "app",
+            &[],
+            vec![],
+            vec![global("app@1.0.0::x", block(vec![]))],
+        );
+        let labels = vec![
+            ("x".into(), presence_field(a::Presence::Present)),
+            ("x".into(), presence_field(a::Presence::Absent)),
+        ];
+        input.header.values[0].scheme.body = if row {
+            a::Type {
+                core: a::Core::Sum(a::Row {
+                    labels: vec![],
+                    rest: a::Rest::More(Box::new(a::Row {
+                        labels,
+                        rest: a::Rest::Closed,
+                    })),
+                }),
+                fields: vec![],
+            }
+        } else {
+            a::Type {
+                core: a::Core::Unit,
+                fields: labels,
+            }
+        };
+        input
+    };
+    assert!(matches!(
+        link::link(&[duplicate(false)]),
+        Err(LinkError::DuplicateTypeField { .. })
+    ));
+    assert!(matches!(
+        link::link(&[duplicate(true)]),
+        Err(LinkError::DuplicateRowLabel { .. })
+    ));
+}
+
+#[test]
 fn every_link_error_has_a_user_facing_message() {
     let errors = [
         LinkError::EmptyGraph,
@@ -1131,6 +1359,53 @@ fn every_link_error_has_a_user_facing_message() {
             name: "b@1.0.0::T".into(),
             expected: 2,
             found: 1,
+        },
+        LinkError::MalformedScheme {
+            owner: "a".into(),
+            name: "x".into(),
+            problem: SchemeProblem::PresenceCount,
+        },
+        LinkError::MalformedScheme {
+            owner: "a".into(),
+            name: "x".into(),
+            problem: SchemeProblem::FormulaBound(1),
+        },
+        LinkError::MalformedScheme {
+            owner: "a".into(),
+            name: "x".into(),
+            problem: SchemeProblem::PresenceBound(1),
+        },
+        LinkError::MalformedScheme {
+            owner: "a".into(),
+            name: "x".into(),
+            problem: SchemeProblem::TypeBound(1),
+        },
+        LinkError::MalformedScheme {
+            owner: "a".into(),
+            name: "x".into(),
+            problem: SchemeProblem::RowBound(1),
+        },
+        LinkError::MalformedEffect {
+            owner: "a".into(),
+            name: "E".into(),
+        },
+        LinkError::MalformedEffectOperation {
+            owner: "a".into(),
+            effect: "E".into(),
+            operation: "bad".into(),
+        },
+        LinkError::DuplicateEffectOperation {
+            owner: "a".into(),
+            effect: "E".into(),
+            operation: "op".into(),
+        },
+        LinkError::DuplicateTypeField {
+            owner: "a".into(),
+            label: "x".into(),
+        },
+        LinkError::DuplicateRowLabel {
+            owner: "a".into(),
+            label: "x".into(),
         },
         LinkError::MissingGlobal {
             owner: "a".into(),

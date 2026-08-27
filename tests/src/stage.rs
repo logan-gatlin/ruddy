@@ -878,14 +878,13 @@ fn link_failure_is_distinct_from_a_skip_and_a_panic() {
     let failed = ruddy_debug::stage::linked::missing(spec, false, Some("bad graph"));
     assert_eq!(failed.status, Status::Error);
     assert_eq!(failed.summary, "bad graph");
-    assert_eq!(
-        ruddy_debug::stage::linked::missing(spec, true, Some("bad graph")).status,
-        Status::Panicked
-    );
-    assert_eq!(
-        ruddy_debug::stage::linked::missing(spec, false, None).status,
-        Status::Skipped
-    );
+    assert_eq!(failed.micros, Some(0));
+    let panicked = ruddy_debug::stage::linked::missing(spec, true, Some("bad graph"));
+    assert_eq!(panicked.status, Status::Panicked);
+    assert_eq!(panicked.micros, Some(0));
+    let skipped = ruddy_debug::stage::linked::missing(spec, false, None);
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.micros, None);
 }
 
 #[test]

@@ -389,6 +389,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // Linking is a distinct final phase. Dependency artifacts remain separate
     // compilation boundaries above; this output copies their code into the
     // active root and therefore needs no external artifacts at execution time.
+    let errored_before_link = !diagnostics.is_empty();
     let mut link_error = None;
     let mut link_panicked = false;
     let linked = artifact.as_ref().and_then(|artifact| {
@@ -454,7 +455,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         mint: built.as_ref().map(|_| &mint),
         symbols: &symbols,
         micros,
-        errored: !diagnostics.is_empty(),
+        // A link-only diagnostic belongs to the final tab and must not
+        // retroactively downgrade compiler phases that already succeeded.
+        errored: errored_before_link,
     };
 
     // In registry order, which is also dependency order: a stage that annotates

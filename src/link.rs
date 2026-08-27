@@ -94,6 +94,33 @@ pub enum LinkError {
         expected: usize,
         found: usize,
     },
+    MalformedScheme {
+        owner: String,
+        name: String,
+        problem: SchemeProblem,
+    },
+    MalformedEffect {
+        owner: String,
+        name: String,
+    },
+    MalformedEffectOperation {
+        owner: String,
+        effect: String,
+        operation: String,
+    },
+    DuplicateEffectOperation {
+        owner: String,
+        effect: String,
+        operation: String,
+    },
+    DuplicateTypeField {
+        owner: String,
+        label: String,
+    },
+    DuplicateRowLabel {
+        owner: String,
+        label: String,
+    },
     MissingGlobal {
         owner: String,
         target: String,
@@ -117,6 +144,16 @@ pub enum DeclarationNamespace {
     Effect,
 }
 
+/// The violated invariant in a normalized public scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemeProblem {
+    PresenceCount,
+    FormulaBound(u32),
+    PresenceBound(u32),
+    TypeBound(u32),
+    RowBound(u32),
+}
+
 impl fmt::Display for DeclarationNamespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -124,6 +161,18 @@ impl fmt::Display for DeclarationNamespace {
             Self::Type => "type",
             Self::Effect => "effect",
         })
+    }
+}
+
+impl fmt::Display for SchemeProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PresenceCount => f.write_str("presence count exceeds total binder count"),
+            Self::FormulaBound(at) => write!(f, "formula presence binder {at} is out of range"),
+            Self::PresenceBound(at) => write!(f, "field presence binder {at} is out of range"),
+            Self::TypeBound(at) => write!(f, "type binder {at} is out of range or presence-only"),
+            Self::RowBound(at) => write!(f, "row binder {at} is out of range or presence-only"),
+        }
     }
 }
 
@@ -216,6 +265,42 @@ impl fmt::Display for LinkError {
             } => write!(
                 f,
                 "artifact `{owner}` interface applies named type `{name}` with {found} arguments, but its declaration has {expected} parameters"
+            ),
+            Self::MalformedScheme {
+                owner,
+                name,
+                problem,
+            } => write!(
+                f,
+                "artifact `{owner}` has malformed scheme `{name}`: {problem}"
+            ),
+            Self::MalformedEffect { owner, name } => write!(
+                f,
+                "artifact `{owner}` has an identity inconsistent with effect `{name}`"
+            ),
+            Self::MalformedEffectOperation {
+                owner,
+                effect,
+                operation,
+            } => write!(
+                f,
+                "artifact `{owner}` effect `{effect}` has malformed operation name `{operation}`"
+            ),
+            Self::DuplicateEffectOperation {
+                owner,
+                effect,
+                operation,
+            } => write!(
+                f,
+                "artifact `{owner}` effect `{effect}` declares operation `{operation}` more than once"
+            ),
+            Self::DuplicateTypeField { owner, label } => write!(
+                f,
+                "artifact `{owner}` interface type contains duplicate field `{label}`"
+            ),
+            Self::DuplicateRowLabel { owner, label } => write!(
+                f,
+                "artifact `{owner}` interface row contains duplicate label `{label}`"
             ),
             Self::MissingGlobal { owner, target } => {
                 write!(f, "artifact `{owner}` references missing global `{target}`")
@@ -329,6 +414,7 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
             globals.insert(global.name.clone());
         }
         validate_declarations(artifact, &owner)?;
+        validate_interface_shapes(artifact, &owner)?;
         let values: HashSet<_> = artifact
             .header
             .values
@@ -595,6 +681,163 @@ fn validate_declaration_names<'a>(
                 namespace,
                 name: name.to_string(),
             });
+        }
+    }
+    Ok(())
+}
+
+fn validate_interface_shapes(artifact: &Artifact, owner: &str) -> Result<(), LinkError> {
+    for value in &artifact.header.values {
+        validate_scheme(owner, &value.name, &value.scheme)?;
+    }
+    for declaration in &artifact.header.types {
+        validate_scheme(owner, &declaration.name, &declaration.scheme)?;
+    }
+    for effect in &artifact.header.effects {
+        match (&effect.identity, &effect.kind) {
+            (Some(_), artifact::EffectKind::Operations(_))
+            | (None, artifact::EffectKind::Alias(_)) => {}
+            _ => {
+                return Err(LinkError::MalformedEffect {
+                    owner: owner.to_string(),
+                    name: effect.name.clone(),
+                });
+            }
+        }
+        if let artifact::EffectKind::Operations(operations) = &effect.kind {
+            let mut names = HashSet::new();
+            for operation in operations {
+                if !source_identifier(&operation.name) {
+                    return Err(LinkError::MalformedEffectOperation {
+                        owner: owner.to_string(),
+                        effect: effect.name.clone(),
+                        operation: operation.name.clone(),
+                    });
+                }
+                if !names.insert(operation.name.as_str()) {
+                    return Err(LinkError::DuplicateEffectOperation {
+                        owner: owner.to_string(),
+                        effect: effect.name.clone(),
+                        operation: operation.name.clone(),
+                    });
+                }
+                let signature = format!("{}::{}", effect.name, operation.name);
+                validate_type(owner, &signature, &operation.from, 0, 0)?;
+                validate_type(owner, &signature, &operation.to, 0, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_scheme(owner: &str, name: &str, scheme: &artifact::Scheme) -> Result<(), LinkError> {
+    let problem = if scheme.presences > scheme.count {
+        Some(SchemeProblem::PresenceCount)
+    } else {
+        let mut formulas = vec![&scheme.formula];
+        let mut found = None;
+        while let Some(formula) = formulas.pop() {
+            match formula {
+                artifact::Formula::Bound(at) if *at >= scheme.presences => {
+                    found = Some(SchemeProblem::FormulaBound(*at));
+                    break;
+                }
+                artifact::Formula::Not(value) => formulas.push(value),
+                artifact::Formula::And(left, right)
+                | artifact::Formula::Or(left, right)
+                | artifact::Formula::Iff(left, right)
+                | artifact::Formula::Xor(left, right) => {
+                    formulas.push(left);
+                    formulas.push(right);
+                }
+                _ => {}
+            }
+        }
+        found
+    };
+    if let Some(problem) = problem {
+        return Err(LinkError::MalformedScheme {
+            owner: owner.to_string(),
+            name: name.to_string(),
+            problem,
+        });
+    }
+    validate_type(owner, name, &scheme.body, scheme.count, scheme.presences)
+}
+
+fn validate_type(
+    owner: &str,
+    name: &str,
+    root: &artifact::Type,
+    count: u32,
+    presences: u32,
+) -> Result<(), LinkError> {
+    enum Part<'a> {
+        Type(&'a artifact::Type),
+        Row(&'a artifact::Row),
+    }
+    let malformed = |problem| LinkError::MalformedScheme {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        problem,
+    };
+    let mut parts = vec![Part::Type(root)];
+    while let Some(part) = parts.pop() {
+        match part {
+            Part::Type(ty) => {
+                let mut labels = HashSet::new();
+                for (label, field) in &ty.fields {
+                    if !labels.insert(label.as_str()) {
+                        return Err(LinkError::DuplicateTypeField {
+                            owner: owner.to_string(),
+                            label: label.clone(),
+                        });
+                    }
+                    if let artifact::Presence::Bound(at) = &field.presence
+                        && *at >= presences
+                    {
+                        return Err(malformed(SchemeProblem::PresenceBound(*at)));
+                    }
+                    parts.push(Part::Type(&field.ty));
+                }
+                match &ty.core {
+                    artifact::Core::Bound(at) if *at < presences || *at >= count => {
+                        return Err(malformed(SchemeProblem::TypeBound(*at)));
+                    }
+                    artifact::Core::Arrow(from, to, row) => {
+                        parts.push(Part::Type(from));
+                        parts.push(Part::Type(to));
+                        parts.push(Part::Row(row));
+                    }
+                    artifact::Core::Sum(row) => parts.push(Part::Row(row)),
+                    artifact::Core::Named { args, .. } => parts.extend(args.iter().map(Part::Type)),
+                    _ => {}
+                }
+            }
+            Part::Row(row) => {
+                let mut labels = HashSet::new();
+                for (label, field) in &row.labels {
+                    if !labels.insert(label.as_str()) {
+                        return Err(LinkError::DuplicateRowLabel {
+                            owner: owner.to_string(),
+                            label: label.clone(),
+                        });
+                    }
+                    if let artifact::Presence::Bound(at) = &field.presence
+                        && *at >= presences
+                    {
+                        return Err(malformed(SchemeProblem::PresenceBound(*at)));
+                    }
+                    parts.push(Part::Type(&field.ty));
+                }
+                match &row.rest {
+                    artifact::Rest::Bound(at) if *at < presences || *at >= count => {
+                        return Err(malformed(SchemeProblem::RowBound(*at)));
+                    }
+                    artifact::Rest::More(more) => parts.push(Part::Row(more)),
+                    _ => {}
+                }
+            }
         }
     }
     Ok(())
