@@ -124,6 +124,8 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
         (Presence::Var(1), Presence::Var(2), false),
         (Presence::Bound(1), Presence::Bound(1), true),
         (Presence::Bound(1), Presence::Bound(2), false),
+        (Presence::Recovered(1), Presence::Recovered(1), true),
+        (Presence::Recovered(1), Presence::Recovered(2), false),
         (Presence::Present, Presence::Absent, false),
     ] {
         assert_eq!(

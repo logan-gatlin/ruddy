@@ -747,7 +747,8 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
             | (Presence::Absent, Presence::Absent)
             | (Presence::Undecided, Presence::Undecided) => true,
             (Presence::Var(left), Presence::Var(right))
-            | (Presence::Bound(left), Presence::Bound(right)) => left == right,
+            | (Presence::Bound(left), Presence::Bound(right))
+            | (Presence::Recovered(left), Presence::Recovered(right)) => left == right,
             _ => false,
         }
     }

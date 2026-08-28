@@ -1522,6 +1522,93 @@ fn same_spelling_does_not_coinduct_distinct_recursive_alias_arguments() {
     }));
 }
 
+/// Recursive adapter states use recovered presence identities as exact syntax.
+/// Repeating the same recovery identity closes the guarded cycle immediately;
+/// changing it reaches one distinct state before the stable suffix coalesces.
+#[test]
+fn recursive_adapter_coalescing_preserves_recovered_presence_correlation() {
+    let adapters = |first_id| {
+        let (output, _) = lowered_after_check(
+            "type X 'a 'b = 'a\n\
+             type Y 'a 'b = 'a\n\
+             let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+             let have : Nat -> Nat = fn n => n\n\
+             let go = takes have",
+            |program, inferred| {
+                let aliases: Vec<_> = inferred.aliases.keys().copied().collect();
+                let [x, y] = aliases.as_slice() else {
+                    panic!("the two test aliases remain available")
+                };
+                let named = |symbol, args: Vec<Rc<Ty>>| {
+                    Rc::new(Ty::Named {
+                        symbol,
+                        name: Rc::from("Recursive"),
+                        args: args.into(),
+                    })
+                };
+                let recovered = |id| {
+                    Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "field".into(),
+                            RowField {
+                                presence: Presence::Recovered(id),
+                                ty: Rc::new(Ty::Nat),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    }))
+                };
+                let recursive = |symbol, effects| {
+                    Scheme::new(
+                        2,
+                        Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            named(symbol, vec![Rc::new(Ty::Bound(1)), Rc::new(Ty::Bound(1))]),
+                            effects,
+                        )),
+                    )
+                };
+                inferred.aliases.insert(
+                    *x,
+                    recursive(
+                        *x,
+                        Row {
+                            labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                .into_iter()
+                                .collect(),
+                            rest: Rest::Closed,
+                        },
+                    ),
+                );
+                inferred.aliases.insert(*y, recursive(*y, Row::closed()));
+
+                let want = named(*x, vec![recovered(first_id), recovered(2)]);
+                let have = named(*y, vec![recovered(first_id), recovered(2)]);
+                let terms: Vec<_> = program.terms.keys().copied().collect();
+                program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                    Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                let ir::TermKind::Apply { arg, .. } =
+                    &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                else {
+                    panic!("go is the checked application")
+                };
+                arg.ty = have;
+            },
+        );
+        output
+            .functions
+            .iter()
+            .filter(|function| function.name.starts_with("go#"))
+            .count()
+    };
+
+    assert_eq!(adapters(2), 1);
+    assert_eq!(adapters(1), 2);
+}
+
 #[test]
 fn recursive_alias_argument_equality_is_stack_safe_at_thirty_thousand_layers() {
     std::thread::Builder::new()
