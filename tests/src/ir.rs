@@ -7156,6 +7156,172 @@ fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
     ));
 }
 
+fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
+    let mut dependency = effect_artifact("dep", "forwarding");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Id".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Struct(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Chain".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Id".into(),
+                    args: vec![artifact_type(a::Type::Bound(0))],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Second".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+                a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Chain".into(),
+                    args: vec![artifact_type(a::Type::Bound(1))],
+                }),
+            },
+        },
+    ];
+    if include_cycle {
+        dependency.header.types.extend([
+            a::DeclaredType {
+                name: "dep@1.0.0::Cycle".into(),
+                params: Vec::new(),
+                scheme: artifact_scheme(artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Cycle".into(),
+                    args: Vec::new(),
+                })),
+            },
+            a::DeclaredType {
+                name: "dep@1.0.0::BrokenSlot".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Bound(9),
+                    }),
+                },
+            },
+        ]);
+    }
+    dependency
+}
+
+#[test]
+fn imported_field_rows_forward_outer_lacks_constraints() {
+    let dependency = forwarding_rows_artifact(false);
+    let parsed = parse::parse(
+        lex(
+            "type WithXY 'r = { x: Nat, y: Nat, ..'r }\n\
+             type Direct 'r = WithXY (dep::Id { ..'r })\n\
+             type Chained 'r = WithXY (dep::Chain { ..'r })\n\
+             type Parameterized 'r = WithXY (dep::Second Nat { ..'r })\n\
+             type BadDirect = Direct { y: String, x: String }\n\
+             type BadChained = Chained { y: String, x: String }\n\
+             type BadParameterized = Parameterized { y: String, x: String }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 3, "{:#?}", out.errors);
+    assert!(
+        out.errors.iter().all(|error| matches!(
+            &error.kind,
+            ErrorKind::RepeatedRowField {
+                shape: Shape::Struct,
+                field,
+            } if field == "y"
+        )),
+        "{:#?}",
+        out.errors
+    );
+}
+
+#[test]
+fn malformed_imported_alias_cycles_are_absorbed_without_recursing() {
+    std::thread::Builder::new()
+        .name("imported-field-cycle".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let dependency = forwarding_rows_artifact(true);
+            let parsed = parse::parse(
+                lex(
+                    "type WithX 'r = { x: Nat, ..'r }\n\
+                     type SafeCycle = WithX (dep::Id dep::Cycle)\n\
+                     type SafeBrokenSlot = WithX (dep::BrokenSlot {})",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                matches!(
+                    out.errors.as_slice(),
+                    [error]
+                        if matches!(
+                            error.kind,
+                            ErrorKind::NotARow {
+                                sense: Sense::Fields
+                            }
+                        )
+                ),
+                "{:#?}",
+                out.errors
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("an imported alias cycle terminates without crashing");
+}
+
 #[test]
 fn imported_struct_aliases_are_valid_field_row_arguments() {
     let mut dependency = effect_artifact("dep", "empty");

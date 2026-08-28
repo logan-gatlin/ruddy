@@ -2125,7 +2125,7 @@ fn build_with_dependency_imports_inner(
         mut kinds,
         mixed,
         errors: clashes,
-    } = kinds(&program.types);
+    } = kinds(&program.types, &program.external_types);
     b.errors.extend(clashes);
     for (symbol, kinds) in &kinds {
         for (param, kind) in program.types[symbol].params.iter_mut().zip(kinds) {
@@ -4595,17 +4595,33 @@ fn references(term: &Term, out: &mut Vec<Symbol>) {
 /// on to may not name — so the set falls out of the same closure with union in
 /// place of a boolean or. It is finite because the labels in a program are, so
 /// no amount of handing on can make it grow forever.
-fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
+fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, ExternalType>) -> Kinds {
     // What each body says of its own parameters, which slots each one hands
     // itself on to, and which ones sit in the tail of a row handed on. All
     // gathered over the whole table before anything is resolved, so the walk
     // needs nothing from the answer and the answer needs nothing from the
-    // order.
-    let mut said: HashMap<Slot, Reading> = HashMap::new();
+    // order. Imported parameter readings are already normalized in their
+    // interfaces, but are nodes in the same graph: a local parameter handed to
+    // one must inherit its reading and lacks just as it does from a local slot.
+    let mut said: HashMap<Slot, Reading> = external
+        .iter()
+        .flat_map(|(symbol, declaration)| {
+            declaration.params.iter().enumerate().map(|(index, kind)| {
+                (
+                    (*symbol, index as u32),
+                    Reading {
+                        senses: std::iter::once(kind.sense()).collect(),
+                        lacks: kind.lacks().clone(),
+                    },
+                )
+            })
+        })
+        .collect();
+    let summaries = field_summaries(types, external);
     let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     for (symbol, decl) in types {
-        constrain(&decl.value, &mut |fact| match fact {
+        constrain(&decl.value, &summaries, &mut |fact| match fact {
             Fact::Says(index, kind) => {
                 let entry = said.entry((*symbol, index)).or_default();
                 entry.senses.insert(kind.sense());
@@ -4749,7 +4765,7 @@ fn senses(
 /// Everything one declaration's body says about its own parameters. See
 /// [`Fact`] for the three, and [`kinds`], which resolves them into a kind
 /// apiece.
-fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
+fn constrain(ty: &Type, summaries: &HashMap<Symbol, FieldSummary>, out: &mut impl FnMut(Fact)) {
     match &ty.tracked {
         // A name reached as a type is one: this walk only descends through
         // positions a type goes in, so arriving here at all is the statement.
@@ -4762,7 +4778,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
         TypeKind::Struct { fields, tail } => {
             for field in fields.values() {
                 if let Some(value) = field.value() {
-                    constrain(value, out);
+                    constrain(value, summaries, out);
                 }
             }
             if let Some(Tail {
@@ -4791,7 +4807,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
         TypeKind::Sum { cases, tail } => {
             for case in cases.values() {
                 if let Some(payload) = case.payload() {
-                    constrain(payload, out);
+                    constrain(payload, summaries, out);
                 }
             }
             if let Some(Tail {
@@ -4807,8 +4823,8 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
         // type positions, and the effects written beside its tail — absent ones
         // included — are what that tail may not name.
         TypeKind::Arrow { from, to, effects } => {
-            constrain(from, out);
-            constrain(to, out);
+            constrain(from, summaries, out);
+            constrain(to, summaries, out);
             says_effects(effects, out);
         }
         // A row written as an argument says of its own tail exactly what an
@@ -4845,25 +4861,29 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                     // reading, which is why it is a [`Fact::Tails`] rather than
                     // a second [`Fact::Hands`].
                     _ => {
-                        // Either shape of row: a sum written out as an argument
-                        // ends up where the callee's tail sat exactly as a
-                        // struct does, and skipping one of the two left a sum's
-                        // row parameter never told what the declaration it is
-                        // handed to already names.
-                        let tail = match &arg.tracked {
-                            TypeKind::Struct { tail, .. } | TypeKind::Sum { tail, .. } => {
-                                tail.as_ref()
-                            }
-                            _ => None,
-                        };
-                        if let Some(Tail {
-                            of: Row::Param { index, .. },
+                        // Every parameter whose fields reach this argument's
+                        // outer row lands where the callee's tail sat. Reading
+                        // a summary rather than only an immediately written
+                        // `{ ..'r }` is what carries the obligation through
+                        // local and imported forwarding aliases alike.
+                        for index in field_summary(arg, summaries).slots {
+                            out(Fact::Tails(index, slot));
+                        }
+                        // Sum rows have their own summaries; retain their
+                        // direct tail edge here until case summaries need the
+                        // same alias normalization as field rows.
+                        if let TypeKind::Sum {
+                            tail:
+                                Some(Tail {
+                                    of: Row::Param { index, .. },
+                                    ..
+                                }),
                             ..
-                        }) = tail
+                        } = &arg.tracked
                         {
                             out(Fact::Tails(*index, slot));
                         }
-                        constrain(arg, out);
+                        constrain(arg, summaries, out);
                     }
                 }
             }
@@ -4935,16 +4955,10 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                                 }),
                                 true => {
                                     let repeated = match shape {
-                                        Shape::Struct => {
-                                            let mut labels = field_summary(arg, carries).labels;
-                                            imported_fields(
-                                                arg,
-                                                external,
-                                                &mut HashSet::new(),
-                                                &mut labels,
-                                            );
-                                            labels.into_iter().find(|name| lacks.contains(name))
-                                        }
+                                        Shape::Struct => field_summary(arg, carries)
+                                            .labels
+                                            .into_iter()
+                                            .find(|name| lacks.contains(name)),
                                         Shape::Sum | Shape::Effect => {
                                             cases_named(arg).find(|name| lacks.contains(name))
                                         }
@@ -5008,7 +5022,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // before anything is walked: an argument written at a struct's `..` carries
     // whatever the declaration it names carries, which is what the repeated
     // field check is asked against. See [`field_summaries`].
-    let carries = field_summaries(&program.types);
+    let carries = field_summaries(&program.types, &program.external_types);
     let declarations = program.types.clone();
     let external = program.external_types.clone();
 
@@ -5376,141 +5390,180 @@ struct FieldSummary {
     slots: IndexSet<u32>,
 }
 
-/// Add fields named by imported semantic aliases, substituting an argument
-/// only when the imported declaration uses it as a struct-row tail.
-fn imported_fields(
-    ty: &Type,
+/// What each local and imported declaration carries at the outside of its
+/// struct row.
+///
+/// Imported declarations are semantic [`Ty`] trees rather than written
+/// [`Type`] trees, but forwarding means the same thing in both: the head's
+/// labels are followed by whatever is supplied at each parameter used as the
+/// outer row. Resolving both forms through one summary table makes kind/lacks
+/// inference and argument checking agree across an import boundary.
+///
+/// Resolution is depth-first to retain that source order. An active declaration
+/// contributes nothing when met again, making malformed imported alias cycles
+/// and unresolved names absorbing rather than recursive. Local unproductive
+/// cycles have already been diagnosed and erased, but the guard keeps this
+/// normalization total independently of that ordering.
+fn field_summaries(
+    types: &IndexMap<Symbol, Decl<Type>>,
     external: &IndexMap<Symbol, ExternalType>,
-    active: &mut HashSet<Symbol>,
-    out: &mut IndexSet<String>,
-) {
-    #[derive(Clone)]
-    enum Argument {
-        Artifact(Type),
-        Semantic {
-            ty: Rc<Ty>,
-            environment: Rc<[Argument]>,
-        },
+) -> HashMap<Symbol, FieldSummary> {
+    fn substitute(
+        head: FieldSummary,
+        mut argument: impl FnMut(u32) -> FieldSummary,
+    ) -> FieldSummary {
+        let mut out = FieldSummary {
+            labels: head.labels,
+            slots: IndexSet::new(),
+        };
+        for index in head.slots {
+            let inner = argument(index);
+            out.labels.extend(inner.labels);
+            out.slots.extend(inner.slots);
+        }
+        out
     }
 
-    fn argument(
-        argument: &Argument,
-        external: &IndexMap<Symbol, ExternalType>,
-        active: &mut HashSet<Symbol>,
-        out: &mut IndexSet<String>,
-    ) {
-        match argument {
-            Argument::Artifact(ty) => match &ty.tracked {
-                TypeKind::Struct { fields, .. } => out.extend(fields.keys().cloned()),
-                _ => imported_fields(ty, external, active, out),
-            },
-            Argument::Semantic { ty, environment } => {
-                semantic(ty, environment, external, active, out)
+    fn semantic_row(row: &crate::types::Row) -> FieldSummary {
+        let mut out = FieldSummary {
+            labels: row.labels.keys().cloned().collect(),
+            slots: IndexSet::new(),
+        };
+        match &row.rest {
+            Rest::Bound(index) => {
+                out.slots.insert(*index);
             }
+            Rest::More(more) => {
+                let inner = semantic_row(more);
+                out.labels.extend(inner.labels);
+                out.slots.extend(inner.slots);
+            }
+            Rest::Closed | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {}
         }
+        out
     }
 
     fn semantic(
-        ty: &Rc<Ty>,
-        environment: &Rc<[Argument]>,
+        ty: &Ty,
+        types: &IndexMap<Symbol, Decl<Type>>,
         external: &IndexMap<Symbol, ExternalType>,
         active: &mut HashSet<Symbol>,
-        out: &mut IndexSet<String>,
-    ) {
-        match &**ty {
-            Ty::Bound(index) => argument(&environment[*index as usize], external, active, out),
-            Ty::Struct(row) => {
-                out.extend(row.labels.keys().cloned());
-                if let Rest::Bound(index) = row.rest
-                    && let Some(supplied) = environment.get(index as usize)
-                {
-                    argument(supplied, external, active, out);
-                }
-                if let Rest::More(more) = &row.rest {
-                    semantic(
-                        &Rc::new(Ty::Struct((**more).clone())),
-                        environment,
-                        external,
-                        active,
-                        out,
-                    );
-                }
-            }
+    ) -> FieldSummary {
+        match ty {
+            Ty::Bound(index) => FieldSummary {
+                labels: IndexSet::new(),
+                slots: std::iter::once(*index).collect(),
+            },
+            Ty::Struct(row) => semantic_row(row),
             Ty::Named {
                 symbol,
                 args: supplied,
                 ..
             } => {
-                // The preceding row-shape validation has already rejected a
-                // non-productive alias cycle.
-                let decl = external
-                    .get(symbol)
-                    .expect("every imported named type has a recovery declaration");
-                let arguments: Rc<[Argument]> = supplied
-                    .iter()
-                    .map(|ty| Argument::Semantic {
-                        ty: ty.clone(),
-                        environment: environment.clone(),
-                    })
-                    .collect();
-                semantic(decl.scheme.body(), &arguments, external, active, out);
+                let head = named(*symbol, types, external, active);
+                substitute(head, |index| {
+                    supplied
+                        .get(index as usize)
+                        .map(|arg| semantic(arg, types, external, active))
+                        .unwrap_or_default()
+                })
             }
-            _ => {}
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Arrow(..)
+            | Ty::Sum(_)
+            | Ty::Var(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => FieldSummary::default(),
         }
     }
 
-    let (symbol, args) = match &ty.tracked {
-        TypeKind::Ident(symbol) => (*symbol, &[][..]),
-        TypeKind::Apply { head, args, .. } => (*head, args.as_slice()),
-        _ => return,
-    };
-    active.insert(symbol);
-    if let Some(decl) = external.get(&symbol) {
-        let arguments: Rc<[Argument]> = args.iter().cloned().map(Argument::Artifact).collect();
-        semantic(decl.scheme.body(), &arguments, external, active, out);
+    fn artifact(
+        ty: &Type,
+        types: &IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
+        active: &mut HashSet<Symbol>,
+    ) -> FieldSummary {
+        match &ty.tracked {
+            TypeKind::Struct { fields, tail } => {
+                let mut slots = IndexSet::new();
+                if let Some(Tail {
+                    of: Row::Param { index, .. },
+                    ..
+                }) = tail
+                {
+                    slots.insert(*index);
+                }
+                FieldSummary {
+                    labels: fields.keys().cloned().collect(),
+                    slots,
+                }
+            }
+            TypeKind::Param { index, .. } => FieldSummary {
+                labels: IndexSet::new(),
+                slots: std::iter::once(*index).collect(),
+            },
+            TypeKind::Ident(symbol) => named(*symbol, types, external, active),
+            TypeKind::Apply {
+                head,
+                args: supplied,
+                ..
+            } => {
+                let head = named(*head, types, external, active);
+                substitute(head, |index| {
+                    supplied
+                        .get(index as usize)
+                        .map(|arg| artifact(arg, types, external, active))
+                        .unwrap_or_default()
+                })
+            }
+            TypeKind::Sum { .. }
+            | TypeKind::Arrow { .. }
+            | TypeKind::Effects(_)
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole
+            | TypeKind::Error => FieldSummary::default(),
+        }
     }
-    active.remove(&symbol);
-}
 
-/// What each declaration carries, over the whole table.
-///
-/// A fixpoint, because a body may be another name and declarations are hoisted:
-/// `type Foo = Bar` carries what `Bar` carries, and which was written first
-/// decides nothing. Both sets only grow and both are bounded — by the labels
-/// written in the program, and by its parameters — so the loop stops. Starting
-/// from nothing is the safe start: a label missed costs a complaint that is not
-/// made, never one made about a program that is right.
-///
-/// Without this the two `x`s of `WithX (WithX Nat)` would meet in
-/// [`Table::resolve`](crate::inference)'s splice, the outer would win without a
-/// word, and a definition would come out with a type nothing showed it has —
-/// the exact failure the lacks condition exists to prevent.
-fn field_summaries(types: &IndexMap<Symbol, Decl<Type>>) -> HashMap<Symbol, FieldSummary> {
-    let mut out: HashMap<Symbol, FieldSummary> = types
+    fn named(
+        symbol: Symbol,
+        types: &IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
+        active: &mut HashSet<Symbol>,
+    ) -> FieldSummary {
+        if !active.insert(symbol) {
+            return FieldSummary::default();
+        }
+        let out = match types.get(&symbol) {
+            Some(declaration) => artifact(&declaration.value, types, external, active),
+            None => external
+                .get(&symbol)
+                .map(|declaration| semantic(declaration.scheme.body(), types, external, active))
+                .unwrap_or_default(),
+        };
+        active.remove(&symbol);
+        out
+    }
+
+    types
         .keys()
-        .map(|symbol| (*symbol, FieldSummary::default()))
-        .collect();
-    loop {
-        let mut grew = false;
-        for (symbol, decl) in types {
-            let found = field_summary(&decl.value, &out);
-            let entry = out.get_mut(symbol).expect("every declaration was seeded");
-            for label in found.labels {
-                grew |= entry.labels.insert(label);
-            }
-            for slot in found.slots {
-                grew |= entry.slots.insert(slot);
-            }
-        }
-        if !grew {
-            return out;
-        }
-    }
+        .chain(external.keys())
+        .map(|symbol| {
+            (
+                *symbol,
+                named(*symbol, types, external, &mut HashSet::new()),
+            )
+        })
+        .collect()
 }
 
-/// What one written type carries, given what each declaration carries so far:
-/// the step [`field_summaries`] iterates, and the read [`row_arguments`] makes of one
-/// argument.
+/// What one written type carries, given the normalized local and imported
+/// declaration summaries: the read [`row_arguments`] makes of one argument.
 ///
 /// A struct writes its own field names, and then whatever its `..` carries. A
 /// name, or an application, carries what the declaration it names carries,
@@ -5554,11 +5607,15 @@ fn field_summary(ty: &Type, decls: &HashMap<Symbol, FieldSummary>) -> FieldSumma
             // said about *this* declaration's parameters, which is what makes
             // the slots compose.
             //
-            // Indexed rather than looked up: the arity check ran where the
-            // application was written, so every slot the head names has an
-            // argument in that position.
+            // A local declaration's arity has already been checked. Imported
+            // semantic interfaces may still be malformed, so an impossible
+            // forwarding slot absorbs instead of indexing outside its supplied
+            // arguments.
             for index in head.slots {
-                let inner = field_summary(&args[index as usize], decls);
+                let inner = args
+                    .get(index as usize)
+                    .map(|arg| field_summary(arg, decls))
+                    .unwrap_or_default();
                 out.labels.extend(inner.labels);
                 out.slots.extend(inner.slots);
             }
