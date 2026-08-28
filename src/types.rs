@@ -612,61 +612,202 @@ impl Assigned {
     }
 }
 
+fn take_row_children(row: &mut Row, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    types.extend(
+        std::mem::take(&mut row.labels)
+            .into_values()
+            .map(|field| field.ty),
+    );
+    if let Rest::More(more) = std::mem::take(&mut row.rest) {
+        rows.push(more);
+    }
+}
+
+fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    match ty {
+        Ty::Arrow(from, to, effects) => {
+            types.push(std::mem::replace(from, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
+            take_row_children(effects, types, rows);
+        }
+        Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
+        Ty::Named { args, .. } => {
+            types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
+        }
+        Ty::Nat
+        | Ty::Int
+        | Ty::Real
+        | Ty::String
+        | Ty::Boolean
+        | Ty::Var(_)
+        | Ty::Bound(_)
+        | Ty::Rigid { .. }
+        | Ty::Undecided => {}
+    }
+}
+
+fn discard_semantic_children(types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    loop {
+        while let Some(row) = rows.pop() {
+            if let Ok(mut row) = Rc::try_unwrap(row) {
+                take_row_children(&mut row, types, rows);
+                // The recursive owners have been removed, so Row::drop sees an
+                // empty shell and does constant-depth work.
+                drop(row);
+            }
+        }
+        let Some(ty) = types.pop() else { break };
+        if let Ok(mut ty) = Rc::try_unwrap(ty) {
+            take_ty_children(&mut ty, types, rows);
+            // Every recursive owner was replaced above. Its ordinary Drop is
+            // therefore constant-depth and can release scalar fields.
+            drop(ty);
+        }
+    }
+}
+
 impl Drop for Ty {
     fn drop(&mut self) {
-        fn take_row(row: &mut Row, pending: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
-            let mut owned = std::mem::take(row);
-            pending.extend(
-                std::mem::take(&mut owned.labels)
-                    .into_values()
-                    .map(|field| field.ty),
-            );
-            if let Rest::More(more) = std::mem::take(&mut owned.rest) {
-                rows.push(more);
-            }
-        }
-
-        fn take_ty(ty: &mut Ty, pending: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
-            match ty {
-                Ty::Arrow(from, to, effects) => {
-                    pending.push(std::mem::replace(from, Rc::new(Ty::Undecided)));
-                    pending.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
-                    take_row(effects, pending, rows);
-                }
-                Ty::Struct(row) | Ty::Sum(row) => take_row(row, pending, rows),
-                Ty::Named { args, .. } => {
-                    pending.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
-                }
-                Ty::Nat
-                | Ty::Int
-                | Ty::Real
-                | Ty::String
-                | Ty::Boolean
-                | Ty::Var(_)
-                | Ty::Bound(_)
-                | Ty::Rigid { .. }
-                | Ty::Undecided => {}
-            }
-        }
-
-        let mut pending = Vec::new();
+        let mut types = Vec::new();
         let mut rows = Vec::new();
-        take_ty(self, &mut pending, &mut rows);
-        loop {
-            while let Some(row) = rows.pop() {
-                if let Ok(mut row) = Rc::try_unwrap(row) {
-                    take_row(&mut row, &mut pending, &mut rows);
+        take_ty_children(self, &mut types, &mut rows);
+        discard_semantic_children(&mut types, &mut rows);
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        let mut types = Vec::new();
+        let mut rows = Vec::new();
+        take_row_children(self, &mut types, &mut rows);
+        discard_semantic_children(&mut types, &mut rows);
+    }
+}
+
+/// Exact equality of finite semantic type syntax.
+///
+/// Declared names and rigid spellings are diagnostic data, not identities:
+/// their symbols and minted ids are. The explicit work list keeps deeply nested
+/// alias arguments and [`Rest::More`] chains off the native stack.
+pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
+    enum Pair<'a> {
+        Ty(&'a Ty, &'a Ty),
+        Row(&'a Row, &'a Row),
+    }
+
+    fn same_presence(left: &Presence, right: &Presence) -> bool {
+        match (left, right) {
+            (Presence::Present, Presence::Present)
+            | (Presence::Absent, Presence::Absent)
+            | (Presence::Undecided, Presence::Undecided) => true,
+            (Presence::Var(left), Presence::Var(right))
+            | (Presence::Bound(left), Presence::Bound(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    let mut pending = vec![Pair::Ty(left, right)];
+    while let Some(pair) = pending.pop() {
+        match pair {
+            Pair::Ty(left, right) => {
+                if std::ptr::eq(left, right) {
+                    continue;
+                }
+                match (left, right) {
+                    (Ty::Nat, Ty::Nat)
+                    | (Ty::Int, Ty::Int)
+                    | (Ty::Real, Ty::Real)
+                    | (Ty::String, Ty::String)
+                    | (Ty::Boolean, Ty::Boolean)
+                    | (Ty::Undecided, Ty::Undecided) => {}
+                    (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Ty::Rigid { id: left, .. }, Ty::Rigid { id: right, .. }) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (
+                        Ty::Arrow(left_from, left_to, left_row),
+                        Ty::Arrow(right_from, right_to, right_row),
+                    ) => {
+                        pending.push(Pair::Row(left_row, right_row));
+                        pending.push(Pair::Ty(left_to, right_to));
+                        pending.push(Pair::Ty(left_from, right_from));
+                    }
+                    (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
+                        pending.push(Pair::Row(left, right))
+                    }
+                    (
+                        Ty::Named {
+                            symbol: left_symbol,
+                            args: left_args,
+                            ..
+                        },
+                        Ty::Named {
+                            symbol: right_symbol,
+                            args: right_args,
+                            ..
+                        },
+                    ) => {
+                        if left_symbol != right_symbol || left_args.len() != right_args.len() {
+                            return false;
+                        }
+                        pending.extend(
+                            left_args
+                                .iter()
+                                .zip(right_args.iter())
+                                .map(|(left, right)| Pair::Ty(left, right)),
+                        );
+                    }
+                    _ => return false,
                 }
             }
-            let Some(ty) = pending.pop() else { break };
-            if let Ok(mut ty) = Rc::try_unwrap(ty) {
-                take_ty(&mut ty, &mut pending, &mut rows);
-                // Every recursive owner was replaced above. Its ordinary Drop
-                // is therefore constant-depth and can release scalar fields.
-                drop(ty);
+            Pair::Row(left, right) => {
+                if std::ptr::eq(left, right) {
+                    continue;
+                }
+                if left.labels.len() != right.labels.len() {
+                    return false;
+                }
+                for (name, left_field) in &left.labels {
+                    let Some(right_field) = right.labels.get(name) else {
+                        return false;
+                    };
+                    if !same_presence(&left_field.presence, &right_field.presence) {
+                        return false;
+                    }
+                    // An absent label has no payload; recovery is free to leave
+                    // any finite type in that semantically unreachable slot.
+                    if !matches!(left_field.presence, Presence::Absent) {
+                        pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
+                    }
+                }
+                match (&left.rest, &right.rest) {
+                    (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
+                    (Rest::Var(left), Rest::Var(right))
+                    | (Rest::Bound(left), Rest::Bound(right)) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Rest::More(left), Rest::More(right)) => {
+                        pending.push(Pair::Row(left, right));
+                    }
+                    _ => return false,
+                }
             }
         }
     }
+    true
 }
 
 impl Ty {
@@ -745,6 +886,18 @@ impl Row {
     /// The row that names nothing and allows nothing more.
     pub fn closed() -> Self {
         Self::of(Rest::Closed)
+    }
+
+    /// Consume a row into its labels and tail.
+    ///
+    /// Rows have a custom destructor so a deep [`Rest::More`] chain is released
+    /// iteratively. This is the ownership-preserving replacement for moving the
+    /// public fields directly out of a row.
+    pub fn into_parts(mut self) -> (IndexMap<String, RowField>, Rest) {
+        (
+            std::mem::take(&mut self.labels),
+            std::mem::take(&mut self.rest),
+        )
     }
 }
 

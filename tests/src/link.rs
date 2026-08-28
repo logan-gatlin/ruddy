@@ -222,6 +222,161 @@ fn links_every_item_and_recursively_relocates_function_indices() {
 }
 
 #[test]
+fn relocates_thirty_thousand_nested_catches_and_switches_iteratively_in_order() {
+    const DEPTH: usize = 30_000;
+
+    let mut nested = local_references();
+    for depth in (0..DEPTH).rev() {
+        nested = match depth % 5 {
+            0 => block(vec![a::Op::Catch {
+                tag: depth as u32,
+                body: Box::new(nested),
+            }]),
+            1 => block(vec![a::Op::SwitchTag {
+                on: depth as u32,
+                cases: vec![
+                    a::TagCase {
+                        name: "nested".into(),
+                        block: nested,
+                    },
+                    a::TagCase {
+                        name: "sibling".into(),
+                        block: local_references(),
+                    },
+                ],
+                fallback: Some(Box::new(local_references())),
+            }]),
+            2 => block(vec![a::Op::SwitchPrim {
+                on: depth as u32,
+                cases: vec![
+                    a::PrimCase {
+                        value: a::Literal::Natural(depth as u64),
+                        block: nested,
+                    },
+                    a::PrimCase {
+                        value: a::Literal::Boolean(true),
+                        block: local_references(),
+                    },
+                ],
+                fallback: Some(Box::new(local_references())),
+            }]),
+            3 => block(vec![a::Op::SwitchPresence {
+                on: depth as u32,
+                field: "field".into(),
+                present: Box::new(nested),
+                absent: Box::new(local_references()),
+            }]),
+            _ => block(vec![a::Op::SwitchRest {
+                on: depth as u32,
+                fields: vec!["field".into()],
+                none: Box::new(nested),
+                some: Box::new(local_references()),
+            }]),
+        };
+    }
+
+    let dep = artifact(
+        "dep",
+        &[],
+        vec![function("dep", local_references())],
+        vec![],
+    );
+    let root = artifact(
+        "app",
+        &[("dep", "1.0.0")],
+        vec![function("root", nested)],
+        vec![],
+    );
+    let linked = link::link(&[dep, root]).unwrap();
+
+    fn assert_references(block: &a::Block) {
+        let a::Op::Closure { func, .. } = &block.instrs[0].op else {
+            panic!("expected closure")
+        };
+        assert_eq!(*func, 1);
+        let a::Op::Call {
+            callee: a::Callee::Direct(func),
+            ..
+        } = &block.instrs[1].op
+        else {
+            panic!("expected direct call")
+        };
+        assert_eq!(*func, 1);
+    }
+
+    let mut current = &linked.lir.functions[1].body;
+    for depth in 0..DEPTH {
+        assert_eq!(current.instrs.len(), 1);
+        current = match (&current.instrs[0].op, depth % 5) {
+            (a::Op::Catch { tag, body }, 0) => {
+                assert_eq!(*tag, depth as u32);
+                body
+            }
+            (
+                a::Op::SwitchTag {
+                    on,
+                    cases,
+                    fallback,
+                },
+                1,
+            ) => {
+                assert_eq!(*on, depth as u32);
+                assert_eq!(cases[0].name, "nested");
+                assert_eq!(cases[1].name, "sibling");
+                assert_references(&cases[1].block);
+                assert_references(fallback.as_deref().unwrap());
+                &cases[0].block
+            }
+            (
+                a::Op::SwitchPrim {
+                    on,
+                    cases,
+                    fallback,
+                },
+                2,
+            ) => {
+                assert_eq!(*on, depth as u32);
+                assert_eq!(cases[0].value, a::Literal::Natural(depth as u64));
+                assert_eq!(cases[1].value, a::Literal::Boolean(true));
+                assert_references(&cases[1].block);
+                assert_references(fallback.as_deref().unwrap());
+                &cases[0].block
+            }
+            (
+                a::Op::SwitchPresence {
+                    on,
+                    field,
+                    present,
+                    absent,
+                },
+                3,
+            ) => {
+                assert_eq!(*on, depth as u32);
+                assert_eq!(field, "field");
+                assert_references(absent);
+                present
+            }
+            (
+                a::Op::SwitchRest {
+                    on,
+                    fields,
+                    none,
+                    some,
+                },
+                4,
+            ) => {
+                assert_eq!(*on, depth as u32);
+                assert_eq!(fields, &["field"]);
+                assert_references(some);
+                none
+            }
+            _ => panic!("unexpected nested operation at depth {depth}"),
+        };
+    }
+    assert_references(current);
+}
+
+#[test]
 fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
     let base = artifact(
         "base",

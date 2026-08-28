@@ -640,10 +640,7 @@ fn an_empty_match_over_an_open_sum_is_skipped() {
     let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
         panic!("the body is an empty match");
     };
-    let row = Row {
-        rest: Rest::Bound(0),
-        ..Row::default()
-    };
+    let row = Row::of(Rest::Bound(0));
     scrutinee.ty = Rc::new(Ty::plain(Ty::Sum(row)));
 
     let checks = patterns::check(&out.program, &inferred);

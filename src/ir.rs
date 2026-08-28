@@ -3098,15 +3098,34 @@ struct RegularType<'a> {
     mint: &'a Mint,
     effects_seen: &'a mut HashSet<Symbol>,
     nodes: Vec<RegularNode>,
-    named: HashMap<(Symbol, Vec<String>), usize>,
+    /// Hash-consing makes semantic argument identity independent of the path
+    /// which built it. In particular, `T Nat` reached around a recursive
+    /// imported declaration meets the same memo entry instead of rebuilding
+    /// and re-encoding an isomorphic argument graph on every turn.
+    interned: HashMap<(String, Vec<(String, usize)>), usize>,
+    named: HashMap<(Symbol, Vec<usize>), usize>,
 }
 
 impl RegularType<'_> {
     fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+        let label = label.into();
+        let key = (label.clone(), edges.clone());
+        if let Some(id) = self.interned.get(&key) {
+            return *id;
+        }
+        let id = self.nodes.len();
+        self.nodes.push(RegularNode { label, edges });
+        self.interned.insert(key, id);
+        id
+    }
+
+    /// A mutable graph back edge. Placeholders are deliberately not interned:
+    /// their label is replaced once the declaration body has been visited.
+    fn placeholder(&mut self) -> usize {
         let id = self.nodes.len();
         self.nodes.push(RegularNode {
-            label: label.into(),
-            edges,
+            label: "unproductive-cycle".into(),
+            edges: Vec::new(),
         });
         id
     }
@@ -3248,138 +3267,206 @@ impl RegularType<'_> {
     }
 
     fn named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
-        // Node allocation is incidental; structural argument spellings make a
-        // fixed recursive application meet its memo entry even when rebuilding
-        // the same argument allocated fresh nodes on the way around.
-        let key = (
-            symbol,
-            args.iter().map(|argument| self.encode(*argument)).collect(),
-        );
+        let key = (symbol, args.clone());
         if let Some(id) = self.named.get(&key) {
             return *id;
         }
-        let id = self.node("unproductive-cycle", Vec::new());
-        self.named.insert(key, id);
-        let body = if let Some(decl) = self.types.get(&symbol) {
-            self.source(&decl.value, &args)
-        } else {
-            // Every imported named type is installed before structuralization;
-            // a missing transitive declaration has an explicit recovery entry.
-            let decl = self
-                .external_types
-                .get(&symbol)
-                .expect("a named type has a local or imported declaration");
-            if let Some(name) = &decl.unresolved {
-                self.node(
-                    format!("unresolved:{name}"),
-                    args.iter()
-                        .copied()
-                        .enumerate()
-                        .map(|(index, argument)| (format!("arg:{index}"), argument))
-                        .collect(),
-                )
-            } else {
-                self.semantic(decl.scheme.body(), &args)
-            }
-        };
-        if body != id {
+        if let Some(decl) = self.types.get(&symbol) {
+            let id = self.placeholder();
+            self.named.insert(key, id);
+            let body = self.source(&decl.value, &args);
+            // Bare alias cycles are replaced during recursion classification;
+            // every declaration reaching canonicalization has a distinct body node.
             self.nodes[id] = self.nodes[body].clone();
-        }
-        id
-    }
-
-    fn semantic(&mut self, ty: &Ty, args: &[usize]) -> usize {
-        match ty {
-            Ty::Nat => self.atom("Nat"),
-            Ty::Int => self.atom("Int"),
-            Ty::Real => self.atom("Real"),
-            Ty::String => self.atom("String"),
-            Ty::Boolean => self.atom("Boolean"),
-            Ty::Arrow(a, b, r) => {
-                let a = self.semantic(a, args);
-                let b = self.semantic(b, args);
-                let r = self.semantic_row(r, args, true);
-                self.node(
-                    "arrow",
-                    vec![("from".into(), a), ("to".into(), b), ("effects".into(), r)],
-                )
-            }
-            Ty::Struct(r)
-                if r.labels.is_empty() && matches!(r.rest, crate::types::Rest::Closed) =>
-            {
-                self.atom("Unit")
-            }
-            Ty::Struct(r) => self.semantic_fields(r, args),
-            Ty::Sum(r) => self.semantic_row(r, args, false),
-            Ty::Bound(i) => self.argument(args, *i),
-            Ty::Named {
-                symbol,
-                args: applied,
-                ..
-            } => {
-                let applied = applied.iter().map(|a| self.semantic(a, args)).collect();
-                self.named(*symbol, applied)
-            }
-            Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => self.atom("?"),
+            id
+        } else {
+            // Imported semantic trees (including all nested named
+            // applications) are built by one explicit continuation stack.
+            self.semantic_named(symbol, args)
         }
     }
 
-    fn semantic_fields(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
+    fn semantic_named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
+        self.semantic_work(symbol, args)
+    }
+
+    /// Build imported semantic types without borrowing the host stack. The
+    /// imported interface is untrusted: besides ordinary deep arrows and rows,
+    /// it may contain a growing recursive application. Hash-consed argument
+    /// nodes make regular applications meet `named`; the per-symbol limit makes
+    /// a non-regular, ever-growing presentation recover to `?` rather than run
+    /// forever or exhaust memory.
+    fn semantic_work(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
         use crate::types::{Presence, Rest};
-        let mut edges = Vec::new();
-        for (name, field) in &row.labels {
-            let p: String = match field.presence {
-                Presence::Present => "+".into(),
-                Presence::Absent => "\\".into(),
-                Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?".into(),
-            };
-            let payload = if matches!(field.presence, Presence::Absent) {
-                self.atom("?")
-            } else {
-                self.semantic(&field.ty, args)
-            };
-            edges.push((format!("field:{name}:{p}"), payload));
-        }
-        let tail = match &row.rest {
-            Rest::Closed => self.atom("Unit"),
-            Rest::Bound(i) => self.argument(args, *i),
-            Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
-            Rest::More(m) => self.semantic_fields(m, args),
-        };
-        edges.push(("core".into(), tail));
-        self.node("fields", edges)
-    }
 
-    fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize], effects: bool) -> usize {
-        use crate::types::Rest;
-        let mut edges = Vec::new();
-        for (name, field) in &row.labels {
-            let presence: String = match &field.presence {
-                crate::types::Presence::Present => "+".into(),
-                crate::types::Presence::Absent => "\\".into(),
-                crate::types::Presence::Var(_)
-                | crate::types::Presence::Bound(_)
-                | crate::types::Presence::Undecided => "?".into(),
-            };
-            let ty = if matches!(field.presence, crate::types::Presence::Absent) {
-                self.atom("?")
-            } else {
-                self.semantic(&field.ty, args)
-            };
-            let name = match effects {
-                true => canonical_effect_key(name),
-                false => name.clone(),
-            };
-            edges.push((format!("label:{name}:{presence}"), ty));
+        const MAX_ACTIVE_INSTANTIATIONS: usize = 256;
+
+        enum Work<'a> {
+            Type(&'a Ty, Vec<usize>),
+            Row(&'a crate::types::Row, Vec<usize>, bool, bool),
+            Named(Symbol, Vec<usize>),
+            Apply(Symbol, usize),
+            FinishNamed(usize, Symbol),
+            Make(String, Vec<String>),
+            Atom(String),
+            Argument(Vec<usize>, u32),
         }
-        let tail = match &row.rest {
-            Rest::Closed => self.atom("closed"),
-            Rest::Bound(id) => self.argument(args, *id),
-            Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
-            Rest::More(more) => self.semantic_row(more, args, effects),
-        };
-        edges.push(("tail".into(), tail));
-        self.node("sum", edges)
+
+        let mut work = vec![Work::Named(symbol, args)];
+        let mut values = Vec::new();
+        let mut active_instantiations: HashMap<Symbol, usize> = HashMap::new();
+
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Atom(label) => values.push(self.atom(label)),
+                Work::Argument(args, index) => values.push(self.argument(&args, index)),
+                Work::Make(label, edge_labels) => {
+                    let mut children = Vec::with_capacity(edge_labels.len());
+                    for _ in 0..edge_labels.len() {
+                        children.push(values.pop().expect("semantic graph postorder is balanced"));
+                    }
+                    children.reverse();
+                    values.push(self.node(label, edge_labels.into_iter().zip(children).collect()));
+                }
+                Work::Type(ty, args) => match ty {
+                    Ty::Nat => values.push(self.atom("Nat")),
+                    Ty::Int => values.push(self.atom("Int")),
+                    Ty::Real => values.push(self.atom("Real")),
+                    Ty::String => values.push(self.atom("String")),
+                    Ty::Boolean => values.push(self.atom("Boolean")),
+                    Ty::Bound(index) => values.push(self.argument(&args, *index)),
+                    Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Make(
+                            "arrow".into(),
+                            vec!["from".into(), "to".into(), "effects".into()],
+                        ));
+                        work.push(Work::Row(effects, args.clone(), true, false));
+                        work.push(Work::Type(to, args.clone()));
+                        work.push(Work::Type(from, args));
+                    }
+                    Ty::Struct(row)
+                        if row.labels.is_empty() && matches!(row.rest, Rest::Closed) =>
+                    {
+                        values.push(self.atom("Unit"));
+                    }
+                    Ty::Struct(row) => work.push(Work::Row(row, args, false, true)),
+                    Ty::Sum(row) => work.push(Work::Row(row, args, false, false)),
+                    Ty::Named {
+                        symbol,
+                        args: applied,
+                        ..
+                    } => {
+                        work.push(Work::Apply(*symbol, applied.len()));
+                        work.extend(
+                            applied
+                                .iter()
+                                .rev()
+                                .map(|argument| Work::Type(argument, args.clone())),
+                        );
+                    }
+                },
+                Work::Apply(symbol, count) => {
+                    let mut args = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        args.push(values.pop().expect("application postorder is balanced"));
+                    }
+                    args.reverse();
+                    work.push(Work::Named(symbol, args));
+                }
+                Work::Named(symbol, args) => {
+                    let key = (symbol, args.clone());
+                    if let Some(id) = self.named.get(&key) {
+                        values.push(*id);
+                        continue;
+                    }
+                    let active = active_instantiations.entry(symbol).or_default();
+                    if *active >= MAX_ACTIVE_INSTANTIATIONS {
+                        values.push(self.atom("?"));
+                        continue;
+                    }
+                    *active += 1;
+                    let id = self.placeholder();
+                    self.named.insert(key, id);
+                    // Import installs a real or qualified recovery declaration
+                    // for every type symbol reachable from an artifact.
+                    let decl = &self.external_types[&symbol];
+                    if let Some(name) = &decl.unresolved {
+                        let edges = args
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(index, argument)| (format!("arg:{index}"), argument))
+                            .collect();
+                        let body = self.node(format!("unresolved:{name}"), edges);
+                        self.nodes[id] = self.nodes[body].clone();
+                        *active -= 1;
+                        values.push(id);
+                    } else {
+                        work.push(Work::FinishNamed(id, symbol));
+                        work.push(Work::Type(decl.scheme.body(), args));
+                    }
+                }
+                Work::FinishNamed(id, symbol) => {
+                    let body = values.pop().expect("named body postorder is balanced");
+                    if body != id {
+                        self.nodes[id] = self.nodes[body].clone();
+                    }
+                    *active_instantiations.entry(symbol).or_default() -= 1;
+                    values.push(id);
+                }
+                Work::Row(row, args, effects, fields) => {
+                    let mut labels = Vec::with_capacity(row.labels.len() + 1);
+                    for (name, field) in &row.labels {
+                        let presence = match field.presence {
+                            Presence::Present => "+",
+                            Presence::Absent => "\\",
+                            Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?",
+                        };
+                        let name = if effects {
+                            canonical_effect_key(name)
+                        } else {
+                            name.clone()
+                        };
+                        labels.push(format!(
+                            "{}:{name}:{presence}",
+                            if fields { "field" } else { "label" }
+                        ));
+                    }
+                    labels.push(if fields { "core".into() } else { "tail".into() });
+                    work.push(Work::Make(
+                        if fields {
+                            "fields".into()
+                        } else {
+                            "sum".into()
+                        },
+                        labels,
+                    ));
+                    match &row.rest {
+                        Rest::Closed => {
+                            work.push(Work::Atom(if fields { "Unit" } else { "closed" }.into()))
+                        }
+                        Rest::Bound(index) => {
+                            work.push(Work::Argument(args.clone(), *index));
+                        }
+                        Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
+                            work.push(Work::Atom("?".into()))
+                        }
+                        Rest::More(more) => {
+                            work.push(Work::Row(more, args.clone(), effects, fields))
+                        }
+                    }
+                    for field in row.labels.values().rev() {
+                        if matches!(field.presence, Presence::Absent) {
+                            work.push(Work::Atom("?".into()));
+                        } else {
+                            work.push(Work::Type(&field.ty, args.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        values.pop().expect("a semantic graph has one root")
     }
 
     /// Eliminate row-composition edges after the complete regular graph has
@@ -3431,74 +3518,101 @@ impl RegularType<'_> {
 
     fn encode(&mut self, root: usize) -> String {
         self.flatten_rows();
-        // Color refinement computes the greatest bisimulation on this finite
-        // graph. Canonical color numbers are obtained by sorting signatures,
-        // then the reachable quotient is numbered from the root.
-        let mut colors = ranks(
-            self.nodes
+        // Acyclic imported types are by far the common deep case. Classify
+        // those bottom-up in one pass; repeated whole-graph refinement would
+        // take quadratic time on a 30,000-arrow signature. Regular recursive
+        // graphs retain the bisimulation refinement below.
+        let mut remaining: Vec<_> = self.nodes.iter().map(|node| node.edges.len()).collect();
+        let mut parents = vec![Vec::new(); self.nodes.len()];
+        for (parent, node) in self.nodes.iter().enumerate() {
+            for (_, child) in &node.edges {
+                parents[*child].push(parent);
+            }
+        }
+        let mut pending: Vec<_> = remaining
+            .iter()
+            .enumerate()
+            .filter_map(|(node, count)| (*count == 0).then_some(node))
+            .collect();
+        let mut dag_colors = vec![usize::MAX; self.nodes.len()];
+        let mut dag_classes: HashMap<(String, Vec<(String, usize)>), usize> = HashMap::new();
+        let mut classified = 0;
+        while let Some(node) = pending.pop() {
+            let mut edges: Vec<_> = self.nodes[node]
+                .edges
                 .iter()
-                .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
-                .collect(),
-        );
-        loop {
-            let signatures: Vec<_> = self
-                .nodes
-                .iter()
-                .map(|node| {
-                    let mut edges: Vec<_> = node
-                        .edges
-                        .iter()
-                        .map(|(label, to)| (label.clone(), colors[*to]))
-                        .collect();
-                    edges.sort();
-                    (node.label.clone(), edges)
-                })
+                .map(|(label, child)| (label.clone(), dag_colors[*child]))
                 .collect();
-            let next = ranks(signatures);
-            let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
-            let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
-            colors = next;
-            if old_classes == new_classes {
-                break;
+            edges.sort();
+            let next = dag_classes.len();
+            let color = *dag_classes
+                .entry((self.nodes[node].label.clone(), edges))
+                .or_insert(next);
+            dag_colors[node] = color;
+            classified += 1;
+            for parent in &parents[node] {
+                remaining[*parent] -= 1;
+                if remaining[*parent] == 0 {
+                    pending.push(*parent);
+                }
+            }
+        }
+
+        let mut colors = if classified == self.nodes.len() {
+            dag_colors
+        } else {
+            ranks(
+                self.nodes
+                    .iter()
+                    .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
+                    .collect(),
+            )
+        };
+        if classified != self.nodes.len() {
+            loop {
+                let signatures: Vec<_> = self
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        let mut edges: Vec<_> = node
+                            .edges
+                            .iter()
+                            .map(|(label, to)| (label.clone(), colors[*to]))
+                            .collect();
+                        edges.sort();
+                        (node.label.clone(), edges)
+                    })
+                    .collect();
+                let next = ranks(signatures);
+                let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
+                let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
+                colors = next;
+                if old_classes == new_classes {
+                    break;
+                }
             }
         }
         let mut representatives = vec![0; colors.iter().copied().max().map_or(0, |n| n + 1)];
         for (node, color) in colors.iter().copied().enumerate() {
             representatives[color] = node;
         }
-        fn visit(
-            color: usize,
-            nodes: &[RegularNode],
-            colors: &[usize],
-            reps: &[usize],
-            ids: &mut HashMap<usize, usize>,
-            order: &mut Vec<usize>,
-        ) {
+        let mut ids = HashMap::new();
+        let mut order = Vec::new();
+        let mut pending = vec![colors[root]];
+        while let Some(color) = pending.pop() {
             if ids.contains_key(&color) {
-                return;
+                continue;
             }
             ids.insert(color, order.len());
             order.push(color);
-            let mut edges: Vec<_> = nodes[reps[color]]
+            let mut edges: Vec<_> = self.nodes[representatives[color]]
                 .edges
                 .iter()
                 .map(|(label, to)| (label, colors[*to]))
                 .collect();
             edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            for (_, child) in edges {
-                visit(child, nodes, colors, reps, ids, order);
-            }
+            pending.extend(edges.into_iter().rev().map(|(_, child)| child));
         }
-        let mut ids = HashMap::new();
-        let mut order = Vec::new();
-        visit(
-            colors[root],
-            &self.nodes,
-            &colors,
-            &representatives,
-            &mut ids,
-            &mut order,
-        );
         let mut out = String::new();
         for color in order {
             let node = &self.nodes[representatives[color]];
@@ -3550,6 +3664,7 @@ fn canonical_type(
         mint,
         effects_seen,
         nodes: Vec::new(),
+        interned: HashMap::new(),
         named: HashMap::new(),
     };
     let root = graph.source(ty, &[]);
@@ -3558,10 +3673,12 @@ fn canonical_type(
 
 /// Imported and source effect labels share this structural spelling.
 fn canonical_effect_key(name: &str) -> String {
-    let (name, interface) = name
-        .split_once('\u{1f}')
-        .expect("an effect row key has a generated structural identity");
-    format!("!{name}<{interface}>")
+    match name.split_once('\u{1f}') {
+        Some((name, interface)) => format!("!{name}<{interface}>"),
+        // Artifact rows are untrusted. A malformed key is still a distinct
+        // recovery label; it must not panic or silently become purity.
+        None => format!("!{name}<?>"),
+    }
 }
 
 fn canonical_written_presence(when: &Option<Box<When>>) -> String {

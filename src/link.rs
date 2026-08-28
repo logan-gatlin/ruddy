@@ -65,43 +65,102 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
 }
 
 fn relocate_block(block: &mut artifact::Block, offset: u64) {
-    for instruction in &mut block.instrs {
-        match &mut instruction.op {
+    // Push operations in reverse so the explicit stack retains the recursive
+    // walk's instruction and branch order without consuming the call stack.
+    let mut pending: Vec<&mut Op> = block
+        .instrs
+        .iter_mut()
+        .rev()
+        .map(|instruction| &mut instruction.op)
+        .collect();
+    while let Some(op) = pending.pop() {
+        match op {
             Op::Closure { func, .. }
             | Op::Call {
                 callee: Callee::Direct(func),
                 ..
             } => *func += offset,
-            Op::Catch { body, .. } => relocate_block(body, offset),
+            Op::Catch { body, .. } => pending.extend(
+                body.instrs
+                    .iter_mut()
+                    .rev()
+                    .map(|instruction| &mut instruction.op),
+            ),
             Op::SwitchTag {
                 cases, fallback, ..
             } => {
-                for case in cases {
-                    relocate_block(&mut case.block, offset);
-                }
                 if let Some(block) = fallback {
-                    relocate_block(block, offset);
+                    pending.extend(
+                        block
+                            .instrs
+                            .iter_mut()
+                            .rev()
+                            .map(|instruction| &mut instruction.op),
+                    );
+                }
+                for case in cases.iter_mut().rev() {
+                    pending.extend(
+                        case.block
+                            .instrs
+                            .iter_mut()
+                            .rev()
+                            .map(|instruction| &mut instruction.op),
+                    );
                 }
             }
             Op::SwitchPrim {
                 cases, fallback, ..
             } => {
-                for case in cases {
-                    relocate_block(&mut case.block, offset);
-                }
                 if let Some(block) = fallback {
-                    relocate_block(block, offset);
+                    pending.extend(
+                        block
+                            .instrs
+                            .iter_mut()
+                            .rev()
+                            .map(|instruction| &mut instruction.op),
+                    );
+                }
+                for case in cases.iter_mut().rev() {
+                    pending.extend(
+                        case.block
+                            .instrs
+                            .iter_mut()
+                            .rev()
+                            .map(|instruction| &mut instruction.op),
+                    );
                 }
             }
             Op::SwitchPresence {
                 present, absent, ..
             } => {
-                relocate_block(present, offset);
-                relocate_block(absent, offset);
+                pending.extend(
+                    absent
+                        .instrs
+                        .iter_mut()
+                        .rev()
+                        .map(|instruction| &mut instruction.op),
+                );
+                pending.extend(
+                    present
+                        .instrs
+                        .iter_mut()
+                        .rev()
+                        .map(|instruction| &mut instruction.op),
+                );
             }
             Op::SwitchRest { none, some, .. } => {
-                relocate_block(none, offset);
-                relocate_block(some, offset);
+                pending.extend(
+                    some.instrs
+                        .iter_mut()
+                        .rev()
+                        .map(|instruction| &mut instruction.op),
+                );
+                pending.extend(
+                    none.instrs
+                        .iter_mut()
+                        .rev()
+                        .map(|instruction| &mut instruction.op),
+                );
             }
             _ => {}
         }

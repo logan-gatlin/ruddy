@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use ruddy::symbol::{Bundle, Mint, Namespace, Version};
 use ruddy::types::{
     Assigned, Atom, EffectId, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme,
-    Sense, Shape, Ty,
+    Sense, Shape, Ty, same_finite_syntax,
 };
 
 fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
@@ -15,6 +15,193 @@ fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
         name: Rc::from("Layer"),
         args: vec![ty].into(),
     })
+}
+
+#[test]
+fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
+    let ty = |ty| Rc::new(ty);
+    let same = |left, right| same_finite_syntax(&ty(left), &ty(right));
+
+    for primitive in [Ty::Nat, Ty::Int, Ty::Real, Ty::String, Ty::Boolean] {
+        assert!(same(primitive.clone(), primitive));
+    }
+    assert!(same(Ty::Undecided, Ty::Undecided));
+    assert!(!same(Ty::Nat, Ty::Int));
+    assert!(same(Ty::Var(1), Ty::Var(1)));
+    assert!(!same(Ty::Var(1), Ty::Var(2)));
+    assert!(same(Ty::Bound(1), Ty::Bound(1)));
+    assert!(!same(Ty::Bound(1), Ty::Bound(2)));
+    assert!(same(
+        Ty::Rigid {
+            id: 1,
+            name: Rc::from("left"),
+        },
+        Ty::Rigid {
+            id: 1,
+            name: Rc::from("right"),
+        },
+    ));
+    assert!(!same(
+        Ty::Rigid {
+            id: 1,
+            name: Rc::from("a"),
+        },
+        Ty::Rigid {
+            id: 2,
+            name: Rc::from("a"),
+        },
+    ));
+
+    let row = |presence, rest| Row {
+        labels: [(
+            "field".into(),
+            RowField {
+                presence,
+                ty: ty(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest,
+    };
+    for (left, right, expected) in [
+        (Presence::Present, Presence::Present, true),
+        (Presence::Absent, Presence::Absent, true),
+        (Presence::Undecided, Presence::Undecided, true),
+        (Presence::Var(1), Presence::Var(1), true),
+        (Presence::Var(1), Presence::Var(2), false),
+        (Presence::Bound(1), Presence::Bound(1), true),
+        (Presence::Bound(1), Presence::Bound(2), false),
+        (Presence::Present, Presence::Absent, false),
+    ] {
+        assert_eq!(
+            same(
+                Ty::Struct(row(left, Rest::Closed)),
+                Ty::Struct(row(right, Rest::Closed))
+            ),
+            expected
+        );
+    }
+    for (left, right, expected) in [
+        (Rest::Closed, Rest::Closed, true),
+        (Rest::Undecided, Rest::Undecided, true),
+        (Rest::Var(1), Rest::Var(1), true),
+        (Rest::Var(1), Rest::Var(2), false),
+        (Rest::Bound(1), Rest::Bound(1), true),
+        (Rest::Bound(1), Rest::Bound(2), false),
+        (
+            Rest::Rigid {
+                id: 1,
+                name: Rc::from("left"),
+            },
+            Rest::Rigid {
+                id: 1,
+                name: Rc::from("right"),
+            },
+            true,
+        ),
+        (
+            Rest::Rigid {
+                id: 1,
+                name: Rc::from("a"),
+            },
+            Rest::Rigid {
+                id: 2,
+                name: Rc::from("a"),
+            },
+            false,
+        ),
+        (Rest::Closed, Rest::Undecided, false),
+    ] {
+        assert_eq!(
+            same(Ty::Sum(Row::of(left)), Ty::Sum(Row::of(right))),
+            expected
+        );
+    }
+    assert!(same(
+        Ty::Struct(Row::of(Rest::More(Rc::new(Row::closed())))),
+        Ty::Struct(Row::of(Rest::More(Rc::new(Row::closed())))),
+    ));
+    let shared_row = Rc::new(row(Presence::Present, Rest::Closed));
+    assert!(same(
+        Ty::Struct(Row::of(Rest::More(shared_row.clone()))),
+        Ty::Struct(Row::of(Rest::More(shared_row))),
+    ));
+
+    assert!(!same(
+        Ty::Struct(Row::closed()),
+        Ty::Struct(row(Presence::Present, Rest::Closed))
+    ));
+    assert!(!same(
+        Ty::Struct(row(Presence::Present, Rest::Closed)),
+        Ty::Struct(Row {
+            labels: [("other".into(), RowField::present(ty(Ty::Nat)))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }),
+    ));
+    assert!(!same(
+        Ty::Struct(row(Presence::Present, Rest::Closed)),
+        Ty::Struct(Row {
+            labels: [("field".into(), RowField::present(ty(Ty::Int)))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }),
+    ));
+    assert!(same(
+        Ty::Struct(row(Presence::Absent, Rest::Closed)),
+        Ty::Struct(Row {
+            labels: [(
+                "field".into(),
+                RowField {
+                    presence: Presence::Absent,
+                    ty: ty(Ty::Int),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }),
+    ));
+    assert!(same(
+        Ty::Arrow(ty(Ty::Nat), ty(Ty::Int), Row::closed()),
+        Ty::Arrow(ty(Ty::Nat), ty(Ty::Int), Row::closed()),
+    ));
+
+    let bundle = Bundle::new("syntax", Version::new(1, 0, 0)).expect("valid bundle");
+    let mut mint = Mint::new(bundle);
+    let left_symbol = mint
+        .global(None, Namespace::Types, "Left")
+        .expect("fresh symbol");
+    let right_symbol = mint
+        .global(None, Namespace::Types, "Right")
+        .expect("fresh symbol");
+    let named = |symbol, name: &str, args: Vec<Rc<Ty>>| Ty::Named {
+        symbol,
+        name: Rc::from(name),
+        args: args.into(),
+    };
+    assert!(same(
+        named(left_symbol, "First", vec![ty(Ty::Nat)]),
+        named(left_symbol, "Second", vec![ty(Ty::Nat)]),
+    ));
+    assert!(!same(
+        named(left_symbol, "Same", Vec::new()),
+        named(right_symbol, "Same", Vec::new()),
+    ));
+    assert!(!same(
+        named(left_symbol, "Same", Vec::new()),
+        named(left_symbol, "Same", vec![ty(Ty::Nat)]),
+    ));
+    assert!(!same(
+        named(left_symbol, "Same", vec![ty(Ty::Nat)]),
+        named(left_symbol, "Same", vec![ty(Ty::Int)]),
+    ));
+
+    let shared_ty = ty(Ty::Arrow(ty(Ty::Nat), ty(Ty::Int), Row::closed()));
+    assert!(same_finite_syntax(&shared_ty, &shared_ty));
 }
 
 fn pending_effect() -> EffectId {
@@ -436,6 +623,52 @@ fn malformed_bound_positions_open_to_recovery() {
             ..
         }) if matches!(more.rest, Rest::Undecided)
     ));
+}
+
+#[test]
+fn standalone_deep_row_destruction_is_stack_safe_for_shared_semantic_dags() {
+    std::thread::Builder::new()
+        .name("deep-standalone-row-drop".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+
+            let mut shared = Rc::new(Row::closed());
+            let bottom = Rc::downgrade(&shared);
+            for _ in 0..DEPTH {
+                shared = Rc::new(Row::of(Rest::More(shared)));
+            }
+            let top = Rc::downgrade(&shared);
+
+            // The root reaches the same row chain directly and through a type
+            // shared by two labels. Dropping one work-list edge must not steal
+            // the other edge, while dropping the final edge must reclaim the
+            // whole chain without recursing through Rest::More.
+            let payload = Rc::new(Ty::Struct(Row::of(Rest::More(shared.clone()))));
+            let payload_weak = Rc::downgrade(&payload);
+            let root = Row {
+                labels: [
+                    ("left".into(), RowField::present(payload.clone())),
+                    ("right".into(), RowField::present(payload.clone())),
+                ]
+                .into_iter()
+                .collect(),
+                rest: Rest::More(shared.clone()),
+            };
+            drop(payload);
+            drop(shared);
+
+            assert!(top.upgrade().is_some());
+            assert!(bottom.upgrade().is_some());
+            assert!(payload_weak.upgrade().is_some());
+            drop(root);
+            assert!(top.upgrade().is_none());
+            assert!(bottom.upgrade().is_none());
+            assert!(payload_weak.upgrade().is_none());
+        })
+        .expect("the bounded-stack row-drop regression starts")
+        .join()
+        .expect("standalone semantic rows are destroyed iteratively");
 }
 
 #[test]

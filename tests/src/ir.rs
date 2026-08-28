@@ -5742,6 +5742,33 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
 }
 
 #[test]
+fn an_unproductive_local_alias_has_a_finite_effect_recovery_identity() {
+    let (mint, out) = build_src("type Loop = Loop\neffect Probe = { inspect: Loop -> () }");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Circular { .. })),
+        "{:#?}",
+        out.errors
+    );
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+            })
+        })
+        .expect("Probe has a recovery identity");
+    assert!(
+        interface.contains("inspect") && interface.contains('?'),
+        "{interface}"
+    );
+}
+
+#[test]
 fn fixed_argument_recursive_types_terminate_during_effect_canonicalization() {
     let (mint, out) = build_src(
         "type T 'a = { next: T Nat }\n\
@@ -7971,6 +7998,177 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
     assert!(out.program.effect_ids.values().any(|identity| {
         matches!(identity, ruddy::types::EffectId::Structural { name, .. } if name == "Local")
     }));
+}
+
+#[test]
+fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
+    std::thread::Builder::new()
+        .name("imported-effect-identity-graph".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+
+            let mut deep = a::Type::Nat;
+            for _ in 0..DEPTH {
+                deep = a::Type::Arrow(
+                    Box::new(a::Type::Nat),
+                    Box::new(deep),
+                    // No structural separator: malformed artifact effect keys
+                    // are recovery input, not a reason to panic.
+                    a::Row {
+                        labels: vec![(
+                            "legacy".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: artifact_unit(),
+                            },
+                        )],
+                        rest: a::Rest::Closed,
+                    },
+                );
+            }
+            let mut dependency = effect_artifact("dep", "identity-graph");
+            dependency.header.types = vec![
+                a::DeclaredType {
+                    name: "dep@1.0.0::Deep".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::Grow".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Named {
+                            name: "dep@1.0.0::Grow".into(),
+                            args: vec![a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "next".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Present,
+                                        ty: a::Type::Bound(0),
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            })],
+                        },
+                    },
+                },
+            ];
+
+            let parsed = parse::parse(
+                lex(
+                    "effect DeepProbe = { inspect: dep::Deep -> () }\n\
+                     effect GrowProbe = { inspect: dep::Grow Nat -> () }",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                out.errors
+                    .iter()
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                "{:#?}",
+                out.errors
+            );
+            for name in ["DeepProbe", "GrowProbe"] {
+                assert!(
+                    out.program
+                        .effect_ids
+                        .keys()
+                        .any(|symbol| mint.name(*symbol) == name),
+                    "{name} retained no recovery identity"
+                );
+            }
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("imported effect identity graph building is iterative and total");
+}
+
+#[test]
+fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit() {
+    const APPLICATIONS: usize = 300;
+
+    let mut dependency = effect_artifact("dep", "wide-instantiations");
+    let fields = (0..APPLICATIONS)
+        .map(|index| {
+            (
+                format!("slot{index}"),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Named {
+                        name: "dep@1.0.0::Box".into(),
+                        args: vec![artifact_struct(vec![(
+                            format!("marker{index}"),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: a::Type::Nat,
+                            },
+                        )])],
+                    },
+                },
+            )
+        })
+        .collect();
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Box".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Wide".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_struct(fields)),
+        },
+    ];
+
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Wide -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+            })
+        })
+        .expect("Probe has a structural identity");
+    assert!(interface.contains("marker0"), "{interface}");
+    assert!(
+        interface.contains(&format!("marker{}", APPLICATIONS - 1)),
+        "late sequential applications must not recover as undecided: {interface}"
+    );
 }
 
 #[test]

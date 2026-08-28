@@ -10,7 +10,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
+    types::{Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -2803,6 +2803,154 @@ fn a_row_parameter_leaves_the_declaration_closed_to_the_solver() {
     }
 }
 
+/// Imported recovery data did not pass the source growth check. A non-nominal
+/// recursive application that wraps its argument therefore never repeats an
+/// exact assumption: every trip around it builds one more struct. The solver
+/// recognizes the earlier arguments structurally and absorbs that malformed
+/// interface rather than allocating forever.
+#[test]
+fn malformed_non_nominal_recursive_growth_is_absorbed() {
+    let parsed = parse::parse(
+        lex(
+            "type T 'a = Nat\n\
+             let f : T Nat -> T Int = fn x => x",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let symbol = symbol_named(&mint, lowered.program.types.keys().copied(), "T");
+    lowered.program.types.shift_remove(&symbol);
+
+    let field = |ty| RowField {
+        presence: Presence::Present,
+        ty,
+    };
+    // Put the previous argument below every composite position the imported
+    // growth check must walk. It reaches the bound argument through an arrow,
+    // another named application, and that application's struct argument.
+    let descendant = Rc::new(Ty::Struct(Row {
+        labels: [("x".into(), field(Rc::new(Ty::Bound(0))))]
+            .into_iter()
+            .collect(),
+        rest: Rest::Closed,
+    }));
+    let nested = semantic_named(symbol, vec![descendant]);
+    let wrapped = Rc::new(Ty::Arrow(
+        Rc::new(Ty::Nat),
+        nested,
+        Row {
+            labels: Default::default(),
+            rest: Rest::Closed,
+        },
+    ));
+    let recursive = semantic_named(symbol, vec![wrapped]);
+    lowered.program.external_types.insert(
+        symbol,
+        ir::ExternalType {
+            params: vec![ParamKind::Type {
+                lacks: Default::default(),
+            }],
+            relevant: vec![false],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Struct(Row {
+                    labels: [("next".into(), field(recursive))].into_iter().collect(),
+                    rest: Rest::Closed,
+                })),
+            ),
+            unresolved: None,
+        },
+    );
+
+    let output = inference::infer(&mint, &mut lowered.program);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert!(
+        output.steps.iter().any(|step| step.rule == Rule::Absorb),
+        "steps: {:#?}",
+        output.steps
+    );
+}
+
+/// Even malformed imported growth is reflexive. For
+/// `A 'a = { next: A { x: 'a } }`, an identical `A Nat ~ A Nat` goal unfolds
+/// into synchronized growth on both sides. The recovery guard absorbs that
+/// imported infinite expansion without turning equality into an error.
+#[test]
+fn malformed_recursive_growth_is_still_reflexive() {
+    let parsed = parse::parse(
+        lex(
+            "type A 'a = Nat\n\
+             let same : A Nat -> A Nat = fn x => x",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let symbol = symbol_named(&mint, lowered.program.types.keys().copied(), "A");
+    lowered.program.types.shift_remove(&symbol);
+
+    let argument = Rc::new(Ty::Struct(Row {
+        labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+            .into_iter()
+            .collect(),
+        rest: Rest::Closed,
+    }));
+    lowered.program.external_types.insert(
+        symbol,
+        ir::ExternalType {
+            params: vec![ParamKind::Type {
+                lacks: Default::default(),
+            }],
+            relevant: vec![false],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Struct(Row {
+                    labels: [(
+                        "next".into(),
+                        RowField::present(semantic_named(symbol, vec![argument])),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                })),
+            ),
+            unresolved: None,
+        },
+    );
+
+    let output = inference::infer(&mint, &mut lowered.program);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert!(
+        output.steps.iter().any(|step| step.rule == Rule::Absorb),
+        "the malformed synchronized growth was not absorbed: {:#?}",
+        output.steps
+    );
+    assert_eq!(scheme(&mint, &output, "same"), "A Nat -> A Nat");
+}
+
+/// Structural containment alone is not malformed growth. A non-nominal
+/// constructor may switch to a fixed argument containing the old one, while a
+/// nominal constructor exposes that same argument on its next layer. The
+/// latter's mismatch must still be reached rather than absorbed by the recovery
+/// guard for two non-nominal declarations.
+#[test]
+fn a_fixed_recursive_argument_is_not_absorbed_as_growth() {
+    let (_, _, output) = infer_src(
+        "type T 'a = { value: Nat, next: T { x: Nat } }\n\
+         type U 'a = { value: 'a, next: U { x: Nat } }\n\
+         let f : T Nat -> U Nat = fn x => x",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "type-mismatch");
+}
+
 /// Every shape the growth rule allows comes back round. Each of these is a
 /// solve that only ends because a goal it has already taken on is one it
 /// recognizes, and reaching the assertion at all is most of what is checked.
@@ -5532,6 +5680,90 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
         scheme(&mint, &output, "absent"),
         "{ x when 'a: Nat, y when 'b: Nat } -> { ..'c } -> { ..'c } where 'a != 'b"
     );
+}
+
+#[test]
+fn structural_families_are_stack_safe_at_thirty_thousand_layers() {
+    std::thread::Builder::new()
+        .name("deep-structural-family".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let mut mint = dummy_mint();
+            let layer = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a layer symbol");
+            let definition = mint
+                .global(None, Namespace::Terms, "family")
+                .expect("a definition symbol");
+            let leaf = |name: &str| {
+                Rc::new(Ty::Struct(Row {
+                    labels: [(name.to_string(), RowField::present(Rc::new(Ty::Nat)))]
+                        .into_iter()
+                        .collect(),
+                    rest: Rest::Closed,
+                }))
+            };
+            let mut left = leaf("left");
+            let mut right = leaf("right");
+            for depth in 0..DEPTH {
+                let wrap = |inner| match depth % 4 {
+                    0 => Rc::new(Ty::Struct(Row {
+                        labels: [("next".to_string(), RowField::present(inner))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    })),
+                    1 => semantic_named(layer, vec![inner]),
+                    2 => Rc::new(Ty::Sum(Row {
+                        labels: [("Next".to_string(), RowField::present(inner))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    })),
+                    _ => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), inner, Row::closed())),
+                };
+                left = wrap(left);
+                right = wrap(right);
+            }
+
+            let family = inference::structural_family_for_tests(
+                definition,
+                &IndexMap::new(),
+                &[left.clone(), right.clone()],
+            );
+            let mut cursor = family.clone();
+            for depth in (0..DEPTH).rev() {
+                cursor = match (depth % 4, &*cursor) {
+                    (0, Ty::Struct(row)) => row.labels["next"].ty.clone(),
+                    (1, Ty::Named { symbol, args, .. }) => {
+                        assert_eq!(*symbol, layer);
+                        args[0].clone()
+                    }
+                    (2, Ty::Sum(row)) => row.labels["Next"].ty.clone(),
+                    (3, Ty::Arrow(from, to, effects)) => {
+                        assert!(matches!(&**from, Ty::Nat));
+                        assert!(effects.labels.is_empty());
+                        to.clone()
+                    }
+                    _ => panic!("family changed a constructor at layer {depth}"),
+                };
+            }
+            let Ty::Struct(row) = &*cursor else {
+                panic!("family leaf is a struct")
+            };
+            assert_eq!(row.labels.len(), 2);
+            assert!(row.labels.contains_key("left"));
+            assert!(row.labels.contains_key("right"));
+
+            // Keep destruction of the deliberately deep inputs outside this
+            // bounded-stack assertion. Their traversal, not Rc destruction, is
+            // the behavior this regression isolates.
+            std::mem::forget((family, cursor, left, right));
+        })
+        .expect("the bounded-stack family regression starts")
+        .join()
+        .expect("type and row family construction uses bounded stack");
 }
 
 #[test]

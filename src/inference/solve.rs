@@ -1,7 +1,8 @@
 //! Pass two: solving. See [`Solve`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     rc::Rc,
 };
 
@@ -570,163 +571,500 @@ impl Solve<'_> {
     /// finite union gets one fresh result presence; constructors, tails and payloads
     /// remain ordinary structural types and are checked by the unifications
     /// that follow.
-    fn family_type(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
-        self.family_type_with(types, &mut Vec::new())
+    pub(super) fn family_type(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
+        self.family_type_with(types)
     }
 
-    fn family_type_with(&mut self, types: &[Rc<Ty>], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Rc<Ty> {
+    /// Build a family with an explicit continuation stack. Match results can
+    /// contain types and rows tens of thousands of constructors deep, and this
+    /// walk must not borrow the native call stack for each one. `unfolding`
+    /// remains a path stack: `PopUnfolding` runs immediately after the expanded
+    /// child, before any sibling is visited.
+    fn family_type_with(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
+        /// Stable semantic hashes for the duration of this family walk. Family
+        /// construction mints variables and records lacks conditions, but does
+        /// not bind an existing variable, so a resolved node cannot change
+        /// underneath this cache. Retaining the node also prevents allocator
+        /// address reuse from turning the pointer memo into the wrong answer.
+        struct Fingerprints {
+            types: HashMap<*const Ty, (Rc<Ty>, u64)>,
+        }
+
+        enum FingerprintWork {
+            Type(Rc<Ty>),
+            Arrow(*const Ty, Rc<Ty>),
+            Struct(*const Ty, Rc<Ty>),
+            Sum(*const Ty, Rc<Ty>),
+            Named(*const Ty, Rc<Ty>, Symbol, usize),
+            Row(Row),
+            FinishRow {
+                fields: Vec<(String, Presence, bool)>,
+                rest: Rest,
+                payloads: usize,
+            },
+        }
+
+        impl Fingerprints {
+            fn new() -> Self {
+                Self {
+                    types: HashMap::new(),
+                }
+            }
+
+            /// Hash every fact [`Table::alike`] compares. Hash matches only
+            /// select candidates; `alike` still makes the coinductive decision,
+            /// so collisions can cost work but cannot change it.
+            fn ty(&mut self, table: &Table, ty: &Rc<Ty>) -> u64 {
+                fn tagged(tag: u8, parts: impl IntoIterator<Item = u64>) -> u64 {
+                    let mut hash = DefaultHasher::new();
+                    tag.hash(&mut hash);
+                    for part in parts {
+                        part.hash(&mut hash);
+                    }
+                    hash.finish()
+                }
+
+                // These hashes select candidates only; `Table::alike` makes
+                // the final decision. Coarsening the uncommon bound/recovery
+                // forms keeps the index total without duplicating equality.
+                fn presence_hash(presence: &Presence) -> u64 {
+                    match presence {
+                        Presence::Present => tagged(0, []),
+                        Presence::Absent => tagged(1, []),
+                        Presence::Var(var) | Presence::Bound(var) => tagged(2, [u64::from(*var)]),
+                        Presence::Undecided => tagged(3, []),
+                    }
+                }
+
+                fn rest_hash(rest: &Rest) -> u64 {
+                    match rest {
+                        Rest::Closed => tagged(0, []),
+                        Rest::Var(var) | Rest::Bound(var) => tagged(1, [u64::from(*var)]),
+                        Rest::Rigid { .. } | Rest::Undecided | Rest::More(_) => tagged(2, []),
+                    }
+                }
+
+                let mut work = vec![FingerprintWork::Type(ty.clone())];
+                let mut values = Vec::new();
+                while let Some(next) = work.pop() {
+                    match next {
+                        FingerprintWork::Type(ty) => {
+                            let ty = table.resolve(&ty);
+                            let key = Rc::as_ptr(&ty);
+                            if let Some((_, hash)) = self.types.get(&key) {
+                                values.push(*hash);
+                                continue;
+                            }
+                            match &*ty {
+                                Ty::Nat => values.push(tagged(0, [])),
+                                Ty::Int => values.push(tagged(1, [])),
+                                Ty::Real => values.push(tagged(2, [])),
+                                Ty::String => values.push(tagged(3, [])),
+                                Ty::Boolean => values.push(tagged(4, [])),
+                                Ty::Var(var) | Ty::Bound(var) => {
+                                    values.push(tagged(5, [u64::from(*var)]));
+                                }
+                                Ty::Rigid { id, .. } => {
+                                    values.push(tagged(6, [u64::from(*id)]));
+                                }
+                                Ty::Undecided => values.push(tagged(7, [])),
+                                Ty::Arrow(from, to, effects) => {
+                                    work.push(FingerprintWork::Arrow(key, ty.clone()));
+                                    work.push(FingerprintWork::Row(effects.clone()));
+                                    work.push(FingerprintWork::Type(to.clone()));
+                                    work.push(FingerprintWork::Type(from.clone()));
+                                    continue;
+                                }
+                                Ty::Struct(row) => {
+                                    work.push(FingerprintWork::Struct(key, ty.clone()));
+                                    work.push(FingerprintWork::Row(row.clone()));
+                                    continue;
+                                }
+                                Ty::Sum(row) => {
+                                    work.push(FingerprintWork::Sum(key, ty.clone()));
+                                    work.push(FingerprintWork::Row(row.clone()));
+                                    continue;
+                                }
+                                Ty::Named { symbol, args, .. } => {
+                                    work.push(FingerprintWork::Named(
+                                        key,
+                                        ty.clone(),
+                                        *symbol,
+                                        args.len(),
+                                    ));
+                                    work.extend(
+                                        args.iter()
+                                            .rev()
+                                            .map(|arg| FingerprintWork::Type(arg.clone())),
+                                    );
+                                    continue;
+                                }
+                            }
+                            let hash = *values.last().expect("family fingerprint leaf");
+                            self.types.insert(key, (ty, hash));
+                        }
+                        FingerprintWork::Arrow(key, ty) => {
+                            let parts = values.split_off(values.len() - 3);
+                            let hash = tagged(9, parts);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Struct(key, ty) => {
+                            let row = values.pop().expect("family struct fingerprint row");
+                            let hash = tagged(10, [row]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Sum(key, ty) => {
+                            let row = values.pop().expect("family sum fingerprint row");
+                            let hash = tagged(11, [row]);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Named(key, ty, symbol, arguments) => {
+                            let parts = values.split_off(values.len() - arguments);
+                            let mut hash = DefaultHasher::new();
+                            12_u8.hash(&mut hash);
+                            symbol.hash(&mut hash);
+                            parts.hash(&mut hash);
+                            let hash = hash.finish();
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Row(row) => {
+                            let (labels, rest) = table.canon(&row).into_parts();
+                            let mut fields: Vec<_> = labels
+                                .into_iter()
+                                .map(|(name, field)| {
+                                    let presence = table.presence_of(&field.presence);
+                                    let payload = !matches!(presence, Presence::Absent);
+                                    (name, presence, payload, field.ty)
+                                })
+                                .collect();
+                            // `alike` treats labels as a map, independent of
+                            // source/insertion order, so the index must too.
+                            fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                            let completion = fields
+                                .iter()
+                                .map(|(name, presence, payload, _)| {
+                                    (name.clone(), presence.clone(), *payload)
+                                })
+                                .collect();
+                            let payloads = fields.iter().filter(|field| field.2).count();
+                            work.push(FingerprintWork::FinishRow {
+                                fields: completion,
+                                rest,
+                                payloads,
+                            });
+                            work.extend(
+                                fields
+                                    .into_iter()
+                                    .rev()
+                                    .filter(|field| field.2)
+                                    .map(|field| FingerprintWork::Type(field.3)),
+                            );
+                        }
+                        FingerprintWork::FinishRow {
+                            fields,
+                            rest,
+                            payloads,
+                        } => {
+                            let payload_values = values.split_off(values.len() - payloads);
+                            let mut payload_values = payload_values.into_iter();
+                            let mut hash = DefaultHasher::new();
+                            fields.len().hash(&mut hash);
+                            for (name, presence, payload) in fields {
+                                name.hash(&mut hash);
+                                presence_hash(&presence).hash(&mut hash);
+                                if payload {
+                                    payload_values
+                                        .next()
+                                        .expect("family row payload fingerprint")
+                                        .hash(&mut hash);
+                                }
+                            }
+                            rest_hash(&rest).hash(&mut hash);
+                            values.push(hash.finish());
+                        }
+                    }
+                }
+                let hash = values.pop().expect("family type fingerprint");
+                debug_assert!(values.is_empty());
+                hash
+            }
+        }
+
+        struct RowState {
+            flat: Vec<Row>,
+            maps: Vec<IndexMap<String, RowField>>,
+            names: Vec<String>,
+            at: usize,
+            labels: IndexMap<String, RowField>,
+        }
+
+        enum Work {
+            Type(Vec<Rc<Ty>>),
+            Row(Vec<Row>),
+            PopUnfolding(Vec<u64>),
+            Arrow,
+            Struct,
+            Sum,
+            Named {
+                symbol: Symbol,
+                name: Rc<str>,
+                arguments: usize,
+            },
+            RowNext(RowState),
+            RowField {
+                state: RowState,
+                name: String,
+            },
+        }
+
         let _ = types
             .first()
             .expect("a structural family has a contributor");
-        let resolved: Vec<Rc<Ty>> = types.iter().map(|ty| self.table.resolve(ty)).collect();
-        let mut symbols = Vec::new();
-        let mut other_concrete = false;
-        for ty in &resolved {
-            match &**ty {
-                Ty::Named { symbol, .. } => {
-                    if !symbols.contains(symbol) {
-                        symbols.push(*symbol);
+        let mut unfolding: Vec<Vec<Rc<Ty>>> = Vec::new();
+        let mut fingerprints = Fingerprints::new();
+        let mut assumptions: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
+        let mut work = vec![Work::Type(types.to_vec())];
+        // Type and row continuations have statically distinct result stacks.
+        // The work variants determine which stack each result belongs to, so a
+        // mixed value enum would only add impossible runtime alternatives.
+        let mut type_values = Vec::new();
+        let mut row_values = Vec::new();
+
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Type(types) => {
+                    let resolved: Vec<Rc<Ty>> =
+                        types.iter().map(|ty| self.table.resolve(ty)).collect();
+                    let mut symbols = Vec::new();
+                    let mut other_concrete = false;
+                    for ty in &resolved {
+                        match &**ty {
+                            Ty::Named { symbol, .. } => {
+                                if !symbols.contains(symbol) {
+                                    symbols.push(*symbol);
+                                }
+                            }
+                            Ty::Var(_) | Ty::Undecided => {}
+                            _ => other_concrete = true,
+                        }
+                    }
+                    let assumption = resolved
+                        .iter()
+                        .map(|ty| fingerprints.ty(self.table, ty))
+                        .collect::<Vec<_>>();
+                    let repeated = assumptions.get(&assumption).is_some_and(|candidates| {
+                        candidates.iter().any(|at| {
+                            unfolding[*at]
+                                .iter()
+                                .zip(&resolved)
+                                .all(|(a, b)| self.table.alike(a, b))
+                        })
+                    });
+                    if !symbols.is_empty() && (symbols.len() > 1 || other_concrete) && !repeated {
+                        assumptions
+                            .entry(assumption.clone())
+                            .or_default()
+                            .push(unfolding.len());
+                        unfolding.push(resolved.clone());
+                        let expanded = resolved
+                            .iter()
+                            .map(|ty| self.table.unfolded(self.aliases, ty))
+                            .collect();
+                        work.push(Work::PopUnfolding(assumption));
+                        work.push(Work::Type(expanded));
+                        continue;
+                    }
+                    let Some(chosen) = resolved
+                        .iter()
+                        .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
+                    else {
+                        type_values.push(self.table.fresh_type());
+                        continue;
+                    };
+                    match &**chosen {
+                        Ty::Arrow(..) => {
+                            let arrows: Vec<_> = resolved
+                                .iter()
+                                .filter_map(|ty| match &**ty {
+                                    Ty::Arrow(a, b, e) => Some((a.clone(), b.clone(), e.clone())),
+                                    _ => None,
+                                })
+                                .collect();
+                            let from = arrows.iter().map(|x| x.0.clone()).collect();
+                            let to = arrows.iter().map(|x| x.1.clone()).collect();
+                            let effects = arrows.iter().map(|x| x.2.clone()).collect();
+                            work.push(Work::Arrow);
+                            work.push(Work::Row(effects));
+                            work.push(Work::Type(to));
+                            work.push(Work::Type(from));
+                        }
+                        Ty::Struct(..) => {
+                            let rows = resolved
+                                .iter()
+                                .filter_map(|ty| ty.fields().cloned())
+                                .collect();
+                            work.push(Work::Struct);
+                            work.push(Work::Row(rows));
+                        }
+                        Ty::Sum(..) => {
+                            let rows = resolved
+                                .iter()
+                                .filter_map(|ty| match &**ty {
+                                    Ty::Sum(row) => Some(row.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            work.push(Work::Sum);
+                            work.push(Work::Row(rows));
+                        }
+                        Ty::Named { symbol, name, args } => {
+                            let arguments = args.len();
+                            let merged: Vec<Vec<Rc<Ty>>> = (0..arguments)
+                                .map(|at| {
+                                    resolved
+                                        .iter()
+                                        .filter_map(|ty| match &**ty {
+                                            Ty::Named { args, .. } => args.get(at).cloned(),
+                                            _ => None,
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+                            work.push(Work::Named {
+                                symbol: *symbol,
+                                name: name.clone(),
+                                arguments,
+                            });
+                            for xs in merged.into_iter().rev() {
+                                work.push(Work::Type(xs));
+                            }
+                        }
+                        other => type_values.push(Rc::new(other.clone())),
                     }
                 }
-                Ty::Var(_) | Ty::Undecided => {}
-                _ => other_concrete = true,
-            }
-        }
-        let repeated = unfolding.iter().any(|earlier| {
-            earlier.len() == resolved.len()
-                && earlier
-                    .iter()
-                    .zip(&resolved)
-                    .all(|(a, b)| self.table.alike(a, b))
-        });
-        if !symbols.is_empty() && (symbols.len() > 1 || other_concrete) && !repeated {
-            unfolding.push(resolved.clone());
-            let expanded: Vec<_> = resolved
-                .iter()
-                .map(|ty| self.table.unfolded(self.aliases, ty))
-                .collect();
-            let family = self.family_type_with(&expanded, unfolding);
-            unfolding.pop();
-            return family;
-        }
-        let Some(chosen) = resolved
-            .iter()
-            .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
-        else {
-            return self.table.fresh_type();
-        };
-        Rc::new(match &**chosen {
-            Ty::Arrow(..) => {
-                let arrows: Vec<_> = resolved
-                    .iter()
-                    .filter_map(|ty| match &**ty {
-                        Ty::Arrow(a, b, e) => Some((a.clone(), b.clone(), e.clone())),
-                        _ => None,
-                    })
-                    .collect();
-                let from: Vec<_> = arrows.iter().map(|x| x.0.clone()).collect();
-                let to: Vec<_> = arrows.iter().map(|x| x.1.clone()).collect();
-                let effects: Vec<_> = arrows.iter().map(|x| x.2.clone()).collect();
-                Ty::Arrow(
-                    self.family_type_with(&from, unfolding),
-                    self.family_type_with(&to, unfolding),
-                    self.family_row(&effects, unfolding),
-                )
-            }
-            Ty::Struct(..) => {
-                let rows: Vec<_> = resolved
-                    .iter()
-                    .filter_map(|ty| ty.fields().cloned())
-                    .collect();
-                Ty::Struct(self.family_row(&rows, unfolding))
-            }
-            Ty::Sum(..) => {
-                let rows: Vec<_> = resolved
-                    .iter()
-                    .filter_map(|ty| match &**ty {
-                        Ty::Sum(r) => Some(r.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                Ty::Sum(self.family_row(&rows, unfolding))
-            }
-            Ty::Named { symbol, name, args } => {
-                let merged = (0..args.len())
-                    .map(|at| {
-                        let xs: Vec<_> = resolved
-                            .iter()
-                            .filter_map(|ty| match &**ty {
-                                Ty::Named { args, .. } => args.get(at).cloned(),
-                                _ => None,
-                            })
-                            .collect();
-                        self.family_type_with(&xs, unfolding)
-                    })
-                    .collect();
-                Ty::Named {
-                    symbol: *symbol,
-                    name: name.clone(),
-                    args: merged,
+                Work::Row(rows) => {
+                    let _ = rows.first().expect("a row family has a contributor");
+                    let flat: Vec<Row> = rows.iter().map(|row| self.table.canon(row)).collect();
+                    let maps: Vec<IndexMap<String, RowField>> =
+                        flat.iter().map(|row| row.labels.clone()).collect();
+                    let mut names = Vec::new();
+                    for labels in &maps {
+                        for name in labels.keys() {
+                            if !names.contains(name) {
+                                names.push(name.clone());
+                            }
+                        }
+                    }
+                    work.push(Work::RowNext(RowState {
+                        flat,
+                        maps,
+                        names,
+                        at: 0,
+                        labels: IndexMap::new(),
+                    }));
                 }
-            }
-            other => other.clone(),
-        })
-    }
-
-    fn family_labels(
-        &mut self,
-        maps: &[IndexMap<String, RowField>],
-        unfolding: &mut Vec<Vec<Rc<Ty>>>,
-    ) -> IndexMap<String, RowField> {
-        let mut names = Vec::new();
-        for labels in maps {
-            for name in labels.keys() {
-                if !names.contains(name) {
-                    names.push(name.clone());
+                Work::PopUnfolding(assumption) => {
+                    unfolding.pop();
+                    let candidates = assumptions
+                        .get_mut(&assumption)
+                        .expect("family unfolding assumption is indexed");
+                    candidates.pop();
                 }
-            }
-        }
-        names
-            .into_iter()
-            .map(|name| {
-                let fields: Vec<RowField> = maps
-                    .iter()
-                    .filter_map(|labels| labels.get(&name).cloned())
-                    .collect();
-                let payloads: Vec<Rc<Ty>> = fields
-                    .iter()
-                    .filter(|field| {
-                        !matches!(self.table.presence_of(&field.presence), Presence::Absent)
-                    })
-                    .map(|field| field.ty.clone())
-                    .collect();
-                let ty = match payloads.is_empty() {
-                    true => Rc::new(Ty::default()),
-                    false => self.family_type_with(&payloads, unfolding),
-                };
-                (
+                Work::Arrow => {
+                    let effects = row_values.pop().expect("family arrow effects");
+                    let to = type_values.pop().expect("family arrow result");
+                    let from = type_values.pop().expect("family arrow parameter");
+                    type_values.push(Rc::new(Ty::Arrow(from, to, effects)));
+                }
+                Work::Struct => {
+                    let row = row_values.pop().expect("family struct row");
+                    type_values.push(Rc::new(Ty::Struct(row)));
+                }
+                Work::Sum => {
+                    let row = row_values.pop().expect("family sum row");
+                    type_values.push(Rc::new(Ty::Sum(row)));
+                }
+                Work::Named {
+                    symbol,
                     name,
-                    RowField {
-                        presence: self.table.fresh_presence(),
-                        ty,
-                    },
-                )
-            })
-            .collect()
-    }
+                    arguments,
+                } => {
+                    let mut args = Vec::with_capacity(arguments);
+                    for _ in 0..arguments {
+                        args.push(type_values.pop().expect("family named argument"));
+                    }
+                    args.reverse();
+                    type_values.push(Rc::new(Ty::Named {
+                        symbol,
+                        name,
+                        args: args.into(),
+                    }));
+                }
+                Work::RowNext(mut state) => {
+                    if state.at == state.names.len() {
+                        let rest = if state
+                            .flat
+                            .iter()
+                            .any(|row| matches!(row.rest, Rest::Var(_)))
+                        {
+                            self.table.fresh_row()
+                        } else {
+                            state.flat[0].rest.clone()
+                        };
+                        row_values.push(Row {
+                            labels: state.labels,
+                            rest,
+                        });
+                        continue;
+                    }
+                    let name = state.names[state.at].clone();
+                    let payloads: Vec<Rc<Ty>> = state
+                        .maps
+                        .iter()
+                        .filter_map(|labels| labels.get(&name))
+                        .filter(|field| {
+                            !matches!(self.table.presence_of(&field.presence), Presence::Absent)
+                        })
+                        .map(|field| field.ty.clone())
+                        .collect();
+                    if payloads.is_empty() {
+                        state.labels.insert(
+                            name,
+                            RowField {
+                                presence: self.table.fresh_presence(),
+                                ty: Rc::new(Ty::default()),
+                            },
+                        );
+                        state.at += 1;
+                        work.push(Work::RowNext(state));
+                    } else {
+                        work.push(Work::RowField { state, name });
+                        work.push(Work::Type(payloads));
+                    }
+                }
+                Work::RowField { mut state, name } => {
+                    let ty = type_values.pop().expect("family row payload");
+                    state.labels.insert(
+                        name,
+                        RowField {
+                            presence: self.table.fresh_presence(),
+                            ty,
+                        },
+                    );
+                    state.at += 1;
+                    work.push(Work::RowNext(state));
+                }
+            }
+        }
 
-    fn family_row(&mut self, rows: &[Row], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Row {
-        let _ = rows.first().expect("a row family has a contributor");
-        let flat: Vec<Row> = rows.iter().map(|row| self.table.canon(row)).collect();
-        let maps: Vec<IndexMap<String, RowField>> =
-            flat.iter().map(|row| row.labels.clone()).collect();
-        let labels = self.family_labels(&maps, unfolding);
-        let rest = if flat.iter().any(|row| matches!(row.rest, Rest::Var(_))) {
-            self.table.fresh_row()
-        } else {
-            flat[0].rest.clone()
-        };
-        Row { labels, rest }
+        let family = type_values.pop().expect("family result");
+        debug_assert!(type_values.is_empty());
+        debug_assert!(row_values.is_empty());
+        family
     }
 
     /// Where the completed store proves a synthesized result presence is the
@@ -886,14 +1224,16 @@ impl Solve<'_> {
             },
         );
         let (want_ty, have_ty) = (row_ty(&opened), row_ty(&have));
+        let (opened_labels, _) = opened.into_parts();
+        let (have_labels, _) = have.into_parts();
         let expected = SolveRow {
             ty: want_ty,
-            labels: Rc::new(opened.labels),
+            labels: Rc::new(opened_labels),
             tail: left,
         };
         let actual = SolveRow {
             ty: have_ty,
-            labels: Rc::new(have.labels),
+            labels: Rc::new(have_labels),
             tail: right,
         };
         for field in self.labels(span, expected, actual) {
@@ -1044,6 +1384,11 @@ impl Solve<'_> {
         // Every recursive type goal stays in this invocation's work list, so
         // assumptions can be indexed as entries are opened below.
         let mut assumption_index: HashMap<(Symbol, Symbol), Vec<usize>> = HashMap::new();
+        // An indexed assumption is necessarily a pair of named types. Keep its
+        // arguments alongside the index so the growth check can consume the
+        // structural data directly instead of rechecking that invariant.
+        type Arguments = (Rc<[Rc<Ty>]>, Rc<[Rc<Ty>]>);
+        let mut assumption_arguments: HashMap<usize, Arguments> = HashMap::new();
         let mut work = vec![SolveWork::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
             match part {
@@ -1127,22 +1472,24 @@ impl Solve<'_> {
                             let (want, have) =
                                 (self.table.canon(effects), self.table.canon(performs));
                             self.step(span, Rule::Arrow, goal, Effect::Decomposed);
+                            let (want_labels, want_rest) = want.into_parts();
+                            let (have_labels, have_rest) = have.into_parts();
                             let left = SolveRow {
                                 ty: lhs.clone(),
-                                labels: Rc::new(want.labels),
+                                labels: Rc::new(want_labels),
                                 tail: Tail::Effects {
                                     from: from.clone(),
                                     to: to.clone(),
-                                    rest: want.rest,
+                                    rest: want_rest,
                                 },
                             };
                             let right = SolveRow {
                                 ty: rhs.clone(),
-                                labels: Rc::new(have.labels),
+                                labels: Rc::new(have_labels),
                                 tail: Tail::Effects {
                                     from: other.clone(),
                                     to: result.clone(),
-                                    rest: have.rest,
+                                    rest: have_rest,
                                 },
                             };
                             work.push(SolveWork::Labels(left, right, depth + 1));
@@ -1164,16 +1511,18 @@ impl Solve<'_> {
                                 Goal::Type { expected, actual },
                                 Effect::Decomposed,
                             );
+                            let (want_labels, want_rest) = want.into_parts();
+                            let (have_labels, have_rest) = have.into_parts();
                             work.push(SolveWork::Labels(
                                 SolveRow {
                                     ty: lhs,
-                                    labels: Rc::new(want.labels),
-                                    tail: Tail::Fields(want.rest),
+                                    labels: Rc::new(want_labels),
+                                    tail: Tail::Fields(want_rest),
                                 },
                                 SolveRow {
                                     ty: rhs,
-                                    labels: Rc::new(have.labels),
-                                    tail: Tail::Fields(have.rest),
+                                    labels: Rc::new(have_labels),
+                                    tail: Tail::Fields(have_rest),
                                 },
                                 depth + 1,
                             ));
@@ -1188,16 +1537,18 @@ impl Solve<'_> {
                                 Goal::Type { expected, actual },
                                 Effect::Decomposed,
                             );
+                            let (want_labels, want_rest) = want.into_parts();
+                            let (have_labels, have_rest) = have.into_parts();
                             work.push(SolveWork::Labels(
                                 SolveRow {
                                     ty: lhs,
-                                    labels: Rc::new(want.labels),
-                                    tail: Tail::Cases(want.rest),
+                                    labels: Rc::new(want_labels),
+                                    tail: Tail::Cases(want_rest),
                                 },
                                 SolveRow {
                                     ty: rhs,
-                                    labels: Rc::new(have.labels),
-                                    tail: Tail::Cases(have.rest),
+                                    labels: Rc::new(have_labels),
+                                    tail: Tail::Cases(have_rest),
                                 },
                                 depth + 1,
                             ));
@@ -1205,12 +1556,24 @@ impl Solve<'_> {
                         (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => {
                             let pair = match (&*lhs, &*rhs) {
                                 (
-                                    Ty::Named { symbol: left, .. },
-                                    Ty::Named { symbol: right, .. },
-                                ) => Some(((*left, *right), (lhs.clone(), rhs.clone()))),
+                                    Ty::Named {
+                                        symbol: left,
+                                        args: left_args,
+                                        ..
+                                    },
+                                    Ty::Named {
+                                        symbol: right,
+                                        args: right_args,
+                                        ..
+                                    },
+                                ) => Some((
+                                    (*left, *right),
+                                    (lhs.clone(), rhs.clone()),
+                                    (left_args.clone(), right_args.clone()),
+                                )),
                                 _ => None,
                             };
-                            let already = pair.as_ref().is_some_and(|(key, _)| {
+                            let already = pair.as_ref().is_some_and(|(key, _, _)| {
                                 assumption_index.get(key).is_some_and(|entries| {
                                     entries.iter().fold(false, |found, at| {
                                         let (left, right) = &self.assumed[*at];
@@ -1220,25 +1583,55 @@ impl Solve<'_> {
                                     })
                                 })
                             });
-                            match already {
-                                true => self.step(span, Rule::Assume, goal, Effect::None),
-                                false => {
-                                    let exposed_left = self.table.unfolded(self.aliases, &lhs);
-                                    let exposed_right = self.table.unfolded(self.aliases, &rhs);
-                                    self.step(span, Rule::Unfold, goal, Effect::Decomposed);
-                                    let assumption = pair.map(|(key, pair)| {
-                                        let at = self.assumed.len();
-                                        self.assumed.push(pair);
-                                        assumption_index.entry(key).or_default().push(at);
-                                        key
+                            // Lowering rejects recursive applications that wrap
+                            // their own arguments, and imported recovery data is
+                            // not entitled to that invariant. Such a non-nominal
+                            // goal never repeats exactly: each trip around the
+                            // declaration puts the previous arguments below one
+                            // more constructor. Recognize that structural
+                            // embedding while the earlier goal is still open and
+                            // absorb the malformed interface instead of growing
+                            // an unbounded sequence of types.
+                            let growing =
+                                pair.as_ref()
+                                    .is_some_and(|(key, _, (later_left, later_right))| {
+                                        (!self.nominal.contains(&key.0)
+                                            & !self.nominal.contains(&key.1))
+                                            && assumption_index.get(key).is_some_and(|entries| {
+                                                entries.iter().any(|at| {
+                                                let (earlier_left, earlier_right) =
+                                                    &assumption_arguments[at];
+                                                let left = self.embeds_arguments(
+                                                    earlier_left,
+                                                    later_left,
+                                                );
+                                                let right = self.embeds_arguments(
+                                                    earlier_right,
+                                                    later_right,
+                                                );
+                                                matches!((left, right), (Some(a), Some(b)) if a | b)
+                                            })
+                                            })
                                     });
-                                    work.push(SolveWork::FinishUnfold { assumption, depth });
-                                    work.push(SolveWork::Ty(
-                                        exposed_left,
-                                        exposed_right,
-                                        depth + 1,
-                                    ));
-                                }
+                            if already {
+                                self.step(span, Rule::Assume, goal, Effect::None);
+                            } else if growing {
+                                self.step(span, Rule::Absorb, goal, Effect::None);
+                                self.recover_ty(span, &lhs);
+                                self.recover_ty(span, &rhs);
+                            } else {
+                                let exposed_left = self.table.unfolded(self.aliases, &lhs);
+                                let exposed_right = self.table.unfolded(self.aliases, &rhs);
+                                self.step(span, Rule::Unfold, goal, Effect::Decomposed);
+                                let assumption = pair.map(|(key, pair, arguments)| {
+                                    let at = self.assumed.len();
+                                    self.assumed.push(pair);
+                                    assumption_arguments.insert(at, arguments);
+                                    assumption_index.entry(key).or_default().push(at);
+                                    key
+                                });
+                                work.push(SolveWork::FinishUnfold { assumption, depth });
+                                work.push(SolveWork::Ty(exposed_left, exposed_right, depth + 1));
                             }
                         }
                         _ => {
@@ -1305,7 +1698,9 @@ impl Solve<'_> {
                 SolveWork::FinishUnfold { assumption, depth } => {
                     self.depth = depth;
                     if let Some(key) = assumption {
+                        let at = self.assumed.len() - 1;
                         self.assumed.pop();
+                        assumption_arguments.remove(&at);
                         let entries = assumption_index
                             .get_mut(&key)
                             .expect("an open assumption is indexed");
@@ -1315,6 +1710,90 @@ impl Solve<'_> {
             }
         }
         self.depth = original_depth;
+    }
+
+    /// Whether `after`'s named arguments structurally embed all of `before`'s,
+    /// and whether at least one of them moved below a constructor.
+    ///
+    /// The roots are a set rather than paired positions because a well-formed
+    /// recursive group may permute arguments. A mere permutation is not growth;
+    /// every old argument must still occur and one must occur strictly below a
+    /// root before this can be the malformed-growth guard.
+    fn embeds_arguments(&self, earlier: &[Rc<Ty>], later: &[Rc<Ty>]) -> Option<bool> {
+        let mut proper = false;
+        for old in earlier.iter() {
+            if later.iter().any(|new| self.table.alike(old, new)) {
+                continue;
+            }
+            if later
+                .iter()
+                .any(|new| self.argument_contains_descendant(new, old))
+            {
+                proper = true;
+            } else {
+                return None;
+            }
+        }
+        Some(proper)
+    }
+
+    /// Whether `needle` occurs strictly below `root` as a complete semantic
+    /// type. This is an explicit walk because imported type arguments are public
+    /// artifact data and may be much deeper than the native stack.
+    fn argument_contains_descendant(&self, root: &Rc<Ty>, needle: &Rc<Ty>) -> bool {
+        enum Work {
+            Ty(Rc<Ty>),
+            Row(Row),
+        }
+
+        let mut work = vec![Work::Ty(root.clone())];
+        let mut first = true;
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(ty) => {
+                    let ty = self.table.resolve(&ty);
+                    if !first && self.table.alike(&ty, needle) {
+                        return true;
+                    }
+                    first = false;
+                    match &*ty {
+                        Ty::Arrow(from, to, effects) => {
+                            work.push(Work::Row(effects.clone()));
+                            work.push(Work::Ty(to.clone()));
+                            work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            work.push(Work::Row(row.clone()));
+                        }
+                        Ty::Named { args, .. } => {
+                            work.extend(args.iter().rev().map(|arg| Work::Ty(arg.clone())))
+                        }
+                        Ty::Nat
+                        | Ty::Int
+                        | Ty::Real
+                        | Ty::String
+                        | Ty::Boolean
+                        | Ty::Var(_)
+                        | Ty::Rigid { .. }
+                        | Ty::Bound(_)
+                        | Ty::Undecided => {}
+                    }
+                }
+                Work::Row(row) => {
+                    let row = self.table.canon(&row);
+                    work.extend(
+                        row.labels
+                            .values()
+                            .rev()
+                            .filter(|field| {
+                                !matches!(self.table.presence_of(&field.presence), Presence::Absent)
+                            })
+                            .map(|field| Work::Ty(field.ty.clone())),
+                    );
+                }
+            }
+        }
+        false
     }
 
     /// Decide two types by their labels and their constructors and row tails.
@@ -2157,11 +2636,11 @@ impl Solve<'_> {
                     }
                 }
                 Work::Row(row) => {
-                    let row = self.table.canon(&row);
+                    let (labels, rest) = self.table.canon(&row).into_parts();
                     work.push(Work::Fields {
-                        pending: row.labels.into_iter().collect::<Vec<_>>().into_iter(),
+                        pending: labels.into_iter().collect::<Vec<_>>().into_iter(),
                         labels: IndexMap::new(),
-                        rest: row.rest,
+                        rest,
                     });
                 }
                 Work::Fields {
@@ -2362,9 +2841,9 @@ impl Solve<'_> {
                     }
                 }
                 Work::Row(row) => {
-                    let row = self.table.canon(&row);
-                    work.push(Work::Rest(row.rest));
-                    for field in row.labels.into_values().rev() {
+                    let (labels, rest) = self.table.canon(&row).into_parts();
+                    work.push(Work::Rest(rest));
+                    for field in labels.into_values().rev() {
                         let presence = self.table.presence_of(&field.presence);
                         if !matches!(presence, Presence::Absent) {
                             work.push(Work::Type(field.ty));

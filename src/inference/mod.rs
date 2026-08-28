@@ -1063,6 +1063,40 @@ impl Subst {
     }
 }
 
+/// Exercise the match-result family builder without constructing a source
+/// program. This is public so integration regressions can feed it semantic
+/// types whose depth would make source syntax itself the thing under test.
+#[doc(hidden)]
+pub fn structural_family_for_tests(
+    definition: Symbol,
+    aliases: &IndexMap<Symbol, Scheme>,
+    types: &[Rc<Ty>],
+) -> Rc<Ty> {
+    let mut table = Table::default();
+    let mut errors = Vec::new();
+    let mut steps = Vec::new();
+    let nominal = HashSet::new();
+    let mut locals = IndexMap::new();
+    let mut refinements = Vec::new();
+    Solve {
+        table: &mut table,
+        errors: &mut errors,
+        steps: &mut steps,
+        aliases,
+        nominal: &nominal,
+        definition,
+        depth: 0,
+        assumed: Vec::new(),
+        schemes: HashMap::new(),
+        locals: &mut locals,
+        guard: None,
+        active_refinement: None,
+        refinements: &mut refinements,
+        generated_end: 0,
+    }
+    .family_type(types)
+}
+
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
@@ -1760,14 +1794,14 @@ impl Table {
                     _ => {
                         return Row {
                             labels,
-                            rest: row.rest,
+                            rest: std::mem::take(&mut row.rest),
                         };
                     }
                 },
                 _ => {
                     return Row {
                         labels,
-                        rest: row.rest,
+                        rest: std::mem::take(&mut row.rest),
                     };
                 }
             };
@@ -2683,9 +2717,9 @@ impl Table {
                             work.push(Work::Ty(a.clone()));
                         }
                         Ty::Struct(row) | Ty::Sum(row) => {
+                            let (labels, _) = self.canon(row).into_parts();
                             work.extend(
-                                self.canon(row)
-                                    .labels
+                                labels
                                     .into_iter()
                                     .rev()
                                     .map(|(name, field)| Work::Field(name, field)),
@@ -2708,7 +2742,8 @@ impl Table {
                     }
                 }
                 Work::Effects(row) => {
-                    for (name, field) in self.canon(&row).labels {
+                    let (labels, _) = self.canon(&row).into_parts();
+                    for (name, field) in labels {
                         found.entry(name.clone()).or_insert_with(|| {
                             let shown = name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0);
                             (shown.to_string(), self.presence_of(&field.presence))
@@ -2813,8 +2848,8 @@ impl Table {
                             })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
-                    if let Rest::Rigid { id, name } = row.rest {
-                        found.entry(id).or_insert(name);
+                    if let Rest::Rigid { id, name } = &row.rest {
+                        found.entry(*id).or_insert_with(|| name.clone());
                     }
                 }
             }
@@ -2845,7 +2880,9 @@ impl Table {
         // [`Assigned::as_row`] says by answering with a row that names nothing
         // and [`Assigned::as_ty`] by answering with a type that carries none.
         let labels: IndexMap<String, RowField> = match shape {
-            Shape::Struct | Shape::Sum | Shape::Effect => self.canon(&value.as_row()).labels,
+            Shape::Struct | Shape::Sum | Shape::Effect => {
+                self.canon(&value.as_row()).into_parts().0
+            }
         };
         let named = labels
             .iter()
@@ -3282,13 +3319,13 @@ impl Table {
                 }
                 Work::Row(row) => {
                     let row = self.canon(&row);
-                    let rest = match row.rest {
+                    let rest = match &row.rest {
                         Rest::Var(var) => subst
                             .types
-                            .get(&var)
-                            .map_or(Rest::Var(var), |at| Rest::Bound(*at)),
-                        Rest::Rigid { id, .. } => Rest::Bound(subst.rigids[&id]),
-                        rest => rest,
+                            .get(var)
+                            .map_or(Rest::Var(*var), |at| Rest::Bound(*at)),
+                        Rest::Rigid { id, .. } => Rest::Bound(subst.rigids[id]),
+                        rest => rest.clone(),
                     };
                     let labels: Vec<_> = row
                         .labels
