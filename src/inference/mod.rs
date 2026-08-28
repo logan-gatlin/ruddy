@@ -515,6 +515,14 @@ pub struct Constraint {
 
 #[derive(Debug, Clone)]
 pub enum ConstraintKind {
+    /// Read one field from a base. The operation stays distinct from ordinary
+    /// equality so a known non-struct can be diagnosed at the base.
+    Project {
+        base: Rc<Ty>,
+        field: String,
+        result: Rc<Ty>,
+        base_span: Span,
+    },
     /// Two types the program requires to be the same. `expected` is the side
     /// the context demanded — an annotation, a function's parameter, or the
     /// arrow shape a call site needs of something that is not one — and
@@ -606,6 +614,8 @@ pub struct Error {
 
 #[derive(Debug, Clone)]
 pub enum ErrorKind {
+    /// A field was read from a value whose outer type is known not to be a struct.
+    NotAStruct { base: Rc<Ty> },
     /// Two types that had to be equal are not. `expected` is the side the
     /// context demanded — an annotation, a function's parameter, or the arrow
     /// shape a call site needs — and `actual` is what the term turned out to
@@ -2124,7 +2134,7 @@ impl Table {
                     // tails nothing never has.
                     let demand = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
                         Some(kind) if !kind.lacks().is_empty() => {
-                            Some((kind.cases().map(|(shape, _)| shape), kind.lacks().clone()))
+                            Some((kind.row().map(|(shape, _)| shape), kind.lacks().clone()))
                         }
                         _ => None,
                     };
@@ -2132,7 +2142,7 @@ impl Table {
                         // A struct's `..` is the type's core, so the condition
                         // lands on the argument's own core variable — the one
                         // thing that would still be free to acquire the label.
-                        Some((None, labels)) => {
+                        Some((None | Some(Shape::Struct), labels)) => {
                             if let Core::Var(var) = self.resolve(arg).core {
                                 self.forbidden(var, Shape::Struct, labels);
                             }
@@ -2141,7 +2151,7 @@ impl Table {
                         // into a row, so both read the argument for the labels
                         // it allows and put the condition on what is open past
                         // them.
-                        Some((Some(shape), labels)) => {
+                        Some((Some(shape @ (Shape::Sum | Shape::Effect)), labels)) => {
                             let written = self.resolve(arg).cases();
                             self.forbid(&written, shape, &labels);
                         }
@@ -3463,6 +3473,9 @@ impl Table {
     /// it spells `a`.
     fn zonk_error(&self, kind: &ErrorKind, subst: &mut Subst) -> ErrorKind {
         match kind {
+            ErrorKind::NotAStruct { base } => ErrorKind::NotAStruct {
+                base: self.close(base, subst),
+            },
             ErrorKind::Mismatch { expected, actual } => ErrorKind::Mismatch {
                 expected: self.close(expected, subst),
                 actual: self.close(actual, subst),
@@ -3725,7 +3738,7 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         table.rigids.insert(variable.id, variable.span);
         let name: Rc<str> = variable.name.as_str().into();
         match variable.sense {
-            Sense::Type => {
+            Sense::Type | Sense::Fields => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
                 let core = Core::Rigid {

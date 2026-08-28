@@ -566,22 +566,15 @@ impl Constrain<'_> {
             TermKind::Project { base, field } => {
                 self.infer_term(base);
                 let result = self.table.fresh_type();
-                let core = Core::Var(self.table.fresh_core());
-                let want = Rc::new(Ty {
-                    core,
-                    fields: [(field.tracked.clone(), RowField::present(result.clone()))]
-                        .into_iter()
-                        .collect(),
+                self.out.push(Constraint {
+                    span: field.span,
+                    kind: ConstraintKind::Project {
+                        base: base.ty.clone(),
+                        field: field.tracked.clone(),
+                        result: result.clone(),
+                        base_span: base.span,
+                    },
                 });
-                // "Whatever else it may also have" is the core beside the
-                // field, and it lacks that name: it stands for a type the field
-                // is already on, and a second copy of it could disagree. One
-                // variable says this where two used to.
-                self.table.note_lacks(&want);
-                let actual = base.ty.clone();
-                // The field name is the only thing the user can fix about a
-                // type that does not have it, whatever kind of type that is.
-                self.checks(field.span, &actual, &want);
                 result
             }
             // The scrutinee is what the written matrix, read column-wise,

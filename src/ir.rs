@@ -4680,16 +4680,15 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>) -> Kinds {
             // among them, for the reason below — and a sum's rest wins over an
             // arrow's effects only because one of the two has to, the
             // declaration being a write-off either way.
-            kinds.push(
-                match (
-                    read_as.contains(&Sense::Cases),
-                    read_as.contains(&Sense::Effects),
-                ) {
-                    (true, _) => ParamKind::Cases { lacks },
-                    (false, true) => ParamKind::Effects { lacks },
-                    (false, false) => ParamKind::Type { lacks },
-                },
-            );
+            kinds.push(if read_as.contains(&Sense::Fields) {
+                ParamKind::Fields { lacks }
+            } else if read_as.contains(&Sense::Cases) {
+                ParamKind::Cases { lacks }
+            } else if read_as.contains(&Sense::Effects) {
+                ParamKind::Effects { lacks }
+            } else {
+                ParamKind::Type { lacks }
+            });
         }
         out.insert(*symbol, kinds);
     }
@@ -4781,7 +4780,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
                 // field named `y` makes it say — and sits in the same map, so
                 // the keys are the whole set.
                 let lacks = fields.keys().cloned().collect();
-                out(Fact::Says(*index, ParamKind::Type { lacks }));
+                out(Fact::Says(*index, ParamKind::Fields { lacks }));
             }
         }
         // The struct arm again, about cases: a payload is a type position, and
@@ -4910,7 +4909,9 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
         carries: &HashMap<Symbol, Carried>,
-        rows: &HashSet<Symbol>,
+        rows: &HashMap<Symbol, Sense>,
+        declarations: &IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
         out: &mut Vec<Error>,
     ) {
         match &mut ty.tracked {
@@ -4925,34 +4926,26 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         // declaration already names. The two conditions are
                         // one condition; only the noun a complaint is
                         // worded in differs.
-                        Some(kind) if kind.cases().is_some() => {
-                            let (shape, lacks) = kind.cases().expect("the arm just asked for one");
-                            match row_shaped(arg, rows) {
+                        Some(kind) if kind.row().is_some() => {
+                            let (shape, lacks) = kind.row().expect("the arm just asked for one");
+                            match row_shaped(arg, rows, shape, declarations, external) {
                                 false => Some(ErrorKind::NotARow {
                                     sense: kind.sense(),
                                 }),
-                                true => cases_named(arg).find(|name| lacks.contains(name)).map(
-                                    |field| ErrorKind::RepeatedRowField {
-                                        shape,
-                                        field: field.clone(),
-                                    },
-                                ),
+                                true => {
+                                    let repeated = match shape {
+                                        Shape::Struct => carried(arg, carries)
+                                            .labels
+                                            .into_iter()
+                                            .find(|name| lacks.contains(name)),
+                                        Shape::Sum | Shape::Effect => {
+                                            cases_named(arg).find(|name| lacks.contains(name))
+                                        }
+                                    };
+                                    repeated
+                                        .map(|field| ErrorKind::RepeatedRowField { shape, field })
+                                }
                             }
-                        }
-                        // A struct's `..` is the type's core, and a core takes
-                        // any type at all — so there is no shape left to check,
-                        // and the only question is the fields the argument would
-                        // bring with it, which reach through a name as much as
-                        // they are written out.
-                        Some(ParamKind::Type { lacks }) if !lacks.is_empty() => {
-                            carried(arg, carries)
-                                .labels
-                                .into_iter()
-                                .find(|name| lacks.contains(name))
-                                .map(|field| ErrorKind::RepeatedRowField {
-                                    shape: Shape::Struct,
-                                    field,
-                                })
                         }
                         _ => None,
                     };
@@ -4964,15 +4957,15 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         *arg = span.track(TypeKind::Error);
                         continue;
                     }
-                    walk(arg, kinds, carries, rows, out);
+                    walk(arg, kinds, carries, rows, declarations, external, out);
                 }
             }
             // The effect row holds no argument to check: an effect is named,
             // never applied, so there is nothing inside one for a parameter's
             // conditions to be broken by.
             TypeKind::Arrow { from, to, .. } => {
-                walk(from, kinds, carries, rows, out);
-                walk(to, kinds, carries, rows, out);
+                walk(from, kinds, carries, rows, declarations, external, out);
+                walk(to, kinds, carries, rows, declarations, external, out);
             }
             // A row holds labels and a tail, and neither is a type: there is
             // nothing inside one for an argument to be written at.
@@ -4980,7 +4973,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             TypeKind::Struct { fields, .. } => {
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
-                        walk(value, kinds, carries, rows, out);
+                        walk(value, kinds, carries, rows, declarations, external, out);
                     }
                 }
             }
@@ -4991,7 +4984,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         ..
                     } = case
                     {
-                        walk(payload, kinds, carries, rows, out);
+                        walk(payload, kinds, carries, rows, declarations, external, out);
                     }
                 }
             }
@@ -5009,6 +5002,8 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // whatever the declaration it names carries, which is what the repeated
     // field check is asked against. See [`carrying`].
     let carries = carrying(&program.types);
+    let declarations = program.types.clone();
+    let external = program.external_types.clone();
 
     let mut out = Vec::new();
     for decl in program.types.values_mut() {
@@ -5020,26 +5015,50 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         // has already collected everything the slot it goes to may not name —
         // that is what [`kinds`] closed the sets over — so there is no second
         // condition here for it to fail.
-        let rows: HashSet<Symbol> = decl
+        let rows: HashMap<Symbol, Sense> = decl
             .params
             .iter()
-            .filter(|param| param.kind.cases().is_some())
-            .map(|param| param.symbol)
+            .filter(|param| param.kind.row().is_some())
+            .map(|param| (param.symbol, param.kind.sense()))
             .collect();
-        walk(&mut decl.value, kinds, &carries, &rows, &mut out);
+        walk(
+            &mut decl.value,
+            kinds,
+            &carries,
+            &rows,
+            &declarations,
+            &external,
+            &mut out,
+        );
     }
     // An annotation binds no parameters, so nothing in one can be a sum's rest
     // by being a parameter — but it is every bit as much a place to apply a
     // declaration, and was the way this check was first written round.
     for decl in program.terms.values_mut() {
         if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
-            walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
+            walk(
+                annotation,
+                kinds,
+                &carries,
+                &HashMap::new(),
+                &declarations,
+                &external,
+                &mut out,
+            );
         }
         // And so is a nested binding's, which is a place to write one as much
         // as a definition's is. An annotation this walk never reaches is a
         // [`ErrorKind::RepeatedRowField`] never reported.
         annotations(&mut decl.value, &mut |annotation| {
-            walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
+            walk(
+                annotation,
+                kinds,
+                &carries,
+                &HashMap::new(),
+                &declarations,
+                &external,
+                &mut out,
+            );
         });
     }
     for decl in program.externs.values_mut() {
@@ -5048,7 +5067,15 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             .as_mut()
             .expect("an extern always has a written annotation")
             .ty;
-        walk(annotation, kinds, &carries, &HashSet::new(), &mut out);
+        walk(
+            annotation,
+            kinds,
+            &carries,
+            &HashMap::new(),
+            &declarations,
+            &external,
+            &mut out,
+        );
     }
     out
 }
@@ -5132,13 +5159,163 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
 /// About cases and nothing else, and so about no shape. A struct's `..` is the
 /// type's core, and every type at all is one of those: `WithX Nat` splices no
 /// row anywhere, it hands a core a core.
-fn row_shaped(ty: &Type, rows: &HashSet<Symbol>) -> bool {
-    match &ty.tracked {
-        TypeKind::Error => true,
-        TypeKind::Sum { .. } | TypeKind::Effects(_) => true,
-        TypeKind::Param { symbol, .. } => rows.contains(symbol),
-        _ => false,
+fn row_shaped(
+    ty: &Type,
+    rows: &HashMap<Symbol, Sense>,
+    shape: Shape,
+    declarations: &IndexMap<Symbol, Decl<Type>>,
+    external: &IndexMap<Symbol, ExternalType>,
+) -> bool {
+    fn semantic_outer(
+        ty: &Rc<Ty>,
+        rows: &HashMap<Symbol, Sense>,
+        shape: Shape,
+        declarations: &IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
+        written_args: Option<&[Type]>,
+        semantic_args: Option<&[Rc<Ty>]>,
+        active: &mut HashSet<Symbol>,
+    ) -> bool {
+        match &ty.core {
+            crate::types::Core::Unit => shape == Shape::Struct,
+            crate::types::Core::Sum(_) => shape == Shape::Sum,
+            crate::types::Core::Bound(index) => {
+                if let Some(arg) = semantic_args.and_then(|args| args.get(*index as usize)) {
+                    semantic_outer(arg, rows, shape, declarations, external, None, None, active)
+                } else if let Some(arg) = written_args.and_then(|args| args.get(*index as usize)) {
+                    outer(arg, rows, shape, declarations, external, None, active)
+                } else {
+                    false
+                }
+            }
+            crate::types::Core::Named { symbol, args, .. } => {
+                if !active.insert(*symbol) {
+                    return false;
+                }
+                let found = external.get(symbol).is_some_and(|decl| {
+                    semantic_outer(
+                        decl.scheme.body(),
+                        rows,
+                        shape,
+                        declarations,
+                        external,
+                        None,
+                        Some(args),
+                        active,
+                    )
+                });
+                active.remove(symbol);
+                found
+            }
+            crate::types::Core::Undecided => true,
+            crate::types::Core::Nat
+            | crate::types::Core::Int
+            | crate::types::Core::Real
+            | crate::types::Core::String
+            | crate::types::Core::Boolean
+            | crate::types::Core::Arrow(..)
+            | crate::types::Core::Var(_)
+            | crate::types::Core::Rigid { .. } => false,
+        }
     }
+
+    fn outer(
+        ty: &Type,
+        rows: &HashMap<Symbol, Sense>,
+        shape: Shape,
+        declarations: &IndexMap<Symbol, Decl<Type>>,
+        external: &IndexMap<Symbol, ExternalType>,
+        args: Option<&[Type]>,
+        active: &mut HashSet<Symbol>,
+    ) -> bool {
+        match &ty.tracked {
+            TypeKind::Error => true,
+            TypeKind::Struct { .. } => shape == Shape::Struct,
+            TypeKind::Sum { .. } => shape == Shape::Sum,
+            TypeKind::Effects(_) => shape == Shape::Effect,
+            TypeKind::Param { symbol, index } => {
+                match args.and_then(|args| args.get(*index as usize)) {
+                    Some(arg) => outer(arg, rows, shape, declarations, external, None, active),
+                    None => rows.get(symbol).copied() == Some(sense(shape)),
+                }
+            }
+            TypeKind::Ident(symbol) => {
+                if !active.insert(*symbol) {
+                    return false;
+                }
+                let found = match declarations.get(symbol) {
+                    Some(decl) => outer(
+                        &decl.value,
+                        rows,
+                        shape,
+                        declarations,
+                        external,
+                        None,
+                        active,
+                    ),
+                    None => external.get(symbol).is_some_and(|decl| {
+                        semantic_outer(
+                            decl.scheme.body(),
+                            rows,
+                            shape,
+                            declarations,
+                            external,
+                            None,
+                            None,
+                            active,
+                        )
+                    }),
+                };
+                active.remove(symbol);
+                found
+            }
+            TypeKind::Apply {
+                head,
+                args: supplied,
+                ..
+            } => {
+                if !active.insert(*head) {
+                    return false;
+                }
+                let found = match declarations.get(head) {
+                    Some(decl) => outer(
+                        &decl.value,
+                        rows,
+                        shape,
+                        declarations,
+                        external,
+                        Some(supplied),
+                        active,
+                    ),
+                    None => external.get(head).is_some_and(|decl| {
+                        semantic_outer(
+                            decl.scheme.body(),
+                            rows,
+                            shape,
+                            declarations,
+                            external,
+                            Some(supplied),
+                            None,
+                            active,
+                        )
+                    }),
+                };
+                active.remove(head);
+                found
+            }
+            TypeKind::Arrow { .. } | TypeKind::Prim(_) | TypeKind::Var(_) | TypeKind::Hole => false,
+        }
+    }
+
+    outer(
+        ty,
+        rows,
+        shape,
+        declarations,
+        external,
+        None,
+        &mut HashSet::new(),
+    )
 }
 
 /// The cases a written type names outright, in the order it names them.
@@ -5933,6 +6110,7 @@ impl Builder<'_> {
                         let lacks = param.lacks.iter().cloned().collect();
                         match param.sense {
                             artifact::Sense::Type => ParamKind::Type { lacks },
+                            artifact::Sense::Fields => ParamKind::Fields { lacks },
                             artifact::Sense::Cases => ParamKind::Cases { lacks },
                             artifact::Sense::Effects => ParamKind::Effects { lacks },
                         }
@@ -8091,7 +8269,7 @@ impl Builder<'_> {
 /// [`Sense`] has two variants rather than one. See [`ErrorKind::MixedTail`].
 fn sense(shape: Shape) -> Sense {
     match shape {
-        Shape::Struct => Sense::Type,
+        Shape::Struct => Sense::Fields,
         Shape::Sum => Sense::Cases,
         Shape::Effect => Sense::Effects,
     }

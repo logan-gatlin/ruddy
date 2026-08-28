@@ -118,22 +118,14 @@ pub enum Shape {
 /// What one parameter of a `type` declaration stands for, without the labels it
 /// carries.
 ///
-/// The question by itself, so that a complaint about a parameter read two ways
-/// can name the two readings without quoting a set of labels nobody asked
-/// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
-///
-/// Four of them rather than two, because a variable can be two
-/// things a declaration's parameter never can: the presence a `when` names, and
-/// nothing here — the rest of a struct *is* a type, since `..'r` in a struct
-/// puts whatever is written for `'r` in the type's core. A sum's rest and an
-/// arrow's effects are readings of their own, for the reason [`Rest`] gives:
-/// neither is a position a whole type could go in.
-///
-/// [`ParamKind`] answers with the first three alone: a declaration binds no
-/// presence, so nothing there can ever be read the fourth way.
+/// Struct fields, sum cases, and arrow effects are distinct row sorts. A row
+/// parameter can only be forwarded to a position with the same sense; none is a
+/// whole type. Presence is the additional annotation-only sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
     Type,
+    /// The rest of a struct's fields.
+    Fields,
     Cases,
     /// The effects an arrow may perform: `..'e` in `type Runner 'e = (Nat -> Nat
     /// + ..'e) -> Nat + ..'e`.
@@ -171,12 +163,11 @@ pub enum Sense {
 /// about an argument breaking the rule twice always names the same label first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
-    /// Stands for a type. `'A` in `type Pair 'A 'B`, and `'r` in
-    /// `type WithX 'r = { x: Nat, ..'r }` alike — the rest of a struct is a
-    /// type, so there is nothing else for it to be, and `WithX Nat` is as
-    /// well-formed
-    /// as `WithX { y: Nat }`.
+    /// Stands for a whole type. `'A` in `type Pair 'A 'B`.
     Type { lacks: IndexSet<String> },
+    /// Stands for fields a struct does not name. `'r` in
+    /// `type WithX 'r = { x: Nat, ..'r }`.
+    Fields { lacks: IndexSet<String> },
     /// Stands for the cases a sum does not name — and, with them, the cases it
     /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
     ///
@@ -565,6 +556,7 @@ impl ParamKind {
     pub fn lacks(&self) -> &IndexSet<String> {
         match self {
             ParamKind::Type { lacks }
+            | ParamKind::Fields { lacks }
             | ParamKind::Cases { lacks }
             | ParamKind::Effects { lacks } => lacks,
         }
@@ -574,6 +566,7 @@ impl ParamKind {
     pub fn sense(&self) -> Sense {
         match self {
             ParamKind::Type { .. } => Sense::Type,
+            ParamKind::Fields { .. } => Sense::Fields,
             ParamKind::Cases { .. } => Sense::Cases,
             ParamKind::Effects { .. } => Sense::Effects,
         }
@@ -583,9 +576,10 @@ impl ParamKind {
     /// be spliced into — or `None` when the parameter stands for a type. What
     /// the one check that is still about a shape asks: a sum's rest and an
     /// arrow's effects are both spliced into a row, so only a row can go there.
-    pub fn cases(&self) -> Option<(Shape, &IndexSet<String>)> {
+    pub fn row(&self) -> Option<(Shape, &IndexSet<String>)> {
         match self {
             ParamKind::Type { .. } => None,
+            ParamKind::Fields { lacks } => Some((Shape::Struct, lacks)),
             ParamKind::Cases { lacks } => Some((Shape::Sum, lacks)),
             ParamKind::Effects { lacks } => Some((Shape::Effect, lacks)),
         }

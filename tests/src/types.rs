@@ -196,7 +196,7 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     };
     assert_eq!(plain.sense(), Sense::Type);
     assert_eq!(plain.lacks(), &empty);
-    assert_eq!(plain.cases(), None);
+    assert_eq!(plain.row(), None);
 
     let lacks: indexmap::IndexSet<String> = ["x".to_string()].into_iter().collect();
     // A struct's `..'r` is a type parameter with fields it may not name, which is
@@ -206,14 +206,14 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     };
     assert_eq!(fielded.sense(), Sense::Type);
     assert_eq!(fielded.lacks(), &lacks);
-    assert_eq!(fielded.cases(), None);
+    assert_eq!(fielded.row(), None);
 
     let cases = ParamKind::Cases {
         lacks: lacks.clone(),
     };
     assert_eq!(cases.sense(), Sense::Cases);
     assert_eq!(cases.lacks(), &lacks);
-    assert_eq!(cases.cases(), Some((Shape::Sum, &lacks)));
+    assert_eq!(cases.row(), Some((Shape::Sum, &lacks)));
 }
 
 /// A label written into a type is simply there. The constructor exists so that
@@ -363,7 +363,7 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
     };
     assert_eq!(effects.sense(), Sense::Effects);
     assert_eq!(effects.lacks(), &lacks);
-    assert_eq!(effects.cases(), Some((Shape::Effect, &lacks)));
+    assert_eq!(effects.row(), Some((Shape::Effect, &lacks)));
 }
 
 /// A scheme has one index space, not two. The presences take the low

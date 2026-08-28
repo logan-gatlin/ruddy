@@ -125,6 +125,7 @@ pub struct Parameter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sense {
     Type,
+    Fields,
     Cases,
     Effects,
 }
@@ -493,6 +494,7 @@ pub fn build_with_dependencies(
                     .map(|param| Parameter {
                         sense: match &param.kind {
                             types::ParamKind::Type { .. } => Sense::Type,
+                            types::ParamKind::Fields { .. } => Sense::Fields,
                             types::ParamKind::Cases { .. } => Sense::Cases,
                             types::ParamKind::Effects { .. } => Sense::Effects,
                         },
@@ -1066,6 +1068,7 @@ pub mod text {
             A("param".into()),
             A(match value.sense {
                 Sense::Type => "type",
+                Sense::Fields => "fields",
                 Sense::Cases => "cases",
                 Sense::Effects => "effects",
             }
@@ -1935,6 +1938,7 @@ pub mod text {
             Parameter {
                 sense: match self.atom(self.take(&mut value)).as_str() {
                     "type" => Sense::Type,
+                    "fields" => Sense::Fields,
                     "cases" => Sense::Cases,
                     "effects" => Sense::Effects,
                     _ => self.invalid("invalid parameter sense", Sense::Type),

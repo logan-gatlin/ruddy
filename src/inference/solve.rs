@@ -311,6 +311,12 @@ impl Solve<'_> {
         for constraint in constraints {
             let span = constraint.span;
             match &constraint.kind {
+                ConstraintKind::Project {
+                    base,
+                    field,
+                    result,
+                    base_span,
+                } => self.project(span, *base_span, base, field, result),
                 ConstraintKind::Equal { expected, actual } => self.unify(span, expected, actual),
                 ConstraintKind::Let {
                     symbol,
@@ -347,6 +353,54 @@ impl Solve<'_> {
                     ambient,
                     inside,
                 } => self.performs(span, performed, ambient, *inside),
+            }
+        }
+    }
+
+    /// Solve a field projection after exposing only the base's outer constructor.
+    fn project(
+        &mut self,
+        field_span: Span,
+        base_span: Span,
+        base: &Rc<Ty>,
+        field: &str,
+        result: &Rc<Ty>,
+    ) {
+        let base = self.table.resolve(base);
+        let exposed = super::unfold(self.aliases, &base);
+        match &exposed.core {
+            Core::Nat
+            | Core::Int
+            | Core::Real
+            | Core::String
+            | Core::Boolean
+            | Core::Arrow(..)
+            | Core::Sum(_) => {
+                let goal = Goal::Type {
+                    expected: Rc::new(Ty::unit()),
+                    actual: exposed.clone(),
+                };
+                let error = Error {
+                    span: base_span,
+                    kind: ErrorKind::NotAStruct { base: exposed },
+                };
+                self.fail(
+                    base_span,
+                    Rule::Mismatch,
+                    goal,
+                    error,
+                    &[Assigned::Ty(result.clone())],
+                );
+            }
+            _ => {
+                let want = Rc::new(Ty {
+                    core: Core::Var(self.table.fresh_core()),
+                    fields: [(field.to_string(), RowField::present(result.clone()))]
+                        .into_iter()
+                        .collect(),
+                });
+                self.table.note_lacks(&want);
+                self.unify(field_span, &want, &exposed);
             }
         }
     }

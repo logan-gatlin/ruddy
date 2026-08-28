@@ -206,6 +206,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     }
 
     for kind in [
+        TypeError::NotAStruct { base: nat.clone() },
         TypeError::Mismatch {
             expected: nat.clone(),
             actual: Rc::new(Ty::default()),
@@ -1788,21 +1789,21 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
     );
 }
 
-/// The complaint about a base with no fields is gone, and with it its code. A
-/// projection now demands a fresh core rather than a struct, so it fits any
-/// type carrying the field and the only way it can fail is the field itself.
+/// Projection from a known non-struct has its own stable diagnostic.
 #[test]
-fn nothing_is_coded_as_not_a_struct_any_more() {
-    assert!(
-        diagnostics()
-            .iter()
-            .all(|(_, code, _)| *code != "not-a-struct"),
-        "{:#?}",
-        diagnostics()
+fn not_a_struct_is_coded_and_worded() {
+    let diagnostics = diagnostics();
+    let (_, _, message) = diagnostics
+        .iter()
+        .find(|(_, code, _)| *code == "not-a-struct")
+        .expect("the projection diagnostic");
+    assert_eq!(
+        message,
+        "`Nat` is not a struct, so it has no fields to read"
     );
-    // And the codes the change leaves alone are still there.
-    let codes: HashSet<&str> = diagnostics().iter().map(|(_, code, _)| *code).collect();
+    let codes: HashSet<&str> = diagnostics.iter().map(|(_, code, _)| *code).collect();
     for code in [
+        "not-a-struct",
         "missing-field",
         "extra-field",
         "type-mismatch",
@@ -2155,6 +2156,12 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
     let symbol = mint.local(None, Namespace::Terms, "x");
 
     let kinds = [
+        ConstraintKind::Project {
+            base: nat.clone(),
+            field: "x".into(),
+            result: nat.clone(),
+            base_span: Span::generated(0, 1),
+        },
         ConstraintKind::Equal {
             expected: nat.clone(),
             actual: nat.clone(),

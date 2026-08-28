@@ -683,7 +683,7 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
         Sense::Type => format!("'{}", variable.name),
-        Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
+        Sense::Fields | Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
         Sense::Presence => format!("when '{}", variable.name),
     };
     format!("{written} ({})", variable.sense)

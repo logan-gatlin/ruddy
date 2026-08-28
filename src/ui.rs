@@ -1087,6 +1087,7 @@ impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Sense::Type => "a whole type",
+            Sense::Fields => "the rest of a struct's fields",
             Sense::Cases => "the rest of a sum's cases",
             Sense::Effects => "the rest of an arrow's effects",
             // What a `when` puts on a label, said as the reader's own word for
@@ -2028,6 +2029,7 @@ impl ConstraintKind {
     /// rather than with prose that may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
+            ConstraintKind::Project { .. } => "project",
             ConstraintKind::Equal { .. } => "equal",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
@@ -2048,6 +2050,14 @@ impl fmt::Display for Constraint {
 impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConstraintKind::Project {
+                base,
+                field,
+                result,
+                ..
+            } => {
+                write!(f, "{base}.{field} -> {result}")
+            }
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
             // A header rather than a line, because a `let` carries two lists of
             // constraints and a list is not a line: what it says of itself is
@@ -2137,6 +2147,7 @@ impl inference::ErrorKind {
     /// rather than on the message, which is prose and may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
+            inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
             // A missing case and a missing field are one complaint, so they
@@ -2167,6 +2178,9 @@ impl inference::ErrorKind {
 impl fmt::Display for inference::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            inference::ErrorKind::NotAStruct { base } => {
+                write!(f, "`{base}` is not a struct, so it has no fields to read")
+            }
             inference::ErrorKind::Mismatch { expected, actual } => {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }

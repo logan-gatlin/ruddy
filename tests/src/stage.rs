@@ -605,7 +605,7 @@ fn the_ir_tab_says_what_each_declared_variable_stands_for() {
         [
             ("Variable a", "when 'a (a presence)"),
             ("Variable c", "'c (a whole type)"),
-            ("Variable b", "'b (a whole type)"),
+            ("Variable b", "..'b (the rest of a struct's fields)"),
             ("Variable d", "..'d (the rest of a sum's cases)"),
         ]
     );
@@ -647,7 +647,7 @@ fn the_ir_tab_links_a_use_to_the_declaration_it_resolves_to() {
             .unwrap_or_else(|| panic!("`{label}` `{text}` is a row: {rows:#?}"))
             .link
     };
-    let b = link("Variable b", "'b");
+    let b = link("Variable b", "..'b");
     let c = link("Variable c", "'c");
     assert_eq!(link("Rest", "..'b"), b);
     assert_eq!(link("Var", "'c"), c);

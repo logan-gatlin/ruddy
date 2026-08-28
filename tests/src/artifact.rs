@@ -273,6 +273,20 @@ fn model_artifact() -> Artifact {
                     },
                 },
                 artifact::DeclaredType {
+                    name: "bundle@1.0.0::Fields".to_string(),
+                    params: vec![artifact::Parameter {
+                        sense: artifact::Sense::Fields,
+                        lacks: vec!["field".to_string()],
+                        relevant: true,
+                    }],
+                    scheme: Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: Formula::True,
+                        body: rich(Core::Unit),
+                    },
+                },
+                artifact::DeclaredType {
                     name: "bundle@1.0.0::Cases".to_string(),
                     params: vec![artifact::Parameter {
                         sense: artifact::Sense::Cases,
