@@ -1809,6 +1809,38 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
     );
 }
 
+/// A struct-pattern projection has the same storage authority as an expression
+/// projection. In particular, it reads the function at the bundle ABI the
+/// polymorphic container was built with before fitting the pattern binding to
+/// this effect-specialized use.
+#[test]
+fn a_function_bound_by_a_struct_pattern_keeps_the_stored_effect_abi() {
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
+         let s = { f: fn g => fn n => g n }\n\
+         let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
+           let a = !Log.write n in let b = !Fail.oops n in n\n\
+         let go = fn w => handle handle\n\
+           (match s with | { f } => f both 1n end)\n\
+           with | !Log.write x => {} end with | !Fail.oops y => {} end";
+    let go = section(source, "fn go(");
+    assert!(go.contains("fn = project") && go.contains("\"f\""), "{go}");
+    // Fitting the stored bundle-taking function to the specialized binding
+    // introduces adapters on both sides of the binding. A raw projection at
+    // the specialized ABI would have no closures here.
+    assert!(go.matches("closure go#").count() >= 1, "{go}");
+    let adapter = section(source, "fn go#6");
+    assert!(
+        adapter.contains("closure go#4") && adapter.contains("closure go#5"),
+        "{adapter}"
+    );
+    let packed = section(source, "fn go#5");
+    assert!(
+        packed.contains("struct = struct { Log:") && packed.contains("Fail:"),
+        "{packed}"
+    );
+}
+
 /// The same value carried as a sum payload behaves identically: the payload
 /// read takes the case's shape from the type the tag was *built* at, and the
 /// match binder holds a value fitted from that shape to the use's own.

@@ -1816,6 +1816,7 @@ impl Table {
             | (Ty::Boolean, Ty::Boolean)
             | (Ty::Undecided, Ty::Undecided) => true,
             (Ty::Var(x), Ty::Var(y)) => x == y,
+            (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => x == y,
             (Ty::Arrow(a, b, e), Ty::Arrow(x, y, f)) => {
                 self.alike(a, x) & self.alike(b, y) & self.alike_row(e, f)
             }
@@ -1831,7 +1832,18 @@ impl Table {
                     args: ys,
                     ..
                 },
-            ) => a == b && xs.iter().zip(ys.iter()).all(|(x, y)| self.alike(x, y)),
+            ) => {
+                a == b
+                    && xs
+                        .iter()
+                        .map(Some)
+                        .chain(std::iter::once(None))
+                        .zip(ys.iter().map(Some).chain(std::iter::once(None)))
+                        .all(|pair| match pair {
+                            (Some(x), Some(y)) => self.alike(x, y),
+                            pair => matches!(pair, (None, None)),
+                        })
+            }
             _ => false,
         }
     }
@@ -3807,10 +3819,11 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
 /// Source recursion checking proves the ordinary walk finite. Imported
 /// interfaces are recovery input, though, and can contain a forwarding cycle
 /// this compiler never checked. Exact application keys close those cycles
-/// coinductively; a declaration-count budget catches malformed growth whose
-/// applications never repeat. Forwarding through [`Ty::Bound`] renews that
-/// budget because it selects a strictly smaller argument, preserving valid
-/// nesting deeper than the number of declarations.
+/// coinductively; a globally monotone declaration-count budget catches malformed
+/// growth whose applications never repeat. Forwarding through [`Ty::Bound`]
+/// does not spend that budget because it selects an existing argument, preserving
+/// valid nesting deeper than the number of declarations, but it cannot renew
+/// budget already spent by a growing step.
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
@@ -3853,7 +3866,7 @@ impl Unfold<'_> {
 
             let body = self.aliases[symbol].body().clone();
             budget = match &*body {
-                Ty::Bound(_) => self.aliases.len(),
+                Ty::Bound(_) => budget,
                 _ => match budget.checked_sub(1) {
                     Some(left) => left,
                     // Source declarations cannot reach this case: lowering

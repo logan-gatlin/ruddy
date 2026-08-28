@@ -2065,6 +2065,15 @@ impl fmt::Display for inference::ErrorKind {
                 f,
                 "this decides what it may perform, but `'{name}` stands for whatever effects the caller allows",
             ),
+            inference::ErrorKind::RigidBroken {
+                found,
+                name,
+                sense: Sense::Fields,
+                ..
+            } => write!(
+                f,
+                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
+            ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,
                 "this is `{found}`, but `'{name}` stands for whatever type the caller picks",

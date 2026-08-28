@@ -2477,59 +2477,126 @@ fn import_scheme(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
 ) -> Scheme {
-    Scheme::constrained(
-        scheme.count,
-        scheme.presences,
-        import_type(mint, &scheme.body, symbols, names),
-        import_formula(&scheme.formula),
-    )
+    // Published values own their quantifier metadata. Clamp inconsistent
+    // presence counts and every bound use before the trusted opening paths can
+    // index the fresh-variable vector.
+    let count = scheme.count;
+    let presences = scheme.presences.min(count);
+    let body = import_type(mint, &scheme.body, symbols, names);
+    let body = clamp_bounds(&body, count as usize, presences as usize);
+    let formula = import_formula(&scheme.formula);
+    let formula = match formula_bounds_valid(&formula, presences) {
+        true => formula,
+        false => crate::types::Formula::True,
+    };
+    Scheme::constrained(count, presences, body, formula)
 }
 
-/// Replace declaration-bound positions a malformed imported type did not
-/// declare with undecided recovery nodes. In particular, an impossible row
-/// rest must not be read as the same numeric slot in a local declaration that
-/// merely mentions the imported bare alias.
-fn clamp_decl_bounds(ty: &Rc<Ty>, arity: usize) -> Rc<Ty> {
-    fn row(value: &crate::types::Row, arity: usize) -> crate::types::Row {
-        let mut labels = IndexMap::with_capacity(value.labels.len());
-        for (name, field) in &value.labels {
-            labels.insert(
-                name.clone(),
-                crate::types::RowField {
-                    presence: field.presence.clone(),
-                    ty: clamp_decl_bounds(&field.ty, arity),
-                },
-            );
+/// Replace bound positions a malformed imported interface did not declare with
+/// undecided recovery nodes. Presence slots occupy `0..presences`; type and row
+/// slots occupy the remainder. Deep `Rest::More` chains are flattened with
+/// outer-wins shadowing while they are clamped, making this path stack safe.
+fn clamp_bounds(ty: &Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
+    fn row(value: &crate::types::Row, count: usize, presences: usize) -> crate::types::Row {
+        fn clamped_labels(
+            value: &crate::types::Row,
+            count: usize,
+            presences: usize,
+        ) -> IndexMap<String, crate::types::RowField> {
+            value
+                .labels
+                .iter()
+                .map(|(name, field)| {
+                    let presence = match field.presence {
+                        Presence::Bound(index) if index as usize >= presences => {
+                            Presence::Undecided
+                        }
+                        _ => field.presence.clone(),
+                    };
+                    (
+                        name.clone(),
+                        crate::types::RowField {
+                            presence,
+                            ty: clamp_bounds(&field.ty, count, presences),
+                        },
+                    )
+                })
+                .collect()
         }
+        fn end(rest: &Rest, count: usize, presences: usize) -> Rest {
+            match rest {
+                Rest::Bound(index) if *index as usize >= count || (*index as usize) < presences => {
+                    Rest::Undecided
+                }
+                rest => rest.clone(),
+            }
+        }
+
+        let labels = clamped_labels(value, count, presences);
+        let Rest::More(first) = &value.rest else {
+            return crate::types::Row {
+                labels,
+                rest: end(&value.rest, count, presences),
+            };
+        };
+        // Keep the outer splice boundary (its shadowing is semantically
+        // relevant) while accumulating an arbitrarily deep tail iteratively.
+        let mut inner_labels = IndexMap::new();
+        let mut at = &**first;
+        let inner_rest = loop {
+            for (name, field) in clamped_labels(at, count, presences) {
+                inner_labels.entry(name).or_insert(field);
+            }
+            match &at.rest {
+                Rest::More(more) => at = more,
+                rest => break end(rest, count, presences),
+            }
+        };
         crate::types::Row {
             labels,
-            rest: match &value.rest {
-                Rest::Bound(index) if *index as usize >= arity => Rest::Undecided,
-                Rest::More(more) => Rest::More(Rc::new(row(more, arity))),
-                rest => rest.clone(),
-            },
+            rest: Rest::More(Rc::new(crate::types::Row {
+                labels: inner_labels,
+                rest: inner_rest,
+            })),
         }
     }
 
     Rc::new(match &**ty {
-        Ty::Bound(index) if *index as usize >= arity => Ty::Undecided,
+        Ty::Bound(index) if *index as usize >= count || (*index as usize) < presences => {
+            Ty::Undecided
+        }
         Ty::Arrow(from, to, effects) => Ty::Arrow(
-            clamp_decl_bounds(from, arity),
-            clamp_decl_bounds(to, arity),
-            row(effects, arity),
+            clamp_bounds(from, count, presences),
+            clamp_bounds(to, count, presences),
+            row(effects, count, presences),
         ),
-        Ty::Struct(fields) => Ty::Struct(row(fields, arity)),
-        Ty::Sum(cases) => Ty::Sum(row(cases, arity)),
+        Ty::Struct(fields) => Ty::Struct(row(fields, count, presences)),
+        Ty::Sum(cases) => Ty::Sum(row(cases, count, presences)),
         Ty::Named { symbol, name, args } => Ty::Named {
             symbol: *symbol,
             name: name.clone(),
             args: args
                 .iter()
-                .map(|arg| clamp_decl_bounds(arg, arity))
+                .map(|arg| clamp_bounds(arg, count, presences))
                 .collect(),
         },
         ty => ty.clone(),
     })
+}
+
+fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool {
+    use crate::types::{Atom, Formula};
+    match formula {
+        Formula::True | Formula::False | Formula::Atom(Atom::Var(_)) => true,
+        Formula::Atom(Atom::Bound(index)) => *index < presences,
+        Formula::Not(inner) => formula_bounds_valid(inner, presences),
+        Formula::And(left, right)
+        | Formula::Or(left, right)
+        | Formula::Iff(left, right)
+        | Formula::Xor(left, right) => {
+            formula_bounds_valid(left, presences) && formula_bounds_valid(right, presences)
+        }
+    }
 }
 
 fn import_type(
@@ -2579,13 +2646,8 @@ fn import_row(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
 ) -> crate::types::Row {
-    crate::types::Row {
-        labels: value
-            .labels
-            .iter()
-            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
-            .collect(),
-        rest: match &value.rest {
+    fn end(rest: &artifact::Rest) -> crate::types::Rest {
+        match rest {
             artifact::Rest::Closed => crate::types::Rest::Closed,
             artifact::Rest::Var(var) => crate::types::Rest::Var(*var),
             artifact::Rest::Bound(var) => crate::types::Rest::Bound(*var),
@@ -2593,11 +2655,56 @@ fn import_row(
                 id: *id,
                 name: Rc::from(name.as_str()),
             },
-            artifact::Rest::Undecided => crate::types::Rest::Undecided,
-            artifact::Rest::More(row) => {
-                crate::types::Rest::More(Rc::new(import_row(mint, row, symbols, names)))
-            }
-        },
+            artifact::Rest::Undecided | artifact::Rest::More(_) => crate::types::Rest::Undecided,
+        }
+    }
+    let labels = value
+        .labels
+        .iter()
+        .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+        .collect();
+    let artifact::Rest::More(first) = &value.rest else {
+        return crate::types::Row {
+            labels,
+            rest: end(&value.rest),
+        };
+    };
+    // Preserve the first two boundaries so clamping itself sees and normalizes
+    // composition, then accumulate any remaining depth iteratively.
+    let first_labels = first
+        .labels
+        .iter()
+        .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
+        .collect();
+    let first_rest = match &first.rest {
+        artifact::Rest::More(second) => {
+            let mut inner_labels = IndexMap::new();
+            let mut at = &**second;
+            let inner_rest = loop {
+                for (name, field) in &at.labels {
+                    if !inner_labels.contains_key(name) {
+                        inner_labels
+                            .insert(name.clone(), import_row_field(mint, field, symbols, names));
+                    }
+                }
+                match &at.rest {
+                    artifact::Rest::More(more) => at = more,
+                    rest => break end(rest),
+                }
+            };
+            Rest::More(Rc::new(crate::types::Row {
+                labels: inner_labels,
+                rest: inner_rest,
+            }))
+        }
+        rest => end(rest),
+    };
+    crate::types::Row {
+        labels,
+        rest: Rest::More(Rc::new(crate::types::Row {
+            labels: first_labels,
+            rest: first_rest,
+        })),
     }
 }
 
@@ -2998,8 +3105,7 @@ impl RegularType<'_> {
                 Presence::Present => "+".into(),
                 Presence::Absent => "\\".into(),
                 Presence::Var(v) => format!("?{v}"),
-                Presence::Bound(v) => format!("'p{v}"),
-                Presence::Undecided => "?".into(),
+                Presence::Bound(_) | Presence::Undecided => "?".into(),
             };
             let payload = if matches!(field.presence, Presence::Absent) {
                 self.atom("?")
@@ -3028,8 +3134,7 @@ impl RegularType<'_> {
                 crate::types::Presence::Present => "+".into(),
                 crate::types::Presence::Absent => "\\".into(),
                 crate::types::Presence::Var(id) => format!("?{id}"),
-                crate::types::Presence::Bound(id) => format!("'p{id}"),
-                crate::types::Presence::Undecided => "?".into(),
+                crate::types::Presence::Bound(_) | crate::types::Presence::Undecided => "?".into(),
             };
             let ty = if matches!(field.presence, crate::types::Presence::Absent) {
                 self.atom("?")
@@ -3721,11 +3826,15 @@ impl<'a> Follow<'a> {
                     Ty::Struct(row) => {
                         let mut row = row;
                         let mut fields = false;
+                        let mut seen = HashSet::new();
                         loop {
-                            fields |= row
-                                .labels
-                                .values()
-                                .any(|field| !matches!(field.presence, Presence::Absent));
+                            // A spliced row is flattened with outer-wins
+                            // shadowing. An outer absence therefore forbids an
+                            // inner presence from counting as field addition.
+                            fields |= row.labels.iter().any(|(name, field)| {
+                                seen.insert(name.clone())
+                                    && !matches!(field.presence, Presence::Absent)
+                            });
                             match &row.rest {
                                 Rest::Bound(index) => {
                                     answer = Some(Stands::Param {
@@ -5236,6 +5345,34 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             &mut out,
         );
     }
+    // Operation inputs and outputs are source-written types too. They are not
+    // annotations on terms, so reach them explicitly rather than letting this
+    // well-formedness check silently omit one of the language's type-bearing
+    // positions.
+    for decl in program.effects.values_mut() {
+        if let Effect::Operations(operations) = &mut decl.value {
+            for operation in operations.values_mut() {
+                walk(
+                    &mut operation.from,
+                    kinds,
+                    &carries,
+                    &HashMap::new(),
+                    &declarations,
+                    &external,
+                    &mut out,
+                );
+                walk(
+                    &mut operation.to,
+                    kinds,
+                    &carries,
+                    &HashMap::new(),
+                    &declarations,
+                    &external,
+                    &mut out,
+                );
+            }
+        }
+    }
     out
 }
 
@@ -6378,12 +6515,6 @@ impl Builder<'_> {
                 else {
                     continue;
                 };
-                let imported = import_scheme(
-                    self.mint,
-                    &declaration.scheme,
-                    &mut symbols,
-                    &mut program.external_names,
-                );
                 let params: Vec<ParamKind> = declaration
                     .params
                     .iter()
@@ -6397,13 +6528,18 @@ impl Builder<'_> {
                         }
                     })
                     .collect();
-                let body = clamp_decl_bounds(imported.body(), params.len());
-                let scheme = Scheme::constrained(
-                    imported.count(),
-                    imported.presences(),
-                    body,
-                    imported.formula().clone(),
+                // A declared type's parameter table is authoritative. Unlike a
+                // value scheme it cannot quantify presences or carry a formula;
+                // malformed artifact metadata must not make opening index a
+                // differently sized argument list.
+                let body = import_type(
+                    self.mint,
+                    &declaration.scheme.body,
+                    &mut symbols,
+                    &mut program.external_names,
                 );
+                let body = clamp_bounds(&body, params.len(), 0);
+                let scheme = Scheme::new(params.len() as u32, body);
                 self.arities.insert(symbol, params.len());
                 program.external_types.insert(
                     symbol,
@@ -6475,12 +6611,14 @@ impl Builder<'_> {
                                 &mut symbols,
                                 &mut program.external_names,
                             );
+                            let from = clamp_bounds(&from, 0, 0);
                             let to = import_type(
                                 self.mint,
                                 &operation.to,
                                 &mut symbols,
                                 &mut program.external_names,
                             );
+                            let to = clamp_bounds(&to, 0, 0);
                             let selector = match &operation.selector {
                                 artifact::OperationSelector::Unnamed => OperationSelector::Unnamed,
                                 artifact::OperationSelector::Named(name) => {

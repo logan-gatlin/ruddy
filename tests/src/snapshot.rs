@@ -1190,7 +1190,9 @@ fn the_types_tab_says_which_declarations_are_recursive() {
         "type list = { val: Nat, next: list }\n\
          type forest = { head: tree }\n\
          type tree = { val: Nat, kids: forest }\n\
-         type Endo = Nat -> Nat\n",
+         type Endo = Nat -> Nat\n\
+         type Ptr 'a = Nat\n\
+         type PhantomLoop = Ptr PhantomLoop\n",
     );
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1232,6 +1234,10 @@ fn the_types_tab_says_which_declarations_are_recursive() {
     assert_eq!(recursion("tree"), Some("tree, forest"));
     // And an alias that leads nowhere 'says nothing.
     assert_eq!(recursion("Endo"), None);
+    // Merely spelling a name in a discarded/phantom alias argument is not a
+    // semantic recursion edge.
+    assert_eq!(recursion("Ptr"), None);
+    assert_eq!(recursion("PhantomLoop"), None);
 }
 
 /// A definition says the same thing under itself, off the binding groups. A

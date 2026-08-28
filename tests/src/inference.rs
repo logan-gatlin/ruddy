@@ -1646,6 +1646,40 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
         &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
         Ty::Undecided
     ));
+
+    // A forwarding Bound may preserve fuel for a genuinely deep argument, but
+    // must not replenish fuel spent by a malformed growing constructor. This
+    // alternates a growing step with an identity step, so resetting at the
+    // identity would run forever without ever repeating an exact key.
+    let forward = mint
+        .global(None, Namespace::Types, "Forward")
+        .expect("a fresh forwarding type");
+    aliases.insert(forward, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    aliases.insert(
+        grow,
+        Scheme::new(
+            1,
+            named(
+                forward,
+                vec![named(
+                    grow,
+                    vec![Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "next".into(),
+                            field(Presence::Present, Rc::new(Ty::Bound(0))),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    }))],
+                )],
+            ),
+        ),
+    );
+    assert!(matches!(
+        &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
+        Ty::Undecided
+    ));
 }
 
 #[test]
@@ -5038,6 +5072,26 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
          let loops = fn v => match v with | {x} => a | {y} => b end",
     );
 
+    // The repeated family goal contains the annotation's identical rigid
+    // argument under recursive sums. Rigid identity is part of alike(), so the
+    // coinductive stop recognizes the second goal instead of unfolding forever.
+    inferred(
+        "type SumA 'a = #A { value: 'a, next: SumA 'a }\n\
+         type SumB 'a = #A { value: 'a, next: SumB 'a }\n\
+         let a : 'a -> SumA 'a = fn x => #A { value: x, next: a x }\n\
+         let b : 'a -> SumB 'a = fn x => #A { value: x, next: b x }\n\
+         let loops : 'r -> { left when 'p: Nat, right when 'q: Nat } -> _ where 'p != 'q =\n\
+           fn x => fn v => match v with | {left} => a x | {right} => b x end",
+    );
+
+    inferred(
+        "type FixedA 'a = { next: FixedA Nat }\n\
+         type FixedB 'a = { next: FixedB Nat }\n\
+         let a : FixedA String = { next: a }\n\
+         let b : FixedB String = { next: b }\n\
+         let fixed = fn v => match v with | {x} => a | {y} => b end",
+    );
+
     let (mint, _, output) = inferred(
         "let absent : { x when 'a: Nat, y when 'b: Nat } -> { \\out, .. } -> { \\out, .. } where 'a != 'b =\n\
          fn v q => match v with | {x} => q | {y} => q end",
@@ -6592,6 +6646,18 @@ fn a_label_demanded_of_a_rigid_is_refused() {
         panic!("expected one error: {:#?}", output.errors);
     };
     assert_eq!(error.kind.code(), "rigid-field");
+
+    // A rigid struct tail meeting a closed struct is reported in the struct's
+    // own Fields/Struct vocabulary, never as a sum of cases.
+    let (_, _, output) = infer_src("let f : { x: Nat, ..'r } -> { x: Nat } = fn p => p");
+    let [error] = output.errors.as_slice() else {
+        panic!("expected one error: {:#?}", output.errors);
+    };
+    assert_eq!(error.kind.code(), "rigid-broken");
+    assert_eq!(
+        error.kind.to_string(),
+        "this is `{}`, but `'r` stands for whatever the caller picks for the rest of a struct's fields"
+    );
 
     // A field the row *does* name is no demand on the rest at all.
     let (mint, _, output) = inferred("let f : { x: Nat, ..'r } -> Nat = fn p => p.x");

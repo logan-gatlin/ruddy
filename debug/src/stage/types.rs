@@ -10,7 +10,7 @@
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use ruddy::{
@@ -67,6 +67,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             program.terms.get(symbol).map(|decl| decl.name_span),
         )
     });
+    let relevant = relevant_parameters(&output.aliases);
 
     let nodes: Vec<Node> = aliases
         .chain(externs)
@@ -99,7 +100,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // it cannot show is whether the name it came back through leads
             // anywhere, which for a pair declared in terms of each other is
             // the whole question.
-            if let Some(loop_names) = loop_through(&output.aliases, symbol) {
+            if let Some(loop_names) = loop_through(&output.aliases, &relevant, symbol) {
                 node = node.child(named_row(&mut ids, mint, loop_names));
             }
             // And a recursive definition says the same thing, off the groups
@@ -285,7 +286,11 @@ fn grouped_with(program: &Program, symbol: Symbol) -> Option<Vec<Symbol>> {
 /// loop found rather than the shortest — either answers the question the row
 /// asks, and showing every loop a declaration is part of is not what the row is
 /// for.
-fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec<Symbol>> {
+fn loop_through(
+    aliases: &IndexMap<Symbol, Scheme>,
+    relevant: &HashMap<Symbol, HashSet<usize>>,
+    start: Symbol,
+) -> Option<Vec<Symbol>> {
     struct Frame {
         at: Symbol,
         named: Vec<Symbol>,
@@ -294,7 +299,7 @@ fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec
 
     let named = aliases.get(&start).map_or_else(Vec::new, |scheme| {
         let mut named = Vec::new();
-        names_in(scheme.body(), &mut named);
+        names_in(scheme.body(), relevant, &mut named);
         named
     });
     let mut path = vec![start];
@@ -325,7 +330,7 @@ fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec
         }
         let named = aliases.get(&next).map_or_else(Vec::new, |scheme| {
             let mut named = Vec::new();
-            names_in(scheme.body(), &mut named);
+            names_in(scheme.body(), relevant, &mut named);
             named
         });
         active.insert(next);
@@ -342,15 +347,85 @@ fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec
     None
 }
 
-/// Every declaration a type mentions, in the order it mentions them. Stops at
-/// a name rather than looking up what it stands for — following one is the
-/// caller's business, and the reason this cannot run away.
-///
-/// Both halves of a type, since both can name one: the constructor it is, and the
-/// fields it carries. A struct type is one inference built rather than
-/// one anybody wrote, but it prints in this tab like any other and a declared
-/// name inside its fields is mentioned just as much.
-fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
+/// The parameters each alias semantically selects. A bound variable passed to
+/// a phantom parameter is not selected merely because its syntax mentions it.
+/// Resolve that transitively as a finite least fixed point before walking the
+/// alias graph shown by the debugger.
+fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, HashSet<usize>> {
+    fn bounds_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>) -> HashSet<usize> {
+        enum Work<'a> {
+            Ty(&'a Ty),
+            Row(&'a Row),
+        }
+        let mut out = HashSet::new();
+        let mut work = vec![Work::Ty(ty)];
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Ty(ty) => match ty {
+                    Ty::Bound(index) => {
+                        out.insert(*index as usize);
+                    }
+                    Ty::Named { symbol, args, .. } => {
+                        if let Some(selected) = relevant.get(symbol) {
+                            work.extend(
+                                selected
+                                    .iter()
+                                    .filter_map(|index| args.get(*index))
+                                    .map(|arg| Work::Ty(arg)),
+                            );
+                        }
+                    }
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(effects));
+                        work.push(Work::Ty(to));
+                        work.push(Work::Ty(from));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Var(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => {}
+                },
+                Work::Row(row) => {
+                    if let Rest::Bound(index) = row.rest {
+                        out.insert(index as usize);
+                    }
+                    if let Rest::More(more) = &row.rest {
+                        work.push(Work::Row(more));
+                    }
+                    work.extend(row.labels.values().map(|field| Work::Ty(&field.ty)));
+                }
+            }
+        }
+        out
+    }
+
+    let mut relevant: HashMap<Symbol, HashSet<usize>> = aliases
+        .keys()
+        .map(|symbol| (*symbol, HashSet::new()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (symbol, scheme) in aliases {
+            let found = bounds_in(scheme.body(), &relevant);
+            let entry = relevant.entry(*symbol).or_default();
+            let before = entry.len();
+            entry.extend(found);
+            changed |= entry.len() != before;
+        }
+        if !changed {
+            return relevant;
+        }
+    }
+}
+
+/// Every declaration a type semantically mentions, in source order. A named
+/// head is mentioned, but only arguments its body selects are traversed.
+fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<Symbol>) {
     enum Work<'a> {
         Ty(&'a Ty),
         Row(&'a Row),
@@ -360,15 +435,22 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
     while let Some(next) = work.pop() {
         match next {
             Work::Ty(ty) => match ty {
-                // The arguments are walked though the body is not: a
-                // declaration reached only through one is mentioned just as
-                // much as one written bare.
                 Ty::Named { symbol, args, .. } => {
                     out.push(*symbol);
-                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                    if let Some(selected) = relevant.get(symbol) {
+                        let mut selected: Vec<_> = selected.iter().copied().collect();
+                        selected.sort_unstable();
+                        work.extend(
+                            selected
+                                .into_iter()
+                                .rev()
+                                .filter_map(|index| args.get(index))
+                                .map(|arg| Work::Ty(arg)),
+                        );
+                    }
                 }
-                // An effect row names effects and no declared types.
-                Ty::Arrow(from, to, _) => {
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Row(effects));
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }

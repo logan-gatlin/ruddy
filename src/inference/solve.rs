@@ -1069,8 +1069,12 @@ impl Solve<'_> {
                     args: xs,
                     ..
                 },
-                Ty::Named { symbol: b, .. },
-            ) if a == b && xs.is_empty() => {
+                Ty::Named {
+                    symbol: b,
+                    args: ys,
+                    ..
+                },
+            ) if a == b && xs.len() == ys.len() && xs.is_empty() => {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
             }
@@ -1088,8 +1092,9 @@ impl Solve<'_> {
             // declaration leading back to itself, since it is keyed on the goal
             // and a recursion may not grow its arguments. See [`Ty::Named`].
             //
-            // Arity belongs to the declaration, so one symbol means one count
-            // and the zip drops nothing.
+            // Imported interfaces are recovery input and may carry malformed
+            // applications, so congruence checks arity rather than letting zip
+            // silently discard unmatched arguments.
             (
                 Ty::Named {
                     symbol: a,
@@ -1101,7 +1106,7 @@ impl Solve<'_> {
                     args: ys,
                     ..
                 },
-            ) if a == b && self.nominal.contains(a) => {
+            ) if a == b && xs.len() == ys.len() && self.nominal.contains(a) => {
                 let pairs: Vec<_> = xs.iter().cloned().zip(ys.iter().cloned()).collect();
                 // Where to put everything back if the arguments turn out not to
                 // agree. A congruence that fails is a failure of the two
@@ -2293,8 +2298,9 @@ impl Solve<'_> {
 /// sense rides along so the wording can follow it.
 fn rest_found(row: &Row, shape: Shape) -> (Sense, Rc<Ty>) {
     match shape {
+        Shape::Struct => (Sense::Fields, Rc::new(Ty::plain(Ty::Struct(row.clone())))),
+        Shape::Sum => (Sense::Cases, Rc::new(Ty::plain(Ty::Sum(row.clone())))),
         Shape::Effect => (Sense::Effects, row_ty(row)),
-        _ => (Sense::Cases, Rc::new(Ty::plain(Ty::Sum(row.clone())))),
     }
 }
 

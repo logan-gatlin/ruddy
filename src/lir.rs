@@ -493,6 +493,7 @@ struct Value {
 #[derive(Debug, Clone)]
 struct Field {
     base: Temp,
+    base_ty: Rc<Ty>,
     name: String,
     presence: Presence,
     ty: Rc<Ty>,
@@ -2666,12 +2667,13 @@ impl Lower<'_> {
         };
         let mut cols: Vec<Col> = named
             .iter()
-            .map(|(name, presence, ty)| {
+            .map(|(name, presence, field_ty)| {
                 Col::Field(Field {
                     base: temp,
+                    base_ty: ty.clone(),
                     name: name.clone(),
                     presence: presence.clone(),
-                    ty: ty.clone(),
+                    ty: field_ty.clone(),
                 })
             })
             .collect();
@@ -2774,16 +2776,26 @@ impl Lower<'_> {
         if matrix.untested() {
             return self.tree(matrix.dropped(), tree, body);
         }
-        let rep = self.rep(&col.ty);
+        // As with expression projection, the container's production type is
+        // authoritative about the representation (including a function's
+        // effect-evidence ABI) actually stored in this slot. Read at that shape,
+        // record it on the projected temp, then adapt to the pattern's
+        // instantiated field type.
+        let authority = self.holding(col.base, &col.base_ty);
+        let have = self
+            .member_of(&authority, &col.name)
+            .unwrap_or_else(|| col.ty.clone());
         let temp = self.emit(
             body,
             tree.span,
-            rep,
+            self.rep(&have),
             Op::Project {
                 base: col.base,
                 field: FieldKey::named(col.name.clone()),
             },
         );
+        self.contain(temp, &have);
+        let temp = self.fitted(&col.ty, &have, temp, body);
         let read = vec![Col::Value(Value {
             temp,
             ty: col.ty.clone(),

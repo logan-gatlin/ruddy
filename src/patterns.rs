@@ -787,11 +787,15 @@ impl Check<'_> {
                 let Ty::Struct(row) = &*shaped else {
                     return None;
                 };
+                let row = flat(row);
                 let field = row.labels.get(name)?;
                 self.presence_at(&field.ty, below)
             }
             None => match &*self.shape(ty) {
-                Ty::Struct(row) => row.labels.get(path).map(|field| field.presence.clone()),
+                Ty::Struct(row) => flat(row)
+                    .labels
+                    .get(path)
+                    .map(|field| field.presence.clone()),
                 _ => None,
             },
         }

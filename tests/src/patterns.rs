@@ -286,13 +286,43 @@ fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
 
 #[test]
 fn nested_presence_paths_are_translated_for_arm_guards() {
-    let checks = clean(
-        "let f = fn v => match v with \
-         | {box: {x}} => 1n | {box: {y}} => 2n end",
-    );
+    let src = "let f = fn v => match v with \
+               | {box: {x}} => 1n | {box: {y}} => 2n end";
+    let checks = clean(src);
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+    // Forward both components of the stored `box.x` path through More links.
+    // The assumptions must still rename to the same bound presences, or the
+    // second arm is incorrectly declared unreachable.
+    let (mut out, inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    let Ty::Struct(mut outer) = (*scrutinee.ty).clone() else {
+        panic!("struct scrutinee fixture")
+    };
+    let field = outer.labels.get_mut("box").expect("box field");
+    let Ty::Struct(inner) = (*field.ty).clone() else {
+        panic!("nested struct fixture")
+    };
+    field.ty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(inner)),
+    }));
+    scrutinee.ty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(outer)),
+    }));
+    let checks = patterns::check(&out.program, &inferred);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    assert_eq!(verdicts(sole_report(&checks)), [Verdict::Reachable; 2]);
 }
 
 #[test]
