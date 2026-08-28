@@ -519,6 +519,8 @@ dependencies = [
  "boa_runtime",
  "clap",
  "fs2",
+ "futures-concurrency",
+ "futures-lite",
  "gix",
  "indexmap",
  "ruddy",

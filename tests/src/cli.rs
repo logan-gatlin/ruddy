@@ -1562,17 +1562,42 @@ fn javascript_reports_unhandled_promises_despite_recurring_jobs() {
 }
 
 #[test]
-fn javascript_does_not_report_a_rejection_handled_by_a_later_job() {
+fn javascript_allows_a_deep_microtask_chain_to_handle_a_rejection() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("handled.mjs");
     fs::write(
         &module,
-        "const promise = Promise.reject(new Error('handled later'));\n\
-         Promise.resolve().then(() => promise.catch(() => {}));\n",
+        "const promise = Promise.reject(new Error('handled eventually'));\n\
+         function defer(depth) {\n\
+           Promise.resolve().then(() => {\n\
+             if (depth === 0) promise.catch(() => {});\n\
+             else defer(depth - 1);\n\
+           });\n\
+         }\n\
+         defer(10_000);\n",
     )
     .unwrap();
 
-    execute_javascript_module(&module).expect("the queued handler makes the rejection handled");
+    execute_javascript_module(&module).expect("the microtask checkpoint drains to quiescence");
+}
+
+#[test]
+fn javascript_reports_a_rejection_before_a_zero_delay_timer_can_handle_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("timer-is-too-late.mjs");
+    fs::write(
+        &module,
+        "const promise = Promise.reject(new Error('timer was too late'));\n\
+         setTimeout(() => promise.catch(() => {}), 0);\n",
+    )
+    .unwrap();
+
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert!(
+        error.to_string().contains("unhandled promise rejection"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("timer was too late"), "{error}");
 }
 
 #[test]

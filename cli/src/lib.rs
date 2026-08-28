@@ -2,21 +2,20 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::{OsStr, OsString},
     fmt, fs,
     fs::OpenOptions,
     io::Write as _,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::Ordering,
 };
 
 use boa_engine::{
     Context, JsError, JsValue, Module, Source,
     builtins::promise::{OperationType, Promise, PromiseState},
-    context::HostHooks,
-    job::{NativeJob, SimpleJobExecutor, TimeoutJob},
+    context::{HostHooks, time::JsInstant},
+    job::{GenericJob, IntervalJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob},
     module::SimpleModuleLoader,
     object::{JsObject, builtins::JsPromise},
 };
@@ -25,6 +24,8 @@ use boa_runtime::{
     fetch::BlockingReqwestFetcher,
 };
 use clap::{Parser, Subcommand};
+use futures_concurrency::future::FutureGroup;
+use futures_lite::{StreamExt, future};
 use indexmap::IndexMap;
 use ruddy::{
     artifact::{Artifact, Dependency},
@@ -416,17 +417,10 @@ type RejectedPromises = Rc<RefCell<Vec<(JsObject<Promise>, JsValue)>>>;
 
 #[derive(Default)]
 struct RuntimeHooks {
-    evaluation: RefCell<Option<JsObject<Promise>>>,
     unhandled: RejectedPromises,
-    executor: Rc<RefCell<Option<Rc<SimpleJobExecutor>>>>,
 }
 
 impl RuntimeHooks {
-    fn watch_evaluation(&self, evaluation: &JsPromise, executor: Rc<SimpleJobExecutor>) {
-        *self.evaluation.borrow_mut() = Some(std::ops::Deref::deref(evaluation).clone());
-        *self.executor.borrow_mut() = Some(executor);
-    }
-
     fn first_unhandled(&self) -> Option<JsValue> {
         self.unhandled
             .borrow()
@@ -440,7 +434,7 @@ impl HostHooks for RuntimeHooks {
         &self,
         promise: &JsObject<Promise>,
         operation: OperationType,
-        context: &mut Context,
+        _context: &mut Context,
     ) {
         match operation {
             OperationType::Reject => {
@@ -449,60 +443,221 @@ impl HostHooks for RuntimeHooks {
                     return;
                 };
                 self.unhandled.borrow_mut().push((promise.clone(), reason));
-                if self.evaluation.borrow().as_ref() == Some(promise) {
-                    if let Some(executor) = self.executor.borrow().as_ref() {
-                        executor
-                            .get_cancellation_token()
-                            .store(true, Ordering::Relaxed);
-                    }
-                } else {
-                    // Let already queued promise and microtask jobs attach a
-                    // handler before deciding that the rejection is unhandled.
-                    let promise = promise.clone();
-                    let unhandled = self.unhandled.clone();
-                    let executor = self.executor.clone();
-                    context.enqueue_job(
-                        TimeoutJob::new(
-                            NativeJob::new(move |_| {
-                                if unhandled
-                                    .borrow()
-                                    .iter()
-                                    .any(|(candidate, _)| candidate == &promise)
-                                    && let Some(executor) = executor.borrow().as_ref()
-                                {
-                                    executor
-                                        .get_cancellation_token()
-                                        .store(true, Ordering::Relaxed);
-                                }
-                                Ok(JsValue::undefined())
-                            }),
-                            1,
-                        )
-                        .into(),
-                    );
-                }
             }
-            OperationType::Handle => {
-                self.unhandled
-                    .borrow_mut()
-                    .retain(|(unhandled, _)| unhandled != promise);
-                let evaluation_rejected =
-                    self.evaluation.borrow().as_ref().is_some_and(|evaluation| {
-                        matches!(
-                            JsPromise::from(evaluation.clone()).state(),
-                            PromiseState::Rejected(_)
-                        )
-                    });
-                if self.unhandled.borrow().is_empty()
-                    && !evaluation_rejected
-                    && let Some(executor) = self.executor.borrow().as_ref()
-                {
-                    executor
-                        .get_cancellation_token()
-                        .store(false, Ordering::Relaxed);
-                }
+            OperationType::Handle => self
+                .unhandled
+                .borrow_mut()
+                .retain(|(unhandled, _)| unhandled != promise),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ClockJob {
+    Timeout(TimeoutJob),
+    Interval(IntervalJob),
+}
+
+impl ClockJob {
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::Timeout(job) => job.cancelled(),
+            Self::Interval(job) => job.cancelled(),
+        }
+    }
+}
+
+/// Boa's simple executor with an observable ECMAScript microtask checkpoint.
+///
+/// Promise jobs always reach quiescence before a timer is dispatched. This is
+/// the boundary at which the host reports rejected promises; a timer therefore
+/// cannot retroactively handle a rejection from the preceding task. The other
+/// queues deliberately mirror `SimpleJobExecutor`.
+#[derive(Default)]
+struct RuntimeJobExecutor {
+    promise_jobs: RefCell<VecDeque<PromiseJob>>,
+    async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    finalization_registry_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    clock_jobs: RefCell<BTreeMap<JsInstant, Vec<ClockJob>>>,
+    generic_jobs: RefCell<VecDeque<GenericJob>>,
+    unhandled: RejectedPromises,
+}
+
+impl RuntimeJobExecutor {
+    fn new(unhandled: RejectedPromises) -> Self {
+        Self {
+            unhandled,
+            ..Self::default()
+        }
+    }
+
+    fn clear(&self) {
+        self.promise_jobs.borrow_mut().clear();
+        self.async_jobs.borrow_mut().clear();
+        self.clock_jobs.borrow_mut().clear();
+        self.generic_jobs.borrow_mut().clear();
+    }
+
+    fn has_immediate_jobs(&self) -> bool {
+        !self.promise_jobs.borrow().is_empty()
+            || !self.async_jobs.borrow().is_empty()
+            || !self.generic_jobs.borrow().is_empty()
+    }
+
+    fn run_microtask_checkpoint(
+        &self,
+        context: &RefCell<&mut Context>,
+    ) -> boa_engine::JsResult<()> {
+        loop {
+            let jobs = std::mem::take(&mut *self.promise_jobs.borrow_mut());
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            for job in jobs {
+                job.call(&mut context.borrow_mut())?;
             }
         }
+    }
+}
+
+impl JobExecutor for RuntimeJobExecutor {
+    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context) {
+        match job {
+            Job::PromiseJob(job) => self.promise_jobs.borrow_mut().push_back(job),
+            Job::AsyncJob(job) => self.async_jobs.borrow_mut().push_back(job),
+            Job::TimeoutJob(job) => {
+                self.clock_jobs
+                    .borrow_mut()
+                    .entry(context.clock().now() + job.timeout())
+                    .or_default()
+                    .push(ClockJob::Timeout(job));
+            }
+            Job::IntervalJob(job) => {
+                self.clock_jobs
+                    .borrow_mut()
+                    .entry(context.clock().now() + job.interval())
+                    .or_default()
+                    .push(ClockJob::Interval(job));
+            }
+            Job::GenericJob(job) => self.generic_jobs.borrow_mut().push_back(job),
+            Job::FinalizationRegistryCleanupJob(job) => {
+                self.finalization_registry_jobs.borrow_mut().push_back(job)
+            }
+            _ => unreachable!("Boa 0.22 job category"),
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> boa_engine::JsResult<()> {
+        future::block_on(self.run_jobs_async(&RefCell::new(context)))
+    }
+
+    async fn run_jobs_async(
+        self: Rc<Self>,
+        context: &RefCell<&mut Context>,
+    ) -> boa_engine::JsResult<()> {
+        let mut async_jobs = FutureGroup::new();
+        let mut finalization_jobs = FutureGroup::new();
+        loop {
+            for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
+                async_jobs.insert(job.call(context));
+            }
+            for job in std::mem::take(&mut *self.finalization_registry_jobs.borrow_mut()) {
+                finalization_jobs.insert(job.call(context));
+            }
+
+            if let Err(error) = self.run_microtask_checkpoint(context) {
+                self.clear();
+                return Err(error);
+            }
+            if !self.unhandled.borrow().is_empty() {
+                self.clear();
+                return Ok(());
+            }
+
+            let jobs = std::mem::take(&mut *self.generic_jobs.borrow_mut());
+            for job in jobs {
+                if let Err(error) = job.call(&mut context.borrow_mut()) {
+                    self.clear();
+                    return Err(error);
+                }
+            }
+            if !self.promise_jobs.borrow().is_empty() {
+                context.borrow_mut().clear_kept_objects();
+                continue;
+            }
+
+            let now = context.borrow().clock().now();
+            let jobs_to_run = {
+                let mut clock_jobs = self.clock_jobs.borrow_mut();
+                let mut jobs_to_keep = clock_jobs.split_off(&now);
+                jobs_to_keep.retain(|_, jobs| {
+                    jobs.retain(|job| !job.cancelled());
+                    !jobs.is_empty()
+                });
+                std::mem::replace(&mut *clock_jobs, jobs_to_keep)
+            };
+            for jobs in jobs_to_run.into_values() {
+                for job in jobs {
+                    if job.cancelled() {
+                        continue;
+                    }
+                    let result = match job {
+                        ClockJob::Timeout(job) => job.call(&mut context.borrow_mut()),
+                        ClockJob::Interval(job) => {
+                            let context = &mut context.borrow_mut();
+                            let now = context.clock().now();
+                            let interval = job.interval();
+                            let result = job.call(context);
+                            self.clock_jobs
+                                .borrow_mut()
+                                .entry(now + interval)
+                                .or_default()
+                                .push(ClockJob::Interval(job));
+                            result
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.clear();
+                        return Err(error);
+                    }
+                }
+            }
+
+            if let Some(Err(error)) = future::poll_once(async_jobs.next()).await.flatten() {
+                self.clear();
+                return Err(error);
+            }
+            context.borrow_mut().clear_kept_objects();
+
+            if self.has_immediate_jobs() {
+                continue;
+            }
+            if async_jobs.is_empty() {
+                match future::poll_once(finalization_jobs.next()).await.flatten() {
+                    Some(Err(error)) => {
+                        self.clear();
+                        return Err(error);
+                    }
+                    _ if self.has_immediate_jobs() => continue,
+                    _ => {}
+                }
+                let deadline = self
+                    .clock_jobs
+                    .borrow()
+                    .first_key_value()
+                    .map(|(at, _)| *at);
+                let Some(deadline) = deadline else {
+                    break;
+                };
+                let now = context.borrow().clock().now();
+                if deadline > now {
+                    std::thread::sleep((deadline - now).into());
+                }
+            } else {
+                future::yield_now().await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -517,8 +672,8 @@ pub fn execute_javascript_module(path: impl AsRef<Path>) -> Result<(), CliError>
         CliError::one(format!("JavaScript path {} has no parent", path.display()))
     })?;
     let loader = Rc::new(SimpleModuleLoader::new(parent).map_err(boa_error)?);
-    let executor = Rc::new(SimpleJobExecutor::new());
     let hooks = Rc::new(RuntimeHooks::default());
+    let executor = Rc::new(RuntimeJobExecutor::new(hooks.unhandled.clone()));
     let mut context = Context::builder()
         .module_loader(loader)
         .job_executor(executor.clone())
@@ -543,7 +698,6 @@ pub fn execute_javascript_module(path: impl AsRef<Path>) -> Result<(), CliError>
     let module = Module::parse(source, None, &mut context).map_err(boa_error)?;
     let evaluation = module.load_link_evaluate(&mut context);
     if matches!(evaluation.state(), PromiseState::Pending) {
-        hooks.watch_evaluation(&evaluation, executor.clone());
         context.run_jobs().map_err(boa_error)?;
     }
     let state = evaluation.state();
