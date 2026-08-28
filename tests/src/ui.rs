@@ -1533,7 +1533,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
             Rest::Closed
         ))
         .to_string(),
-        "#Err Nat | ..#Ok Nat"
+        "#Err Nat | #Ok Nat"
     );
     assert_eq!(err_nat(more(vec![], Rest::Closed)).to_string(), "#Err Nat");
 
@@ -1961,9 +1961,8 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
 }
 
 /// A row lifted out of the type it belongs to has no shape to be read in, so it
-/// falls back to braces — including a tail already spliced to more labels, which
-/// prints as those labels in the same notation. The solver's own record is where
-/// one surfaces.
+/// falls back to braces. A spliced tail is flattened into the same canonical,
+/// source-representable row; the solver's own record is where one surfaces.
 #[test]
 fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
     let nat = Rc::new(Ty::plain(Ty::Nat));
@@ -1978,7 +1977,71 @@ fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
             rest: Rest::Closed,
         })),
     };
-    assert_eq!(row.to_string(), "{ x: Nat, ..{ y: Nat } }");
+    assert_eq!(row.to_string(), "{ x: Nat, y: Nat }");
+}
+
+#[test]
+fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
+    let nat = Rc::new(Ty::Nat);
+    let inner = Row {
+        labels: [
+            ("masked".into(), RowField::present(nat.clone())),
+            (
+                "Log\u{1f}generated-interface".into(),
+                RowField::present(Rc::new(Ty::unit())),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    let outer = Row {
+        labels: [(
+            "masked".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: Rc::new(Ty::String),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::More(Rc::new(inner)),
+    };
+
+    assert_eq!(
+        Ty::Struct(outer.clone()).to_string(),
+        "{ \"Log\u{1f}generated-interface\": {} }"
+    );
+    assert_eq!(
+        outer.to_string(),
+        "{ \"Log\u{1f}generated-interface\": {} }"
+    );
+    // In an applied effect-interface position, every More layer participates
+    // in identity stripping; the opaque separator and suffix never leak.
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).unwrap());
+    let runner = mint.global(None, Namespace::Types, "Runner").unwrap();
+    let applied = Ty::Named {
+        symbol: runner,
+        name: "Runner".into(),
+        args: vec![Rc::new(Ty::Sum(outer))].into(),
+    };
+    assert_eq!(applied.to_string(), "Runner (#Log)");
+
+    let absent = Row {
+        labels: [(
+            "gone".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: nat,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    assert_eq!(absent.to_string(), "∅");
+    assert_eq!(Ty::Struct(absent.clone()).to_string(), "{}");
+    assert_eq!(Ty::Sum(absent).to_string(), "|");
 }
 
 /// A constraint kind is coded the way an error kind is, and for the same

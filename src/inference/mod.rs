@@ -75,8 +75,7 @@ pub mod sat;
 mod solve;
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
 };
@@ -1808,77 +1807,89 @@ impl Table {
     /// yes costs a repeated goal; answering yes to one that is really no would
     /// accept two types that differ, so the one-sided error is the one to make.
     fn alike(&self, a: &Rc<Ty>, b: &Rc<Ty>) -> bool {
-        let (a, b) = (self.resolve(a), self.resolve(b));
-        match (&*a, &*b) {
-            (Ty::Nat, Ty::Nat)
-            | (Ty::Int, Ty::Int)
-            | (Ty::Real, Ty::Real)
-            | (Ty::String, Ty::String)
-            | (Ty::Boolean, Ty::Boolean)
-            | (Ty::Undecided, Ty::Undecided) => true,
-            (Ty::Var(x), Ty::Var(y)) => x == y,
-            (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => x == y,
-            (Ty::Arrow(a, b, e), Ty::Arrow(x, y, f)) => {
-                self.alike(a, x) & self.alike(b, y) & self.alike_row(e, f)
-            }
-            (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => self.alike_row(a, b),
-            (
-                Ty::Named {
-                    symbol: a,
-                    args: xs,
-                    ..
-                },
-                Ty::Named {
-                    symbol: b,
-                    args: ys,
-                    ..
-                },
-            ) => {
-                a == b
-                    && xs
-                        .iter()
-                        .map(Some)
-                        .chain(std::iter::once(None))
-                        .zip(ys.iter().map(Some).chain(std::iter::once(None)))
-                        .all(|pair| match pair {
-                            (Some(x), Some(y)) => self.alike(x, y),
-                            pair => matches!(pair, (None, None)),
-                        })
-            }
-            _ => false,
+        enum Work {
+            Ty(Rc<Ty>, Rc<Ty>),
+            Row(Row, Row),
         }
-    }
 
-    /// [`alike`](Self::alike) about two label maps: name against name, since a
-    /// type's fields have no tail to agree about. The order the labels were
-    /// written in decides nothing.
-    fn alike_labels(&self, a: &IndexMap<String, RowField>, b: &IndexMap<String, RowField>) -> bool {
-        a.len() == b.len()
-            && a.iter().all(|(name, field)| {
-                b.get(name).is_some_and(|other| {
-                    self.alike_presence(&field.presence, &other.presence)
-                        & self.alike(&field.ty, &other.ty)
-                })
-            })
-    }
-
-    /// [`alike`](Self::alike) about two types.
-    /// [`alike_labels`](Self::alike_labels) about a sum's cases: flattened
-    /// first, so that a row spliced into a tail is recognized as the row written
-    /// out flat, and then the tails as well.
-    fn alike_row(&self, a: &Row, b: &Row) -> bool {
-        let (a, b) = (self.canon(a), self.canon(b));
-        self.alike_labels(&a.labels, &b.labels)
-            && match (&a.rest, &b.rest) {
-                (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
-                (Rest::Var(x), Rest::Var(y)) => x == y,
-                _ => false,
+        let mut work = vec![Work::Ty(a.clone(), b.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(a, b) => {
+                    let (a, b) = (self.resolve(&a), self.resolve(&b));
+                    match (&*a, &*b) {
+                        (Ty::Nat, Ty::Nat)
+                        | (Ty::Int, Ty::Int)
+                        | (Ty::Real, Ty::Real)
+                        | (Ty::String, Ty::String)
+                        | (Ty::Boolean, Ty::Boolean)
+                        | (Ty::Undecided, Ty::Undecided) => {}
+                        (Ty::Var(x), Ty::Var(y)) if x == y => {}
+                        (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) if x == y => {}
+                        (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
+                            work.push(Work::Row(effects.clone(), performs.clone()));
+                            work.push(Work::Ty(to.clone(), result.clone()));
+                            work.push(Work::Ty(from.clone(), other.clone()));
+                        }
+                        (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
+                            work.push(Work::Row(a.clone(), b.clone()));
+                        }
+                        (
+                            Ty::Named {
+                                symbol: a,
+                                args: xs,
+                                ..
+                            },
+                            Ty::Named {
+                                symbol: b,
+                                args: ys,
+                                ..
+                            },
+                        ) if a == b && xs.len() == ys.len() => {
+                            work.extend(
+                                xs.iter()
+                                    .zip(ys.iter())
+                                    .rev()
+                                    .map(|(x, y)| Work::Ty(x.clone(), y.clone())),
+                            );
+                        }
+                        _ => return false,
+                    }
+                }
+                Work::Row(a, b) => {
+                    let (a, b) = (self.canon(&a), self.canon(&b));
+                    if a.labels.len() != b.labels.len() {
+                        return false;
+                    }
+                    for (name, field) in &a.labels {
+                        let Some(other) = b.labels.get(name) else {
+                            return false;
+                        };
+                        let left = self.presence_of(&field.presence);
+                        let right = self.presence_of(&other.presence);
+                        if left != right {
+                            return false;
+                        }
+                        // An absent slot denotes no payload. Imported recovery
+                        // artifacts may put arbitrary, even recursive, trees in
+                        // it; those trees are not part of row equality.
+                        if !matches!((&left, &right), (Presence::Absent, Presence::Absent)) {
+                            work.push(Work::Ty(field.ty.clone(), other.ty.clone()));
+                        }
+                    }
+                    let same_rest = match (&a.rest, &b.rest) {
+                        (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
+                        (Rest::Var(x), Rest::Var(y)) => x == y,
+                        (Rest::Rigid { id: x, .. }, Rest::Rigid { id: y, .. }) => x == y,
+                        _ => false,
+                    };
+                    if !same_rest {
+                        return false;
+                    }
+                }
             }
-    }
-
-    /// [`alike`](Self::alike) about two presences.
-    fn alike_presence(&self, a: &Presence, b: &Presence) -> bool {
-        self.presence_of(a) == self.presence_of(b)
+        }
+        true
     }
 
     /// Whether `var` occurs in what it is about to be bound to, whichever sort
@@ -3954,38 +3965,37 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
 /// back is one shape deep, and the names inside it are still names.
 ///
 /// Source recursion checking proves the ordinary walk finite. Imported
-/// interfaces are recovery input, though, and can contain a forwarding cycle
-/// this compiler never checked. Exact application identities close those cycles
-/// coinductively; re-entering a structure-adding declaration on one active path
-/// catches malformed growth whose applications never repeat. Direct type and
-/// empty-row forwarding do not count because they add no semantic structure,
-/// preserving valid nesting independently of how many aliases happen to exist.
-/// Independent sibling substitutions have independent active paths.
+/// interfaces are recovery input, though, and can contain forwarding and
+/// growing cycles this compiler never checked. Forwarding classification walks
+/// the declaration graph without opening its arguments; structure-adding paths
+/// are then bounded by the declarations active on that path, and a cycle that
+/// cumulatively adds fields is rejected before those prefixes are materialized.
+/// Direct type and empty-row forwarding do not count because they add no
+/// semantic structure, preserving valid nesting independently of how many
+/// aliases happen to exist. Independent sibling substitutions have independent
+/// active paths.
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
 pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     Unfold {
         aliases,
-        active: HashSet::new(),
         growing: HashSet::new(),
-        identity: Identity::default(),
         forwarding: Forwarding::default(),
     }
     .ty(ty)
 }
 
 /// One unfolding path. Row-bound forwarding can ask for the shape of an
-/// argument while its outer alias is still opening, so the active applications
-/// are shared through that nested request rather than reset at the row.
+/// argument while its outer alias is still opening, so active growing
+/// declarations are shared through that nested request rather than reset at
+/// the row.
 struct Unfold<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
-    active: HashSet<u32>,
     /// Non-forwarding declarations on the active path. Re-entering one is
     /// malformed structural growth; unrelated declarations do not buy fuel.
     /// Nested row opening is part of the path, while a completed sibling is not.
     growing: HashSet<Symbol>,
-    identity: Identity,
     forwarding: Forwarding,
 }
 
@@ -3997,38 +4007,53 @@ impl Unfold<'_> {
             let Ty::Named { symbol, args, .. } = &*ty else {
                 break ty;
             };
-            // Canonical node IDs are exact (hashing only selects an equality
-            // bucket), stack safe, and memoized by allocation. Thus peeling a
-            // 30,000-deep forwarding argument visits its nodes once rather
-            // than retaining a flattened copy at every level.
-            let key = self.identity.ty(&ty);
-            if !self.active.insert(key) {
-                break Rc::new(Ty::Undecided);
-            }
-
             let Some(scheme) = self.aliases.get(symbol) else {
-                entered.push((key, None));
                 break Rc::new(Ty::Undecided);
             };
             let body = scheme.body().clone();
             let grows = self.forwarding.projection(self.aliases, &body).is_none();
-            if grows && !self.growing.insert(*symbol) {
-                entered.push((key, None));
+            // A head-alias cycle that only grows the forwarded argument can be
+            // rejected before materializing any cumulative row at all. The
+            // forwarding classifier has already walked that declaration graph
+            // and marked every alias on the cycle-reaching path.
+            if grows && adds_argument_structure(&body) && self.forwarding.cycles.contains(symbol) {
                 break Rc::new(Ty::Undecided);
             }
-            entered.push((key, grows.then_some(*symbol)));
+            // A forwarding declaration selects an existing argument and thus
+            // strictly consumes the finite application tree; it needs no
+            // cumulative identity for every argument it passes through.
+            // Structure-adding paths are bounded by declaration identity
+            // instead. This keeps an N-alias malformed growth cycle at O(N)
+            // retained graph memory rather than storing N flattened maps of
+            // sizes 1 through N.
+            if grows && !self.growing.insert(*symbol) {
+                break Rc::new(Ty::Undecided);
+            }
+            entered.push(grows.then_some(*symbol));
 
             let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
             ty = body.open_alias(&fresh, self);
         };
-        for (key, grew) in entered {
-            self.active.remove(&key);
-            if let Some(symbol) = grew {
-                self.growing.remove(&symbol);
-            }
+        for symbol in entered.into_iter().flatten() {
+            self.growing.remove(&symbol);
         }
         result
     }
+}
+
+/// Whether a head alias adds a constructor around one of the arguments it
+/// passes on. For a cycle of distinct aliases this is the cumulative-growth
+/// case that can be rejected before materializing all N row prefixes. A plain
+/// recursive argument still opens one layer: row forwarding uses that layer to
+/// preserve the outer `Rest::More` and recover only its recursive tail.
+fn adds_argument_structure(ty: &Ty) -> bool {
+    let Ty::Named { args, .. } = ty else {
+        return false;
+    };
+    args.iter().any(|arg| match &**arg {
+        Ty::Struct(row) | Ty::Sum(row) => !row.labels.is_empty(),
+        _ => false,
+    })
 }
 
 /// Which parameter an expression forwards unchanged, if it is only a chain of
@@ -4046,6 +4071,7 @@ impl Unfold<'_> {
 struct Forwarding {
     expressions: HashMap<usize, Option<u32>>,
     aliases: HashMap<Symbol, Option<u32>>,
+    cycles: HashSet<Symbol>,
 }
 
 impl Forwarding {
@@ -4104,6 +4130,8 @@ impl Forwarding {
                     if let Some(value) = self.aliases.get(&symbol) {
                         values.push(*value);
                     } else if !active.insert(symbol) {
+                        self.cycles.extend(active.iter().copied());
+                        self.cycles.insert(symbol);
                         values.push(None);
                     } else {
                         work.push(Work::FinishAlias(symbol));
@@ -4134,208 +4162,6 @@ impl Forwarding {
             }
         }
         values.pop().expect("forwarding root result")
-    }
-}
-
-/// Exact, compact identities for the semantic graph reached by alias
-/// applications. Recursive children are represented by already-interned IDs,
-/// so every descriptor is shallow and equality/hash walks are stack safe.
-#[derive(Default)]
-struct Identity {
-    tys: HashMap<usize, (Rc<Ty>, u32)>,
-    rows: HashMap<usize, u32>,
-    ty_nodes: HashMap<TyIdentity, u32>,
-    row_nodes: HashMap<RowIdentity, u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TyIdentity {
-    Leaf(u8),
-    Number(u8, u32),
-    Arrow(u32, u32, u32),
-    Row(u8, u32),
-    Named(Symbol, Vec<u32>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RowIdentity {
-    labels: HashMap<String, (PresenceIdentity, Option<u32>)>,
-    rest: RestIdentity,
-}
-
-impl Hash for RowIdentity {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.rest.hash(state);
-        self.labels.len().hash(state);
-        // HashMap equality is exactly the order-independent row equality we
-        // need, but HashMap deliberately has no Hash implementation. Fold
-        // independently hashed entries with commutative operations; a hash
-        // collision only reaches the exact HashMap equality check in `intern`.
-        let mut sum = 0_u64;
-        let mut xor = 0_u64;
-        for entry in &self.labels {
-            let mut hasher = DefaultHasher::new();
-            entry.hash(&mut hasher);
-            let hash = hasher.finish();
-            sum = sum.wrapping_add(hash);
-            xor ^= hash.rotate_left(23);
-        }
-        sum.hash(state);
-        xor.hash(state);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PresenceIdentity {
-    Present,
-    Absent,
-    Var(u32),
-    Bound(u32),
-    Undecided,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum RestIdentity {
-    Closed,
-    Var(u32),
-    Bound(u32),
-    Rigid(u32),
-    Undecided,
-}
-
-impl Identity {
-    fn ty(&mut self, root: &Rc<Ty>) -> u32 {
-        enum Work<'a> {
-            Ty(&'a Rc<Ty>, bool),
-            Row(&'a Row, bool),
-        }
-
-        let mut work = vec![Work::Ty(root, false)];
-        while let Some(part) = work.pop() {
-            match part {
-                Work::Ty(ty, false) => {
-                    let address = Rc::as_ptr(ty) as usize;
-                    if self.tys.contains_key(&address) {
-                        continue;
-                    }
-                    work.push(Work::Ty(ty, true));
-                    match &**ty {
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects, false));
-                            work.push(Work::Ty(to, false));
-                            work.push(Work::Ty(from, false));
-                        }
-                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row, false)),
-                        Ty::Named { args, .. } => {
-                            work.extend(args.iter().rev().map(|arg| Work::Ty(arg, false)));
-                        }
-                        _ => {}
-                    }
-                }
-                Work::Ty(ty, true) => {
-                    let node = match &**ty {
-                        Ty::Nat => TyIdentity::Leaf(0),
-                        Ty::Int => TyIdentity::Leaf(1),
-                        Ty::Real => TyIdentity::Leaf(2),
-                        Ty::String => TyIdentity::Leaf(3),
-                        Ty::Boolean => TyIdentity::Leaf(4),
-                        Ty::Arrow(from, to, effects) => TyIdentity::Arrow(
-                            self.ty_id(from),
-                            self.ty_id(to),
-                            self.row_id(effects),
-                        ),
-                        Ty::Struct(row) => TyIdentity::Row(0, self.row_id(row)),
-                        Ty::Sum(row) => TyIdentity::Row(1, self.row_id(row)),
-                        Ty::Var(var) => TyIdentity::Number(0, *var),
-                        Ty::Bound(index) => TyIdentity::Number(1, *index),
-                        Ty::Rigid { id, .. } => TyIdentity::Number(2, *id),
-                        Ty::Named { symbol, args, .. } => TyIdentity::Named(
-                            *symbol,
-                            args.iter().map(|arg| self.ty_id(arg)).collect(),
-                        ),
-                        Ty::Undecided => TyIdentity::Leaf(5),
-                    };
-                    let id = Self::intern(&mut self.ty_nodes, node);
-                    self.tys.insert(Rc::as_ptr(ty) as usize, (ty.clone(), id));
-                }
-                Work::Row(row, false) => {
-                    work.push(Work::Row(row, true));
-                    // `More` is one semantic row chain, not a tree of rows to
-                    // normalize independently. Scheduling every suffix here
-                    // retained vectors of lengths n, n-1, ... and made one
-                    // 30,000-link row quadratic. Visit all payloads once and
-                    // intern only the root requested by its containing type.
-                    let mut current = row;
-                    loop {
-                        work.extend(
-                            current
-                                .labels
-                                .iter()
-                                .rev()
-                                .map(|(_, field)| Work::Ty(&field.ty, false)),
-                        );
-                        match &current.rest {
-                            Rest::More(more) => current = more,
-                            _ => break,
-                        }
-                    }
-                }
-                Work::Row(row, true) => {
-                    // A row is a record, not a source list. Flatten `More`
-                    // with outer labels winning, ignore absent payloads, and
-                    // sort by label so semantically equal rows intern together
-                    // however an imported artifact happened to present them.
-                    let mut fields: HashMap<String, (&Presence, &Rc<Ty>)> = HashMap::new();
-                    let mut current = row;
-                    let rest = loop {
-                        for (name, field) in &current.labels {
-                            fields
-                                .entry(name.clone())
-                                .or_insert((&field.presence, &field.ty));
-                        }
-                        match &current.rest {
-                            Rest::More(more) => current = more,
-                            Rest::Closed => break RestIdentity::Closed,
-                            Rest::Var(var) => break RestIdentity::Var(*var),
-                            Rest::Bound(index) => break RestIdentity::Bound(*index),
-                            Rest::Rigid { id, .. } => break RestIdentity::Rigid(*id),
-                            Rest::Undecided => break RestIdentity::Undecided,
-                        }
-                    };
-                    let labels = fields
-                        .into_iter()
-                        .map(|(name, (presence, ty))| {
-                            let presence = match presence {
-                                Presence::Present => PresenceIdentity::Present,
-                                Presence::Absent => PresenceIdentity::Absent,
-                                Presence::Var(var) => PresenceIdentity::Var(*var),
-                                Presence::Bound(index) => PresenceIdentity::Bound(*index),
-                                Presence::Undecided => PresenceIdentity::Undecided,
-                            };
-                            let ty = (!matches!(presence, PresenceIdentity::Absent))
-                                .then(|| self.ty_id(ty));
-                            (name, (presence, ty))
-                        })
-                        .collect();
-                    let id = Self::intern(&mut self.row_nodes, RowIdentity { labels, rest });
-                    self.rows.insert(row as *const Row as usize, id);
-                }
-            }
-        }
-        self.ty_id(root)
-    }
-
-    fn ty_id(&self, ty: &Rc<Ty>) -> u32 {
-        self.tys[&(Rc::as_ptr(ty) as usize)].1
-    }
-
-    fn row_id(&self, row: &Row) -> u32 {
-        self.rows[&(row as *const Row as usize)]
-    }
-
-    fn intern<K: Eq + std::hash::Hash>(nodes: &mut HashMap<K, u32>, node: K) -> u32 {
-        let next = nodes.len() as u32;
-        *nodes.entry(node).or_insert(next)
     }
 }
 

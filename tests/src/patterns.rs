@@ -810,6 +810,28 @@ fn an_abandoned_presence_skips_the_checks() {
 /// what escapes is anything at all, and the witness says so rather than
 /// being "anything other than" nothing.
 #[test]
+fn an_abandoned_struct_tail_skips_reachability_cascade() {
+    let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
+    let (mut out, mut inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    scrutinee.ty = Rc::new(Ty::Struct(Row::of(Rest::Undecided)));
+    inferred
+        .store
+        .batches
+        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
+    let checks = patterns::check(&out.program, &inferred);
+    assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+    assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
+}
+
+#[test]
 fn an_open_sum_with_no_cases_witnesses_as_anything() {
     let src = "let f : { a: Nat, b: (\\#X | ..'r), .. } -> Nat = \
                fn v => match v with | {a: 0n, ..} => 1n end";

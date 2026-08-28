@@ -971,11 +971,225 @@ impl Solve<'_> {
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
+        if self.direct_equal(&lhs, &rhs) {
+            self.unify_equal(span, lhs, rhs);
+            return;
+        }
         let goal = Goal::Type {
             expected: lhs.clone(),
             actual: rhs.clone(),
         };
         self.types(span, goal, &lhs, &rhs);
+    }
+
+    /// Whether an already equal pair can take only the solver's direct
+    /// decomposition arms. Names whose parameters are discarded still have to
+    /// unfold, since nominal congruence would disagree with structural
+    /// equality there; every other equal composite can be replayed by the
+    /// explicit-stack path below.
+    fn direct_equal(&self, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+        if !self.table.alike(lhs, rhs) {
+            // Leaf mismatches need no recursive work, but routing them through
+            // the same trampoline gives its fallback the ordinary directional
+            // mismatch rule rather than leaving an impossible continuation.
+            return matches!(
+                (&**lhs, &**rhs),
+                (
+                    Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean,
+                    Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean
+                )
+            );
+        }
+        enum Work {
+            Ty(Rc<Ty>, Rc<Ty>),
+            Row(Row, Row),
+        }
+        let mut work = vec![Work::Ty(lhs.clone(), rhs.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(lhs, rhs) => {
+                    let (lhs, rhs) = (self.table.resolve(&lhs), self.table.resolve(&rhs));
+                    match (&*lhs, &*rhs) {
+                        (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
+                            work.push(Work::Row(effects.clone(), performs.clone()));
+                            work.push(Work::Ty(to.clone(), result.clone()));
+                            work.push(Work::Ty(from.clone(), other.clone()));
+                        }
+                        (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
+                            work.push(Work::Row(a.clone(), b.clone()));
+                        }
+                        (Ty::Named { symbol, args, .. }, Ty::Named { args: others, .. })
+                            if !args.is_empty() =>
+                        {
+                            if !self.nominal.contains(symbol) {
+                                return false;
+                            }
+                            work.extend(
+                                args.iter()
+                                    .zip(others.iter())
+                                    .rev()
+                                    .map(|(a, b)| Work::Ty(a.clone(), b.clone())),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Work::Row(lhs, rhs) => {
+                    let (lhs, rhs) = (self.table.canon(&lhs), self.table.canon(&rhs));
+                    for (name, field) in lhs.labels {
+                        let other = &rhs.labels[&name];
+                        let presence = self.table.presence_of(&field.presence);
+                        if !matches!(presence, Presence::Absent) {
+                            work.push(Work::Ty(field.ty, other.ty.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Replay successful direct equality with an explicit continuation stack.
+    /// This is the same rule order and nesting depth as the ordinary recursive
+    /// implementation, but a 30,000-node imported Arrow/Named/row tree borrows
+    /// heap space rather than the native stack.
+    fn unify_equal(&mut self, span: Span, lhs: Rc<Ty>, rhs: Rc<Ty>) {
+        enum Work {
+            Ty(Rc<Ty>, Rc<Ty>, u32),
+            Row(Row, Row, u32),
+            Field(RowField, RowField, u32),
+            Rest(Rest, Rest, Shape, u32),
+        }
+
+        let original_depth = self.depth;
+        let mut work = vec![Work::Ty(lhs, rhs, original_depth)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(lhs, rhs, depth) => {
+                    self.depth = depth;
+                    let (lhs, rhs) = (self.table.resolve(&lhs), self.table.resolve(&rhs));
+                    let goal = Goal::Type {
+                        expected: lhs.clone(),
+                        actual: rhs.clone(),
+                    };
+                    match (&*lhs, &*rhs) {
+                        (Ty::Undecided, _) => {
+                            self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &rhs);
+                        }
+                        (Ty::Var(_), Ty::Var(_)) | (Ty::Rigid { .. }, Ty::Rigid { .. }) => {
+                            self.step(span, Rule::Same, goal, Effect::None);
+                        }
+                        (Ty::Named { args, .. }, Ty::Named { args: others, .. })
+                            if args.is_empty() =>
+                        {
+                            self.step(span, Rule::Same, goal, Effect::None);
+                        }
+                        (Ty::Named { args, .. }, Ty::Named { args: others, .. }) => {
+                            self.step(span, Rule::Congruent, goal, Effect::Decomposed);
+                            work.extend(
+                                args.iter()
+                                    .zip(others.iter())
+                                    .rev()
+                                    .map(|(a, b)| Work::Ty(a.clone(), b.clone(), depth + 1)),
+                            );
+                        }
+                        (Ty::Nat, Ty::Nat)
+                        | (Ty::Int, Ty::Int)
+                        | (Ty::Real, Ty::Real)
+                        | (Ty::String, Ty::String)
+                        | (Ty::Boolean, Ty::Boolean) => {
+                            self.step(span, Rule::Prim, goal, Effect::None);
+                        }
+                        (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
+                            self.step(span, Rule::Arrow, goal, Effect::Decomposed);
+                            work.push(Work::Row(effects.clone(), performs.clone(), depth + 1));
+                            work.push(Work::Ty(to.clone(), result.clone(), depth + 1));
+                            work.push(Work::Ty(from.clone(), other.clone(), depth + 1));
+                        }
+                        (Ty::Struct(fields), Ty::Struct(others))
+                            if fields.labels.is_empty()
+                                && others.labels.is_empty()
+                                && matches!(fields.rest, Rest::Closed)
+                                && matches!(others.rest, Rest::Closed) => {}
+                        (Ty::Struct(fields), Ty::Struct(others)) => {
+                            let (want, have) = (self.table.canon(fields), self.table.canon(others));
+                            let expected = Rc::new(Ty::Struct(want.clone()));
+                            let actual = Rc::new(Ty::Struct(have.clone()));
+                            self.step(
+                                span,
+                                Rule::Struct,
+                                Goal::Type { expected, actual },
+                                Effect::Decomposed,
+                            );
+                            work.push(Work::Row(want, have, depth + 1));
+                        }
+                        (Ty::Sum(cases), Ty::Sum(others)) => {
+                            let (want, have) = (self.table.canon(cases), self.table.canon(others));
+                            let expected = Rc::new(Ty::Sum(want.clone()));
+                            let actual = Rc::new(Ty::Sum(have.clone()));
+                            self.step(
+                                span,
+                                Rule::Sum,
+                                Goal::Type { expected, actual },
+                                Effect::Decomposed,
+                            );
+                            work.push(Work::Row(want, have, depth + 1));
+                        }
+                        _ => {
+                            self.types(span, goal, &lhs, &rhs);
+                        }
+                    }
+                }
+                Work::Row(lhs, rhs, depth) => {
+                    self.depth = depth;
+                    let rest = (!(matches!(lhs.rest, Rest::Closed)
+                        && matches!(rhs.rest, Rest::Closed)))
+                    .then(|| {
+                        Work::Rest(
+                            lhs.rest.clone(),
+                            rhs.rest.clone(),
+                            // Payload behavior is shape-independent on an
+                            // already equal row. Struct is the neutral reading
+                            // for the bare rest goal recorded here.
+                            Shape::Struct,
+                            depth,
+                        )
+                    });
+                    let mut fields: Vec<_> = lhs
+                        .labels
+                        .into_iter()
+                        .map(|(name, field)| (field, rhs.labels[&name].clone()))
+                        .collect();
+                    work.extend(
+                        fields
+                            .drain(..)
+                            .rev()
+                            .map(|(a, b)| Work::Field(a, b, depth)),
+                    );
+                    // Tails are decided before shared labels.
+                    work.extend(rest);
+                }
+                Work::Field(lhs, rhs, depth) => {
+                    self.depth = depth;
+                    let left = self.table.presence_of(&lhs.presence);
+                    let right = self.table.presence_of(&rhs.presence);
+                    if self.guard.is_some() {
+                        self.guarded_presence(span, &left, &right);
+                    } else if !matches!((&left, &right), (Presence::Present, Presence::Present)) {
+                        self.presences(span, &left, &right);
+                    }
+                    if !matches!((&left, &right), (Presence::Absent, Presence::Absent)) {
+                        work.push(Work::Ty(lhs.ty, rhs.ty, depth));
+                    }
+                }
+                Work::Rest(lhs, rhs, shape, depth) => {
+                    self.depth = depth;
+                    self.rests(span, &lhs, &rhs, shape);
+                }
+            }
+        }
+        self.depth = original_depth;
     }
 
     /// Decide two types by their labels and their constructors and row tails.
@@ -1020,10 +1234,6 @@ impl Solve<'_> {
                 self.recover_ty(span, lhs);
                 true
             }
-            (Ty::Var(a), Ty::Var(b)) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None);
-                true
-            }
             (Ty::Var(var), _) => {
                 let var = *var;
                 self.assign(span, goal, var, Assigned::Ty(rhs.clone()));
@@ -1034,15 +1244,9 @@ impl Solve<'_> {
                 self.assign(span, goal, var, Assigned::Ty(lhs.clone()));
                 true
             }
-            // A variable is equal to itself and to nothing else.
-            // Two rigids with one id are the same variable however differently
-            // the two sides were reached; two with different ids are two
-            // promises about two independent choices the caller makes, and one
-            // is no more the other than `Nat` is.
-            (Ty::Rigid { id: a, .. }, Ty::Rigid { id: b, .. }) if a == b => {
-                self.step(span, Rule::Same, goal, Effect::None);
-                true
-            }
+            // A variable is equal to itself and to nothing else. Equal rigids
+            // and equal unbound variables were discharged by the iterative
+            // direct path before reaching this matcher.
             // Meeting anything else is the promise broken — except an unbound
             // variable, which takes the rigid as it would take any other type
             // and is left to the binding rules below. A declared name is not
@@ -1056,28 +1260,9 @@ impl Solve<'_> {
                 let (name, id) = (name.clone(), *id);
                 self.rigid_broken(span, goal, name, id, Sense::Type, lhs)
             }
-            // One declaration applied to nothing is only ever equal to itself,
-            // so this saves an unfolding rather than deciding anything. Two
-            // *different* declarations fall through to unfolding and are equal
-            // whenever what they stand for is.
-            //
-            // Arity belongs to the declaration, so one empty argument list
-            // means the other is empty too.
-            (
-                Ty::Named {
-                    symbol: a,
-                    args: xs,
-                    ..
-                },
-                Ty::Named {
-                    symbol: b,
-                    args: ys,
-                    ..
-                },
-            ) if a == b && xs.len() == ys.len() && xs.is_empty() => {
-                self.step(span, Rule::Same, goal, Effect::None);
-                true
-            }
+            // Equal nullary declarations were discharged by the iterative
+            // direct path. Different declarations fall through to unfolding
+            // and are equal whenever what they stand for is.
             // Two applications of one declaration are equal when their
             // arguments are — and this is a shortcut to unfolding rather than a
             // rule that could contradict it, which is the whole of what
@@ -1156,14 +1341,6 @@ impl Solve<'_> {
                 self.unfold(span, goal, lhs, rhs);
                 false
             }
-            (Ty::Nat, Ty::Nat)
-            | (Ty::Int, Ty::Int)
-            | (Ty::Real, Ty::Real)
-            | (Ty::String, Ty::String)
-            | (Ty::Boolean, Ty::Boolean) => {
-                self.step(span, Rule::Prim, goal, Effect::None);
-                true
-            }
             // Three goals rather than two, and the third is not opened: an
             // annotation says what it says, so `let h : Nat -> Nat = f` with
             // `f : Nat -> Nat + !Log` is refused. Opening happens where a
@@ -1199,14 +1376,6 @@ impl Solve<'_> {
             // mismatch — a struct and a sum are two types however much their
             // insides look alike, and lining their labels up would be answering
             // a question nobody asked.
-            (Ty::Struct(fields), Ty::Struct(others))
-                if fields.labels.is_empty()
-                    && others.labels.is_empty()
-                    && matches!(fields.rest, Rest::Closed)
-                    && matches!(others.rest, Rest::Closed) =>
-            {
-                true
-            }
             (Ty::Struct(fields), Ty::Struct(others)) => {
                 let (want, have) = (self.table.canon(fields), self.table.canon(others));
                 let (left, right) = (
@@ -2160,22 +2329,42 @@ impl Solve<'_> {
                 } => match pending.next() {
                     Some((name, field)) => {
                         let resolved = self.table.presence_of(&field.presence);
-                        let presence = match resolved {
+                        let presence = match &resolved {
                             Presence::Undecided => Presence::Undecided,
                             resolved => {
                                 let shared = self.table.fresh_presence();
-                                self.guarded_presence(span, &shared, &resolved);
+                                self.guarded_presence(span, &shared, resolved);
                                 shared
                             }
                         };
-                        work.push(Work::Field {
-                            name,
-                            presence,
-                            pending,
-                            labels,
-                            rest,
-                        });
-                        work.push(Work::Type(field.ty));
+                        if matches!(resolved, Presence::Absent) {
+                            // An absent slot has no semantic payload. Do not
+                            // copy or abstract variables hidden in malformed
+                            // imported recovery data; keep the slot explicitly
+                            // irrelevant instead.
+                            let mut labels = labels;
+                            labels.insert(
+                                name,
+                                RowField {
+                                    presence,
+                                    ty: Rc::new(Ty::Undecided),
+                                },
+                            );
+                            work.push(Work::Fields {
+                                pending,
+                                labels,
+                                rest,
+                            });
+                        } else {
+                            work.push(Work::Field {
+                                name,
+                                presence,
+                                pending,
+                                labels,
+                                rest,
+                            });
+                            work.push(Work::Type(field.ty));
+                        }
                     }
                     None => rows.push(Row { labels, rest }),
                 },
@@ -2334,8 +2523,11 @@ impl Solve<'_> {
                     let row = self.table.canon(&row);
                     work.push(Work::Rest(row.rest));
                     for field in row.labels.into_values().rev() {
-                        work.push(Work::Type(field.ty));
-                        work.push(Work::Presence(field.presence));
+                        let presence = self.table.presence_of(&field.presence);
+                        if !matches!(presence, Presence::Absent) {
+                            work.push(Work::Type(field.ty));
+                        }
+                        work.push(Work::Presence(presence));
                     }
                 }
                 Work::Presence(presence) => self.recover_presence(span, &presence),

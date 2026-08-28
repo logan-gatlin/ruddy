@@ -1202,6 +1202,84 @@ fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
 }
 
 #[test]
+fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
+    std::thread::Builder::new()
+        .name("deep-artifact-types".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (mut mint, program, mut inferred, lowered) = compiled("let value = 1n");
+            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let layer = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a type symbol");
+
+            let mut arrow = Rc::new(types::Ty::Nat);
+            let mut named = Rc::new(types::Ty::Nat);
+            let mut payload = Rc::new(types::Ty::Nat);
+            let mut more = types::Row::closed();
+            for index in 0..DEPTH {
+                arrow = Rc::new(types::Ty::Arrow(
+                    Rc::new(types::Ty::Nat),
+                    arrow,
+                    types::Row::closed(),
+                ));
+                named = Rc::new(types::Ty::Named {
+                    symbol: layer,
+                    name: "Layer".into(),
+                    args: vec![named].into(),
+                });
+                payload = Rc::new(types::Ty::Struct(types::Row {
+                    labels: [(format!("field{index}"), types::RowField::present(payload))]
+                        .into_iter()
+                        .collect(),
+                    rest: types::Rest::Closed,
+                }));
+                more = types::Row::of(types::Rest::More(Rc::new(more)));
+            }
+            let body = Rc::new(types::Ty::Struct(types::Row {
+                labels: [
+                    ("arrow".into(), types::RowField::present(arrow)),
+                    ("named".into(), types::RowField::present(named)),
+                    ("payload".into(), types::RowField::present(payload)),
+                    (
+                        "more".into(),
+                        types::RowField::present(Rc::new(types::Ty::Sum(more))),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                rest: types::Rest::Closed,
+            }));
+            inferred.schemes.insert(symbol, types::Scheme::new(0, body));
+
+            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+            let value = artifact
+                .header
+                .values
+                .iter()
+                .find(|value| value.name.ends_with("value"))
+                .expect("the built value");
+            let Type::Struct(row) = &value.scheme.body else {
+                panic!("semantic root changed schema")
+            };
+            assert_eq!(
+                row.labels
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                ["arrow", "named", "payload", "more"]
+            );
+            // Recursive Rc/Box destruction is outside conversion itself.
+            std::mem::forget(inferred);
+            std::mem::forget(artifact);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("artifact type, row, field and rest conversion uses bounded stack");
+}
+
+#[test]
 fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     const DEPTH: usize = 400;
     let mut value = Artifact {

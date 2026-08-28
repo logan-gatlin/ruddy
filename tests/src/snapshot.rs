@@ -1332,7 +1332,7 @@ fn an_argument_wears_its_type_through_a_declared_type() {
     // in braces it would show a reader a case list as if it were fields.
     assert_eq!(
         badge("type G 'r = (#Err Nat | ..'r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1n\n"),
-        "#Err Nat | ..#Ok Nat"
+        "#Err Nat | #Ok Nat"
     );
 }
 

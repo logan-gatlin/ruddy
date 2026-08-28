@@ -640,65 +640,132 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
 }
 
 fn ty(mint: &Mint, value: &types::Ty) -> Type {
-    match value {
-        types::Ty::Nat => Type::Nat,
-        types::Ty::Int => Type::Int,
-        types::Ty::Real => Type::Real,
-        types::Ty::String => Type::String,
-        types::Ty::Boolean => Type::Boolean,
-        types::Ty::Arrow(from, to, effects) => Type::Arrow(
-            Box::new(ty(mint, from)),
-            Box::new(ty(mint, to)),
-            row(mint, effects),
-        ),
-        types::Ty::Struct(row_) => Type::Struct(row(mint, row_)),
-        types::Ty::Sum(row_) => Type::Sum(row(mint, row_)),
-        types::Ty::Var(value) => Type::Var(*value),
-        types::Ty::Bound(value) => Type::Bound(*value),
-        types::Ty::Rigid { id, name } => Type::Rigid {
+    enum Work<'a> {
+        Ty(&'a types::Ty),
+        Row(&'a types::Row),
+        Arrow,
+        Struct,
+        Sum,
+        Named {
+            name: QualifiedName,
+            count: usize,
+        },
+        FinishRow {
+            labels: Vec<(String, Presence)>,
+            rest: Option<Rest>,
+        },
+    }
+
+    let presence = |value: &types::Presence| match value {
+        types::Presence::Present => Presence::Present,
+        types::Presence::Absent => Presence::Absent,
+        types::Presence::Var(value) => Presence::Var(*value),
+        types::Presence::Bound(value) => Presence::Bound(*value),
+        types::Presence::Undecided => Presence::Undecided,
+    };
+    let rest = |value: &types::Rest| match value {
+        types::Rest::Closed => Some(Rest::Closed),
+        types::Rest::Var(value) => Some(Rest::Var(*value)),
+        types::Rest::Bound(value) => Some(Rest::Bound(*value)),
+        types::Rest::Rigid { id, name } => Some(Rest::Rigid {
             id: *id,
             name: name.to_string(),
-        },
-        types::Ty::Named { symbol, args, .. } => Type::Named {
-            name: qualified(mint, *symbol),
-            args: args.iter().map(|arg| ty(mint, arg)).collect(),
-        },
-        types::Ty::Undecided => Type::Undecided,
-    }
-}
+        }),
+        types::Rest::Undecided => Some(Rest::Undecided),
+        types::Rest::More(_) => None,
+    };
 
-fn row(mint: &Mint, value: &types::Row) -> Row {
-    Row {
-        labels: value
-            .labels
-            .iter()
-            .map(|(name, field)| (name.clone(), row_field(mint, field)))
-            .collect(),
-        rest: match &value.rest {
-            types::Rest::Closed => Rest::Closed,
-            types::Rest::Var(value) => Rest::Var(*value),
-            types::Rest::Bound(value) => Rest::Bound(*value),
-            types::Rest::Rigid { id, name } => Rest::Rigid {
-                id: *id,
-                name: name.to_string(),
+    let mut work = vec![Work::Ty(value)];
+    let mut tys = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(value) => match value {
+                types::Ty::Nat => tys.push(Type::Nat),
+                types::Ty::Int => tys.push(Type::Int),
+                types::Ty::Real => tys.push(Type::Real),
+                types::Ty::String => tys.push(Type::String),
+                types::Ty::Boolean => tys.push(Type::Boolean),
+                types::Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Arrow);
+                    work.push(Work::Row(effects));
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                types::Ty::Struct(row) => {
+                    work.push(Work::Struct);
+                    work.push(Work::Row(row));
+                }
+                types::Ty::Sum(row) => {
+                    work.push(Work::Sum);
+                    work.push(Work::Row(row));
+                }
+                types::Ty::Var(value) => tys.push(Type::Var(*value)),
+                types::Ty::Bound(value) => tys.push(Type::Bound(*value)),
+                types::Ty::Rigid { id, name } => tys.push(Type::Rigid {
+                    id: *id,
+                    name: name.to_string(),
+                }),
+                types::Ty::Named { symbol, args, .. } => {
+                    work.push(Work::Named {
+                        name: qualified(mint, *symbol),
+                        count: args.len(),
+                    });
+                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                }
+                types::Ty::Undecided => tys.push(Type::Undecided),
             },
-            types::Rest::Undecided => Rest::Undecided,
-            types::Rest::More(row_) => Rest::More(Box::new(row(mint, row_))),
-        },
+            Work::Row(value) => {
+                let labels = value
+                    .labels
+                    .iter()
+                    .map(|(name, field)| (name.clone(), presence(&field.presence)))
+                    .collect();
+                work.push(Work::FinishRow {
+                    labels,
+                    rest: rest(&value.rest),
+                });
+                if let types::Rest::More(more) = &value.rest {
+                    work.push(Work::Row(more));
+                }
+                work.extend(value.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+            }
+            Work::Arrow => {
+                let effects = rows.pop().expect("artifact arrow effects");
+                let to = tys.pop().expect("artifact arrow result");
+                let from = tys.pop().expect("artifact arrow parameter");
+                tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            Work::Struct => {
+                let row = rows.pop().expect("artifact struct row");
+                tys.push(Type::Struct(row));
+            }
+            Work::Sum => {
+                let row = rows.pop().expect("artifact sum row");
+                tys.push(Type::Sum(row));
+            }
+            Work::Named { name, count } => {
+                let split = tys.len() - count;
+                let args = tys.drain(split..).collect();
+                tys.push(Type::Named { name, args });
+            }
+            Work::FinishRow { labels, rest } => {
+                let split = tys.len() - labels.len();
+                let payloads: Vec<_> = tys.drain(split..).collect();
+                let labels = labels
+                    .into_iter()
+                    .zip(payloads)
+                    .map(|((name, presence), ty)| (name, RowField { presence, ty }))
+                    .collect();
+                let rest = match rest {
+                    Some(rest) => rest,
+                    None => Rest::More(Box::new(rows.pop().expect("artifact nested row"))),
+                };
+                rows.push(Row { labels, rest });
+            }
+        }
     }
-}
-
-fn row_field(mint: &Mint, value: &types::RowField) -> RowField {
-    RowField {
-        presence: match &value.presence {
-            types::Presence::Present => Presence::Present,
-            types::Presence::Absent => Presence::Absent,
-            types::Presence::Var(value) => Presence::Var(*value),
-            types::Presence::Bound(value) => Presence::Bound(*value),
-            types::Presence::Undecided => Presence::Undecided,
-        },
-        ty: ty(mint, &value.ty),
-    }
+    tys.pop().expect("artifact type result")
 }
 
 fn formula(value: &types::Formula) -> Formula {

@@ -961,6 +961,13 @@ impl Check<'_> {
             Cell::Struct { fields, .. } => {
                 let Ty::Struct(row) = &*ty else { return false };
                 let row = flat(row);
+                // The struct demand follows the same cascade rule as a sum
+                // demand above. Once typing abandoned the row tail, its labels
+                // are recovery debris rather than facts from which reachability
+                // can be proved.
+                if matches!(row.rest, Rest::Undecided) {
+                    return false;
+                }
                 fields.iter().all(|(name, sub)| match row.labels.get(name) {
                     Some(field) => match &field.presence {
                         Presence::Absent => true,

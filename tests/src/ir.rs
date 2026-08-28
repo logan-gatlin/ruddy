@@ -8378,6 +8378,150 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
 }
 
 #[test]
+fn deep_equal_imported_types_unify_on_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-equal-imported-solve".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let deep = |hidden| {
+                let mut named = a::Type::Nat;
+                let mut payload = a::Type::Nat;
+                let mut effects = a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                };
+                for index in 0..DEPTH {
+                    named = a::Type::Named {
+                        name: "dep@1.0.0::Wrap".into(),
+                        args: vec![named],
+                    };
+                    payload = a::Type::Struct(a::Row {
+                        labels: vec![(
+                            format!("field{index}"),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: payload,
+                            },
+                        )],
+                        rest: a::Rest::Closed,
+                    });
+                    effects = a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::More(Box::new(effects)),
+                    };
+                }
+                let mut ty = a::Type::Arrow(Box::new(named), Box::new(payload), effects);
+                for _ in 1..DEPTH {
+                    ty = a::Type::Arrow(
+                        Box::new(a::Type::Nat),
+                        Box::new(ty),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    );
+                }
+                a::Type::Struct(a::Row {
+                    labels: vec![
+                        (
+                            "value".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty,
+                            },
+                        ),
+                        (
+                            "hidden".into(),
+                            a::RowField {
+                                presence: a::Presence::Absent,
+                                ty: hidden,
+                            },
+                        ),
+                    ],
+                    rest: a::Rest::Closed,
+                })
+            };
+
+            let mut dependency = effect_artifact("dep", "deep-equal");
+            dependency.header.types = vec![
+                a::DeclaredType {
+                    name: "dep@1.0.0::Wrap".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Bound(0),
+                    },
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::A".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::Nat)),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::B".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::String)),
+                },
+            ];
+            dependency.header.values.extend([
+                a::Value {
+                    name: "dep@1.0.0::value".into(),
+                    scheme: artifact_scheme(a::Type::Named {
+                        name: "dep@1.0.0::B".into(),
+                        args: Vec::new(),
+                    }),
+                },
+                a::Value {
+                    name: "dep@1.0.0::accept".into(),
+                    scheme: artifact_scheme(a::Type::Arrow(
+                        Box::new(a::Type::Named {
+                            name: "dep@1.0.0::A".into(),
+                            args: Vec::new(),
+                        }),
+                        Box::new(a::Type::Nat),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    )),
+                },
+            ]);
+            let parsed = parse::parse(
+                lex("let imported = dep::accept dep::value", FileID::GENERATED).tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let mut out =
+                build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            let inferred = inference::infer(&mint, &mut out.program);
+            assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+            assert!(
+                inferred
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.rule, inference::Rule::Arrow)),
+                "the deep bodies were decomposed"
+            );
+            // Recursive imported owners are deliberately not destroyed on the
+            // bounded test stack.
+            std::mem::forget(dependency);
+            std::mem::forget(out);
+            std::mem::forget(inferred);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("successful deep Arrow/Named/Row unification is iterative");
+}
+
+#[test]
 fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
     std::thread::Builder::new()
         .name("deep-imported-field-summaries".into())

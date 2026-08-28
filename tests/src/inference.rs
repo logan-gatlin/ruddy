@@ -1957,6 +1957,71 @@ fn deep_more_identity_is_linear_and_stack_safe() {
 }
 
 #[test]
+fn growing_alias_cycles_retain_only_linear_path_state() {
+    std::thread::Builder::new()
+        .name("large-growing-alias-cycle".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const ALIASES: usize = 10_000;
+            let bundle = Bundle::new("growth", Version::new(1, 0, 0)).unwrap();
+            let mut mint = Mint::new(bundle);
+            let symbols: Vec<_> = (0..ALIASES)
+                .map(|index| {
+                    mint.global(None, Namespace::Types, &format!("Alias{index}"))
+                        .expect("a distinct alias")
+                })
+                .collect();
+            // A finite alias may add a row before handing it to a forwarding
+            // declaration. It takes the same bounded path without being
+            // mistaken for the cyclic case below.
+            let forward = mint
+                .global(None, Namespace::Types, "Forward")
+                .expect("a forwarding alias");
+            let add = mint
+                .global(None, Namespace::Types, "Add")
+                .expect("a row-adding alias");
+            let added = Rc::new(Ty::Struct(Row {
+                labels: [("finite".into(), RowField::present(Rc::new(Ty::Nat)))]
+                    .into_iter()
+                    .collect(),
+                rest: Rest::Closed,
+            }));
+            let finite = IndexMap::from([
+                (forward, Scheme::new(1, Rc::new(Ty::Bound(0)))),
+                (add, Scheme::new(0, semantic_named(forward, vec![added]))),
+            ]);
+            assert!(matches!(
+                &*inference::unfold(&finite, &semantic_named(add, Vec::new())),
+                Ty::Struct(_)
+            ));
+
+            let mut aliases = IndexMap::new();
+            for (index, symbol) in symbols.iter().copied().enumerate() {
+                let next = symbols[(index + 1) % ALIASES];
+                let added = Rc::new(Ty::Struct(Row {
+                    labels: [(format!("field{index}"), RowField::present(Rc::new(Ty::Nat)))]
+                        .into_iter()
+                        .collect(),
+                    rest: Rest::Bound(0),
+                }));
+                aliases.insert(symbol, Scheme::new(1, semantic_named(next, vec![added])));
+            }
+            let root = semantic_named(symbols[0], vec![Rc::new(Ty::unit())]);
+            assert!(matches!(
+                &*inference::unfold(&aliases, &root),
+                Ty::Undecided
+            ));
+            // The regression measures the unfolding walk, not recursive Rc
+            // destruction of its deliberately malformed recovery graph.
+            std::mem::forget(aliases);
+            std::mem::forget(root);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("N growing aliases use O(N) retained graph memory");
+}
+
+#[test]
 fn the_solve_is_recorded_rule_by_rule() {
     let (mint, _, output) = inferred("let fst : { x: Nat } -> Nat = fn p => p.x");
     // The projection's demand meets the annotation's closed struct. The
@@ -5366,6 +5431,20 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
          let fixed = fn v => match v with | {x} => a | {y} => b end",
     );
 
+    // Recursive goals can also carry the same rigid row choice. Its ID and
+    // fields sense are part of the repeated goal; recognizing that exact rest
+    // closes both recursive struct and sum families coinductively.
+    inferred(
+        "type OpenA 'r = { next: OpenA 'r, ..'r }\n\
+         type OpenB 'r = { next: OpenB 'r, ..'r }\n\
+         let open : { left when 'p: Nat, right when 'q: Nat } -> OpenA { ..'r } -> OpenB { ..'r } -> _ where 'p != 'q =\n\
+           fn v => fn a => fn b => match v with | {left} => a | {right} => b end\n\
+         type CasesA 'r = #Next (CasesA 'r) | ..'r\n\
+         type CasesB 'r = #Next (CasesB 'r) | ..'r\n\
+         let cases : { left when 'p: Nat, right when 'q: Nat } -> CasesA (| ..'r) -> CasesB (| ..'r) -> _ where 'p != 'q =\n\
+           fn v => fn a => fn b => match v with | {left} => a | {right} => b end",
+    );
+
     let (mint, _, output) = inferred(
         "let absent : { x when 'a: Nat, y when 'b: Nat } -> { \\out, .. } -> { \\out, .. } where 'a != 'b =\n\
          fn v q => match v with | {x} => q | {y} => q end",
@@ -5408,6 +5487,23 @@ fn failed_nominal_congruence_rolls_back_active_refinement_state() {
         output.errors[0].kind.to_string(),
         "type mismatch: expected `Pair Nat Nat`, found `Pair Nat {}`"
     );
+}
+
+#[test]
+fn guarded_assignments_leave_absent_payloads_irrelevant() {
+    let (mint, _, output) = inferred(
+        "let f = fn v => match v with\n\
+         | {x} => let q : { \\gone, .. } = x in 1n\n\
+         | {y} => 2n end",
+    );
+    let printed = scheme(&mint, &output, "f");
+    assert!(!printed.contains("gone:"), "{printed}");
+
+    // Recovery likewise abandons only semantic payloads. Walking this failed
+    // annotation reaches its absent slot, but never treats the slot's unknown
+    // payload as a constraint to settle.
+    let (_, _, failed) = infer_src("let bad : { \\gone, .. } = 1n");
+    assert_eq!(failed.errors.len(), 1, "{:#?}", failed.errors);
 }
 
 #[test]

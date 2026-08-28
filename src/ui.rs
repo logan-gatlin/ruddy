@@ -41,7 +41,7 @@
 //! sharing can only run in this direction: `ruddy-debug` depends on `ruddy`,
 //! and nothing may make the dependency run back.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use crate::{
     bundle,
@@ -1223,7 +1223,7 @@ enum SemanticJob<'a> {
     Fields(&'a Row),
     Cases(&'a Row, bool),
     Effects(&'a Row),
-    Tail(Shape, &'a Rest),
+    Tail(&'a Rest),
     Field(&'a str, &'a RowField),
     Case(&'a str, &'a RowField, bool),
     Effect(&'a str, &'a Presence),
@@ -1284,16 +1284,24 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     work.push(SemanticJob::Text(")"));
                 }
                 match ty {
-                    Ty::Sum(row) if row.labels.keys().any(|name| name.contains('\u{1f}')) => {
+                    Ty::Sum(row)
+                        if flattened_row(row)
+                            .0
+                            .iter()
+                            .any(|(name, _)| name.contains('\u{1f}')) =>
+                    {
                         work.push(SemanticJob::Cases(row, true));
                     }
                     ty => work.push(SemanticJob::Ty(ty, false)),
                 }
             }
-            SemanticJob::Row(row) => match row.labels.is_empty() {
-                true => work.push(SemanticJob::Rest(&row.rest)),
-                false => work.push(SemanticJob::Fields(row)),
-            },
+            SemanticJob::Row(row) => {
+                let (fields, rest) = flattened_row(row);
+                match fields.is_empty() {
+                    true => work.push(SemanticJob::Rest(rest)),
+                    false => work.push(SemanticJob::Fields(row)),
+                }
+            }
             SemanticJob::Rest(rest) => match rest {
                 Rest::Closed => f.write_str("∅")?,
                 Rest::Var(var) => write!(f, "?{var}")?,
@@ -1303,8 +1311,8 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 Rest::More(row) => work.push(SemanticJob::Row(row)),
             },
             SemanticJob::Fields(row) => {
-                let fields: Vec<_> = visible_fields(row).collect();
-                let tail = visible_tail(Shape::Struct, &row.rest);
+                let (fields, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Struct, rest);
                 if fields.is_empty() && tail.is_none() {
                     f.write_str("{}")?;
                     continue;
@@ -1312,7 +1320,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 f.write_str("{ ")?;
                 work.push(SemanticJob::Text(" }"));
                 if let Some(tail) = tail {
-                    work.push(SemanticJob::Tail(Shape::Struct, tail));
+                    work.push(SemanticJob::Tail(tail));
                     work.push(SemanticJob::Text(".."));
                     if !fields.is_empty() {
                         work.push(SemanticJob::Text(", "));
@@ -1326,13 +1334,13 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
             }
             SemanticJob::Cases(row, strip_interface) => {
-                let cases: Vec<_> = visible_fields(row).collect();
-                let tail = visible_tail(Shape::Sum, &row.rest);
+                let (cases, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Sum, rest);
                 if cases.is_empty() {
                     f.write_str("|")?;
                 }
                 if let Some(tail) = tail {
-                    work.push(SemanticJob::Tail(Shape::Sum, tail));
+                    work.push(SemanticJob::Tail(tail));
                     work.push(SemanticJob::Text(if cases.is_empty() {
                         " .."
                     } else {
@@ -1347,14 +1355,14 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                 }
             }
             SemanticJob::Effects(row) => {
-                let effects: Vec<_> = visible_fields(row).collect();
-                let tail = visible_tail(Shape::Effect, &row.rest);
+                let (effects, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Effect, rest);
                 if effects.is_empty() && tail.is_none() {
                     f.write_str("|")?;
                     continue;
                 }
                 if let Some(tail) = tail {
-                    work.push(SemanticJob::Tail(Shape::Effect, tail));
+                    work.push(SemanticJob::Tail(tail));
                     work.push(SemanticJob::Text(".."));
                     if !effects.is_empty() {
                         work.push(SemanticJob::Text(" + "));
@@ -1367,15 +1375,8 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     }
                 }
             }
-            SemanticJob::Tail(shape, rest) => match rest {
-                Rest::Undecided => {}
-                Rest::More(row) => match shape {
-                    Shape::Struct => work.push(SemanticJob::Fields(row)),
-                    Shape::Sum => work.push(SemanticJob::Cases(row, false)),
-                    Shape::Effect => work.push(SemanticJob::Effects(row)),
-                },
-                rest => work.push(SemanticJob::Rest(rest)),
-            },
+            SemanticJob::Tail(Rest::Undecided) => {}
+            SemanticJob::Tail(rest) => work.push(SemanticJob::Rest(rest)),
             SemanticJob::Field(name, field) => {
                 write_field_label(f, name)?;
                 write_semantic_mark(f, &field.presence, false)?;
@@ -1404,43 +1405,45 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
     Ok(())
 }
 
-fn visible_fields(row: &Row) -> impl Iterator<Item = (&str, &RowField)> {
-    row.labels.iter().filter_map(|(name, field)| {
-        (!matches!(field.presence, Presence::Absent)).then_some((name.as_str(), field))
-    })
+/// Flatten a semantic row with the same outer-wins rule as inference. A name
+/// is claimed before its presence is inspected, so an outer absent entry masks
+/// an inner present one rather than merely disappearing beside it.
+fn flattened_row(row: &Row) -> (Vec<(&str, &RowField)>, &Rest) {
+    let mut names = HashSet::new();
+    let mut fields = Vec::new();
+    let mut row = row;
+    loop {
+        for (name, field) in &row.labels {
+            if names.insert(name.as_str()) && !matches!(field.presence, Presence::Absent) {
+                fields.push((name.as_str(), field));
+            }
+        }
+        match &row.rest {
+            Rest::More(more) => row = more,
+            rest => return (fields, rest),
+        }
+    }
 }
 
-fn visible_tail(shape: Shape, rest: &Rest) -> Option<&Rest> {
-    let mut rest = rest;
-    loop {
-        match rest {
-            Rest::Closed => return None,
-            Rest::Undecided if matches!(shape, Shape::Effect) => return None,
-            Rest::More(row) if visible_fields(row).next().is_none() => rest = &row.rest,
-            rest => return Some(rest),
-        }
+fn semantic_tail(shape: Shape, rest: &Rest) -> Option<&Rest> {
+    match rest {
+        Rest::Closed => None,
+        Rest::Undecided if matches!(shape, Shape::Effect) => None,
+        rest => Some(rest),
     }
 }
 
 fn effect_row_shown(row: &Row) -> bool {
-    visible_fields(row).next().is_some() || visible_tail(Shape::Effect, &row.rest).is_some()
+    let (fields, rest) = flattened_row(row);
+    !fields.is_empty() || semantic_tail(Shape::Effect, rest).is_some()
 }
 
 fn unit_type(ty: &Ty) -> bool {
-    let Ty::Struct(root) = ty else {
+    let Ty::Struct(row) = ty else {
         return false;
     };
-    let mut row = root;
-    loop {
-        if visible_fields(row).next().is_some() {
-            return false;
-        }
-        match &row.rest {
-            Rest::Closed => return true,
-            Rest::More(more) => row = more,
-            _ => return false,
-        }
-    }
+    let (fields, rest) = flattened_row(row);
+    fields.is_empty() && matches!(rest, Rest::Closed)
 }
 
 fn write_semantic_mark(
