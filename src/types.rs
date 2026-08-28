@@ -707,10 +707,14 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
     }
 
     let mut pending = vec![Pair::Ty(left, right)];
+    let mut seen_types = std::collections::HashSet::new();
+    let mut seen_rows = std::collections::HashSet::new();
     while let Some(pair) = pending.pop() {
         match pair {
             Pair::Ty(left, right) => {
-                if std::ptr::eq(left, right) {
+                if std::ptr::eq(left, right)
+                    || !seen_types.insert((left as *const Ty, right as *const Ty))
+                {
                     continue;
                 }
                 match (left, right) {
@@ -767,7 +771,9 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                 }
             }
             Pair::Row(left, right) => {
-                if std::ptr::eq(left, right) {
+                if std::ptr::eq(left, right)
+                    || !seen_rows.insert((left as *const Row, right as *const Row))
+                {
                     continue;
                 }
                 if left.labels.len() != right.labels.len() {

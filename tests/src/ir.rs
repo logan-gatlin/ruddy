@@ -8001,6 +8001,75 @@ fn malformed_nested_imported_applications_recover_during_effect_identity() {
 }
 
 #[test]
+fn deep_acyclic_operation_effect_dependencies_use_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-operation-effect-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 512;
+
+            let mut source = String::new();
+            for index in 0..DEPTH - 1 {
+                source.push_str(&format!(
+                    "effect E{index} = {{ op: (() -> () + !E{}) -> () }}\n",
+                    index + 1
+                ));
+            }
+            source.push_str(&format!("effect E{} = {{ op: () -> () }}", DEPTH - 1));
+
+            let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build(&mut mint, parsed.stmts);
+            assert!(
+                out.errors
+                    .iter()
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                "{:#?}",
+                out.errors
+            );
+            assert_eq!(out.program.effect_ids.len(), DEPTH);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("operation effect dependencies are iterative");
+}
+
+#[test]
+fn deep_local_type_and_effect_identity_dependencies_use_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-local-effect-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+
+            let mut source = String::new();
+            for index in 0..DEPTH - 1 {
+                source.push_str(&format!("type E{index} = E{}\n", index + 1));
+            }
+            source.push_str(&format!(
+                "type E{} = () -> () + !Leaf\n\
+                 effect Probe = {{ inspect: E0 -> () }}\n\
+                 effect Leaf = {{ touch: () -> () }}",
+                DEPTH - 1
+            ));
+
+            let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build(&mut mint, parsed.stmts);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            assert!(out.program.effect_ids.iter().any(|(symbol, identity)| {
+                mint.name(*symbol) == "Probe"
+                    && matches!(identity, ruddy::types::EffectId::Structural { interface, .. } if interface.contains("Leaf"))
+            }));
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("source type/effect identity dependencies are iterative");
+}
+
+#[test]
 fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
     std::thread::Builder::new()
         .name("imported-effect-identity-graph".into())

@@ -204,6 +204,35 @@ fn finite_semantic_syntax_equality_compares_every_identity_and_position() {
     assert!(same_finite_syntax(&shared_ty, &shared_ty));
 }
 
+#[test]
+fn finite_semantic_syntax_equality_memoizes_independent_shared_dags() {
+    fn binary_dag(mut leaf: Rc<Ty>, depth: usize) -> Rc<Ty> {
+        for _ in 0..depth {
+            leaf = Rc::new(Ty::Arrow(leaf.clone(), leaf, Row::closed()));
+        }
+        leaf
+    }
+
+    // These have 41 independently allocated nodes apiece but 2^40 unfolded
+    // paths. Pair memoization must compare the shared presentations, not every
+    // path through their infinite-tree interpretation.
+    let left = binary_dag(Rc::new(Ty::Nat), 40);
+    let right = binary_dag(Rc::new(Ty::Nat), 40);
+    assert!(same_finite_syntax(&left, &right));
+
+    let different = binary_dag(Rc::new(Ty::Int), 40);
+    assert!(!same_finite_syntax(&left, &different));
+
+    // Distinct type wrappers can also converge on one shared `Rest::More`
+    // pair, so row pairs need the same memoization as type pairs.
+    let left_row = Rc::new(Row::closed());
+    let right_row = Rc::new(Row::closed());
+    let wrap = |row: &Rc<Row>| Rc::new(Ty::Struct(Row::of(Rest::More(row.clone()))));
+    let left = Rc::new(Ty::pure(wrap(&left_row), wrap(&left_row)));
+    let right = Rc::new(Ty::pure(wrap(&right_row), wrap(&right_row)));
+    assert!(same_finite_syntax(&left, &right));
+}
+
 fn pending_effect() -> EffectId {
     let bundle = Bundle::new("test", Version::new(1, 0, 0)).expect("valid bundle");
     let mut mint = Mint::new(bundle);
@@ -340,6 +369,10 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
     // scheme hands over — the variable itself.
     let fresh = Assigned::Ty(Rc::new(Ty::plain(Ty::Var(7))));
     assert!(matches!(fresh.as_row().rest, Rest::Var(7)));
+    let structure = Assigned::Ty(Rc::new(Ty::Struct(Row::closed())));
+    let sum = Assigned::Ty(Rc::new(Ty::Sum(Row::closed())));
+    assert!(matches!(structure.as_row().rest, Rest::Closed));
+    assert!(matches!(sum.as_row().rest, Rest::Closed));
     assert!(matches!(nat.as_row().rest, Rest::Undecided));
 
     // And the pairs no position can produce say nothing rather than inventing

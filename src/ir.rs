@@ -2987,49 +2987,34 @@ fn structuralize_effects(
     // replacing the map with local-only identities silently dropped every
     // dependency effect from local declared types.
     let mut ids = program.effect_ids.clone();
-    ids.extend(
-        program
-            .effects
-            .iter()
-            .filter_map(|(symbol, decl)| match &decl.value {
-                Effect::Operations(operations) => {
-                    let mut interface: Vec<_> = operations
-                        .iter()
-                        .map(|(name, op)| {
-                            let mut effects_seen = HashSet::new();
-                            format!(
-                                "{}:{}->{}",
-                                name.canonical(),
-                                canonical_type(
-                                    &op.from,
-                                    &program.types,
-                                    &program.effects,
-                                    &program.external_types,
-                                    &program.effect_ids,
-                                    mint,
-                                    &mut effects_seen,
-                                ),
-                                canonical_type(
-                                    &op.to,
-                                    &program.types,
-                                    &program.effects,
-                                    &program.external_types,
-                                    &program.effect_ids,
-                                    mint,
-                                    &mut effects_seen,
-                                )
-                            )
-                        })
-                        .collect();
-                    interface.sort();
-                    Some((
-                        *symbol,
-                        EffectId::structural(mint.name(*symbol).to_string(), interface.join("|")),
-                    ))
-                }
-                Effect::Alias(_) => None,
-            }),
-    );
+    let operation_effects: Vec<_> = program
+        .effects
+        .iter()
+        .filter_map(|(symbol, decl)| match &decl.value {
+            Effect::Operations(operations) => Some((*symbol, operations)),
+            Effect::Alias(_) => None,
+        })
+        .collect();
+    let local_ids = {
+        let mut canonical = EffectCanonicalizer::new(
+            &program.types,
+            &program.effects,
+            &program.external_types,
+            &program.effect_ids,
+            mint,
+        );
+        operation_effects
+            .into_iter()
+            .map(|(symbol, operations)| {
+                let interface = canonical.canonical_interface(operations);
+                (
+                    symbol,
+                    EffectId::structural(mint.name(symbol).to_string(), interface),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    ids.extend(local_ids);
     program.effect_ids = ids.clone();
     for decl in program.effects.values_mut() {
         match &mut decl.value {
@@ -3092,11 +3077,8 @@ struct RegularNode {
 /// than the particular collection of aliases which happened to present it.
 struct RegularType<'a> {
     types: &'a IndexMap<Symbol, Decl<Type>>,
-    effects: &'a IndexMap<Symbol, Decl<Effect>>,
     external_types: &'a IndexMap<Symbol, ExternalType>,
-    effect_ids: &'a IndexMap<Symbol, EffectId>,
-    mint: &'a Mint,
-    effects_seen: &'a mut HashSet<Symbol>,
+    effect_interfaces: &'a HashMap<Symbol, String>,
     nodes: Vec<RegularNode>,
     /// Hash-consing makes semantic argument identity independent of the path
     /// which built it. In particular, `T Nat` reached around a recursive
@@ -3157,137 +3139,200 @@ impl RegularType<'_> {
         self.node("fields", edges)
     }
 
+    /// Build source syntax, local named declarations, and effect rows with one
+    /// continuation stack. Effect spellings have already been resolved by the
+    /// outer dependency work list, so crossing type/effect/type boundaries
+    /// never re-enters this walk on the native stack.
     fn source(&mut self, ty: &Type, args: &[usize]) -> usize {
-        match &ty.tracked {
-            TypeKind::Struct { fields, tail } => {
-                let core = self.source_core_tail(tail, args);
-                let fields = fields
-                    .iter()
-                    .map(|(name, field)| match field {
-                        TypeField::Written { when, value, .. } => (
-                            name.clone(),
-                            canonical_written_presence(when),
-                            self.source(value, args),
-                        ),
-                        TypeField::Absent { .. } => (name.clone(), "\\".into(), self.atom("?")),
-                    })
-                    .collect();
-                self.with_fields(core, fields)
-            }
-            TypeKind::Sum { cases, tail } => {
-                let mut edges = Vec::new();
-                for (name, case) in cases {
-                    let (presence, payload) = match case {
-                        SumCase::Written { when, payload, .. } => (
-                            canonical_written_presence(when),
-                            payload
-                                .as_ref()
-                                .map(|ty| self.source(ty, args))
-                                .unwrap_or_else(|| self.atom("Unit")),
-                        ),
-                        SumCase::Absent { .. } => ("\\".into(), self.atom("?")),
-                    };
-                    edges.push((format!("label:{name}:{presence}"), payload));
+        enum Work<'a> {
+            Type(&'a Type, Vec<usize>),
+            CoreTail(&'a Option<Tail>, Vec<usize>),
+            RowTail(&'a Option<Tail>, Vec<usize>),
+            EffectRow(&'a EffectRow, Vec<usize>),
+            Named(Symbol, Vec<usize>),
+            Apply(Symbol, usize),
+            FinishNamed(usize),
+            Make(String, Vec<String>),
+            Fields(Vec<(String, String)>),
+            Atom(String),
+        }
+
+        let mut work = vec![Work::Type(ty, args.to_vec())];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Atom(label) => values.push(self.atom(label)),
+                Work::Make(label, edge_labels) => {
+                    let start = values.len() - edge_labels.len();
+                    let children = values.split_off(start);
+                    values.push(self.node(label, edge_labels.into_iter().zip(children).collect()));
                 }
-                edges.push(("tail".into(), self.source_row_tail(tail, args)));
-                self.node("sum", edges)
+                Work::Fields(fields) => {
+                    let start = values.len() - fields.len() - 1;
+                    let mut children = values.split_off(start).into_iter();
+                    let core = children.next().expect("fields have a core");
+                    let fields = fields
+                        .into_iter()
+                        .zip(children)
+                        .map(|((name, presence), ty)| (name, presence, ty))
+                        .collect();
+                    values.push(self.with_fields(core, fields));
+                }
+                Work::Type(ty, args) => match &ty.tracked {
+                    TypeKind::Struct { fields, tail } => {
+                        let labels = fields
+                            .iter()
+                            .map(|(name, field)| {
+                                let presence = match field {
+                                    TypeField::Written { when, .. } => {
+                                        canonical_written_presence(when)
+                                    }
+                                    TypeField::Absent { .. } => "\\".into(),
+                                };
+                                (name.clone(), presence)
+                            })
+                            .collect();
+                        work.push(Work::Fields(labels));
+                        for field in fields.values().rev() {
+                            match field {
+                                TypeField::Written { value, .. } => {
+                                    work.push(Work::Type(value, args.clone()))
+                                }
+                                TypeField::Absent { .. } => work.push(Work::Atom("?".into())),
+                            }
+                        }
+                        work.push(Work::CoreTail(tail, args));
+                    }
+                    TypeKind::Sum { cases, tail } => {
+                        let labels = cases
+                            .iter()
+                            .map(|(name, case)| {
+                                let presence = match case {
+                                    SumCase::Written { when, .. } => {
+                                        canonical_written_presence(when)
+                                    }
+                                    SumCase::Absent { .. } => "\\".into(),
+                                };
+                                format!("label:{name}:{presence}")
+                            })
+                            .chain(std::iter::once("tail".into()))
+                            .collect();
+                        work.push(Work::Make("sum".into(), labels));
+                        work.push(Work::RowTail(tail, args.clone()));
+                        for case in cases.values().rev() {
+                            match case {
+                                SumCase::Written {
+                                    payload: Some(payload),
+                                    ..
+                                } => work.push(Work::Type(payload, args.clone())),
+                                SumCase::Written { payload: None, .. } => {
+                                    work.push(Work::Atom("Unit".into()))
+                                }
+                                SumCase::Absent { .. } => work.push(Work::Atom("?".into())),
+                            }
+                        }
+                    }
+                    TypeKind::Arrow { from, to, effects } => {
+                        work.push(Work::Make(
+                            "arrow".into(),
+                            vec!["from".into(), "to".into(), "effects".into()],
+                        ));
+                        work.push(Work::EffectRow(effects, args.clone()));
+                        work.push(Work::Type(to, args.clone()));
+                        work.push(Work::Type(from, args));
+                    }
+                    TypeKind::Ident(symbol) => work.push(Work::Named(*symbol, Vec::new())),
+                    TypeKind::Apply {
+                        head,
+                        args: applied,
+                        ..
+                    } => {
+                        work.push(Work::Apply(*head, applied.len()));
+                        work.extend(
+                            applied
+                                .iter()
+                                .rev()
+                                .map(|argument| Work::Type(argument, args.clone())),
+                        );
+                    }
+                    TypeKind::Param { index, .. } => {
+                        values.push(self.argument(&args, *index));
+                    }
+                    TypeKind::Prim(prim) => values.push(self.atom(format!("{prim:?}"))),
+                    TypeKind::Effects(row) => work.push(Work::EffectRow(row, args)),
+                    TypeKind::Var(_) | TypeKind::Hole | TypeKind::Error => {
+                        values.push(self.atom("?"));
+                    }
+                },
+                Work::CoreTail(tail, args) => {
+                    let value = match tail.as_ref().map(|tail| &tail.of) {
+                        Some(Row::Param { index, .. }) => self.argument(&args, *index),
+                        _ => self.atom("Unit"),
+                    };
+                    values.push(value);
+                }
+                Work::RowTail(tail, args) => {
+                    let value = match tail.as_ref().map(|tail| &tail.of) {
+                        Some(Row::Anything) => self.atom("?"),
+                        Some(Row::Param { index, .. }) => self.argument(&args, *index),
+                        _ => self.atom("closed"),
+                    };
+                    values.push(value);
+                }
+                Work::EffectRow(row, args) => {
+                    let labels = row
+                        .effects
+                        .values()
+                        .map(|label| {
+                            let effect = &self.effect_interfaces[&label.symbol()];
+                            let presence = match label {
+                                EffectLabel::Written { when, .. } => {
+                                    canonical_written_presence(when)
+                                }
+                                EffectLabel::Absent { .. } => "\\".into(),
+                            };
+                            format!("label:{effect}:{presence}")
+                        })
+                        .chain(std::iter::once("tail".into()))
+                        .collect();
+                    work.push(Work::Make("sum".into(), labels));
+                    work.push(Work::RowTail(&row.tail, args));
+                    for _ in row.effects.values().rev() {
+                        work.push(Work::Atom("Unit".into()));
+                    }
+                }
+                Work::Apply(symbol, count) => {
+                    let start = values.len() - count;
+                    let args = values.split_off(start);
+                    work.push(Work::Named(symbol, args));
+                }
+                Work::Named(symbol, args) => {
+                    let key = (symbol, args.clone());
+                    if let Some(id) = self.named.get(&key) {
+                        values.push(*id);
+                    } else if let Some(decl) = self.types.get(&symbol) {
+                        let id = self.placeholder();
+                        self.named.insert(key, id);
+                        work.push(Work::FinishNamed(id));
+                        work.push(Work::Type(&decl.value, args));
+                    } else {
+                        // Imported semantic trees have their own iterative
+                        // continuation walk and share this graph's named memo.
+                        let id = self.semantic_work(symbol, args);
+                        values.push(id);
+                    }
+                }
+                Work::FinishNamed(id) => {
+                    let body = values.pop().expect("named bodies produce one graph node");
+                    // Bare aliases were rejected during recursion
+                    // classification, so a local declaration always reaches a
+                    // distinct body node.
+                    self.nodes[id] = self.nodes[body].clone();
+                    values.push(id);
+                }
             }
-            TypeKind::Arrow { from, to, effects } => {
-                let from = self.source(from, args);
-                let to = self.source(to, args);
-                let effects = self.source_effect_row(effects, args);
-                self.node(
-                    "arrow",
-                    vec![
-                        ("from".into(), from),
-                        ("to".into(), to),
-                        ("effects".into(), effects),
-                    ],
-                )
-            }
-            TypeKind::Ident(symbol) => self.named(*symbol, Vec::new()),
-            TypeKind::Apply {
-                head,
-                args: applied,
-                ..
-            } => {
-                let applied = applied.iter().map(|arg| self.source(arg, args)).collect();
-                self.named(*head, applied)
-            }
-            TypeKind::Param { index, .. } => self.argument(args, *index),
-            TypeKind::Prim(prim) => self.atom(format!("{prim:?}")),
-            TypeKind::Effects(row) => self.source_effect_row(row, args),
-            // Free variables and recovery nodes cannot survive in a declared
-            // operation signature; both share the recovery spelling here.
-            _ => self.atom("?"),
         }
-    }
-
-    fn source_core_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
-        match tail.as_ref().map(|tail| &tail.of) {
-            Some(Row::Param { index, .. }) => self.argument(args, *index),
-            // Canonicalized source types are declarations: an open or named
-            // annotation tail never reaches this walk.
-            _ => self.atom("Unit"),
-        }
-    }
-
-    fn source_row_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
-        match tail.as_ref().map(|tail| &tail.of) {
-            Some(Row::Anything) => self.atom("?"),
-            Some(Row::Param { index, .. }) => self.argument(args, *index),
-            // A free named row tail belongs only to an annotation, while a
-            // canonicalized declaration is otherwise closed.
-            _ => self.atom("closed"),
-        }
-    }
-
-    fn source_effect_row(&mut self, row: &EffectRow, args: &[usize]) -> usize {
-        let mut edges = Vec::new();
-        for label in row.effects.values() {
-            let effect = canonical_effect(
-                label.symbol(),
-                self.types,
-                self.effects,
-                self.external_types,
-                self.effect_ids,
-                self.mint,
-                self.effects_seen,
-            );
-            let presence = match label {
-                EffectLabel::Written { when, .. } => canonical_written_presence(when),
-                EffectLabel::Absent { .. } => "\\".into(),
-            };
-            let unit = self.atom("Unit");
-            edges.push((format!("label:{effect}:{presence}"), unit));
-        }
-        let tail = self.source_row_tail(&row.tail, args);
-        edges.push(("tail".into(), tail));
-        self.node("sum", edges)
-    }
-
-    fn named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
-        let key = (symbol, args.clone());
-        if let Some(id) = self.named.get(&key) {
-            return *id;
-        }
-        if let Some(decl) = self.types.get(&symbol) {
-            let id = self.placeholder();
-            self.named.insert(key, id);
-            let body = self.source(&decl.value, &args);
-            // Bare alias cycles are replaced during recursion classification;
-            // every declaration reaching canonicalization has a distinct body node.
-            self.nodes[id] = self.nodes[body].clone();
-            id
-        } else {
-            // Imported semantic trees (including all nested named
-            // applications) are built by one explicit continuation stack.
-            self.semantic_named(symbol, args)
-        }
-    }
-
-    fn semantic_named(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
-        self.semantic_work(symbol, args)
+        values.pop().expect("a source type has one graph root")
     }
 
     /// Build imported semantic types without borrowing the host stack. The
@@ -3647,30 +3692,6 @@ fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
         .collect()
 }
 
-fn canonical_type(
-    ty: &Type,
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    external_types: &IndexMap<Symbol, ExternalType>,
-    effect_ids: &IndexMap<Symbol, EffectId>,
-    mint: &Mint,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    let mut graph = RegularType {
-        types,
-        effects,
-        external_types,
-        effect_ids,
-        mint,
-        effects_seen,
-        nodes: Vec::new(),
-        interned: HashMap::new(),
-        named: HashMap::new(),
-    };
-    let root = graph.source(ty, &[]);
-    graph.encode(root)
-}
-
 /// Imported and source effect labels share this structural spelling.
 fn canonical_effect_key(name: &str) -> String {
     match name.split_once('\u{1f}') {
@@ -3689,89 +3710,276 @@ fn canonical_written_presence(when: &Option<Box<When>>) -> String {
     }
 }
 
-/// One effect's module-independent interface, descending through effect rows.
-/// Effect cycles terminate at a module-independent interface back edge.
-#[allow(clippy::too_many_arguments)]
-fn canonical_effect(
-    symbol: Symbol,
-    types: &IndexMap<Symbol, Decl<Type>>,
-    effects: &IndexMap<Symbol, Decl<Effect>>,
-    external_types: &IndexMap<Symbol, ExternalType>,
-    effect_ids: &IndexMap<Symbol, EffectId>,
-    mint: &Mint,
-    effects_seen: &mut HashSet<Symbol>,
-) -> String {
-    let name = match effect_ids.get(&symbol) {
-        Some(EffectId::Structural { name, .. }) => name.as_str(),
-        _ => mint.name(symbol),
-    };
-    if !effects_seen.insert(symbol) {
-        return format!("!{name}<rec>");
+/// Collect all source effect labels reached by a type's regular local named
+/// graph. A label does not depend on type arguments, so each declaration body
+/// needs visiting only once even when applications form a cycle.
+fn type_effect_dependencies<'a>(
+    root: &'a Type,
+    types: &'a IndexMap<Symbol, Decl<Type>>,
+) -> Vec<Symbol> {
+    let mut pending = vec![root];
+    let mut named_seen = HashSet::new();
+    let mut dependencies = Vec::new();
+    while let Some(ty) = pending.pop() {
+        match &ty.tracked {
+            TypeKind::Struct { fields, .. } => {
+                pending.extend(fields.values().rev().filter_map(|field| match field {
+                    TypeField::Written { value, .. } => Some(value),
+                    TypeField::Absent { .. } => None,
+                }));
+            }
+            TypeKind::Sum { cases, .. } => {
+                pending.extend(cases.values().rev().filter_map(|case| match case {
+                    SumCase::Written {
+                        payload: Some(payload),
+                        ..
+                    } => Some(payload),
+                    SumCase::Written { payload: None, .. } | SumCase::Absent { .. } => None,
+                }));
+            }
+            TypeKind::Arrow { from, to, effects } => {
+                dependencies.extend(effects.effects.values().map(EffectLabel::symbol));
+                pending.push(to);
+                pending.push(from);
+            }
+            TypeKind::Ident(symbol) => {
+                if named_seen.insert(*symbol)
+                    && let Some(decl) = types.get(symbol)
+                {
+                    pending.push(&decl.value);
+                }
+            }
+            TypeKind::Apply {
+                head,
+                args: applied,
+                ..
+            } => {
+                if named_seen.insert(*head)
+                    && let Some(decl) = types.get(head)
+                {
+                    pending.push(&decl.value);
+                }
+                pending.extend(applied.iter().rev());
+            }
+            TypeKind::Effects(effects) => {
+                dependencies.extend(effects.effects.values().map(EffectLabel::symbol));
+            }
+            TypeKind::Param { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole
+            | TypeKind::Error => {}
+        }
     }
-    let interface = match effects.get(&symbol).map(|decl| &decl.value) {
-        Some(Effect::Operations(operations)) => {
-            let mut operations: Vec<_> = operations
-                .iter()
-                .map(|(name, operation)| {
-                    format!(
-                        "{}:{}->{}",
-                        name.canonical(),
-                        canonical_type(
-                            &operation.from,
-                            types,
-                            effects,
-                            external_types,
-                            effect_ids,
-                            mint,
-                            effects_seen,
-                        ),
-                        canonical_type(
-                            &operation.to,
-                            types,
-                            effects,
-                            external_types,
-                            effect_ids,
-                            mint,
-                            effects_seen,
-                        )
-                    )
-                })
-                .collect();
-            operations.sort();
-            operations.join("|")
+    dependencies
+}
+
+#[derive(Clone)]
+struct CanonicalValue {
+    spelling: String,
+}
+
+/// Canonicalize the complete effect/type/effect dependency graph with an
+/// explicit continuation stack. Completed acyclic effects are memoized across
+/// all local identities. Values containing a recovery back edge remain
+/// path-sensitive and therefore are deliberately not cached.
+struct EffectCanonicalizer<'a> {
+    types: &'a IndexMap<Symbol, Decl<Type>>,
+    effects: &'a IndexMap<Symbol, Decl<Effect>>,
+    external_types: &'a IndexMap<Symbol, ExternalType>,
+    effect_ids: &'a IndexMap<Symbol, EffectId>,
+    mint: &'a Mint,
+    active: HashSet<Symbol>,
+    cache: HashMap<Symbol, CanonicalValue>,
+}
+
+impl<'a> EffectCanonicalizer<'a> {
+    fn new(
+        types: &'a IndexMap<Symbol, Decl<Type>>,
+        effects: &'a IndexMap<Symbol, Decl<Effect>>,
+        external_types: &'a IndexMap<Symbol, ExternalType>,
+        effect_ids: &'a IndexMap<Symbol, EffectId>,
+        mint: &'a Mint,
+    ) -> Self {
+        Self {
+            types,
+            effects,
+            external_types,
+            effect_ids,
+            mint,
+            active: HashSet::new(),
+            cache: HashMap::new(),
         }
-        // Aliases have already expanded out of ordinary rows. Keeping this
-        // branch total makes malformed recovery rows deterministic too.
-        Some(Effect::Alias(named)) => {
-            let mut named: Vec<_> = named
-                .values()
-                .map(|named| {
-                    canonical_effect(
-                        named.symbol,
-                        types,
-                        effects,
-                        external_types,
-                        effect_ids,
-                        mint,
-                        effects_seen,
-                    )
-                })
-                .collect();
-            named.sort();
-            named.join("+")
+    }
+
+    fn name(&self, symbol: Symbol) -> &str {
+        match self.effect_ids.get(&symbol) {
+            Some(EffectId::Structural { name, .. }) => name,
+            _ => self.mint.name(symbol),
         }
-        None => match effect_ids.get(&symbol) {
-            // Imported operation effects carry the interface published by
-            // their artifact (or the recovery identity synthesized at import).
-            Some(EffectId::Structural { interface, .. }) => interface.clone(),
-            // An imported alias cycle has no finite structural identity. It
-            // may still occur in a recovery type, which remains total and gets
-            // the same unknown spelling as any other missing identity.
-            _ => "?".to_string(),
-        },
-    };
-    effects_seen.remove(&symbol);
-    format!("!{name}<{interface}>")
+    }
+
+    /// Build a declared operation effect's interface in the same context as
+    /// the original root walk: the root itself is not active until an
+    /// operation row names it. This preserves the one finite unrolling used by
+    /// recursive recovery identities, while nested effects use `Effect` below.
+    fn canonical_interface(
+        &mut self,
+        operations: &'a IndexMap<OperationSelector, Operation>,
+    ) -> String {
+        self.run(CanonicalWork::Interface(operations)).spelling
+    }
+
+    fn run(&mut self, root: CanonicalWork<'a>) -> CanonicalValue {
+        let mut work = vec![root];
+        let mut values: Vec<CanonicalValue> = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                CanonicalWork::Interface(operations) => {
+                    let names = operations.keys().map(|name| name.canonical()).collect();
+                    work.push(CanonicalWork::FinishInterface(names));
+                    for operation in operations.values().rev() {
+                        work.push(CanonicalWork::Type(&operation.to));
+                        work.push(CanonicalWork::Type(&operation.from));
+                    }
+                }
+                CanonicalWork::FinishInterface(names) => {
+                    let start = values.len() - names.len() * 2;
+                    let mut types = values.split_off(start).into_iter();
+                    let mut operations: Vec<_> = names
+                        .into_iter()
+                        .map(|name| {
+                            let from = types.next().expect("an operation has an input");
+                            let to = types.next().expect("an operation has an output");
+                            format!("{name}:{}->{}", from.spelling, to.spelling)
+                        })
+                        .collect();
+                    operations.sort();
+                    values.push(CanonicalValue {
+                        spelling: operations.join("|"),
+                    });
+                }
+                CanonicalWork::Type(ty) => {
+                    let dependencies = type_effect_dependencies(ty, self.types);
+                    work.push(CanonicalWork::FinishType(ty, dependencies.clone()));
+                    work.extend(dependencies.into_iter().rev().map(CanonicalWork::Effect));
+                }
+                CanonicalWork::FinishType(ty, dependencies) => {
+                    let start = values.len() - dependencies.len();
+                    let resolved = dependencies
+                        .into_iter()
+                        .zip(values.split_off(start))
+                        .map(|(symbol, value)| (symbol, value.spelling))
+                        .collect();
+                    let mut graph = RegularType {
+                        types: self.types,
+                        external_types: self.external_types,
+                        effect_interfaces: &resolved,
+                        nodes: Vec::new(),
+                        interned: HashMap::new(),
+                        named: HashMap::new(),
+                    };
+                    let root = graph.source(ty, &[]);
+                    values.push(CanonicalValue {
+                        spelling: graph.encode(root),
+                    });
+                }
+                CanonicalWork::Effect(symbol) => {
+                    let name = self.name(symbol).to_string();
+                    if self.active.contains(&symbol) {
+                        values.push(CanonicalValue {
+                            spelling: format!("!{name}<rec>"),
+                        });
+                    } else if let Some(value) = self.cache.get(&symbol) {
+                        values.push(value.clone());
+                    } else {
+                        self.active.insert(symbol);
+                        match self.effects.get(&symbol).map(|decl| &decl.value) {
+                            Some(Effect::Operations(operations)) => {
+                                let names =
+                                    operations.keys().map(|name| name.canonical()).collect();
+                                work.push(CanonicalWork::FinishOperations(symbol, name, names));
+                                for operation in operations.values().rev() {
+                                    work.push(CanonicalWork::Type(&operation.to));
+                                    work.push(CanonicalWork::Type(&operation.from));
+                                }
+                            }
+                            Some(Effect::Alias(named)) => {
+                                work.push(CanonicalWork::FinishAlias(symbol, name, named.len()));
+                                work.extend(
+                                    named
+                                        .values()
+                                        .rev()
+                                        .map(|named| CanonicalWork::Effect(named.symbol)),
+                                );
+                            }
+                            None => {
+                                let interface = match self.effect_ids.get(&symbol) {
+                                    Some(EffectId::Structural { interface, .. }) => {
+                                        interface.clone()
+                                    }
+                                    _ => "?".into(),
+                                };
+                                self.finish_effect(symbol, name, interface, &mut values);
+                            }
+                        }
+                    }
+                }
+                CanonicalWork::FinishOperations(symbol, name, names) => {
+                    let start = values.len() - names.len() * 2;
+                    let mut types = values.split_off(start).into_iter();
+                    let mut operations: Vec<_> = names
+                        .into_iter()
+                        .map(|name| {
+                            let from = types.next().expect("an operation has an input");
+                            let to = types.next().expect("an operation has an output");
+                            format!("{name}:{}->{}", from.spelling, to.spelling)
+                        })
+                        .collect();
+                    operations.sort();
+                    self.finish_effect(symbol, name, operations.join("|"), &mut values);
+                }
+                CanonicalWork::FinishAlias(symbol, name, count) => {
+                    let start = values.len() - count;
+                    let mut named: Vec<_> = values
+                        .split_off(start)
+                        .into_iter()
+                        .map(|value| value.spelling)
+                        .collect();
+                    named.sort();
+                    self.finish_effect(symbol, name, named.join("+"), &mut values);
+                }
+            }
+        }
+        values.pop().expect("canonical work produces one value")
+    }
+
+    fn finish_effect(
+        &mut self,
+        symbol: Symbol,
+        name: String,
+        interface: String,
+        values: &mut Vec<CanonicalValue>,
+    ) {
+        self.active.remove(&symbol);
+        let value = CanonicalValue {
+            spelling: format!("!{name}<{interface}>"),
+        };
+        if !value.spelling.contains("<rec>") {
+            self.cache.insert(symbol, value.clone());
+        }
+        values.push(value);
+    }
+}
+
+enum CanonicalWork<'a> {
+    Interface(&'a IndexMap<OperationSelector, Operation>),
+    FinishInterface(Vec<String>),
+    Type(&'a Type),
+    Effect(Symbol),
+    FinishType(&'a Type, Vec<Symbol>),
+    FinishOperations(Symbol, String, Vec<String>),
+    FinishAlias(Symbol, String, usize),
 }
 
 fn rekey_row(row: &mut EffectRow, ids: &IndexMap<Symbol, EffectId>, errors: &mut Vec<Error>) {
