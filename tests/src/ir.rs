@@ -7736,6 +7736,48 @@ fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
 }
 
 #[test]
+fn malformed_nested_imported_applications_recover_during_effect_identity() {
+    let mut dependency = effect_artifact("dep", "bad-nested-arity");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Box".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Broken".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Box".into(),
+                args: Vec::new(),
+            }),
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Local = { op: dep::Broken -> () }\nlet value = 1n",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(out.program.effect_ids.values().any(|identity| {
+        matches!(identity, ruddy::types::EffectId::Structural { name, .. } if name == "Local")
+    }));
+}
+
+#[test]
 fn forwarded_field_addition_respects_outer_absent_shadowing() {
     let mut dependency = effect_artifact("dep", "shadow");
     dependency.header.types = vec![a::DeclaredType {
@@ -7987,6 +8029,10 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             dependency.header.types.push(a::DeclaredType {
                 name: "dep@1.0.0::Deep".into(),
                 params: Vec::new(),
+                scheme: artifact_scheme(a::Type::Nat),
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::deep_type".into(),
                 scheme: artifact_scheme(body),
             });
             dependency.header.values.push(a::Value {
@@ -8010,27 +8056,39 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
 
             // Importing alone only clamps the tree. Naming the value also
             // instantiates, substitutes, reads, and solves the deep formula.
-            let parsed =
-                parse::parse(lex("let answer = dep::deep_formula", FileID::GENERATED).tokens);
+            let parsed = parse::parse(
+                lex(
+                    "let answer = dep::deep_formula\nlet typed = dep::deep_type",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
             let mut mint = dummy_mint();
             let dependencies = vec![dependency];
             let out = build_with_dependencies(&mut mint, parsed.stmts, &dependencies);
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             assert!(out.program.external_types.len() >= 2);
-            assert_eq!(out.program.external_schemes.len(), 2);
+            assert_eq!(out.program.external_schemes.len(), 3);
             assert_eq!(
                 out.program
                     .external_schemes
                     .values()
                     .filter(|scheme| scheme.formula().is_true())
                     .count(),
-                1
+                2
             );
+
+            // Naming both values semantically instantiates the deep formula
+            // and the deep arrow/name/field-payload type on this small stack.
+            let mut program = out.program;
+            let inferred = inference::infer(&mint, &mut program);
+            assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
 
             // Recursive ownership is not what this regression measures. Both
             // imported representations remain live until the bounded-stack
-            // import has demonstrably completed.
-            std::mem::forget(out);
+            // semantic use has demonstrably completed.
+            std::mem::forget(program);
+            std::mem::forget(inferred);
             std::mem::forget(dependencies);
         })
         .expect("the bounded-stack regression thread starts")

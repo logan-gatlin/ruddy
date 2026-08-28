@@ -3107,6 +3107,15 @@ impl RegularType<'_> {
         self.node(value, Vec::new())
     }
 
+    /// Select one applied parameter, recovering malformed imported arity with
+    /// the ordinary unknown node. Source applications are already arity-checked;
+    /// sharing this lookup keeps both presentations bounds-safe.
+    fn argument(&mut self, args: &[usize], index: u32) -> usize {
+        args.get(index as usize)
+            .copied()
+            .unwrap_or_else(|| self.atom("?"))
+    }
+
     fn with_fields(&mut self, core: usize, fields: Vec<(String, String, usize)>) -> usize {
         if fields.is_empty() {
             return core;
@@ -3178,7 +3187,7 @@ impl RegularType<'_> {
                 let applied = applied.iter().map(|arg| self.source(arg, args)).collect();
                 self.named(*head, applied)
             }
-            TypeKind::Param { index, .. } => args[*index as usize],
+            TypeKind::Param { index, .. } => self.argument(args, *index),
             TypeKind::Prim(prim) => self.atom(format!("{prim:?}")),
             TypeKind::Effects(row) => self.source_effect_row(row, args),
             // Free variables and recovery nodes cannot survive in a declared
@@ -3189,7 +3198,7 @@ impl RegularType<'_> {
 
     fn source_core_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
         match tail.as_ref().map(|tail| &tail.of) {
-            Some(Row::Param { index, .. }) => args[*index as usize],
+            Some(Row::Param { index, .. }) => self.argument(args, *index),
             // Canonicalized source types are declarations: an open or named
             // annotation tail never reaches this walk.
             _ => self.atom("Unit"),
@@ -3199,7 +3208,7 @@ impl RegularType<'_> {
     fn source_row_tail(&mut self, tail: &Option<Tail>, args: &[usize]) -> usize {
         match tail.as_ref().map(|tail| &tail.of) {
             Some(Row::Anything) => self.atom("?"),
-            Some(Row::Param { index, .. }) => args[*index as usize],
+            Some(Row::Param { index, .. }) => self.argument(args, *index),
             // A free named row tail belongs only to an annotation, while a
             // canonicalized declaration is otherwise closed.
             _ => self.atom("closed"),
@@ -3294,7 +3303,7 @@ impl RegularType<'_> {
             }
             Ty::Struct(r) => self.semantic_fields(r, args),
             Ty::Sum(r) => self.semantic_row(r, args),
-            Ty::Bound(i) => args[*i as usize],
+            Ty::Bound(i) => self.argument(args, *i),
             Ty::Named {
                 symbol,
                 args: applied,
@@ -3325,7 +3334,7 @@ impl RegularType<'_> {
         }
         let tail = match &row.rest {
             Rest::Closed => self.atom("Unit"),
-            Rest::Bound(i) => args[*i as usize],
+            Rest::Bound(i) => self.argument(args, *i),
             Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
             Rest::More(m) => self.semantic_fields(m, args),
         };
@@ -3356,7 +3365,7 @@ impl RegularType<'_> {
         }
         let tail = match &row.rest {
             Rest::Closed => self.atom("closed"),
-            Rest::Bound(id) => args[*id as usize],
+            Rest::Bound(id) => self.argument(args, *id),
             Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
             Rest::More(more) => self.semantic_row(more, args),
         };

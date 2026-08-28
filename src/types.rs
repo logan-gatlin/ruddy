@@ -783,7 +783,7 @@ impl Formula {
         match self {
             Formula::True => Formula::False,
             Formula::False => Formula::True,
-            Formula::Not(inner) => (*inner).clone(),
+            Formula::Not(inner) => Rc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone()),
             other => Formula::Not(Rc::new(other)),
         }
     }
@@ -791,19 +791,39 @@ impl Formula {
     /// Both, with the constants folded away — which is what makes "says
     /// nothing" the value [`Formula::True`] rather than a tree of them.
     pub fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Formula::False, _) | (_, Formula::False) => Formula::False,
-            (Formula::True, kept) | (kept, Formula::True) => kept,
-            (left, right) => Formula::And(Rc::new(left), Rc::new(right)),
+        match self {
+            Formula::False => {
+                drop_formula_iterative(other);
+                Formula::False
+            }
+            Formula::True => other,
+            left => match other {
+                Formula::False => {
+                    drop_formula_iterative(left);
+                    Formula::False
+                }
+                Formula::True => left,
+                right => Formula::And(Rc::new(left), Rc::new(right)),
+            },
         }
     }
 
     /// Either, folded the same way.
     pub fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Formula::True, _) | (_, Formula::True) => Formula::True,
-            (Formula::False, kept) | (kept, Formula::False) => kept,
-            (left, right) => Formula::Or(Rc::new(left), Rc::new(right)),
+        match self {
+            Formula::True => {
+                drop_formula_iterative(other);
+                Formula::True
+            }
+            Formula::False => other,
+            left => match other {
+                Formula::True => {
+                    drop_formula_iterative(left);
+                    Formula::True
+                }
+                Formula::False => left,
+                right => Formula::Or(Rc::new(left), Rc::new(right)),
+            },
         }
     }
 
@@ -1004,6 +1024,35 @@ impl Formula {
             Atom::Var(var) => Formula::var(var),
             Atom::Bound(index) => fresh[index as usize].presence().formula(),
         })
+    }
+}
+
+/// Release an owned formula without recursively dropping its `Rc` tree.
+///
+/// Constructor simplification can throw away an arbitrarily deep operand. It
+/// must first retain every child on an explicit heap stack, so releasing its
+/// parent cannot become the last reference to a deep chain on the host stack.
+pub(crate) fn drop_formula_iterative(root: Formula) {
+    fn retain_children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
+        match formula {
+            Formula::Not(inner) => work.push(inner.clone()),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                work.push(left.clone());
+                work.push(right.clone());
+            }
+            Formula::True | Formula::False | Formula::Atom(_) => {}
+        }
+    }
+
+    let mut work = Vec::new();
+    retain_children(&root, &mut work);
+    drop(root);
+    while let Some(formula) = work.pop() {
+        retain_children(&formula, &mut work);
+        drop(formula);
     }
 }
 

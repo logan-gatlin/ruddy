@@ -606,9 +606,8 @@ fn a_corrupted_container_type_uses_the_written_member_type() {
 }
 
 #[test]
-#[should_panic(expected = "struct pattern on non-struct")]
-fn a_corrupted_non_struct_match_type_is_rejected_by_lir() {
-    let _ = lowered_after_check(
+fn a_corrupted_non_struct_match_type_recovers_in_lir() {
+    let (output, labels) = lowered_after_check(
         "let f = fn s => match s with | { x } => 1n | _ => 2n end",
         |program, _| {
             let definition = &mut program.terms.values_mut().next().unwrap().value;
@@ -621,6 +620,8 @@ fn a_corrupted_non_struct_match_type_is_rejected_by_lir() {
             scrutinee.ty = Rc::new(Ty::Nat);
         },
     );
+    let printed = print::lir::program(&output, &labels);
+    assert!(printed.contains("%1: nat = const 2n"), "{printed}");
 }
 
 fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Presence) {
@@ -1824,6 +1825,30 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
          \x20 %48: any = call %43, %47, %46\n\
          \x20 ret %48"
     );
+}
+
+/// Containers returned by both direct and indirect calls retain the type at
+/// which the callee produced them. Projecting an effect-polymorphic member must
+/// therefore install the same ABI adapters as projecting from a global struct.
+#[test]
+fn call_results_keep_container_production_metadata_for_projection() {
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
+         let stored = { f: fn g => fn n => g n }\n\
+         let direct = fn u => stored\n\
+         let indirect = fn k => k {}\n\
+         let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
+           let a = !Log.write n in let b = !Fail.oops n in n\n\
+         let go = fn w => handle handle\n\
+           let a = (direct {}).f both 1n in\n\
+           (indirect direct).f both a\n\
+           with | !Log.write x => {} end with | !Fail.oops y => {} end";
+    let go = section(source, "fn go(");
+    assert_eq!(go.matches("project ").count(), 2, "{go}");
+    // Each stored `f` is read through a bundle-shaped adapter before being
+    // specialized to the two concrete effect records at this use.
+    assert!(go.matches("closure go#").count() >= 4, "{go}");
+    assert!(go.contains("struct { Fail:") && go.contains("Log:"), "{go}");
 }
 
 /// A struct-pattern projection has the same storage authority as an expression

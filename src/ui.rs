@@ -1562,51 +1562,60 @@ impl Named<'_> {
     /// Write `formula` for a position that binds at least as tightly as
     /// `level`, bracketing it when it does not.
     fn at(&self, f: &mut fmt::Formatter<'_>, formula: &Formula, level: u8) -> fmt::Result {
-        let parens = prec(formula) < level;
-        if parens {
-            f.write_str("(")?;
+        enum Work<'a> {
+            Formula(&'a Formula, u8),
+            Text(&'static str),
+            Close,
         }
-        match formula {
-            // Neither constant has a spelling in the grammar, and neither has
-            // to: a formula that says nothing writes no clause at all, and one
-            // nothing satisfies is a complaint rather than a type. They print
-            // as the words they are, for the debugger and for a message that
-            // has to show one.
-            Formula::True => f.write_str("always")?,
-            Formula::False => f.write_str("never")?,
-            Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
-            Formula::Not(inner) => {
-                f.write_str("not ")?;
-                self.at(f, inner, 3)?;
+
+        let mut work = vec![Work::Formula(formula, level)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => f.write_str(text)?,
+                Work::Close => f.write_str(")")?,
+                Work::Formula(formula, level) => {
+                    let parens = prec(formula) < level;
+                    if parens {
+                        f.write_str("(")?;
+                        work.push(Work::Close);
+                    }
+                    match formula {
+                        // Neither constant has a spelling in the grammar, and
+                        // neither has to: they are debugger/recovery readings.
+                        Formula::True => f.write_str("always")?,
+                        Formula::False => f.write_str("never")?,
+                        Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
+                        Formula::Not(inner) => {
+                            f.write_str("not ")?;
+                            work.push(Work::Formula(inner, 3));
+                        }
+                        // Left-associative, so the right side is written one
+                        // level tighter and retains required parentheses.
+                        Formula::And(left, right) => {
+                            work.push(Work::Formula(right, 3));
+                            work.push(Work::Text(" and "));
+                            work.push(Work::Formula(left, 2));
+                        }
+                        Formula::Or(left, right) => {
+                            work.push(Work::Formula(right, 2));
+                            work.push(Work::Text(" or "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                        // Comparisons are non-associative, so both operands are
+                        // one precedence level tighter.
+                        Formula::Iff(left, right) => {
+                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Text(" = "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                        Formula::Xor(left, right) => {
+                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Text(" != "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                    }
+                }
             }
-            // Left-associative, so the right side is written one level tighter
-            // and a right-nested `or` inside an `or` keeps its parentheses.
-            Formula::And(left, right) => {
-                self.at(f, left, 2)?;
-                f.write_str(" and ")?;
-                self.at(f, right, 3)?;
-            }
-            Formula::Or(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" or ")?;
-                self.at(f, right, 2)?;
-            }
-            // Non-associative, so both sides are written one level tighter: a
-            // comparison inside a comparison takes parentheses, because the
-            // grammar refuses to read one without them.
-            Formula::Iff(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" = ")?;
-                self.at(f, right, 1)?;
-            }
-            Formula::Xor(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" != ")?;
-                self.at(f, right, 1)?;
-            }
-        }
-        if parens {
-            f.write_str(")")?;
         }
         Ok(())
     }

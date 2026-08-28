@@ -10,11 +10,19 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Formula, Presence, Rest, Row, Scheme, Sense, Shape, Ty, TyVar},
+    types::{Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
     Mint::new(Bundle::new("test", Version::new(0, 0, 0)).expect("valid bundle"))
+}
+
+fn semantic_named(symbol: Symbol, args: Vec<Rc<Ty>>) -> Rc<Ty> {
+    Rc::new(Ty::Named {
+        symbol,
+        name: Rc::from("Named"),
+        args: args.into(),
+    })
 }
 
 /// Parse, lower and infer. Only the parse is required to be clean: some tests
@@ -1691,10 +1699,10 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
         Ty::Undecided
     ));
 
-    // Fuel spent before a row-tail substitution is not replenished by the
-    // nested request to learn that argument's shape. This is the semantic form
-    // of `A r = { ..r }; G a = A (G { x: a })`: every application grows, and
-    // only the globally shared budget makes it recovery rather than recursion.
+    // A growing declaration remains active through the row-tail request that
+    // learns its argument's shape. This is the semantic form of
+    // `A r = { ..r }; G a = A (G { x: a })`: re-entering `G` adds another
+    // field, so it recovers rather than recursing forever.
     let row = mint
         .global(None, Namespace::Types, "OpenRow")
         .expect("a fresh row-opening type");
@@ -1734,6 +1742,83 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             ..
         }) if matches!(more.rest, Rest::Undecided)
     ));
+}
+
+#[test]
+fn nested_row_identity_forwarding_neither_spends_fuel_nor_uses_alias_count() {
+    let bundle = Bundle::new("row-id", Version::new(1, 0, 0)).unwrap();
+    let mut mint = Mint::new(bundle);
+    let id = mint
+        .global(None, Namespace::Types, "RowId")
+        .expect("a row identity symbol");
+    let mut aliases = IndexMap::new();
+    aliases.insert(
+        id,
+        Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+    );
+    let empty = Rc::new(Ty::unit());
+    let nested = semantic_named(id, vec![semantic_named(id, vec![empty])]);
+    let opened = inference::unfold(&aliases, &nested);
+    let Ty::Struct(row) = &*opened else {
+        panic!("nested row forwarding was truncated: {opened:?}")
+    };
+    let mut row = row;
+    while let Rest::More(more) = &row.rest {
+        row = more;
+    }
+    assert!(row.labels.is_empty());
+    assert!(matches!(row.rest, Rest::Closed));
+}
+
+#[test]
+fn alias_unfolding_opens_deep_semantic_bodies_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-alias-body-open".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let bundle = Bundle::new("deep-open", Version::new(1, 0, 0)).unwrap();
+            let mut mint = Mint::new(bundle);
+            let alias = mint
+                .global(None, Namespace::Types, "Deep")
+                .expect("an alias symbol");
+            let layer = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a nested name");
+            let mut body = Rc::new(Ty::Bound(0));
+            for depth in 0..30_000 {
+                body = match depth % 3 {
+                    0 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), body, Row::closed())),
+                    1 => Rc::new(Ty::Named {
+                        symbol: layer,
+                        name: Rc::from("Layer"),
+                        args: vec![body].into(),
+                    }),
+                    _ => Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "payload".into(),
+                            RowField {
+                                presence: Presence::Present,
+                                ty: body,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    })),
+                };
+            }
+            let mut aliases = IndexMap::new();
+            aliases.insert(alias, Scheme::new(1, body));
+            let use_ = semantic_named(alias, vec![Rc::new(Ty::Nat)]);
+            let opened = inference::unfold(&aliases, &use_);
+            assert!(!matches!(&*opened, Ty::Undecided));
+            std::mem::forget(aliases);
+            std::mem::forget(use_);
+            std::mem::forget(opened);
+        })
+        .unwrap()
+        .join()
+        .expect("deep alias substitution does not recurse");
 }
 
 #[test]

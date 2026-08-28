@@ -144,11 +144,12 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
 pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
     let mut named = Vec::new();
     formula.atoms(&mut named);
-    let kept: Vec<Atom> = keep
-        .iter()
-        .copied()
-        .filter(|atom| named.contains(atom))
-        .collect();
+    let mut kept: Vec<Atom> = Vec::new();
+    for atom in keep.iter().copied().filter(|atom| named.contains(atom)) {
+        if !kept.contains(&atom) {
+            kept.push(atom);
+        }
+    }
     let Some(cover) = eliminate(formula, &kept) else {
         // More products than [`CUBES`] allows, so what comes back errs the one
         // way it may: `true` says less about the kept atoms than the truth
@@ -186,7 +187,12 @@ fn eliminate(formula: &Formula, kept: &[Atom]) -> Option<Vec<Cube>> {
         justify(formula, true, &|atom| model[&atom], &mut needed);
         let mut cube: Cube = vec![None; kept.len()];
         for (atom, there) in needed {
+            // Justification may visit one atom through several agreeing paths.
+            // Collapse those visits into the one literal a cube can carry, and
+            // discard eliminated atoms outright rather than letting either
+            // affect the projected cover.
             if let Some(at) = kept.iter().position(|known| *known == atom) {
+                debug_assert!(cube[at].is_none_or(|known| known == there));
                 cube[at] = Some(there);
             }
         }

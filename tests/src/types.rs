@@ -358,6 +358,94 @@ fn deep_formula_opening_and_use_site_walks_are_stack_safe() {
         .expect("deep formula opening and reads use bounded stack");
 }
 
+#[test]
+fn deep_formula_display_and_simplifying_destruction_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-formula-display-drop".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let mut formula = Formula::var(0);
+            for _ in 0..30_000 {
+                formula = Formula::Not(Rc::new(formula));
+            }
+            let printed = formula.to_string();
+            assert!(printed.starts_with("not not not "));
+            assert!(printed.ends_with("?0"));
+
+            // Folding this conjunction discards the entire unique Rc chain.
+            // Its release is part of substitution/constructor semantics and
+            // must use the heap worklist rather than recursive Drop.
+            assert_eq!(Formula::False.and(formula), Formula::False);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep formula printing and simplification use bounded stack");
+}
+
+#[test]
+fn malformed_bound_positions_open_to_recovery() {
+    assert!(matches!(&*Ty::Bound(9).open(&[]), Ty::Undecided));
+    let opened = Ty::Struct(Row::of(Rest::Bound(9))).open(&[]);
+    assert!(matches!(
+        &*opened,
+        Ty::Struct(Row {
+            rest: Rest::More(more),
+            ..
+        }) if matches!(more.rest, Rest::Undecided)
+    ));
+}
+
+#[test]
+fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
+    std::thread::Builder::new()
+        .name("deep-type-open".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let bundle = Bundle::new("deep", Version::new(1, 0, 0)).unwrap();
+            let mut mint = Mint::new(bundle);
+            let symbol = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a type symbol");
+            let mut ty = Rc::new(Ty::Bound(0));
+            for depth in 0..30_000 {
+                ty = match depth % 3 {
+                    0 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed())),
+                    1 => Rc::new(Ty::Named {
+                        symbol,
+                        name: Rc::from("Layer"),
+                        args: vec![ty].into(),
+                    }),
+                    _ => Rc::new(Ty::Struct(Row {
+                        labels: [("payload".into(), RowField::present(ty))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    })),
+                };
+            }
+            let opened = ty.open(&[Assigned::Ty(Rc::new(Ty::Nat))]);
+
+            let mut row = Row::of(Rest::Bound(0));
+            for _ in 0..30_000 {
+                row = Row::of(Rest::More(Rc::new(row)));
+            }
+            let row_ty = Ty::Struct(row);
+            let opened_row = row_ty.open(&[Assigned::Ty(Rc::new(Ty::unit()))]);
+            assert!(matches!(&*opened_row, Ty::Struct(_)));
+
+            // The owned semantic trees are deliberately retained: this test is
+            // about substitution and semantic use, not Rust's recursive Rc
+            // destructor for arbitrary public values.
+            std::mem::forget(ty);
+            std::mem::forget(opened);
+            std::mem::forget(row_ty);
+            std::mem::forget(opened_row);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep type and row opening use bounded stack");
+}
+
 /// A third reading of the same machinery, and the only new thing it says is
 /// where it lives: an arrow carries a row beside its two sides, and a bare
 /// `A -> B` is that row closed and empty — which is what pure means, and what

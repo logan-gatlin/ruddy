@@ -2084,6 +2084,10 @@ impl Lower<'_> {
                 args,
             },
         );
+        // Containers, like functions, retain the production type of the
+        // callee's result. A later projection must read members at the stored
+        // ABI before adapting them to this use's instantiation.
+        self.contain(value, &to);
         // What comes back is shaped by the callee's own next level. Where that
         // level pins a function shape down, fit it to what this node stands
         // for; where it does not — an `any` nothing decided — the value is
@@ -2181,6 +2185,7 @@ impl Lower<'_> {
                 // binding or a further application takes it.
                 let to = known.levels[arity - 1].to.clone();
                 self.hold(temp, &to);
+                self.contain(temp, &to);
                 temp
             }
             // Short of a full application, the arguments so far become the
@@ -2623,7 +2628,14 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let row = flat(ty.fields().expect("struct pattern on non-struct"));
+        let exposed = unfold(&self.inference.aliases, ty);
+        let row = match &*exposed {
+            Ty::Struct(row) => flat(row),
+            // Imported recovery types can disagree with the already-recovered
+            // pattern matrix. Treat them as an open unknown row: the fields the
+            // pattern itself names are added below, and lowering remains total.
+            _ => Row::of(Rest::Undecided),
+        };
         let mut named: Vec<(String, Presence, Rc<Ty>)> = row
             .labels
             .iter()

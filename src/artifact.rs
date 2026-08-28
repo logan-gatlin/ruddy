@@ -702,25 +702,65 @@ fn row_field(mint: &Mint, value: &types::RowField) -> RowField {
 }
 
 fn formula(value: &types::Formula) -> Formula {
-    match value {
-        types::Formula::True => Formula::True,
-        types::Formula::False => Formula::False,
-        types::Formula::Atom(types::Atom::Var(value)) => Formula::Var(*value),
-        types::Formula::Atom(types::Atom::Bound(value)) => Formula::Bound(*value),
-        types::Formula::Not(value) => Formula::Not(Box::new(formula(value))),
-        types::Formula::And(left, right) => {
-            Formula::And(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Or(left, right) => {
-            Formula::Or(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Iff(left, right) => {
-            Formula::Iff(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Xor(left, right) => {
-            Formula::Xor(Box::new(formula(left)), Box::new(formula(right)))
+    enum Work<'a> {
+        Formula(&'a types::Formula),
+        Not,
+        Pair(u8),
+    }
+
+    let mut work = vec![Work::Formula(value)];
+    let mut out = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Formula(types::Formula::True) => out.push(Formula::True),
+            Work::Formula(types::Formula::False) => out.push(Formula::False),
+            Work::Formula(types::Formula::Atom(types::Atom::Var(value))) => {
+                out.push(Formula::Var(*value))
+            }
+            Work::Formula(types::Formula::Atom(types::Atom::Bound(value))) => {
+                out.push(Formula::Bound(*value))
+            }
+            Work::Formula(types::Formula::Not(inner)) => {
+                work.push(Work::Not);
+                work.push(Work::Formula(inner));
+            }
+            Work::Formula(types::Formula::And(left, right)) => {
+                work.push(Work::Pair(0));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Or(left, right)) => {
+                work.push(Work::Pair(1));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Iff(left, right)) => {
+                work.push(Work::Pair(2));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Xor(left, right)) => {
+                work.push(Work::Pair(3));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Not => {
+                let inner = out.pop().expect("formula conversion postorder");
+                out.push(Formula::Not(Box::new(inner)));
+            }
+            Work::Pair(kind) => {
+                let right = Box::new(out.pop().expect("right formula conversion postorder"));
+                let left = Box::new(out.pop().expect("left formula conversion postorder"));
+                out.push(match kind {
+                    0 => Formula::And(left, right),
+                    1 => Formula::Or(left, right),
+                    2 => Formula::Iff(left, right),
+                    _ => Formula::Xor(left, right),
+                });
+            }
         }
     }
+    out.pop().expect("a converted formula")
 }
 
 fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
@@ -950,6 +990,10 @@ pub mod text {
     enum S {
         Atom(String),
         Str(String),
+        /// Already-canonical deep syntax. Pretty-printing a 30,000-level list
+        /// would build and render an equally deep document (and quadratic
+        /// indentation); compact syntax remains canonical and stack safe.
+        Raw(String),
         List(Vec<S>),
     }
 
@@ -975,7 +1019,7 @@ pub mod text {
         }
     }
 
-    use S::{Atom as A, List as L, Str as Q};
+    use S::{Atom as A, List as L, Raw, Str as Q};
 
     /// Print one artifact as canonical text, pretty-printed at a fixed width
     /// and always ending in one newline.
@@ -1185,20 +1229,137 @@ pub mod text {
         }
     }
     fn formula(value: &Formula) -> S {
-        match value {
-            Formula::True => A("true".into()),
-            Formula::False => A("false".into()),
-            Formula::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Formula::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Formula::Not(value) => L(vec![A("not".into()), formula(value)]),
-            Formula::And(left, right) => pair("and", left, right),
-            Formula::Or(left, right) => pair("or", left, right),
-            Formula::Iff(left, right) => pair("iff", left, right),
-            Formula::Xor(left, right) => pair("xor", left, right),
+        let mut depth = vec![(value, 1usize)];
+        while let Some((formula, at)) = depth.pop() {
+            if at > 1_024 {
+                return Raw(compact_formula(value));
+            }
+            match formula {
+                Formula::Not(inner) => depth.push((inner, at + 1)),
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    depth.push((right, at + 1));
+                    depth.push((left, at + 1));
+                }
+                Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+            }
         }
+
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Pair(&'static str),
+        }
+        let mut work = vec![Work::Formula(value)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => out.push(A("true".into())),
+                Work::Formula(Formula::False) => out.push(A("false".into())),
+                Work::Formula(Formula::Var(value)) => {
+                    out.push(L(vec![A("var".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Bound(value)) => {
+                    out.push(L(vec![A("bound".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Pair("and"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Pair("or"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Pair("iff"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Pair("xor"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = out.pop().expect("formula text postorder");
+                    out.push(L(vec![A("not".into()), inner]));
+                }
+                Work::Pair(tag) => {
+                    let right = out.pop().expect("right formula text postorder");
+                    let left = out.pop().expect("left formula text postorder");
+                    out.push(L(vec![A(tag.into()), left, right]));
+                }
+            }
+        }
+        out.pop().expect("formula text")
     }
-    fn pair(tag: &str, left: &Formula, right: &Formula) -> S {
-        L(vec![A(tag.into()), formula(left), formula(right)])
+
+    fn compact_formula(root: &Formula) -> String {
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Text(&'static str),
+        }
+        let mut out = String::new();
+        let mut work = vec![Work::Formula(root)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => out.push_str(text),
+                Work::Formula(Formula::True) => out.push_str("true"),
+                Work::Formula(Formula::False) => out.push_str("false"),
+                Work::Formula(Formula::Var(value)) => {
+                    out.push_str("(var ");
+                    out.push_str(&value.to_string());
+                    out.push(')');
+                }
+                Work::Formula(Formula::Bound(value)) => {
+                    out.push_str("(bound ");
+                    out.push_str(&value.to_string());
+                    out.push(')');
+                }
+                Work::Formula(Formula::Not(inner)) => {
+                    out.push_str("(not ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    out.push_str("(and ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    out.push_str("(or ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    out.push_str("(iff ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    out.push_str("(xor ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+            }
+        }
+        out
     }
 
     fn lir(value: &Lir) -> S {
@@ -1428,14 +1589,35 @@ pub mod text {
     }
 
     fn doc(value: &S) -> RcDoc<'_, ()> {
-        match value {
-            A(value) => RcDoc::text(value.as_str()),
-            Q(value) => RcDoc::text(quoted(value)),
-            L(values) => RcDoc::text("(")
-                .append(RcDoc::intersperse(values.iter().map(doc), RcDoc::line()).nest(2))
-                .append(")")
-                .group(),
+        enum Work<'a> {
+            Value(&'a S),
+            List(usize),
         }
+        let mut work = vec![Work::Value(value)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Value(A(value)) | Work::Value(Raw(value)) => {
+                    out.push(RcDoc::text(value.as_str()))
+                }
+                Work::Value(Q(value)) => out.push(RcDoc::text(quoted(value))),
+                Work::Value(L(values)) => {
+                    work.push(Work::List(values.len()));
+                    work.extend(values.iter().rev().map(Work::Value));
+                }
+                Work::List(len) => {
+                    let at = out.len() - len;
+                    let children = out.split_off(at);
+                    out.push(
+                        RcDoc::text("(")
+                            .append(RcDoc::intersperse(children, RcDoc::line()).nest(2))
+                            .append(")")
+                            .group(),
+                    );
+                }
+            }
+        }
+        out.pop().expect("one document root")
     }
 
     fn quoted(value: &str) -> String {

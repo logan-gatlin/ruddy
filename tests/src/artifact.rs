@@ -1168,6 +1168,40 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
 }
 
 #[test]
+fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-artifact-formula-write".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (mint, program, mut inferred, lowered) = compiled("let value = 1n");
+            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let mut formula = types::Formula::var(9)
+                .and(types::Formula::bound(0))
+                .or(types::Formula::True.iff(types::Formula::False))
+                .xor(types::Formula::var(10));
+            for _ in 0..DEPTH {
+                formula = types::Formula::Not(Rc::new(formula));
+            }
+            inferred.schemes.insert(
+                symbol,
+                types::Scheme::constrained(1, 1, Rc::new(types::Ty::Nat), formula),
+            );
+            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+            let printed = artifact.print();
+            assert!(printed.contains("(not"));
+            assert!(printed.contains("(bound 0)"));
+            drop(artifact);
+            // The semantic inference output owns the original Rc chain. Its
+            // public destructor is outside the artifact-boundary regression.
+            std::mem::forget(inferred);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep artifact formula conversion and writing use bounded stack");
+}
+
+#[test]
 fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     const DEPTH: usize = 400;
     let mut value = Artifact {
