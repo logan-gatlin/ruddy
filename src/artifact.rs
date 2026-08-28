@@ -72,7 +72,8 @@ pub struct Header {
     pub identity: Identity,
     /// The bundles this artifact depends on.
     pub dependencies: Vec<Dependency>,
-    /// Every top-level `let`, in source declaration order.
+    /// Every top-level value exported by the bundle. Externs precede `let`s;
+    /// each kind retains its source declaration order.
     pub values: Vec<Value>,
     /// Every declared type, in source declaration order.
     pub types: Vec<DeclaredType>,
@@ -260,8 +261,22 @@ pub enum Formula {
 /// The span-free LIR portion of an artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lir {
+    /// Target-provided values, in source order for an unlinked artifact and
+    /// dependency-first artifact order after linking.
+    pub externs: Vec<Extern>,
     pub functions: Vec<Function>,
     pub globals: Vec<Global>,
+}
+
+/// One target-provided value in a backend import table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extern {
+    /// The qualified Ruddy name used by [`Op::Global`] references.
+    pub name: QualifiedName,
+    /// The nonempty target namespace path, whose nonempty segments are joined
+    /// with dots by a backend (for example, `["console", "log"]`).
+    pub target: Vec<String>,
+    pub rep: Rep,
 }
 
 /// A lifted LIR function.
@@ -475,12 +490,16 @@ pub fn build_with_dependencies(
         },
         dependencies,
         values: program
-            .terms
+            .externs
             .keys()
             .map(|symbol| Value {
                 name: qualified(mint, *symbol),
-                scheme: scheme(mint, &inference.schemes[symbol]),
+                scheme: scheme(mint, &inference.externs[symbol]),
             })
+            .chain(program.terms.keys().map(|symbol| Value {
+                name: qualified(mint, *symbol),
+                scheme: scheme(mint, &inference.schemes[symbol]),
+            }))
             .collect(),
         types: program
             .types
@@ -730,6 +749,15 @@ fn formula(value: &types::Formula) -> Formula {
 
 fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
     Lir {
+        externs: output
+            .externs
+            .iter()
+            .map(|external| Extern {
+                name: qualified(mint, external.symbol),
+                target: external.target.clone(),
+                rep: rep(external.rep),
+            })
+            .collect(),
         functions: output
             .functions
             .iter()
@@ -1221,12 +1249,25 @@ pub mod text {
     fn lir(value: &Lir) -> S {
         L(vec![
             A("lir".into()),
+            L(std::iter::once(A("externs".into()))
+                .chain(value.externs.iter().map(extern_))
+                .collect()),
             L(std::iter::once(A("functions".into()))
                 .chain(value.functions.iter().map(function))
                 .collect()),
             L(std::iter::once(A("globals".into()))
                 .chain(value.globals.iter().map(global))
                 .collect()),
+        ])
+    }
+    fn extern_(value: &Extern) -> S {
+        L(vec![
+            A("extern".into()),
+            Q(value.name.clone()),
+            L(std::iter::once(A("target".into()))
+                .chain(value.target.iter().cloned().map(Q))
+                .collect()),
+            A(rep_name(value.rep).into()),
         ])
     }
     fn function(value: &Function) -> S {
@@ -2300,8 +2341,13 @@ pub mod text {
         }
 
         fn read_lir(&self, value: S) -> Lir {
-            let mut value = self.exact(self.list(value, "lir"), 2, "lir");
+            let mut value = self.exact(self.list(value, "lir"), 3, "lir");
             Lir {
+                externs: self
+                    .many(self.take(&mut value), "externs")
+                    .into_iter()
+                    .map(|value| self.read_extern(value))
+                    .collect(),
                 functions: self
                     .many(self.take(&mut value), "functions")
                     .into_iter()
@@ -2312,6 +2358,23 @@ pub mod text {
                     .into_iter()
                     .map(|value| self.read_global(value))
                     .collect(),
+            }
+        }
+        fn read_extern(&self, value: S) -> Extern {
+            let mut value = self.exact(self.list(value, "extern"), 3, "extern");
+            let name = self.string(self.take(&mut value));
+            let target: Vec<String> = self
+                .many(self.take(&mut value), "target")
+                .into_iter()
+                .map(|value| self.string(value))
+                .collect();
+            if target.is_empty() || target.iter().any(String::is_empty) {
+                self.fail("extern target must contain nonempty path segments");
+            }
+            Extern {
+                name,
+                target,
+                rep: self.read_rep(self.take(&mut value)),
             }
         }
         fn read_function(&self, value: S) -> Function {

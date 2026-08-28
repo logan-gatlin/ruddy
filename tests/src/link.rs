@@ -37,7 +37,15 @@ fn artifact(
             types: Vec::new(),
             effects: Vec::new(),
         },
-        lir: a::Lir { functions, globals },
+        lir: a::Lir {
+            externs: vec![a::Extern {
+                name: format!("{name}@1.0.0::host"),
+                target: vec![name.into(), "host".into()],
+                rep: a::Rep::Any,
+            }],
+            functions,
+            globals,
+        },
     }
 }
 
@@ -168,6 +176,9 @@ fn links_every_item_and_recursively_relocates_function_indices() {
     assert_eq!(linked.header.values, root.header.values);
     assert_eq!(linked.header.types, root.header.types);
     assert!(linked.header.dependencies.is_empty());
+    assert_eq!(linked.lir.externs.len(), 2);
+    assert_eq!(linked.lir.externs[0].name, "dep@1.0.0::host");
+    assert_eq!(linked.lir.externs[1].name, "app@1.0.0::host");
     assert_eq!(linked.lir.functions.len(), 2);
     assert_eq!(linked.lir.globals.len(), 2);
     assert_eq!(linked.lir.globals[0].name, "dep@1.0.0::value");
@@ -256,6 +267,20 @@ fn copies_valid_dependency_first_transitive_diamond_graph_without_pruning() {
         .map(|function| function.name.as_str())
         .collect();
     assert_eq!(names, ["base", "left", "right", "root"]);
+    assert_eq!(
+        linked
+            .lir
+            .externs
+            .iter()
+            .map(|external| external.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "base@1.0.0::host",
+            "left@1.0.0::host",
+            "right@1.0.0::host",
+            "app@1.0.0::host"
+        ]
+    );
     for (index, function) in linked.lir.functions.iter().enumerate() {
         assert_references(&function.body, index as u64);
     }

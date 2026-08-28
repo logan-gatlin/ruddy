@@ -742,6 +742,7 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
             }],
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },

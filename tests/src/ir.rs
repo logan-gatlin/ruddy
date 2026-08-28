@@ -5450,6 +5450,7 @@ fn effect_artifact(bundle: &str, interface: &str) -> a::Artifact {
             }],
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -5703,6 +5704,7 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -5743,6 +5745,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -5811,6 +5814,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
             .collect(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6063,6 +6067,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6137,6 +6142,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6210,6 +6216,7 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6297,6 +6304,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
             .collect(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6490,6 +6498,7 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
             effects: Vec::new(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6578,6 +6587,7 @@ fn imported_alias_cycles_recover_without_a_spurious_structural_identity() {
                 .collect(),
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -6821,6 +6831,7 @@ fn dependency_interfaces_import_every_semantic_form() {
             ],
         },
         lir: a::Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
