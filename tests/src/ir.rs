@@ -8387,6 +8387,194 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
 }
 
 #[test]
+fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
+    const PARAMETERS: usize = 257;
+
+    let mut dependency = effect_artifact("dep", "long-rotation");
+    let parameters = (0..PARAMETERS)
+        .map(|_| a::Parameter {
+            sense: a::Sense::Type,
+            lacks: Vec::new(),
+            relevant: true,
+        })
+        .collect::<Vec<_>>();
+    let rotated = (1..PARAMETERS)
+        .chain(std::iter::once(0))
+        .map(|index| a::Type::Bound(index as u32))
+        .collect();
+    let rotate = a::DeclaredType {
+        name: "dep@1.0.0::Rotate".into(),
+        params: parameters,
+        scheme: a::Scheme {
+            count: PARAMETERS as u32,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Arrow(
+                Box::new(a::Type::Bound(0)),
+                Box::new(a::Type::Named {
+                    name: "dep@1.0.0::Rotate".into(),
+                    args: rotated,
+                }),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            ),
+        },
+    };
+    let alias = |name: &str, last: a::Type| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Named {
+            name: "dep@1.0.0::Rotate".into(),
+            args: (0..PARAMETERS)
+                .map(|index| {
+                    if index + 1 == PARAMETERS {
+                        last.clone()
+                    } else {
+                        a::Type::Nat
+                    }
+                })
+                .collect(),
+        }),
+    };
+    dependency.header.types = vec![
+        rotate,
+        alias("Strings", a::Type::String),
+        alias("Booleans", a::Type::Boolean),
+    ];
+
+    let parsed = parse::parse(
+        lex(
+            "effect StringProbe = { inspect: dep::Strings -> () }\n\
+             effect BooleanProbe = { inspect: dep::Booleans -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_ne!(
+        interface("StringProbe"),
+        interface("BooleanProbe"),
+        "the differing 257th rotation state is semantic"
+    );
+}
+
+#[test]
+fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
+    let mut dependency = effect_artifact("dep", "growing-rotation");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Grow".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Grow".into(),
+                    args: vec![
+                        a::Type::Bound(1),
+                        artifact_struct(vec![(
+                            "next".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: a::Type::Bound(0),
+                            },
+                        )]),
+                    ],
+                },
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Loop".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Arrow(
+                Box::new(a::Type::Nat),
+                Box::new(a::Type::Named {
+                    name: "dep@1.0.0::Loop".into(),
+                    args: Vec::new(),
+                }),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            )),
+        },
+        // A malformed changing arity is finite here and must not be mistaken
+        // for constructor growth merely because its active vectors differ.
+        a::DeclaredType {
+            name: "dep@1.0.0::Odd".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Odd".into(),
+                    args: vec![a::Type::Bound(0), a::Type::Bound(0)],
+                },
+            },
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Grow String dep::Loop -> () }\n\
+             effect OddProbe = { inspect: dep::Odd Nat -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+            })
+        })
+        .expect("Probe has a recovery identity");
+    assert!(interface.contains(":?"), "{interface}");
+    assert!(interface.len() < 1_000, "{interface}");
+}
+
+#[test]
 fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit() {
     const APPLICATIONS: usize = 300;
 
@@ -8460,6 +8648,112 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
         interface.contains(&format!("marker{}", APPLICATIONS - 1)),
         "late sequential applications must not recover as undecided: {interface}"
     );
+}
+
+#[test]
+fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
+    let raw = effect_artifact("raw", "x");
+    let ordinary = effect_artifact("ordinary", "0#18:opaque-interface:x;");
+    let round_trip = effect_artifact("round", "0#o1:x;");
+    let parsed = parse::parse(
+        lex(
+            "effect RawProbe = { op: (() -> () + raw::!IO) -> () }\n\
+             effect OrdinaryProbe = { op: (() -> () + ordinary::!IO) -> () }\n\
+             effect RoundProbe = { op: (() -> () + round::!IO) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, ordinary, round_trip]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_eq!(interface("RawProbe"), interface("RoundProbe"));
+    assert_ne!(interface("RawProbe"), interface("OrdinaryProbe"));
+}
+
+#[test]
+fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
+    let mut dependency = effect_artifact("dep", "key-collisions");
+    let effectful = |key: &str| {
+        a::Type::Arrow(
+            Box::new(a::Type::Nat),
+            Box::new(a::Type::Nat),
+            a::Row {
+                labels: vec![(
+                    key.into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_unit(),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            },
+        )
+    };
+    dependency.header.types = [
+        ("Raw", "IO"),
+        ("Ordinary", "IO\u{1f}0#17:unknown-interface;"),
+        ("Round", "IO\u{1f}0#u;"),
+    ]
+    .into_iter()
+    .map(|(name, key)| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(effectful(key)),
+    })
+    .collect();
+    let parsed = parse::parse(
+        lex(
+            "effect RawProbe = { op: dep::Raw -> () }\n\
+             effect OrdinaryProbe = { op: dep::Ordinary -> () }\n\
+             effect RoundProbe = { op: dep::Round -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_eq!(interface("RawProbe"), interface("RoundProbe"));
+    assert_ne!(interface("RawProbe"), interface("OrdinaryProbe"));
 }
 
 #[test]

@@ -3065,9 +3065,25 @@ fn structuralize_effects(
 /// compare as pure ones. Recursive types and effects use graph backreferences,
 /// so equivalent dependency cycles neither acquire a module path nor depend on
 /// a finite unrolling depth.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RegularLabel {
+    Ordinary(String),
+    /// Recovery for text which is not a graph encoding. This is graph data,
+    /// rather than a magic ordinary atom an accepted encoding could forge.
+    OpaqueInterface(String),
+    /// Recovery for an effect-row key with no interface component.
+    UnknownInterface,
+}
+
+impl Default for RegularLabel {
+    fn default() -> Self {
+        Self::Ordinary(String::new())
+    }
+}
+
 #[derive(Clone, Default)]
 struct RegularNode {
-    label: String,
+    label: RegularLabel,
     edges: Vec<(String, usize)>,
 }
 
@@ -3075,7 +3091,7 @@ struct RegularNode {
 /// type/effect graph they reach. Node numbers are only construction details;
 /// `encode` bisimulation-minimizes the reachable graph and assigns deterministic
 /// backreference numbers before an identity crosses the artifact boundary.
-type EncodedGraph = Vec<(usize, String, Vec<(String, usize)>)>;
+type EncodedGraph = Vec<(usize, RegularLabel, Vec<(String, usize)>)>;
 
 #[derive(Default)]
 struct CanonicalArena {
@@ -3083,13 +3099,14 @@ struct CanonicalArena {
 }
 
 impl CanonicalArena {
-    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+    fn labelled_node(&mut self, label: RegularLabel, edges: Vec<(String, usize)>) -> usize {
         let id = self.nodes.len();
-        self.nodes.push(RegularNode {
-            label: label.into(),
-            edges,
-        });
+        self.nodes.push(RegularNode { label, edges });
         id
+    }
+
+    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+        self.labelled_node(RegularLabel::Ordinary(label.into()), edges)
     }
 
     fn atom(&mut self, label: impl Into<String>) -> usize {
@@ -3128,10 +3145,27 @@ impl CanonicalArena {
             let mut parsed = Vec::new();
             while at < bytes.len() {
                 let id = number(bytes, &mut at, b'#')?;
-                let length = number(bytes, &mut at, b':')?;
-                let end = at.checked_add(length)?;
-                let label = std::str::from_utf8(bytes.get(at..end)?).ok()?.to_string();
-                at = end;
+                let label = match bytes.get(at).copied() {
+                    Some(b'o') => {
+                        at += 1;
+                        let length = number(bytes, &mut at, b':')?;
+                        let end = at.checked_add(length)?;
+                        let value = std::str::from_utf8(bytes.get(at..end)?).ok()?.to_string();
+                        at = end;
+                        RegularLabel::OpaqueInterface(value)
+                    }
+                    Some(b'u') => {
+                        at += 1;
+                        RegularLabel::UnknownInterface
+                    }
+                    _ => {
+                        let length = number(bytes, &mut at, b':')?;
+                        let end = at.checked_add(length)?;
+                        let value = std::str::from_utf8(bytes.get(at..end)?).ok()?.to_string();
+                        at = end;
+                        RegularLabel::Ordinary(value)
+                    }
+                };
                 let mut edges = Vec::new();
                 while bytes.get(at).copied() == Some(b'|') {
                     at += 1;
@@ -3155,7 +3189,10 @@ impl CanonicalArena {
         }
 
         let Some(parsed) = parse(encoded) else {
-            return self.atom(format!("opaque-interface:{encoded}"));
+            return self.labelled_node(
+                RegularLabel::OpaqueInterface(encoded.to_string()),
+                Vec::new(),
+            );
         };
         let base = self.nodes.len();
         self.nodes
@@ -3178,7 +3215,7 @@ impl CanonicalArena {
             .map_or((key, None), |(name, interface)| (name, Some(interface)));
         let interface = interface
             .map(|interface| self.import(interface))
-            .unwrap_or_else(|| self.atom("unknown-interface"));
+            .unwrap_or_else(|| self.labelled_node(RegularLabel::UnknownInterface, Vec::new()));
         self.node(
             format!("effect:{name}"),
             vec![("interface".into(), interface)],
@@ -3458,16 +3495,47 @@ impl RegularType<'_> {
         values.pop().expect("a source type has one graph root")
     }
 
+    /// Whether `needle` is structurally retained below `root`. Substitution
+    /// puts an argument's existing graph node below every constructor wrapped
+    /// around it, so this exact reachability check recognizes growth without a
+    /// depth bound or a recursive host-stack walk.
+    fn retains(nodes: &[RegularNode], needle: usize, root: usize) -> bool {
+        let mut pending = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if node == needle {
+                return true;
+            }
+            if seen.insert(node) {
+                pending.extend(nodes[node].edges.iter().map(|(_, child)| *child));
+            }
+        }
+        false
+    }
+
+    /// A recursive application grows when every argument from an earlier
+    /// instantiation remains at its corresponding position and at least one is
+    /// now below a constructor. Permutations eventually return to their exact
+    /// memo key; an unbounded constructor context instead embeds an ancestor.
+    fn grows(nodes: &[RegularNode], before: &[usize], after: &[usize]) -> bool {
+        before.len() == after.len()
+            && before
+                .iter()
+                .zip(after)
+                .all(|(before, after)| Self::retains(nodes, *before, *after))
+            && before
+                .iter()
+                .zip(after)
+                .any(|(before, after)| before != after)
+    }
+
     /// Build imported semantic types without borrowing the host stack. The
     /// imported interface is untrusted: besides ordinary deep arrows and rows,
     /// it may contain a growing recursive application. Hash-consed argument
-    /// nodes make regular applications meet `named`; the per-symbol limit makes
-    /// a non-regular, ever-growing presentation recover to `?` rather than run
-    /// forever or exhaust memory.
+    /// nodes make finite regular applications meet `named`; structural
+    /// embedding rejects only an active constructor-growing application.
     fn semantic_work(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
         use crate::types::{Presence, Rest};
-
-        const MAX_ACTIVE_INSTANTIATIONS: usize = 256;
 
         enum Work<'a> {
             Type(&'a Ty, Vec<usize>),
@@ -3484,7 +3552,7 @@ impl RegularType<'_> {
 
         let mut work = vec![Work::Named(symbol, args)];
         let mut values = Vec::new();
-        let mut active_instantiations: HashMap<Symbol, usize> = HashMap::new();
+        let mut active_instantiations: HashMap<Symbol, Vec<Vec<usize>>> = HashMap::new();
 
         while let Some(part) = work.pop() {
             match part {
@@ -3559,12 +3627,18 @@ impl RegularType<'_> {
                         values.push(*id);
                         continue;
                     }
-                    let active = active_instantiations.entry(symbol).or_default();
-                    if *active >= MAX_ACTIVE_INSTANTIATIONS {
+                    if active_instantiations.get(&symbol).is_some_and(|active| {
+                        active
+                            .iter()
+                            .any(|ancestor| Self::grows(&self.arena.nodes, ancestor, &args))
+                    }) {
                         values.push(self.atom("?"));
                         continue;
                     }
-                    *active += 1;
+                    active_instantiations
+                        .entry(symbol)
+                        .or_default()
+                        .push(args.clone());
                     let id = self.placeholder();
                     self.named.insert(key, id);
                     // Import installs a real or qualified recovery declaration
@@ -3579,7 +3653,10 @@ impl RegularType<'_> {
                             .collect();
                         let body = self.node(format!("unresolved:{name}"), edges);
                         self.arena.nodes[id] = self.arena.nodes[body].clone();
-                        *active -= 1;
+                        active_instantiations
+                            .get_mut(&symbol)
+                            .expect("the unresolved instantiation is active")
+                            .pop();
                         values.push(id);
                     } else {
                         work.push(Work::FinishNamed(id, symbol));
@@ -3591,7 +3668,10 @@ impl RegularType<'_> {
                     if body != id {
                         self.arena.nodes[id] = self.arena.nodes[body].clone();
                     }
-                    *active_instantiations.entry(symbol).or_default() -= 1;
+                    active_instantiations
+                        .get_mut(&symbol)
+                        .expect("the finished instantiation is active")
+                        .pop();
                     values.push(id);
                 }
                 Work::Row(row, args, effects, fields) => {
@@ -3681,10 +3761,10 @@ impl RegularType<'_> {
         let original = self.arena.nodes.clone();
         let mut effect_keys = HashMap::new();
         for root in self.created.iter().copied() {
-            let (kind, join) = match original[root].label.as_str() {
-                "fields" => ("fields", "core"),
-                "sum" => ("sum", "tail"),
-                "effects" => ("effects", "tail"),
+            let (kind, join) = match &original[root].label {
+                RegularLabel::Ordinary(label) if label == "fields" => ("fields", "core"),
+                RegularLabel::Ordinary(label) if label == "sum" => ("sum", "tail"),
+                RegularLabel::Ordinary(label) if label == "effects" => ("effects", "tail"),
                 _ => continue,
             };
             let mut pending = vec![root];
@@ -3696,7 +3776,9 @@ impl RegularType<'_> {
                     continue;
                 }
                 for (label, child) in &original[node].edges {
-                    if label == join && original[*child].label == kind {
+                    if label == join
+                        && original[*child].label == RegularLabel::Ordinary(kind.into())
+                    {
                         pending.push(*child);
                     } else if label == join {
                         edges.push((label.clone(), *child));
@@ -3879,12 +3961,16 @@ fn encode_dense_graph(nodes: &[RegularNode], root: usize) -> String {
     let mut out = String::new();
     for color in order {
         let node = &nodes[representatives[color]];
-        out.push_str(&format!(
-            "{}#{}:{}",
-            ids[&color],
-            node.label.len(),
-            node.label
-        ));
+        out.push_str(&format!("{}#", ids[&color]));
+        match &node.label {
+            RegularLabel::Ordinary(label) => {
+                out.push_str(&format!("{}:{}", label.len(), label));
+            }
+            RegularLabel::OpaqueInterface(value) => {
+                out.push_str(&format!("o{}:{}", value.len(), value));
+            }
+            RegularLabel::UnknownInterface => out.push('u'),
+        }
         let mut edges: Vec<_> = node
             .edges
             .iter()
@@ -4179,7 +4265,7 @@ impl<'a> EffectCanonicalizer<'a> {
             .remove(&symbol)
             .expect("finishing effects have a placeholder");
         self.arena.nodes[node] = RegularNode {
-            label: format!("effect:{name}"),
+            label: RegularLabel::Ordinary(format!("effect:{name}")),
             edges: vec![("interface".into(), interface.node)],
         };
         let value = CanonicalValue { node };
