@@ -3831,6 +3831,7 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     Unfold {
         aliases,
         active: HashSet::new(),
+        budget: aliases.len(),
     }
     .ty(ty)
 }
@@ -3841,12 +3842,15 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
 struct Unfold<'a> {
     aliases: &'a IndexMap<Symbol, Scheme>,
     active: HashSet<Rc<[AliasPart]>>,
+    /// One globally monotone allowance for this complete substitution. Opening
+    /// a row tail can recursively request another type's shape; that request is
+    /// part of the same unfold, not a new path with replenished fuel.
+    budget: usize,
 }
 
 impl Unfold<'_> {
     fn ty(&mut self, ty: &Rc<Ty>) -> Rc<Ty> {
         let mut ty = ty.clone();
-        let mut budget = self.aliases.len();
         let mut entered = Vec::new();
         let result = loop {
             let Ty::Named { symbol, args, .. } = &*ty.clone() else {
@@ -3865,16 +3869,15 @@ impl Unfold<'_> {
             entered.push(key);
 
             let body = self.aliases[symbol].body().clone();
-            budget = match &*body {
-                Ty::Bound(_) => budget,
-                _ => match budget.checked_sub(1) {
+            if !matches!(&*body, Ty::Bound(_)) {
+                self.budget = match self.budget.checked_sub(1) {
                     Some(left) => left,
                     // Source declarations cannot reach this case: lowering
                     // diagnosed their loop. A malformed imported interface
                     // recovers to unknown rather than panicking.
                     None => break Rc::new(Ty::Undecided),
-                },
-            };
+                };
+            }
             let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
             ty = body.open_alias(&fresh, self);
         };

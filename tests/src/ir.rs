@@ -7917,6 +7917,125 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
 }
 
 #[test]
+fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-imported-semantics".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            const TYPE_DEPTH: usize = 30_000;
+            const NAMED_DEPTH: usize = 30_000;
+
+            let mut named = a::Type::Nat;
+            for _ in 0..NAMED_DEPTH {
+                named = a::Type::Named {
+                    name: "dep@1.0.0::Phantom".into(),
+                    args: vec![named],
+                };
+            }
+            let mut payload = a::Type::Nat;
+            for _ in 0..TYPE_DEPTH {
+                payload = a::Type::Arrow(
+                    Box::new(a::Type::Nat),
+                    Box::new(payload),
+                    a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Closed,
+                    },
+                );
+            }
+            let mut tail = a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            };
+            for _ in 0..TYPE_DEPTH {
+                tail = a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::More(Box::new(tail)),
+                };
+            }
+            let body = a::Type::Arrow(
+                Box::new(named),
+                Box::new(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "deep".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: payload,
+                        },
+                    )],
+                    rest: a::Rest::Closed,
+                })),
+                tail,
+            );
+
+            let mut formula = a::Formula::Bound(0);
+            for depth in 0..DEPTH {
+                formula = match depth % 3 {
+                    0 => a::Formula::Not(Box::new(formula)),
+                    1 => a::Formula::And(Box::new(formula), Box::new(a::Formula::True)),
+                    _ => a::Formula::Or(Box::new(a::Formula::False), Box::new(formula)),
+                };
+            }
+
+            let mut malformed_formula = a::Formula::Var(999);
+            for _ in 0..DEPTH {
+                malformed_formula = a::Formula::Not(Box::new(malformed_formula));
+            }
+
+            let mut dependency = effect_artifact("dep", "deep-semantics");
+            dependency.header.types.push(a::DeclaredType {
+                name: "dep@1.0.0::Deep".into(),
+                params: Vec::new(),
+                scheme: artifact_scheme(body),
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::deep_formula".into(),
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 1,
+                    formula,
+                    body: a::Type::Nat,
+                },
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::malformed_formula".into(),
+                scheme: a::Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: malformed_formula,
+                    body: a::Type::Nat,
+                },
+            });
+
+            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let dependencies = vec![dependency];
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &dependencies);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            assert!(out.program.external_types.len() >= 2);
+            assert_eq!(out.program.external_schemes.len(), 2);
+            assert_eq!(
+                out.program
+                    .external_schemes
+                    .values()
+                    .filter(|scheme| scheme.formula().is_true())
+                    .count(),
+                1
+            );
+
+            // Recursive ownership is not what this regression measures. Both
+            // imported representations remain live until the bounded-stack
+            // import has demonstrably completed.
+            std::mem::forget(out);
+            std::mem::forget(dependencies);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep semantic imports and clamping do not recurse");
+}
+
+#[test]
 fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
     let malformed = a::Scheme {
         count: 1,
@@ -8018,6 +8137,135 @@ fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
         .expect("the malformed value scheme was imported");
     assert_eq!(value.presences(), 1);
     assert!(value.formula().is_true());
+}
+
+#[test]
+fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
+    let row = |presence, rest, ty| {
+        a::Type::Struct(a::Row {
+            labels: vec![("x".into(), a::RowField { presence, ty })],
+            rest,
+        })
+    };
+    let mut dependency = effect_artifact("dep", "foreign-locals");
+    for (name, body) in [
+        ("TypeVar", a::Type::Var(999)),
+        (
+            "TypeRigid",
+            a::Type::Rigid {
+                id: 999,
+                name: "foreign".into(),
+            },
+        ),
+        ("TypeUnknown", a::Type::Undecided),
+        (
+            "RestVar",
+            row(a::Presence::Present, a::Rest::Var(999), a::Type::Nat),
+        ),
+        (
+            "RestRigid",
+            row(
+                a::Presence::Present,
+                a::Rest::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+                a::Type::Nat,
+            ),
+        ),
+        (
+            "PresenceVar",
+            row(a::Presence::Var(999), a::Rest::Closed, a::Type::Nat),
+        ),
+    ] {
+        dependency.header.types.push(a::DeclaredType {
+            name: format!("dep@1.0.0::{name}"),
+            params: Vec::new(),
+            scheme: artifact_scheme(body),
+        });
+    }
+    for (name, formula) in [
+        ("formula_var", a::Formula::Var(999)),
+        (
+            "nested_formula_var",
+            a::Formula::And(
+                Box::new(a::Formula::True),
+                Box::new(a::Formula::Not(Box::new(a::Formula::Var(999)))),
+            ),
+        ),
+    ] {
+        dependency.header.values.push(a::Value {
+            name: format!("dep@1.0.0::{name}"),
+            scheme: a::Scheme {
+                count: 0,
+                presences: 0,
+                formula,
+                body: a::Type::Nat,
+            },
+        });
+    }
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("foreign".into()),
+        from: a::Type::Arrow(
+            Box::new(row(
+                a::Presence::Var(999),
+                a::Rest::Var(999),
+                a::Type::Var(999),
+            )),
+            Box::new(row(
+                a::Presence::Undecided,
+                a::Rest::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+                a::Type::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+            )),
+            a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Var(999),
+            },
+        ),
+        to: a::Type::Rigid {
+            id: 999,
+            name: "foreign".into(),
+        },
+    });
+
+    let parsed = parse::parse(
+        lex(
+            "type A = dep::TypeVar\n\
+             type B = dep::TypeRigid\n\
+             type C = dep::RestVar\n\
+             type D = dep::RestRigid\n\
+             type E = dep::PresenceVar\n\
+             let a = dep::formula_var\n\
+             let b = dep::nested_formula_var\n\
+             let operation = dep::!IO.foreign (fn x => x)",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(
+        out.program
+            .external_schemes
+            .values()
+            .all(|scheme| scheme.formula().is_true())
+    );
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(matches!(
+        inferred.errors.as_slice(),
+        [error] if matches!(error.kind, inference::ErrorKind::Unhandled { .. })
+    ));
 }
 
 #[test]

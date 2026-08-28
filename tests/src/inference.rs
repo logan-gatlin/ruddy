@@ -1680,6 +1680,50 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
         &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
         Ty::Undecided
     ));
+
+    // Fuel spent before a row-tail substitution is not replenished by the
+    // nested request to learn that argument's shape. This is the semantic form
+    // of `A r = { ..r }; G a = A (G { x: a })`: every application grows, and
+    // only the globally shared budget makes it recovery rather than recursion.
+    let row = mint
+        .global(None, Namespace::Types, "OpenRow")
+        .expect("a fresh row-opening type");
+    let recursive = mint
+        .global(None, Namespace::Types, "RowGrow")
+        .expect("a fresh growing type");
+    let mut aliases = IndexMap::new();
+    aliases.insert(
+        row,
+        Scheme::new(1, Rc::new(Ty::Struct(Row::of(Rest::Bound(0))))),
+    );
+    aliases.insert(
+        recursive,
+        Scheme::new(
+            1,
+            named(
+                row,
+                vec![named(
+                    recursive,
+                    vec![Rc::new(Ty::Struct(Row {
+                        labels: [("x".into(), field(Presence::Present, Rc::new(Ty::Bound(0))))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Closed,
+                    }))],
+                )],
+            ),
+        ),
+    );
+    assert!(matches!(
+        &*inference::unfold(
+            &aliases,
+            &named(recursive, vec![Rc::new(Ty::Nat)])
+        ),
+        Ty::Struct(Row {
+            rest: Rest::More(more),
+            ..
+        }) if matches!(more.rest, Rest::Undecided)
+    ));
 }
 
 #[test]

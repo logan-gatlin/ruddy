@@ -2483,274 +2483,486 @@ fn import_scheme(
     let count = scheme.count;
     let presences = scheme.presences.min(count);
     let body = import_type(mint, &scheme.body, symbols, names);
-    let body = clamp_bounds(&body, count as usize, presences as usize);
-    let formula = import_formula(&scheme.formula);
-    let formula = match formula_bounds_valid(&formula, presences) {
+    let body = clamp_bounds(body, count as usize, presences as usize);
+    let (formula, sanitized) = import_formula(&scheme.formula);
+    let formula = match sanitized && formula_bounds_valid(&formula, presences) {
         true => formula,
-        false => crate::types::Formula::True,
+        false => {
+            drop_formula_iterative(formula);
+            crate::types::Formula::True
+        }
     };
     Scheme::constrained(count, presences, body, formula)
 }
 
 /// Replace bound positions a malformed imported interface did not declare with
 /// undecided recovery nodes. Presence slots occupy `0..presences`; type and row
-/// slots occupy the remainder. Deep `Rest::More` chains are flattened with
-/// outer-wins shadowing while they are clamped, making this path stack safe.
-fn clamp_bounds(ty: &Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
-    fn row(value: &crate::types::Row, count: usize, presences: usize) -> crate::types::Row {
-        fn clamped_labels(
-            value: &crate::types::Row,
-            count: usize,
-            presences: usize,
-        ) -> IndexMap<String, crate::types::RowField> {
-            value
-                .labels
-                .iter()
-                .map(|(name, field)| {
+/// slots occupy the remainder. Foreign solver-local variables and rigids are
+/// recovery input as well. The explicit postorder stack keeps arbitrarily deep
+/// types, field payloads, and `Rest::More` rows safe to import.
+fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
+    enum Work<'a> {
+        Ty(&'a Ty),
+        Row(&'a crate::types::Row),
+        Arrow,
+        Struct,
+        Sum,
+        Named {
+            symbol: Symbol,
+            name: Rc<str>,
+            args: usize,
+        },
+        BuiltRow(&'a crate::types::Row),
+    }
+    let mut types = Vec::new();
+    let mut rows = Vec::new();
+
+    let mut work = vec![Work::Ty(&ty)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(value) => match value {
+                Ty::Nat => types.push(Rc::new(Ty::Nat)),
+                Ty::Int => types.push(Rc::new(Ty::Int)),
+                Ty::Real => types.push(Rc::new(Ty::Real)),
+                Ty::String => types.push(Rc::new(Ty::String)),
+                Ty::Boolean => types.push(Rc::new(Ty::Boolean)),
+                Ty::Bound(index) if (*index as usize) < count && (*index as usize) >= presences => {
+                    types.push(Rc::new(Ty::Bound(*index)))
+                }
+                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => {
+                    types.push(Rc::new(Ty::Undecided))
+                }
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Arrow);
+                    work.push(Work::Row(effects));
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                Ty::Struct(fields) => {
+                    work.push(Work::Struct);
+                    work.push(Work::Row(fields));
+                }
+                Ty::Sum(cases) => {
+                    work.push(Work::Sum);
+                    work.push(Work::Row(cases));
+                }
+                Ty::Named { symbol, name, args } => {
+                    work.push(Work::Named {
+                        symbol: *symbol,
+                        name: name.clone(),
+                        args: args.len(),
+                    });
+                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                }
+            },
+            Work::Row(value) => {
+                work.push(Work::BuiltRow(value));
+                if let Rest::More(more) = &value.rest {
+                    work.push(Work::Row(more));
+                }
+                work.extend(value.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+            }
+            Work::Arrow => {
+                let effects = rows.pop().expect("row postorder stays balanced");
+                let to = types.pop().expect("type postorder stays balanced");
+                let from = types.pop().expect("type postorder stays balanced");
+                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Struct => {
+                let fields = rows.pop().expect("row postorder stays balanced");
+                types.push(Rc::new(Ty::Struct(fields)));
+            }
+            Work::Sum => {
+                let cases = rows.pop().expect("row postorder stays balanced");
+                types.push(Rc::new(Ty::Sum(cases)));
+            }
+            Work::Named { symbol, name, args } => {
+                let mut imported = Vec::with_capacity(args);
+                for _ in 0..args {
+                    imported.push(types.pop().expect("type postorder stays balanced"));
+                }
+                imported.reverse();
+                types.push(Rc::new(Ty::Named {
+                    symbol,
+                    name,
+                    args: imported.into(),
+                }));
+            }
+            Work::BuiltRow(value) => {
+                let rest = match &value.rest {
+                    Rest::Closed => Rest::Closed,
+                    Rest::Bound(index)
+                        if (*index as usize) < count && (*index as usize) >= presences =>
+                    {
+                        Rest::Bound(*index)
+                    }
+                    Rest::More(_) => {
+                        let mut inner = rows.pop().expect("row postorder stays balanced");
+                        while let Rest::More(deeper) = &inner.rest {
+                            let deeper_labels = deeper.labels.clone();
+                            let deeper_rest = deeper.rest.clone();
+                            for (name, field) in deeper_labels {
+                                inner.labels.entry(name).or_insert(field);
+                            }
+                            inner.rest = deeper_rest;
+                        }
+                        Rest::More(Rc::new(inner))
+                    }
+                    Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
+                        Rest::Undecided
+                    }
+                };
+                let mut fields = Vec::with_capacity(value.labels.len());
+                for (name, field) in value.labels.iter().rev() {
                     let presence = match field.presence {
-                        Presence::Bound(index) if index as usize >= presences => {
+                        Presence::Present => Presence::Present,
+                        Presence::Absent => Presence::Absent,
+                        Presence::Bound(index) if (index as usize) < presences => {
+                            Presence::Bound(index)
+                        }
+                        Presence::Bound(_) | Presence::Var(_) | Presence::Undecided => {
                             Presence::Undecided
                         }
-                        _ => field.presence.clone(),
                     };
-                    (
+                    fields.push((
                         name.clone(),
                         crate::types::RowField {
                             presence,
-                            ty: clamp_bounds(&field.ty, count, presences),
+                            ty: types.pop().expect("type postorder stays balanced"),
                         },
-                    )
-                })
-                .collect()
-        }
-        fn end(rest: &Rest, count: usize, presences: usize) -> Rest {
-            match rest {
-                Rest::Bound(index) if *index as usize >= count || (*index as usize) < presences => {
-                    Rest::Undecided
+                    ));
                 }
-                rest => rest.clone(),
+                fields.reverse();
+                rows.push(crate::types::Row {
+                    labels: fields.into_iter().collect(),
+                    rest,
+                });
             }
         }
+    }
+    let clamped = types.pop().expect("type postorder stays balanced");
+    drop_type_iterative(ty);
+    clamped
+}
 
-        let labels = clamped_labels(value, count, presences);
-        let Rest::More(first) = &value.rest else {
-            return crate::types::Row {
-                labels,
-                rest: end(&value.rest, count, presences),
-            };
-        };
-        // Keep the outer splice boundary (its shadowing is semantically
-        // relevant) while accumulating an arbitrarily deep tail iteratively.
-        let mut inner_labels = IndexMap::new();
-        let mut at = &**first;
-        let inner_rest = loop {
-            for (name, field) in clamped_labels(at, count, presences) {
-                inner_labels.entry(name).or_insert(field);
-            }
-            match &at.rest {
-                Rest::More(more) => at = more,
-                rest => break end(rest, count, presences),
-            }
-        };
-        crate::types::Row {
-            labels,
-            rest: Rest::More(Rc::new(crate::types::Row {
-                labels: inner_labels,
-                rest: inner_rest,
-            })),
+/// Destroy a possibly deep temporary semantic type with an explicit stack.
+/// Importing and clamping intentionally build two independent trees; letting
+/// Rust recursively release the first one would undo the stack-safe walk.
+fn drop_type_iterative(root: Rc<Ty>) {
+    enum Work {
+        Ty(Rc<Ty>),
+        Row(Rc<crate::types::Row>),
+    }
+
+    fn row(row: &crate::types::Row, work: &mut Vec<Work>) {
+        work.extend(row.labels.values().map(|field| Work::Ty(field.ty.clone())));
+        if let Rest::More(more) = &row.rest {
+            work.push(Work::Row(more.clone()));
         }
     }
 
-    Rc::new(match &**ty {
-        Ty::Bound(index) if *index as usize >= count || (*index as usize) < presences => {
-            Ty::Undecided
+    let mut work = vec![Work::Ty(root)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty) => {
+                match &*ty {
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Ty(from.clone()));
+                        work.push(Work::Ty(to.clone()));
+                        row(effects, &mut work);
+                    }
+                    Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut work),
+                    Ty::Named { args, .. } => {
+                        work.extend(args.iter().cloned().map(Work::Ty));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Var(_)
+                    | Ty::Bound(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => {}
+                }
+                drop(ty);
+            }
+            Work::Row(row_) => {
+                row(&row_, &mut work);
+                drop(row_);
+            }
         }
-        Ty::Arrow(from, to, effects) => Ty::Arrow(
-            clamp_bounds(from, count, presences),
-            clamp_bounds(to, count, presences),
-            row(effects, count, presences),
-        ),
-        Ty::Struct(fields) => Ty::Struct(row(fields, count, presences)),
-        Ty::Sum(cases) => Ty::Sum(row(cases, count, presences)),
-        Ty::Named { symbol, name, args } => Ty::Named {
-            symbol: *symbol,
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|arg| clamp_bounds(arg, count, presences))
-                .collect(),
-        },
-        ty => ty.clone(),
-    })
+    }
+}
+
+fn drop_formula_iterative(root: crate::types::Formula) {
+    use crate::types::Formula;
+
+    fn children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
+        match formula {
+            Formula::Not(inner) => work.push(inner.clone()),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                work.push(left.clone());
+                work.push(right.clone());
+            }
+            Formula::True | Formula::False | Formula::Atom(_) => {}
+        }
+    }
+
+    let mut work = Vec::new();
+    children(&root, &mut work);
+    drop(root);
+    while let Some(formula) = work.pop() {
+        children(&formula, &mut work);
+        drop(formula);
+    }
 }
 
 fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool {
     use crate::types::{Atom, Formula};
-    match formula {
-        Formula::True | Formula::False | Formula::Atom(Atom::Var(_)) => true,
-        Formula::Atom(Atom::Bound(index)) => *index < presences,
-        Formula::Not(inner) => formula_bounds_valid(inner, presences),
-        Formula::And(left, right)
-        | Formula::Or(left, right)
-        | Formula::Iff(left, right)
-        | Formula::Xor(left, right) => {
-            formula_bounds_valid(left, presences) && formula_bounds_valid(right, presences)
+    let mut work = vec![formula];
+    while let Some(formula) = work.pop() {
+        match formula {
+            Formula::True | Formula::False => {}
+            Formula::Atom(Atom::Bound(index)) if *index < presences => {}
+            Formula::Atom(_) => return false,
+            Formula::Not(inner) => work.push(inner),
+            Formula::And(left, right)
+            | Formula::Or(left, right)
+            | Formula::Iff(left, right)
+            | Formula::Xor(left, right) => {
+                work.push(right);
+                work.push(left);
+            }
         }
     }
+    true
 }
 
+/// Convert an artifact type without using the host call stack. Artifact types
+/// are untrusted and may be tens of thousands of constructors deep.
 fn import_type(
     mint: &mut Mint,
     value: &artifact::Type,
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
 ) -> Rc<Ty> {
-    Rc::new(match value {
-        artifact::Type::Nat => Ty::Nat,
-        artifact::Type::Int => Ty::Int,
-        artifact::Type::Real => Ty::Real,
-        artifact::Type::String => Ty::String,
-        artifact::Type::Boolean => Ty::Boolean,
-        artifact::Type::Arrow(a, b, r) => Ty::Arrow(
-            import_type(mint, a, symbols, names),
-            import_type(mint, b, symbols, names),
-            import_row(mint, r, symbols, names),
-        ),
-        artifact::Type::Struct(r) => Ty::Struct(import_row(mint, r, symbols, names)),
-        artifact::Type::Sum(r) => Ty::Sum(import_row(mint, r, symbols, names)),
-        artifact::Type::Var(v) => Ty::Var(*v),
-        artifact::Type::Bound(v) => Ty::Bound(*v),
-        artifact::Type::Rigid { id, name } => Ty::Rigid {
-            id: *id,
-            name: Rc::from(name.as_str()),
+    enum Work<'a> {
+        Ty(&'a artifact::Type),
+        Row(&'a artifact::Row),
+        Arrow,
+        Struct,
+        Sum,
+        Named {
+            symbol: Symbol,
+            name: Rc<str>,
+            args: usize,
         },
-        artifact::Type::Named { name, args } => {
-            let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
-            Ty::Named {
-                symbol,
-                name: Rc::from(name.as_str()),
-                args: args
-                    .iter()
-                    .map(|a| import_type(mint, a, symbols, names))
-                    .collect::<Vec<_>>()
-                    .into(),
+        BuiltRow(&'a artifact::Row),
+    }
+    let mut types = Vec::new();
+    let mut rows = Vec::new();
+
+    let mut work = vec![Work::Ty(value)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(value) => match value {
+                artifact::Type::Nat => types.push(Rc::new(Ty::Nat)),
+                artifact::Type::Int => types.push(Rc::new(Ty::Int)),
+                artifact::Type::Real => types.push(Rc::new(Ty::Real)),
+                artifact::Type::String => types.push(Rc::new(Ty::String)),
+                artifact::Type::Boolean => types.push(Rc::new(Ty::Boolean)),
+                artifact::Type::Bound(index) => types.push(Rc::new(Ty::Bound(*index))),
+                artifact::Type::Var(_)
+                | artifact::Type::Rigid { .. }
+                | artifact::Type::Undecided => types.push(Rc::new(Ty::Undecided)),
+                artifact::Type::Arrow(from, to, effects) => {
+                    work.push(Work::Arrow);
+                    work.push(Work::Row(effects));
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                artifact::Type::Struct(fields) => {
+                    work.push(Work::Struct);
+                    work.push(Work::Row(fields));
+                }
+                artifact::Type::Sum(cases) => {
+                    work.push(Work::Sum);
+                    work.push(Work::Row(cases));
+                }
+                artifact::Type::Named { name, args } => {
+                    let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
+                    work.push(Work::Named {
+                        symbol,
+                        name: Rc::from(name.as_str()),
+                        args: args.len(),
+                    });
+                    work.extend(args.iter().rev().map(Work::Ty));
+                }
+            },
+            Work::Row(value) => {
+                work.push(Work::BuiltRow(value));
+                if let artifact::Rest::More(more) = &value.rest {
+                    work.push(Work::Row(more));
+                }
+                work.extend(
+                    value
+                        .labels
+                        .iter()
+                        .rev()
+                        .map(|(_, field)| Work::Ty(&field.ty)),
+                );
+            }
+            Work::Arrow => {
+                let effects = rows.pop().expect("row postorder stays balanced");
+                let to = types.pop().expect("type postorder stays balanced");
+                let from = types.pop().expect("type postorder stays balanced");
+                types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Struct => {
+                let fields = rows.pop().expect("row postorder stays balanced");
+                types.push(Rc::new(Ty::Struct(fields)));
+            }
+            Work::Sum => {
+                let cases = rows.pop().expect("row postorder stays balanced");
+                types.push(Rc::new(Ty::Sum(cases)));
+            }
+            Work::Named { symbol, name, args } => {
+                let mut imported = Vec::with_capacity(args);
+                for _ in 0..args {
+                    imported.push(types.pop().expect("type postorder stays balanced"));
+                }
+                imported.reverse();
+                types.push(Rc::new(Ty::Named {
+                    symbol,
+                    name,
+                    args: imported.into(),
+                }));
+            }
+            Work::BuiltRow(value) => {
+                let rest = match &value.rest {
+                    artifact::Rest::Closed => Rest::Closed,
+                    artifact::Rest::Bound(index) => Rest::Bound(*index),
+                    artifact::Rest::More(_) => {
+                        Rest::More(Rc::new(rows.pop().expect("row postorder stays balanced")))
+                    }
+                    artifact::Rest::Var(_)
+                    | artifact::Rest::Rigid { .. }
+                    | artifact::Rest::Undecided => Rest::Undecided,
+                };
+                let mut fields = Vec::with_capacity(value.labels.len());
+                for (name, field) in value.labels.iter().rev() {
+                    let presence = match field.presence {
+                        artifact::Presence::Present => Presence::Present,
+                        artifact::Presence::Absent => Presence::Absent,
+                        artifact::Presence::Bound(index) => Presence::Bound(index),
+                        artifact::Presence::Var(_) | artifact::Presence::Undecided => {
+                            Presence::Undecided
+                        }
+                    };
+                    fields.push((
+                        name.clone(),
+                        crate::types::RowField {
+                            presence,
+                            ty: types.pop().expect("type postorder stays balanced"),
+                        },
+                    ));
+                }
+                fields.reverse();
+                rows.push(crate::types::Row {
+                    labels: fields.into_iter().collect(),
+                    rest,
+                });
             }
         }
-        artifact::Type::Undecided => Ty::Undecided,
-    })
+    }
+    types.pop().expect("type postorder stays balanced")
 }
 
-fn import_row(
-    mint: &mut Mint,
-    value: &artifact::Row,
-    symbols: &mut HashMap<(Namespace, String), Symbol>,
-    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
-) -> crate::types::Row {
-    fn end(rest: &artifact::Rest) -> crate::types::Rest {
-        match rest {
-            artifact::Rest::Closed => crate::types::Rest::Closed,
-            artifact::Rest::Var(var) => crate::types::Rest::Var(*var),
-            artifact::Rest::Bound(var) => crate::types::Rest::Bound(*var),
-            artifact::Rest::Rigid { id, name } => crate::types::Rest::Rigid {
-                id: *id,
-                name: Rc::from(name.as_str()),
-            },
-            artifact::Rest::Undecided | artifact::Rest::More(_) => crate::types::Rest::Undecided,
-        }
-    }
-    let labels = value
-        .labels
-        .iter()
-        .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
-        .collect();
-    let artifact::Rest::More(first) = &value.rest else {
-        return crate::types::Row {
-            labels,
-            rest: end(&value.rest),
-        };
-    };
-    // Preserve the first two boundaries so clamping itself sees and normalizes
-    // composition, then accumulate any remaining depth iteratively.
-    let first_labels = first
-        .labels
-        .iter()
-        .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
-        .collect();
-    let first_rest = match &first.rest {
-        artifact::Rest::More(second) => {
-            let mut inner_labels = IndexMap::new();
-            let mut at = &**second;
-            let inner_rest = loop {
-                for (name, field) in &at.labels {
-                    if !inner_labels.contains_key(name) {
-                        inner_labels
-                            .insert(name.clone(), import_row_field(mint, field, symbols, names));
-                    }
-                }
-                match &at.rest {
-                    artifact::Rest::More(more) => at = more,
-                    rest => break end(rest),
-                }
-            };
-            Rest::More(Rc::new(crate::types::Row {
-                labels: inner_labels,
-                rest: inner_rest,
-            }))
-        }
-        rest => end(rest),
-    };
-    crate::types::Row {
-        labels,
-        rest: Rest::More(Rc::new(crate::types::Row {
-            labels: first_labels,
-            rest: first_rest,
-        })),
-    }
-}
-
-fn import_row_field(
-    mint: &mut Mint,
-    value: &artifact::RowField,
-    symbols: &mut HashMap<(Namespace, String), Symbol>,
-    names: &mut IndexMap<Symbol, artifact::QualifiedName>,
-) -> crate::types::RowField {
-    crate::types::RowField {
-        presence: match value.presence {
-            artifact::Presence::Present => crate::types::Presence::Present,
-            artifact::Presence::Absent => crate::types::Presence::Absent,
-            artifact::Presence::Var(var) => crate::types::Presence::Var(var),
-            artifact::Presence::Bound(var) => crate::types::Presence::Bound(var),
-            artifact::Presence::Undecided => crate::types::Presence::Undecided,
-        },
-        ty: import_type(mint, &value.ty, symbols, names),
-    }
-}
-
-fn import_formula(value: &artifact::Formula) -> crate::types::Formula {
+/// Import a formula iteratively. A solver-local atom has no meaning across the
+/// artifact boundary; `false` in the second result asks the scheme importer to
+/// recover the whole constraint to `true` rather than retaining a foreign ID.
+fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
     use crate::types::{Atom, Formula};
-    match value {
-        artifact::Formula::True => Formula::True,
-        artifact::Formula::False => Formula::False,
-        artifact::Formula::Var(var) => Formula::Atom(Atom::Var(*var)),
-        artifact::Formula::Bound(var) => Formula::Atom(Atom::Bound(*var)),
-        artifact::Formula::Not(value) => Formula::Not(Rc::new(import_formula(value))),
-        artifact::Formula::And(left, right) => Formula::And(
-            Rc::new(import_formula(left)),
-            Rc::new(import_formula(right)),
-        ),
-        artifact::Formula::Or(left, right) => Formula::Or(
-            Rc::new(import_formula(left)),
-            Rc::new(import_formula(right)),
-        ),
-        artifact::Formula::Iff(left, right) => Formula::Iff(
-            Rc::new(import_formula(left)),
-            Rc::new(import_formula(right)),
-        ),
-        artifact::Formula::Xor(left, right) => Formula::Xor(
-            Rc::new(import_formula(left)),
-            Rc::new(import_formula(right)),
-        ),
+
+    #[derive(Clone, Copy)]
+    enum Binary {
+        And,
+        Or,
+        Iff,
+        Xor,
     }
+    enum Work<'a> {
+        Formula(&'a artifact::Formula),
+        Not,
+        Binary(Binary),
+    }
+
+    let mut valid = true;
+    let mut work = vec![Work::Formula(value)];
+    let mut values = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Formula(value) => match value {
+                artifact::Formula::True => values.push(Formula::True),
+                artifact::Formula::False => values.push(Formula::False),
+                artifact::Formula::Bound(index) => values.push(Formula::Atom(Atom::Bound(*index))),
+                artifact::Formula::Var(_) => {
+                    valid = false;
+                    values.push(Formula::True);
+                }
+                artifact::Formula::Not(inner) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                artifact::Formula::And(left, right) => {
+                    work.push(Work::Binary(Binary::And));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                artifact::Formula::Or(left, right) => {
+                    work.push(Work::Binary(Binary::Or));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                artifact::Formula::Iff(left, right) => {
+                    work.push(Work::Binary(Binary::Iff));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                artifact::Formula::Xor(left, right) => {
+                    work.push(Work::Binary(Binary::Xor));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+            },
+            Work::Not => {
+                let inner = values.pop().expect("not visits one operand");
+                values.push(Formula::Not(Rc::new(inner)));
+            }
+            Work::Binary(operator) => {
+                let right = values
+                    .pop()
+                    .expect("a binary formula visits its right operand");
+                let left = values
+                    .pop()
+                    .expect("a binary formula visits its left operand");
+                values.push(match operator {
+                    Binary::And => Formula::And(Rc::new(left), Rc::new(right)),
+                    Binary::Or => Formula::Or(Rc::new(left), Rc::new(right)),
+                    Binary::Iff => Formula::Iff(Rc::new(left), Rc::new(right)),
+                    Binary::Xor => Formula::Xor(Rc::new(left), Rc::new(right)),
+                });
+            }
+        }
+    }
+    (
+        values.pop().expect("a visited formula produces a value"),
+        valid,
+    )
 }
 
 /// Assign structural identities to effects and replace the provisional source
@@ -3082,9 +3294,7 @@ impl RegularType<'_> {
             }
             Ty::Struct(r) => self.semantic_fields(r, args),
             Ty::Sum(r) => self.semantic_row(r, args),
-            Ty::Var(v) => self.atom(format!("?{v}")),
             Ty::Bound(i) => args[*i as usize],
-            Ty::Rigid { id, .. } => self.atom(format!("'r{id}")),
             Ty::Named {
                 symbol,
                 args: applied,
@@ -3093,7 +3303,7 @@ impl RegularType<'_> {
                 let applied = applied.iter().map(|a| self.semantic(a, args)).collect();
                 self.named(*symbol, applied)
             }
-            Ty::Undecided => self.atom("?"),
+            Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => self.atom("?"),
         }
     }
 
@@ -3101,11 +3311,10 @@ impl RegularType<'_> {
         use crate::types::{Presence, Rest};
         let mut edges = Vec::new();
         for (name, field) in &row.labels {
-            let p = match field.presence {
+            let p: String = match field.presence {
                 Presence::Present => "+".into(),
                 Presence::Absent => "\\".into(),
-                Presence::Var(v) => format!("?{v}"),
-                Presence::Bound(_) | Presence::Undecided => "?".into(),
+                Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?".into(),
             };
             let payload = if matches!(field.presence, Presence::Absent) {
                 self.atom("?")
@@ -3116,10 +3325,8 @@ impl RegularType<'_> {
         }
         let tail = match &row.rest {
             Rest::Closed => self.atom("Unit"),
-            Rest::Var(v) => self.atom(format!("?{v}")),
             Rest::Bound(i) => args[*i as usize],
-            Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
-            Rest::Undecided => self.atom("?"),
+            Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
             Rest::More(m) => self.semantic_fields(m, args),
         };
         edges.push(("core".into(), tail));
@@ -3130,11 +3337,12 @@ impl RegularType<'_> {
         use crate::types::Rest;
         let mut edges = Vec::new();
         for (name, field) in &row.labels {
-            let presence = match &field.presence {
+            let presence: String = match &field.presence {
                 crate::types::Presence::Present => "+".into(),
                 crate::types::Presence::Absent => "\\".into(),
-                crate::types::Presence::Var(id) => format!("?{id}"),
-                crate::types::Presence::Bound(_) | crate::types::Presence::Undecided => "?".into(),
+                crate::types::Presence::Var(_)
+                | crate::types::Presence::Bound(_)
+                | crate::types::Presence::Undecided => "?".into(),
             };
             let ty = if matches!(field.presence, crate::types::Presence::Absent) {
                 self.atom("?")
@@ -3148,10 +3356,8 @@ impl RegularType<'_> {
         }
         let tail = match &row.rest {
             Rest::Closed => self.atom("closed"),
-            Rest::Var(id) => self.atom(format!("?{id}")),
             Rest::Bound(id) => args[*id as usize],
-            Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
-            Rest::Undecided => self.atom("?"),
+            Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
             Rest::More(more) => self.semantic_row(more, args),
         };
         edges.push(("tail".into(), tail));
@@ -6538,7 +6744,7 @@ impl Builder<'_> {
                     &mut symbols,
                     &mut program.external_names,
                 );
-                let body = clamp_bounds(&body, params.len(), 0);
+                let body = clamp_bounds(body, params.len(), 0);
                 let scheme = Scheme::new(params.len() as u32, body);
                 self.arities.insert(symbol, params.len());
                 program.external_types.insert(
@@ -6611,14 +6817,14 @@ impl Builder<'_> {
                                 &mut symbols,
                                 &mut program.external_names,
                             );
-                            let from = clamp_bounds(&from, 0, 0);
+                            let from = clamp_bounds(from, 0, 0);
                             let to = import_type(
                                 self.mint,
                                 &operation.to,
                                 &mut symbols,
                                 &mut program.external_names,
                             );
-                            let to = clamp_bounds(&to, 0, 0);
+                            let to = clamp_bounds(to, 0, 0);
                             let selector = match &operation.selector {
                                 artifact::OperationSelector::Unnamed => OperationSelector::Unnamed,
                                 artifact::OperationSelector::Named(name) => {
