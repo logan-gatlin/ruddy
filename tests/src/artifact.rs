@@ -1372,6 +1372,228 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
 }
 
 #[test]
+fn iterative_artifact_equality_preserves_every_derived_distinction() {
+    assert_ne!(Type::Var(0), Type::Var(1));
+    assert_ne!(Type::Bound(0), Type::Bound(1));
+    assert_ne!(
+        Type::Rigid {
+            id: 0,
+            name: "same".into(),
+        },
+        Type::Rigid {
+            id: 1,
+            name: "same".into(),
+        }
+    );
+    assert_ne!(
+        Type::Rigid {
+            id: 0,
+            name: "left".into(),
+        },
+        Type::Rigid {
+            id: 0,
+            name: "right".into(),
+        }
+    );
+    assert_ne!(
+        Type::Named {
+            name: "Left".into(),
+            args: vec![Type::Nat],
+        },
+        Type::Named {
+            name: "Right".into(),
+            args: vec![Type::Nat],
+        }
+    );
+    assert_ne!(
+        Type::Named {
+            name: "Same".into(),
+            args: vec![Type::Nat],
+        },
+        Type::Named {
+            name: "Same".into(),
+            args: Vec::new(),
+        }
+    );
+    assert_ne!(Type::Nat, Type::Int);
+
+    let row = |name: &str, presence, rest| Row {
+        labels: vec![(name.into(), field(presence, Type::Nat))],
+        rest,
+    };
+    let same = row("field", Presence::Present, Rest::Closed);
+    assert_eq!(same.clone(), same);
+    assert_ne!(
+        same,
+        Row {
+            labels: Vec::new(),
+            rest: Rest::Closed
+        }
+    );
+    assert_ne!(
+        row("left", Presence::Present, Rest::Closed),
+        row("right", Presence::Present, Rest::Closed)
+    );
+    assert_ne!(
+        row("field", Presence::Present, Rest::Closed),
+        row("field", Presence::Absent, Rest::Closed)
+    );
+    assert_ne!(
+        row("field", Presence::Present, Rest::Closed),
+        row("field", Presence::Present, Rest::Undecided)
+    );
+
+    assert_ne!(Rest::Var(0), Rest::Var(1));
+    assert_ne!(Rest::Bound(0), Rest::Bound(1));
+    assert_ne!(
+        Rest::Rigid {
+            id: 0,
+            name: "same".into(),
+        },
+        Rest::Rigid {
+            id: 1,
+            name: "same".into(),
+        }
+    );
+    assert_ne!(
+        Rest::Rigid {
+            id: 0,
+            name: "left".into(),
+        },
+        Rest::Rigid {
+            id: 0,
+            name: "right".into(),
+        }
+    );
+    assert_ne!(Rest::Closed, Rest::Undecided);
+    assert_ne!(
+        Rest::More(Box::new(Row {
+            labels: Vec::new(),
+            rest: Rest::Closed,
+        })),
+        Rest::More(Box::new(Row {
+            labels: Vec::new(),
+            rest: Rest::Undecided,
+        }))
+    );
+
+    assert_ne!(Formula::Var(0), Formula::Var(1));
+    assert_ne!(Formula::Bound(0), Formula::Bound(1));
+    assert_ne!(Formula::True, Formula::False);
+    assert_ne!(
+        Formula::Not(Box::new(Formula::True)),
+        Formula::Not(Box::new(Formula::False))
+    );
+}
+
+#[test]
+fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-artifact-ownership".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+
+            let deep_formula = || {
+                let mut value = Formula::True;
+                for _ in 0..DEPTH {
+                    value = Formula::Not(Box::new(value));
+                }
+                value
+            };
+            let deep_type = || {
+                let mut value = Type::Nat;
+                for _ in 0..DEPTH {
+                    value = Type::Named {
+                        name: "deep@1::Layer".into(),
+                        args: vec![value],
+                    };
+                }
+                value
+            };
+            let deep_row_type = || {
+                let mut row = Row {
+                    labels: Vec::new(),
+                    rest: Rest::Closed,
+                };
+                for _ in 0..DEPTH {
+                    row = Row {
+                        labels: Vec::new(),
+                        rest: Rest::More(Box::new(row)),
+                    };
+                }
+                Type::Struct(row)
+            };
+
+            let artifact = Artifact {
+                header: artifact::Header {
+                    identity: artifact::Identity {
+                        name: "deep".into(),
+                        version: "1".into(),
+                    },
+                    dependencies: Vec::new(),
+                    values: vec![artifact::Value {
+                        name: "deep@1::value".into(),
+                        scheme: Scheme {
+                            count: 0,
+                            presences: 0,
+                            formula: deep_formula(),
+                            body: deep_type(),
+                        },
+                    }],
+                    types: vec![artifact::DeclaredType {
+                        name: "deep@1::Rows".into(),
+                        params: Vec::new(),
+                        scheme: Scheme {
+                            count: 0,
+                            presences: 0,
+                            formula: Formula::True,
+                            body: deep_row_type(),
+                        },
+                    }],
+                    effects: Vec::new(),
+                },
+                lir: Lir {
+                    functions: Vec::new(),
+                    globals: Vec::new(),
+                },
+            };
+            let cloned = artifact.clone();
+            assert_eq!(cloned, artifact);
+            drop(cloned);
+            drop(artifact);
+
+            // Public header components can also outlive their containing
+            // artifact, and must not depend on `Artifact::drop` for safety.
+            drop(artifact::Value {
+                name: "deep@1::standalone".into(),
+                scheme: Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: deep_formula(),
+                    body: deep_type(),
+                },
+            });
+            drop(artifact::DeclaredType {
+                name: "deep@1::StandaloneType".into(),
+                params: Vec::new(),
+                scheme: Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: Formula::True,
+                    body: deep_row_type(),
+                },
+            });
+            drop(deep_type());
+            drop(deep_row_type());
+            drop(deep_formula());
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("recursive artifact ownership uses bounded stack");
+}
+
+#[test]
 fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));

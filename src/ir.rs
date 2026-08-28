@@ -5416,8 +5416,6 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
         carries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
         rows: &HashMap<Symbol, Sense>,
-        declarations: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
         out: &mut Vec<Error>,
     ) {
         match &mut ty.tracked {
@@ -5457,15 +5455,15 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         *arg = span.track(TypeKind::Error);
                         continue;
                     }
-                    walk(arg, kinds, carries, rows, declarations, external, out);
+                    walk(arg, kinds, carries, rows, out);
                 }
             }
             // The effect row holds no argument to check: an effect is named,
             // never applied, so there is nothing inside one for a parameter's
             // conditions to be broken by.
             TypeKind::Arrow { from, to, .. } => {
-                walk(from, kinds, carries, rows, declarations, external, out);
-                walk(to, kinds, carries, rows, declarations, external, out);
+                walk(from, kinds, carries, rows, out);
+                walk(to, kinds, carries, rows, out);
             }
             // A row holds labels and a tail, and neither is a type: there is
             // nothing inside one for an argument to be written at.
@@ -5473,7 +5471,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             TypeKind::Struct { fields, .. } => {
                 for field in fields.values_mut() {
                     if let TypeField::Written { value, .. } = field {
-                        walk(value, kinds, carries, rows, declarations, external, out);
+                        walk(value, kinds, carries, rows, out);
                     }
                 }
             }
@@ -5484,7 +5482,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         ..
                     } = case
                     {
-                        walk(payload, kinds, carries, rows, declarations, external, out);
+                        walk(payload, kinds, carries, rows, out);
                     }
                 }
             }
@@ -5511,9 +5509,6 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                 )
             })
             .collect();
-    let declarations = program.types.clone();
-    let external = program.external_types.clone();
-
     let mut out = Vec::new();
     for decl in program.types.values_mut() {
         // Which of this declaration's own parameters are a sum's rest, so one
@@ -5530,44 +5525,20 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             .filter(|param| param.kind.row().is_some())
             .map(|param| (param.symbol, param.kind.sense()))
             .collect();
-        walk(
-            &mut decl.value,
-            kinds,
-            &carries,
-            &rows,
-            &declarations,
-            &external,
-            &mut out,
-        );
+        walk(&mut decl.value, kinds, &carries, &rows, &mut out);
     }
     // An annotation binds no parameters, so nothing in one can be a sum's rest
     // by being a parameter — but it is every bit as much a place to apply a
     // declaration, and was the way this check was first written round.
     for decl in program.terms.values_mut() {
         if let Some(annotation) = decl.annotation.as_mut().map(|it| &mut it.ty) {
-            walk(
-                annotation,
-                kinds,
-                &carries,
-                &HashMap::new(),
-                &declarations,
-                &external,
-                &mut out,
-            );
+            walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
         }
         // And so is a nested binding's, which is a place to write one as much
         // as a definition's is. An annotation this walk never reaches is a
         // [`ErrorKind::RepeatedRowField`] never reported.
         annotations(&mut decl.value, &mut |annotation| {
-            walk(
-                annotation,
-                kinds,
-                &carries,
-                &HashMap::new(),
-                &declarations,
-                &external,
-                &mut out,
-            );
+            walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
         });
     }
     for decl in program.externs.values_mut() {
@@ -5576,15 +5547,7 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
             .as_mut()
             .expect("an extern always has a written annotation")
             .ty;
-        walk(
-            annotation,
-            kinds,
-            &carries,
-            &HashMap::new(),
-            &declarations,
-            &external,
-            &mut out,
-        );
+        walk(annotation, kinds, &carries, &HashMap::new(), &mut out);
     }
     // Operation inputs and outputs are source-written types too. They are not
     // annotations on terms, so reach them explicitly rather than letting this
@@ -5598,8 +5561,6 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     kinds,
                     &carries,
                     &HashMap::new(),
-                    &declarations,
-                    &external,
                     &mut out,
                 );
                 walk(
@@ -5607,8 +5568,6 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                     kinds,
                     &carries,
                     &HashMap::new(),
-                    &declarations,
-                    &external,
                     &mut out,
                 );
             }

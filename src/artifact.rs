@@ -186,7 +186,7 @@ pub struct Scheme {
 
 /// A normalized semantic type. Structural fields are representable only by
 /// the `Struct` constructor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Type {
     Nat,
     Int,
@@ -210,14 +210,14 @@ pub enum Type {
 }
 
 /// A normalized sum or effect row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Row {
     pub labels: Vec<(String, RowField)>,
     pub rest: Rest,
 }
 
 /// The part of a sum or effect row beyond its named labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Rest {
     Closed,
     Var(u32),
@@ -245,7 +245,7 @@ pub enum Presence {
 }
 
 /// A propositional constraint over presence variables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Formula {
     True,
     False,
@@ -256,6 +256,483 @@ pub enum Formula {
     Or(Box<Formula>, Box<Formula>),
     Iff(Box<Formula>, Box<Formula>),
     Xor(Box<Formula>, Box<Formula>),
+}
+
+// These values are part of the public artifact schema, so callers can own and
+// destroy and compare them independently of `Artifact`. Keep their recursive
+// ownership and equality walks on explicit heap stacks: real generated schemes
+// can be tens of thousands of constructors deep.
+enum SemanticRef<'a> {
+    Type(&'a Type),
+    Row(&'a Row),
+}
+
+enum SemanticPair<'a> {
+    Type(&'a Type, &'a Type),
+    Row(&'a Row, &'a Row),
+    Rest(&'a Rest, &'a Rest),
+}
+
+fn semantic_eq(root: SemanticPair<'_>) -> bool {
+    let mut pending = vec![root];
+    while let Some(pair) = pending.pop() {
+        match pair {
+            SemanticPair::Type(left, right) => match (left, right) {
+                (Type::Nat, Type::Nat)
+                | (Type::Int, Type::Int)
+                | (Type::Real, Type::Real)
+                | (Type::String, Type::String)
+                | (Type::Boolean, Type::Boolean)
+                | (Type::Undecided, Type::Undecided) => {}
+                (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
+                    if left == right => {}
+                (
+                    Type::Rigid {
+                        id: left_id,
+                        name: left_name,
+                    },
+                    Type::Rigid {
+                        id: right_id,
+                        name: right_name,
+                    },
+                ) if left_id == right_id && left_name == right_name => {}
+                (
+                    Type::Arrow(left_from, left_to, left_effects),
+                    Type::Arrow(right_from, right_to, right_effects),
+                ) => {
+                    pending.push(SemanticPair::Row(left_effects, right_effects));
+                    pending.push(SemanticPair::Type(left_to, right_to));
+                    pending.push(SemanticPair::Type(left_from, right_from));
+                }
+                (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
+                    pending.push(SemanticPair::Row(left, right));
+                }
+                (
+                    Type::Named {
+                        name: left_name,
+                        args: left_args,
+                    },
+                    Type::Named {
+                        name: right_name,
+                        args: right_args,
+                    },
+                ) if left_name == right_name && left_args.len() == right_args.len() => {
+                    pending.extend(
+                        left_args
+                            .iter()
+                            .zip(right_args)
+                            .rev()
+                            .map(|(left, right)| SemanticPair::Type(left, right)),
+                    );
+                }
+                _ => return false,
+            },
+            SemanticPair::Row(left, right) => {
+                if left.labels.len() != right.labels.len() {
+                    return false;
+                }
+                for ((left_name, left_field), (right_name, right_field)) in
+                    left.labels.iter().zip(&right.labels)
+                {
+                    if left_name != right_name || left_field.presence != right_field.presence {
+                        return false;
+                    }
+                    pending.push(SemanticPair::Type(&left_field.ty, &right_field.ty));
+                }
+                pending.push(SemanticPair::Rest(&left.rest, &right.rest));
+            }
+            SemanticPair::Rest(left, right) => match (left, right) {
+                (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
+                (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right))
+                    if left == right => {}
+                (
+                    Rest::Rigid {
+                        id: left_id,
+                        name: left_name,
+                    },
+                    Rest::Rigid {
+                        id: right_id,
+                        name: right_name,
+                    },
+                ) if left_id == right_id && left_name == right_name => {}
+                (Rest::More(left), Rest::More(right)) => {
+                    pending.push(SemanticPair::Row(left, right));
+                }
+                _ => return false,
+            },
+        }
+    }
+    true
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Type(self, other))
+    }
+}
+
+impl Eq for Type {}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Row(self, other))
+    }
+}
+
+impl Eq for Row {}
+
+impl PartialEq for Rest {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Rest(self, other))
+    }
+}
+
+impl Eq for Rest {}
+
+impl PartialEq for Formula {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            match (left, right) {
+                (Formula::True, Formula::True) | (Formula::False, Formula::False) => {}
+                (Formula::Var(left), Formula::Var(right))
+                | (Formula::Bound(left), Formula::Bound(right))
+                    if left == right => {}
+                (Formula::Not(left), Formula::Not(right)) => pending.push((left, right)),
+                (Formula::And(left_a, left_b), Formula::And(right_a, right_b))
+                | (Formula::Or(left_a, left_b), Formula::Or(right_a, right_b))
+                | (Formula::Iff(left_a, left_b), Formula::Iff(right_a, right_b))
+                | (Formula::Xor(left_a, left_b), Formula::Xor(right_a, right_b)) => {
+                    pending.push((left_b, right_b));
+                    pending.push((left_a, right_a));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Formula {}
+
+enum CloneWork<'a> {
+    Semantic(SemanticRef<'a>),
+    Arrow,
+    Struct,
+    Sum,
+    Named {
+        name: String,
+        count: usize,
+    },
+    FinishRow {
+        labels: Vec<(String, Presence)>,
+        rest: Option<Rest>,
+    },
+}
+
+fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
+    let mut work = vec![CloneWork::Semantic(root)];
+    let mut types = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            CloneWork::Semantic(SemanticRef::Type(value)) => match value {
+                Type::Nat => types.push(Type::Nat),
+                Type::Int => types.push(Type::Int),
+                Type::Real => types.push(Type::Real),
+                Type::String => types.push(Type::String),
+                Type::Boolean => types.push(Type::Boolean),
+                Type::Arrow(from, to, effects) => {
+                    work.push(CloneWork::Arrow);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(to)));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(from)));
+                }
+                Type::Struct(row) => {
+                    work.push(CloneWork::Struct);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(row)));
+                }
+                Type::Sum(row) => {
+                    work.push(CloneWork::Sum);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(row)));
+                }
+                Type::Var(value) => types.push(Type::Var(*value)),
+                Type::Bound(value) => types.push(Type::Bound(*value)),
+                Type::Rigid { id, name } => types.push(Type::Rigid {
+                    id: *id,
+                    name: name.clone(),
+                }),
+                Type::Named { name, args } => {
+                    work.push(CloneWork::Named {
+                        name: name.clone(),
+                        count: args.len(),
+                    });
+                    work.extend(
+                        args.iter()
+                            .rev()
+                            .map(|arg| CloneWork::Semantic(SemanticRef::Type(arg))),
+                    );
+                }
+                Type::Undecided => types.push(Type::Undecided),
+            },
+            CloneWork::Semantic(SemanticRef::Row(value)) => {
+                let labels = value
+                    .labels
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.presence.clone()))
+                    .collect();
+                let rest = match &value.rest {
+                    Rest::Closed => Some(Rest::Closed),
+                    Rest::Var(value) => Some(Rest::Var(*value)),
+                    Rest::Bound(value) => Some(Rest::Bound(*value)),
+                    Rest::Rigid { id, name } => Some(Rest::Rigid {
+                        id: *id,
+                        name: name.clone(),
+                    }),
+                    Rest::Undecided => Some(Rest::Undecided),
+                    Rest::More(_) => None,
+                };
+                work.push(CloneWork::FinishRow { labels, rest });
+                if let Rest::More(more) = &value.rest {
+                    work.push(CloneWork::Semantic(SemanticRef::Row(more)));
+                }
+                work.extend(
+                    value
+                        .labels
+                        .iter()
+                        .rev()
+                        .map(|(_, field)| CloneWork::Semantic(SemanticRef::Type(&field.ty))),
+                );
+            }
+            CloneWork::Arrow => {
+                let effects = rows.pop().expect("cloned arrow effects");
+                let to = types.pop().expect("cloned arrow result");
+                let from = types.pop().expect("cloned arrow parameter");
+                types.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            CloneWork::Struct => {
+                types.push(Type::Struct(rows.pop().expect("cloned struct row")));
+            }
+            CloneWork::Sum => {
+                types.push(Type::Sum(rows.pop().expect("cloned sum row")));
+            }
+            CloneWork::Named { name, count } => {
+                let split = types.len() - count;
+                let args = types.drain(split..).collect();
+                types.push(Type::Named { name, args });
+            }
+            CloneWork::FinishRow { labels, rest } => {
+                let mut cloned = Vec::with_capacity(labels.len());
+                for (name, presence) in labels.into_iter().rev() {
+                    cloned.push((
+                        name,
+                        RowField {
+                            presence,
+                            ty: types.pop().expect("cloned row field"),
+                        },
+                    ));
+                }
+                cloned.reverse();
+                let rest = match rest {
+                    Some(rest) => rest,
+                    None => Rest::More(Box::new(rows.pop().expect("cloned row rest"))),
+                };
+                rows.push(Row {
+                    labels: cloned,
+                    rest,
+                });
+            }
+        }
+    }
+    (types, rows)
+}
+
+impl Clone for Type {
+    fn clone(&self) -> Self {
+        let (mut types, rows) = clone_semantic(SemanticRef::Type(self));
+        debug_assert!(rows.is_empty());
+        types.pop().expect("cloned type")
+    }
+}
+
+impl Clone for Row {
+    fn clone(&self) -> Self {
+        let (types, mut rows) = clone_semantic(SemanticRef::Row(self));
+        debug_assert!(types.is_empty());
+        rows.pop().expect("cloned row")
+    }
+}
+
+enum SemanticOwned {
+    Type(Type),
+    Row(Row),
+}
+
+fn empty_row() -> Row {
+    Row {
+        labels: Vec::new(),
+        rest: Rest::Closed,
+    }
+}
+
+fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
+    match value {
+        Type::Arrow(from, to, effects) => {
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                from.as_mut(),
+                Type::Undecided,
+            )));
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                to.as_mut(),
+                Type::Undecided,
+            )));
+            pending.push(SemanticOwned::Row(std::mem::replace(effects, empty_row())));
+        }
+        Type::Struct(row) | Type::Sum(row) => {
+            pending.push(SemanticOwned::Row(std::mem::replace(row, empty_row())));
+        }
+        Type::Named { args, .. } => {
+            pending.extend(std::mem::take(args).into_iter().map(SemanticOwned::Type))
+        }
+        Type::Nat
+        | Type::Int
+        | Type::Real
+        | Type::String
+        | Type::Boolean
+        | Type::Var(_)
+        | Type::Bound(_)
+        | Type::Rigid { .. }
+        | Type::Undecided => {}
+    }
+}
+
+fn drain_row(value: &mut Row, pending: &mut Vec<SemanticOwned>) {
+    pending.extend(
+        std::mem::take(&mut value.labels)
+            .into_iter()
+            .map(|(_, field)| SemanticOwned::Type(field.ty)),
+    );
+    if let Rest::More(more) = &mut value.rest {
+        pending.push(SemanticOwned::Row(std::mem::replace(
+            more.as_mut(),
+            empty_row(),
+        )));
+    }
+}
+
+fn discard_semantic(root: SemanticRefMut<'_>) {
+    let mut pending = Vec::new();
+    match root {
+        SemanticRefMut::Type(value) => drain_type(value, &mut pending),
+        SemanticRefMut::Row(value) => drain_row(value, &mut pending),
+    }
+    while let Some(mut value) = pending.pop() {
+        match &mut value {
+            SemanticOwned::Type(value) => drain_type(value, &mut pending),
+            SemanticOwned::Row(value) => drain_row(value, &mut pending),
+        }
+    }
+}
+
+enum SemanticRefMut<'a> {
+    Type(&'a mut Type),
+    Row(&'a mut Row),
+}
+
+impl Drop for Type {
+    fn drop(&mut self) {
+        discard_semantic(SemanticRefMut::Type(self));
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        discard_semantic(SemanticRefMut::Row(self));
+    }
+}
+
+impl Clone for Formula {
+    fn clone(&self) -> Self {
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Pair(u8),
+        }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => out.push(Formula::True),
+                Work::Formula(Formula::False) => out.push(Formula::False),
+                Work::Formula(Formula::Var(value)) => out.push(Formula::Var(*value)),
+                Work::Formula(Formula::Bound(value)) => out.push(Formula::Bound(*value)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Pair(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Pair(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Pair(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Pair(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = out.pop().expect("cloned formula operand");
+                    out.push(Formula::Not(Box::new(inner)));
+                }
+                Work::Pair(kind) => {
+                    let right = out.pop().expect("cloned right formula operand");
+                    let left = out.pop().expect("cloned left formula operand");
+                    out.push(match kind {
+                        0 => Formula::And(Box::new(left), Box::new(right)),
+                        1 => Formula::Or(Box::new(left), Box::new(right)),
+                        2 => Formula::Iff(Box::new(left), Box::new(right)),
+                        _ => Formula::Xor(Box::new(left), Box::new(right)),
+                    });
+                }
+            }
+        }
+        out.pop().expect("cloned formula")
+    }
+}
+
+impl Drop for Formula {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_formula(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            drain_formula(&mut value, &mut pending);
+        }
+    }
+}
+
+fn drain_formula(value: &mut Formula, pending: &mut Vec<Formula>) {
+    match value {
+        Formula::Not(inner) => pending.push(std::mem::replace(inner.as_mut(), Formula::True)),
+        Formula::And(left, right)
+        | Formula::Or(left, right)
+        | Formula::Iff(left, right)
+        | Formula::Xor(left, right) => {
+            pending.push(std::mem::replace(left.as_mut(), Formula::True));
+            pending.push(std::mem::replace(right.as_mut(), Formula::True));
+        }
+        Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+    }
 }
 
 /// The span-free LIR portion of an artifact.
@@ -1918,58 +2395,11 @@ pub mod text {
     /// field destruction constant-depth.
     pub(super) fn discard_artifact(artifact: &mut Artifact) {
         fn discard_formula(formula: Formula) {
-            let mut pending = vec![formula];
-            while let Some(formula) = pending.pop() {
-                match formula {
-                    Formula::Not(value) => pending.push(*value),
-                    Formula::And(left, right)
-                    | Formula::Or(left, right)
-                    | Formula::Iff(left, right)
-                    | Formula::Xor(left, right) => {
-                        pending.push(*left);
-                        pending.push(*right);
-                    }
-                    Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
-                }
-            }
+            drop(formula);
         }
 
-        enum Semantic {
-            Ty(Type),
-            Row(Row),
-        }
         fn discard_type(ty: Type) {
-            let mut pending = vec![Semantic::Ty(ty)];
-            while let Some(value) = pending.pop() {
-                match value {
-                    Semantic::Ty(ty) => match ty {
-                        Type::Arrow(from, to, effects) => {
-                            pending.push(Semantic::Ty(*from));
-                            pending.push(Semantic::Ty(*to));
-                            pending.push(Semantic::Row(effects));
-                        }
-                        Type::Struct(row) | Type::Sum(row) => pending.push(Semantic::Row(row)),
-                        Type::Named { args, .. } => {
-                            pending.extend(args.into_iter().map(Semantic::Ty))
-                        }
-                        Type::Nat
-                        | Type::Int
-                        | Type::Real
-                        | Type::String
-                        | Type::Boolean
-                        | Type::Var(_)
-                        | Type::Bound(_)
-                        | Type::Rigid { .. }
-                        | Type::Undecided => {}
-                    },
-                    Semantic::Row(Row { labels, rest }) => {
-                        pending.extend(labels.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
-                        if let Rest::More(row) = rest {
-                            pending.push(Semantic::Row(*row));
-                        }
-                    }
-                }
-            }
+            drop(ty);
         }
 
         fn discard_scheme(scheme: Scheme) {

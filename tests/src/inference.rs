@@ -3097,6 +3097,17 @@ fn a_settled_presence_is_reported_as_the_field_it_is_about() {
 /// it is not part of what the type says, so closing a row that has settled it
 /// away is closing a row that does not name it.
 #[test]
+fn a_presence_settled_absent_beside_another_field_failure_skips_its_payload() {
+    let (_, _, output) = infer_src(
+        "let absent : { \\x, \\y, .. } = {}\n\
+         let need : { x: Nat, y when 'a: {}, .. } -> Nat = fn r => r.x\n\
+         let bad = need absent",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(output.errors[0].kind.code(), "missing-field");
+}
+
+#[test]
 fn a_field_settled_absent_passes_a_closed_row_without_a_word() {
     inferred(
         "let optional : { x when 'a: Nat, .. } -> Nat = fn p => 1n\n\
@@ -5571,6 +5582,16 @@ fn guarded_assignments_leave_absent_payloads_irrelevant() {
     // annotation reaches its absent slot, but never treats the slot's unknown
     // payload as a constraint to settle.
     let (_, _, failed) = infer_src("let bad : { \\gone, .. } = 1n");
+    assert_eq!(failed.errors.len(), 1, "{:#?}", failed.errors);
+
+    // A differing label set uses the full row rule. Its shared absent slot is
+    // still payload-free under the arm premise.
+    let (_, _, failed) = infer_src(
+        "let absent : { \\b, .. } = {}\n\
+         let need : { a: Nat, b when 'p: {}, .. } -> Nat = fn r => r.a\n\
+         let f = fn v => match v with\n\
+         | {x} => need absent | {y} => 0n end",
+    );
     assert_eq!(failed.errors.len(), 1, "{:#?}", failed.errors);
 }
 

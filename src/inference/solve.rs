@@ -972,95 +972,25 @@ impl Solve<'_> {
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
         let rhs = self.table.resolve(actual);
-        if self.direct_equal(&lhs, &rhs) {
-            self.unify_equal(span, lhs, rhs);
-            return;
-        }
-        let goal = Goal::Type {
-            expected: lhs.clone(),
-            actual: rhs.clone(),
-        };
-        self.types(span, goal, &lhs, &rhs);
+        self.unify_direct(span, lhs, rhs);
     }
 
-    /// Whether an already equal pair can take only the solver's direct
-    /// decomposition arms. Names whose parameters are discarded still have to
-    /// unfold, since nominal congruence would disagree with structural
-    /// equality there; every other equal composite can be replayed by the
-    /// explicit-stack path below.
-    fn direct_equal(&self, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
-        enum Work {
-            Ty(Rc<Ty>, Rc<Ty>),
-            Row(Row, Row),
+    /// Decide a type goal with an explicit continuation stack.
+    ///
+    /// The stack is not only an equality fast path. An unequal leaf may sit at
+    /// the bottom of an arbitrarily deep pair of arrows, named arguments, or
+    /// equal-label rows, and reaching that leaf must not borrow one native
+    /// frame per enclosing constructor. A row that needs the full label rule,
+    /// or a name that needs unfolding, falls back only at that node; recursive
+    /// payload goals immediately enter this trampoline again.
+    fn unify_direct(&mut self, span: Span, lhs: Rc<Ty>, rhs: Rc<Ty>) {
+        struct Rollback {
+            stepped: usize,
+            stored: usize,
+            traced: Vec<usize>,
+            known: Known,
         }
-        let mut work = vec![Work::Ty(lhs.clone(), rhs.clone())];
-        while let Some(part) = work.pop() {
-            match part {
-                Work::Ty(lhs, rhs) => {
-                    let (lhs, rhs) = (self.table.resolve(&lhs), self.table.resolve(&rhs));
-                    match (&*lhs, &*rhs) {
-                        (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
-                            work.push(Work::Row(effects.clone(), performs.clone()));
-                            work.push(Work::Ty(to.clone(), result.clone()));
-                            work.push(Work::Ty(from.clone(), other.clone()));
-                        }
-                        (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
-                            work.push(Work::Row(a.clone(), b.clone()));
-                        }
-                        (
-                            Ty::Named { symbol, args, .. },
-                            Ty::Named {
-                                symbol: other,
-                                args: others,
-                                ..
-                            },
-                        ) if symbol == other && args.len() == others.len() => {
-                            if !args.is_empty() && !self.nominal.contains(symbol) {
-                                return false;
-                            }
-                            work.extend(
-                                args.iter()
-                                    .zip(others.iter())
-                                    .rev()
-                                    .map(|(a, b)| Work::Ty(a.clone(), b.clone())),
-                            );
-                        }
-                        // Every leaf pair, equal or not, is safe for the
-                        // trampoline's ordinary directional fallback. A name
-                        // that cannot use congruence still has to unfold.
-                        (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => return false,
-                        _ => {}
-                    }
-                }
-                Work::Row(lhs, rhs) => {
-                    let (lhs, rhs) = (self.table.canon(&lhs), self.table.canon(&rhs));
-                    if lhs.labels.len() != rhs.labels.len()
-                        || lhs.labels.keys().any(|name| !rhs.labels.contains_key(name))
-                    {
-                        return false;
-                    }
-                    for (name, field) in lhs.labels {
-                        let other = &rhs.labels[&name];
-                        let presence = self.table.presence_of(&field.presence);
-                        let other_presence = self.table.presence_of(&other.presence);
-                        if presence != other_presence {
-                            return false;
-                        }
-                        if !matches!(presence, Presence::Absent) {
-                            work.push(Work::Ty(field.ty, other.ty.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        true
-    }
 
-    /// Replay successful direct equality with an explicit continuation stack.
-    /// This is the same rule order and nesting depth as the ordinary recursive
-    /// implementation, but a 30,000-node imported Arrow/Named/row tree borrows
-    /// heap space rather than the native stack.
-    fn unify_equal(&mut self, span: Span, lhs: Rc<Ty>, rhs: Rc<Ty>) {
         enum Work {
             Ty(Rc<Ty>, Rc<Ty>, u32),
             Row(Row, Row, Shape, u32),
@@ -1071,11 +1001,11 @@ impl Solve<'_> {
                 rhs: Rc<Ty>,
                 depth: u32,
                 reported: usize,
-                stepped: usize,
-                stored: usize,
-                traced: Vec<usize>,
-                known: Known,
-                nested: bool,
+                /// Only the outermost open congruence owns a full checkpoint.
+                /// A nested failure necessarily fails that outer attempt too,
+                /// so cloning `Known` at every nominal depth is both redundant
+                /// and quadratic in a deep application.
+                rollback: Option<Rollback>,
             },
         }
 
@@ -1112,23 +1042,31 @@ impl Solve<'_> {
                                 self.types(span, goal, &lhs, &rhs);
                             }
                         },
-                        (Ty::Named { args, .. }, Ty::Named { args: others, .. }) => {
+                        (
+                            Ty::Named { symbol, args, .. },
+                            Ty::Named {
+                                symbol: other,
+                                args: others,
+                                ..
+                            },
+                        ) if symbol == other
+                            && args.len() == others.len()
+                            && (args.is_empty() || self.nominal.contains(symbol)) =>
+                        {
                             match args.is_empty() {
                                 true => self.step(span, Rule::Same, goal, Effect::None),
                                 false => {
-                                    // `direct_equal` preflights symbol, arity,
-                                    // and nominal relevance for every nested
-                                    // application before this replay begins.
                                     let reported = self.errors.len();
-                                    let stepped = self.steps.len();
-                                    let stored = self.table.store.batches.len();
-                                    let traced = self
-                                        .refinements
-                                        .iter()
-                                        .map(|refinement| refinement.obligations.len())
-                                        .collect();
-                                    let known = self.table.snapshot();
-                                    let nested = congruences != 0;
+                                    let rollback = (congruences == 0).then(|| Rollback {
+                                        stepped: self.steps.len(),
+                                        stored: self.table.store.batches.len(),
+                                        traced: self
+                                            .refinements
+                                            .iter()
+                                            .map(|refinement| refinement.obligations.len())
+                                            .collect(),
+                                        known: self.table.snapshot(),
+                                    });
                                     congruences += 1;
                                     self.step(span, Rule::Congruent, goal, Effect::Decomposed);
                                     work.push(Work::FinishCongruent {
@@ -1136,11 +1074,7 @@ impl Solve<'_> {
                                         rhs: rhs.clone(),
                                         depth,
                                         reported,
-                                        stepped,
-                                        stored,
-                                        traced,
-                                        known,
-                                        nested,
+                                        rollback,
                                     });
                                     work.extend(
                                         args.iter().zip(others.iter()).rev().map(|(a, b)| {
@@ -1158,13 +1092,14 @@ impl Solve<'_> {
                             self.step(span, Rule::Prim, goal, Effect::None);
                         }
                         (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
+                            let (want, have) =
+                                (self.table.canon(effects), self.table.canon(performs));
+                            if !self.direct_row(&want, &have) {
+                                self.types(span, goal, &lhs, &rhs);
+                                continue;
+                            }
                             self.step(span, Rule::Arrow, goal, Effect::Decomposed);
-                            work.push(Work::Row(
-                                self.table.canon(effects),
-                                self.table.canon(performs),
-                                Shape::Effect,
-                                depth + 1,
-                            ));
+                            work.push(Work::Row(want, have, Shape::Effect, depth + 1));
                             work.push(Work::Ty(to.clone(), result.clone(), depth + 1));
                             work.push(Work::Ty(from.clone(), other.clone(), depth + 1));
                         }
@@ -1175,6 +1110,10 @@ impl Solve<'_> {
                                 && matches!(others.rest, Rest::Closed) => {}
                         (Ty::Struct(fields), Ty::Struct(others)) => {
                             let (want, have) = (self.table.canon(fields), self.table.canon(others));
+                            if !self.direct_row(&want, &have) {
+                                self.types(span, goal, &lhs, &rhs);
+                                continue;
+                            }
                             let expected = Rc::new(Ty::Struct(want.clone()));
                             let actual = Rc::new(Ty::Struct(have.clone()));
                             self.step(
@@ -1187,6 +1126,10 @@ impl Solve<'_> {
                         }
                         (Ty::Sum(cases), Ty::Sum(others)) => {
                             let (want, have) = (self.table.canon(cases), self.table.canon(others));
+                            if !self.direct_row(&want, &have) {
+                                self.types(span, goal, &lhs, &rhs);
+                                continue;
+                            }
                             let expected = Rc::new(Ty::Sum(want.clone()));
                             let actual = Rc::new(Ty::Sum(have.clone()));
                             self.step(
@@ -1230,7 +1173,19 @@ impl Solve<'_> {
                     } else if !matches!((&left, &right), (Presence::Present, Presence::Present)) {
                         self.presences(span, &left, &right);
                     }
-                    if !matches!((&left, &right), (Presence::Absent, Presence::Absent)) {
+                    // Binding the expected presence may just have made the
+                    // label absent. Keep `field`'s directional undecided
+                    // behavior too; under a guard either explicit absence
+                    // makes the payload irrelevant.
+                    let payload = if self.guard.is_some() {
+                        !matches!(
+                            (&left, &right),
+                            (Presence::Absent, _) | (_, Presence::Absent)
+                        )
+                    } else {
+                        !matches!(self.table.presence_of(&left), Presence::Absent)
+                    };
+                    if payload {
                         work.push(Work::Ty(lhs.ty, rhs.ty, depth));
                     }
                 }
@@ -1243,46 +1198,58 @@ impl Solve<'_> {
                     rhs,
                     depth,
                     reported,
-                    stepped,
-                    stored,
-                    traced,
-                    known,
-                    nested,
+                    rollback,
                 } => {
                     self.depth = depth;
                     congruences -= 1;
-                    if self.errors.len() > reported {
+                    if self.errors.len() > reported
+                        && let Some(rollback) = rollback
+                    {
                         self.errors.truncate(reported);
-                        self.steps.truncate(stepped);
-                        self.table.store.batches.truncate(stored);
-                        for (refinement, obligations) in self.refinements.iter_mut().zip(traced) {
+                        self.steps.truncate(rollback.stepped);
+                        self.table.store.batches.truncate(rollback.stored);
+                        for (refinement, obligations) in
+                            self.refinements.iter_mut().zip(rollback.traced)
+                        {
                             refinement.obligations.truncate(obligations);
                         }
-                        self.table.restore(known);
-                        if nested {
-                            // A containing congruence will roll this attempt
-                            // back too. Leave only a cheap failure marker for
-                            // it rather than repeatedly recovering every
-                            // suffix of a deep nominal argument.
-                            self.errors.push(Error {
-                                span,
-                                kind: ErrorKind::Mismatch {
-                                    expected: lhs,
-                                    actual: rhs,
-                                },
-                            });
-                        } else {
-                            let goal = Goal::Type {
-                                expected: lhs.clone(),
-                                actual: rhs.clone(),
-                            };
-                            self.mismatch(span, goal, &lhs, &rhs);
-                        }
+                        self.table.restore(rollback.known);
+                        let goal = Goal::Type {
+                            expected: lhs.clone(),
+                            actual: rhs.clone(),
+                        };
+                        self.mismatch(span, goal, &lhs, &rhs);
                     }
+                    // A nested failure is left in place as the outer
+                    // attempt's failure marker. The one outer checkpoint will
+                    // discard both it and every tentative binding.
                 }
             }
         }
         self.depth = original_depth;
+    }
+
+    /// Whether a canonical row can use the explicit shared-label path.
+    /// Different label sets need absorption, and an unguarded constant presence
+    /// clash needs the label's name for its diagnostic; both are handled by
+    /// `labels`. Every other presence pair can be settled without recursion.
+    fn direct_row(&self, lhs: &Row, rhs: &Row) -> bool {
+        lhs.labels.len() == rhs.labels.len()
+            && lhs.labels.iter().all(|(name, field)| {
+                let Some(other) = rhs.labels.get(name) else {
+                    return false;
+                };
+                if self.guard.is_some() {
+                    return true;
+                }
+                !matches!(
+                    (
+                        self.table.presence_of(&field.presence),
+                        self.table.presence_of(&other.presence),
+                    ),
+                    (Presence::Present, Presence::Absent) | (Presence::Absent, Presence::Present)
+                )
+            })
     }
 
     /// Decide two types by their labels and their constructors and row tails.

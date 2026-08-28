@@ -6042,7 +6042,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
                 declared(
                     "Cases",
                     artifact_type(a::Type::Sum(a::Row {
-                        labels: row("X").labels,
+                        labels: row("X").labels.clone(),
                         rest: a::Rest::More(Box::new(row("Y"))),
                     })),
                 ),
@@ -8060,15 +8060,15 @@ fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::Artifact {
         .map(|index| {
             let stem = if cycle { "Cycle" } else { "Link" };
             let name = format!("dep@1.0.0::{stem}{index}");
-            let params = (!cycle)
-                .then(|| {
-                    vec![a::Parameter {
-                        sense: a::Sense::Fields,
-                        lacks: vec!["z".into()],
-                        relevant: true,
-                    }]
-                })
-                .unwrap_or_default();
+            let params = if cycle {
+                Vec::new()
+            } else {
+                vec![a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: vec!["z".into()],
+                    relevant: true,
+                }]
+            };
             let body = if !cycle && index + 1 == depth {
                 a::Type::Struct(a::Row {
                     labels: vec![(
@@ -8803,10 +8803,23 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                         },
                     )),
                 },
+                // Grow the table before the 30,000 nested `Wrap`s disagree.
+                // Per-depth snapshots would retain DEPTH × 5,000 slots; the
+                // single outer transaction remains O(DEPTH + variables).
+                a::Value {
+                    name: "dep@1.0.0::padding".into(),
+                    scheme: a::Scheme {
+                        count: 5_000,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Nat,
+                    },
+                },
             ]);
             let parsed = parse::parse(
                 lex(
-                    "let imported = dep::accept dep::value\n\
+                    "let padding = dep::padding\n\
+                     let imported = dep::accept dep::value\n\
                      let mismatch = dep::accept dep::bad",
                     FileID::GENERATED,
                 )
@@ -8834,6 +8847,113 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
         .expect("the bounded-stack regression thread starts")
         .join()
         .expect("successful deep Arrow/Named/Row unification is iterative");
+}
+
+#[test]
+fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-unequal-imported-rows".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            for (actual_label, actual_presence) in [
+                ("other", a::Presence::Present),
+                ("bottom", a::Presence::Absent),
+            ] {
+                let nested = |label: &str, presence| {
+                    let mut ty = a::Type::Struct(a::Row {
+                        labels: vec![(
+                            label.into(),
+                            a::RowField {
+                                presence,
+                                ty: a::Type::Nat,
+                            },
+                        )],
+                        rest: a::Rest::Closed,
+                    });
+                    for _ in 0..DEPTH {
+                        ty = a::Type::Struct(a::Row {
+                            labels: vec![(
+                                "payload".into(),
+                                a::RowField {
+                                    presence: a::Presence::Present,
+                                    ty,
+                                },
+                            )],
+                            rest: a::Rest::Closed,
+                        });
+                    }
+                    ty
+                };
+
+                let mut dependency = effect_artifact("dep", "deep-unequal-rows");
+                dependency.header.types = vec![
+                    a::DeclaredType {
+                        name: "dep@1.0.0::Expected".into(),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(nested("bottom", a::Presence::Present)),
+                    },
+                    a::DeclaredType {
+                        name: "dep@1.0.0::Actual".into(),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(nested(actual_label, actual_presence)),
+                    },
+                ];
+                dependency.header.values.extend([
+                    a::Value {
+                        name: "dep@1.0.0::bad".into(),
+                        scheme: artifact_scheme(a::Type::Named {
+                            name: "dep@1.0.0::Actual".into(),
+                            args: Vec::new(),
+                        }),
+                    },
+                    a::Value {
+                        name: "dep@1.0.0::accept".into(),
+                        scheme: artifact_scheme(a::Type::Arrow(
+                            Box::new(a::Type::Named {
+                                name: "dep@1.0.0::Expected".into(),
+                                args: Vec::new(),
+                            }),
+                            Box::new(a::Type::Nat),
+                            a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Closed,
+                            },
+                        )),
+                    },
+                ]);
+                let parsed = parse::parse(
+                    lex("let mismatch = dep::accept dep::bad", FileID::GENERATED).tokens,
+                );
+                let mut mint = dummy_mint();
+                let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+                assert!(out.errors.is_empty(), "{:#?}", out.errors);
+                let inferred = inference::infer(&mint, &mut out.program);
+                let messages: Vec<String> = inferred
+                    .errors
+                    .iter()
+                    .map(|error| error.kind.to_string())
+                    .collect();
+                let expected_errors = if actual_label == "other" { 2 } else { 1 };
+                assert_eq!(messages.len(), expected_errors, "{messages:#?}");
+                assert!(
+                    messages.iter().all(|message| message.contains("bottom"))
+                        && (actual_label != "other"
+                            || messages.iter().all(|message| message.contains("other"))),
+                    "direction was lost: {messages:#?}"
+                );
+                assert!(
+                    inferred
+                        .steps
+                        .iter()
+                        .any(|step| matches!(step.rule, inference::Rule::Struct)),
+                    "the deep rows did not use the struct decomposition path"
+                );
+            }
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep unequal row payloads use one explicit continuation stack");
 }
 
 #[test]

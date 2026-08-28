@@ -1639,8 +1639,8 @@ impl Table {
     ///
     /// Copied rather than journalled. A trail of undo records would be the
     /// cheaper thing and a second representation of the solution to keep
-    /// honest; this is one line, and the one caller takes it per congruence
-    /// between two applications rather than per binding.
+    /// honest; this is one line, and the one caller takes it once for the
+    /// outermost open congruence rather than per binding or nominal depth.
     fn snapshot(&self) -> Known {
         (self.vars.clone(), self.levels.clone(), self.lacks.clone())
     }
