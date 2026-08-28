@@ -419,24 +419,19 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     // project's manifest target. It consumes the same linked, in-memory root
     // artifact as the command-line backend and is guarded like every other
     // compiler phase.
-    let mut javascript_error = None;
-    let mut javascript_panicked = false;
-    let javascript = linked.as_ref().and_then(|linked| {
+    let mut js_error = None;
+    let mut js_panicked = false;
+    let js = linked.as_ref().and_then(|linked| {
         let started = Instant::now();
-        let out = guard("javascript", &mut panicked, || ruddy_js::generate(linked));
-        javascript_panicked = out.is_none();
-        micros.javascript = started.elapsed().as_micros() as u64;
+        let out = guard("js", &mut panicked, || ruddy_js::generate(linked));
+        js_panicked = out.is_none();
+        micros.js = started.elapsed().as_micros() as u64;
         match out {
             Some(Ok(source)) => Some(source),
             Some(Err(error)) => {
                 let message = error.to_string();
-                diagnostics.push(raw(
-                    "javascript",
-                    "javascript-generation",
-                    message.clone(),
-                    None,
-                ));
-                javascript_error = Some(message);
+                diagnostics.push(raw("js", "javascript-generation", message.clone(), None));
+                js_error = Some(message);
                 None
             }
             None => None,
@@ -474,9 +469,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
         linked: linked.as_ref(),
-        javascript: javascript.as_deref(),
-        javascript_error: javascript_error.as_deref(),
-        javascript_panicked,
+        js: js.as_deref(),
+        js_error: js_error.as_deref(),
+        js_panicked,
         dependency_declarations: &req.dependencies,
         dependency_aliases: &dependency_aliases,
         dependencies: &dependency_artifacts,

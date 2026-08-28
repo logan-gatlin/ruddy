@@ -598,7 +598,7 @@ fn every_stage_reports_on_the_demo() {
             "lir",
             "artifact",
             "linked",
-            "javascript",
+            "js",
             "symbols",
             "types-ir"
         ]
@@ -609,7 +609,7 @@ fn every_stage_reports_on_the_demo() {
         // The demo ends in three deliberate mistakes, and LIR runs on accepted
         // programs alone — so its tab is the one that reports `Skipped` here,
         // with a summary saying so and no rows behind it.
-        if matches!(stage.id, "lir" | "artifact" | "linked" | "javascript") {
+        if matches!(stage.id, "lir" | "artifact" | "linked" | "js") {
             assert_eq!(stage.status, Status::Skipped);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -1884,7 +1884,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "lir",
             "artifact",
             "linked",
-            "javascript",
+            "js",
             "types-ir"
         ]
     );
@@ -1916,7 +1916,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
     let javascript = clean
         .stages
         .iter()
-        .find(|stage| stage.id == "javascript")
+        .find(|stage| stage.id == "js")
         .expect("the JavaScript stage is registered");
     assert_eq!(javascript.status, Status::Ok);
     assert!(javascript.micros.is_some());

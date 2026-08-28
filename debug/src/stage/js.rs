@@ -10,18 +10,13 @@ use crate::{
 };
 
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
-    let Some(source) = cx.javascript else {
-        return missing_timed(
-            spec,
-            cx.javascript_panicked,
-            cx.javascript_error,
-            cx.micros.javascript,
-        );
+    let Some(source) = cx.js else {
+        return missing_timed(spec, cx.js_panicked, cx.js_error, cx.micros.js);
     };
 
     Stage {
         status: Status::Ok,
-        micros: Some(cx.micros.javascript),
+        micros: Some(cx.micros.js),
         summary: format!("{} bytes", source.len()),
         text: Some(source.to_string()),
         debug: source.to_string(),
