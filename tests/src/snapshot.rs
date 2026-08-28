@@ -2364,7 +2364,11 @@ fn every_stage_reports_on_explicit_absence() {
         if stage.id == "patterns" {
             continue;
         }
-        assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
+        assert!(
+            !stage.nodes.is_empty() || stage.text.as_ref().is_some_and(|text| !text.is_empty()),
+            "{} produced nothing",
+            stage.id
+        );
     }
     let stage = |id: &str| {
         snapshot
@@ -2635,7 +2639,11 @@ fn every_stage_reports_on_a_source_using_effects() {
     let snapshot = snapshot(source);
     assert!(snapshot.panic.is_none());
     for stage in &snapshot.stages {
-        assert!(!stage.nodes.is_empty(), "{} produced nothing", stage.id);
+        assert!(
+            !stage.nodes.is_empty() || stage.text.as_ref().is_some_and(|text| !text.is_empty()),
+            "{} produced nothing",
+            stage.id
+        );
         assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
     }
 

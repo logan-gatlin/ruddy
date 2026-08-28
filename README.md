@@ -33,7 +33,17 @@ target = "js"
 
 `ruddy build` then writes both `build/app.artifact` and `build/app.js`. Generation uses the fully linked in-memory root artifact, so the JavaScript module is self-contained with respect to Ruddy dependencies. A dependency's own `target` never causes JavaScript output while building a parent, and Ruddy never writes into an immutable Git checkout. The default `target = "lib"` writes only the canonical artifact. `ruddy check` generates neither file.
 
-The generated file is deterministic JavaScript ESM. Its exports follow the bundle's public Ruddy value/module structure. Ruddy `extern` declarations are resolved from their dotted JavaScript target at module initialization; the embedding environment must provide those target values.
+The generated file is deterministic, portable JavaScript ESM. Root values are named exports, while nested Ruddy modules become frozen, prototype-free namespace objects:
+
+```js
+import { main, util } from "./build/app.js";
+main;
+util.map;
+```
+
+Ruddy `extern` declarations are resolved by walking their dotted target from `globalThis` during module initialization; the embedding environment must provide those values. Function externs are bound to the object owning the final path segment, so host methods retain their `this` receiver.
+
+Ruddy `Nat`, `Int`, and `Real` values use JavaScript `Number`; integers beyond 2^53 can therefore lose precision. Natural subtraction saturates at zero, integer division truncates toward zero, and real division uses ordinary JavaScript division.
 
 Compiler integrations can invoke the backend directly with `ruddy_js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation returns the module source or a validation error and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
 
