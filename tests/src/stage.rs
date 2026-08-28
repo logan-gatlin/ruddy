@@ -932,6 +932,9 @@ fn artifact_stage_renders_one_dependency() {
         lir: None,
         artifact: Some(&artifact),
         linked: None,
+        javascript: None,
+        javascript_error: None,
+        javascript_panicked: false,
         dependency_declarations: &declarations,
         dependency_aliases: &["base".to_string()],
         dependencies: &artifact.header.dependencies,
@@ -994,6 +997,26 @@ fn artifact_phase_panic_is_not_reported_as_skipped() {
         ruddy_debug::stage::artifact::missing(spec, false).status,
         Status::Skipped
     );
+}
+
+#[test]
+fn javascript_phase_distinguishes_skipped_error_and_panic() {
+    let spec = REGISTRY
+        .iter()
+        .find(|spec| spec.id == "javascript")
+        .expect("JavaScript stage is registered");
+    let skipped = ruddy_debug::stage::javascript::missing(spec, false, None);
+    assert_eq!(skipped.status, Status::Skipped);
+    assert_eq!(skipped.micros, None);
+
+    let failed = ruddy_debug::stage::javascript::missing(spec, false, Some("bad artifact"));
+    assert_eq!(failed.status, Status::Error);
+    assert_eq!(failed.summary, "bad artifact");
+    assert_eq!(failed.micros, Some(0));
+
+    let panicked = ruddy_debug::stage::javascript::missing(spec, true, Some("bad artifact"));
+    assert_eq!(panicked.status, Status::Panicked);
+    assert_eq!(panicked.micros, Some(0));
 }
 
 /// The artifact is the canonical disk boundary: the text is directly usable,

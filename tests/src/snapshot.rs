@@ -598,6 +598,7 @@ fn every_stage_reports_on_the_demo() {
             "lir",
             "artifact",
             "linked",
+            "javascript",
             "symbols",
             "types-ir"
         ]
@@ -608,7 +609,7 @@ fn every_stage_reports_on_the_demo() {
         // The demo ends in three deliberate mistakes, and LIR runs on accepted
         // programs alone — so its tab is the one that reports `Skipped` here,
         // with a summary saying so and no rows behind it.
-        if matches!(stage.id, "lir" | "artifact" | "linked") {
+        if matches!(stage.id, "lir" | "artifact" | "linked" | "javascript") {
             assert_eq!(stage.status, Status::Skipped);
             assert!(stage.nodes.is_empty(), "a skipped stage rendered rows");
             assert!(!stage.summary.is_empty(), "{} counted nothing", stage.id);
@@ -644,6 +645,7 @@ fn every_stage_reports_on_the_demo() {
             "LIR",
             "Artifact",
             "Linked Artifact",
+            "JavaScript",
             "Symbols"
         ]
     );
@@ -1882,6 +1884,7 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
             "lir",
             "artifact",
             "linked",
+            "javascript",
             "types-ir"
         ]
     );
@@ -1910,6 +1913,19 @@ fn only_the_stages_that_own_a_phase_report_a_time() {
         .expect("the link stage is registered");
     assert_eq!(linked.status, Status::Ok);
     assert!(linked.micros.is_some());
+    let javascript = clean
+        .stages
+        .iter()
+        .find(|stage| stage.id == "javascript")
+        .expect("the JavaScript stage is registered");
+    assert_eq!(javascript.status, Status::Ok);
+    assert!(javascript.micros.is_some());
+    assert!(
+        javascript
+            .text
+            .as_deref()
+            .is_some_and(|source| !source.is_empty())
+    );
     assert!(
         artifact
             .text

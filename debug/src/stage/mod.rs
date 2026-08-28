@@ -11,6 +11,7 @@ pub mod constraints;
 pub mod dependencies;
 pub mod externs;
 pub mod ir;
+pub mod javascript;
 pub mod linked;
 pub mod lir;
 pub mod patterns;
@@ -53,6 +54,12 @@ pub struct Cx<'a> {
     pub artifact: Option<&'a ruddy::artifact::Artifact>,
     /// The self-contained artifact produced by statically linking the graph.
     pub linked: Option<&'a ruddy::artifact::Artifact>,
+    /// JavaScript generated from the linked artifact.
+    pub javascript: Option<&'a str>,
+    /// A normal backend rejection, as opposed to a panic or skipped phase.
+    pub javascript_error: Option<&'a str>,
+    /// JavaScript generation ran but panicked, rather than being skipped.
+    pub javascript_panicked: bool,
     /// Direct dependency artifacts successfully resolved for the active project.
     pub dependency_declarations: &'a indexmap::IndexMap<String, crate::wire::DependencySpec>,
     /// Aliases for successfully resolved direct dependencies, in request order.
@@ -92,6 +99,7 @@ pub struct Phases {
     pub lir: u64,
     pub artifact: u64,
     pub link: u64,
+    pub javascript: u64,
 }
 
 /// Everything about a panel that does not depend on what the compiler produced.
@@ -309,6 +317,15 @@ pub const REGISTRY: &[Spec] = &[
         scoped: false,
         annotates: None,
         build: Build::Panel(linked::build),
+    },
+    Spec {
+        id: "javascript",
+        title: "JavaScript",
+        view: View::Text,
+        highlight: None,
+        scoped: false,
+        annotates: None,
+        build: Build::Panel(javascript::build),
     },
     Spec {
         id: "symbols",
