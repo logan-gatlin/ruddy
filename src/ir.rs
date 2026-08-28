@@ -3188,7 +3188,22 @@ impl CanonicalArena {
             .then_some(parsed)
         }
 
-        let Some(parsed) = parse(encoded) else {
+        let Some(parsed) = parse(encoded).filter(|parsed| {
+            // Graph identities have one wire spelling. Besides excluding
+            // unreachable records, this rejects padded numbers, construction
+            // numbering, unsorted edges and every other presentation which
+            // decodes to a canonical graph but is not itself that encoding.
+            // Recovery labels (`#o` and `#u`) go through the same check and
+            // remain accepted when canonically spelled.
+            let nodes: Vec<_> = parsed
+                .iter()
+                .map(|(_, label, edges)| RegularNode {
+                    label: label.clone(),
+                    edges: edges.clone(),
+                })
+                .collect();
+            encode_dense_graph(&nodes, 0) == encoded
+        }) else {
             return self.labelled_node(
                 RegularLabel::OpaqueInterface(encoded.to_string()),
                 Vec::new(),
@@ -3225,6 +3240,15 @@ impl CanonicalArena {
     fn encode(&self, root: usize) -> String {
         encode_regular_graph(&self.nodes, root)
     }
+}
+
+/// Imported identities are compared and stored only in graph-canonical form.
+/// Malformed text becomes the canonical opaque recovery node, which also makes
+/// an explicitly encoded opaque identity for that exact text the same row key.
+fn canonical_effect_interface(interface: &str) -> String {
+    let mut arena = CanonicalArena::default();
+    let root = arena.import(interface);
+    arena.encode(root)
 }
 
 /// A finite presentation of a regular type tree. Named declarations are
@@ -3515,18 +3539,42 @@ impl RegularType<'_> {
 
     /// A recursive application grows when every argument from an earlier
     /// instantiation remains at its corresponding position and at least one is
-    /// now below a constructor. Permutations eventually return to their exact
-    /// memo key; an unbounded constructor context instead embeds an ancestor.
-    fn grows(nodes: &[RegularNode], before: &[usize], after: &[usize]) -> bool {
+    /// now below a constructor in the SCC quotient. Distinct roots of one
+    /// recursive component mutually retain each other and are therefore equal
+    /// at this level: finite permutations of such roots must reach their exact
+    /// memo key instead of being absorbed as growth.
+    ///
+    /// Successful reachability only grows while placeholders are filled, so it
+    /// is safe to retain across the whole imported walk. A large finite orbit
+    /// can otherwise ask the same SCC question millions of times.
+    fn grows(
+        nodes: &[RegularNode],
+        known_retained: &mut HashSet<(usize, usize)>,
+        before: &[usize],
+        after: &[usize],
+    ) -> bool {
+        fn retained(
+            nodes: &[RegularNode],
+            known: &mut HashSet<(usize, usize)>,
+            needle: usize,
+            root: usize,
+        ) -> bool {
+            known.contains(&(needle, root))
+                || RegularType::retains(nodes, needle, root) && {
+                    known.insert((needle, root));
+                    true
+                }
+        }
+
         before.len() == after.len()
             && before
                 .iter()
                 .zip(after)
-                .all(|(before, after)| Self::retains(nodes, *before, *after))
+                .all(|(before, after)| retained(nodes, known_retained, *before, *after))
             && before
                 .iter()
                 .zip(after)
-                .any(|(before, after)| before != after)
+                .any(|(before, after)| !retained(nodes, known_retained, *after, *before))
     }
 
     /// Build imported semantic types without borrowing the host stack. The
@@ -3553,6 +3601,7 @@ impl RegularType<'_> {
         let mut work = vec![Work::Named(symbol, args)];
         let mut values = Vec::new();
         let mut active_instantiations: HashMap<Symbol, Vec<Vec<usize>>> = HashMap::new();
+        let mut known_retained = HashSet::new();
 
         while let Some(part) = work.pop() {
             match part {
@@ -3628,9 +3677,9 @@ impl RegularType<'_> {
                         continue;
                     }
                     if active_instantiations.get(&symbol).is_some_and(|active| {
-                        active
-                            .iter()
-                            .any(|ancestor| Self::grows(&self.arena.nodes, ancestor, &args))
+                        active.iter().any(|ancestor| {
+                            Self::grows(&self.arena.nodes, &mut known_retained, ancestor, &args)
+                        })
                     }) {
                         values.push(self.atom("?"));
                         continue;
@@ -7392,7 +7441,7 @@ impl Builder<'_> {
                         symbol,
                         EffectId::Structural {
                             name: identity.name.clone(),
-                            interface: identity.interface.clone(),
+                            interface: canonical_effect_interface(&identity.interface),
                         },
                     );
                 }

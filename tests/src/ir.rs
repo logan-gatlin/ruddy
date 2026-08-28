@@ -8422,27 +8422,61 @@ fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
             ),
         },
     };
-    let alias = |name: &str, last: a::Type| a::DeclaredType {
+    // Every argument root is a different state of one 257-node recursive SCC.
+    // Rotating those roots is not constructor growth: all states mutually
+    // retain each other. The final state's marker still has to remain semantic.
+    let ring = |prefix: &str, marker: a::Type| {
+        let prefix = prefix.to_string();
+        (0..PARAMETERS)
+            .map(move |index| {
+                let mut fields = vec![(
+                    "next".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: a::Type::Named {
+                            name: format!("dep@1.0.0::{prefix}{}", (index + 1) % PARAMETERS),
+                            args: Vec::new(),
+                        },
+                    },
+                )];
+                if index + 1 == PARAMETERS {
+                    fields.push((
+                        "marker".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: marker.clone(),
+                        },
+                    ));
+                }
+                a::DeclaredType {
+                    name: format!("dep@1.0.0::{prefix}{index}"),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_struct(fields)),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let alias = |name: &str, prefix: &str| a::DeclaredType {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
         scheme: artifact_scheme(a::Type::Named {
             name: "dep@1.0.0::Rotate".into(),
             args: (0..PARAMETERS)
-                .map(|index| {
-                    if index + 1 == PARAMETERS {
-                        last.clone()
-                    } else {
-                        a::Type::Nat
-                    }
+                .map(|index| a::Type::Named {
+                    name: format!("dep@1.0.0::{prefix}{index}"),
+                    args: Vec::new(),
                 })
                 .collect(),
         }),
     };
-    dependency.header.types = vec![
-        rotate,
-        alias("Strings", a::Type::String),
-        alias("Booleans", a::Type::Boolean),
-    ];
+    dependency.header.types = std::iter::once(rotate)
+        .chain(ring("StringRing", a::Type::String))
+        .chain(ring("BooleanRing", a::Type::Boolean))
+        .chain([
+            alias("Strings", "StringRing"),
+            alias("Booleans", "BooleanRing"),
+        ])
+        .collect();
 
     let parsed = parse::parse(
         lex(
@@ -8688,6 +8722,72 @@ fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
     };
     assert_eq!(interface("RawProbe"), interface("RoundProbe"));
     assert_ne!(interface("RawProbe"), interface("OrdinaryProbe"));
+}
+
+#[test]
+fn imported_effect_ids_are_normalized_before_alias_duplicate_checks() {
+    let raw = effect_artifact("raw", "x");
+    let encoded = effect_artifact("encoded", "0#o1:x;");
+    let parsed =
+        parse::parse(lex("effect Both = raw::!IO + encoded::!IO", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, encoded]);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-case"]
+    );
+    let imported: Vec<_> = out
+        .program
+        .effect_ids
+        .values()
+        .filter_map(|identity| match identity {
+            ruddy::types::EffectId::Structural { name, interface } if name == "IO" => {
+                Some(interface.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imported, ["0#o1:x;", "0#o1:x;"]);
+}
+
+#[test]
+fn noncanonical_graph_encodings_are_opaque_without_identity_collisions() {
+    for noncanonical in [
+        "00#1:a;",                        // padded node number
+        "0#01:a;",                        // padded label length
+        "0#1:a;1#1:b;",                   // unreachable record
+        "0#1:r|1:b>0|1:a>0;",             // noncanonical edge order
+        "0#1:r|1:a>1|1:b>2;1#1:x;2#1:x;", // nonminimal duplicate states
+        "0#1:r|1:a>2|1:b>1;1#1:y;2#1:x;", // construction numbering
+        "0#1:a|1:x>00;",                  // padded backreference
+    ] {
+        let bad = effect_artifact("bad", noncanonical);
+        let opaque = effect_artifact(
+            "opaque",
+            &format!("0#o{}:{noncanonical};", noncanonical.len()),
+        );
+        let parsed =
+            parse::parse(lex("effect Both = bad::!IO + opaque::!IO", FileID::GENERATED).tokens);
+        assert!(
+            parsed.errors.is_empty(),
+            "{noncanonical}: {:#?}",
+            parsed.errors
+        );
+        let mut mint = dummy_mint();
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[bad, opaque]);
+        assert_eq!(
+            out.errors
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            ["duplicate-case"],
+            "{noncanonical} was accepted as a graph rather than opaque text"
+        );
+    }
 }
 
 #[test]
