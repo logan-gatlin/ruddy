@@ -11,6 +11,92 @@ use ruddy::{
 };
 use ruddy_js::Error;
 
+fn retag_numeric_global(artifact: &mut Artifact, name: &str, rep: artifact::Rep) {
+    let global = artifact
+        .lir
+        .globals
+        .iter_mut()
+        .find(|global| global.name.ends_with(&format!("::{name}")))
+        .unwrap_or_else(|| panic!("no global named {name}"));
+    for instr in &mut global.body.instrs {
+        if instr.rep == artifact::Rep::Real {
+            instr.rep = rep;
+        }
+        if let artifact::Op::Const(artifact::Literal::Real(bits)) = &mut instr.op {
+            let value = f64::from_bits(*bits);
+            instr.op = artifact::Op::Const(match rep {
+                artifact::Rep::Nat => artifact::Literal::Natural(value as u64),
+                artifact::Rep::Int => artifact::Literal::Integer(value as i64),
+                _ => panic!("numeric retag requires an integer representation"),
+            });
+        }
+    }
+}
+
+fn split_record_into_merge(artifact: &mut Artifact, name: &str) {
+    let global = artifact
+        .lir
+        .globals
+        .iter_mut()
+        .find(|global| global.name.ends_with(&format!("::{name}")))
+        .unwrap_or_else(|| panic!("no global named {name}"));
+    let combined = global.body.instrs.pop().expect("record constructor");
+    let artifact::Op::Struct(fields) = &combined.op else {
+        panic!("{name} does not end in a record")
+    };
+    let fields = fields.clone();
+    assert_eq!(fields.len(), 2);
+    let left_temp = combined.temp;
+    let right_temp = left_temp + 1;
+    let merged_temp = left_temp + 2;
+    global.body.instrs.push(artifact::Instr {
+        temp: left_temp,
+        rep: artifact::Rep::Struct,
+        op: artifact::Op::Struct(vec![fields[0].clone()]),
+    });
+    global.body.instrs.push(artifact::Instr {
+        temp: right_temp,
+        rep: artifact::Rep::Struct,
+        op: artifact::Op::Struct(vec![fields[1].clone()]),
+    });
+    global.body.instrs.push(artifact::Instr {
+        temp: merged_temp,
+        rep: artifact::Rep::Struct,
+        op: artifact::Op::Merge(vec![left_temp, right_temp]),
+    });
+    global.body.end = artifact::End::Ret(merged_temp);
+}
+
+fn retag_primitive_cases(artifact: &mut Artifact, name: &str, rep: artifact::Rep) {
+    let function = artifact
+        .lir
+        .functions
+        .iter_mut()
+        .find(|function| function.name.contains(name))
+        .unwrap_or_else(|| panic!("no function named {name}"));
+    function.params[0].rep = rep;
+    let cases = function
+        .body
+        .instrs
+        .iter_mut()
+        .find_map(|instr| match &mut instr.op {
+            artifact::Op::SwitchPrim { cases, .. } => Some(cases),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{name} has no primitive switch"));
+    for case in cases {
+        let artifact::Literal::Real(bits) = case.value else {
+            panic!("{name} has a non-real source case")
+        };
+        let value = f64::from_bits(bits);
+        case.value = match rep {
+            artifact::Rep::Nat => artifact::Literal::Natural(value as u64),
+            artifact::Rep::Int => artifact::Literal::Integer(value as i64),
+            _ => panic!("primitive retag requires an integer representation"),
+        };
+    }
+}
+
 fn compiled(source: &str) -> Artifact {
     let mut files = FileManager::new();
     let file = files.register_new_file("<javascript-test>".to_string(), source.to_string());
@@ -81,6 +167,70 @@ fn generated_module_executes_values_functions_records_and_sums_in_node() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         "[42,2,42,\"object\"]"
+    );
+}
+
+#[test]
+fn generated_runtime_preserves_arithmetic_switch_record_effect_and_literal_semantics() {
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    // Arithmetic operators currently surface as Real in source inference. Retag the
+    // three focused initializers and two primitive cases to exercise the backend's
+    // Nat/Int representations exactly as linked artifact LIR records them.
+    let mut artifact = compiled(
+        "let nat_sub = 2.0 - 5.0\n\
+         let int_div = -7.0 / 2.0\n\
+         let int_negative_zero = 0.0 / -1.0\n\
+         let real_div = 1.0 / 0.0\n\
+         let real_literal = 1.5\n\
+         let classify_nat = fn n => match n with | 0.0 => \"zero\" | 1.0 => \"one\" | _ => \"other\" end\n\
+         let classify_int = fn n => match n with | 0.0 => \"zero\" | _ => \"other\" end\n\
+         let classify_real = fn n => match n with | 0.0 => \"positive zero\" | _ => \"other\" end\n\
+         let unpack = fn value => match value with | #Value n => n | #Empty => 0n | _ => 99n end\n\
+         let payload = unpack (#Value 8n)\n\
+         let tag_fallback = unpack #Other\n\
+         let shape = fn value => match value with | { x } => 1n | { x, .. } => 2n | _ => 3n end\n\
+         let merged = { left: 1n, right: 2n }\n\
+         effect Bump = Real -> Real\n\
+         let bump = fn n => handle !Bump n with | !Bump value => value + 1.0 end\n\
+         effect Read = { get: () -> Nat }\n\
+         let read = fn _ => handle !Read.get () with | !Read.get _ => 42n end\n\
+         effect Plus = { apply: Real -> Real }\n\
+         effect Times = { apply: Real -> Real }\n\
+         let calculate : Real -> Real + !Plus + !Times = fn n => let x = !Plus.apply n in !Times.apply x\n\
+         let calculated = fn n => handle (handle calculate n with | !Plus.apply value => value + 1.0 end) with | !Times.apply value => value * 2.0 end\n",
+    );
+    retag_numeric_global(&mut artifact, "nat_sub", artifact::Rep::Nat);
+    retag_numeric_global(&mut artifact, "int_div", artifact::Rep::Int);
+    retag_numeric_global(&mut artifact, "int_negative_zero", artifact::Rep::Int);
+    retag_primitive_cases(&mut artifact, "classify_nat", artifact::Rep::Nat);
+    retag_primitive_cases(&mut artifact, "classify_int", artifact::Rep::Int);
+    split_record_into_merge(&mut artifact, "merged");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("semantics.mjs");
+    let module = ruddy_js::generate(&artifact).unwrap();
+    assert!(
+        module.contains("Object.assign(Object.create(null)"),
+        "artifact fixture did not exercise record merging"
+    );
+    fs::write(&path, module).unwrap();
+    let probe = format!(
+        "const app = await import({}); const values = [app.nat_sub, app.int_div, Object.is(app.int_negative_zero, -0), Number.isFinite(app.real_div), app.real_literal, app.classify_nat(-0), app.classify_nat(7), app.classify_int(app.int_negative_zero), app.classify_real(0), app.classify_real(-0), app.payload, app.tag_fallback, app.shape({{x: 4}}), app.shape({{x: 4, y: 5}}), app.shape({{y: 5}}), app.merged.left + app.merged.right, app.bump(4), app.read(null), app.calculated(4)]; console.log(JSON.stringify(values));",
+        serde_json::to_string(path.to_str().unwrap()).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &probe])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "[0,-3,true,false,1.5,\"zero\",\"other\",\"zero\",\"positive zero\",\"other\",8,99,1,2,3,3,5,42,10]"
     );
 }
 

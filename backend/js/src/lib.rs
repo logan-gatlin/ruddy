@@ -473,11 +473,18 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         out.push_str("(function() {");
         for case in cases {
-            out.push_str(" if ($same(");
+            out.push_str(" if (");
+            let integer = matches!(case.value, Literal::Natural(_) | Literal::Integer(_));
+            if !integer {
+                out.push_str("$same(");
+            }
             out.push_str(&temp(on));
-            out.push_str(", ");
+            out.push_str(if integer { " === " } else { ", " });
             literal(&case.value, out);
-            out.push_str(")) return ");
+            if !integer {
+                out.push(')');
+            }
+            out.push_str(") return ");
             self.block(&case.block, out, depth + 1)?;
             out.push(';');
         }

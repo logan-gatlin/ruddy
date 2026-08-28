@@ -645,7 +645,7 @@ fn every_stage_reports_on_the_demo() {
             "LIR",
             "Artifact",
             "Linked Artifact",
-            "JavaScript",
+            "JS",
             "Symbols"
         ]
     );
