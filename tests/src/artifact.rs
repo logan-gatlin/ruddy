@@ -349,6 +349,11 @@ fn model_artifact() -> Artifact {
             ],
         },
         lir: Lir {
+            externs: vec![artifact::Extern {
+                name: "bundle@1.0.0::consoleLog".to_string(),
+                target: vec!["console".to_string(), "log".to_string()],
+                rep: Rep::Fn,
+            }],
             functions: vec![artifact::Function {
                 name: "f".to_string(),
                 params: reps
@@ -543,6 +548,34 @@ fn a_compiled_bundle_round_trips_through_canonical_text() {
 }
 
 #[test]
+fn compiler_externs_cross_the_artifact_boundary_without_symbols_or_spans() {
+    let artifact = built(
+        "module Host =\n\
+         extern log : String -> () = console.log\n\
+         end\n\
+         let main = Host::log \"hello\"\n",
+    );
+
+    assert_eq!(artifact.header.values.len(), 2);
+    assert_eq!(artifact.header.values[0].name, "tests@0.1.0::Host::log");
+    assert_eq!(
+        artifact.lir.externs,
+        [artifact::Extern {
+            name: "tests@0.1.0::Host::log".to_string(),
+            target: vec!["console".to_string(), "log".to_string()],
+            rep: Rep::Fn,
+        }]
+    );
+    let printed = assert_round_trip(&artifact);
+    assert!(
+        printed.contains("(extern \"tests@0.1.0::Host::log\" (target \"console\" \"log\") fn)"),
+        "{printed}"
+    );
+    assert!(!printed.contains("Span"), "{printed}");
+    assert!(!printed.contains("Symbol"), "{printed}");
+}
+
+#[test]
 fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
     let empty = |name: String| Artifact {
         header: artifact::Header {
@@ -556,6 +589,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
             effects: Vec::new(),
         },
         lir: Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -570,7 +604,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (values)\n\
          \x20   (types)\n\
          \x20   (effects))\n\
-         \x20 (lir (functions) (globals)))\n"
+         \x20 (lir (externs) (functions) (globals)))\n"
     );
     assert_eq!(
         empty("界".repeat(13)).print(),
@@ -581,7 +615,7 @@ fn canonical_pretty_layout_is_pinned_at_its_unicode_width_boundary() {
          \x20   (values)\n\
          \x20   (types)\n\
          \x20   (effects))\n\
-         \x20 (lir (functions) (globals)))\n"
+         \x20 (lir (externs) (functions) (globals)))\n"
     );
 }
 
@@ -1030,6 +1064,9 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(iff ", "(equivalence "),
         ("(xor ", "(inequality "),
         ("(lir ", "(lowered "),
+        ("(externs ", "(imports "),
+        ("(extern ", "(import "),
+        ("(target ", "(foreign-path "),
         ("(functions ", "(function-list "),
         ("(function ", "(fn "),
         ("(param 0 nat)", "(param 0 bogus)"),
@@ -1093,6 +1130,12 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     // Invalid values of each S-expression shape reach reader paths that a tag
     // miss or arity error does not.
     assert_bad_replacement(&valid, "(param 0 nat)", "(param 0 ())");
+    assert_bad_replacement(&valid, "(target \"console\" \"log\")", "(target)");
+    assert_bad_replacement(
+        &valid,
+        "(target \"console\" \"log\")",
+        "(target \"console\" \"\")",
+    );
     assert_bad_replacement(&valid, "(selector named \"write\")", "\"write\"");
     assert_bad_replacement(
         &valid,
@@ -1304,6 +1347,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
             effects: Vec::new(),
         },
         lir: Lir {
+            externs: Vec::new(),
             functions: Vec::new(),
             globals: vec![Global {
                 name: "deep@1::value".to_string(),
@@ -1606,6 +1650,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                     effects: Vec::new(),
                 },
                 lir: Lir {
+                    externs: Vec::new(),
                     functions: vec![artifact::Function {
                         name: "deep".into(),
                         params: Vec::new(),
@@ -1724,7 +1769,7 @@ fn balanced_malformed_deep_values_fail_on_a_small_stack() {
     const DEPTH: usize = 30_000;
     let nested = format!("{}wrong{}", "(wrong ".repeat(DEPTH), ")".repeat(DEPTH));
     let header = "(header (identity \"deep\" \"1\") (dependencies) (values) (types) (effects))";
-    let lir = "(lir (functions) (globals))";
+    let lir = "(lir (externs) (functions) (globals))";
 
     // The first input is structurally balanced but puts an arbitrarily deep
     // list where a dependency string belongs. The second puts the same value
@@ -1754,7 +1799,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty (struct (row (labels) closed)))))) \
-         (types) (effects)) (lir (functions) wrong))"
+         (types) (effects)) (lir (externs) (functions) wrong))"
     );
 
     let error = std::thread::Builder::new()

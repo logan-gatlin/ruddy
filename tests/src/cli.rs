@@ -77,12 +77,12 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     write_project(&dependency, "std", "0.1.0", &[]);
     fs::write(
         dependency.join("main.hc"),
-        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  let foo = 1n\nend\n",
+        "module Nested =\n  type Number = Nat\n  effect Read = { get: {} -> Nat }\n  extern runtime : Nat = host.runtime\n  let foo = 1n\nend\n",
     )
     .unwrap();
     fs::write(
         directory.path().join("main.hc"),
-        "let value : std::Nested::Number = std::Nested::foo\nlet operation = std::Nested::!Read.get\n",
+        "let value : std::Nested::Number = std::Nested::foo\nlet imported = std::Nested::runtime\nlet operation = std::Nested::!Read.get\n",
     )
     .unwrap();
     fs::write(
@@ -95,7 +95,10 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     let printed = built.print();
     assert!(printed.contains("std@0.1.0::Nested::foo"), "{printed}");
     assert!(printed.contains("std@0.1.0::Nested::Number"), "{printed}");
-    assert_eq!(built.header.values.len(), 2);
+    assert_eq!(built.lir.externs.len(), 1);
+    assert_eq!(built.lir.externs[0].name, "std@0.1.0::Nested::runtime");
+    assert_eq!(built.lir.externs[0].target, ["host", "runtime"]);
+    assert_eq!(built.header.values.len(), 3);
     assert!(built.header.types.is_empty());
     assert!(built.header.effects.is_empty());
 }
@@ -850,6 +853,14 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
         "1.0.0",
         &[("left", "../left"), ("right", "../right")],
     );
+    for (project, declaration) in [
+        (&shared, "extern host : Nat = shared.host\nlet value = 0n\n"),
+        (&left, "extern host : Nat = left.host\nlet value = 0n\n"),
+        (&right, "extern host : Nat = right.host\nlet value = 0n\n"),
+        (&app, "extern host : Nat = app.host\nlet value = 0n\n"),
+    ] {
+        fs::write(project.join("main.hc"), declaration).unwrap();
+    }
 
     let graph = ruddy_cli::compile_graph(&app).unwrap();
     let names: Vec<_> = graph
@@ -895,6 +906,20 @@ fn transitive_diamond_graphs_are_unique_dependency_first_and_direct_only() {
     let linked = Artifact::try_parse(&fs::read_to_string(&path).unwrap()).unwrap();
     assert!(linked.header.dependencies.is_empty());
     assert_eq!(linked.lir.globals.len(), 4);
+    assert_eq!(
+        linked
+            .lir
+            .externs
+            .iter()
+            .map(|external| (external.name.as_str(), external.target.join(".")))
+            .collect::<Vec<_>>(),
+        [
+            ("shared@3.0.0::host", "shared.host".to_string()),
+            ("left@2.0.0::host", "left.host".to_string()),
+            ("right@2.1.0::host", "right.host".to_string()),
+            ("app@1.0.0::host", "app.host".to_string()),
+        ]
+    );
     for (dir, name) in [
         (&shared, "shared"),
         (&left, "left"),

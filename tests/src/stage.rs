@@ -909,6 +909,11 @@ fn artifact_stage_renders_one_dependency() {
             effects: Vec::new(),
         },
         lir: Lir {
+            externs: vec![ruddy::artifact::Extern {
+                name: "demo@1.0.0::log".to_string(),
+                target: vec!["console".to_string(), "log".to_string()],
+                rep: ruddy::artifact::Rep::Fn,
+            }],
             functions: Vec::new(),
             globals: Vec::new(),
         },
@@ -949,7 +954,7 @@ fn artifact_stage_renders_one_dependency() {
 
     assert_eq!(
         stage.summary,
-        "1 dependency · 0 values · 0 types · 0 effects · 0 functions · 0 globals"
+        "1 dependency · 0 values · 0 types · 0 effects · 1 externs · 0 functions · 0 globals"
     );
     let dependencies = &stage.nodes[0].children[0];
     assert_eq!(dependencies.label, "dependencies");
@@ -957,6 +962,12 @@ fn artifact_stage_renders_one_dependency() {
     assert_eq!(dependencies.children.len(), 1);
     assert_eq!(dependencies.children[0].label, "dependency");
     assert_eq!(dependencies.children[0].text, "base@2.3.4");
+    assert_eq!(stage.nodes[1].text, "1 externs · 0 functions · 0 globals");
+    assert_eq!(stage.nodes[1].children[0].label, "extern");
+    assert_eq!(
+        stage.nodes[1].children[0].text,
+        "demo@1.0.0::log = console.log · Fn"
+    );
 
     let dependency_spec = REGISTRY
         .iter()
@@ -1066,7 +1077,10 @@ fn link_failure_is_distinct_from_a_skip_and_a_panic() {
 
 #[test]
 fn linked_artifact_is_a_distinct_final_phase_tab() {
-    let linked = stage("linked", "let id = fn x => x\n");
+    let linked = stage(
+        "linked",
+        "extern host : Nat = runtime.host\nlet id = fn x => x\n",
+    );
     assert_eq!(linked.title, "Linked Artifact");
     assert_eq!(linked.status, Status::Ok);
     assert_eq!(linked.view, View::Text);
@@ -1076,6 +1090,9 @@ fn linked_artifact_is_a_distinct_final_phase_tab() {
             .as_ref()
             .is_some_and(|text| text.contains("(dependencies)"))
     );
+    assert!(linked.summary.contains("1 externs"), "{}", linked.summary);
+    assert_eq!(linked.nodes[1].children[0].label, "extern");
+    assert!(linked.nodes[1].children[0].text.contains("runtime.host"));
 
     let skipped = stage("linked", "let bad : Nat = fn x => x\n");
     assert_eq!(skipped.status, Status::Skipped);

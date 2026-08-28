@@ -3,8 +3,8 @@
 //! Compilation deliberately produces one artifact per project. This final phase
 //! consumes valid compiler-produced artifacts in dependency-first order and
 //! makes the root artifact self-contained. It performs no optimization: every
-//! function and global is copied, in graph order, and only artifact-local
-//! function-table indices change.
+//! extern, function, and global is copied in graph order, and only
+//! artifact-local function-table indices change.
 
 use std::{error::Error, fmt};
 
@@ -38,9 +38,11 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
         return Err(LinkError::EmptyGraph);
     };
 
+    let mut externs = Vec::new();
     let mut functions = Vec::new();
     let mut globals = Vec::new();
     for artifact in artifacts {
+        externs.extend(artifact.lir.externs.iter().cloned());
         // Artifact indices are u64 and Rust vectors cannot exceed u64::MAX
         // entries on supported targets.
         let offset = functions.len() as u64;
@@ -60,7 +62,11 @@ pub fn link(artifacts: &[Artifact]) -> Result<Artifact, LinkError> {
     header.dependencies.clear();
     Ok(Artifact {
         header,
-        lir: artifact::Lir { functions, globals },
+        lir: artifact::Lir {
+            externs,
+            functions,
+            globals,
+        },
     })
 }
 
