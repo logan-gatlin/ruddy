@@ -50,7 +50,8 @@ use crate::{
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
     types::{
-        Assigned, Atom, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape, Ty,
+        Assigned, Atom, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
+        Shape, Ty,
     },
 };
 
@@ -1129,7 +1130,7 @@ pub fn label(shape: Shape, name: &str) -> String {
         // as the one bare name they share. Keep the old path spelling for the
         // diagnostic helper's explicitly path-shaped input.
         Shape::Effect => {
-            let name = name.split('\u{1f}').next().unwrap_or(name);
+            let name = EffectId::parse_row_key(name).map_or(name, |pair| pair.0);
             match name.rsplit_once("::") {
                 Some((modules, effect)) => format!("{modules}::!{effect}"),
                 None => format!("!{name}"),
@@ -1288,7 +1289,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         if flattened_row(row)
                             .0
                             .iter()
-                            .any(|(name, _)| name.contains('\u{1f}')) =>
+                            .any(|(name, _)| EffectId::parse_row_key(name).is_some()) =>
                     {
                         work.push(SemanticJob::Cases(row, true));
                     }
@@ -1385,7 +1386,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             }
             SemanticJob::Case(name, field, strip_interface) => {
                 let name = if strip_interface {
-                    name.split_once('\u{1f}').map_or(name, |pair| pair.0)
+                    EffectId::parse_row_key(name).map_or(name, |pair| pair.0)
                 } else {
                     name
                 };

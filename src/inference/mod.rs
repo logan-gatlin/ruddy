@@ -87,8 +87,8 @@ use crate::{
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{
-        Assigned, Atom, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape,
-        Ty, TyVar,
+        Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
+        Shape, Ty, TyVar,
     },
 };
 use constrain::Constrain;
@@ -2745,7 +2745,8 @@ impl Table {
                     let (labels, _) = self.canon(&row).into_parts();
                     for (name, field) in labels {
                         found.entry(name.clone()).or_insert_with(|| {
-                            let shown = name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0);
+                            let shown =
+                                EffectId::parse_row_key(&name).map_or(name.as_str(), |x| x.0);
                             (shown.to_string(), self.presence_of(&field.presence))
                         });
                     }

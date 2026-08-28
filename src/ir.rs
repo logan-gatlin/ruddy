@@ -2629,12 +2629,11 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     let presence = match field.presence {
                         Presence::Present => Presence::Present,
                         Presence::Absent => Presence::Absent,
-                        Presence::Bound(index) if (index as usize) < presences => {
-                            Presence::Bound(index)
-                        }
-                        Presence::Bound(_) | Presence::Var(_) | Presence::Undecided => {
-                            Presence::Undecided
-                        }
+                        // Preserve presence correlation for canonical recovery.
+                        // `open_type` bounds-checks malformed positions and
+                        // turns them into Undecided before solving.
+                        Presence::Bound(index) => Presence::Bound(index),
+                        Presence::Var(_) | Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
                         Presence::Absent => Rc::new(Ty::Undecided),
@@ -2763,15 +2762,43 @@ fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool
 #[derive(Default)]
 struct ImportedEffectRows {
     labels: HashMap<String, String>,
+    /// A leaf name with exactly one known structural declaration. This closes
+    /// stale generated keys whose published interface text no longer exactly
+    /// matches that declaration; ambiguous same-named effects still require an
+    /// exact old key and are never guessed.
+    names: HashMap<String, Option<String>>,
+    identities: HashMap<artifact::QualifiedName, EffectId>,
     arguments: HashMap<artifact::QualifiedName, Vec<artifact::Sense>>,
 }
 
 impl ImportedEffectRows {
+    fn insert_identity(&mut self, qualified: &str, identity: EffectId) {
+        let name = identity.name().to_string();
+        let canonical = identity.row_key();
+        self.identities.insert(qualified.to_string(), identity);
+        match self.names.entry(name.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(canonical.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&canonical) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+
     fn label(&self, label: &str) -> String {
-        self.labels
-            .get(label)
-            .cloned()
-            .unwrap_or_else(|| label.to_string())
+        if let Some(canonical) = self.labels.get(label) {
+            return canonical.clone();
+        }
+        let Some((name, interface)) = EffectId::parse_row_key(label) else {
+            return label.to_string();
+        };
+        if let Some(Some(canonical)) = self.names.get(name) {
+            return canonical.clone();
+        }
+        EffectId::structural(name.to_string(), canonical_effect_interface(interface)).row_key()
     }
 
     fn argument_is_effects(&self, name: &str, index: usize) -> bool {
@@ -2905,9 +2932,12 @@ fn import_type(
                         artifact::Presence::Present => Presence::Present,
                         artifact::Presence::Absent => Presence::Absent,
                         artifact::Presence::Bound(index) => Presence::Bound(index),
-                        artifact::Presence::Var(_) | artifact::Presence::Undecided => {
-                            Presence::Undecided
-                        }
+                        // Foreign solver variables cannot enter this solver's
+                        // ID space. Keep their correlation in a disjoint
+                        // recovery-bound spelling; opening an out-of-range
+                        // bound recovers to Undecided rather than indexing.
+                        artifact::Presence::Var(index) => Presence::Bound(index ^ 0x8000_0000),
+                        artifact::Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
                         Presence::Absent => Rc::new(Ty::Undecided),
@@ -3265,8 +3295,7 @@ impl CanonicalArena {
     }
 
     fn effect_key(&mut self, key: &str) -> usize {
-        let (name, interface) = key
-            .split_once('\u{1f}')
+        let (name, interface) = EffectId::parse_row_key(key)
             .map_or((key, None), |(name, interface)| (name, Some(interface)));
         let interface = interface
             .map(|interface| self.import(interface))
@@ -3306,7 +3335,7 @@ struct RegularType<'a> {
     /// imported declaration meets the same memo entry instead of rebuilding
     /// and re-encoding an isomorphic argument graph on every turn.
     interned: HashMap<(String, Vec<(String, usize)>), usize>,
-    named: HashMap<(Symbol, Vec<usize>), usize>,
+    named: HashMap<(Symbol, Vec<usize>, bool), usize>,
 }
 
 impl RegularType<'_> {
@@ -3379,6 +3408,8 @@ impl RegularType<'_> {
 
         let mut work = vec![Work::Type(ty, args.to_vec())];
         let mut values = Vec::new();
+        let mut presences = HashMap::new();
+        let mut next_presence = 0usize;
         while let Some(part) = work.pop() {
             match part {
                 Work::Atom(label) => values.push(self.atom(label)),
@@ -3413,9 +3444,11 @@ impl RegularType<'_> {
                             .iter()
                             .map(|(name, field)| {
                                 let presence = match field {
-                                    TypeField::Written { when, .. } => {
-                                        canonical_written_presence(when)
-                                    }
+                                    TypeField::Written { when, .. } => canonical_written_presence(
+                                        when,
+                                        &mut presences,
+                                        &mut next_presence,
+                                    ),
                                     TypeField::Absent { .. } => "\\".into(),
                                 };
                                 (name.clone(), presence)
@@ -3437,9 +3470,11 @@ impl RegularType<'_> {
                             .iter()
                             .map(|(name, case)| {
                                 let presence = match case {
-                                    SumCase::Written { when, .. } => {
-                                        canonical_written_presence(when)
-                                    }
+                                    SumCase::Written { when, .. } => canonical_written_presence(
+                                        when,
+                                        &mut presences,
+                                        &mut next_presence,
+                                    ),
                                     SumCase::Absent { .. } => "\\".into(),
                                 };
                                 format!("label:{name}:{presence}")
@@ -3517,11 +3552,20 @@ impl RegularType<'_> {
                     work.push(Work::RowTail(&row.tail, args));
                     for label in row.effects.values().rev() {
                         let presence = match label {
-                            EffectLabel::Written { when, .. } => canonical_written_presence(when),
+                            EffectLabel::Written { when, .. } => {
+                                canonical_written_presence(when, &mut presences, &mut next_presence)
+                            }
                             EffectLabel::Absent { .. } => "\\".into(),
                         };
                         work.push(Work::EffectCase(presence));
-                        work.push(Work::Atom("Unit".into()));
+                        work.push(Work::Atom(
+                            if matches!(label, EffectLabel::Absent { .. }) {
+                                "?"
+                            } else {
+                                "Unit"
+                            }
+                            .into(),
+                        ));
                         work.push(Work::Canonical(self.effect_interfaces[&label.symbol()]));
                     }
                 }
@@ -3531,7 +3575,7 @@ impl RegularType<'_> {
                     work.push(Work::Named(symbol, args));
                 }
                 Work::Named(symbol, args) => {
-                    let key = (symbol, args.clone());
+                    let key = (symbol, args.clone(), false);
                     if let Some(id) = self.named.get(&key) {
                         values.push(*id);
                     } else if let Some(decl) = self.types.get(&symbol) {
@@ -3626,10 +3670,10 @@ impl RegularType<'_> {
         use crate::types::{Presence, Rest};
 
         enum Work<'a> {
-            Type(&'a Ty, Vec<usize>),
+            Type(&'a Ty, Vec<usize>, bool),
             Row(&'a crate::types::Row, Vec<usize>, bool, bool),
-            Named(Symbol, Vec<usize>),
-            Apply(Symbol, usize),
+            Named(Symbol, Vec<usize>, bool),
+            Apply(Symbol, usize, bool),
             FinishNamed(usize, Symbol),
             Make(String, Vec<String>),
             EffectCase(String),
@@ -3638,10 +3682,17 @@ impl RegularType<'_> {
             Argument(Vec<usize>, u32),
         }
 
-        let mut work = vec![Work::Named(symbol, args)];
+        let mut work = vec![Work::Named(symbol, args, false)];
         let mut values = Vec::new();
         let mut active_instantiations: HashMap<Symbol, Vec<Vec<usize>>> = HashMap::new();
         let mut known_retained = HashSet::new();
+        // A placeholder only has to survive when an in-progress recursive edge
+        // actually observed it. Pure forwarding aliases can otherwise publish
+        // their body's interned node directly, so a fresh `Id a = a`
+        // placeholder does not make `Loop (Id a)` a new instantiation forever.
+        let mut referenced_placeholders = HashSet::new();
+        let mut presences = HashMap::new();
+        let mut next_presence = 0usize;
 
         while let Some(part) = work.pop() {
             match part {
@@ -3664,7 +3715,7 @@ impl RegularType<'_> {
                     children.reverse();
                     values.push(self.node(label, edge_labels.into_iter().zip(children).collect()));
                 }
-                Work::Type(ty, args) => match ty {
+                Work::Type(ty, args, supplied_as_effects) => match ty {
                     Ty::Nat => values.push(self.atom("Nat")),
                     Ty::Int => values.push(self.atom("Int")),
                     Ty::Real => values.push(self.atom("Real")),
@@ -3678,8 +3729,8 @@ impl RegularType<'_> {
                             vec!["from".into(), "to".into(), "effects".into()],
                         ));
                         work.push(Work::Row(effects, args.clone(), true, false));
-                        work.push(Work::Type(to, args.clone()));
-                        work.push(Work::Type(from, args));
+                        work.push(Work::Type(to, args.clone(), false));
+                        work.push(Work::Type(from, args, false));
                     }
                     Ty::Struct(row)
                         if row.labels.is_empty() && matches!(row.rest, Rest::Closed) =>
@@ -3687,32 +3738,35 @@ impl RegularType<'_> {
                         values.push(self.atom("Unit"));
                     }
                     Ty::Struct(row) => work.push(Work::Row(row, args, false, true)),
-                    Ty::Sum(row) => work.push(Work::Row(row, args, false, false)),
+                    Ty::Sum(row) => work.push(Work::Row(row, args, supplied_as_effects, false)),
                     Ty::Named {
                         symbol,
                         args: applied,
                         ..
                     } => {
-                        work.push(Work::Apply(*symbol, applied.len()));
-                        work.extend(
-                            applied
-                                .iter()
-                                .rev()
-                                .map(|argument| Work::Type(argument, args.clone())),
-                        );
+                        work.push(Work::Apply(*symbol, applied.len(), supplied_as_effects));
+                        work.extend(applied.iter().enumerate().rev().map(|(index, argument)| {
+                            let effects = self
+                                .external_types
+                                .get(symbol)
+                                .and_then(|declaration| declaration.params.get(index))
+                                .is_some_and(|kind| matches!(kind, ParamKind::Effects { .. }));
+                            Work::Type(argument, args.clone(), effects)
+                        }));
                     }
                 },
-                Work::Apply(symbol, count) => {
+                Work::Apply(symbol, count, supplied_as_effects) => {
                     let mut args = Vec::with_capacity(count);
                     for _ in 0..count {
                         args.push(values.pop().expect("application postorder is balanced"));
                     }
                     args.reverse();
-                    work.push(Work::Named(symbol, args));
+                    work.push(Work::Named(symbol, args, supplied_as_effects));
                 }
-                Work::Named(symbol, args) => {
-                    let key = (symbol, args.clone());
+                Work::Named(symbol, args, supplied_as_effects) => {
+                    let key = (symbol, args.clone(), supplied_as_effects);
                     if let Some(id) = self.named.get(&key) {
+                        referenced_placeholders.insert(*id);
                         values.push(*id);
                         continue;
                     }
@@ -3749,19 +3803,29 @@ impl RegularType<'_> {
                         values.push(id);
                     } else {
                         work.push(Work::FinishNamed(id, symbol));
-                        work.push(Work::Type(decl.scheme.body(), args));
+                        work.push(Work::Type(decl.scheme.body(), args, supplied_as_effects));
                     }
                 }
                 Work::FinishNamed(id, symbol) => {
                     let body = values.pop().expect("named body postorder is balanced");
-                    if body != id {
-                        self.arena.nodes[id] = self.arena.nodes[body].clone();
-                    }
+                    let result = if body != id && !referenced_placeholders.contains(&id) {
+                        for named in self.named.values_mut() {
+                            if *named == id {
+                                *named = body;
+                            }
+                        }
+                        body
+                    } else {
+                        if body != id {
+                            self.arena.nodes[id] = self.arena.nodes[body].clone();
+                        }
+                        id
+                    };
                     active_instantiations
                         .get_mut(&symbol)
                         .expect("the finished instantiation is active")
                         .pop();
-                    values.push(id);
+                    values.push(result);
                 }
                 Work::Row(row, args, effects, fields) => {
                     let labels = row
@@ -3771,13 +3835,11 @@ impl RegularType<'_> {
                             if effects {
                                 "effect".to_string()
                             } else {
-                                let presence = match field.presence {
-                                    Presence::Present => "+",
-                                    Presence::Absent => "\\",
-                                    Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => {
-                                        "?"
-                                    }
-                                };
+                                let presence = canonical_semantic_presence(
+                                    &field.presence,
+                                    &mut presences,
+                                    &mut next_presence,
+                                );
                                 format!(
                                     "{}:{name}:{presence}",
                                     if fields { "field" } else { "label" }
@@ -3816,23 +3878,23 @@ impl RegularType<'_> {
                     }
                     for (name, field) in row.labels.iter().rev() {
                         if effects {
-                            let presence = match field.presence {
-                                Presence::Present => "+",
-                                Presence::Absent => "\\",
-                                Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?",
-                            };
+                            let presence = canonical_semantic_presence(
+                                &field.presence,
+                                &mut presences,
+                                &mut next_presence,
+                            );
                             let identity = self.arena.effect_key(name);
-                            work.push(Work::EffectCase(presence.into()));
+                            work.push(Work::EffectCase(presence));
                             if matches!(field.presence, Presence::Absent) {
                                 work.push(Work::Atom("?".into()));
                             } else {
-                                work.push(Work::Type(&field.ty, args.clone()));
+                                work.push(Work::Type(&field.ty, args.clone(), false));
                             }
                             work.push(Work::Canonical(identity));
                         } else if matches!(field.presence, Presence::Absent) {
                             work.push(Work::Atom("?".into()));
                         } else {
-                            work.push(Work::Type(&field.ty, args.clone()));
+                            work.push(Work::Type(&field.ty, args.clone(), false));
                         }
                     }
                 }
@@ -4084,12 +4146,46 @@ fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
         .collect()
 }
 
-fn canonical_written_presence(when: &Option<Box<When>>) -> String {
-    match when.as_ref().and_then(|when| when.name.as_ref()) {
-        None if when.is_none() => "+".to_string(),
-        None => "?".to_string(),
-        Some(name) => format!("?{name}"),
-    }
+fn canonical_semantic_presence(
+    presence: &Presence,
+    presences: &mut HashMap<(u8, u32), usize>,
+    next: &mut usize,
+) -> String {
+    let key = match presence {
+        Presence::Present => return "+".into(),
+        Presence::Absent => return "\\".into(),
+        Presence::Undecided => return "?".into(),
+        Presence::Var(id) | Presence::Bound(id) => (0, *id),
+    };
+    let index = *presences.entry(key).or_insert_with(|| {
+        let index = *next;
+        *next += 1;
+        index
+    });
+    format!("?{index}")
+}
+
+fn canonical_written_presence(
+    when: &Option<Box<When>>,
+    presences: &mut HashMap<String, usize>,
+    next: &mut usize,
+) -> String {
+    let Some(when) = when else {
+        return "+".to_string();
+    };
+    let index = match &when.name {
+        Some(name) => *presences.entry(name.clone()).or_insert_with(|| {
+            let index = *next;
+            *next += 1;
+            index
+        }),
+        None => {
+            let index = *next;
+            *next += 1;
+            index
+        }
+    };
+    format!("?{index}")
 }
 
 /// Collect all source effect labels reached by a type's regular local named
@@ -7320,14 +7416,45 @@ impl Builder<'_> {
                 if dependency_path(dependency, &declaration.name).is_none() {
                     continue;
                 }
-                let Some(identity) = &declaration.identity else {
-                    continue;
+                let (identity, published_interface) = match &declaration.identity {
+                    Some(identity) => (
+                        EffectId::structural(
+                            identity.name.clone(),
+                            canonical_effect_interface(&identity.interface),
+                        ),
+                        identity.interface.clone(),
+                    ),
+                    None if matches!(declaration.kind, artifact::EffectKind::Operations(_)) => {
+                        let name = declaration
+                            .name
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(&declaration.name)
+                            .to_string();
+                        (
+                            EffectId::structural(
+                                name,
+                                canonical_effect_interface(&format!(
+                                    "unresolved:{}",
+                                    declaration.name
+                                )),
+                            ),
+                            format!("unresolved:{}", declaration.name),
+                        )
+                    }
+                    None => continue,
                 };
-                let raw = format!("{}\u{1f}{}", identity.name, identity.interface);
-                let canonical = canonical_effect_interface(&identity.interface);
-                effect_rows
-                    .labels
-                    .insert(raw, format!("{}\u{1f}{canonical}", identity.name));
+                let canonical = identity.row_key();
+                let name = identity.name();
+                effect_rows.labels.insert(
+                    format!("{name}\u{1f}{published_interface}"),
+                    canonical.clone(),
+                );
+                effect_rows.labels.insert(
+                    EffectId::structural(name.to_string(), published_interface).row_key(),
+                    canonical,
+                );
+                effect_rows.insert_identity(&declaration.name, identity);
             }
             for declaration in &dependency.header.types {
                 if dependency_path(dependency, &declaration.name).is_none() {
@@ -7520,14 +7647,8 @@ impl Builder<'_> {
                 else {
                     continue;
                 };
-                if let Some(identity) = &declaration.identity {
-                    program.effect_ids.insert(
-                        symbol,
-                        EffectId::Structural {
-                            name: identity.name.clone(),
-                            interface: canonical_effect_interface(&identity.interface),
-                        },
-                    );
+                if let Some(identity) = effect_rows.identities.get(&declaration.name) {
+                    program.effect_ids.insert(symbol, identity.clone());
                 }
                 match &declaration.kind {
                     artifact::EffectKind::Operations(operations) => {
@@ -7535,17 +7656,10 @@ impl Builder<'_> {
                         // of an operation declaration. Keep malformed or older
                         // direct-only interfaces total as well: an absent
                         // identity must never make every use of the effect pure.
-                        program.effect_ids.entry(symbol).or_insert_with(|| {
-                            EffectId::structural(
-                                declaration
-                                    .name
-                                    .rsplit("::")
-                                    .next()
-                                    .unwrap_or(&declaration.name)
-                                    .to_string(),
-                                format!("unresolved:{}", declaration.name),
-                            )
-                        });
+                        // The normalization table above installs this for
+                        // every operation declaration, including legacy
+                        // artifacts with no published identity.
+                        debug_assert!(program.effect_ids.contains_key(&symbol));
                         self.expanded.insert(
                             symbol,
                             [(declaration.name.clone(), symbol)].into_iter().collect(),

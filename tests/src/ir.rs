@@ -5505,7 +5505,7 @@ fn imported_unnamed_handlers_are_complete_without_panicking() {
 #[test]
 fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     let raw = "IO\u{1f}x";
-    let canonical = "IO\u{1f}0#o1:x;";
+    let canonical = ruddy::types::EffectId::structural("IO".into(), "0#o1:x;".into()).row_key();
     let effect_row = || a::Row {
         labels: Vec::new(),
         rest: a::Rest::More(Box::new(a::Row {
@@ -5617,7 +5617,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     let Rest::More(more) = &effects.rest else {
         panic!("action keeps its composed row")
     };
-    assert!(more.labels.contains_key(canonical));
+    assert!(more.labels.contains_key(&canonical));
 
     let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::nested").body() else {
         panic!("nested outer alias")
@@ -5631,7 +5631,7 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     let Rest::More(more) = &row.rest else {
         panic!("effect argument keeps its composed row")
     };
-    assert!(more.labels.contains_key(canonical));
+    assert!(more.labels.contains_key(&canonical));
 
     let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::unresolved").body() else {
         panic!("unresolved named type")
@@ -5653,16 +5653,103 @@ fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
     };
     assert!(matches!(
         &imported_type("dep@1.0.0::Effects").params[0],
-        ParamKind::Effects { lacks } if lacks.contains(canonical)
+        ParamKind::Effects { lacks } if lacks.contains(&canonical)
     ));
     let Ty::Sum(cases) = &**imported_type("dep@1.0.0::Cases").scheme.body() else {
         panic!("ordinary imported sum")
     };
     assert!(cases.labels.contains_key(raw));
-    assert!(!cases.labels.contains_key(canonical));
+    assert!(!cases.labels.contains_key(&canonical));
 
     let inferred = inference::infer(&mint, &mut out.program);
     assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
+#[test]
+fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
+    let mut dependency = effect_artifact("dep", "ignored");
+    dependency.header.effects[0].identity = None;
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("run".into()),
+        from: artifact_unit(),
+        to: artifact_unit(),
+    });
+    let legacy_key = "IO\u{1f}unresolved:dep@1.0.0::IO";
+    let effects = a::Row {
+        labels: vec![(
+            legacy_key.into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )],
+        rest: a::Rest::Closed,
+    };
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::action".into(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            effects,
+        )),
+    });
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Effects".into(),
+        params: vec![a::Parameter {
+            sense: a::Sense::Effects,
+            lacks: vec![legacy_key.into()],
+            relevant: true,
+        }],
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Bound(0),
+        },
+    });
+
+    let parsed = parse::parse(
+        lex(
+            "let main = fn unit => handle dep::action unit with | dep::!IO.run value => value end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identity = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(_, identity)| (identity.name() == "IO").then_some(identity))
+        .expect("legacy operation identity");
+    let key = identity.row_key();
+    let action = out
+        .program
+        .external_schemes
+        .iter()
+        .find_map(|(symbol, scheme)| (mint.name(*symbol) == "dep@1.0.0::action").then_some(scheme))
+        .expect("legacy action");
+    let Ty::Arrow(_, _, effects) = &**action.body() else {
+        panic!("action arrow")
+    };
+    assert!(effects.labels.contains_key(&key));
+    let effects_type = out
+        .program
+        .external_types
+        .iter()
+        .find_map(|(symbol, declaration)| {
+            (mint.name(*symbol) == "dep@1.0.0::Effects").then_some(declaration)
+        })
+        .expect("legacy effects type");
+    assert!(matches!(
+        &effects_type.params[0],
+        ParamKind::Effects { lacks } if lacks.contains(&key)
+    ));
 }
 
 #[test]
@@ -6248,6 +6335,101 @@ fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
 }
 
 #[test]
+fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
+    let mut dependency = effect_artifact("dep", "presence-correlation");
+    let declaration = |name: &str, left, right| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Struct(a::Row {
+            labels: vec![
+                (
+                    "x".into(),
+                    a::RowField {
+                        presence: left,
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "y".into(),
+                    a::RowField {
+                        presence: right,
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ],
+            rest: a::Rest::Closed,
+        })),
+    };
+    dependency.header.types = vec![
+        declaration("Bound", a::Presence::Bound(9), a::Presence::Bound(9)),
+        declaration("Var", a::Presence::Var(41), a::Presence::Var(41)),
+        declaration("Independent", a::Presence::Bound(9), a::Presence::Bound(10)),
+        declaration("Unknown", a::Presence::Undecided, a::Presence::Undecided),
+    ];
+    let parsed = parse::parse(
+        lex(
+            "module B = effect Probe = { op: dep::Bound -> () } end\n\
+             module V = effect Probe = { op: dep::Var -> () } end\n\
+             module I = effect Probe = { op: dep::Independent -> () } end\n\
+             module U = effect Probe = { op: dep::Unknown -> () } end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 4);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+    assert_ne!(identities[0], identities[3]);
+}
+
+#[test]
+fn effect_identity_alpha_normalizes_presence_variables_and_keeps_correlation() {
+    let source = "module P =\n\
+                    effect Probe = { op: { x when 'p: Nat, y when 'p: Nat } -> () }\n\
+                  end\n\
+                  module Q =\n\
+                    effect Probe = { op: { x when 'q: Nat, y when 'q: Nat } -> () }\n\
+                  end\n\
+                  module Independent =\n\
+                    effect Probe = { op: { x when 'p: Nat, y when 'q: Nat } -> () }\n\
+                  end";
+    let (mint, out) = build_src(source);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
 fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion() {
     let mut source = String::from("effect Branch0 = { op: () -> () }\n");
     for depth in 1..=30 {
@@ -6298,6 +6480,60 @@ fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion
     assert_eq!(loops[0], loops[3], "one- and two-state cycles differ");
     assert_eq!(loops[0], loops[4], "cycle entry point changed identity");
     assert_ne!(loops[0], loops[2], "operation names disappeared");
+}
+
+#[test]
+fn source_and_imported_absent_effect_payloads_have_one_identity() {
+    let io_source = "effect IO = { run: () -> () }";
+    let io = local_effect_interface(io_source, "IO");
+    let mut dependency = effect_artifact("dep", &io);
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            a::Row {
+                labels: vec![(
+                    format!("IO\u{1f}{io}"),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        // An absent effect payload is semantically ignored.
+                        ty: a::Type::String,
+                    },
+                )],
+                rest: a::Rest::Undecided,
+            },
+        )),
+    });
+    let source = format!(
+        "{io_source}\n\
+         module Source =\n\
+           effect Probe = {{ op: (() -> () + \\!IO + ..) -> () }}\n\
+         end\n\
+         module Imported =\n\
+           effect Probe = {{ op: dep::Carrier -> () }}\n\
+         end"
+    );
+    let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0], identities[1]);
 }
 
 #[test]
@@ -6403,6 +6639,133 @@ fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels
         assert_eq!(ids[0], ids[1], "{name} composition was not flattened");
         assert_ne!(ids[0], ids[2], "{name} labels were lost while flattening");
     }
+}
+
+#[test]
+fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
+    let mut dependency = effect_artifact("dep", "x");
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let effect_row = || a::Row {
+        labels: vec![("IO\u{1f}x".into(), present(artifact_unit()))],
+        rest: a::Rest::Closed,
+    };
+    let case_row = || a::Row {
+        labels: vec![("IO\u{1f}x".into(), present(artifact_unit()))],
+        rest: a::Rest::Closed,
+    };
+    let parameter = |sense| a::Parameter {
+        sense,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    let declared = |name: &str, params, count, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params,
+        scheme: a::Scheme {
+            count,
+            presences: 0,
+            formula: a::Formula::True,
+            body,
+        },
+    };
+    dependency.header.types = vec![
+        declared("EffectRows", Vec::new(), 0, a::Type::Sum(effect_row())),
+        declared(
+            "Effects",
+            vec![parameter(a::Sense::Effects)],
+            1,
+            a::Type::Arrow(
+                Box::new(artifact_unit()),
+                Box::new(artifact_unit()),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                },
+            ),
+        ),
+        declared(
+            "ComposedEffects",
+            Vec::new(),
+            0,
+            a::Type::Named {
+                name: "dep@1.0.0::Effects".into(),
+                args: vec![a::Type::Named {
+                    name: "dep@1.0.0::EffectRows".into(),
+                    args: Vec::new(),
+                }],
+            },
+        ),
+        declared(
+            "FlatEffects",
+            Vec::new(),
+            0,
+            a::Type::Arrow(
+                Box::new(artifact_unit()),
+                Box::new(artifact_unit()),
+                effect_row(),
+            ),
+        ),
+        declared(
+            "Cases",
+            vec![parameter(a::Sense::Cases)],
+            1,
+            a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        ),
+        declared(
+            "ComposedCases",
+            Vec::new(),
+            0,
+            a::Type::Named {
+                name: "dep@1.0.0::Cases".into(),
+                args: vec![a::Type::Sum(case_row())],
+            },
+        ),
+        declared("FlatCases", Vec::new(), 0, a::Type::Sum(case_row())),
+    ];
+    let parsed = parse::parse(
+        lex(
+            "module EC =\n\
+               effect Probe = { op: dep::ComposedEffects -> () }\n\
+             end\n\
+             module EF =\n\
+               effect Probe = { op: dep::FlatEffects -> () }\n\
+             end\n\
+             module CC =\n\
+               effect Probe = { op: dep::ComposedCases -> () }\n\
+             end\n\
+             module CF =\n\
+               effect Probe = { op: dep::FlatCases -> () }\n\
+             end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 4);
+    assert_eq!(identities[0], identities[1]);
+    assert_eq!(identities[2], identities[3]);
+    assert_ne!(identities[0], identities[2]);
 }
 
 #[test]
@@ -8550,6 +8913,66 @@ fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
 }
 
 #[test]
+fn imported_recursive_instantiations_close_through_forwarding_aliases() {
+    let mut dependency = effect_artifact("dep", "forwarding-loop");
+    let parameter = || a::Parameter {
+        sense: a::Sense::Type,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Id".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Loop".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Loop".into(),
+                    args: vec![a::Type::Named {
+                        name: "dep@1.0.0::Id".into(),
+                        args: vec![a::Type::Bound(0)],
+                    }],
+                },
+            },
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Loop Nat -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("pending identity"),
+            })
+        })
+        .expect("Probe identity");
+    assert!(interface.len() < 500, "{interface}");
+}
+
+#[test]
 fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
     const PARAMETERS: usize = 257;
 
@@ -8848,6 +9271,18 @@ fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit(
 }
 
 #[test]
+fn canonical_unknown_effect_interfaces_decode_as_graph_nodes() {
+    let dependency = effect_artifact("dep", "0#u;");
+    let parsed = parse::parse(lex("type Use = Nat", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.program.effect_ids.values().any(|identity| matches!(
+        identity,
+        ruddy::types::EffectId::Structural { interface, .. } if interface == "0#u;"
+    )));
+}
+
+#[test]
 fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
     let raw = effect_artifact("raw", "x");
     let ordinary = effect_artifact("ordinary", "0#18:opaque-interface:x;");
@@ -9015,8 +9450,8 @@ fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
             })
             .unwrap_or_else(|| panic!("missing {name}"))
     };
-    assert_eq!(interface("RawProbe"), interface("RoundProbe"));
-    assert_ne!(interface("RawProbe"), interface("OrdinaryProbe"));
+    assert_ne!(interface("RawProbe"), interface("RoundProbe"));
+    assert_eq!(interface("RoundProbe"), interface("OrdinaryProbe"));
 }
 
 #[test]

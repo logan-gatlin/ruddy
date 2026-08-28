@@ -9,6 +9,28 @@ use ruddy::types::{
     Sense, Shape, Ty, same_finite_syntax,
 };
 
+#[test]
+fn effect_row_keys_are_unambiguous_and_read_legacy_artifacts() {
+    let first = EffectId::structural("A\u{1f}B".into(), "C:1".into()).row_key();
+    let second = EffectId::structural("A".into(), "B\u{1f}C:1".into()).row_key();
+    assert_ne!(first, second);
+    assert_eq!(EffectId::parse_row_key(&first), Some(("A\u{1f}B", "C:1")));
+    assert_eq!(EffectId::parse_row_key(&second), Some(("A", "B\u{1f}C:1")));
+    assert_eq!(
+        EffectId::parse_row_key("A\u{1f}legacy"),
+        Some(("A", "legacy"))
+    );
+    assert_eq!(EffectId::parse_row_key("\u{1e}e1:A1:xjunk"), None);
+    assert_eq!(EffectId::parse_row_key("\u{1e}e"), None);
+    assert_eq!(EffectId::parse_row_key("\u{1e}eA"), None);
+    assert_eq!(EffectId::parse_row_key("\u{1e}e1A"), None);
+    assert_eq!(
+        EffectId::parse_row_key("\u{1e}e18446744073709551616:A1:x"),
+        None
+    );
+    assert_eq!(EffectId::parse_row_key("ordinary"), None);
+}
+
 fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
     Rc::new(Ty::Named {
         symbol,

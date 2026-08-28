@@ -25,9 +25,9 @@ use ruddy::{
 
 /// The structural effect keys that are internal to one lowered program.
 ///
-/// A unit separator has no intrinsic meaning in an LIR struct field: quoted
-/// source fields may contain one. Only generated evidence operations naming
-/// keys minted for effects hide the opaque interface following that separator.
+/// An encoded identity has no intrinsic meaning in an LIR struct field: quoted
+/// source fields may resemble one. Only generated evidence operations naming
+/// keys minted for effects hide the opaque interface component.
 #[derive(Default)]
 pub struct Labels {
     effects: HashSet<String>,
@@ -39,9 +39,7 @@ impl Labels {
             .effect_ids
             .values()
             .filter_map(|effect| match effect {
-                EffectId::Structural { name, interface } => {
-                    Some(format!("{name}\u{1f}{interface}"))
-                }
+                EffectId::Structural { .. } => Some(effect.row_key()),
                 EffectId::Pending(_) => None,
             })
             .collect();
@@ -50,7 +48,7 @@ impl Labels {
 
     fn named<'a>(&self, name: &'a str, generated: bool) -> &'a str {
         match generated && self.effects.contains(name) {
-            true => name.split_once('\u{1f}').map_or(name, |(name, _)| name),
+            true => EffectId::parse_row_key(name).map_or(name, |(name, _)| name),
             false => name,
         }
     }

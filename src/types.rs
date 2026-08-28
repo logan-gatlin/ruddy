@@ -56,14 +56,51 @@ impl EffectId {
         Self::Structural { name, interface }
     }
 
-    /// The stable semantic row key. The separator cannot occur in an
-    /// identifier, and keeps incompatible same-named effects distinct without
-    /// leaking their interface into printed types.
+    /// The stable semantic row key. Both components are byte-length prefixed:
+    /// imported recovery data is allowed to contain every character, including
+    /// the separator used by older artifacts, so a delimiter alone cannot be
+    /// an unambiguous identity boundary.
     pub fn row_key(&self) -> String {
         match self {
-            Self::Structural { name, interface } => format!("{name}\u{1f}{interface}"),
+            Self::Structural { name, interface } => {
+                format!(
+                    "\u{1e}e{}:{name}{}:{interface}",
+                    name.len(),
+                    interface.len()
+                )
+            }
             Self::Pending(_) => panic!("effect row reached inference before structuralization"),
         }
+    }
+
+    /// Decode a semantic effect-row key. The length-prefixed spelling is
+    /// canonical; the unit-separator spelling remains readable so old artifact
+    /// rows can be normalized while importing them.
+    pub fn parse_row_key(key: &str) -> Option<(&str, &str)> {
+        fn component<'a>(key: &'a str, at: &mut usize) -> Option<&'a str> {
+            let bytes = key.as_bytes();
+            let start = *at;
+            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            if start == *at || bytes.get(*at) != Some(&b':') {
+                return None;
+            }
+            let length: usize = key.get(start..*at)?.parse().ok()?;
+            *at += 1;
+            let end = at.checked_add(length)?;
+            let value = key.get(*at..end)?;
+            *at = end;
+            Some(value)
+        }
+
+        if let Some(rest) = key.strip_prefix("\u{1e}e") {
+            let mut at = 0;
+            let name = component(rest, &mut at)?;
+            let interface = component(rest, &mut at)?;
+            return (at == rest.len()).then_some((name, interface));
+        }
+        key.split_once('\u{1f}')
     }
 
     pub fn name(&self) -> &str {

@@ -1585,30 +1585,28 @@ impl Solve<'_> {
                             });
                             // Lowering rejects recursive applications that wrap
                             // their own arguments, and imported recovery data is
-                            // not entitled to that invariant. Such a non-nominal
+                            // not entitled to that invariant. Such a malformed
                             // goal never repeats exactly: each trip around the
                             // declaration puts the previous arguments below one
-                            // more constructor. Recognize that structural
+                            // more constructor. Relevance metadata is untrusted
+                            // too, so nominal cross-alias goals need this guard
+                            // just as structural ones do. Recognize structural
                             // embedding while the earlier goal is still open and
                             // absorb the malformed interface instead of growing
                             // an unbounded sequence of types.
                             let growing =
                                 pair.as_ref()
                                     .is_some_and(|(key, _, (later_left, later_right))| {
-                                        (!self.nominal.contains(&key.0)
-                                            & !self.nominal.contains(&key.1))
+                                        (self.nominal.contains(&key.0)
+                                            == self.nominal.contains(&key.1))
                                             && assumption_index.get(key).is_some_and(|entries| {
                                                 entries.iter().any(|at| {
                                                 let (earlier_left, earlier_right) =
                                                     &assumption_arguments[at];
-                                                let left = self.embeds_arguments(
-                                                    earlier_left,
-                                                    later_left,
-                                                );
-                                                let right = self.embeds_arguments(
-                                                    earlier_right,
-                                                    later_right,
-                                                );
+                                                let left =
+                                                    self.embeds_arguments(earlier_left, later_left);
+                                                let right = self
+                                                    .embeds_arguments(earlier_right, later_right);
                                                 matches!((left, right), (Some(a), Some(b)) if a | b)
                                             })
                                             })

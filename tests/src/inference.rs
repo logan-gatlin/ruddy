@@ -10,7 +10,10 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
+    types::{
+        EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty,
+        TyVar,
+    },
 };
 
 fn dummy_mint() -> Mint {
@@ -2873,6 +2876,64 @@ fn malformed_non_nominal_recursive_growth_is_absorbed() {
         "steps: {:#?}",
         output.steps
     );
+}
+
+#[test]
+fn malformed_nominal_cross_alias_growth_is_absorbed() {
+    let parsed = parse::parse(
+        lex(
+            "type A 'a = Nat\n\
+             type B 'a = Nat\n\
+             let f : A Nat -> B Nat = fn x => x",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let a = symbol_named(&mint, lowered.program.types.keys().copied(), "A");
+    let b = symbol_named(&mint, lowered.program.types.keys().copied(), "B");
+    lowered.program.types.shift_remove(&a);
+    lowered.program.types.shift_remove(&b);
+
+    let pure = || Row {
+        labels: Default::default(),
+        rest: Rest::Closed,
+    };
+    for symbol in [a, b] {
+        let argument = Rc::new(Ty::Arrow(
+            Rc::new(Ty::Bound(0)),
+            Rc::new(Ty::Bound(0)),
+            pure(),
+        ));
+        lowered.program.external_types.insert(
+            symbol,
+            ir::ExternalType {
+                params: vec![ParamKind::Type {
+                    lacks: Default::default(),
+                }],
+                relevant: vec![true],
+                scheme: Scheme::new(
+                    1,
+                    Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "next".into(),
+                            RowField::present(semantic_named(symbol, vec![argument])),
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    })),
+                ),
+                unresolved: None,
+            },
+        );
+    }
+
+    let output = inference::infer(&mint, &mut lowered.program);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert!(output.steps.iter().any(|step| step.rule == Rule::Absorb));
 }
 
 /// Even malformed imported growth is reflexive. For
@@ -6915,7 +6976,9 @@ fn an_effect_written_absent_lowers_to_an_absent_presence() {
     let label = effects
         .labels
         .iter()
-        .find_map(|(name, label)| (name.split('\u{1f}').next() == Some("IO")).then_some(label))
+        .find_map(|(name, label)| {
+            (EffectId::parse_row_key(name).map(|pair| pair.0) == Some("IO")).then_some(label)
+        })
         .expect("an IO effect label");
     assert!(matches!(label.presence, Presence::Absent), "{label:?}");
 
