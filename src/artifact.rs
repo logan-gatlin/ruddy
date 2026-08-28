@@ -78,8 +78,9 @@ pub struct Header {
     pub identity: Identity,
     /// The bundles this artifact depends on.
     pub dependencies: Vec<Dependency>,
-    /// Every top-level value exported by the bundle. Externs precede `let`s;
-    /// each kind retains its source declaration order.
+    /// Every source-addressable top-level value exported by the bundle. Externs
+    /// precede `let`s; each kind retains its source declaration order. Hidden
+    /// definitions generated for patterns such as `let _` are not exported.
     pub values: Vec<Value>,
     /// Every declared type, in source declaration order.
     pub types: Vec<DeclaredType>,
@@ -1555,10 +1556,19 @@ pub fn build_with_dependencies(
                 name: qualified(mint, *symbol),
                 scheme: scheme(mint, &inference.externs[symbol]),
             })
-            .chain(program.terms.keys().map(|symbol| Value {
-                name: qualified(mint, *symbol),
-                scheme: scheme(mint, &inference.schemes[symbol]),
-            }))
+            .chain(
+                program
+                    .terms
+                    .keys()
+                    // Fresh top-level definitions implement patterns such as
+                    // `let _`; they must be initialized, but have no source
+                    // name through which another bundle could import them.
+                    .filter(|symbol| !mint.is_local(**symbol))
+                    .map(|symbol| Value {
+                        name: qualified(mint, *symbol),
+                        scheme: scheme(mint, &inference.schemes[symbol]),
+                    }),
+            )
             .collect(),
         types: program
             .types
@@ -1669,8 +1679,8 @@ fn qualified(mint: &Mint, symbol: Symbol) -> QualifiedName {
     if let Some(qualified) = mint.external(symbol) {
         return qualified.to_owned();
     }
-    // Source paths deliberately do not distinguish locals. Artifact names must:
-    // top-level wildcard definitions are fresh local symbols and multiple such
+    // Source paths deliberately do not distinguish locals. LIR names must:
+    // hidden top-level definitions are fresh local symbols and multiple such
     // globals can coexist. A full canonical mangling is deterministic and
     // injective, while `%` keeps this compiler-only component disjoint from
     // every source identifier.
