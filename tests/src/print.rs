@@ -8,7 +8,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
-    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Ty},
+    types::{Formula, Presence, Rest, Row, RowField, Scheme, Ty},
 };
 use ruddy_debug::print;
 
@@ -692,22 +692,22 @@ fn a_scheme_declares_the_letters_it_quantifies() {
         "A".to_string(),
         RowField {
             presence: Presence::Bound(0),
-            ty: Rc::new(Ty::plain(Core::Bound(1))),
+            ty: Rc::new(Ty::plain(Ty::Bound(1))),
         },
     )]
     .into_iter()
     .collect();
-    let body = Rc::new(Ty::plain(Core::pure(
-        Rc::new(Ty {
-            core: Core::Bound(2),
-            fields: [(
+    let body = Rc::new(Ty::plain(Ty::pure(
+        Rc::new(Ty::Struct(Row {
+            labels: [(
                 "x".to_string(),
-                RowField::present(Rc::new(Ty::plain(Core::Bound(1)))),
+                RowField::present(Rc::new(Ty::plain(Ty::Bound(1)))),
             )]
             .into_iter()
             .collect(),
-        }),
-        Rc::new(Ty::plain(Core::Sum(Row {
+            rest: Rest::Bound(2),
+        })),
+        Rc::new(Ty::plain(Ty::Sum(Row {
             labels: cases,
             rest: Rest::Bound(3),
         }))),
@@ -723,27 +723,27 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     let both = Scheme::constrained(
         2,
         2,
-        Rc::new(Ty {
-            core: Core::Unit,
-            fields: [
+        Rc::new(Ty::Struct(Row {
+            labels: [
                 (
                     "x".to_string(),
                     RowField {
                         presence: Presence::Bound(0),
-                        ty: Rc::new(Ty::plain(Core::Nat)),
+                        ty: Rc::new(Ty::plain(Ty::Nat)),
                     },
                 ),
                 (
                     "y".to_string(),
                     RowField {
                         presence: Presence::Bound(1),
-                        ty: Rc::new(Ty::plain(Core::Nat)),
+                        ty: Rc::new(Ty::plain(Ty::Nat)),
                     },
                 ),
             ]
             .into_iter()
             .collect(),
-        }),
+            rest: Rest::Closed,
+        })),
         Formula::bound(0).xor(Formula::bound(1)),
     );
     assert_eq!(
@@ -754,37 +754,36 @@ fn a_scheme_declares_the_letters_it_quantifies() {
     // A scheme requiring something of a presence it does not itself quantify
     // writes the clause and no `let`: there are no letters to declare, and the
     // formula is still what the scheme requires.
-    let free = Scheme::constrained(0, 0, Rc::new(Ty::plain(Core::Nat)), Formula::var(3));
+    let free = Scheme::constrained(0, 0, Rc::new(Ty::plain(Ty::Nat)), Formula::var(3));
     assert_eq!(free.to_string(), "Nat where ?3");
 
     // A scheme quantifying nothing and requiring nothing writes no `where` at
     // all, which is every scheme in a monomorphic program.
-    let plain = Scheme::new(0, Rc::new(Ty::plain(Core::Nat)));
+    let plain = Scheme::new(0, Rc::new(Ty::plain(Ty::Nat)));
     assert_eq!(plain.to_string(), "Nat");
 
     // A rigid prints as the name its `where 'let` gave it, in either sort.
-    let rigid = Rc::new(Ty {
-        core: Core::Rigid {
-            id: 0,
-            name: "r".into(),
-        },
-        fields: [(
+    let rigid = Rc::new(Ty::Struct(Row {
+        labels: [(
             "x".to_string(),
-            RowField::present(Rc::new(Ty::plain(Core::Rigid {
+            RowField::present(Rc::new(Ty::plain(Ty::Rigid {
                 id: 1,
                 name: "a".into(),
             }))),
         )]
         .into_iter()
         .collect(),
-    });
+        rest: Rest::Rigid {
+            id: 0,
+            name: "r".into(),
+        },
+    }));
     assert_eq!(rigid.to_string(), "{ x: 'a, ..'r }");
 
     // And a solver variable is unchanged: `?3` for a type or a rest, `?3` in a
     // `when` for a presence, a bare `?` for the undecided.
-    let solver = Rc::new(Ty {
-        core: Core::Var(3),
-        fields: [(
+    let solver = Rc::new(Ty::Struct(Row {
+        labels: [(
             "x".to_string(),
             RowField {
                 presence: Presence::Var(4),
@@ -793,7 +792,8 @@ fn a_scheme_declares_the_letters_it_quantifies() {
         )]
         .into_iter()
         .collect(),
-    });
+        rest: Rest::Var(3),
+    }));
     assert_eq!(solver.to_string(), "{ x when ?4: ?, ..?3 }");
 }
 

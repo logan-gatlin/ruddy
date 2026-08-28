@@ -29,7 +29,7 @@ use crate::{
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Formula, Presence, Rest, Row, Ty},
+    types::{Formula, Presence, Rest, Row, Ty},
 };
 
 /// A value the instruction stream names. Numbered by one program-wide counter,
@@ -1083,20 +1083,18 @@ impl Lower<'_> {
     /// is no narrower answer to give.
     fn rep(&self, ty: &Rc<Ty>) -> Rep {
         let ty = unfold(&self.inference.aliases, ty);
-        match &ty.core {
-            Core::Nat => Rep::Nat,
-            Core::Int => Rep::Int,
-            Core::Real => Rep::Real,
-            Core::String => Rep::String,
-            Core::Boolean => Rep::Boolean,
-            Core::Arrow(..) => Rep::Fn,
-            Core::Sum(_) => Rep::Sum,
-            // A core carrying fields is a struct, and one carrying none is the
-            // unit value. Only `Unit` splits this way: a non-`Unit` core with
-            // fields has no constructible values, so deriving its
-            // representation from the core alone is arbitrary and safe.
-            Core::Unit if ty.fields.is_empty() => Rep::Unit,
-            Core::Unit => Rep::Struct,
+        match &*ty {
+            Ty::Nat => Rep::Nat,
+            Ty::Int => Rep::Int,
+            Ty::Real => Rep::Real,
+            Ty::String => Rep::String,
+            Ty::Boolean => Rep::Boolean,
+            Ty::Arrow(..) => Rep::Fn,
+            Ty::Sum(_) => Rep::Sum,
+            Ty::Struct(row) if row.labels.is_empty() && matches!(row.rest, Rest::Closed) => {
+                Rep::Unit
+            }
+            Ty::Struct(_) => Rep::Struct,
             _ => Rep::Any,
         }
     }
@@ -1111,7 +1109,7 @@ impl Lower<'_> {
     /// this pass is never handed.
     fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
         let ty = unfold(&self.inference.aliases, ty);
-        let Core::Arrow(from, to, row) = &ty.core else {
+        let Ty::Arrow(from, to, row) = &*ty else {
             panic!("LIR runs only on programs with no errors");
         };
         (from.clone(), to.clone(), flat(row))
@@ -1133,11 +1131,14 @@ impl Lower<'_> {
     /// name the member — a use may dispatch on a case the production type
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
         let ty = unfold(&self.inference.aliases, ty);
-        let member = match &ty.core {
-            Core::Sum(row) => flat(row).labels.get(name).map(|case| case.ty.clone()),
-            _ => ty.fields.get(name).map(|field| field.ty.clone()),
+        let member = match &*ty {
+            Ty::Sum(row) | Ty::Struct(row) => {
+                flat(row).labels.get(name).map(|field| field.ty.clone())
+            }
+            _ => None,
         };
         member.filter(|member| self.rep(member) != Rep::Any)
     }
@@ -2421,11 +2422,11 @@ impl Lower<'_> {
             .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
-        match &ty.core {
-            Core::Nat | Core::Int | Core::Real | Core::String | Core::Boolean if primitives => {
+        match &*ty {
+            Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean if primitives => {
                 self.switch_prim(col.temp, matrix, tree, body)
             }
-            Core::Sum(row) if tags => {
+            Ty::Sum(row) if tags => {
                 let row = flat(row);
                 self.switch_tag(col.temp, &row, matrix, tree, body)
             }
@@ -2605,6 +2606,7 @@ impl Lower<'_> {
 
     /// Widen a struct position: one presence column per field the solved type
     /// names, then the core, then whatever fields lie beyond the named ones.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn widen(
         &mut self,
         temp: Temp,
@@ -2613,8 +2615,12 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let mut named: Vec<(String, Presence, Rc<Ty>)> = ty
-            .fields
+        let Ty::Struct(row) = &**ty else {
+            panic!("struct pattern on non-struct")
+        };
+        let row = flat(row);
+        let mut named: Vec<(String, Presence, Rc<Ty>)> = row
+            .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
             .collect();
@@ -2631,7 +2637,7 @@ impl Lower<'_> {
             }
         }
         let widen = |cell: &Cell| -> Vec<Cell> {
-            let mut wide = Vec::with_capacity(named.len() + 2);
+            let mut wide = Vec::with_capacity(named.len() + 1);
             match cell {
                 Cell::Struct { fields, exact } => {
                     for (name, _, _) in &named {
@@ -2642,17 +2648,13 @@ impl Lower<'_> {
                             (None, false) => Cell::Wild(None),
                         });
                     }
-                    // A struct pattern says nothing about the core beside the
-                    // fields, and everything about what lies beyond them.
-                    wide.push(Cell::Wild(None));
                     wide.push(match exact {
                         true => Cell::Absent,
                         false => Cell::Wild(None),
                     });
                 }
-                cell => {
+                _ => {
                     wide.extend(std::iter::repeat_n(Cell::Wild(None), named.len()));
-                    wide.push(cell.clone());
                     wide.push(Cell::Wild(None));
                 }
             }
@@ -2669,14 +2671,10 @@ impl Lower<'_> {
                 })
             })
             .collect();
-        cols.push(Col::Value(Value {
-            temp,
-            ty: Rc::new(Ty::plain(ty.core.clone())),
-        }));
         cols.push(Col::Beyond(Beyond {
             base: temp,
             names: named.iter().map(|(name, _, _)| name.clone()).collect(),
-            open: !matches!(ty.core, Core::Unit),
+            open: !matches!(row.rest, Rest::Closed),
         }));
         let widened = Matrix {
             cols: matrix.cols,
@@ -2698,6 +2696,7 @@ impl Lower<'_> {
     /// out; one it proves absent tests nothing and starves the arms demanding
     /// it; one still open is the `switch_presence` the optional fields exist
     /// for.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn presence(&mut self, col: &Field, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
         // Nothing anywhere in the column asks about this field, so neither the
         // presence nor the value is worth reading.

@@ -10,7 +10,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token::lex,
     tracking::FileID,
-    types::{Core, Formula, Rest, Row, Ty},
+    types::{Formula, Rest, Row, Ty},
 };
 
 fn dummy_mint() -> Mint {
@@ -550,7 +550,7 @@ fn an_empty_match_over_an_open_sum_is_skipped() {
         rest: Rest::Bound(0),
         ..Row::default()
     };
-    scrutinee.ty = Rc::new(Ty::plain(Core::Sum(row)));
+    scrutinee.ty = Rc::new(Ty::plain(Ty::Sum(row)));
 
     let checks = patterns::check(&out.program, &inferred);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);

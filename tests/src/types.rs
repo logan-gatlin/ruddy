@@ -5,8 +5,8 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 use ruddy::symbol::{Bundle, Mint, Namespace, Version};
 use ruddy::types::{
-    Assigned, Atom, Core, EffectId, Formula, ParamKind, Presence, Prim, Rest, Row, RowField,
-    Scheme, Sense, Shape, Ty,
+    Assigned, Atom, EffectId, Formula, ParamKind, Presence, Prim, Rest, Row, RowField, Scheme,
+    Sense, Shape, Ty,
 };
 
 fn pending_effect() -> EffectId {
@@ -51,11 +51,11 @@ fn distinct_primitives_are_spelled_differently() {
     assert_eq!(Prim::Real.name(), "Real");
     assert_eq!(Prim::String.name(), "String");
     assert_eq!(Prim::Boolean.name(), "Boolean");
-    assert!(matches!(Core::from(Prim::Nat), Core::Nat));
-    assert!(matches!(Core::from(Prim::Int), Core::Int));
-    assert!(matches!(Core::from(Prim::Real), Core::Real));
-    assert!(matches!(Core::from(Prim::String), Core::String));
-    assert!(matches!(Core::from(Prim::Boolean), Core::Boolean));
+    assert!(matches!(Ty::from(Prim::Nat), Ty::Nat));
+    assert!(matches!(Ty::from(Prim::Int), Ty::Int));
+    assert!(matches!(Ty::from(Prim::Real), Ty::Real));
+    assert!(matches!(Ty::from(Prim::String), Ty::String));
+    assert!(matches!(Ty::from(Prim::Boolean), Ty::Boolean));
 }
 
 /// Unit is one type with one spelling. A second way to build it would be a
@@ -65,16 +65,22 @@ fn distinct_primitives_are_spelled_differently() {
 #[test]
 fn each_empty_type_has_one_constructor() {
     let unit = Ty::unit();
-    assert!(matches!(unit.core, Core::Unit));
-    assert!(unit.fields.is_empty());
+    assert!(matches!(
+        unit,
+        Ty::Struct(Row {
+            rest: Rest::Closed,
+            ..
+        })
+    ));
+    assert!(matches!(&unit, Ty::Struct(row) if row.labels.is_empty()));
     assert_eq!(unit.to_string(), "{}");
     // The default type is the undecided one, which is what a term that has not
     // been inferred yet carries.
-    assert!(matches!(Ty::default().core, Core::Undecided));
+    assert!(matches!(Ty::default(), Ty::Undecided));
 
     // And a plain core is that core carrying nothing, which is every type the
     // language can currently write.
-    assert!(Ty::plain(Core::Nat).fields.is_empty());
+    assert!(matches!(Ty::plain(Ty::Nat), Ty::Nat));
 }
 
 /// A type is a core and the labels it carries, and the labels have no tail of
@@ -82,23 +88,18 @@ fn each_empty_type_has_one_constructor() {
 /// beside them. So `{ x: Nat }` is unit with an `x`, `{ x: Nat, .. }` is a
 /// variable with an `x`, and `Nat` with an `x` is a closed type with a field.
 #[test]
-fn a_type_is_a_core_and_the_labels_it_carries() {
-    let carrying = |core| Ty {
-        core,
-        fields: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
+fn only_struct_types_carry_fields() {
+    let ty = Ty::Struct(Row {
+        labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
             .into_iter()
             .collect(),
-    };
-    assert_eq!(carrying(Core::Unit).to_string(), "{ x: {} }");
-    assert_eq!(carrying(Core::Var(3)).to_string(), "{ x: {}, ..?3 }");
-    assert_eq!(carrying(Core::Nat).to_string(), "Nat with { x: {} }");
-    // And the labels are a bare map: there is no second place for a `..` to
-    // live, so nothing can say the same thing twice.
-    assert_eq!(carrying(Core::Unit).fields.len(), 1);
+        rest: Rest::Var(3),
+    });
+    assert_eq!(ty.to_string(), "{ x: {}, ..?3 }");
 }
 
 /// [`Row`] and [`Rest`] survive for a sum's cases and reach nothing else: the
-/// only place one is written into a type is inside [`Core::Sum`].
+/// only place one is written into a type is inside [`Ty::Sum`].
 #[test]
 fn a_row_is_reachable_only_through_a_sum() {
     let cases = Row {
@@ -107,14 +108,14 @@ fn a_row_is_reachable_only_through_a_sum() {
             .collect(),
         rest: Rest::Var(2),
     };
-    let sum = Ty::plain(Core::Sum(cases));
+    let sum = Ty::plain(Ty::Sum(cases));
     assert_eq!(sum.to_string(), "#A | ..?2");
     assert_eq!(sum.cases().labels.len(), 1);
 
     // Everything else allows no case it has not been shown, which it says as
     // the undecided tail an erased argument has always left behind — never as a
     // closed one, which would be a claim nobody made.
-    for ty in [Ty::unit(), Ty::plain(Core::Nat), Ty::default()] {
+    for ty in [Ty::unit(), Ty::plain(Ty::Nat), Ty::default()] {
         let cases = ty.cases();
         assert!(cases.labels.is_empty());
         assert!(matches!(cases.rest, Rest::Undecided), "{cases:?}");
@@ -126,7 +127,7 @@ fn a_row_is_reachable_only_through_a_sum() {
 /// rather than with a rule for something nobody can write.
 #[test]
 fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
-    let nat = Assigned::Ty(Rc::new(Ty::plain(Core::Nat)));
+    let nat = Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)));
     let row = Assigned::Row(Rc::new(Row {
         labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
             .into_iter()
@@ -143,14 +144,14 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
     // A type at a row or a presence position is read for what it carries: the
     // cases it allows, and — for a bare variable, which is what instantiating a
     // scheme hands over — the variable itself.
-    let fresh = Assigned::Ty(Rc::new(Ty::plain(Core::Var(7))));
+    let fresh = Assigned::Ty(Rc::new(Ty::plain(Ty::Var(7))));
     assert!(matches!(fresh.as_row().rest, Rest::Var(7)));
     assert!(matches!(nat.as_row().rest, Rest::Undecided));
 
     // And the pairs no position can produce say nothing rather than inventing
     // an answer.
-    assert!(matches!(row.as_ty().core, Core::Undecided));
-    assert!(matches!(presence.as_ty().core, Core::Undecided));
+    assert!(matches!(&*row.as_ty(), Ty::Undecided));
+    assert!(matches!(&*presence.as_ty(), Ty::Undecided));
     assert!(matches!(presence.as_row().rest, Rest::Closed));
 }
 
@@ -161,15 +162,15 @@ fn an_assigned_value_reads_as_the_sort_its_position_asks_for() {
 #[test]
 fn a_value_can_name_a_variable_and_a_nothing_of_its_own_sort() {
     let cases = [
-        Assigned::Ty(Rc::new(Ty::plain(Core::Nat))),
+        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
         Assigned::Row(Rc::new(Row::closed())),
         Assigned::Presence(Presence::Present),
     ];
     for value in &cases {
         match (value.variable(3), value.undecided(), value) {
             (Assigned::Ty(var), Assigned::Ty(nothing), Assigned::Ty(_)) => {
-                assert!(matches!(var.core, Core::Var(3)));
-                assert!(matches!(nothing.core, Core::Undecided));
+                assert!(matches!(&*var, Ty::Var(3)));
+                assert!(matches!(&*nothing, Ty::Undecided));
             }
             (Assigned::Row(var), Assigned::Row(nothing), Assigned::Row(_)) => {
                 assert!(matches!(var.rest, Rest::Var(3)));
@@ -201,12 +202,12 @@ fn a_parameter_says_what_an_argument_has_to_be() {
     let lacks: indexmap::IndexSet<String> = ["x".to_string()].into_iter().collect();
     // A struct's `..'r` is a type parameter with fields it may not name, which is
     // why `WithX Nat` is well-formed and `WithX { x: Nat }` is not.
-    let fielded = ParamKind::Type {
+    let fielded = ParamKind::Fields {
         lacks: lacks.clone(),
     };
-    assert_eq!(fielded.sense(), Sense::Type);
+    assert_eq!(fielded.sense(), Sense::Fields);
     assert_eq!(fielded.lacks(), &lacks);
-    assert_eq!(fielded.row(), None);
+    assert_eq!(fielded.row(), Some((Shape::Struct, &lacks)));
 
     let cases = ParamKind::Cases {
         lacks: lacks.clone(),
@@ -221,7 +222,7 @@ fn a_parameter_says_what_an_argument_has_to_be() {
 /// one case — cannot disagree about what "there" is.
 #[test]
 fn a_written_label_is_present() {
-    let field = RowField::present(Rc::new(Ty::plain(Core::Nat)));
+    let field = RowField::present(Rc::new(Ty::plain(Ty::Nat)));
     assert!(matches!(field.presence, Presence::Present));
     assert_eq!(field.ty.to_string(), "Nat");
 }
@@ -231,7 +232,7 @@ fn a_written_label_is_present() {
 #[test]
 fn a_primitive_lowers_to_its_core() {
     for &prim in Prim::ALL {
-        let core: Core = prim.into();
+        let core: Ty = prim.into();
         assert_eq!(core.to_string(), prim.name());
     }
 }
@@ -315,18 +316,18 @@ fn opening_a_formula_substitutes_what_was_minted() {
 /// the printer writes as nothing at all.
 #[test]
 fn an_arrow_carries_the_effects_calling_it_may_perform() {
-    let nat = || Rc::new(Ty::plain(Core::Nat));
+    let nat = || Rc::new(Ty::plain(Ty::Nat));
     // The constructor every position with no effects to put on an arrow goes
     // through, so the empty row is one value rather than six literals.
-    let pure = Ty::plain(Core::pure(nat(), nat()));
+    let pure = Ty::plain(Ty::pure(nat(), nat()));
     assert_eq!(pure.to_string(), "Nat -> Nat");
-    let Core::Arrow(_, _, effects) = &pure.core else {
+    let Ty::Arrow(_, _, effects) = &pure else {
         panic!("expected an arrow");
     };
     assert!(effects.labels.is_empty());
     assert!(matches!(effects.rest, Rest::Closed));
 
-    let performing = Ty::plain(Core::Arrow(
+    let performing = Ty::plain(Ty::Arrow(
         nat(),
         nat(),
         Row {
@@ -374,7 +375,7 @@ fn a_parameter_may_stand_for_an_arrows_effects() {
 fn a_scheme_numbers_every_sort_in_one_space() {
     // A declaration's scheme quantifies its parameters and requires nothing, so
     // it has no presences and its count is the whole of it.
-    let body = Rc::new(Ty::plain(Core::Bound(1)));
+    let body = Rc::new(Ty::plain(Ty::Bound(1)));
     let declaration = Scheme::new(2, body.clone());
     assert_eq!(declaration.count(), 2);
     assert_eq!(declaration.presences(), 0);
@@ -386,15 +387,15 @@ fn a_scheme_numbers_every_sort_in_one_space() {
         "x".to_string(),
         RowField {
             presence: Presence::Bound(0),
-            ty: Rc::new(Ty::plain(Core::Bound(1))),
+            ty: Rc::new(Ty::plain(Ty::Bound(1))),
         },
     )]
     .into_iter()
     .collect();
-    let body = Rc::new(Ty {
-        core: Core::Bound(2),
-        fields,
-    });
+    let body = Rc::new(Ty::Struct(Row {
+        labels: fields,
+        rest: Rest::Bound(2),
+    }));
     let scheme = Scheme::constrained(3, 1, body, Formula::bound(0));
     assert_eq!(scheme.count(), 3);
     assert_eq!(scheme.presences(), 1);
@@ -403,7 +404,7 @@ fn a_scheme_numbers_every_sort_in_one_space() {
     // a presence, and the rest are types.
     let fresh = [
         Assigned::Presence(Presence::Var(7)),
-        Assigned::Ty(Rc::new(Ty::plain(Core::Nat))),
+        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))),
         Assigned::Ty(Rc::new(Ty::unit())),
     ];
     let opened = scheme.body().open(&fresh);
@@ -418,7 +419,7 @@ fn a_scheme_numbers_every_sort_in_one_space() {
 #[test]
 fn a_value_of_the_wrong_sort_opens_to_nothing() {
     assert_eq!(
-        Assigned::Ty(Rc::new(Ty::plain(Core::Nat))).presence(),
+        Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))).presence(),
         Presence::Undecided
     );
     assert_eq!(
@@ -432,24 +433,24 @@ fn a_value_of_the_wrong_sort_opens_to_nothing() {
 }
 
 /// A rigid is a leaf: it is not opened, because nothing supplies a value for
-/// one. What a scheme quantified is a [`Core::Bound`], and a rigid is what an
+/// one. What a scheme quantified is a [`Ty::Bound`], and a rigid is what an
 /// annotation's own variable stands for while its body is being checked.
 #[test]
 fn a_rigid_is_a_leaf_that_opening_leaves_alone() {
-    let rigid = Rc::new(Ty::plain(Core::Rigid {
+    let rigid = Rc::new(Ty::plain(Ty::Rigid {
         id: 4,
         name: "r".into(),
     }));
-    let opened = rigid.open(&[Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))]);
-    assert!(matches!(opened.core, Core::Rigid { id: 4, .. }));
+    let opened = rigid.open(&[Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))]);
+    assert!(matches!(&*opened, Ty::Rigid { id: 4, .. }));
 
     // A sum's rest goes the same way, and prints as its name either side of
     // the substitution.
-    let cases = Rc::new(Ty::plain(Core::Sum(Row::of(Rest::Rigid {
+    let cases = Rc::new(Ty::plain(Ty::Sum(Row::of(Rest::Rigid {
         id: 5,
         name: "s".into(),
     }))));
     assert_eq!(cases.to_string(), "| ..'s");
-    let opened = cases.open(&[Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))]);
+    let opened = cases.open(&[Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))]);
     assert_eq!(opened.to_string(), "| ..'s");
 }

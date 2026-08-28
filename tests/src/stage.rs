@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 use ruddy::{
     artifact::{Artifact, Dependency, Header, Identity, Lir},
-    types::Core,
+    types::Ty,
 };
 use ruddy_debug::{
     snapshot::{ROOT, compile},
@@ -55,7 +55,7 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     assert_eq!(pattern, r"\B\?\d*");
 
     // `\?\d*`: a `?`, then digits — of which a bare `?` is the empty case.
-    for (ty, tail) in [(Core::Var(4), "4"), (Core::Undecided, "")] {
+    for (ty, tail) in [(Ty::Var(4), "4"), (Ty::Undecided, "")] {
         let printed = ty.to_string();
         assert_eq!(printed, format!("?{tail}"));
         assert!(tail.chars().all(|c| c.is_ascii_digit()), "{printed}");
@@ -66,7 +66,7 @@ fn the_type_tabs_declare_how_a_variable_is_spelled() {
     // light every annotation on the page. The sigil is what says which letters
     // a scheme quantifies, so nothing else has to.
     for index in [0, 25, 26] {
-        let printed = Core::Bound(index).to_string();
+        let printed = Ty::Bound(index).to_string();
         let mut chars = printed.chars();
         assert_eq!(chars.next(), Some('\''), "{printed}");
         assert!(

@@ -178,23 +178,17 @@ pub struct Scheme {
     pub body: Type,
 }
 
-/// A normalized semantic type, independent of compiler symbols and spans.
+/// A normalized semantic type. Structural fields are representable only by
+/// the `Struct` constructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Type {
-    pub core: Core,
-    pub fields: Vec<(String, RowField)>,
-}
-
-/// A type's core, before its structural fields are laid over it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Core {
-    Unit,
+pub enum Type {
     Nat,
     Int,
     Real,
     String,
     Boolean,
     Arrow(Box<Type>, Box<Type>, Row),
+    Struct(Row),
     Sum(Row),
     Var(u32),
     Bound(u32),
@@ -640,37 +634,30 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
 }
 
 fn ty(mint: &Mint, value: &types::Ty) -> Type {
-    Type {
-        core: match &value.core {
-            types::Core::Unit => Core::Unit,
-            types::Core::Nat => Core::Nat,
-            types::Core::Int => Core::Int,
-            types::Core::Real => Core::Real,
-            types::Core::String => Core::String,
-            types::Core::Boolean => Core::Boolean,
-            types::Core::Arrow(from, to, effects) => Core::Arrow(
-                Box::new(ty(mint, from)),
-                Box::new(ty(mint, to)),
-                row(mint, effects),
-            ),
-            types::Core::Sum(row_) => Core::Sum(row(mint, row_)),
-            types::Core::Var(value) => Core::Var(*value),
-            types::Core::Bound(value) => Core::Bound(*value),
-            types::Core::Rigid { id, name } => Core::Rigid {
-                id: *id,
-                name: name.to_string(),
-            },
-            types::Core::Named { symbol, args, .. } => Core::Named {
-                name: qualified(mint, *symbol),
-                args: args.iter().map(|arg| ty(mint, arg)).collect(),
-            },
-            types::Core::Undecided => Core::Undecided,
+    match value {
+        types::Ty::Nat => Type::Nat,
+        types::Ty::Int => Type::Int,
+        types::Ty::Real => Type::Real,
+        types::Ty::String => Type::String,
+        types::Ty::Boolean => Type::Boolean,
+        types::Ty::Arrow(from, to, effects) => Type::Arrow(
+            Box::new(ty(mint, from)),
+            Box::new(ty(mint, to)),
+            row(mint, effects),
+        ),
+        types::Ty::Struct(row_) => Type::Struct(row(mint, row_)),
+        types::Ty::Sum(row_) => Type::Sum(row(mint, row_)),
+        types::Ty::Var(value) => Type::Var(*value),
+        types::Ty::Bound(value) => Type::Bound(*value),
+        types::Ty::Rigid { id, name } => Type::Rigid {
+            id: *id,
+            name: name.to_string(),
         },
-        fields: value
-            .fields
-            .iter()
-            .map(|(name, field)| (name.clone(), row_field(mint, field)))
-            .collect(),
+        types::Ty::Named { symbol, args, .. } => Type::Named {
+            name: qualified(mint, *symbol),
+            args: args.iter().map(|arg| ty(mint, arg)).collect(),
+        },
+        types::Ty::Undecided => Type::Undecided,
     }
 }
 
@@ -1127,40 +1114,27 @@ pub mod text {
         ])
     }
     fn ty(value: &Type) -> S {
-        L(vec![
-            A("ty".into()),
-            core(&value.core),
-            L(std::iter::once(A("fields".into()))
-                .chain(
-                    value
-                        .fields
-                        .iter()
-                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
-                )
-                .collect()),
-        ])
-    }
-    fn core(value: &Core) -> S {
-        match value {
-            Core::Unit => A("unit".into()),
-            Core::Nat => A("nat".into()),
-            Core::Int => A("int".into()),
-            Core::Real => A("real".into()),
-            Core::String => A("string".into()),
-            Core::Boolean => A("boolean".into()),
-            Core::Arrow(from, to, row_) => L(vec![A("arrow".into()), ty(from), ty(to), row(row_)]),
-            Core::Sum(row_) => L(vec![A("sum".into()), row(row_)]),
-            Core::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Core::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Core::Rigid { id, name } => {
+        let value = match value {
+            Type::Nat => A("nat".into()),
+            Type::Int => A("int".into()),
+            Type::Real => A("real".into()),
+            Type::String => A("string".into()),
+            Type::Boolean => A("boolean".into()),
+            Type::Arrow(from, to, row_) => L(vec![A("arrow".into()), ty(from), ty(to), row(row_)]),
+            Type::Struct(row_) => L(vec![A("struct".into()), row(row_)]),
+            Type::Sum(row_) => L(vec![A("sum".into()), row(row_)]),
+            Type::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
+            Type::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
+            Type::Rigid { id, name } => {
                 L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
             }
-            Core::Named { name, args } => L(std::iter::once(A("named".into()))
+            Type::Named { name, args } => L(std::iter::once(A("named".into()))
                 .chain(std::iter::once(Q(name.clone())))
                 .chain(args.iter().map(ty))
                 .collect()),
-            Core::Undecided => A("undecided".into()),
-        }
+            Type::Undecided => A("undecided".into()),
+        };
+        L(vec![A("ty".into()), value])
     }
     fn row(value: &Row) -> S {
         L(vec![
@@ -1657,30 +1631,26 @@ pub mod text {
             let mut pending = vec![Semantic::Ty(ty)];
             while let Some(value) = pending.pop() {
                 match value {
-                    Semantic::Ty(Type { core, fields }) => {
-                        pending.extend(fields.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
-                        match core {
-                            Core::Arrow(from, to, effects) => {
-                                pending.push(Semantic::Ty(*from));
-                                pending.push(Semantic::Ty(*to));
-                                pending.push(Semantic::Row(effects));
-                            }
-                            Core::Sum(row) => pending.push(Semantic::Row(row)),
-                            Core::Named { args, .. } => {
-                                pending.extend(args.into_iter().map(Semantic::Ty));
-                            }
-                            Core::Unit
-                            | Core::Nat
-                            | Core::Int
-                            | Core::Real
-                            | Core::String
-                            | Core::Boolean
-                            | Core::Var(_)
-                            | Core::Bound(_)
-                            | Core::Rigid { .. }
-                            | Core::Undecided => {}
+                    Semantic::Ty(ty) => match ty {
+                        Type::Arrow(from, to, effects) => {
+                            pending.push(Semantic::Ty(*from));
+                            pending.push(Semantic::Ty(*to));
+                            pending.push(Semantic::Row(effects));
                         }
-                    }
+                        Type::Struct(row) | Type::Sum(row) => pending.push(Semantic::Row(row)),
+                        Type::Named { args, .. } => {
+                            pending.extend(args.into_iter().map(Semantic::Ty))
+                        }
+                        Type::Nat
+                        | Type::Int
+                        | Type::Real
+                        | Type::String
+                        | Type::Boolean
+                        | Type::Var(_)
+                        | Type::Bound(_)
+                        | Type::Rigid { .. }
+                        | Type::Undecided => {}
+                    },
                     Semantic::Row(Row { labels, rest }) => {
                         pending.extend(labels.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
                         if let Rest::More(row) = rest {
@@ -2023,12 +1993,11 @@ pub mod text {
         fn read_ty(&self, value: S) -> Type {
             enum Task {
                 Ty(S),
-                Core(S),
                 Row(S),
                 Rest(S),
                 Field(S),
-                BuildTy { fields: Vec<String> },
                 BuildArrow,
+                BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
                 BuildRow { labels: Vec<String> },
@@ -2036,93 +2005,75 @@ pub mod text {
                 BuildField(Presence),
             }
             let mut tasks = vec![Task::Ty(value)];
-            // Each task has one statically known result sort. Keep those sorts
-            // on separate stacks so an impossible internal mismatch is not
-            // modeled as malformed artifact input with a semantic fallback.
-            let mut tys = Vec::new();
-            let mut cores = Vec::new();
-            let mut rows = Vec::new();
-            let mut rests = Vec::new();
-            let mut fields_out = Vec::new();
+            let (mut tys, mut rows, mut rests, mut fields_out) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             while let Some(task) = tasks.pop() {
                 match task {
                     Task::Ty(value) => {
-                        let mut values = self.exact(self.list(value, "ty"), 2, "ty");
-                        let core = self.take(&mut values);
-                        let fields = self.many(self.take(&mut values), "fields");
-                        let mut names = Vec::with_capacity(fields.len());
-                        let mut field_values = Vec::with_capacity(fields.len());
-                        for field in fields {
-                            let values = list_contents(field)
-                                .unwrap_or_else(|| self.invalid("bad type field", Vec::new()));
-                            let mut values = self.exact(values, 2, "type field");
-                            names.push(self.string(self.take(&mut values)));
-                            field_values.push(self.take(&mut values));
-                        }
-                        tasks.push(Task::BuildTy { fields: names });
-                        for value in field_values.into_iter().rev() {
-                            tasks.push(Task::Field(value));
-                        }
-                        tasks.push(Task::Core(core));
-                    }
-                    Task::Core(mut value) => match &mut value {
-                        A(value) => cores.push(match value.as_str() {
-                            "unit" => Core::Unit,
-                            "nat" => Core::Nat,
-                            "int" => Core::Int,
-                            "real" => Core::Real,
-                            "string" => Core::String,
-                            "boolean" => Core::Boolean,
-                            "undecided" => Core::Undecided,
-                            _ => self.invalid("invalid type core", Core::Undecided),
-                        }),
-                        L(values) => {
-                            let mut values = std::mem::take(values);
-                            let tag = self.atom(self.take(&mut values));
-                            match tag.as_str() {
-                                "arrow" => {
-                                    let mut values = self.exact(values, 3, "arrow");
-                                    let from = self.take(&mut values);
-                                    let to = self.take(&mut values);
-                                    let effects = self.take(&mut values);
-                                    tasks.push(Task::BuildArrow);
-                                    tasks.push(Task::Row(effects));
-                                    tasks.push(Task::Ty(to));
-                                    tasks.push(Task::Ty(from));
-                                }
-                                "sum" => {
-                                    let value = self.exact(values, 1, "sum").remove(0);
-                                    tasks.push(Task::BuildSum);
-                                    tasks.push(Task::Row(value));
-                                }
-                                "var" => cores.push(Core::Var(
-                                    self.number(self.exact(values, 1, "var").remove(0)),
-                                )),
-                                "bound" => cores.push(Core::Bound(
-                                    self.number(self.exact(values, 1, "bound").remove(0)),
-                                )),
-                                "rigid" => {
-                                    let mut values = self.exact(values, 2, "rigid");
-                                    let id = self.number(self.take(&mut values));
-                                    let name = self.string(self.take(&mut values));
-                                    cores.push(Core::Rigid { id, name });
-                                }
-                                "named" => {
-                                    if values.is_empty() {
-                                        self.fail("named type is missing name");
+                        let mut wrapper = self.exact(self.list(value, "ty"), 1, "ty");
+                        let mut value = self.take(&mut wrapper);
+                        match &mut value {
+                            A(value) => tys.push(match value.as_str() {
+                                "nat" => Type::Nat,
+                                "int" => Type::Int,
+                                "real" => Type::Real,
+                                "string" => Type::String,
+                                "boolean" => Type::Boolean,
+                                "undecided" => Type::Undecided,
+                                _ => self.invalid("invalid type", Type::Undecided),
+                            }),
+                            L(values) => {
+                                let mut values = std::mem::take(values);
+                                match self.atom(self.take(&mut values)).as_str() {
+                                    "arrow" => {
+                                        let mut values = self.exact(values, 3, "arrow");
+                                        let from = self.take(&mut values);
+                                        let to = self.take(&mut values);
+                                        let effects = self.take(&mut values);
+                                        tasks.push(Task::BuildArrow);
+                                        tasks.push(Task::Row(effects));
+                                        tasks.push(Task::Ty(to));
+                                        tasks.push(Task::Ty(from));
                                     }
-                                    let name = self.string(self.take(&mut values));
-                                    let count = values.len();
-                                    tasks.push(Task::BuildNamed { name, count });
-                                    for value in values.into_iter().rev() {
-                                        tasks.push(Task::Ty(value));
+                                    "struct" => {
+                                        let row = self.exact(values, 1, "struct").remove(0);
+                                        tasks.push(Task::BuildStruct);
+                                        tasks.push(Task::Row(row));
                                     }
+                                    "sum" => {
+                                        let row = self.exact(values, 1, "sum").remove(0);
+                                        tasks.push(Task::BuildSum);
+                                        tasks.push(Task::Row(row));
+                                    }
+                                    "var" => tys.push(Type::Var(
+                                        self.number(self.exact(values, 1, "var").remove(0)),
+                                    )),
+                                    "bound" => tys.push(Type::Bound(
+                                        self.number(self.exact(values, 1, "bound").remove(0)),
+                                    )),
+                                    "rigid" => {
+                                        let mut values = self.exact(values, 2, "rigid");
+                                        let id = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        tys.push(Type::Rigid { id, name });
+                                    }
+                                    "named" => {
+                                        if values.is_empty() {
+                                            self.fail("named type is missing name");
+                                        }
+                                        let name = self.string(self.take(&mut values));
+                                        let count = values.len();
+                                        tasks.push(Task::BuildNamed { name, count });
+                                        for value in values.into_iter().rev() {
+                                            tasks.push(Task::Ty(value));
+                                        }
+                                    }
+                                    _ => tys.push(self.invalid("invalid type", Type::Undecided)),
                                 }
-                                _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
                             }
+                            _ => tys.push(self.invalid("invalid type", Type::Undecided)),
                         }
-                        _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
-                    },
+                    }
                     Task::Row(value) => {
                         let mut values = self.exact(self.list(value, "row"), 2, "row");
                         let labels = self.many(self.take(&mut values), "labels");
@@ -2178,35 +2129,30 @@ pub mod text {
                         tasks.push(Task::Ty(ty));
                     }
                     Task::BuildField(presence) => {
-                        let ty = tys.pop().expect("a field task produces a type");
+                        let ty = tys.pop().expect("field type");
                         fields_out.push(RowField { presence, ty });
                     }
-                    Task::BuildTy { fields } => {
-                        let split = fields_out.len() - fields.len();
-                        let decoded = fields_out.split_off(split);
-                        let core = cores.pop().expect("a type task produces a core");
-                        tys.push(Type {
-                            core,
-                            fields: fields.into_iter().zip(decoded).collect(),
-                        });
-                    }
                     Task::BuildArrow => {
-                        let effects = rows.pop().expect("an arrow task produces an effects row");
-                        let to = tys.pop().expect("an arrow task produces a result type");
-                        let from = tys.pop().expect("an arrow task produces an argument type");
-                        cores.push(Core::Arrow(Box::new(from), Box::new(to), effects));
+                        let effects = rows.pop().expect("effects");
+                        let to = tys.pop().expect("to");
+                        let from = tys.pop().expect("from");
+                        tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+                    }
+                    Task::BuildStruct => {
+                        let row = rows.pop().expect("struct row");
+                        tys.push(Type::Struct(row));
                     }
                     Task::BuildSum => {
-                        let row = rows.pop().expect("a sum task produces a row");
-                        cores.push(Core::Sum(row));
+                        let row = rows.pop().expect("sum row");
+                        tys.push(Type::Sum(row));
                     }
                     Task::BuildNamed { name, count } => {
                         let split = tys.len() - count;
                         let args = tys.split_off(split);
-                        cores.push(Core::Named { name, args });
+                        tys.push(Type::Named { name, args });
                     }
                     Task::BuildRow { labels } => {
-                        let rest = rests.pop().expect("a row task produces a rest");
+                        let rest = rests.pop().expect("rest");
                         let split = fields_out.len() - labels.len();
                         let fields = fields_out.split_off(split);
                         rows.push(Row {
@@ -2215,12 +2161,12 @@ pub mod text {
                         });
                     }
                     Task::BuildMore => {
-                        let row = rows.pop().expect("a more task produces a row");
+                        let row = rows.pop().expect("more row");
                         rests.push(Rest::More(Box::new(row)));
                     }
                 }
             }
-            tys.pop().expect("the root type task produces a type")
+            tys.pop().expect("root type")
         }
         fn read_presence(&self, mut value: S) -> Presence {
             match &mut value {

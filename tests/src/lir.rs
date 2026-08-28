@@ -7,7 +7,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
-    types::{Formula, Presence},
+    types::{Formula, Presence, Ty},
 };
 use ruddy_debug::print;
 
@@ -498,8 +498,10 @@ fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Pr
     let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
         panic!("the fixture function immediately matches")
     };
-    Rc::make_mut(&mut scrutinee.ty)
-        .fields
+    let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+        panic!("struct scrutinee")
+    };
+    row.labels
         .get_mut(field)
         .expect("the scrutinee type names the tested field")
         .presence = presence;
@@ -544,7 +546,7 @@ fn an_exact_pattern_over_an_open_type_tests_the_rest() {
             "let f = fn s => match s with | {x} => 1n | {x, ..} => 2n end",
             "fn f("
         ),
-        "fn f(%0: any):\n\
+        "fn f(%0: struct):\n\
          \x20 %1: any = project %0, \"x\"\n\
          \x20 %4: nat = switch_rest %0, [\"x\"]:\n\
          \x20   none =>\n\
@@ -708,9 +710,12 @@ fn structurally_equivalent_handler_arms_build_one_complete_record() {
 fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
     let declaration = "effect Log = { write: Nat -> (), flush: () -> () }";
     let interface = local_effect_interface(declaration);
-    let plain = |core| a::Type {
-        core,
-        fields: Vec::new(),
+    let plain = |ty| ty;
+    let unit = || {
+        a::Type::Struct(a::Row {
+            labels: Vec::new(),
+            rest: a::Rest::Closed,
+        })
     };
     let dependency = a::Artifact {
         header: a::Header {
@@ -730,13 +735,13 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
                 kind: a::EffectKind::Operations(vec![
                     a::Operation {
                         selector: a::OperationSelector::Named("write".into()),
-                        from: plain(a::Core::Nat),
-                        to: plain(a::Core::Unit),
+                        from: plain(a::Type::Nat),
+                        to: unit(),
                     },
                     a::Operation {
                         selector: a::OperationSelector::Named("flush".into()),
-                        from: plain(a::Core::Unit),
-                        to: plain(a::Core::Unit),
+                        from: unit(),
+                        to: unit(),
                     },
                 ]),
             }],
@@ -1052,7 +1057,7 @@ fn an_open_pattern_says_nothing_about_a_field_it_omits() {
             "let f = fn s => match s with | {x, ..} => 1n | {y} => 2n | _ => 3n end",
             "fn f("
         ),
-        "fn f(%0: any):\n\
+        "fn f(%0: struct):\n\
          \x20 %9: nat = switch_presence %0, \"x\":\n\
          \x20   present =>\n\
          \x20     %1: any = project %0, \"x\"\n\

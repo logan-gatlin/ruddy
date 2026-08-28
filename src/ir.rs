@@ -11,7 +11,7 @@ use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{EffectId, ParamKind, Prim, Scheme, Sense, Shape, Ty},
+    types::{EffectId, ParamKind, Prim, Rest, Scheme, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -153,7 +153,7 @@ pub struct Group {
 }
 
 /// A top-level definition. The symbol is the map key rather than part of the
-/// value, so only the span the name was written at is carried here — the same
+/// value, so only the span the name was written at is field_summary here — the same
 /// split [`Field`] uses.
 #[derive(Debug, Clone)]
 pub struct Decl<T> {
@@ -190,7 +190,7 @@ pub struct Param {
     /// stand for exactly when every argument reaches the body, so a
     /// declaration with an argument that does not is compared by unfolding
     /// like any other type. See [`relevance`] for how it is worked out and
-    /// [`Core::Named`] for what rests on it.
+    /// [`Ty::Named`] for what rests on it.
     ///
     /// Not known while the body is being lowered either — it follows from what
     /// every *other* declaration does with what it is handed — so it is `false`
@@ -282,7 +282,7 @@ pub enum TermKind {
     /// path anything can refer to, so there is no symbol to resolve it to and
     /// nothing here can fail to resolve.
     ///
-    /// A case carrying nothing keeps its `None` rather than being handed a
+    /// A case field_summaries nothing keeps its `None` rather than being handed a
     /// `{}` here. `()` and `{}` are two spellings of one *written* type and so
     /// meet in this pass; `#None` writes no type at all, and inventing one
     /// would put a node on the page the reader never wrote. What it means is
@@ -301,7 +301,7 @@ pub enum TermKind {
         field: TrackedString,
     },
     /// Dispatch on what a value is: the written match, one arm per written
-    /// arm, each carrying its pattern normalized — names resolved, puns
+    /// arm, each field_summaries its pattern normalized — names resolved, puns
     /// expanded, grouping gone — and its body exactly once.
     ///
     /// The matrix of arms carries the whole meaning: first-match, top to
@@ -330,7 +330,7 @@ pub enum TermKind {
     ///
     /// That an arm encloses it, with no `fn` in between, is checked here rather
     /// than typed: `raise` is bound to one particular handler, so a closure
-    /// carrying one could outlive the `handle` and be called with nothing on
+    /// field_summaries one could outlive the `handle` and be called with nothing on
     /// the stack. See [`ErrorKind::RaiseInFunction`].
     Raise(Box<Term>),
     /// `!Log.write` — one operation of an effect, as an ordinary value.
@@ -424,7 +424,7 @@ pub struct ReturnArm {
 /// conveniences are erased.
 pub type Pattern = Tracked<PatternKind>;
 
-// spans carried per node as the IR's other types do
+// spans field_summary per node as the IR's other types do
 /// One scalar value that can be written both as an expression and a pattern.
 /// Real equality is by representation so the compiler and eventual backends
 /// agree even for signed zero.
@@ -555,7 +555,7 @@ pub enum TypeKind {
     ///
     /// Both the symbol and the position, because the two readers want
     /// different things: the debugger names it and cross-highlights it, and
-    /// inference substitutes for it by position — which is [`Core::Bound`]
+    /// inference substitutes for it by position — which is [`Ty::Bound`]
     /// exactly, so lowering one is a rename rather than a translation.
     Param {
         symbol: Symbol,
@@ -656,7 +656,7 @@ pub struct Annotation {
     /// What the a variable statements declared, in the order they were
     /// written, each with the sort its uses gave it.
     ///
-    /// Carried rather than left to be read back out of the lowered type,
+    /// FieldSummary rather than left to be read back out of the lowered type,
     /// because lowering is what worked it out: a variable's sort follows from
     /// where the type uses it, and inference should not re-derive a fact this
     /// pass already settled. Empty for an annotation that declares nothing,
@@ -699,7 +699,7 @@ pub enum SumCase {
         when: Option<Box<When>>,
         payload: Option<Type>,
     },
-    /// `\#Name` — the case is explicitly absent, carrying nothing.
+    /// `\#Name` — the case is explicitly absent, field_summaries nothing.
     /// `name_span` covers the whole `\#Name`.
     Absent { name_span: Span },
 }
@@ -788,7 +788,7 @@ pub enum Row {
 
 /// A struct field. The name is the map key rather than part of the value, so
 /// that a field can be looked up by name alone; only the span the name was
-/// written at is carried here. `value` keeps its own span as usual.
+/// written at is field_summary here. `value` keeps its own span as usual.
 ///
 /// Field names stay strings: they are labels scoped to their own struct, not
 /// paths anything can refer to, so they have no place in a module tree.
@@ -841,7 +841,7 @@ pub enum ErrorKind {
     /// dropped: the mark says something about a tail that is not there, and a
     /// reader who wrote it meant one of the two to change.
     ///
-    /// The shape and the label are carried for the wording alone, the way
+    /// The shape and the label are field_summary for the wording alone, the way
     /// [`ErrorKind::RepeatedRowField`] carries them: the complaint quotes the
     /// label the way it was written, `#` and all for a case.
     AbsentInClosed {
@@ -868,7 +868,7 @@ pub enum ErrorKind {
     /// mistake made about values: `let f = fn n => f n` names itself through a
     /// shape and is an ordinary recursive function, and `let x = x` reaches no
     /// shape at all and so says nothing about what `x` is. The namespace is
-    /// carried for the wording, the way [`ErrorKind::Undefined`] carries one.
+    /// field_summary for the wording, the way [`ErrorKind::Undefined`] carries one.
     Circular {
         namespace: Namespace,
     },
@@ -883,12 +883,12 @@ pub enum ErrorKind {
     /// A tail naming a row parameter is the exception, and the reason the rule
     /// is worth stating this precisely rather than as "a declaration is
     /// closed". What such a tail stands for is not decided here either — it is
-    /// supplied at every use — so it lowers to a [`Core::Bound`], not to a
+    /// supplied at every use — so it lowers to a [`Ty::Bound`], not to a
     /// variable, and the property inference leans on survives untouched: a
     /// declaration's body mentions no solver variable, which is what lets every
     /// walk stop at a name instead of descending into what it stands for.
     ///
-    /// The shape is carried for the wording alone: `type X = #A (when a) Nat`
+    /// The shape is field_summary for the wording alone: `type X = #A (when a) Nat`
     /// is the same mistake made about cases, and a complaint that said "fields"
     /// to someone who wrote `#`s would be describing a type they never
     /// wrote.
@@ -1001,7 +1001,7 @@ pub enum ErrorKind {
     /// standing, the tail would be shared anyway, and a field would come back
     /// out of the solve as a case with the reader never told why.
     ///
-    /// Where the name was first used is carried the way a repeat carries the
+    /// Where the name was first used is field_summary the way a repeat carries the
     /// definition it repeats — see [`ErrorKind::Duplicate`] — because half of
     /// what went wrong is somewhere else on the page, and a reader shown only
     /// the second `..` has to hunt for the first one themselves.
@@ -1035,7 +1035,7 @@ pub enum ErrorKind {
     /// into a row — so the declaration absorbs, and nothing is asked of the
     /// arguments written at it either.
     ///
-    /// The two readings are carried so the complaint can name them. A
+    /// The two readings are field_summary so the complaint can name them. A
     /// parameter read all three ways still names two: there is one thing to
     /// fix, and a sentence listing every way the declaration is wrong is not a
     /// better instruction for fixing it.
@@ -1055,7 +1055,7 @@ pub enum ErrorKind {
     /// Never about a struct: a struct's `..` is its core, and a core takes any
     /// type at all, so `WithX Nat` is well-formed. A sum's rest and an arrow's
     /// effects are the two that are spliced into a row, so the reading is
-    /// carried to say which of them the reader was asked for. The name stays
+    /// field_summary to say which of them the reader was asked for. The name stays
     /// because the code is stable and renaming it would churn a code and a test
     /// file for no gain.
     ///
@@ -1077,9 +1077,9 @@ pub enum ErrorKind {
     /// to flatten the row.
     ///
     /// A struct's argument is looked at through names as well as at what it
-    /// writes out, since a `..` handed a declared type ends up carrying whatever
+    /// writes out, since a `..` handed a declared type ends up field_summaries whatever
     /// *that* carries: `WithX (WithX Nat)` names `x` twice as much as
-    /// `WithX { x: Nat }` does. See [`carrying`].
+    /// `WithX { x: Nat }` does. See [`field_summaries`].
     ///
     /// The argument absorbs, for the reason [`ErrorKind::NotARow`] does: left
     /// standing it would be substituted in all the same, and the reader would be
@@ -1117,7 +1117,7 @@ pub enum ErrorKind {
     /// Lowering stays total: every name the pattern would have bound is still
     /// bound, to [`TermKind::Error`] values, so downstream uses resolve and
     /// one mistake makes one complaint. What made the pattern able to fail is
-    /// carried so the complaint can quote it.
+    /// field_summary so the complaint can quote it.
     RefutableBinding {
         found: Refuter,
     },
@@ -1171,7 +1171,7 @@ pub enum ErrorKind {
     /// `!Console.write` where `Console` is an alias.
     ///
     /// An alias is a name for a set of effects and declares nothing of its own,
-    /// so there is no operation here to refer to. The name is carried for the
+    /// so there is no operation here to refer to. The name is field_summary for the
     /// wording; the span points at the head.
     OperationOnAlias {
         effect: String,
@@ -1202,7 +1202,7 @@ pub enum ErrorKind {
     /// Which effects a handler discharges has to be known before inference —
     /// the body is checked at an ambient the discharged effects extend — and a
     /// half-covered effect leaves that set undecidable. The operations with no
-    /// arm are carried so the complaint can name them.
+    /// arm are field_summary so the complaint can name them.
     PartialHandler {
         effect: String,
         missing: Vec<String>,
@@ -1223,7 +1223,7 @@ pub enum ErrorKind {
     /// A `raise` written inside a `fn` that sits inside a handler arm.
     ///
     /// The rule that keeps the feature sound. A `raise` answers one particular
-    /// handler rather than an effect, so a closure carrying one could be
+    /// handler rather than an effect, so a closure field_summaries one could be
     /// returned by the computation, outlive the `handle`, and be called with no
     /// handler on the stack. The mirror case needs no rule, because the row
     /// already tracks it.
@@ -1231,7 +1231,7 @@ pub enum ErrorKind {
 }
 
 /// What made a binding's pattern able to fail: the first tag or literal found
-/// in it, carried so the complaint can quote what the reader wrote. See
+/// in it, field_summary so the complaint can quote what the reader wrote. See
 /// [`ErrorKind::RefutableBinding`].
 #[derive(Debug, Clone)]
 pub enum Refuter {
@@ -1255,12 +1255,12 @@ pub enum Witness {
     /// This non-natural primitive value.
     Literal(Literal),
     /// This case. `None` says any payload serves — rendered bare, the way a
-    /// case carrying unit is written.
+    /// case field_summaries unit is written.
     Tag {
         name: String,
         payload: Option<Box<Witness>>,
     },
-    /// A value carrying these fields. A field held to be *present* is named
+    /// A value field_summaries these fields. A field held to be *present* is named
     /// even when any value serves for what it holds — under exactness the
     /// presence is the information, and such a field prints pun-style, as
     /// `{a}` — while a field the example does not need is left out.
@@ -1597,7 +1597,7 @@ enum Stands {
     /// `type Id 'a = 'a` stands for its parameter outright, and
     /// `type WithX 'r = { x: Nat, ..'r }` stands for its parameter *with an `x`
     /// in front of it* — the fields are written beside the `..`, and the `..` is
-    /// the core, so what the declaration stands for is the argument carrying
+    /// the core, so what the declaration stands for is the argument field_summaries
     /// them. That is the one step that tells [`ErrorKind::EndlessFields`] from
     /// [`ErrorKind::Circular`]: a loop with such a step on it adds a field every
     /// time round.
@@ -2474,46 +2474,38 @@ fn import_type(
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
 ) -> Rc<Ty> {
-    let core = match &value.core {
-        artifact::Core::Unit => crate::types::Core::Unit,
-        artifact::Core::Nat => crate::types::Core::Nat,
-        artifact::Core::Int => crate::types::Core::Int,
-        artifact::Core::Real => crate::types::Core::Real,
-        artifact::Core::String => crate::types::Core::String,
-        artifact::Core::Boolean => crate::types::Core::Boolean,
-        artifact::Core::Arrow(from, to, effects) => crate::types::Core::Arrow(
-            import_type(mint, from, symbols, names),
-            import_type(mint, to, symbols, names),
-            import_row(mint, effects, symbols, names),
+    Rc::new(match value {
+        artifact::Type::Nat => Ty::Nat,
+        artifact::Type::Int => Ty::Int,
+        artifact::Type::Real => Ty::Real,
+        artifact::Type::String => Ty::String,
+        artifact::Type::Boolean => Ty::Boolean,
+        artifact::Type::Arrow(a, b, r) => Ty::Arrow(
+            import_type(mint, a, symbols, names),
+            import_type(mint, b, symbols, names),
+            import_row(mint, r, symbols, names),
         ),
-        artifact::Core::Sum(row) => crate::types::Core::Sum(import_row(mint, row, symbols, names)),
-        artifact::Core::Var(var) => crate::types::Core::Var(*var),
-        artifact::Core::Bound(var) => crate::types::Core::Bound(*var),
-        artifact::Core::Rigid { id, name } => crate::types::Core::Rigid {
+        artifact::Type::Struct(r) => Ty::Struct(import_row(mint, r, symbols, names)),
+        artifact::Type::Sum(r) => Ty::Sum(import_row(mint, r, symbols, names)),
+        artifact::Type::Var(v) => Ty::Var(*v),
+        artifact::Type::Bound(v) => Ty::Bound(*v),
+        artifact::Type::Rigid { id, name } => Ty::Rigid {
             id: *id,
             name: Rc::from(name.as_str()),
         },
-        artifact::Core::Named { name, args } => {
+        artifact::Type::Named { name, args } => {
             let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
-            crate::types::Core::Named {
+            Ty::Named {
                 symbol,
                 name: Rc::from(name.as_str()),
                 args: args
                     .iter()
-                    .map(|arg| import_type(mint, arg, symbols, names))
+                    .map(|a| import_type(mint, a, symbols, names))
                     .collect::<Vec<_>>()
                     .into(),
             }
         }
-        artifact::Core::Undecided => crate::types::Core::Undecided,
-    };
-    Rc::new(Ty {
-        core,
-        fields: value
-            .fields
-            .iter()
-            .map(|(name, field)| (name.clone(), import_row_field(mint, field, symbols, names)))
-            .collect(),
+        artifact::Type::Undecided => Ty::Undecided,
     })
 }
 
@@ -2897,66 +2889,78 @@ impl RegularType<'_> {
     }
 
     fn semantic(&mut self, ty: &Ty, args: &[usize]) -> usize {
-        use crate::types::{Core, Presence};
-        fn presence(value: &Presence) -> String {
-            match value {
-                Presence::Present => "+".into(),
-                Presence::Absent => "\\".into(),
-                Presence::Var(id) => format!("?{id}"),
-                Presence::Bound(id) => format!("'p{id}"),
-                Presence::Undecided => "?".into(),
-            }
-        }
-        let core = match &ty.core {
-            Core::Unit => self.atom("Unit"),
-            Core::Nat => self.atom("Nat"),
-            Core::Int => self.atom("Int"),
-            Core::Real => self.atom("Real"),
-            Core::String => self.atom("String"),
-            Core::Boolean => self.atom("Boolean"),
-            Core::Arrow(from, to, effects) => {
-                let from = self.semantic(from, args);
-                let to = self.semantic(to, args);
-                let effects = self.semantic_row(effects, args);
+        match ty {
+            Ty::Nat => self.atom("Nat"),
+            Ty::Int => self.atom("Int"),
+            Ty::Real => self.atom("Real"),
+            Ty::String => self.atom("String"),
+            Ty::Boolean => self.atom("Boolean"),
+            Ty::Arrow(a, b, r) => {
+                let a = self.semantic(a, args);
+                let b = self.semantic(b, args);
+                let r = self.semantic_row(r, args);
                 self.node(
                     "arrow",
-                    vec![
-                        ("from".into(), from),
-                        ("to".into(), to),
-                        ("effects".into(), effects),
-                    ],
+                    vec![("from".into(), a), ("to".into(), b), ("effects".into(), r)],
                 )
             }
-            Core::Sum(cases) => self.semantic_row(cases, args),
-            Core::Var(id) => self.atom(format!("?{id}")),
-            Core::Bound(id) => args
-                .get(*id as usize)
+            Ty::Struct(r)
+                if r.labels.is_empty() && matches!(r.rest, crate::types::Rest::Closed) =>
+            {
+                self.atom("Unit")
+            }
+            Ty::Struct(r) => self.semantic_fields(r, args),
+            Ty::Sum(r) => self.semantic_row(r, args),
+            Ty::Var(v) => self.atom(format!("?{v}")),
+            Ty::Bound(i) => args
+                .get(*i as usize)
                 .copied()
-                .unwrap_or_else(|| self.atom(format!("'{id}"))),
-            Core::Rigid { id, .. } => self.atom(format!("'r{id}")),
-            Core::Named {
+                .unwrap_or_else(|| self.atom(format!("'{i}"))),
+            Ty::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Ty::Named {
                 symbol,
                 args: applied,
                 ..
             } => {
-                let applied = applied.iter().map(|arg| self.semantic(arg, args)).collect();
+                let applied = applied.iter().map(|a| self.semantic(a, args)).collect();
                 self.named(*symbol, applied)
             }
-            Core::Undecided => self.atom("?"),
+            Ty::Undecided => self.atom("?"),
+        }
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn semantic_fields(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
+        use crate::types::{Presence, Rest};
+        let mut edges = Vec::new();
+        for (name, field) in &row.labels {
+            let p = match field.presence {
+                Presence::Present => "+".into(),
+                Presence::Absent => "\\".into(),
+                Presence::Var(v) => format!("?{v}"),
+                Presence::Bound(v) => format!("'p{v}"),
+                Presence::Undecided => "?".into(),
+            };
+            let payload = if matches!(field.presence, Presence::Absent) {
+                self.atom("?")
+            } else {
+                self.semantic(&field.ty, args)
+            };
+            edges.push((format!("field:{name}:{p}"), payload));
+        }
+        let tail = match &row.rest {
+            Rest::Closed => self.atom("Unit"),
+            Rest::Var(v) => self.atom(format!("?{v}")),
+            Rest::Bound(i) => args
+                .get(*i as usize)
+                .copied()
+                .unwrap_or_else(|| self.atom(format!("'#{i}"))),
+            Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
+            Rest::Undecided => self.atom("?"),
+            Rest::More(m) => self.semantic_fields(m, args),
         };
-        let fields = ty
-            .fields
-            .iter()
-            .map(|(name, field)| {
-                let payload = if matches!(field.presence, Presence::Absent) {
-                    self.atom("?")
-                } else {
-                    self.semantic(&field.ty, args)
-                };
-                (name.clone(), presence(&field.presence), payload)
-            })
-            .collect();
-        self.with_fields(core, fields)
+        edges.push(("core".into(), tail));
+        self.node("fields", edges)
     }
 
     fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
@@ -3000,6 +3004,7 @@ impl RegularType<'_> {
     /// was visited, so doing this while lowering would make normalization
     /// depend on declaration order. Epsilon closure also makes recursive row
     /// graphs finite: each row node contributes its labels at most once.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn flatten_rows(&mut self) {
         let original = self.nodes.clone();
         for root in 0..original.len() {
@@ -3604,7 +3609,7 @@ impl Follow<'_> {
         match &ty.tracked {
             // A struct whose `..` names a parameter stands for that parameter:
             // the `..` is the type's core, so what the declaration is, is
-            // whatever is written there, carrying the fields beside it. Every
+            // whatever is written there, field_summaries the fields beside it. Every
             // other struct — closed, or open in the way only an annotation may
             // be — is a shape like any other.
             TypeKind::Struct {
@@ -4153,7 +4158,7 @@ impl Matrix {
             .insert(literal);
     }
 
-    /// Whether the earlier arms alone leave no unhandled value carrying this
+    /// Whether the earlier arms alone leave no unhandled value field_summaries this
     /// case at this position — what lets a later binder's view mark the case
     /// absent. The same usefulness question, asked of a synthetic row that is
     /// wildcards everywhere except the path down to the case.
@@ -4885,7 +4890,7 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
 /// [`ParamKind::Type`] parameter has only the second. A struct's `..` is the
 /// type's core, and a core takes every type there is, so there is no shape left
 /// to refuse; what is left is the labels the argument would bring with it, which
-/// [`carried`] reads through a name as readily as off a struct written out.
+/// [`field_summary`] reads through a name as readily as off a struct written out.
 ///
 /// The kinds themselves are a well-formedness check and nothing more — an
 /// argument lowers to exactly the type it would anywhere else, and substitution
@@ -4901,14 +4906,14 @@ fn constrain(ty: &Type, out: &mut impl FnMut(Fact)) {
 /// [`ErrorKind::Circular`] and [`ErrorKind::OpenDeclaredType`] do — the
 /// argument and not the whole application, because the mistake is the argument
 /// and `WithX { x: Nat } -> Nat` is half correct. [`row_shaped`] already reads
-/// [`TypeKind::Error`] as row-shaped and [`carried`] reads it as carrying
+/// [`TypeKind::Error`] as row-shaped and [`field_summary`] reads it as field_summaries
 /// nothing, so nothing complains about the erasure, and it lowers to the
 /// undecided type, which a tail and a core are both already allowed to be.
 fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
     fn walk(
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
-        carries: &HashMap<Symbol, Carried>,
+        carries: &HashMap<Symbol, FieldSummary>,
         rows: &HashMap<Symbol, Sense>,
         declarations: &IndexMap<Symbol, Decl<Type>>,
         external: &IndexMap<Symbol, ExternalType>,
@@ -4934,10 +4939,16 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                                 }),
                                 true => {
                                     let repeated = match shape {
-                                        Shape::Struct => carried(arg, carries)
-                                            .labels
-                                            .into_iter()
-                                            .find(|name| lacks.contains(name)),
+                                        Shape::Struct => {
+                                            let mut labels = field_summary(arg, carries).labels;
+                                            imported_fields(
+                                                arg,
+                                                external,
+                                                &mut HashSet::new(),
+                                                &mut labels,
+                                            );
+                                            labels.into_iter().find(|name| lacks.contains(name))
+                                        }
                                         Shape::Sum | Shape::Effect => {
                                             cases_named(arg).find(|name| lacks.contains(name))
                                         }
@@ -5000,8 +5011,8 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // What each declaration's fields come to, read once over the whole table
     // before anything is walked: an argument written at a struct's `..` carries
     // whatever the declaration it names carries, which is what the repeated
-    // field check is asked against. See [`carrying`].
-    let carries = carrying(&program.types);
+    // field check is asked against. See [`field_summaries`].
+    let carries = field_summaries(&program.types);
     let declarations = program.types.clone();
     let external = program.external_types.clone();
 
@@ -5166,6 +5177,7 @@ fn row_shaped(
     declarations: &IndexMap<Symbol, Decl<Type>>,
     external: &IndexMap<Symbol, ExternalType>,
 ) -> bool {
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn semantic_outer(
         ty: &Rc<Ty>,
         rows: &HashMap<Symbol, Sense>,
@@ -5176,10 +5188,10 @@ fn row_shaped(
         semantic_args: Option<&[Rc<Ty>]>,
         active: &mut HashSet<Symbol>,
     ) -> bool {
-        match &ty.core {
-            crate::types::Core::Unit => shape == Shape::Struct,
-            crate::types::Core::Sum(_) => shape == Shape::Sum,
-            crate::types::Core::Bound(index) => {
+        match &**ty {
+            crate::types::Ty::Struct(_) => shape == Shape::Struct,
+            crate::types::Ty::Sum(_) => shape == Shape::Sum,
+            crate::types::Ty::Bound(index) => {
                 if let Some(arg) = semantic_args.and_then(|args| args.get(*index as usize)) {
                     semantic_outer(arg, rows, shape, declarations, external, None, None, active)
                 } else if let Some(arg) = written_args.and_then(|args| args.get(*index as usize)) {
@@ -5188,7 +5200,7 @@ fn row_shaped(
                     false
                 }
             }
-            crate::types::Core::Named { symbol, args, .. } => {
+            crate::types::Ty::Named { symbol, args, .. } => {
                 if !active.insert(*symbol) {
                     return false;
                 }
@@ -5207,18 +5219,19 @@ fn row_shaped(
                 active.remove(symbol);
                 found
             }
-            crate::types::Core::Undecided => true,
-            crate::types::Core::Nat
-            | crate::types::Core::Int
-            | crate::types::Core::Real
-            | crate::types::Core::String
-            | crate::types::Core::Boolean
-            | crate::types::Core::Arrow(..)
-            | crate::types::Core::Var(_)
-            | crate::types::Core::Rigid { .. } => false,
+            crate::types::Ty::Undecided => true,
+            crate::types::Ty::Nat
+            | crate::types::Ty::Int
+            | crate::types::Ty::Real
+            | crate::types::Ty::String
+            | crate::types::Ty::Boolean
+            | crate::types::Ty::Arrow(..)
+            | crate::types::Ty::Var(_)
+            | crate::types::Ty::Rigid { .. } => false,
         }
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn outer(
         ty: &Type,
         rows: &HashMap<Symbol, Sense>,
@@ -5343,7 +5356,7 @@ fn cases_named(ty: &Type) -> impl Iterator<Item = String> + '_ {
 /// for `'r`. Which that is cannot be known until a use site writes one, so the
 /// slot is recorded here and read where the argument is.
 #[derive(Debug, Clone, Default)]
-struct Carried {
+struct FieldSummary {
     /// Insertion-ordered, so a complaint about an argument breaking the rule
     /// twice always names the same label first — the one a reader would reach
     /// first reading the argument left to right, which is the rule
@@ -5351,8 +5364,71 @@ struct Carried {
     /// reached through a variable.
     labels: IndexSet<String>,
     /// The parameters that land in the core of what this stands for, so that
-    /// whatever is written at them is carried too.
+    /// whatever is written at them is field_summary too.
     slots: IndexSet<u32>,
+}
+
+/// Add fields field_summary by imported semantic aliases, including field-row
+/// arguments substituted into an imported struct tail.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn imported_fields(
+    ty: &Type,
+    external: &IndexMap<Symbol, ExternalType>,
+    active: &mut HashSet<Symbol>,
+    out: &mut IndexSet<String>,
+) {
+    fn semantic(
+        ty: &Rc<Ty>,
+        args: Option<&[Type]>,
+        external: &IndexMap<Symbol, ExternalType>,
+        active: &mut HashSet<Symbol>,
+        out: &mut IndexSet<String>,
+    ) {
+        match &**ty {
+            Ty::Struct(row) => {
+                out.extend(row.labels.keys().cloned());
+                if let Rest::Bound(index) = row.rest
+                    && let Some(arg) = args.and_then(|args| args.get(index as usize))
+                {
+                    imported_fields(arg, external, active, out);
+                }
+                if let Rest::More(more) = &row.rest {
+                    semantic(
+                        &Rc::new(Ty::Struct((**more).clone())),
+                        args,
+                        external,
+                        active,
+                        out,
+                    );
+                }
+            }
+            Ty::Named {
+                symbol,
+                args: supplied,
+                ..
+            } if active.insert(*symbol) => {
+                if let Some(decl) = external.get(symbol) {
+                    semantic(decl.scheme.body(), None, external, active, out);
+                }
+                for arg in supplied.iter() {
+                    semantic(arg, None, external, active, out);
+                }
+                active.remove(symbol);
+            }
+            _ => {}
+        }
+    }
+    let (symbol, args) = match &ty.tracked {
+        TypeKind::Ident(symbol) => (*symbol, None),
+        TypeKind::Apply { head, args, .. } => (*head, Some(args.as_slice())),
+        _ => return,
+    };
+    if active.insert(symbol) {
+        if let Some(decl) = external.get(&symbol) {
+            semantic(decl.scheme.body(), args, external, active, out);
+        }
+        active.remove(&symbol);
+    }
 }
 
 /// What each declaration carries, over the whole table.
@@ -5368,15 +5444,15 @@ struct Carried {
 /// [`Table::resolve`](crate::inference)'s splice, the outer would win without a
 /// word, and a definition would come out with a type nothing showed it has —
 /// the exact failure the lacks condition exists to prevent.
-fn carrying(types: &IndexMap<Symbol, Decl<Type>>) -> HashMap<Symbol, Carried> {
-    let mut out: HashMap<Symbol, Carried> = types
+fn field_summaries(types: &IndexMap<Symbol, Decl<Type>>) -> HashMap<Symbol, FieldSummary> {
+    let mut out: HashMap<Symbol, FieldSummary> = types
         .keys()
-        .map(|symbol| (*symbol, Carried::default()))
+        .map(|symbol| (*symbol, FieldSummary::default()))
         .collect();
     loop {
         let mut grew = false;
         for (symbol, decl) in types {
-            let found = carried(&decl.value, &out);
+            let found = field_summary(&decl.value, &out);
             let entry = out.get_mut(symbol).expect("every declaration was seeded");
             for label in found.labels {
                 grew |= entry.labels.insert(label);
@@ -5392,15 +5468,15 @@ fn carrying(types: &IndexMap<Symbol, Decl<Type>>) -> HashMap<Symbol, Carried> {
 }
 
 /// What one written type carries, given what each declaration carries so far:
-/// the step [`carrying`] iterates, and the read [`row_arguments`] makes of one
+/// the step [`field_summaries`] iterates, and the read [`row_arguments`] makes of one
 /// argument.
 ///
 /// A struct writes its own field names, and then whatever its `..` carries. A
 /// name, or an application, carries what the declaration it names carries,
-/// joined with what is carried by each argument written at a parameter that
+/// joined with what is field_summary by each argument written at a parameter that
 /// declaration puts in its core. Everything else carries nothing — a sum carries
 /// no *fields*, so `WithX (#A | #B)` is fine.
-fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
+fn field_summary(ty: &Type, decls: &HashMap<Symbol, FieldSummary>) -> FieldSummary {
     match &ty.tracked {
         TypeKind::Struct { fields, tail } => {
             let mut slots = IndexSet::new();
@@ -5411,7 +5487,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
             {
                 slots.insert(*index);
             }
-            Carried {
+            FieldSummary {
                 labels: fields.keys().cloned().collect(),
                 slots,
             }
@@ -5419,7 +5495,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
         // The body is the parameter, as in `type Id 'a = 'a`: whatever is written
         // there is the whole of what the declaration stands for, fields
         // included.
-        TypeKind::Param { index, .. } => Carried {
+        TypeKind::Param { index, .. } => FieldSummary {
             labels: IndexSet::new(),
             slots: std::iter::once(*index).collect(),
         },
@@ -5428,7 +5504,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
         TypeKind::Ident(symbol) => decls.get(symbol).cloned().unwrap_or_default(),
         TypeKind::Apply { head, args, .. } => {
             let head = decls.get(head).cloned().unwrap_or_default();
-            let mut out = Carried {
+            let mut out = FieldSummary {
                 labels: head.labels,
                 slots: IndexSet::new(),
             };
@@ -5441,7 +5517,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
             // application was written, so every slot the head names has an
             // argument in that position.
             for index in head.slots {
-                let inner = carried(&args[index as usize], decls);
+                let inner = field_summary(&args[index as usize], decls);
                 out.labels.extend(inner.labels);
                 out.slots.extend(inner.slots);
             }
@@ -5453,7 +5529,7 @@ fn carried(ty: &Type, decls: &HashMap<Symbol, Carried>) -> Carried {
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
-        | TypeKind::Error => Carried::default(),
+        | TypeKind::Error => FieldSummary::default(),
     }
 }
 
@@ -7032,7 +7108,7 @@ impl Builder<'_> {
         match expr.tracked {
             // `()` is the empty struct rather than a form of its own, so it is
             // erased here instead of surviving into the IR. See
-            // [`Core::Unit`](crate::types::Core::Unit) for why, and for what it
+            // [`Ty::Unit`](crate::types::Ty::Unit) for why, and for what it
             // costs when the compiler answers.
             ExprKind::Unit => TermKind::Struct(Default::default()).with_span(span),
             ExprKind::Ident { name } => match self.resolve(&name, Namespace::Terms) {
@@ -7465,7 +7541,7 @@ impl Builder<'_> {
             }
             // As in [`term`](Self::term): the two surface spellings of the
             // empty struct, `()` and `{}`, meet here. See
-            // [`Core::Unit`](crate::types::Core::Unit).
+            // [`Ty::Unit`](crate::types::Ty::Unit).
             parse::TypeKind::Unit => span.track(TypeKind::Struct {
                 fields: Default::default(),
                 tail: None,

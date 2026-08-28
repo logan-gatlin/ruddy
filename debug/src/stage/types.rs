@@ -15,7 +15,7 @@ use ruddy::{
     ir::{Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Tracked,
-    types::{Core, Rest, Row, RowField, Scheme, Ty},
+    types::{Rest, Row, RowField, Scheme, Ty},
 };
 
 use crate::{
@@ -87,7 +87,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             // the meaning column cannot say.
             if let Some(decl) = program.types.get(&symbol) {
                 for (index, param) in decl.params.iter().enumerate() {
-                    let letter = Core::Bound(index as u32).to_string();
+                    let letter = Ty::Bound(index as u32).to_string();
                     let row = Node::new(ids.next(), letter, stands_for(mint, param)).at(param.span);
                     node = node.child(with_symbol(row, cx, mint, param.symbol));
                 }
@@ -322,12 +322,12 @@ fn walk(
 /// one anybody wrote, but it prints in this tab like any other and a declared
 /// name inside its fields is mentioned just as much.
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
-    match &ty.core {
+    match ty {
         // The arguments are walked though the body is not: a declaration
         // reached only through one — `type Rose 'a = { kids: List (Rose 'a) }` —
         // is mentioned just as much as one written bare, and a row that missed
         // it would not show as recursive.
-        Core::Named { symbol, args, .. } => {
+        Ty::Named { symbol, args, .. } => {
             out.push(*symbol);
             for arg in args.iter() {
                 names_in(arg, out);
@@ -335,23 +335,21 @@ fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
         }
         // An effect row names effects and no declared types, so there is
         // nothing in one for this to find.
-        Core::Arrow(from, to, _) => {
+        Ty::Arrow(from, to, _) => {
             names_in(from, out);
             names_in(to, out);
         }
-        Core::Sum(cases) => names_in_row(cases, out),
-        Core::Unit
-        | Core::Nat
-        | Core::Int
-        | Core::Real
-        | Core::String
-        | Core::Boolean
-        | Core::Var(_)
-        | Core::Bound(_)
-        | Core::Rigid { .. }
-        | Core::Undecided => {}
+        Ty::Struct(fields) | Ty::Sum(fields) => names_in_row(fields, out),
+        Ty::Nat
+        | Ty::Int
+        | Ty::Real
+        | Ty::String
+        | Ty::Boolean
+        | Ty::Var(_)
+        | Ty::Bound(_)
+        | Ty::Rigid { .. }
+        | Ty::Undecided => {}
     }
-    names_in_labels(&ty.fields, out);
 }
 
 /// [`names_in`] over a sum's cases: what each case carries, and whatever a tail
@@ -367,7 +365,7 @@ fn names_in_row(row: &Row, out: &mut Vec<Symbol>) {
 /// [`names_in`] over a label map: what each label holds. A type's fields are one
 /// — they have no tail of their own, their tail being the core beside them,
 /// which [`names_in`] descends where it sits. So a name sitting in a core under
-/// fields, as `WithX Nat with { y: Nat }` has, is still found.
+/// rows, so every declared name inside a field payload is still found.
 fn names_in_labels(labels: &IndexMap<String, RowField>, out: &mut Vec<Symbol>) {
     for field in labels.values() {
         names_in(&field.ty, out);

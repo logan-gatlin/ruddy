@@ -8,7 +8,7 @@ use crate::{
     ir::{self, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::{Span, Tracked},
-    types::{Core, Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty},
+    types::{Formula, Presence, Rest, Row, RowField, Scheme, Shape, Ty},
 };
 
 use super::{
@@ -151,7 +151,8 @@ type Cover = Option<IndexMap<usize, Formula>>;
 /// conjunction — and a disjunction with that in it is [`Formula::True`], so a
 /// column with one emits nothing, exactly as R6 says.
 fn presence_paths(ty: &Rc<Ty>, prefix: &str, found: &mut Vec<(String, Presence)>) {
-    for (name, field) in &ty.fields {
+    let Ty::Struct(row) = &**ty else { return };
+    for (name, field) in &row.labels {
         let path = match prefix.is_empty() {
             true => name.clone(),
             false => format!("{prefix}.{name}"),
@@ -250,19 +251,19 @@ impl Constrain<'_> {
             // The error term absorbs: it unifies with anything, so the one
             // diagnostic lowering already reported stays the only one.
             TermKind::Error => Rc::new(Ty::default()),
-            TermKind::Natural(_) => Rc::new(Ty::plain(Core::Nat)),
-            TermKind::Integer(_) => Rc::new(Ty::plain(Core::Int)),
-            TermKind::Real(_) => Rc::new(Ty::plain(Core::Real)),
-            TermKind::String(_) => Rc::new(Ty::plain(Core::String)),
-            TermKind::Boolean(_) => Rc::new(Ty::plain(Core::Boolean)),
+            TermKind::Natural(_) => Rc::new(Ty::plain(Ty::Nat)),
+            TermKind::Integer(_) => Rc::new(Ty::plain(Ty::Int)),
+            TermKind::Real(_) => Rc::new(Ty::plain(Ty::Real)),
+            TermKind::String(_) => Rc::new(Ty::plain(Ty::String)),
+            TermKind::Boolean(_) => Rc::new(Ty::plain(Ty::Boolean)),
             TermKind::Unary { op, value } => match op {
                 crate::ir::UnaryOp::Neg => {
-                    let real = Rc::new(Ty::plain(Core::Real));
+                    let real = Rc::new(Ty::plain(Ty::Real));
                     self.check_term(value, &real);
                     real
                 }
                 crate::ir::UnaryOp::Not => {
-                    let boolean = Rc::new(Ty::plain(Core::Boolean));
+                    let boolean = Rc::new(Ty::plain(Ty::Boolean));
                     self.check_term(value, &boolean);
                     boolean
                 }
@@ -272,10 +273,10 @@ impl Constrain<'_> {
                     crate::ir::BinaryOp::Add
                     | crate::ir::BinaryOp::Sub
                     | crate::ir::BinaryOp::Mul
-                    | crate::ir::BinaryOp::Div => Core::Real,
+                    | crate::ir::BinaryOp::Div => Ty::Real,
                     crate::ir::BinaryOp::And
                     | crate::ir::BinaryOp::Or
-                    | crate::ir::BinaryOp::Xor => Core::Boolean,
+                    | crate::ir::BinaryOp::Xor => Ty::Boolean,
                 };
                 let ty = Rc::new(Ty::plain(core));
                 self.check_term(left, &ty);
@@ -397,14 +398,14 @@ impl Constrain<'_> {
                 // below ties to it where it is not. Either way the application
                 // opens it into the ambient — R12 — which is what makes an
                 // effect row an upper bound rather than a demand.
-                let (result, performed) = match &self.table.unfolded(self.aliases, &applied).core {
+                let (result, performed) = match &*self.table.unfolded(self.aliases, &applied) {
                     // The function already knows what it takes, so the demand
                     // on the argument is the parameter type and the result is
                     // the arrow's own. Written this way round, a mismatch
                     // reads "expected <parameter>, found <argument>": the
                     // parameter is what the context asked for, and the
                     // argument is the term the reader can change.
-                    Core::Arrow(from, to, does) => {
+                    Ty::Arrow(from, to, does) => {
                         let (from, to, does) = (from.clone(), to.clone(), does.clone());
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &from);
@@ -434,7 +435,7 @@ impl Constrain<'_> {
                         let param = self.table.fresh_type();
                         let result = self.table.fresh_type();
                         let does = Row::of(self.table.fresh_row());
-                        let wanted = Rc::new(Ty::plain(Core::Arrow(
+                        let wanted = Rc::new(Ty::plain(Ty::Arrow(
                             param.clone(),
                             result.clone(),
                             does.clone(),
@@ -475,7 +476,7 @@ impl Constrain<'_> {
                 self.infer_term(body);
                 self.answer = held;
                 self.leave(outer);
-                Rc::new(Ty::plain(Core::Arrow(param, body.ty.clone(), does)))
+                Rc::new(Ty::plain(Ty::Arrow(param, body.ty.clone(), does)))
             }
             // An operation is an ordinary value of its declared signature, with
             // the effect's own label as the row of its outermost arrow, closed.
@@ -496,7 +497,7 @@ impl Constrain<'_> {
                     .collect(),
                     rest: Rest::Closed,
                 };
-                Rc::new(Ty::plain(Core::Arrow(from.clone(), to.clone(), does)))
+                Rc::new(Ty::plain(Ty::Arrow(from.clone(), to.clone(), does)))
             }
             TermKind::Handle { body, handler } => self.handle(body, handler),
             // `raise` does not return, so its own type is a fresh variable
@@ -521,10 +522,10 @@ impl Constrain<'_> {
                 // tail is closed. Openness belongs to demands, not to values.
                 // Nothing of its own beside them, which is what makes a struct
                 // unit carrying fields rather than a shape of its own.
-                Rc::new(Ty {
-                    core: Core::Unit,
-                    fields: tys,
-                })
+                Rc::new(Ty::Struct(Row {
+                    labels: tys,
+                    rest: Rest::Closed,
+                }))
             }
             // A tag is one case of a sum, and which sum is not for the literal
             // to say — so the type it gets names that case and leaves the tail
@@ -545,7 +546,7 @@ impl Constrain<'_> {
                     None => Rc::new(Ty::unit()),
                 };
                 let rest = self.table.fresh_row();
-                let ty = Rc::new(Ty::plain(Core::Sum(Row {
+                let ty = Rc::new(Ty::plain(Ty::Sum(Row {
                     labels: [(name.tracked.clone(), RowField::present(carried))]
                         .into_iter()
                         .collect(),
@@ -593,7 +594,7 @@ impl Constrain<'_> {
                 let result = self.table.fresh_type();
                 let mut qualifying = None;
                 let expected = match arms.is_empty() {
-                    true => Rc::new(Ty::plain(Core::Sum(Row {
+                    true => Rc::new(Ty::plain(Ty::Sum(Row {
                         labels: IndexMap::new(),
                         rest: Rest::Closed,
                     }))),
@@ -618,11 +619,14 @@ impl Constrain<'_> {
                             let raw: Vec<Formula> = (0..arms.len())
                                 .map(|arm| cover.get(&arm).cloned().unwrap_or(Formula::True))
                                 .collect();
-                            let fields = demand
-                                .fields
-                                .iter()
-                                .map(|(name, field)| (name.clone(), field.presence.clone()))
-                                .collect();
+                            let fields = match &*demand {
+                                Ty::Struct(row) => row
+                                    .labels
+                                    .iter()
+                                    .map(|(name, field)| (name.clone(), field.presence.clone()))
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
                             let mut paths = Vec::new();
                             presence_paths(&demand, "", &mut paths);
                             let formula = Formula::any(raw.clone());
@@ -801,7 +805,7 @@ impl Constrain<'_> {
     /// presence is a fresh variable, which is what lets unification infer an
     /// optional field — and each field's type comes from its sub-position
     /// across the arms that mention it. The demand is closed — its core the
-    /// fieldless [`Core::Unit`], so no further fields can attach — iff every
+    /// fieldless [`Ty::Unit`], so no further fields can attach — iff every
     /// entry is an exact struct or unit pattern; any `..`, binder or wildcard
     /// entry leaves it open, a fresh core with the projection's lacks note.
     /// `()` and `{}` are one pattern — an exact struct naming no fields — so a
@@ -833,7 +837,7 @@ impl Constrain<'_> {
         entries: &[(usize, Col)],
     ) -> (Rc<Ty>, Cover) {
         let mut binds: Vec<(usize, Tracked<Symbol>)> = Vec::new();
-        let mut primitives: Vec<Core> = Vec::new();
+        let mut primitives: Vec<Ty> = Vec::new();
         let mut tags: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         let mut fields: IndexMap<&str, Vec<(usize, Col)>> = IndexMap::new();
         // Whether the column qualifies for coverage-to-constraint conversion:
@@ -870,11 +874,11 @@ impl Constrain<'_> {
                         structs = true;
                         exacts = true;
                     }
-                    ir::PatternKind::Natural(_) => primitives.push(Core::Nat),
-                    ir::PatternKind::Integer(_) => primitives.push(Core::Int),
-                    ir::PatternKind::Real(_) => primitives.push(Core::Real),
-                    ir::PatternKind::String(_) => primitives.push(Core::String),
-                    ir::PatternKind::Boolean(_) => primitives.push(Core::Boolean),
+                    ir::PatternKind::Natural(_) => primitives.push(Ty::Nat),
+                    ir::PatternKind::Integer(_) => primitives.push(Ty::Int),
+                    ir::PatternKind::Real(_) => primitives.push(Ty::Real),
+                    ir::PatternKind::String(_) => primitives.push(Ty::String),
+                    ir::PatternKind::Boolean(_) => primitives.push(Ty::Boolean),
                     ir::PatternKind::Tag { name, payload } => {
                         let payload = payload.as_deref().map(Col::Pattern).unwrap_or(Col::Unit);
                         tags.entry(name.tracked.as_str())
@@ -942,7 +946,7 @@ impl Constrain<'_> {
                 true => self.table.fresh_row(),
                 false => Rest::Closed,
             };
-            let ty = Rc::new(Ty::plain(Core::Sum(Row {
+            let ty = Rc::new(Ty::plain(Ty::Sum(Row {
                 labels: labels.clone(),
                 rest: rest.clone(),
             })));
@@ -994,14 +998,14 @@ impl Constrain<'_> {
                     },
                 );
             }
-            let core = match exact {
-                true => Core::Unit,
-                false => Core::Var(self.table.fresh_core()),
+            let rest = match exact {
+                true => Rest::Closed,
+                false => self.table.fresh_row(),
             };
-            let ty = Rc::new(Ty {
-                core,
-                fields: named.clone(),
-            });
+            let ty = Rc::new(Ty::Struct(Row {
+                labels: named.clone(),
+                rest,
+            }));
             self.table.note_lacks(&ty);
             demands.push(ty);
         }
@@ -1038,7 +1042,7 @@ impl Constrain<'_> {
                             (name.clone(), field)
                         })
                         .collect();
-                    Rc::new(Ty::plain(Core::Sum(Row {
+                    Rc::new(Ty::plain(Ty::Sum(Row {
                         labels: refined,
                         rest: rest.clone(),
                     })))
@@ -1068,12 +1072,12 @@ impl Constrain<'_> {
         // than from this, so the term keeps the name the user wrote and prints
         // as it.
         let shape = self.table.unfolded(self.aliases, expected);
-        match (&mut term.kind, &shape.core) {
+        match (&mut term.kind, &*shape) {
             // The lambda's arrow *is* the annotation, so its effect row is the
             // annotation's: the body is walked at what the reader wrote it may
             // do, and a `fn` that mints its own row here would be checking
             // against a promise nobody made.
-            (TermKind::Fn { arg, body }, Core::Arrow(from, to, does)) => {
+            (TermKind::Fn { arg, body }, Ty::Arrow(from, to, does)) => {
                 let (from, to, does) = (from.clone(), to.clone(), does.clone());
                 self.env.insert(arg.tracked, Binding::Mono(from));
                 let outer = self.enter(Ambient {
@@ -1094,15 +1098,16 @@ impl Constrain<'_> {
             // same things, just without the better spans pushing gives. The
             // gate reads the written type's own syntax, never the table, so
             // generation stays a description of the term.
-            (TermKind::Struct(fields), Core::Unit)
-                if shape
-                    .fields
-                    .values()
-                    .all(|field| matches!(field.presence, Presence::Present))
-                    && same_field_set(fields, &shape.fields) =>
+            (TermKind::Struct(fields), Ty::Struct(row))
+                if matches!(row.rest, Rest::Closed)
+                    && row
+                        .labels
+                        .values()
+                        .all(|field| matches!(field.presence, Presence::Present))
+                    && same_field_set(fields, &row.labels) =>
             {
                 for (name, field) in fields.iter_mut() {
-                    let want = shape.fields[name].ty.clone();
+                    let want = row.labels[name].ty.clone();
                     self.check_term(&mut field.value, &want);
                 }
                 term.ty = expected.clone();
@@ -1118,7 +1123,7 @@ impl Constrain<'_> {
             // ever have; a tag has one case out of however many, so a sum with
             // more cases than the literal names is the ordinary case rather
             // than the one to fall back on.
-            (TermKind::Tag { name, payload }, Core::Sum(cases))
+            (TermKind::Tag { name, payload }, Ty::Sum(cases))
                 if cases
                     .labels
                     .get(&name.tracked)

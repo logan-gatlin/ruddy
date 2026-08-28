@@ -64,10 +64,10 @@
 //! no solve → refine → regenerate cycle.
 //!
 //! Inference runs after lowering and mutates the [`Program`] it is handed:
-//! every [`Term`]'s `ty` goes from [`Core::Undecided`] to what was inferred for
+//! every [`Term`]'s `ty` goes from [`Ty::Undecided`] to what was inferred for
 //! it, fully resolved, so nothing downstream ever needs the solver's variable
 //! table to read a type. Errors do not stop either pass — a term that failed to
-//! type still has a type, [`Core::Undecided`], which unifies with everything so
+//! type still has a type, [`Ty::Undecided`], which unifies with everything so
 //! that one mistake is reported once rather than echoed by every consumer.
 
 mod constrain;
@@ -87,8 +87,8 @@ use crate::{
     symbol::{Mint, Symbol},
     tracking::Span,
     types::{
-        Assigned, Atom, Core, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar,
+        Assigned, Atom, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense, Shape,
+        Ty, TyVar,
     },
 };
 use constrain::Constrain;
@@ -97,13 +97,13 @@ use solve::Solve;
 #[derive(Debug, Clone)]
 pub struct Output {
     /// What each `type` declaration stands for: the semantic type its body
-    /// denotes, one step deep. A name inside a body stays a [`Core::Named`] and
+    /// denotes, one step deep. A name inside a body stays a [`Ty::Named`] and
     /// is looked up here again, which is how a declaration that names itself
     /// stays a finite value — and why this map, not the type, is what a
     /// recursive type is made of. See [`unfold`].
     ///
     /// A [`Scheme`] rather than a bare type, because handing a declaration its
-    /// arguments is substituting for the [`Core::Bound`]s standing in for its
+    /// arguments is substituting for the [`Ty::Bound`]s standing in for its
     /// parameters — which is what instantiating a scheme already is, down to
     /// the same `open`. A declaration taking no parameters is a scheme binding
     /// nothing, and opening one returns its body unchanged.
@@ -155,7 +155,7 @@ pub struct Output {
     pub store: Store,
     /// What [`patterns`](crate::patterns) may assume while it walks each
     /// top-level definition: the store's word about *every* presence variable
-    /// that definition's zonked terms can name, in the [`Core::Bound`]
+    /// that definition's zonked terms can name, in the [`Ty::Bound`]
     /// numbering those terms were closed into.
     ///
     /// Not the scheme's `where` clause, which is a strictly smaller thing. A
@@ -391,7 +391,7 @@ pub enum Goal {
 /// that follows every failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
-    /// One side is [`Core::Undecided`], which unifies with anything.
+    /// One side is [`Ty::Undecided`], which unifies with anything.
     Absorb,
     /// Both sides are already the same thing: the same variable, or the same
     /// declared type applied to nothing. Either way there is nothing to take
@@ -786,7 +786,7 @@ pub enum ErrorKind {
 
 /// What one type variable is known to be. Private to inference, and rightly so:
 /// it is the solver's working state rather than part of the type language, and
-/// nothing downstream ever sees a [`Core::Var`] to want a slot for — generalizing
+/// nothing downstream ever sees a [`Ty::Var`] to want a slot for — generalizing
 /// and zonking are what make sure of that.
 #[derive(Debug, Clone)]
 enum Slot {
@@ -920,7 +920,7 @@ struct Solved {
 /// generalization reads it. It is the only state that outlives a pass.
 #[derive(Default)]
 struct Table {
-    /// One slot per variable; [`Core::Var`] indexes into it.
+    /// One slot per variable; [`Ty::Var`] indexes into it.
     ///
     /// A group rather than a definition, and the difference is only where the
     /// line falls: two definitions that name each other are solved together, so
@@ -990,7 +990,7 @@ struct Table {
     /// Where each a variable variable in the program was declared, by the id
     /// its annotation gave it.
     ///
-    /// A [`Core::Rigid`] carries its spelling but not its span — a type is
+    /// A [`Ty::Rigid`] carries its spelling but not its span — a type is
     /// printed with no table beside it, and a span is not something a reader
     /// reads — so the second place a rigid complaint points at is looked up
     /// here. Program-global, exactly as the ids are.
@@ -1102,7 +1102,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // runs in decides nothing — which is what lets two declarations refer to
     // each other.
     for (symbol, decl) in &program.types {
-        // The parameters are already `Core::Bound`s by their position, so the
+        // The parameters are already `Ty::Bound`s by their position, so the
         // scheme is closed by counting them rather than by walking anything.
         let body = lower_type(mint, &mut table, &decl.value);
         aliases.insert(*symbol, Scheme::new(decl.params.len() as u32, body));
@@ -1361,7 +1361,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
         // separately, which loses the sharing — and there is no scope outside a
         // group for that to matter to, a group being the outermost thing there
         // is. A nested `let` is inside one and so keeps the sharing: what its
-        // level leaves free is a [`Core::Var`] the enclosing binder still owns.
+        // level leaves free is a [`Ty::Var`] the enclosing binder still owns.
         for (at, member) in solved.into_iter().enumerate() {
             let symbol = member.scoped.symbol;
             let (from, to) = (bounds[at], bounds[at + 1]);
@@ -1654,22 +1654,7 @@ impl Table {
     /// of its own, so that binding it takes whatever it is against entire.
     fn fresh_type(&mut self) -> Rc<Ty> {
         let var = self.mint();
-        Rc::new(Ty::plain(Core::Var(var)))
-    }
-
-    /// A variable standing for the core of a type whose fields are written
-    /// beside it — the projection's demand, and nothing else so far.
-    ///
-    /// The same sort as [`fresh_type`](Self::fresh_type) and a different
-    /// position, which is why it is its own function. A fresh *type* is bare, so
-    /// binding it takes whatever it meets entire, fields and all; a fresh
-    /// *core* has labels standing next to it, so binding it takes only what the
-    /// other side is under those labels — and the labels beside it are a
-    /// condition on it, which is what [`Table::note_lacks`] then records. It
-    /// hands back the variable rather than a type because its caller has a row
-    /// to build around it.
-    fn fresh_core(&mut self) -> TyVar {
-        self.mint()
+        Rc::new(Ty::plain(Ty::Var(var)))
     }
 
     /// A variable standing for the rest of a row.
@@ -1708,14 +1693,12 @@ impl Table {
     fn resolve(&self, ty: &Rc<Ty>) -> Rc<Ty> {
         let mut ty = ty.clone();
         let mut budget = self.vars.len();
-        while let Core::Var(v) = &ty.core {
+        while let Ty::Var(v) = &*ty {
             let Slot::Bound(Assigned::Ty(inner)) = &self.vars[*v as usize] else {
                 break;
             };
-            budget = budget
-                .checked_sub(1)
-                .expect("a chain of bound variables closed a cycle the occurs check should refuse");
-            ty = splice(&ty.fields, inner);
+            budget = budget.checked_sub(1).expect("bound type cycle");
+            ty = inner.clone();
         }
         ty
     }
@@ -1830,7 +1813,32 @@ impl Table {
     /// accept two types that differ, so the one-sided error is the one to make.
     fn alike(&self, a: &Rc<Ty>, b: &Rc<Ty>) -> bool {
         let (a, b) = (self.resolve(a), self.resolve(b));
-        self.alike_labels(&a.fields, &b.fields) && self.alike_core(&a.core, &b.core)
+        match (&*a, &*b) {
+            (Ty::Nat, Ty::Nat)
+            | (Ty::Int, Ty::Int)
+            | (Ty::Real, Ty::Real)
+            | (Ty::String, Ty::String)
+            | (Ty::Boolean, Ty::Boolean)
+            | (Ty::Undecided, Ty::Undecided) => true,
+            (Ty::Var(x), Ty::Var(y)) => x == y,
+            (Ty::Arrow(a, b, e), Ty::Arrow(x, y, f)) => {
+                self.alike(a, x) & self.alike(b, y) & self.alike_row(e, f)
+            }
+            (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => self.alike_row(a, b),
+            (
+                Ty::Named {
+                    symbol: a,
+                    args: xs,
+                    ..
+                },
+                Ty::Named {
+                    symbol: b,
+                    args: ys,
+                    ..
+                },
+            ) => a == b && xs.iter().zip(ys.iter()).all(|(x, y)| self.alike(x, y)),
+            _ => false,
+        }
     }
 
     /// [`alike`](Self::alike) about two label maps: name against name, since a
@@ -1841,64 +1849,12 @@ impl Table {
             && a.iter().all(|(name, field)| {
                 b.get(name).is_some_and(|other| {
                     self.alike_presence(&field.presence, &other.presence)
-                        && self.alike(&field.ty, &other.ty)
+                        & self.alike(&field.ty, &other.ty)
                 })
             })
     }
 
     /// [`alike`](Self::alike) about two cores.
-    fn alike_core(&self, a: &Core, b: &Core) -> bool {
-        match (a, b) {
-            (Core::Unit, Core::Unit)
-            | (Core::Nat, Core::Nat)
-            | (Core::Int, Core::Int)
-            | (Core::Real, Core::Real)
-            | (Core::String, Core::String)
-            | (Core::Boolean, Core::Boolean)
-            | (Core::Undecided, Core::Undecided) => true,
-            (Core::Var(x), Core::Var(y)) => x == y,
-            // A quantified variable is not written out, on purpose: nothing
-            // reaches here holding one — an argument was lowered from what
-            // somebody wrote at a use site, and a scheme is opened before it is
-            // ever compared — and a variant this cannot tell about belongs in
-            // the arm below, whose answer is the safe one. A rigid goes the
-            // same way: an argument written at a declaration comes from a use
-            // site, and the one caller of this is looking for a goal about two
-            // declared names it is already in the middle of.
-            (Core::Arrow(from, to, effects), Core::Arrow(other_from, other_to, others)) => {
-                self.alike(from, other_from)
-                    && self.alike(to, other_to)
-                    && self.alike_row(effects, others)
-            }
-            (Core::Sum(cases), Core::Sum(others)) => self.alike_row(cases, others),
-            // The name and the arguments, and nothing of the body. Two
-            // applications of one declaration with equal arguments are
-            // certainly the same type, which is all this has to be right
-            // about — it says no where it cannot tell, and two applications
-            // that differ only in an argument the declaration discards are one
-            // of the places it cannot. Arity belongs to the declaration, so
-            // equal symbols mean equal lengths and the zip drops nothing.
-            (
-                Core::Named { symbol, args, .. },
-                Core::Named {
-                    symbol: other,
-                    args: other_args,
-                    ..
-                },
-            ) => {
-                symbol == other
-                    && args
-                        .iter()
-                        .zip(other_args.iter())
-                        .all(|(arg, other)| self.alike(arg, other))
-            }
-            // Two different shapes, and — since this is the one arm that is not
-            // written out — anything a later variant is put against. Both are
-            // the same answer, and it is the safe one.
-            _ => false,
-        }
-    }
-
     /// [`alike_labels`](Self::alike_labels) about a sum's cases: flattened
     /// first, so that a row spliced into a tail is recognized as the row written
     /// out flat, and then the tails as well.
@@ -1914,13 +1870,7 @@ impl Table {
 
     /// [`alike`](Self::alike) about two presences.
     fn alike_presence(&self, a: &Presence, b: &Presence) -> bool {
-        match (self.presence_of(a), self.presence_of(b)) {
-            (Presence::Present, Presence::Present)
-            | (Presence::Absent, Presence::Absent)
-            | (Presence::Undecided, Presence::Undecided) => true,
-            (Presence::Var(x), Presence::Var(y)) => x == y,
-            _ => false,
-        }
+        self.presence_of(a) == self.presence_of(b)
     }
 
     /// Whether `var` occurs in what it is about to be bound to, whichever sort
@@ -2009,39 +1959,28 @@ impl Table {
     /// Every variable `ty` mentions — in its core, and in the fields it carries.
     fn mentions_ty(&self, ty: &Rc<Ty>, found: &mut Vec<TyVar>) {
         let ty = self.resolve(ty);
-        match &ty.core {
-            Core::Var(var) => found.push(*var),
-            Core::Arrow(from, to, effects) => {
-                self.mentions_ty(from, found);
-                self.mentions_ty(to, found);
-                self.mentions_row(effects, found);
+        match &*ty {
+            Ty::Var(v) => found.push(*v),
+            Ty::Arrow(a, b, r) => {
+                self.mentions_ty(a, found);
+                self.mentions_ty(b, found);
+                self.mentions_row(r, found)
             }
-            Core::Sum(cases) => self.mentions_row(cases, found),
-            // A declared type is descended into as far as its arguments and no
-            // further, here and in every walk below. What one stands for was
-            // lowered from what the user wrote and mentions no variable at all
-            // — lowering refuses a `..` or a `when` in a declaration for exactly
-            // this reason — so there is nothing in the body to find and nothing
-            // to rebuild; and stopping there is what keeps a walk over a type
-            // that names itself finite. The arguments are the other half: they
-            // were written at the use site and hold whatever it held, so
-            // skipping them would miss a cycle.
-            Core::Named { args, .. } => {
+            Ty::Struct(r) | Ty::Sum(r) => self.mentions_row(r, found),
+            Ty::Named { args, .. } => {
                 for arg in args.iter() {
-                    self.mentions_ty(arg, found);
+                    self.mentions_ty(arg, found)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Bound(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => {}
         }
-        self.mentions_labels(&ty.fields, found);
     }
 
     /// Every variable a sum's cases mention. Every slot a row has, in one
@@ -2089,87 +2028,39 @@ impl Table {
     /// past them — the flattening [`Table::canon`] does, for the same reason.
     fn note_lacks(&mut self, ty: &Rc<Ty>) {
         let ty = self.resolve(ty);
-        // Every type carries fields, so every type says something here — and
-        // the core beside them is the only place there is left to say it. The
-        // labels land on the type's own core variable, which stands for a type
-        // those labels are already on: `{ x: Nat, ..?3 }` reads "an `x`, and
-        // whatever else `?3` is", so a `?3` with an `x` of its own would name
-        // the field twice.
-        let labels: IndexSet<String> = ty.fields.keys().cloned().collect();
-        if let Core::Var(var) = ty.core {
-            self.forbidden(var, Shape::Struct, labels);
-        }
-        for field in ty.fields.values() {
-            let field = field.ty.clone();
-            self.note_lacks(&field);
-        }
-        match &ty.core {
-            Core::Arrow(from, to, effects) => {
-                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
-                self.note_lacks(&from);
-                self.note_lacks(&to);
-                self.note_lacks_row(&effects, Shape::Effect);
+        match &*ty {
+            Ty::Arrow(a, b, r) => {
+                self.note_lacks(a);
+                self.note_lacks(b);
+                self.note_lacks_row(r, Shape::Effect)
             }
-            Core::Sum(cases) => {
-                let cases = cases.clone();
-                self.note_lacks_row(&cases, Shape::Sum);
-            }
-            // The body holds no row of its own to speak of, but an argument is
-            // whatever the use site wrote — including an open row whose tail
-            // must acquire the labels around it.
-            //
-            // And the declaration has something to say about the argument
-            // itself, at every position it takes a row: `type WithX 'r = { x:
-            // Nat, ..'r }` says whatever is written for `'r` has no `x`, and
-            // that
-            // holds whether or not anything ever unfolds `WithX` to find out.
-            // Recorded here, where the application is, rather than left to
-            // [`Solve::unfold`] — a goal decided by [`Rule::Congruent`] never
-            // unfolds either side, and the condition would simply be lost.
-            Core::Named { symbol, args, .. } => {
-                let (symbol, args) = (*symbol, args.clone());
+            Ty::Struct(r) => self.note_lacks_row(r, Shape::Struct),
+            Ty::Sum(r) => self.note_lacks_row(r, Shape::Sum),
+            Ty::Named { symbol, args, .. } => {
+                let symbol = *symbol;
+                let args = args.clone();
                 for (at, arg) in args.iter().enumerate() {
-                    // Cloned out, since forbidding borrows the table; and only
-                    // when there is something to forbid, which a parameter that
-                    // tails nothing never has.
-                    let demand = match self.params.get(&symbol).and_then(|kinds| kinds.get(at)) {
-                        Some(kind) if !kind.lacks().is_empty() => {
-                            Some((kind.row().map(|(shape, _)| shape), kind.lacks().clone()))
-                        }
-                        _ => None,
-                    };
-                    match demand {
-                        // A struct's `..` is the type's core, so the condition
-                        // lands on the argument's own core variable — the one
-                        // thing that would still be free to acquire the label.
-                        Some((None | Some(Shape::Struct), labels)) => {
-                            if let Core::Var(var) = self.resolve(arg).core {
-                                self.forbidden(var, Shape::Struct, labels);
-                            }
-                        }
-                        // A sum's rest and an arrow's effects are both spliced
-                        // into a row, so both read the argument for the labels
-                        // it allows and put the condition on what is open past
-                        // them.
-                        Some((Some(shape @ (Shape::Sum | Shape::Effect)), labels)) => {
-                            let written = self.resolve(arg).cases();
-                            self.forbid(&written, shape, &labels);
-                        }
-                        None => {}
+                    let demand = self
+                        .params
+                        .get(&symbol)
+                        .and_then(|k| k.get(at))
+                        .and_then(|k| k.row().map(|(shape, labels)| (shape, labels.clone())));
+                    if let Some((shape, labels)) = demand {
+                        let row = self.resolve(arg).cases();
+                        self.forbid(&row, shape, &labels);
                     }
                     self.note_lacks(arg);
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Var(_)
+            | Ty::Bound(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => {}
         }
     }
 
@@ -2212,6 +2103,7 @@ impl Table {
     /// every later condition on it is read in — so a tail carried across a
     /// binding by a row that happened to name no labels would leave a sum's
     /// tail being complained about in fields.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn forbidden(&mut self, var: TyVar, shape: Shape, labels: impl IntoIterator<Item = String>) {
         let mut labels = labels.into_iter().peekable();
         if labels.peek().is_none() {
@@ -2551,43 +2443,27 @@ impl Table {
     /// order is the first mention's.
     fn presences_in(&self, ty: &Rc<Ty>, found: &mut IndexSet<TyVar>) {
         let ty = self.resolve(ty);
-        for field in ty.fields.values() {
-            if let Presence::Var(var) = self.presence_of(&field.presence) {
-                found.insert(var);
+        match &*ty {
+            Ty::Arrow(a, b, r) => {
+                self.presences_in(a, found);
+                self.presences_in(b, found);
+                self.presences_in_row(r, found)
             }
-            let held = field.ty.clone();
-            self.presences_in(&held, found);
-        }
-        match &ty.core {
-            Core::Arrow(from, to, effects) => {
-                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
-                self.presences_in(&from, found);
-                self.presences_in(&to, found);
-                // An effect's presence is quantified like any other — a
-                // `!Log (when a)` on an arrow is a presence the scheme
-                // names — so one missed here would vanish from the scheme
-                // instead of being reported.
-                self.presences_in_row(&effects, found);
-            }
-            Core::Sum(cases) => {
-                let cases = cases.clone();
-                self.presences_in_row(&cases, found);
-            }
-            Core::Named { args, .. } => {
-                for arg in args.clone().iter() {
-                    self.presences_in(arg, found);
+            Ty::Struct(r) | Ty::Sum(r) => self.presences_in_row(r, found),
+            Ty::Named { args, .. } => {
+                for a in args.iter() {
+                    self.presences_in(a, found)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Var(_)
+            | Ty::Bound(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => {}
         }
     }
 
@@ -2648,30 +2524,18 @@ impl Table {
     /// demands are structural, so a declared name cannot reach this walk.
     fn presence_paths(&self, ty: &Rc<Ty>, prefix: &str, found: &mut IndexMap<String, Presence>) {
         let ty = self.resolve(ty);
-        for (name, field) in &ty.fields {
-            let path = match prefix.is_empty() {
-                true => name.clone(),
-                false => format!("{prefix}.{name}"),
-            };
-            found
-                .entry(path.clone())
-                .or_insert_with(|| self.presence_of(&field.presence));
-            self.presence_paths(&field.ty, &path, found);
-        }
-        match &ty.core {
-            Core::Arrow(_, _, _)
-            | Core::Sum(_)
-            | Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Named { .. }
-            | Core::Undecided => {}
+        if let Ty::Struct(row) = &*ty {
+            for (name, field) in &self.canon(row).labels {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                found
+                    .entry(path.clone())
+                    .or_insert_with(|| self.presence_of(&field.presence));
+                self.presence_paths(&field.ty, &path, found)
+            }
         }
     }
 
@@ -2681,51 +2545,31 @@ impl Table {
     /// reading the type left to right meets.
     fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, (String, Presence)>) {
         let ty = self.resolve(ty);
-        for (name, field) in &ty.fields {
-            found
-                .entry(name.clone())
-                .or_insert_with(|| (name.clone(), self.presence_of(&field.presence)));
-            let held = field.ty.clone();
-            self.labels_in(&held, found);
-        }
-        match &ty.core {
-            Core::Arrow(from, to, effects) => {
-                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
-                self.labels_in(&from, found);
-                self.labels_in(&to, found);
-                for (name, field) in &self.canon(&effects).labels {
+        match &*ty {
+            Ty::Arrow(a, b, r) => {
+                self.labels_in(a, found);
+                self.labels_in(b, found);
+                for (name, field) in &self.canon(r).labels {
                     found.entry(name.clone()).or_insert_with(|| {
-                        let shown = name
-                            .split_once('\u{1f}')
-                            .map_or(name.as_str(), |(name, _)| name);
+                        let shown = name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0);
                         (shown.to_string(), self.presence_of(&field.presence))
                     });
                 }
             }
-            Core::Sum(cases) => {
-                for (name, field) in &self.canon(cases).labels {
+            Ty::Struct(r) | Ty::Sum(r) => {
+                for (name, field) in &self.canon(r).labels {
                     found
                         .entry(name.clone())
                         .or_insert_with(|| (name.clone(), self.presence_of(&field.presence)));
-                    let held = field.ty.clone();
-                    self.labels_in(&held, found);
+                    self.labels_in(&field.ty, found)
                 }
             }
-            Core::Named { args, .. } => {
-                for arg in args.clone().iter() {
-                    self.labels_in(arg, found);
+            Ty::Named { args, .. } => {
+                for a in args.iter() {
+                    self.labels_in(a, found)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            _ => {}
         }
     }
 
@@ -2788,47 +2632,31 @@ impl Table {
     /// tail, a sum's cases and an arrow's effects, read the same way.
     fn rigids_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<u32, Rc<str>>) {
         let ty = self.resolve(ty);
-        for field in ty.fields.values() {
-            let held = field.ty.clone();
-            self.rigids_in(&held, found);
-        }
-        match &ty.core {
-            Core::Rigid { id, name } => {
+        match &*ty {
+            Ty::Rigid { id, name } => {
                 found.entry(*id).or_insert_with(|| name.clone());
             }
-            Core::Arrow(from, to, effects) => {
-                let (from, to) = (from.clone(), to.clone());
-                self.rigids_in(&from, found);
-                self.rigids_in(&to, found);
-                let row = self.canon(effects);
-                if let Rest::Rigid { id, name } = &row.rest {
-                    found.entry(*id).or_insert_with(|| name.clone());
+            Ty::Arrow(a, b, r) => {
+                self.rigids_in(a, found);
+                self.rigids_in(b, found);
+                self.rigids_in_row(r, found)
+            }
+            Ty::Struct(r) | Ty::Sum(r) => self.rigids_in_row(r, found),
+            Ty::Named { args, .. } => {
+                for a in args.iter() {
+                    self.rigids_in(a, found)
                 }
             }
-            Core::Sum(cases) => {
-                let row = self.canon(cases);
-                for field in row.labels.values() {
-                    let held = field.ty.clone();
-                    self.rigids_in(&held, found);
-                }
-                if let Rest::Rigid { id, name } = &row.rest {
-                    found.entry(*id).or_insert_with(|| name.clone());
-                }
-            }
-            Core::Named { args, .. } => {
-                for arg in args.clone().iter() {
-                    self.rigids_in(arg, found);
-                }
-            }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Undecided => {}
+            _ => {}
+        }
+    }
+    fn rigids_in_row(&self, row: &Row, found: &mut IndexMap<u32, Rc<str>>) {
+        let row = self.canon(row);
+        for f in row.labels.values() {
+            self.rigids_in(&f.ty, found)
+        }
+        if let Rest::Rigid { id, name } = row.rest {
+            found.entry(id).or_insert(name);
         }
     }
 
@@ -2856,8 +2684,7 @@ impl Table {
         // [`Assigned::as_row`] says by answering with a row that names nothing
         // and [`Assigned::as_ty`] by answering with a type that carries none.
         let labels: IndexMap<String, RowField> = match shape {
-            Shape::Struct => self.resolve(&value.as_ty()).fields.clone(),
-            Shape::Sum | Shape::Effect => self.canon(&value.as_row()).labels,
+            Shape::Struct | Shape::Sum | Shape::Effect => self.canon(&value.as_row()).labels,
         };
         let named = labels
             .iter()
@@ -2880,21 +2707,8 @@ impl Table {
         let Some((shape, labels)) = self.lacks.get(&var).cloned() else {
             return;
         };
-        match shape {
-            // A struct's condition travels through the core alone, there being
-            // no tail left to put it on: the type a core variable stands for is
-            // a type those labels are already on, so a copy of one arriving
-            // there would name the field twice.
-            Shape::Struct => {
-                if let Core::Var(core) = self.resolve(&value.as_ty()).core {
-                    self.forbidden(core, shape, labels);
-                }
-            }
-            Shape::Sum | Shape::Effect => {
-                let row = value.as_row();
-                self.forbid(&row, shape, &labels);
-            }
-        }
+        let row = value.as_row();
+        self.forbid(&row, shape, &labels);
     }
 
     /// [`note_lacks`](Self::note_lacks) about a value of any sort. `shape` is
@@ -2964,45 +2778,29 @@ impl Table {
     /// nowhere but here.
     fn count_effects(&self, ty: &Rc<Ty>, found: &mut IndexMap<TyVar, usize>) {
         let ty = self.resolve(ty);
-        for field in ty.fields.values() {
-            let held = field.ty.clone();
-            self.count_effects(&held, found);
-        }
-        match &ty.core {
-            Core::Arrow(from, to, effects) => {
-                let (from, to) = (from.clone(), to.clone());
-                self.count_effects(&from, found);
-                self.count_effects(&to, found);
-                let row = self.canon(effects);
-                if let Rest::Var(var) = row.rest {
-                    *found.entry(var).or_default() += 1;
+        match &*ty {
+            Ty::Arrow(a, b, r) => {
+                self.count_effects(a, found);
+                self.count_effects(b, found);
+                let row = self.canon(r);
+                if let Rest::Var(v) = row.rest {
+                    *found.entry(v).or_default() += 1
                 }
-                for field in row.labels.values() {
-                    let held = field.ty.clone();
-                    self.count_effects(&held, found);
+                for f in row.labels.values() {
+                    self.count_effects(&f.ty, found)
                 }
             }
-            Core::Sum(cases) => {
-                for field in self.canon(cases).labels.values() {
-                    let held = field.ty.clone();
-                    self.count_effects(&held, found);
+            Ty::Struct(r) | Ty::Sum(r) => {
+                for f in self.canon(r).labels.values() {
+                    self.count_effects(&f.ty, found)
                 }
             }
-            Core::Named { args, .. } => {
-                for arg in args.clone().iter() {
-                    self.count_effects(arg, found);
+            Ty::Named { args, .. } => {
+                for a in args.iter() {
+                    self.count_effects(a, found)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            _ => {}
         }
     }
 
@@ -3010,7 +2808,7 @@ impl Table {
     /// Returns the scheme and the substitution that built it, so the caller can
     /// spell the same variables the same way elsewhere.
     ///
-    /// A variable below the level is left where it stands, as a [`Core::Var`]
+    /// A variable below the level is left where it stands, as a [`Ty::Var`]
     /// in the scheme's body: it belongs to an enclosing binder, so every use of
     /// this scheme is to share it rather than get a copy. That is the whole of
     /// what makes `fn p => let q = p.x in q` one type rather than two — see
@@ -3121,7 +2919,7 @@ impl Table {
                 .map(|(var, at)| (var, scheme.presences() + at))
                 .collect(),
             // A scheme's body holds no rigid: generalization numbered every
-            // one into a [`Core::Bound`] before it published anything, so
+            // one into a [`Ty::Bound`] before it published anything, so
             // there is nothing here left to shift.
             rigids: HashMap::new(),
         };
@@ -3163,51 +2961,30 @@ impl Table {
     /// sits.
     fn quantify_walk(&self, ty: &Rc<Ty>, subst: &mut Subst, level: u32, presences: bool) {
         let ty = self.resolve(ty);
-        self.quantify_labels(&ty.fields, subst, level, presences);
-        match &ty.core {
-            Core::Var(var) => {
+        match &*ty {
+            Ty::Var(v) => {
                 if !presences {
-                    self.quantify_var(*var, subst, level);
+                    self.quantify_var(*v, subst, level)
                 }
             }
-            // A rigid is quantified rather than left standing: the annotation
-            // that declared it is exactly the scheme being built, so what was
-            // a promise about every caller while the body was checked becomes
-            // the quantifier that says so. No level to consult — a rigid was
-            // never minted, so there is no binder further out for it to belong
-            // to. One that belongs to a *different* annotation is numbered here
-            // too and reported separately: see [`Table::escapes`].
-            Core::Rigid { id, .. } => {
+            Ty::Rigid { id, .. } => {
                 if !presences {
                     let next = subst.next();
                     subst.rigids.entry(*id).or_insert(next);
                 }
             }
-            Core::Arrow(from, to, effects) => {
-                self.quantify_walk(from, subst, level, presences);
-                self.quantify_walk(to, subst, level, presences);
-                // The effect row is quantified with everything else, and an
-                // effect variable missed here would vanish from the scheme
-                // rather than be reported.
-                self.quantify_row(effects, subst, level, presences);
+            Ty::Arrow(a, b, r) => {
+                self.quantify_walk(a, subst, level, presences);
+                self.quantify_walk(b, subst, level, presences);
+                self.quantify_row(r, subst, level, presences)
             }
-            Core::Sum(cases) => self.quantify_row(cases, subst, level, presences),
-            // An argument left open is the definition's to quantify, the same
-            // as one written anywhere else: `WithX ..'a -> Nat` names its tail
-            // because this descends.
-            Core::Named { args, .. } => {
-                for arg in args.iter() {
-                    self.quantify_walk(arg, subst, level, presences);
+            Ty::Struct(r) | Ty::Sum(r) => self.quantify_row(r, subst, level, presences),
+            Ty::Named { args, .. } => {
+                for a in args.iter() {
+                    self.quantify_walk(a, subst, level, presences)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Bound(_)
-            | Core::Undecided => {}
+            _ => {}
         }
     }
 
@@ -3275,52 +3052,26 @@ impl Table {
     /// variables free — so everything published at level 0 outlives the solver.
     fn zonk(&self, ty: &Rc<Ty>, subst: &Subst) -> Rc<Ty> {
         let ty = self.resolve(ty);
-        let fields = self.zonk_labels(&ty.fields, subst);
-        let core = match &ty.core {
-            // A variable with no number is one quantifying was asked to leave
-            // alone: it belongs to a binder further out, and standing for
-            // itself is exactly what a scheme of a nested binding has to say
-            // about it.
-            Core::Var(var) => match subst.types.get(var) {
-                Some(at) => Core::Bound(*at),
-                None => ty.core.clone(),
-            },
-            // The rigid the annotation checked its body against, becoming the
-            // quantifier the scheme publishes. See
-            // [`quantify_walk`](Self::quantify_walk).
-            //
-            // Indexed rather than looked up, unlike the variable above: a
-            // variable may belong to a binder further out and be left standing,
-            // and a rigid belongs to nobody further out. Every caller quantifies
-            // the very type it then zonks, and quantifying numbers every rigid
-            // it walks whatever the level, so a rigid reaching here has a
-            // position.
-            Core::Rigid { id, .. } => Core::Bound(subst.rigids[id]),
-            Core::Arrow(from, to, effects) => Core::Arrow(
-                self.zonk(from, subst),
-                self.zonk(to, subst),
-                self.zonk_row(effects, subst),
+        Rc::new(match &*ty {
+            Ty::Var(v) => subst
+                .types
+                .get(v)
+                .map_or_else(|| Ty::Var(*v), |at| Ty::Bound(*at)),
+            Ty::Rigid { id, .. } => Ty::Bound(subst.rigids[id]),
+            Ty::Arrow(a, b, r) => Ty::Arrow(
+                self.zonk(a, subst),
+                self.zonk(b, subst),
+                self.zonk_row(r, subst),
             ),
-            Core::Sum(cases) => Core::Sum(self.zonk_row(cases, subst)),
-            // Rebuilt rather than handed back, because an argument may hold a
-            // variable and what leaves here may not. Nothing downstream
-            // resolves one, so a `Core::Var` that survived this would reach a
-            // reader as an unanswerable `?3`.
-            Core::Named { symbol, name, args } => Core::Named {
+            Ty::Struct(r) => Ty::Struct(self.zonk_row(r, subst)),
+            Ty::Sum(r) => Ty::Sum(self.zonk_row(r, subst)),
+            Ty::Named { symbol, name, args } => Ty::Named {
                 symbol: *symbol,
                 name: name.clone(),
-                args: args.iter().map(|arg| self.zonk(arg, subst)).collect(),
+                args: args.iter().map(|a| self.zonk(a, subst)).collect(),
             },
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Bound(_)
-            | Core::Undecided => ty.core.clone(),
-        };
-        Rc::new(Ty { core, fields })
+            other => other.clone(),
+        })
     }
 
     /// [`zonk`](Self::zonk) over a sum's cases.
@@ -3387,7 +3138,7 @@ impl Table {
     /// argument is typed `?5 -> ?5`, which `a : Nat` never mentions and
     /// generalization therefore never numbered. A variable like that is
     /// unconstrained rather than unknown, so it is quantified here and
-    /// numbered on from the scheme's — which leaves no [`Core::Var`] anywhere in
+    /// numbered on from the scheme's — which leaves no [`Ty::Var`] anywhere in
     /// the program for a consumer to have to resolve, and still spells a
     /// variable the scheme does name the way the scheme names it.
     /// Resolve `ty` and give a name to whatever is still unsolved in it,
@@ -3555,7 +3306,7 @@ impl Table {
 /// it was given — [`Table::zonk`] about a formula rather than about a type.
 ///
 /// A variable with no number is left standing, for the same reason a
-/// [`Core::Var`] is: it belongs to a binder further out, and a conjunct linking
+/// [`Ty::Var`] is: it belongs to a binder further out, and a conjunct linking
 /// a quantified presence to an outer one moves into the scheme with the outer
 /// one kept free. That is standard HM(X), and the level machinery is what
 /// decided the entitlement.
@@ -3576,40 +3327,24 @@ fn quantify_formula(formula: &Formula, subst: &Subst) -> Formula {
 /// below the ones that move and is left exactly where it is, which is why
 /// neither [`Presence::Bound`] nor the formula's [`Atom::Bound`] appears here.
 ///
-/// Unconditional over [`Core::Bound`] and [`Rest::Bound`]: every one of those is
+/// Unconditional over [`Ty::Bound`] and [`Rest::Bound`]: every one of those is
 /// a type or a row position by construction, since a presence is only ever
 /// written as a [`Presence::Bound`].
 fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
-    let fields = shift_labels(&ty.fields, by);
-    let core = match &ty.core {
-        Core::Bound(at) => Core::Bound(at + by),
-        Core::Arrow(from, to, effects) => {
-            Core::Arrow(shift(from, by), shift(to, by), shift_row(effects, by))
-        }
-        Core::Sum(cases) => Core::Sum(shift_row(cases, by)),
-        Core::Named { symbol, name, args } => Core::Named {
+    Rc::new(match &**ty {
+        Ty::Bound(at) => Ty::Bound(at + by),
+        Ty::Arrow(a, b, r) => Ty::Arrow(shift(a, by), shift(b, by), shift_row(r, by)),
+        Ty::Struct(r) => Ty::Struct(shift_row(r, by)),
+        Ty::Sum(r) => Ty::Sum(shift_row(r, by)),
+        Ty::Named { symbol, name, args } => Ty::Named {
             symbol: *symbol,
             name: name.clone(),
-            args: args.iter().map(|arg| shift(arg, by)).collect(),
+            args: args.iter().map(|a| shift(a, by)).collect(),
         },
-        // A variable is one an enclosing binder still owns, and a rigid is
-        // numbered by the zonk that follows this: neither is a position in the
-        // space being made room in.
-        Core::Unit
-        | Core::Nat
-        | Core::Int
-        | Core::Real
-        | Core::String
-        | Core::Boolean
-        | Core::Var(_)
-        | Core::Rigid { .. }
-        | Core::Undecided => ty.core.clone(),
-    };
-    Rc::new(Ty { core, fields })
+        other => other.clone(),
+    })
 }
 
-/// [`shift`] over a sum's cases: the labels, and the tail when that is a
-/// position rather than a variable, a rigid or a decided end.
 fn shift_row(row: &Row, by: u32) -> Row {
     let labels = shift_labels(&row.labels, by);
     let rest = match &row.rest {
@@ -3637,7 +3372,7 @@ fn shift_labels(labels: &IndexMap<String, RowField>, by: u32) -> IndexMap<String
 /// The semantic type a written type denotes. A declared type stays the name it
 /// was written as — `Endo` stays `Endo`, and what it stands for is looked up
 /// where a shape is actually needed — and a type that failed to lower becomes
-/// [`Core::Undecided`], which absorbs rather than cascades.
+/// [`Ty::Undecided`], which absorbs rather than cascades.
 ///
 /// Keeping the name is what makes a recursive declaration lowerable at all: a
 /// body that named its own meaning would have to contain it, and nothing
@@ -3654,9 +3389,9 @@ fn shift_labels(labels: &IndexMap<String, RowField>, by: u32) -> IndexMap<String
 ///
 /// A `type` declaration's body reaches none of that. A `when` and a bare `..` are
 /// refused there outright, and the one tail it may have names a row parameter,
-/// which lowers to a [`Core::Bound`] — a leaf whose value comes from the use
+/// which lowers to a [`Ty::Bound`] — a leaf whose value comes from the use
 /// site, not a variable this table has to solve. So a declaration still lowers
-/// to something with no [`Core::Var`] anywhere in it, which several walks here
+/// to something with no [`Ty::Var`] anywhere in it, which several walks here
 /// rely on: it is why they may stop at a name rather than descend into what it
 /// stands for.
 fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
@@ -3684,7 +3419,7 @@ fn lower_type(mint: &Mint, table: &mut Table, ty: &Type) -> Rc<Ty> {
 /// tails are its parameters.
 #[derive(Default)]
 struct Tails {
-    cores: HashMap<String, Core>,
+    types: HashMap<String, Ty>,
     rows: HashMap<String, Rest>,
     /// The presences, by the names their `when`s wear. Two labels wearing one
     /// name share one variable, which is how a type says two fields are there
@@ -3738,19 +3473,21 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         table.rigids.insert(variable.id, variable.span);
         let name: Rc<str> = variable.name.as_str().into();
         match variable.sense {
-            Sense::Type | Sense::Fields => {
+            Sense::Type => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
-                let core = Core::Rigid {
-                    id: variable.id,
-                    name,
-                };
-                tails.cores.insert(variable.name.clone(), core);
+                tails.types.insert(
+                    variable.name.clone(),
+                    Ty::Rigid {
+                        id: variable.id,
+                        name,
+                    },
+                );
             }
-            // A sum's rest and an arrow's effects are both rests, spliced
+            // Every row sort has an explicit rest.
             // from the same map: which row a use splices into was fixed where
             // the variable's sense was, so the two senses lower the same way.
-            Sense::Cases | Sense::Effects => {
+            Sense::Fields | Sense::Cases | Sense::Effects => {
                 at.insert(variable.id, at.len() as u32);
                 rigids.push(variable.id);
                 let rest = Rest::Rigid {
@@ -3810,41 +3547,22 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
 /// variable this annotation declared, and a rigid in the type came from this
 /// annotation or from nowhere.
 fn close_rigids(ty: &Rc<Ty>, at: &HashMap<u32, u32>) -> Rc<Ty> {
-    let fields = ty
-        .fields
-        .iter()
-        .map(|(name, field)| {
-            let field = RowField {
-                presence: field.presence.clone(),
-                ty: close_rigids(&field.ty, at),
-            };
-            (name.clone(), field)
-        })
-        .collect();
-    let core = match &ty.core {
-        Core::Rigid { id, .. } => Core::Bound(at[id]),
-        Core::Arrow(from, to, effects) => Core::Arrow(
-            close_rigids(from, at),
-            close_rigids(to, at),
-            close_rigids_row(effects, at),
+    Rc::new(match &**ty {
+        Ty::Rigid { id, .. } => Ty::Bound(at[id]),
+        Ty::Arrow(a, b, r) => Ty::Arrow(
+            close_rigids(a, at),
+            close_rigids(b, at),
+            close_rigids_row(r, at),
         ),
-        Core::Sum(cases) => Core::Sum(close_rigids_row(cases, at)),
-        Core::Named { symbol, name, args } => Core::Named {
+        Ty::Struct(r) => Ty::Struct(close_rigids_row(r, at)),
+        Ty::Sum(r) => Ty::Sum(close_rigids_row(r, at)),
+        Ty::Named { symbol, name, args } => Ty::Named {
             symbol: *symbol,
             name: name.clone(),
-            args: args.iter().map(|arg| close_rigids(arg, at)).collect(),
+            args: args.iter().map(|a| close_rigids(a, at)).collect(),
         },
-        Core::Unit
-        | Core::Nat
-        | Core::Int
-        | Core::Real
-        | Core::String
-        | Core::Boolean
-        | Core::Var(_)
-        | Core::Bound(_)
-        | Core::Undecided => ty.core.clone(),
-    };
-    Rc::new(Ty { core, fields })
+        other => other.clone(),
+    })
 }
 
 /// [`close_rigids`] over a sum's cases: its payloads, and the rest it ends with.
@@ -3897,16 +3615,16 @@ fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
 /// scope.
 fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty> {
-    let core = match &ty.tracked {
+    let ty = match &ty.tracked {
         TypeKind::Prim(prim) => (*prim).into(),
-        TypeKind::Ident(symbol) => Core::Named {
+        TypeKind::Ident(symbol) => Ty::Named {
             symbol: *symbol,
             name: mint.name(*symbol).into(),
             // Lowering counted the arguments, so a name that reaches here bare
             // is one that takes none.
             args: Rc::from([]),
         },
-        TypeKind::Apply { head, args, .. } => Core::Named {
+        TypeKind::Apply { head, args, .. } => Ty::Named {
             symbol: *head,
             name: mint.name(*head).into(),
             args: args
@@ -3915,20 +3633,20 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
                 .collect(),
         },
         // A parameter is the position it was declared at, which is what
-        // unfolding hands an argument to. See [`Core::Bound`].
-        TypeKind::Param { index, .. } => Core::Bound(*index),
-        TypeKind::Arrow { from, to, effects } => Core::Arrow(
+        // unfolding hands an argument to. See [`Ty::Bound`].
+        TypeKind::Param { index, .. } => Ty::Bound(*index),
+        TypeKind::Arrow { from, to, effects } => Ty::Arrow(
             lower(mint, table, tails, from),
             lower(mint, table, tails, to),
             effect_row(table, tails, effects),
         ),
         // A row handed to a declaration as an argument, which is the one place
         // a row arrives without an arrow around it. It lowers to the row it is
-        // — [`Core::Sum`] is a set of labels and a rest, which is what a row of
+        // — [`Ty::Sum`] is a set of labels and a rest, which is what a row of
         // effects is too — and the position it is spliced into is what says
         // which of the three it is being read as. See
         // [`types::Shape`](crate::types::Shape).
-        TypeKind::Effects(effects) => Core::Sum(effect_row(table, tails, effects)),
+        TypeKind::Effects(effects) => Ty::Sum(effect_row(table, tails, effects)),
         // A written struct is unit carrying the fields that were written: the
         // fields are what the type says, and there is nothing else to it. A
         // field written `\name` is [`Presence::Absent`] in the position it was
@@ -3949,10 +3667,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
                 };
                 labels.insert(name.clone(), lowered);
             }
-            return Rc::new(Ty {
-                core: core_tail(table, tails, tail),
-                fields: labels,
-            });
+            Ty::Struct(row(table, tails, labels, tail))
         }
         // The struct arm again, about cases — except that a sum's cases are its
         // core and it carries no fields of its own. The one other difference is
@@ -3984,24 +3699,24 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
                 };
                 labels.insert(name.clone(), lowered);
             }
-            Core::Sum(row(table, tails, labels, tail))
+            Ty::Sum(row(table, tails, labels, tail))
         }
         // A hole the solver fills: a fresh variable, so whatever the position
         // meets decides it. `_` written by a reader and the field types of the
         // pattern desugar's exact demand are the same thing — a position left
         // to be decided, whoever left it — and the variable is what lets a
         // projection of a field and the demand for it share one answer.
-        TypeKind::Hole => Core::Var(table.fresh_core()),
+        TypeKind::Hole => Ty::Var(table.mint()),
         // A variable in a type position: the rigid its declaration
         // minted, shared by every mention of the name in this one annotation.
         //
         // Indexed rather than looked up: lowering refused a name nothing
         // declared, and a name read at another sort absorbed into
         // [`TypeKind::Error`] rather than reaching here.
-        TypeKind::Var(name) => tails.cores[name].clone(),
-        TypeKind::Error => Core::Undecided,
+        TypeKind::Var(name) => tails.types[name].clone(),
+        TypeKind::Error => Ty::Undecided,
     };
-    Rc::new(Ty::plain(core))
+    Rc::new(ty)
 }
 
 /// Whether one label is there, as its `when` clause says it: no clause means it
@@ -4080,31 +3795,13 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
     row(table, tails, labels, &effects.tail)
 }
 
-/// What a written struct's `..` stands for, which is the type its fields sit on.
-///
-/// [`row`] about the other shape, and shorter for it: a struct's rest is a whole
-/// type, so each of the four tails lowers to the core that already means it. No
-/// tail at all is [`Core::Unit`] — the type with nothing of its own, which
-/// allows no field it does not name. A bare `..` is a variable this definition
-/// may decide, `..'r` is that variable shared across one annotation, and `..'r`
-/// naming a parameter is a [`Core::Bound`], the position an argument is handed
-/// to — which is what keeps a declaration's body free of solver variables.
-fn core_tail(table: &mut Table, tails: &mut Tails, tail: &Option<Tail>) -> Core {
-    match tail.as_ref().map(|tail| &tail.of) {
-        None => Core::Unit,
-        Some(ir::Row::Anything) => Core::Var(table.fresh_core()),
-        Some(ir::Row::Named(name)) => tails.cores[name].clone(),
-        Some(ir::Row::Param { index, .. }) => Core::Bound(*index),
-    }
-}
-
-/// What a declared type stands for: [`Core::Named`] replaced by the body it was
+/// What a declared type stands for: [`Ty::Named`] replaced by the body it was
 /// declared with, holding the arguments it was applied to, and again for as
 /// long as that is another name.
 ///
 /// Substituting the arguments is opening the declaration's [`Scheme`], which is
 /// the same `open` that instantiates a definition's — a declaration's
-/// parameters and a scheme's quantified variables are both [`Core::Bound`], and
+/// parameters and a scheme's quantified variables are both [`Ty::Bound`], and
 /// both are handed their values from outside. One taking no arguments opens to
 /// its body unchanged, which is what this did before there were any.
 ///
@@ -4121,94 +3818,21 @@ fn core_tail(table: &mut Table, tails: &mut Tails, tail: &Option<Tail>) -> Core 
 /// strictly smaller piece of the type that came in. The same bargain
 /// [`Table::resolve`] has with the occurs check.
 ///
-/// A name with no declaration behind it is [`Core::Undecided`]: the only way to
+/// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
 pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
     let mut ty = ty.clone();
-    // The budget is the one [`Table::resolve`] keeps, for the reason it keeps
-    // it: it bounds what a bug in that check would cost rather than restating
-    // the guarantee — with one honest limit, below.
-    //
-    // What it bounds is a chain of *name bodies*. A step whose body is another
-    // name applied to something follows one declaration to the one declaration
-    // written at the head of its body, and a body has one head that `open`
-    // never renames — so the successor is a function of the declaration alone,
-    // and more than one such step per declaration means a declaration was
-    // visited twice, which is the loop lowering refuses.
-    //
-    // A step whose body is a parameter hands back an argument instead, and the
-    // budget resets: what is left to unfold starts a new chain, and correct
-    // programs put no bound on how many chains one call walks. Not
-    // `aliases.len()` — `type Id 'a = 'a` written `Id (Id Nat)` is two
-    // hand-backs from one declaration — and not any function of the table:
-    // each layer of `type I1 'a = I0 (I0 'a)`, `type I2 'a = I1 (I1 'a)`, …
-    // doubles the walk, so a tower of aliases is a correct program whose walk
-    // is exponential in the declarations it holds.
-    //
-    // The honest limit: a cycle routed *through* a parameter — `type Loop =
-    // Id Loop`, were lowering not refusing it — alternates one decrement with
-    // one reset, so this budget never exhausts and the hang goes uncaught.
-    // That shape is exactly what lowering's parameter tracking exists to
-    // refuse, and by the paragraph above no budget local to this function
-    // could catch it without also refusing correct programs.
     let mut budget = aliases.len();
-    while let Core::Named { symbol, args, .. } = &ty.clone().core {
-        // Indexed rather than looked up: a name that repeats a declaration
-        // binds nothing, so a name lowering wrote into a type is one this table
-        // has.
+    while let Ty::Named { symbol, args, .. } = &*ty.clone() {
         let scheme = &aliases[symbol];
-        budget = match &scheme.body().core {
-            Core::Bound(_) => aliases.len(),
-            _ => budget
-                .checked_sub(1)
-                .expect("a chain of declarations closed a loop that lowering should refuse"),
+        budget = match &**scheme.body() {
+            Ty::Bound(_) => aliases.len(),
+            _ => budget.checked_sub(1).expect("declaration loop"),
         };
-        let fresh: Vec<Assigned> = args.iter().map(|arg| Assigned::Ty(arg.clone())).collect();
-        // The name's own fields ride along: unfolding decides what the core
-        // stands for and says nothing about the fields written outside it.
-        // A declaration binds no presence — lowering refuses a `when` in one —
-        // so there is no presence list for unfolding to supply.
-        ty = splice(&ty.fields, &scheme.body().open(&fresh));
+        let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
+        ty = scheme.body().open(&fresh)
     }
     ty
-}
-
-/// A type whose core has been replaced by what it stands for: the inner type's
-/// core, carrying both sets of labels, the outer ones winning.
-///
-/// The one splice a struct has, and the whole of what makes a core stand for a
-/// type with fields of its own. `{ x: Nat, ..?3 }` with `?3` known to be
-/// `{ y: Nat }` is `{ x: Nat, y: Nat }`; `WithX Nat` unfolded is a `Nat`
-/// carrying an `x`. Both are this.
-///
-/// The outer labels win because they are the ones written where the whole type
-/// is read. A label *certainly there* on both sides would be a type naming a
-/// field twice, and there is no way left to reach one: lowering refuses an
-/// argument that repeats a label the declaration it goes to already names, and
-/// [`Solve::assign`]'s lacks check refuses every route through a variable that
-/// would bring the label in present. What that check lets through is a copy
-/// settled absent — not part of what the inner type says — so the one thing
-/// the rule decides in practice is to drop it for the outer label, which is
-/// the only reading, and it stays definite about what happens if either
-/// refusal is ever weakened.
-fn splice(outer: &IndexMap<String, RowField>, inner: &Rc<Ty>) -> Rc<Ty> {
-    if outer.is_empty() {
-        return inner.clone();
-    }
-    if inner.fields.is_empty() {
-        return Rc::new(Ty {
-            core: inner.core.clone(),
-            fields: outer.clone(),
-        });
-    }
-    let mut fields = outer.clone();
-    for (name, field) in &inner.fields {
-        fields.entry(name.clone()).or_insert_with(|| field.clone());
-    }
-    Rc::new(Ty {
-        core: inner.core.clone(),
-        fields,
-    })
 }
 
 impl Ty {
@@ -4220,42 +3844,18 @@ impl Ty {
     /// decided here rather than by the caller, because the position is what
     /// knows: see [`Assigned::as_row`].
     pub fn open(&self, fresh: &[Assigned]) -> Rc<Ty> {
-        let fields = open_labels(&self.fields, fresh);
-        let core = match &self.core {
-            // Not a leaf: what the variable stands for may carry fields, and
-            // the fields written outside it are kept over them. This is what a
-            // struct's row parameter is — `type WithX 'r = { x: Nat, ..'r }` puts
-            // its parameter here — so opening one is the substitution every
-            // other position already had.
-            Core::Bound(index) => {
-                return splice(&fields, &fresh[*index as usize].as_ty());
-            }
-            Core::Arrow(from, to, effects) => {
-                Core::Arrow(from.open(fresh), to.open(fresh), effects.open(fresh))
-            }
-            Core::Sum(cases) => Core::Sum(cases.open(fresh)),
-            // A declaration's own body reaches here holding its parameters, so
-            // `type Wrap 'a = { inner: Pair 'a 'a }` depends on this arm
-            // entirely.
-            Core::Named { symbol, name, args } => Core::Named {
+        match self {
+            Ty::Bound(i) => fresh[*i as usize].as_ty(),
+            Ty::Arrow(a, b, r) => Rc::new(Ty::Arrow(a.open(fresh), b.open(fresh), r.open(fresh))),
+            Ty::Struct(r) => Rc::new(Ty::Struct(r.open(fresh))),
+            Ty::Sum(r) => Rc::new(Ty::Sum(r.open(fresh))),
+            Ty::Named { symbol, name, args } => Rc::new(Ty::Named {
                 symbol: *symbol,
                 name: name.clone(),
-                args: args.iter().map(|arg| arg.open(fresh)).collect(),
-            },
-            // A rigid is a leaf and is never opened: what a scheme quantified is
-            // a [`Core::Bound`], and a rigid is what an annotation's own
-            // variable stands for while its body is being checked.
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Var(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => self.core.clone(),
-        };
-        Rc::new(Ty { core, fields })
+                args: args.iter().map(|a| a.open(fresh)).collect(),
+            }),
+            other => Rc::new(other.clone()),
+        }
     }
 }
 

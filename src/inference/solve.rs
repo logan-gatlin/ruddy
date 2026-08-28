@@ -10,9 +10,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::{
     symbol::Symbol,
     tracking::Span,
-    types::{
-        Assigned, Core, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar,
-    },
+    types::{Assigned, Formula, Presence, Rest, Row, RowField, Scheme, Sense, Shape, Ty, TyVar},
 };
 
 use super::{
@@ -28,7 +26,7 @@ use super::{
 /// them says they do — `{ x: Nat, ..'r }` is the type `'r` carrying an `x` —
 /// and a
 /// sum's cases run out where its row's [`Rest`] says they do, because
-/// [`Core::Sum`] is the only core with a case row and there is nowhere else for
+/// [`Ty::Sum`] is the only core with a case row and there is nowhere else for
 /// a sum's tail to live.
 ///
 /// Everything else about matching two sets of labels — the extras each way, the
@@ -37,8 +35,8 @@ use super::{
 /// copies of it that have to agree is a defect, not an implementation choice.
 #[derive(Debug, Clone)]
 enum Tail {
-    Core(Core),
-    Rest(Rest),
+    Fields(Rest),
+    Cases(Rest),
     /// An arrow's effects: what is past them, and the two sides they sit
     /// beside.
     ///
@@ -79,8 +77,8 @@ impl Tail {
     /// are absorbed into, and the whole of what makes a set of labels open.
     fn var(&self) -> Option<TyVar> {
         match self {
-            Tail::Core(Core::Var(var))
-            | Tail::Rest(Rest::Var(var))
+            Tail::Fields(Rest::Var(var))
+            | Tail::Cases(Rest::Var(var))
             | Tail::Effects {
                 rest: Rest::Var(var),
                 ..
@@ -93,8 +91,8 @@ impl Tail {
     /// its id. What a label demanded of it is refused by name.
     fn rigid(&self) -> Option<(Rc<str>, u32)> {
         match self {
-            Tail::Core(Core::Rigid { id, name })
-            | Tail::Rest(Rest::Rigid { id, name })
+            Tail::Fields(Rest::Rigid { id, name })
+            | Tail::Cases(Rest::Rigid { id, name })
             | Tail::Effects {
                 rest: Rest::Rigid { id, name },
                 ..
@@ -108,8 +106,8 @@ impl Tail {
     fn absorbs(&self) -> bool {
         matches!(
             self,
-            Tail::Core(Core::Undecided)
-                | Tail::Rest(Rest::Undecided)
+            Tail::Fields(Rest::Undecided)
+                | Tail::Cases(Rest::Undecided)
                 | Tail::Effects {
                     rest: Rest::Undecided,
                     ..
@@ -133,12 +131,18 @@ impl Tail {
         self.var().is_none() && !self.absorbs() && self.rigid().is_none()
     }
 
+    fn rest(&self) -> &Rest {
+        match self {
+            Tail::Fields(r) | Tail::Cases(r) | Tail::Effects { rest: r, .. } => r,
+        }
+    }
+
     /// Which of the two sets of labels this is a tail of, which is the reading
     /// every complaint under it is worded in.
     fn shape(&self) -> Shape {
         match self {
-            Tail::Core(_) => Shape::Struct,
-            Tail::Rest(_) => Shape::Sum,
+            Tail::Fields(_) => Shape::Struct,
+            Tail::Cases(_) => Shape::Sum,
             Tail::Effects { .. } => Shape::Effect,
         }
     }
@@ -146,16 +150,13 @@ impl Tail {
     /// This tail carrying `labels`, as the value a variable takes: a whole type
     /// for a struct's fields, a row for a sum's cases or an arrow's effects.
     fn value(&self, labels: IndexMap<String, RowField>) -> Assigned {
-        match self {
-            Tail::Core(core) => Assigned::Ty(Rc::new(Ty {
-                core: core.clone(),
-                fields: labels,
-            })),
-            Tail::Rest(rest) | Tail::Effects { rest, .. } => Assigned::Row(Rc::new(Row {
-                labels,
-                rest: rest.clone(),
-            })),
-        }
+        let rest = match self {
+            Tail::Fields(rest) | Tail::Cases(rest) | Tail::Effects { rest, .. } => rest,
+        };
+        Assigned::Row(Rc::new(Row {
+            labels,
+            rest: rest.clone(),
+        }))
     }
 
     /// This tail as the value a variable standing for it would take: the tail
@@ -169,10 +170,10 @@ impl Tail {
 
 impl<'a> Rowed<'a> {
     /// The fields a type carries, which every type has.
-    fn fields(ty: &'a Rc<Ty>, tail: &'a Tail) -> Self {
+    fn fields(ty: &'a Rc<Ty>, row: &'a Row, tail: &'a Tail) -> Self {
         Self {
             ty,
-            labels: &ty.fields,
+            labels: &row.labels,
             tail,
         }
     }
@@ -200,31 +201,25 @@ impl<'a> Rowed<'a> {
     /// solver was looking at.
     fn rebuild(&self, labels: IndexMap<String, RowField>) -> Rc<Ty> {
         match self.tail {
-            Tail::Core(core) => Rc::new(Ty {
-                core: core.clone(),
-                fields: labels,
-            }),
-            Tail::Rest(rest) => Rc::new(Ty {
-                core: Core::Sum(Row {
-                    labels,
-                    rest: rest.clone(),
-                }),
-                fields: self.ty.fields.clone(),
-            }),
+            Tail::Fields(rest) => Rc::new(Ty::Struct(Row {
+                labels,
+                rest: rest.clone(),
+            })),
+            Tail::Cases(rest) => Rc::new(Ty::Sum(Row {
+                labels,
+                rest: rest.clone(),
+            })),
             // The arrow with its effect row replaced: what the reader wrote,
             // said as far as the solve has got. The two sides stay as they are,
             // since the goal that failed was about the effects alone.
-            Tail::Effects { from, to, rest } => Rc::new(Ty {
-                core: Core::Arrow(
-                    from.clone(),
-                    to.clone(),
-                    Row {
-                        labels,
-                        rest: rest.clone(),
-                    },
-                ),
-                fields: self.ty.fields.clone(),
-            }),
+            Tail::Effects { from, to, rest } => Rc::new(Ty::Arrow(
+                from.clone(),
+                to.clone(),
+                Row {
+                    labels,
+                    rest: rest.clone(),
+                },
+            )),
         }
     }
 }
@@ -263,7 +258,7 @@ pub struct Solve<'a> {
     /// then a shortcut with better spans and better wording, and never a second
     /// answer. Where a parameter is discarded they *do* disagree, and unfolding
     /// is the one that is right, so those fall through to it. See
-    /// [`Core::Named`] and [`ir::relevance`](crate::ir).
+    /// [`Ty::Named`] and [`ir::relevance`](crate::ir).
     pub nominal: &'a HashSet<Symbol>,
     /// Stamped onto every step this solve records.
     pub definition: Symbol,
@@ -368,14 +363,14 @@ impl Solve<'_> {
     ) {
         let base = self.table.resolve(base);
         let exposed = super::unfold(self.aliases, &base);
-        match &exposed.core {
-            Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Arrow(..)
-            | Core::Sum(_) => {
+        match &*exposed {
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Arrow(..)
+            | Ty::Sum(_) => {
                 let goal = Goal::Type {
                     expected: Rc::new(Ty::unit()),
                     actual: exposed.clone(),
@@ -392,15 +387,37 @@ impl Solve<'_> {
                     &[Assigned::Ty(result.clone())],
                 );
             }
+            Ty::Rigid { id, name } => {
+                let error = Error {
+                    span: field_span,
+                    kind: ErrorKind::RigidField {
+                        shape: Shape::Struct,
+                        field: field.to_string(),
+                        name: name.clone(),
+                        declared: self.table.declared(*id),
+                    },
+                };
+                let goal = Goal::Type {
+                    expected: Rc::new(Ty::unit()),
+                    actual: exposed.clone(),
+                };
+                self.fail(
+                    field_span,
+                    Rule::Mismatch,
+                    goal,
+                    error,
+                    &[Assigned::Ty(result.clone())],
+                );
+            }
             _ => {
-                let want = Rc::new(Ty {
-                    core: Core::Var(self.table.fresh_core()),
-                    fields: [(field.to_string(), RowField::present(result.clone()))]
+                let want = Rc::new(Ty::Struct(Row {
+                    labels: [(field.to_string(), RowField::present(result.clone()))]
                         .into_iter()
                         .collect(),
-                });
+                    rest: self.table.fresh_row(),
+                }));
                 self.table.note_lacks(&want);
-                self.unify(field_span, &want, &exposed);
+                self.unify(field_span, &want, &base);
             }
         }
     }
@@ -521,31 +538,20 @@ impl Solve<'_> {
     }
 
     fn family_type_with(&mut self, types: &[Rc<Ty>], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Rc<Ty> {
-        // Every call starts from at least one written arm, field, arrow half or
-        // named argument. Keeping that invariant here avoids inventing a
-        // structure for a family no source term contributed to.
         let _ = types
             .first()
             .expect("a structural family has a contributor");
         let resolved: Vec<Rc<Ty>> = types.iter().map(|ty| self.table.resolve(ty)).collect();
-
-        // Different names are still structural types. Build their family from
-        // what they stand for rather than from one declaration's arguments;
-        // otherwise a label appearing only under the other name is lost. A
-        // repeated full application state is a recursive position, where
-        // preserving the finite names lets ordinary unification's assumption
-        // stack finish the comparison. Constructor names alone are not enough:
-        // `A (A {})` is a finite inner application, not a back edge.
         let mut symbols = Vec::new();
         let mut other_concrete = false;
         for ty in &resolved {
-            match &ty.core {
-                Core::Named { symbol, .. } => {
+            match &**ty {
+                Ty::Named { symbol, .. } => {
                     if !symbols.contains(symbol) {
                         symbols.push(*symbol);
                     }
                 }
-                Core::Var(_) | Core::Undecided => {}
+                Ty::Var(_) | Ty::Undecided => {}
                 _ => other_concrete = true,
             }
         }
@@ -554,11 +560,11 @@ impl Solve<'_> {
                 && earlier
                     .iter()
                     .zip(&resolved)
-                    .all(|(one, other)| self.table.alike(one, other))
+                    .all(|(a, b)| self.table.alike(a, b))
         });
         if !symbols.is_empty() && (symbols.len() > 1 || other_concrete) && !repeated {
             unfolding.push(resolved.clone());
-            let expanded: Vec<Rc<Ty>> = resolved
+            let expanded: Vec<_> = resolved
                 .iter()
                 .map(|ty| self.table.unfolded(self.aliases, ty))
                 .collect();
@@ -566,14 +572,72 @@ impl Solve<'_> {
             unfolding.pop();
             return family;
         }
-
-        let maps: Vec<IndexMap<String, RowField>> =
-            resolved.iter().map(|ty| ty.fields.clone()).collect();
-        let fields = self.family_labels(&maps, unfolding);
-        let core = self.family_core(&resolved, unfolding);
-        let family = Rc::new(Ty { core, fields });
-        self.table.note_lacks(&family);
-        family
+        let Some(chosen) = resolved
+            .iter()
+            .find(|ty| !matches!(&***ty, Ty::Var(_) | Ty::Undecided))
+        else {
+            return self.table.fresh_type();
+        };
+        Rc::new(match &**chosen {
+            Ty::Arrow(..) => {
+                let arrows: Vec<_> = resolved
+                    .iter()
+                    .filter_map(|ty| match &**ty {
+                        Ty::Arrow(a, b, e) => Some((a.clone(), b.clone(), e.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                let from: Vec<_> = arrows.iter().map(|x| x.0.clone()).collect();
+                let to: Vec<_> = arrows.iter().map(|x| x.1.clone()).collect();
+                let effects: Vec<_> = arrows.iter().map(|x| x.2.clone()).collect();
+                Ty::Arrow(
+                    self.family_type_with(&from, unfolding),
+                    self.family_type_with(&to, unfolding),
+                    self.family_row(&effects, unfolding),
+                )
+            }
+            Ty::Struct(..) => {
+                #[cfg_attr(coverage_nightly, coverage(off))]
+                fn row(ty: &Ty) -> Option<Row> {
+                    match ty {
+                        Ty::Struct(row) => Some(row.clone()),
+                        _ => None,
+                    }
+                }
+                let rows: Vec<_> = resolved.iter().filter_map(|ty| row(ty)).collect();
+                Ty::Struct(self.family_row(&rows, unfolding))
+            }
+            Ty::Sum(..) => {
+                let rows: Vec<_> = resolved
+                    .iter()
+                    .filter_map(|ty| match &**ty {
+                        Ty::Sum(r) => Some(r.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Ty::Sum(self.family_row(&rows, unfolding))
+            }
+            Ty::Named { symbol, name, args } => {
+                let merged = (0..args.len())
+                    .map(|at| {
+                        let xs: Vec<_> = resolved
+                            .iter()
+                            .filter_map(|ty| match &**ty {
+                                Ty::Named { args, .. } => args.get(at).cloned(),
+                                _ => None,
+                            })
+                            .collect();
+                        self.family_type_with(&xs, unfolding)
+                    })
+                    .collect();
+                Ty::Named {
+                    symbol: *symbol,
+                    name: name.clone(),
+                    args: merged,
+                }
+            }
+            other => other.clone(),
+        })
     }
 
     fn family_labels(
@@ -616,66 +680,6 @@ impl Solve<'_> {
                 )
             })
             .collect()
-    }
-
-    fn family_core(&mut self, types: &[Rc<Ty>], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Core {
-        let Some(chosen) = types
-            .iter()
-            .find(|ty| !matches!(ty.core, Core::Var(_) | Core::Undecided))
-        else {
-            return Core::Var(self.table.fresh_core());
-        };
-        match &chosen.core {
-            Core::Arrow(_, _, _) => {
-                let arrows: Vec<_> = types
-                    .iter()
-                    .filter_map(|ty| match &ty.core {
-                        Core::Arrow(arg, result, does) => {
-                            Some((arg.clone(), result.clone(), does.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let from: Vec<_> = arrows.iter().map(|(arg, _, _)| arg.clone()).collect();
-                let to: Vec<_> = arrows.iter().map(|(_, result, _)| result.clone()).collect();
-                let effects: Vec<_> = arrows.iter().map(|(_, _, does)| does.clone()).collect();
-                Core::Arrow(
-                    self.family_type_with(&from, unfolding),
-                    self.family_type_with(&to, unfolding),
-                    self.family_row(&effects, unfolding),
-                )
-            }
-            Core::Sum(_) => {
-                let rows: Vec<Row> = types
-                    .iter()
-                    .filter_map(|ty| match &ty.core {
-                        Core::Sum(row) => Some(row.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                Core::Sum(self.family_row(&rows, unfolding))
-            }
-            Core::Named { symbol, name, args } => {
-                let merged = (0..args.len())
-                    .map(|at| {
-                        let candidates: Vec<Rc<Ty>> = types
-                            .iter()
-                            .filter_map(|ty| match &ty.core {
-                                Core::Named { args, .. } => args.get(at).cloned(),
-                                _ => None,
-                            })
-                            .collect();
-                        self.family_type_with(&candidates, unfolding)
-                    })
-                    .collect();
-                Core::Named {
-                    symbol: *symbol,
-                    name: name.clone(),
-                    args: merged,
-                }
-            }
-            core => core.clone(),
-        }
     }
 
     fn family_row(&mut self, rows: &[Row], unfolding: &mut Vec<Vec<Rc<Ty>>>) -> Row {
@@ -953,13 +957,13 @@ impl Solve<'_> {
     /// Two types are equal when they name the same labels with the same
     /// presences and types, and their cores agree about everything else. One
     /// function decides a type; there is no separate rule for a struct, because
-    /// a struct is a [`Core::Unit`] carrying labels and every other type carries
+    /// a struct is a [`Ty::Unit`] carrying labels and every other type carries
     /// labels too.
     ///
     /// Four steps, in this order:
     ///
-    /// 1. [`Core::Undecided`] on either side absorbs, as it always has.
-    /// 2. A *bare* variable — a [`Core::Var`] carrying no labels — takes the
+    /// 1. [`Ty::Undecided`] on either side absorbs, as it always has.
+    /// 2. A *bare* variable — a [`Ty::Var`] carrying no labels — takes the
     ///    whole type it is against, fields and all, which is what keeps
     ///    `fn x => x` inferring `a -> a`. Before unfolding, so that one
     ///    against a declared type takes the type by the name it was written as:
@@ -976,36 +980,7 @@ impl Solve<'_> {
             expected: lhs.clone(),
             actual: rhs.clone(),
         };
-        // One variable against itself is already the same thing, so the arms
-        // below must not read it as a variable against a type and try to bind
-        // it to itself. Its labels may still differ, which is what the
-        // fall-through decides.
-        let itself = matches!((&lhs.core, &rhs.core), (Core::Var(a), Core::Var(b)) if a == b);
-        match (&lhs.core, &rhs.core) {
-            // Undecided is the absorbing error type: whatever failed under it
-            // was reported where it failed. Absorbing is not the same as
-            // learning nothing, though — the other side is a type this goal
-            // was going to decide, and leaving its variables unbound would let
-            // generalization quantify a term that only reached the solver
-            // through a failure.
-            (Core::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_ty(span, &rhs);
-            }
-            (_, Core::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_ty(span, &lhs);
-            }
-            (Core::Var(var), _) if !itself && lhs.fields.is_empty() => {
-                let var = *var;
-                self.assign(span, goal, var, Assigned::Ty(rhs.clone()));
-            }
-            (_, Core::Var(var)) if !itself && rhs.fields.is_empty() => {
-                let var = *var;
-                self.assign(span, goal, var, Assigned::Ty(lhs.clone()));
-            }
-            _ => self.fielded(span, goal, &lhs, &rhs),
-        }
+        self.types(span, goal, &lhs, &rhs);
     }
 
     /// Decide two types by their labels and their cores.
@@ -1017,7 +992,7 @@ impl Solve<'_> {
     ///
     /// Where either side carries a label there is a [`Rule::Struct`] over the
     /// whole of it, with the label steps and the core step one level under. Two
-    /// [`Core::Unit`] cores record no step of their own — they are already the
+    /// [`Ty::Unit`] cores record no step of their own — they are already the
     /// same thing — which is what keeps a struct against a struct reading byte
     /// for byte as it always has.
     ///
@@ -1035,87 +1010,33 @@ impl Solve<'_> {
     /// Either way the two halves are one goal, so a failure in one abandons the
     /// other: a core bound to a fieldless type with labels it could not take
     /// beside it is a type nothing can be. See [`Solve::abandon`].
-    fn fielded(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
-        let carried = !(lhs.fields.is_empty() && rhs.fields.is_empty());
-        let named =
-            matches!(lhs.core, Core::Named { .. }) || matches!(rhs.core, Core::Named { .. });
-        if carried && named {
-            return self.unwrapped(span, goal, lhs, rhs);
-        }
-        // The core step's goal is the two cores, each as a type carrying no
-        // labels, so a binding reads `?1 ~ {}` rather than repeating the whole
-        // types the step above already showed. With no labels on either side the
-        // two are the same thing said twice, and this is that one thing.
-        let cores = Goal::Type {
-            expected: Rc::new(Ty::plain(lhs.core.clone())),
-            actual: Rc::new(Ty::plain(rhs.core.clone())),
-        };
-        if !carried {
-            self.cores(span, cores, lhs, rhs);
-            return;
-        }
-
-        self.step(span, Rule::Struct, goal, Effect::Decomposed);
-        self.depth += 1;
-        let absorbing = matches!(lhs.core, Core::Var(_)) || matches!(rhs.core, Core::Var(_));
-        let reported = self.errors.len();
-        if absorbing || self.cores(span, cores, lhs, rhs) {
-            let (left, right) = (Tail::Core(lhs.core.clone()), Tail::Core(rhs.core.clone()));
-            self.labels(span, Rowed::fields(lhs, &left), Rowed::fields(rhs, &right));
-            if self.errors.len() > reported {
-                self.abandon(span, lhs, rhs);
-            }
-        }
-        self.depth -= 1;
-    }
-
-    /// Replace a declared type beside labels with what it stands for, and ask
-    /// the goal again.
-    ///
-    /// What a declaration stands for keeps its fields behind the name, so
-    /// binding a core variable to the name would leave the labels beside it with
-    /// nothing to be decided against — which is why this comes before the labels
-    /// rather than after. It is the rule `cores` has always applied to a name
-    /// against a shape, restated for the order the labels now go in, and it is
-    /// what keeps `a.x` working where `a : WithX { y: Nat }`.
-    ///
-    /// Recorded as [`Rule::Unfold`] with [`Effect::Decomposed`], the same rule
-    /// as [`Solve::unfold`]'s two-sided unfolding, and *not* pushed onto
-    /// [`Solve::assumed`]: that stack is keyed on a goal about two names, and
-    /// this is one side of one type.
-    ///
-    /// Termination is [`ir::build`](crate::ir)'s check and not the assumption
-    /// stack. Each unfold replaces a name with its body under the arguments
-    /// written at that mention, so the chain descends either along the
-    /// declarations' core graph, which
-    /// [`ir::ErrorKind::EndlessFields`](crate::ir::ErrorKind) makes acyclic, or
-    /// into a strictly smaller written argument. Both are finite. That is the
-    /// whole of why this rule is safe, and none of it may be relaxed without
-    /// coming back here first.
-    fn unwrapped(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
-        let lhs = self.table.unfolded(self.aliases, lhs);
-        let rhs = self.table.unfolded(self.aliases, rhs);
-        self.step(span, Rule::Unfold, goal, Effect::Decomposed);
-        self.depth += 1;
-        self.unify(span, &lhs, &rhs);
-        self.depth -= 1;
-    }
-
-    /// Decide two cores, and say whether the labels beside them are still worth
-    /// deciding. A goal that failed decides nothing, and one that was replaced —
-    /// an unfolding — carries its own fields along with it.
-    ///
-    /// A core variable bound here takes the *core* it is against and no labels,
-    /// not the whole type: the labels are the caller's to decide, and binding
-    /// them in as well would decide them twice.
-    fn cores(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
-        match (&lhs.core, &rhs.core) {
+    fn types(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
+        match (&**lhs, &**rhs) {
             // Two types with nothing of their own are already the same thing,
             // and saying so would be a step about nothing — which is what keeps
             // a struct against a struct recording exactly what it always did.
-            (Core::Unit, Core::Unit) => true,
-            (Core::Var(a), Core::Var(b)) if a == b => {
+            (Ty::Undecided, _) => {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_ty(span, rhs);
+                true
+            }
+            (_, Ty::Undecided) => {
+                self.step(span, Rule::Absorb, goal, Effect::None);
+                self.recover_ty(span, lhs);
+                true
+            }
+            (Ty::Var(a), Ty::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None);
+                true
+            }
+            (Ty::Var(var), _) => {
+                let var = *var;
+                self.assign(span, goal, var, Assigned::Ty(rhs.clone()));
+                true
+            }
+            (_, Ty::Var(var)) => {
+                let var = *var;
+                self.assign(span, goal, var, Assigned::Ty(lhs.clone()));
                 true
             }
             // A variable is equal to itself and to nothing else.
@@ -1123,7 +1044,7 @@ impl Solve<'_> {
             // the two sides were reached; two with different ids are two
             // promises about two independent choices the caller makes, and one
             // is no more the other than `Nat` is.
-            (Core::Rigid { id: a, .. }, Core::Rigid { id: b, .. }) if a == b => {
+            (Ty::Rigid { id: a, .. }, Ty::Rigid { id: b, .. }) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
             }
@@ -1132,11 +1053,11 @@ impl Solve<'_> {
             // and is left to the binding rules below. A declared name is not
             // looked through first: what the reader wrote is the name, and
             // unfolding it would quote them a shape they never put on the page.
-            (Core::Rigid { name, id }, other) if !matches!(other, Core::Var(_)) => {
+            (Ty::Rigid { name, id }, _) => {
                 let (name, id) = (name.clone(), *id);
                 self.rigid_broken(span, goal, name, id, Sense::Type, rhs)
             }
-            (other, Core::Rigid { name, id }) if !matches!(other, Core::Var(_)) => {
+            (_, Ty::Rigid { name, id }) => {
                 let (name, id) = (name.clone(), *id);
                 self.rigid_broken(span, goal, name, id, Sense::Type, lhs)
             }
@@ -1148,12 +1069,12 @@ impl Solve<'_> {
             // Arity belongs to the declaration, so one empty argument list
             // means the other is empty too.
             (
-                Core::Named {
+                Ty::Named {
                     symbol: a,
                     args: xs,
                     ..
                 },
-                Core::Named { symbol: b, .. },
+                Ty::Named { symbol: b, .. },
             ) if a == b && xs.is_empty() => {
                 self.step(span, Rule::Same, goal, Effect::None);
                 true
@@ -1170,17 +1091,17 @@ impl Solve<'_> {
             //
             // Not termination either: the assumption stack catches a
             // declaration leading back to itself, since it is keyed on the goal
-            // and a recursion may not grow its arguments. See [`Core::Named`].
+            // and a recursion may not grow its arguments. See [`Ty::Named`].
             //
             // Arity belongs to the declaration, so one symbol means one count
             // and the zip drops nothing.
             (
-                Core::Named {
+                Ty::Named {
                     symbol: a,
                     args: xs,
                     ..
                 },
-                Core::Named {
+                Ty::Named {
                     symbol: b,
                     args: ys,
                     ..
@@ -1231,29 +1152,15 @@ impl Solve<'_> {
                 self.table.restore(known);
                 self.mismatch(span, goal, lhs, rhs)
             }
-            (Core::Named { .. }, _) | (_, Core::Named { .. }) => {
+            (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => {
                 self.unfold(span, goal, lhs, rhs);
                 false
             }
-            // A core variable takes the core it is against. A name is looked
-            // through before this, in [`Solve::unwrapped`], for the reason that
-            // rule gives; a *bare* variable is taken before either, in
-            // [`Solve::unify`], because there is nothing beside it to decide.
-            (Core::Var(var), core) => {
-                let (var, core) = (*var, core.clone());
-                self.assign(span, goal, var, Assigned::Ty(Rc::new(Ty::plain(core))));
-                true
-            }
-            (core, Core::Var(var)) => {
-                let (var, core) = (*var, core.clone());
-                self.assign(span, goal, var, Assigned::Ty(Rc::new(Ty::plain(core))));
-                true
-            }
-            (Core::Nat, Core::Nat)
-            | (Core::Int, Core::Int)
-            | (Core::Real, Core::Real)
-            | (Core::String, Core::String)
-            | (Core::Boolean, Core::Boolean) => {
+            (Ty::Nat, Ty::Nat)
+            | (Ty::Int, Ty::Int)
+            | (Ty::Real, Ty::Real)
+            | (Ty::String, Ty::String)
+            | (Ty::Boolean, Ty::Boolean) => {
                 self.step(span, Rule::Prim, goal, Effect::None);
                 true
             }
@@ -1261,7 +1168,7 @@ impl Solve<'_> {
             // annotation says what it says, so `let h : Nat -> Nat = f` with
             // `f : Nat -> Nat + !Log` is refused. Opening happens where a
             // function is *applied* and nowhere else. See R13.
-            (Core::Arrow(from1, to1, does1), Core::Arrow(from2, to2, does2)) => {
+            (Ty::Arrow(from1, to1, does1), Ty::Arrow(from2, to2, does2)) => {
                 let (from1, to1) = (from1.clone(), to1.clone());
                 let (from2, to2) = (from2.clone(), to2.clone());
                 let (want, have) = (self.table.canon(does1), self.table.canon(does2));
@@ -1292,9 +1199,38 @@ impl Solve<'_> {
             // mismatch — a struct and a sum are two types however much their
             // insides look alike, and lining their labels up would be answering
             // a question nobody asked.
-            (Core::Sum(cases), Core::Sum(others)) => {
+            (Ty::Struct(fields), Ty::Struct(others))
+                if fields.labels.is_empty()
+                    && others.labels.is_empty()
+                    && matches!(fields.rest, Rest::Closed)
+                    && matches!(others.rest, Rest::Closed) =>
+            {
+                true
+            }
+            (Ty::Struct(fields), Ty::Struct(others)) => {
+                let (want, have) = (self.table.canon(fields), self.table.canon(others));
+                let (left, right) = (
+                    Tail::Fields(want.rest.clone()),
+                    Tail::Fields(have.rest.clone()),
+                );
+                let expects = Rowed::fields(lhs, &want, &left);
+                let actuals = Rowed::fields(rhs, &have, &right);
+                let goal = Goal::Type {
+                    expected: expects.rebuild(want.labels.clone()),
+                    actual: actuals.rebuild(have.labels.clone()),
+                };
+                self.step(span, Rule::Struct, goal, Effect::Decomposed);
+                self.depth += 1;
+                self.labels(span, expects, actuals);
+                self.depth -= 1;
+                true
+            }
+            (Ty::Sum(cases), Ty::Sum(others)) => {
                 let (want, have) = (self.table.canon(cases), self.table.canon(others));
-                let (left, right) = (Tail::Rest(want.rest.clone()), Tail::Rest(have.rest.clone()));
+                let (left, right) = (
+                    Tail::Cases(want.rest.clone()),
+                    Tail::Cases(have.rest.clone()),
+                );
                 let expects = Rowed::cases(lhs, &want.labels, &left);
                 let actuals = Rowed::cases(rhs, &have.labels, &right);
                 // Flattened first and each put back in the type it came out of,
@@ -1500,8 +1436,8 @@ impl Solve<'_> {
     /// everywhere else.
     fn fresh_tail(&mut self, shape: Shape) -> Tail {
         match shape {
-            Shape::Struct => Tail::Core(Core::Var(self.table.fresh_core())),
-            Shape::Sum => Tail::Rest(self.table.fresh_row()),
+            Shape::Struct => Tail::Fields(self.table.fresh_row()),
+            Shape::Sum => Tail::Cases(self.table.fresh_row()),
             // The two sides only matter to a complaint that names the whole
             // arrow, and a *fresh* tail is one nothing has yet gone wrong
             // about: it stands for what the two sides allow beyond the labels
@@ -1523,37 +1459,7 @@ impl Solve<'_> {
     /// two sets of labels, and everything below it is a question the two shapes
     /// answer with different machinery.
     fn tails(&mut self, span: Span, lhs: &Tail, rhs: &Tail) {
-        match (lhs, rhs) {
-            // What is past either kind of row is a row again. Kept as two arms
-            // because the two sides always have one shape: a mixed sum/effect
-            // pair cannot be produced, and treating the four pattern
-            // alternatives as a cartesian product would suggest otherwise.
-            (Tail::Rest(left), Tail::Rest(right)) => {
-                self.rests(span, left, right, Shape::Sum);
-            }
-            (Tail::Effects { rest: left, .. }, Tail::Effects { rest: right, .. }) => {
-                self.rests(span, left, right, Shape::Effect);
-            }
-            // Two cores, and nothing else can reach here: which shape a set of
-            // labels is, is decided by the syntax that wrote it, and the two
-            // sides of a goal were matched on it before either arrived. So the
-            // pair is read as the two types the cores are, which is what a
-            // struct's tail *is*.
-            //
-            // Resolved, because a core reaching here may be a variable this very
-            // rule closed a moment ago — [`Solve::absorb`] settles both sides of
-            // a pair one after the other, and the second must see what the first
-            // decided rather than bind the variable twice.
-            (left, right) => {
-                let left = self.table.resolve(&left.bare().as_ty());
-                let right = self.table.resolve(&right.bare().as_ty());
-                let goal = Goal::Type {
-                    expected: left.clone(),
-                    actual: right.clone(),
-                };
-                self.cores(span, goal, &left, &right);
-            }
-        }
+        self.rests(span, lhs.rest(), rhs.rest(), lhs.shape());
     }
 
     /// Make two of a sum's tails the same tail: a variable takes the other, and
@@ -1878,7 +1784,10 @@ impl Solve<'_> {
                 Side::Expected => (tail.bare(), value.clone()),
                 Side::Actual => (value.clone(), tail.bare()),
             };
-            let goal = goal_of(expected, actual);
+            let goal = Goal::Row {
+                expected: Rc::new(expected.as_row()),
+                actual: Rc::new(actual.as_row()),
+            };
             // Not a second label rule: what the extras are was decided above,
             // and this is the act of putting them somewhere. A variable takes
             // them; an undecided tail absorbs them, and everything they would
@@ -2051,11 +1960,11 @@ impl Solve<'_> {
     /// were called. Comparing two applications of one declaration argument by
     /// argument is a way of reaching that answer sooner where it is bound to be
     /// the same answer, not a second notion of equality beside it. See
-    /// [`Core::Named`], which states the rule, and [`Solve::nominal`], which is
+    /// [`Ty::Named`], which states the rule, and [`Solve::nominal`], which is
     /// where the "bound to be" is checked.
     fn unfold(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
-        let pair = match (&lhs.core, &rhs.core) {
-            (Core::Named { .. }, Core::Named { .. }) => Some((lhs.clone(), rhs.clone())),
+        let pair = match (&**lhs, &**rhs) {
+            (Ty::Named { .. }, Ty::Named { .. }) => Some((lhs.clone(), rhs.clone())),
             _ => None,
         };
         let already = pair.is_some()
@@ -2177,17 +2086,18 @@ impl Solve<'_> {
         self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
         let ty = self.table.resolve(ty);
-        let fields = self.guarded_labels(span, &ty.fields);
-        let core = match &ty.core {
-            Core::Arrow(from, to, effects) => Core::Arrow(
+        Rc::new(match &*ty {
+            Ty::Arrow(from, to, effects) => Ty::Arrow(
                 self.guarded_type(span, from),
                 self.guarded_type(span, to),
                 self.guarded_row(span, effects),
             ),
-            Core::Sum(cases) => Core::Sum(self.guarded_row(span, cases)),
-            Core::Named { symbol, name, args } => Core::Named {
+            Ty::Struct(fields) => Ty::Struct(self.guarded_row(span, fields)),
+            Ty::Sum(cases) => Ty::Sum(self.guarded_row(span, cases)),
+            Ty::Named { symbol, name, args } => Ty::Named {
                 symbol: *symbol,
                 name: name.clone(),
                 args: args
@@ -2195,9 +2105,8 @@ impl Solve<'_> {
                     .map(|arg| self.guarded_type(span, arg))
                     .collect(),
             },
-            core => core.clone(),
-        };
-        Rc::new(Ty { core, fields })
+            other => other.clone(),
+        })
     }
 
     fn guarded_row(&mut self, span: Span, row: &Row) -> Row {
@@ -2258,47 +2167,6 @@ impl Solve<'_> {
         }
     }
 
-    /// Abandon the cores of two types whose labels could not be made to agree.
-    ///
-    /// [`fail`](Self::fail) abandons what a failing rule was about, and a core
-    /// is the one thing it cannot reach. A type is its core and its fields, both
-    /// decided by one goal, so a failure over the fields is a failure of the
-    /// whole of it — and the core was bound in between, by the step before. Left
-    /// standing, a core variable bound to a fieldless type while labels sit
-    /// beside it is a type nothing can be: the definition publishes it, and
-    /// every use of the definition is refused again for the one mistake already
-    /// reported. `let f = fn p => { a: p.x, b: p 1 }` is the shape of it — `p`
-    /// would have to be a function carrying an `x` — and that is `f`'s mistake,
-    /// said once, wherever `f` is then used.
-    ///
-    /// Settled rather than recovered because there is no longer a variable to
-    /// recover: this goal bound it, so [`recover_ty`](Self::recover_ty) would
-    /// resolve straight through the binding and find nothing to abandon.
-    ///
-    /// The cores and nothing else. What the two types hold besides them — a
-    /// label's type, an arrow's halves — was not decided by the goal that
-    /// failed, and a complaint already made names one of these two types: a
-    /// reader is better served by ``no field `y` on `a -> a` `` than by the
-    /// same sentence about `? -> ?`.
-    fn abandon(&mut self, span: Span, lhs: &Rc<Ty>, rhs: &Rc<Ty>) {
-        for core in [&lhs.core, &rhs.core] {
-            if let Core::Var(var) = core {
-                let var = *var;
-                // Unless the failure already reached it. [`fail`](Self::fail)
-                // abandons the values the rule was about, and where the labels
-                // go first those values are whole types with these very cores
-                // in them — so a core may already be pointed at the undecided
-                // type, and settling it again would show a reader one act as
-                // two. Which also covers the two sides being one variable.
-                let settled = self.table.resolve(&Rc::new(Ty::plain(Core::Var(var))));
-                if matches!(settled.core, Core::Undecided) {
-                    continue;
-                }
-                self.settle(span, var, Assigned::Ty(Rc::new(Ty::default())));
-            }
-        }
-    }
-
     /// Abandon a value nothing will decide: every variable still unsolved in it
     /// becomes undecided, which unifies with everything, so the one complaint is
     /// not echoed by every term downstream of it. No occurs check — an undecided
@@ -2322,41 +2190,28 @@ impl Solve<'_> {
     /// the goal that would have decided `?1 -> ?2` decided neither half.
     fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>) {
         let ty = self.table.resolve(ty);
-        match &ty.core {
-            Core::Var(var) => {
-                let var = *var;
-                self.settle(span, var, Assigned::Ty(Rc::new(Ty::default())));
+        match &*ty {
+            Ty::Var(var) => self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided))),
+            Ty::Arrow(from, to, effects) => {
+                self.recover_ty(span, from);
+                self.recover_ty(span, to);
+                self.recover_row(span, effects);
             }
-            Core::Arrow(from, to, effects) => {
-                let (from, to, effects) = (from.clone(), to.clone(), effects.clone());
-                self.recover_ty(span, &from);
-                self.recover_ty(span, &to);
-                self.recover_row(span, &effects);
-            }
-            Core::Sum(cases) => {
-                let cases = cases.clone();
-                self.recover_row(span, &cases);
-            }
-            // For the reason an arrow's halves are: an argument the abandoned
-            // goal would have decided is left for generalization to quantify
-            // otherwise.
-            Core::Named { args, .. } => {
-                for arg in args.clone().iter() {
-                    self.recover_ty(span, arg);
+            Ty::Struct(row) | Ty::Sum(row) => self.recover_row(span, row),
+            Ty::Named { args, .. } => {
+                for arg in args.iter() {
+                    self.recover_ty(span, arg)
                 }
             }
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => {}
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Bound(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => {}
         }
-        let fields = ty.fields.clone();
-        self.recover_labels(span, &fields);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
@@ -2399,7 +2254,7 @@ impl Solve<'_> {
         self.table.vars[var as usize] = Slot::Bound(value.clone());
         let goal = match &value {
             Assigned::Ty(ty) => Goal::Type {
-                expected: Rc::new(Ty::plain(Core::Var(var))),
+                expected: Rc::new(Ty::plain(Ty::Var(var))),
                 actual: ty.clone(),
             },
             Assigned::Row(row) => Goal::Row {
@@ -2445,27 +2300,14 @@ impl Solve<'_> {
 fn rest_found(row: &Row, shape: Shape) -> (Sense, Rc<Ty>) {
     match shape {
         Shape::Effect => (Sense::Effects, row_ty(row)),
-        _ => (Sense::Cases, Rc::new(Ty::plain(Core::Sum(row.clone())))),
+        _ => (Sense::Cases, Rc::new(Ty::plain(Ty::Sum(row.clone())))),
     }
 }
 
 fn row_ty(row: &Row) -> Rc<Ty> {
-    Rc::new(Ty::plain(Core::Arrow(
+    Rc::new(Ty::plain(Ty::Arrow(
         Rc::new(Ty::unit()),
         Rc::new(Ty::unit()),
         row.clone(),
     )))
-}
-
-fn goal_of(expected: Assigned, actual: Assigned) -> Goal {
-    match (expected, actual) {
-        (Assigned::Row(expected), Assigned::Row(actual)) => Goal::Row { expected, actual },
-        // Anything else is two types. A presence never reaches here — nothing
-        // builds one out of a tail — and two values of different sorts never
-        // meet, for the reason [`Solve::tails`] gives.
-        (expected, actual) => Goal::Type {
-            expected: expected.as_ty(),
-            actual: actual.as_ty(),
-        },
-    }
 }

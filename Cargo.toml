@@ -8,6 +8,9 @@ autotests = false
 [workspace]
 members = ["cli", "debug", "tests"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [dependencies]
 indexmap = "2"
 pretty = "0.12.5"

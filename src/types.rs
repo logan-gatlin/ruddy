@@ -12,10 +12,8 @@ use crate::symbol::Symbol;
 /// [`ir::TypeKind`](crate::ir::TypeKind) and the semantic type language, so the
 /// two can never disagree about which primitives exist.
 ///
-/// Unit is deliberately not one of them. `()` is a spelling of the type with
-/// nothing of its own and no fields, not a type of its own, so there is nothing
-/// here for it to name; see [`Core::Unit`] for why it stays that way even though
-/// it means the compiler answers in `{}` where the user wrote `()`.
+/// Unit is deliberately not one of them. `()` is the empty closed
+/// [`Ty::Struct`], so there is no primitive for it to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
     /// The type of unsigned 64-bit integer literals.
@@ -85,11 +83,8 @@ impl EffectId {
 /// unified, flattened, generalized and printed by the same code, and this is the
 /// only thing that tells them apart.
 ///
-/// What each says about the names it does not list is the one place the two
-/// differ. A struct's is the core beside it — [`Ty::fields`] is a bare label map
-/// and [`Ty::core`] is what its `..` stands for — and a sum's is the
-/// [`Rest`] inside its [`Row`]. So a struct's fields have no tail of their own,
-/// and [`Row`] and [`Rest`] survive for [`Core::Sum`] alone.
+/// Every shape uses an explicit [`Row`] and [`Rest`]; the containing `Ty`
+/// variant determines whether its labels are fields, cases, or effects.
 ///
 /// Stored nowhere. Where a set of labels sits already says which it is, so the
 /// shape is a *reading* the caller carries down — the way `solve::Rowed` does —
@@ -172,7 +167,7 @@ pub enum ParamKind {
     /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
     ///
     /// The one reading that is not a type, and the reason it is enforced rather
-    /// than substituted: a sum's rest is spliced into [`Core::Sum`]'s row, so
+    /// than substituted: a sum's rest is spliced into [`Ty::Sum`]'s row, so
     /// anything else written there would leave a row holding what no row can
     /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
     Cases { lacks: IndexSet<String> },
@@ -181,7 +176,7 @@ pub enum ParamKind {
     /// `type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e`.
     ///
     /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
-    /// row's rest is spliced into the row [`Core::Arrow`] carries, so anything
+    /// row's rest is spliced into the row [`Ty::Arrow`] carries, so anything
     /// else written there would leave a row holding what no row can hold.
     Effects { lacks: IndexSet<String> },
 }
@@ -255,42 +250,10 @@ pub struct Scheme {
     formula: Formula,
 }
 
-/// A type: what it is, and the struct fields it carries.
-///
-/// Every type has both halves. `Nat` is the `Nat` core with no fields; a struct
-/// is the [`Core::Unit`] core with fields; and a `Nat` that carries an `x` is
-/// the `Nat` core with an `x`, which the solver can infer and the printer can
-/// show even though no source syntax writes one.
-///
-/// Splitting them this way is what makes "has fields" a property of every type
-/// rather than of one shape of type. Two types are equal when they name the same
-/// labels and their cores agree about everything else, which is one rule where
-/// there used to be a rule about structs and a complaint for everything else.
-///
-/// The fields are a bare label map with no tail of their own, because the core
-/// beside them *is* their tail: `{ x: Nat, ..'r }` is the type `'r` carrying an
-/// `x`, and what the type says about the fields it does not name is the whole of
-/// what its core says. So one variable does the work two used to — `fn a => a.x`
-/// is `{ x: 'a, ..'b } -> 'a` — and substituting for a struct's `..` is
-/// substituting a type, which is the one substitution the compiler already has.
+/// A semantic type. Only `Struct` contains structural fields; every other
+/// constructor is fieldless by construction.
 #[derive(Debug, Clone, Default)]
-pub struct Ty {
-    pub core: Core,
-    /// The labels this type carries, each either there or not. What the type
-    /// says about the labels it does *not* name is [`Ty::core`]: a `Unit`,
-    /// `Nat`, `Arrow`, `Sum` or `Named` core names no others, a [`Core::Var`]
-    /// stands for whatever that variable has, a [`Core::Bound`] for whatever the
-    /// parameter has, and [`Core::Undecided`] has nothing further to report.
-    pub fields: IndexMap<String, RowField>,
-}
-
-/// What a type is, before the fields it carries.
-#[derive(Debug, Clone, Default)]
-pub enum Core {
-    /// A type with nothing of its own. `{}` and `()` are this with no fields,
-    /// which is why unit falls out of the printer as `{}` rather than as `()`:
-    /// there is one type here and one spelling for it.
-    Unit,
+pub enum Ty {
     Nat,
     Int,
     Real,
@@ -305,9 +268,11 @@ pub enum Core {
     /// what the printer writes as nothing at all.
     ///
     /// The third position is [`Shape::Effect`]'s only home, the way
-    /// [`Core::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
+    /// [`Ty::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
     /// property of every type, so there is nowhere else for the row to live.
     Arrow(Rc<Ty>, Rc<Ty>, Row),
+    /// A structural record and its true field-row tail.
+    Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
     /// tail saying what is known about the cases not named.
     ///
@@ -317,18 +282,14 @@ pub enum Core {
     /// — is written once and reaches both, with [`Shape`] as the only thing
     /// saying which is being read.
     ///
-    /// The one place a [`Row`] survives, and so the one place a [`Rest`] does.
-    /// A struct's `..` moved into the core beside its fields because every type
-    /// has fields and so every core can carry them; "is one of these cases" is
-    /// not a property of every type, and this is the only core with a case row,
-    /// so there is no core position for a sum's tail to move into.
+    /// Sum cases and their explicit tail.
     Sum(Row),
     Var(TyVar),
     /// A variable some [`Scheme`] binds, by its position in that scheme.
     ///
     /// Which scheme depends on where the type came from, and the two never
     /// meet. In a definition's scheme it is a variable generalization
-    /// quantified, and instantiation hands it a fresh [`Core::Var`]. In a
+    /// quantified, and instantiation hands it a fresh [`Ty::Var`]. In a
     /// declaration's scheme it is one of the declaration's parameters, and
     /// unfolding hands it the argument written at the use site. Both are the
     /// same substitution — see `open` in [`inference`](crate::inference) — which
@@ -355,12 +316,12 @@ pub enum Core {
     ///
     /// `id` is unique per declaration occurrence across the whole program, so
     /// two annotations that each write `a` never collide however alike they
-    /// look. `name` is the spelling, carried for the reason [`Core::Named`]
+    /// look. `name` is the spelling, carried for the reason [`Ty::Named`]
     /// carries one: [`Display`](std::fmt::Display) is handed a bare type with no
     /// table to ask.
     ///
-    /// A leaf, unlike [`Core::Bound`]. Nothing supplies a value for it — the
-    /// scheme the annotation publishes re-quantifies it into a [`Core::Bound`]
+    /// A leaf, unlike [`Ty::Bound`]. Nothing supplies a value for it — the
+    /// scheme the annotation publishes re-quantifies it into a [`Ty::Bound`]
     /// at generalization — so the fields written beside one are the whole of
     /// what a type carrying it says.
     Rigid {
@@ -433,13 +394,8 @@ pub enum Core {
     Undecided,
 }
 
-/// The cases a sum allows, each either there or not, and what is known about
+/// The fields/cases/effects a row allows and what is known beyond its labels.
 /// the ones it does not list.
-///
-/// A sum's business and nothing else: this appears inside [`Core::Sum`] and
-/// nowhere else in the type language, because a struct's fields are a bare label
-/// map on [`Ty`] whose tail is the core beside them. See [`Rest`] for why the
-/// two are not the same shape of thing.
 ///
 /// A type of its own rather than a shape of [`Ty`], and that is what makes the
 /// recursion terminate: a closed tail is a [`Rest::Closed`], not a type that
@@ -450,21 +406,8 @@ pub struct Row {
     pub rest: Rest,
 }
 
-/// What is known about the cases a [`Row`] does not name.
-///
-/// A sum's alone. A struct once had one of these too, and it said the same thing
-/// twice: a [`Core::Var`] beside a field map already stands for a whole type
-/// that may carry fields of its own, so the tail variable next to it was a
-/// second mechanism for one meaning. The two are now one, and what a struct says
-/// about the fields it does not name is its core.
-///
-/// The same merge cannot be done here, and that asymmetry is why this type
-/// survives. "Has fields" is a property of every type, so every core can carry
-/// them; "is one of these cases" is not, and [`Core::Sum`] is the only core with
-/// a case row, so there is no core position for a sum's tail to move into. It is
-/// also why [`Sense`], [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind) and
-/// [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind) still have two things
-/// to tell apart.
+/// What is known beyond the labels a [`Row`] names. The containing type fixes
+/// whether this is a field, case, or effect-row tail.
 #[derive(Debug, Clone, Default)]
 pub enum Rest {
     /// Every case not named is absent: the row lists all of them.
@@ -474,14 +417,14 @@ pub enum Rest {
     /// A tail a scheme quantified, or one a declaration takes as a sum's rest.
     /// A leaf: what it stands for is supplied from outside.
     Bound(u32),
-    /// A rest an annotation introduced: [`Core::Rigid`] about a
+    /// A rest an annotation introduced: [`Ty::Rigid`] about a
     /// sum's cases, and rigid for the same reason and on the same terms.
     Rigid {
         id: u32,
         name: Rc<str>,
     },
     /// A failure abandoned the question, or a reporter froze it. Absorbs, the
-    /// way [`Core::Undecided`] does.
+    /// way [`Ty::Undecided`] does.
     Undecided,
     /// A tail that has been decided to be more cases, and then whatever is
     /// past them: a sum's row parameter handed a written sum, or a tail variable
@@ -598,7 +541,7 @@ impl Assigned {
     pub fn as_ty(&self) -> Rc<Ty> {
         match self {
             Assigned::Ty(ty) => ty.clone(),
-            Assigned::Row(_) | Assigned::Presence(_) => Rc::new(Ty::plain(Core::Undecided)),
+            Assigned::Row(_) | Assigned::Presence(_) => Rc::new(Ty::Undecided),
         }
     }
 
@@ -623,9 +566,10 @@ impl Assigned {
     pub fn as_row(&self) -> Row {
         match self {
             Assigned::Row(row) => (**row).clone(),
-            Assigned::Ty(ty) => match (&ty.core, ty.fields.is_empty()) {
-                (Core::Var(var), true) => Row::of(Rest::Var(*var)),
-                _ => ty.cases(),
+            Assigned::Ty(ty) => match &**ty {
+                Ty::Var(var) => Row::of(Rest::Var(*var)),
+                Ty::Struct(row) | Ty::Sum(row) => row.clone(),
+                _ => Row::of(Rest::Undecided),
             },
             Assigned::Presence(_) => Row::closed(),
         }
@@ -650,7 +594,7 @@ impl Assigned {
     /// minted for.
     pub fn variable(&self, var: TyVar) -> Self {
         match self {
-            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::plain(Core::Var(var)))),
+            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::Var(var))),
             Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Var(var)))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Var(var)),
         }
@@ -668,50 +612,41 @@ impl Assigned {
     }
 }
 
-impl Core {
+impl Ty {
     /// `from -> to`, performing nothing: [`Row::closed`] with no labels, which
     /// is what a bare `A -> B` means and what the printer writes as nothing at
     /// all. Every position that builds an arrow with no effects to put on it
     /// goes through here rather than spelling the empty row again.
     pub fn pure(from: Rc<Ty>, to: Rc<Ty>) -> Self {
-        Core::Arrow(from, to, Row::closed())
+        Ty::Arrow(from, to, Row::closed())
     }
 }
 
-impl From<Prim> for Core {
+impl From<Prim> for Ty {
     fn from(value: Prim) -> Self {
         match value {
-            Prim::Nat => Core::Nat,
-            Prim::Int => Core::Int,
-            Prim::Real => Core::Real,
-            Prim::String => Core::String,
-            Prim::Boolean => Core::Boolean,
+            Prim::Nat => Ty::Nat,
+            Prim::Int => Ty::Int,
+            Prim::Real => Ty::Real,
+            Prim::String => Ty::String,
+            Prim::Boolean => Ty::Boolean,
         }
     }
 }
 
 impl Ty {
-    /// A type that is only its core, carrying no fields at all. Every type the
-    /// language can currently *write* is one of these or a [`Ty::unit`] with
-    /// fields, so this is what nearly every constructor in the compiler wants.
-    pub fn plain(core: Core) -> Self {
-        Self {
-            core,
-            fields: IndexMap::new(),
-        }
+    /// Compatibility constructor for callers that already have a complete
+    /// explicit type value.
+    pub fn plain(ty: Ty) -> Self {
+        ty
     }
 
-    /// The type with nothing of its own and no fields: what `()` and `{}` both
-    /// spell, what a case written with no payload carries, and what a struct
-    /// type is before its fields are put in.
-    ///
-    /// One spelling and one constructor, because a second empty type would be
-    /// one the solver could find not quite equal to the first.
+    /// The empty closed struct, also used for unit.
     pub fn unit() -> Self {
-        Self::plain(Core::Unit)
+        Self::Struct(Row::closed())
     }
 
-    /// The cases this type allows: the row inside a [`Core::Sum`], and the one
+    /// The cases this type allows: the row inside a [`Ty::Sum`].
     /// thing anything still asks a type for a row about.
     ///
     /// Anything else is an argument [`ir::build`](crate::ir::build) already
@@ -719,8 +654,8 @@ impl Ty {
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {
-        match &self.core {
-            Core::Sum(cases) => cases.clone(),
+        match self {
+            Ty::Sum(cases) => cases.clone(),
             _ => Row::of(Rest::Undecided),
         }
     }
@@ -762,14 +697,14 @@ impl RowField {
 
 impl Scheme {
     /// Close `body` over the type and row variables it binds, requiring nothing
-    /// of its presences. Every [`Core::Bound`] and [`Rest::Bound`] in `body`
+    /// of its presences. Every [`Ty::Bound`] and [`Rest::Bound`] in `body`
     /// must be an index below `count`; opening one trusts that.
     ///
     /// Two things are closed this way and the difference is only in who
     /// supplies the values: a definition's scheme binds what generalization
     /// quantified, and instantiation hands each one a fresh variable; a
     /// declaration's binds its parameters, and unfolding hands each one the
-    /// argument written at the use site. See [`Core::Bound`].
+    /// argument written at the use site. See [`Ty::Bound`].
     ///
     /// A declaration's scheme is always one of these: a declaration's body
     /// holds no presence variable — lowering refuses a `when` there for the

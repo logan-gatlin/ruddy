@@ -8,7 +8,7 @@ use std::{
 use indexmap::IndexMap;
 use ruddy::{
     artifact::{
-        self, Artifact, Block, Callee, Core, End, Formula, Global, Instr, Lir, Literal, Op, Param,
+        self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
         Presence, Rep, Rest, Row, RowField, Scheme, Type,
     },
     inference, ir, lir, parse, patterns,
@@ -41,39 +41,27 @@ fn built(source: &str) -> Artifact {
     Artifact::build(&mint, &program, &inferred, &lowered)
 }
 
-fn plain(core: Core) -> Type {
-    Type {
-        core,
-        fields: Vec::new(),
-    }
+fn plain(ty: Type) -> Type {
+    ty
+}
+fn unit() -> Type {
+    Type::Struct(Row {
+        labels: Vec::new(),
+        rest: Rest::Closed,
+    })
 }
 
-fn field(presence: Presence, core: Core) -> RowField {
-    RowField {
-        presence,
-        ty: plain(core),
-    }
+fn field(presence: Presence, ty: Type) -> RowField {
+    RowField { presence, ty }
 }
 
-fn rich(core: Core) -> Type {
-    Type {
-        core,
-        fields: vec![
-            ("present".to_string(), field(Presence::Present, Core::Unit)),
-            ("absent".to_string(), field(Presence::Absent, Core::Nat)),
-            ("var".to_string(), field(Presence::Var(1), Core::Int)),
-            ("bound".to_string(), field(Presence::Bound(2), Core::Real)),
-            (
-                "undecided".to_string(),
-                field(Presence::Undecided, Core::String),
-            ),
-        ],
-    }
+fn rich(ty: Type) -> Type {
+    ty
 }
 
 fn row(rest: Rest) -> Row {
     Row {
-        labels: vec![("label".to_string(), field(Presence::Present, Core::Boolean))],
+        labels: vec![("label".to_string(), field(Presence::Present, Type::Boolean))],
         rest,
     }
 }
@@ -94,35 +82,56 @@ fn model_artifact() -> Artifact {
         Formula::Xor(Box::new(Formula::False), Box::new(Formula::Bound(6))),
     ];
     let types = vec![
-        rich(Core::Unit),
-        rich(Core::Nat),
-        rich(Core::Int),
-        rich(Core::Real),
-        rich(Core::String),
-        rich(Core::Boolean),
-        rich(Core::Arrow(
-            Box::new(plain(Core::Var(7))),
-            Box::new(plain(Core::Bound(8))),
+        Type::Struct(Row {
+            labels: vec![
+                (
+                    "present".to_string(),
+                    field(
+                        Presence::Present,
+                        Type::Struct(Row {
+                            labels: Vec::new(),
+                            rest: Rest::Closed,
+                        }),
+                    ),
+                ),
+                ("absent".to_string(), field(Presence::Absent, Type::Nat)),
+                ("var".to_string(), field(Presence::Var(1), Type::Int)),
+                ("bound".to_string(), field(Presence::Bound(2), Type::Real)),
+                (
+                    "undecided".to_string(),
+                    field(Presence::Undecided, Type::String),
+                ),
+            ],
+            rest: Rest::Closed,
+        }),
+        rich(Type::Nat),
+        rich(Type::Int),
+        rich(Type::Real),
+        rich(Type::String),
+        rich(Type::Boolean),
+        rich(Type::Arrow(
+            Box::new(plain(Type::Var(7))),
+            Box::new(plain(Type::Bound(8))),
             row(Rest::More(Box::new(row(Rest::Rigid {
                 id: 9,
                 name: "tail".to_string(),
             })))),
         )),
-        rich(Core::Sum(row(Rest::Closed))),
-        rich(Core::Sum(row(Rest::Var(10)))),
-        rich(Core::Sum(row(Rest::Bound(11)))),
-        rich(Core::Sum(row(Rest::Undecided))),
-        rich(Core::Var(12)),
-        rich(Core::Bound(13)),
-        rich(Core::Rigid {
+        rich(Type::Sum(row(Rest::Closed))),
+        rich(Type::Sum(row(Rest::Var(10)))),
+        rich(Type::Sum(row(Rest::Bound(11)))),
+        rich(Type::Sum(row(Rest::Undecided))),
+        rich(Type::Var(12)),
+        rich(Type::Bound(13)),
+        rich(Type::Rigid {
             id: 14,
             name: "rigid".to_string(),
         }),
-        rich(Core::Named {
+        rich(Type::Named {
             name: "other@1.2.3::T".to_string(),
-            args: vec![plain(Core::Nat), plain(Core::Undecided)],
+            args: vec![plain(Type::Nat), plain(Type::Undecided)],
         }),
-        rich(Core::Undecided),
+        rich(Type::Undecided),
     ];
     let values = types
         .into_iter()
@@ -269,7 +278,7 @@ fn model_artifact() -> Artifact {
                         count: 1,
                         presences: 0,
                         formula: Formula::True,
-                        body: plain(Core::Unit),
+                        body: plain(unit()),
                     },
                 },
                 artifact::DeclaredType {
@@ -283,7 +292,7 @@ fn model_artifact() -> Artifact {
                         count: 1,
                         presences: 0,
                         formula: Formula::True,
-                        body: rich(Core::Unit),
+                        body: rich(unit()),
                     },
                 },
                 artifact::DeclaredType {
@@ -297,7 +306,7 @@ fn model_artifact() -> Artifact {
                         count: 2,
                         presences: 1,
                         formula: Formula::Var(0),
-                        body: plain(Core::Sum(row(Rest::Closed))),
+                        body: plain(Type::Sum(row(Rest::Closed))),
                     },
                 },
                 artifact::DeclaredType {
@@ -311,9 +320,9 @@ fn model_artifact() -> Artifact {
                         count: 3,
                         presences: 2,
                         formula: Formula::Bound(1),
-                        body: plain(Core::Arrow(
-                            Box::new(plain(Core::Nat)),
-                            Box::new(plain(Core::Unit)),
+                        body: plain(Type::Arrow(
+                            Box::new(plain(Type::Nat)),
+                            Box::new(plain(unit())),
                             row(Rest::Closed),
                         )),
                     },
@@ -328,8 +337,8 @@ fn model_artifact() -> Artifact {
                     }),
                     kind: artifact::EffectKind::Operations(vec![artifact::Operation {
                         selector: artifact::OperationSelector::Named("write".to_string()),
-                        from: plain(Core::Nat),
-                        to: plain(Core::Unit),
+                        from: plain(Type::Nat),
+                        to: plain(unit()),
                     }]),
                 },
                 artifact::DeclaredEffect {
@@ -632,25 +641,25 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     let mut fields = IndexMap::new();
     fields.insert(
         "int".to_string(),
-        compiler_field(types::Presence::Var(0), types::Core::Int),
+        compiler_field(types::Presence::Var(0), types::Ty::Int),
     );
     fields.insert(
         "real".to_string(),
-        compiler_field(types::Presence::Undecided, types::Core::Real),
+        compiler_field(types::Presence::Undecided, types::Ty::Real),
     );
     fields.insert(
         "boolean".to_string(),
-        compiler_field(types::Presence::Absent, types::Core::Boolean),
+        compiler_field(types::Presence::Absent, types::Ty::Boolean),
     );
     fields.insert(
         "var".to_string(),
-        compiler_field(types::Presence::Present, types::Core::Var(1)),
+        compiler_field(types::Presence::Present, types::Ty::Var(1)),
     );
     fields.insert(
         "rigid".to_string(),
         compiler_field(
             types::Presence::Bound(2),
-            types::Core::Rigid {
+            types::Ty::Rigid {
                 id: 3,
                 name: Rc::from("rigid"),
             },
@@ -660,31 +669,31 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         "var-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Var(4))),
+            types::Ty::Sum(types::Row::of(types::Rest::Var(4))),
         ),
     );
     fields.insert(
         "bound-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Bound(5))),
+            types::Ty::Sum(types::Row::of(types::Rest::Bound(5))),
         ),
     );
     fields.insert(
         "undecided-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Undecided)),
+            types::Ty::Sum(types::Row::of(types::Rest::Undecided)),
         ),
     );
     fields.insert(
         "named".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Named {
+            types::Ty::Named {
                 symbol: type_symbol,
                 name: Rc::from("OpenCases"),
-                args: vec![compiler_plain(types::Core::Undecided)].into(),
+                args: vec![compiler_plain(types::Ty::Undecided)].into(),
             },
         ),
     );
@@ -692,7 +701,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     let mut inner_labels = IndexMap::new();
     inner_labels.insert(
         "effect".to_string(),
-        compiler_field(types::Presence::Present, types::Core::String),
+        compiler_field(types::Presence::Present, types::Ty::String),
     );
     let inner_row = types::Row {
         labels: inner_labels,
@@ -702,14 +711,21 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         },
     };
     let effects = types::Row::of(types::Rest::More(Rc::new(inner_row)));
-    let body = Rc::new(types::Ty {
-        core: types::Core::Arrow(
-            compiler_plain(types::Core::Int),
-            compiler_plain(types::Core::Real),
-            effects,
+    fields.insert(
+        "arrow".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Ty::Arrow(
+                compiler_plain(types::Ty::Int),
+                compiler_plain(types::Ty::Real),
+                effects,
+            ),
         ),
-        fields,
-    });
+    );
+    let body = Rc::new(types::Ty::Struct(types::Row {
+        labels: fields,
+        rest: types::Rest::Closed,
+    }));
     let formula = types::Formula::Iff(
         Rc::new(types::Formula::False),
         Rc::new(types::Formula::Xor(
@@ -908,11 +924,11 @@ fn canonical_text_escapes_and_parses_every_control_character() {
     let escaped = format!("{controls}\\");
     let mut artifact = model_artifact();
     artifact.header.identity.name = escaped.clone();
-    artifact.header.values[0].scheme.body = plain(Core::Arrow(
-        Box::new(plain(Core::Unit)),
-        Box::new(plain(Core::Unit)),
+    artifact.header.values[0].scheme.body = plain(Type::Arrow(
+        Box::new(plain(unit())),
+        Box::new(plain(unit())),
         Row {
-            labels: vec![(controls.clone(), field(Presence::Present, Core::Unit))],
+            labels: vec![(controls.clone(), field(Presence::Present, unit()))],
             rest: Rest::Closed,
         },
     ));
@@ -997,8 +1013,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(alias ", "(aliases "),
         ("(scheme ", "(polytype "),
         ("(ty ", "(type-value "),
-        ("(fields ", "(record-fields "),
-        ("(ty unit ", "(ty void "),
+        ("(struct ", "(record-type "),
         ("(arrow ", "(function-type "),
         ("(sum ", "(variant-type "),
         ("(named ", "(external-type "),
@@ -1048,7 +1063,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(identity \"bundle\" \"1.0.0\")", "(identity \"bundle\")"),
         ("(dependency \"base\" \"2.1.0\")", "(dependency \"base\")"),
         ("(scheme 15 7", "(scheme 15"),
-        ("(ty unit (fields", "(ty unit extra (fields"),
+        ("(ty nat)", "(ty nat extra)"),
         ("(param 0 nat)", "(param 0 nat extra)"),
         ("(tag \"Case\")", "(tag \"Case\" 1 2)"),
         ("(direct 0)", "(direct 0 1)"),
@@ -1092,7 +1107,7 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
         "operations",
     ));
     assert_malformed(&replace_balanced(&valid, "(named \"other@", "(named)"));
-    assert_bad_replacement(&valid, "(ty unit (fields", "(ty \"wrong\" (fields");
+    assert_bad_replacement(&valid, "(ty nat)", "(ty \"wrong\")");
     assert_bad_replacement(&valid, "field present", "field (wrong)");
     assert_bad_replacement(&valid, " 7 true ", " 7 \"wrong\" ");
     assert_bad_replacement(&valid, " 7 true ", " 7 wrong ");
@@ -1168,7 +1183,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                     count: 0,
                     presences: 0,
                     formula: Formula::True,
-                    body: plain(Core::Unit),
+                    body: plain(unit()),
                 },
             }],
             types: Vec::new(),
@@ -1190,11 +1205,11 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
             &mut value.header.values[0].scheme.formula,
             Formula::True,
         )));
-        value.header.values[0].scheme.body = plain(Core::Named {
+        value.header.values[0].scheme.body = plain(Type::Named {
             name: "deep@1::Layer".to_string(),
             args: vec![std::mem::replace(
                 &mut value.header.values[0].scheme.body,
-                plain(Core::Unit),
+                plain(unit()),
             )],
         });
         value.lir.globals[0].body = Block {
@@ -1288,7 +1303,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty unit (fields))))) \
+         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty (struct (row (labels) closed)))))) \
          (types) (effects)) (lir (functions) wrong))"
     );
 
@@ -1299,6 +1314,16 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
         .join()
         .unwrap();
     assert_eq!(error.message(), "expected `globals` list");
+}
+
+#[test]
+fn non_struct_fields_are_not_representable_in_artifact_text() {
+    let valid = compact(&model_artifact().print());
+    assert_bad_replacement(
+        &valid,
+        "(ty nat)",
+        "(ty nat (fields (\"x\" (field present (ty nat)))))",
+    );
 }
 
 #[test]

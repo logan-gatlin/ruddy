@@ -46,10 +46,10 @@ fn scheme() -> a::Scheme {
         count: 0,
         presences: 0,
         formula: a::Formula::True,
-        body: a::Type {
-            core: a::Core::Unit,
-            fields: vec![],
-        },
+        body: a::Type::Struct(a::Row {
+            labels: vec![],
+            rest: a::Rest::Closed,
+        }),
     }
 }
 

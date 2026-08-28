@@ -52,8 +52,7 @@ use crate::{
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
     types::{
-        Assigned, Atom, Core, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape,
-        Ty,
+        Assigned, Atom, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape, Ty,
     },
 };
 
@@ -140,17 +139,6 @@ pub enum Prec {
     /// what makes `#A Nat | #B -> Nat` a function *from* the sum rather
     /// than a sum whose last case carries an arrow.
     Sum,
-    /// `<core> with { ... }` — the fields extend rightward, so a `with` needs
-    /// parentheses anywhere a field list could be mistaken for something
-    /// else's.
-    ///
-    /// Above the arrow and the sum, which is what leaves a `with` type bare on
-    /// either side of an arrow and puts the parentheses round an arrow or a sum
-    /// used as the core of one. Below [`Prec::Tag`], and so below an argument
-    /// position: a `with` type handed to a type constructor or carried by a tag
-    /// is bracketed, because the fields would otherwise read as the next thing
-    /// along.
-    With,
     /// `#A` with nothing after it — a tag takes the next atom as its
     /// payload, so a bare one needs parentheses anywhere one could follow.
     ///
@@ -1211,217 +1199,72 @@ impl fmt::Display for Prim {
 /// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
-        match (self.fields.is_empty(), &self.core) {
-            (true, core) => core.prec(),
-            // Braces close it, however many fields are inside and whatever the
-            // `..` after them says.
-            (
-                false,
-                Core::Unit | Core::Var(_) | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided,
-            ) => Prec::Atom,
-            (false, _) => Prec::With,
-        }
-    }
-}
-
-/// How much of the surface grammar a core can be. The arrow extends rightward,
-/// an application extends rightward by argument, and a sum extends rightward by
-/// case; everything else — a primitive, unit, a variable — is a form nothing
-/// can be appended to.
-impl Grouped for Core {
-    fn prec(&self) -> Prec {
         match self {
-            Core::Arrow(..) => Prec::Arrow,
-            // A sum is written as its cases with nothing around them, so
-            // anything that could follow a case has to be kept off it — an
-            // argument, a payload, another case.
-            Core::Sum(_) => Prec::Sum,
-            // Applied to something, a declared type groups as the application
-            // it is: `Pair Nat Nat` needs parentheses wherever an argument
-            // could follow it.
-            Core::Named { args, .. } if !args.is_empty() => Prec::Apply,
-            // Applied to nothing it is an atom whatever it stands for: it
-            // prints as its name, and a name is one word however many arrows
-            // are behind it. Unit is one too: its braces close it.
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Named { .. }
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => Prec::Atom,
+            Ty::Arrow(..) => Prec::Arrow,
+            Ty::Sum(_) => Prec::Sum,
+            Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
+            _ => Prec::Atom,
         }
     }
 }
 
-/// Types print in the surface type grammar, so a printed type reads the same
-/// as one the user could have written. The two forms with no surface spelling
-/// print as what they mean: a quantified variable as the bare letter its
-/// a variable declares it as, and an unsolved or
-/// undecided type as `?` — inference's way of saying it has nothing to report.
-///
-/// Three forms, and which one a type takes is decided by its two halves rather
-/// than by a variant. A type carrying no fields prints as its core alone, which
-/// is every type the language had before fields were a property of all of them.
-/// A type carrying fields whose core is one a `..` can be written with —
-/// [`Core::Unit`], which writes no `..` at all, a variable, a quantified
-/// variable, or the undecided type — prints as its fields in braces, which is
-/// how a struct has always printed and is what makes `{ x: 'a, ..'b }` come out
-/// as something a reader could have written. And anything else carrying fields
-/// prints as `<core> with { ... }` — a form inference can build and no source
-/// syntax can write, which is why it exists here and nowhere in the parser, and
-/// which is reachable only through a declaration whose `..` was handed a known
-/// type.
-///
-/// The `..` spelling is [`tail_of`]'s table read off the core rather than off a
-/// tail, and that is the whole of what keeps a printed type re-lowerable to the
-/// type it was printed from: `b with { x: a }` is not something the parser
-/// could read back, and `{ x: 'a, ..'b }` is.
-///
-/// The grouping comes from [`write_arrow`] and the braces from [`write_row`]
-/// below, both of which the debugger's two tree printers also write through.
-/// So the punctuation a type is written with is one rule rather than two
-/// copies of a rule agreeing: where a diagnostic puts a parenthesis, a comma
-/// or a `when` clause, the debugger's IR tab puts one too.
-///
-/// Not the whole string, though, and deliberately not. A tail is written by
-/// whoever knows what it stands for, and the two readers know different
-/// things: the IR tab is showing a type as it was written, so it spells a
-/// named tail `..'r`, while a scheme is showing what the definition was
-/// inferred to be, so it spells the same tail `..'a`. `tests/src/print.rs`
-/// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.fields.is_empty() {
-            return self.core.fmt(f);
-        }
-        match core_tail(&self.core) {
-            Some(tail) => write_fields(f, &self.fields, tail.as_ref().map(shown)),
-            None => {
-                write_grouped(f, self.core.prec() < Prec::With, &self.core)?;
-                f.write_str(" with ")?;
-                write_fields(f, &self.fields, None)
+        match self {
+            Ty::Nat => f.write_str(Prim::Nat.name()),
+            Ty::Int => f.write_str(Prim::Int.name()),
+            Ty::Real => f.write_str(Prim::Real.name()),
+            Ty::String => f.write_str(Prim::String.name()),
+            Ty::Boolean => f.write_str(Prim::Boolean.name()),
+            Ty::Arrow(from, to, effects) => {
+                let row = effects_of(effects);
+                write_arrow(f, &**from, &**to, row.as_ref().map(shown))
             }
+            Ty::Struct(row) => write_fields(
+                f,
+                &row.labels,
+                tail_of(Shape::Struct, &row.rest).as_ref().map(shown),
+            ),
+            Ty::Sum(row) => write_cases(f, row, Shape::Sum),
+            Ty::Named { name, args, .. } if args.is_empty() => f.write_str(name),
+            Ty::Named { name, args, .. } => {
+                write_applied(f, &**name, args.iter().map(|arg| AppliedArgument(arg)))
+            }
+            Ty::Var(v) => write!(f, "?{v}"),
+            Ty::Bound(i) => f.write_str(&name_at(*i)),
+            Ty::Rigid { name, .. } => write!(f, "'{name}"),
+            Ty::Undecided => f.write_str("?"),
         }
     }
 }
 
-/// What follows a fielded type's `..`, or `None` when the core is not one a
-/// `..` can be written with at all and the type has to wear a `with` instead.
-///
-/// [`tail_of`]'s table moved from a row's tail to a type's core, which is where
-/// a struct's `..` now lives. The four it answers about are exactly the four a
-/// written `..` could stand for: nothing further at all, which writes no `..`;
-/// a solver variable; one a scheme quantified; and the undecided type, which
-/// writes the bare `..` a reader would have written.
-///
-/// `Some(None)` and `None` are two different answers and the difference matters:
-/// the first is unit, which closes the braces with no `..` in them, and the
-/// second is a `Nat`, an arrow, a sum or a declared name, none of which a `..`
-/// has a spelling for.
-fn core_tail(core: &Core) -> Option<Option<String>> {
-    match core {
-        Core::Unit => Some(None),
-        Core::Var(var) => Some(Some(format!("?{var}"))),
-        Core::Bound(index) => Some(Some(name_at(*index))),
-        // A struct's rest declared by a variable prints as the name it was
-        // declared with, which is what the reader wrote and what re-lowers to
-        // the same rest.
-        Core::Rigid { name, .. } => Some(Some(format!("'{name}"))),
-        Core::Undecided => Some(Some(String::new())),
-        Core::Nat
-        | Core::Int
-        | Core::Real
-        | Core::String
-        | Core::Boolean
-        | Core::Arrow(..)
-        | Core::Sum(_)
-        | Core::Named { .. } => None,
-    }
-}
-
-/// One argument of a declared type application.
-///
-/// Effect rows are represented as sum-shaped types while they travel through a
-/// declaration parameter. Their generated keys carry an opaque interface after
-/// a unit separator; keep hiding that implementation detail here, at the one
-/// erased-shape boundary that needs it, rather than truncating ordinary sum
-/// labels everywhere they are printed.
 struct AppliedArgument<'a>(&'a Ty);
-
 impl Grouped for AppliedArgument<'_> {
     fn prec(&self) -> Prec {
         self.0.prec()
     }
 }
-
 impl fmt::Display for AppliedArgument<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Core::Sum(row) = &self.0.core else {
+        let Ty::Sum(row) = self.0 else {
             return self.0.fmt(f);
         };
-        if !self.0.fields.is_empty() || !row.labels.keys().any(|name| name.contains('\u{1f}')) {
+        if !row.labels.keys().any(|name| name.contains('\u{1f}')) {
             return self.0.fmt(f);
         }
-
         let entries = row
             .labels
             .iter()
             .filter_map(|(name, field)| match mark(&field.presence) {
                 Absence::Absent => None,
                 Absence::There(mark) => Some(Entry::Written {
-                    name: name
-                        .split_once('\u{1f}')
-                        .map_or(name.as_str(), |(name, _)| name),
+                    name: name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0),
                     mark,
                     holds: payload(&field.ty),
                 }),
             });
         let tail = tail_of(Shape::Sum, &row.rest);
         write_sum(f, entries, tail.as_ref().map(shown))
-    }
-}
-
-/// A core prints as the whole type would if it carried no fields, which is what
-/// [`Display for Ty`](Ty) writes it as.
-impl fmt::Display for Core {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Unit falls out of this as `{}` rather than `()`, on purpose:
-            // there is one type here, and one spelling for it. See
-            // [`Core::Unit`].
-            Core::Unit => write_fields(f, &IndexMap::new(), None),
-            Core::Nat => f.write_str(Prim::Nat.name()),
-            Core::Int => f.write_str(Prim::Int.name()),
-            Core::Real => f.write_str(Prim::Real.name()),
-            Core::String => f.write_str(Prim::String.name()),
-            Core::Boolean => f.write_str(Prim::Boolean.name()),
-            Core::Arrow(from, to, effects) => {
-                let row = effects_of(effects);
-                write_arrow(f, &**from, &**to, row.as_ref().map(shown))
-            }
-            Core::Sum(cases) => write_cases(f, cases, Shape::Sum),
-            // A declared type prints as what the user called it rather than as
-            // what it stands for, applied to whatever it was given. It is
-            // shorter, it is what they wrote, and it is the only way a type
-            // that names itself can be printed at all.
-            Core::Named { name, args, .. } if args.is_empty() => f.write_str(name),
-            Core::Named { name, args, .. } => {
-                write_applied(f, &**name, args.iter().map(|arg| AppliedArgument(arg)))
-            }
-            // A solver variable has no name, only an index; it is numbered so
-            // that two different unknowns in one message stay distinguishable.
-            Core::Var(var) => write!(f, "?{var}"),
-            Core::Bound(index) => f.write_str(&name_at(*index)),
-            // A rigid prints as the name its a variable gave it: the reader
-            // wrote it, and it is what tells two of them apart in one message.
-            Core::Rigid { name, .. } => write!(f, "'{name}"),
-            Core::Undecided => f.write_str("?"),
-        }
     }
 }
 
@@ -1871,7 +1714,16 @@ fn payload(ty: &Ty) -> Option<&Ty> {
     // unit core writes no `..` after them, which is the whole of what makes this
     // the same question a printed type asks: a case carrying a struct that came
     // to nothing is still a case carrying unit, and still prints as `#A`.
-    let empty = matches!(ty.core, Core::Unit) && ty.fields.values().all(absent);
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn empty_row(row: &Row) -> bool {
+        row.labels.values().all(absent)
+            && match &row.rest {
+                Rest::Closed => true,
+                Rest::More(more) => empty_row(more),
+                _ => false,
+            }
+    }
+    let empty = matches!(ty, Ty::Struct(row) if empty_row(row));
     match empty {
         true => None,
         false => Some(ty),
