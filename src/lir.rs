@@ -29,7 +29,7 @@ use crate::{
     ir::{Handler, HandlerArm, Literal, Pattern, PatternKind, Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Formula, Presence, Rest, Row, Ty},
+    types::{Formula, Presence, Rest, Row, Ty, same_finite_syntax},
 };
 
 /// A value the instruction stream names. Numbered by one program-wide counter,
@@ -493,6 +493,7 @@ struct Value {
 #[derive(Debug, Clone)]
 struct Field {
     base: Temp,
+    base_ty: Rc<Ty>,
     name: String,
     presence: Presence,
     ty: Rc<Ty>,
@@ -544,6 +545,56 @@ struct Tree<'a> {
     ty: Rc<Ty>,
     span: Span,
     allowed: Formula,
+}
+
+fn alias_symbols(want: &Rc<Ty>, have: &Rc<Ty>) -> Option<(Symbol, Symbol)> {
+    match (&**want, &**have) {
+        (Ty::Named { symbol: want, .. }, Ty::Named { symbol: have, .. }) => Some((*want, *have)),
+        _ => None,
+    }
+}
+
+fn same_alias_pair(
+    left_want: &Rc<Ty>,
+    left_have: &Rc<Ty>,
+    right_want: &Rc<Ty>,
+    right_have: &Rc<Ty>,
+) -> bool {
+    same_finite_syntax(left_want, right_want) && same_finite_syntax(left_have, right_have)
+}
+
+type TypePair = (Rc<Ty>, Rc<Ty>);
+type AliasPairs = HashMap<(Symbol, Symbol), Vec<TypePair>>;
+type AdapterAliases = HashMap<(Symbol, Symbol), Vec<(Rc<Ty>, Rc<Ty>, FuncId)>>;
+type CachedFit = (Rc<Ty>, Rc<Ty>, bool);
+
+#[derive(Default)]
+struct FitsCache {
+    /// Non-aliased arrow pairs keep their allocation identity while a type is
+    /// walked. Remembering their answer makes fitting a deep suffix linear
+    /// rather than asking the same question again at every enclosing arrow.
+    direct: HashMap<(usize, usize), CachedFit>,
+}
+
+/// A generated adapter while its two recursive fits are evaluated. Keeping
+/// these on the heap is what lets a source type contain an arbitrary number of
+/// arrow levels without consuming the Rust call stack.
+struct FittedContext {
+    want: Rc<Ty>,
+    wrapped: Temp,
+    params: Vec<Param>,
+    body: Body,
+    stage: FittedStage,
+    reserved: Option<(FuncId, String)>,
+}
+
+enum FittedStage {
+    Argument {
+        args: Vec<Temp>,
+        have_to: Rc<Ty>,
+        want_to: Rc<Ty>,
+    },
+    Result,
 }
 
 /// The lowering itself: the program being read, everything emitted so far, and
@@ -1083,20 +1134,27 @@ impl Lower<'_> {
     /// is no narrower answer to give.
     fn rep(&self, ty: &Rc<Ty>) -> Rep {
         let ty = unfold(&self.inference.aliases, ty);
-        match &ty.core {
-            Core::Nat => Rep::Nat,
-            Core::Int => Rep::Int,
-            Core::Real => Rep::Real,
-            Core::String => Rep::String,
-            Core::Boolean => Rep::Boolean,
-            Core::Arrow(..) => Rep::Fn,
-            Core::Sum(_) => Rep::Sum,
-            // A core carrying fields is a struct, and one carrying none is the
-            // unit value. Only `Unit` splits this way: a non-`Unit` core with
-            // fields has no constructible values, so deriving its
-            // representation from the core alone is arbitrary and safe.
-            Core::Unit if ty.fields.is_empty() => Rep::Unit,
-            Core::Unit => Rep::Struct,
+        match &*ty {
+            Ty::Nat => Rep::Nat,
+            Ty::Int => Rep::Int,
+            Ty::Real => Rep::Real,
+            Ty::String => Rep::String,
+            Ty::Boolean => Rep::Boolean,
+            Ty::Arrow(..) => Rep::Fn,
+            Ty::Sum(_) => Rep::Sum,
+            Ty::Struct(row) => {
+                let row = flat(row);
+                if row
+                    .labels
+                    .values()
+                    .all(|field| matches!(field.presence, Presence::Absent))
+                    && matches!(row.rest, Rest::Closed)
+                {
+                    Rep::Unit
+                } else {
+                    Rep::Struct
+                }
+            }
             _ => Rep::Any,
         }
     }
@@ -1111,7 +1169,7 @@ impl Lower<'_> {
     /// this pass is never handed.
     fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
         let ty = unfold(&self.inference.aliases, ty);
-        let Core::Arrow(from, to, row) = &ty.core else {
+        let Ty::Arrow(from, to, row) = &*ty else {
             panic!("LIR runs only on programs with no errors");
         };
         (from.clone(), to.clone(), flat(row))
@@ -1135,9 +1193,11 @@ impl Lower<'_> {
     /// site's own reading is all there is to go on.
     fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
         let ty = unfold(&self.inference.aliases, ty);
-        let member = match &ty.core {
-            Core::Sum(row) => flat(row).labels.get(name).map(|case| case.ty.clone()),
-            _ => ty.fields.get(name).map(|field| field.ty.clone()),
+        let member = match &*ty {
+            Ty::Sum(row) | Ty::Struct(row) => {
+                flat(row).labels.get(name).map(|field| field.ty.clone())
+            }
+            _ => None,
         };
         member.filter(|member| self.rep(member) != Rep::Any)
     }
@@ -1156,13 +1216,55 @@ impl Lower<'_> {
     /// through as it stands, which is the same assumption the whole pass makes
     /// of every polymorphic position: what a scheme quantified is carried, not
     /// repacked.
-    fn fits(&self, want: &Rc<Ty>, have: &Rc<Ty>) -> bool {
-        if self.rep(want) != Rep::Fn || self.rep(have) != Rep::Fn {
-            return true;
+    ///
+    /// Iterative evidence-shape comparison. Recursive declarations are regular
+    /// trees: revisiting the same pair of alias applications after inspecting
+    /// an arrow is a guarded back edge, and therefore a successful end to this
+    /// path rather than another recursive Rust call.
+    fn fits(&self, want: &Rc<Ty>, have: &Rc<Ty>, cache: &mut FitsCache) -> bool {
+        let mut want = want.clone();
+        let mut have = have.clone();
+        let mut direct = Vec::new();
+        let mut aliases = AliasPairs::new();
+
+        let answer = loop {
+            let direct_key = (Rc::as_ptr(&want) as usize, Rc::as_ptr(&have) as usize);
+            if !matches!((&*want, &*have), (Ty::Named { .. }, Ty::Named { .. })) {
+                if let Some((_, _, answer)) = cache.direct.get(&direct_key) {
+                    break *answer;
+                }
+                // Retain the nodes as well as their addresses. Alias opening
+                // may allocate a finite arrow prefix; without these owners a
+                // later allocation could reuse an address during this fit.
+                direct.push((direct_key, want.clone(), have.clone()));
+            }
+
+            if let Some((want_symbol, have_symbol)) = alias_symbols(&want, &have) {
+                let states = aliases.entry((want_symbol, have_symbol)).or_default();
+                if states.iter().any(|(seen_want, seen_have)| {
+                    same_alias_pair(seen_want, seen_have, &want, &have)
+                }) {
+                    break true;
+                }
+                states.push((want.clone(), have.clone()));
+            }
+
+            if self.rep(&want) != Rep::Fn || self.rep(&have) != Rep::Fn {
+                break true;
+            }
+            let (_, want_to, want_row) = self.arrow(&want);
+            let (_, have_to, have_row) = self.arrow(&have);
+            if shape(&want_row) != shape(&have_row) {
+                break false;
+            }
+            want = want_to;
+            have = have_to;
+        };
+
+        for (key, want, have) in direct {
+            cache.direct.insert(key, (want, have, answer));
         }
-        let (_, want_to, want_row) = self.arrow(want);
-        let (_, have_to, have_row) = self.arrow(have);
-        shape(&want_row) == shape(&have_row) && self.fits(&want_to, &have_to)
+        answer
     }
 
     /// Lower one top-level definition: its functions, and the global that gives
@@ -1408,141 +1510,224 @@ impl Lower<'_> {
     /// of it what the value expects, and calling the value — which is code
     /// nobody wrote, so all of it is generated.
     fn fitted(&mut self, want: &Rc<Ty>, have: &Rc<Ty>, temp: Temp, body: &mut Body) -> Temp {
-        if self.fits(want, have) {
-            self.hold(temp, want);
-            return temp;
-        }
-        let (want_from, want_to, want_row) = self.arrow(want);
-        let (have_from, have_to, have_row) = self.arrow(have);
-        let want_shape = shape(&want_row);
-        let have_shape = shape(&have_row);
+        let mut cache = FitsCache::default();
+        let mut contexts: Vec<FittedContext> = Vec::new();
+        let mut adapters = AdapterAliases::new();
+        let mut root = std::mem::take(body);
+        let mut request = Some((want.clone(), have.clone(), temp));
+        let mut result = None;
 
-        self.frames.push(Frame::default());
-        let wrapped = self.thread(self.frames.len() - 2, temp);
-        let mut params: Vec<Param> = Vec::new();
-        let mut records: IndexMap<String, Temp> = IndexMap::new();
-        for name in &want_shape.names {
-            let record = self.fresh(Rep::Struct);
-            params.push(Param {
-                temp: record,
-                rep: Rep::Struct,
-            });
-            records.insert(name.clone(), record);
-        }
-        let mut carried = None;
-        if want_shape.tail {
-            let bundle = self.fresh(Rep::Struct);
-            params.push(Param {
-                temp: bundle,
-                rep: Rep::Struct,
-            });
-            carried = Some(bundle);
-        }
-        let rep = self.rep(&want_from);
-        let arg = self.fresh(rep);
-        params.push(Param { temp: arg, rep });
+        loop {
+            if let Some((want, have, temp)) = request.take() {
+                if self.fits(&want, &have, &mut cache) {
+                    self.hold(temp, &want);
+                    result = Some(temp);
+                    continue;
+                }
 
-        let mut lifted = Body::default();
-        let mut args: Vec<Temp> = Vec::new();
-        for name in &have_shape.names {
-            // A record the declaration passes on its own is handed straight
-            // over; one it does not is inside the bundle it passes instead,
-            // which is keyed by effect name.
-            let record = match records.get(name) {
-                Some(record) => *record,
-                None => {
-                    let bundle = carried
-                        .expect("the position a value fills accounts for every effect it performs");
-                    self.emit(
-                        &mut lifted,
+                // Re-entering a guarded recursive pair closes over the newly
+                // returned function with the adapter already being built. The
+                // generated function is a reusable schema: only that capture
+                // changes at each trip around the regular tree.
+                let reused = alias_symbols(&want, &have).and_then(|symbols| {
+                    adapters.get(&symbols).and_then(|states| {
+                        states.iter().find_map(|(seen_want, seen_have, id)| {
+                            same_alias_pair(seen_want, seen_have, &want, &have).then_some(*id)
+                        })
+                    })
+                });
+                if let Some(id) = reused {
+                    let current = contexts
+                        .last_mut()
+                        .map(|context| &mut context.body)
+                        .unwrap_or(&mut root);
+                    let adapted = self.emit(
+                        current,
                         Span::default(),
-                        Rep::Struct,
-                        Op::Project {
-                            base: bundle,
-                            field: FieldKey::named(name.clone()),
+                        Rep::Fn,
+                        Op::Closure {
+                            func: id,
+                            captures: vec![temp],
                         },
-                    )
-                }
-            };
-            args.push(record);
-        }
-        if have_shape.tail {
-            // What the value calls its tail stands for everything the
-            // declaration handed over that the value does not name outright —
-            // which is the records the declaration passed positionally, keyed
-            // by effect name, and whatever its own bundle stood for. So all
-            // three cases are the same one: lay the records over the bundle.
-            // Either piece alone goes across as it is, and a bundle carrying a
-            // name the value also takes positionally is a key nothing reads
-            // rather than a mistake.
-            let bundle = match (carried, records.is_empty()) {
-                (Some(bundle), true) => bundle,
-                (Some(bundle), false) => {
-                    let named = self.emit(
-                        &mut lifted,
-                        Span::default(),
-                        Rep::Struct,
-                        Op::Struct(named_fields(records)),
                     );
-                    self.emit(
-                        &mut lifted,
-                        Span::default(),
-                        Rep::Struct,
-                        Op::Merge(vec![bundle, named]),
-                    )
+                    self.hold(adapted, &want);
+                    result = Some(adapted);
+                    continue;
                 }
-                (None, _) => self.emit(
-                    &mut lifted,
-                    Span::default(),
-                    Rep::Struct,
-                    Op::Struct(named_fields(records)),
-                ),
+
+                let (want_from, want_to, want_row) = self.arrow(&want);
+                let (have_from, have_to, have_row) = self.arrow(&have);
+                let want_shape = shape(&want_row);
+                let have_shape = shape(&have_row);
+
+                self.frames.push(Frame::default());
+                let wrapped = self.thread(self.frames.len() - 2, temp);
+                let mut params = Vec::new();
+                let mut records: IndexMap<String, Temp> = IndexMap::new();
+                for name in &want_shape.names {
+                    let record = self.fresh(Rep::Struct);
+                    params.push(Param {
+                        temp: record,
+                        rep: Rep::Struct,
+                    });
+                    records.insert(name.clone(), record);
+                }
+                let mut carried = None;
+                if want_shape.tail {
+                    let bundle = self.fresh(Rep::Struct);
+                    params.push(Param {
+                        temp: bundle,
+                        rep: Rep::Struct,
+                    });
+                    carried = Some(bundle);
+                }
+                let rep = self.rep(&want_from);
+                let arg = self.fresh(rep);
+                params.push(Param { temp: arg, rep });
+
+                let mut lifted = Body::default();
+                let mut args = Vec::new();
+                for name in &have_shape.names {
+                    let record = match records.get(name) {
+                        Some(record) => *record,
+                        None => {
+                            let bundle = carried.expect(
+                                "the position a value fills accounts for every effect it performs",
+                            );
+                            self.emit(
+                                &mut lifted,
+                                Span::default(),
+                                Rep::Struct,
+                                Op::Project {
+                                    base: bundle,
+                                    field: FieldKey::named(name.clone()),
+                                },
+                            )
+                        }
+                    };
+                    args.push(record);
+                }
+                if have_shape.tail {
+                    let bundle = match (carried, records.is_empty()) {
+                        (Some(bundle), true) => bundle,
+                        (Some(bundle), false) => {
+                            let named = self.emit(
+                                &mut lifted,
+                                Span::default(),
+                                Rep::Struct,
+                                Op::Struct(named_fields(records)),
+                            );
+                            self.emit(
+                                &mut lifted,
+                                Span::default(),
+                                Rep::Struct,
+                                Op::Merge(vec![bundle, named]),
+                            )
+                        }
+                        (None, _) => self.emit(
+                            &mut lifted,
+                            Span::default(),
+                            Rep::Struct,
+                            Op::Struct(named_fields(records)),
+                        ),
+                    };
+                    args.push(bundle);
+                }
+
+                // Recursive alias adapters need their slot before their result
+                // is fitted, because that result may close over this very
+                // function. Ordinary adapters retain the established postorder
+                // numbering used by listings and the debugger.
+                let reserved = alias_symbols(&want, &have).map(|symbols| {
+                    let name = self.lifted_name();
+                    let id = self.slot(name.clone());
+                    adapters
+                        .entry(symbols)
+                        .or_default()
+                        .push((want.clone(), have.clone(), id));
+                    (id, name)
+                });
+                contexts.push(FittedContext {
+                    want,
+                    wrapped,
+                    params,
+                    body: lifted,
+                    stage: FittedStage::Argument {
+                        args,
+                        have_to,
+                        want_to,
+                    },
+                    reserved,
+                });
+                request = Some((have_from, want_from, arg));
+                continue;
+            }
+
+            let value = result.take().expect("a fitted request produced a value");
+            let Some(context) = contexts.last_mut() else {
+                *body = root;
+                return value;
             };
-            args.push(bundle);
+            match &mut context.stage {
+                FittedStage::Argument {
+                    args,
+                    have_to,
+                    want_to,
+                } => {
+                    args.push(value);
+                    let called = self.emit(
+                        &mut context.body,
+                        Span::default(),
+                        self.rep(have_to),
+                        Op::Call {
+                            callee: Callee::Indirect(context.wrapped),
+                            args: std::mem::take(args),
+                        },
+                    );
+                    let next_want = want_to.clone();
+                    let next_have = have_to.clone();
+                    context.stage = FittedStage::Result;
+                    request = Some((next_want, next_have, called));
+                }
+                FittedStage::Result => {
+                    let context = contexts.pop().expect("the current fitted adapter");
+                    let lifted = context.body.seal(Terminator {
+                        span: Span::default(),
+                        kind: End::Ret(value),
+                    });
+                    let frame = self.frames.pop().expect("the frame just pushed");
+                    let (id, name) = context.reserved.unwrap_or_else(|| {
+                        let name = self.lifted_name();
+                        let id = self.slot(name.clone());
+                        (id, name)
+                    });
+                    let captures: Vec<Temp> =
+                        frame.captures.iter().map(|capture| capture.outer).collect();
+                    let params = Self::with_captures(&frame, context.params);
+                    self.fill(
+                        id,
+                        Function {
+                            name,
+                            params,
+                            body: lifted,
+                            span: Span::default(),
+                        },
+                    );
+                    let parent = contexts
+                        .last_mut()
+                        .map(|context| &mut context.body)
+                        .unwrap_or(&mut root);
+                    let adapted = self.emit(
+                        parent,
+                        Span::default(),
+                        Rep::Fn,
+                        Op::Closure { func: id, captures },
+                    );
+                    self.hold(adapted, &context.want);
+                    result = Some(adapted);
+                }
+            }
         }
-        // The visible argument arrives shaped as the declaration passes it,
-        // and the value takes its own level's argument at its own shape — a
-        // function crossing between the two is a value changing hands like
-        // any other, and is fitted the same way.
-        args.push(self.fitted(&have_from, &want_from, arg, &mut lifted));
-        let called = self.emit(
-            &mut lifted,
-            Span::default(),
-            self.rep(&have_to),
-            Op::Call {
-                callee: Callee::Indirect(wrapped),
-                args,
-            },
-        );
-        // What comes back is the value's next level, and the caller will go on
-        // calling it as the declaration's — so the same fitting applies again.
-        let value = self.fitted(&want_to, &have_to, called, &mut lifted);
-        let lifted = lifted.seal(Terminator {
-            span: Span::default(),
-            kind: End::Ret(value),
-        });
-        let frame = self.frames.pop().expect("the frame just pushed");
-        let name = self.lifted_name();
-        let id = self.slot(name.clone());
-        let captures: Vec<Temp> = frame.captures.iter().map(|capture| capture.outer).collect();
-        let params = Self::with_captures(&frame, params);
-        self.fill(
-            id,
-            Function {
-                name,
-                params,
-                body: lifted,
-                span: Span::default(),
-            },
-        );
-        let adapted = self.emit(
-            body,
-            Span::default(),
-            Rep::Fn,
-            Op::Closure { func: id, captures },
-        );
-        self.hold(adapted, want);
-        adapted
     }
 
     /// The record of one effect's operations, as this scope has it — captured
@@ -2074,6 +2259,10 @@ impl Lower<'_> {
                 args,
             },
         );
+        // Containers, like functions, retain the production type of the
+        // callee's result. A later projection must read members at the stored
+        // ABI before adapting them to this use's instantiation.
+        self.contain(value, &to);
         // What comes back is shaped by the callee's own next level. Where that
         // level pins a function shape down, fit it to what this node stands
         // for; where it does not — an `any` nothing decided — the value is
@@ -2171,6 +2360,7 @@ impl Lower<'_> {
                 // binding or a further application takes it.
                 let to = known.levels[arity - 1].to.clone();
                 self.hold(temp, &to);
+                self.contain(temp, &to);
                 temp
             }
             // Short of a full application, the arguments so far become the
@@ -2401,7 +2591,7 @@ impl Lower<'_> {
     }
 
     /// One whole position. A column any arm reaches into fields at is widened
-    /// first — one presence column per field the type names, the core, and then
+    /// first — one presence column per field the type names, the constructor, and then
     /// whatever fields lie beyond — so everything below only ever sees a flat
     /// cell.
     fn column(&mut self, col: &Value, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
@@ -2421,11 +2611,11 @@ impl Lower<'_> {
             .lines
             .iter()
             .any(|line| matches!(line.cells[0], Cell::Tag { .. }));
-        match &ty.core {
-            Core::Nat | Core::Int | Core::Real | Core::String | Core::Boolean if primitives => {
+        match &*ty {
+            Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean if primitives => {
                 self.switch_prim(col.temp, matrix, tree, body)
             }
-            Core::Sum(row) if tags => {
+            Ty::Sum(row) if tags => {
                 let row = flat(row);
                 self.switch_tag(col.temp, &row, matrix, tree, body)
             }
@@ -2604,7 +2794,7 @@ impl Lower<'_> {
     }
 
     /// Widen a struct position: one presence column per field the solved type
-    /// names, then the core, then whatever fields lie beyond the named ones.
+    /// names, then the constructor, then whatever fields lie beyond the named ones.
     fn widen(
         &mut self,
         temp: Temp,
@@ -2613,8 +2803,16 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let mut named: Vec<(String, Presence, Rc<Ty>)> = ty
-            .fields
+        let exposed = unfold(&self.inference.aliases, ty);
+        let row = match &*exposed {
+            Ty::Struct(row) => flat(row),
+            // Imported recovery types can disagree with the already-recovered
+            // pattern matrix. Treat them as an open unknown row: the fields the
+            // pattern itself names are added below, and lowering remains total.
+            _ => Row::of(Rest::Undecided),
+        };
+        let mut named: Vec<(String, Presence, Rc<Ty>)> = row
+            .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
             .collect();
@@ -2631,7 +2829,7 @@ impl Lower<'_> {
             }
         }
         let widen = |cell: &Cell| -> Vec<Cell> {
-            let mut wide = Vec::with_capacity(named.len() + 2);
+            let mut wide = Vec::with_capacity(named.len() + 1);
             match cell {
                 Cell::Struct { fields, exact } => {
                     for (name, _, _) in &named {
@@ -2642,17 +2840,13 @@ impl Lower<'_> {
                             (None, false) => Cell::Wild(None),
                         });
                     }
-                    // A struct pattern says nothing about the core beside the
-                    // fields, and everything about what lies beyond them.
-                    wide.push(Cell::Wild(None));
                     wide.push(match exact {
                         true => Cell::Absent,
                         false => Cell::Wild(None),
                     });
                 }
-                cell => {
+                _ => {
                     wide.extend(std::iter::repeat_n(Cell::Wild(None), named.len()));
-                    wide.push(cell.clone());
                     wide.push(Cell::Wild(None));
                 }
             }
@@ -2660,23 +2854,20 @@ impl Lower<'_> {
         };
         let mut cols: Vec<Col> = named
             .iter()
-            .map(|(name, presence, ty)| {
+            .map(|(name, presence, field_ty)| {
                 Col::Field(Field {
                     base: temp,
+                    base_ty: ty.clone(),
                     name: name.clone(),
                     presence: presence.clone(),
-                    ty: ty.clone(),
+                    ty: field_ty.clone(),
                 })
             })
             .collect();
-        cols.push(Col::Value(Value {
-            temp,
-            ty: Rc::new(Ty::plain(ty.core.clone())),
-        }));
         cols.push(Col::Beyond(Beyond {
             base: temp,
             names: named.iter().map(|(name, _, _)| name.clone()).collect(),
-            open: !matches!(ty.core, Core::Unit),
+            open: !matches!(row.rest, Rest::Closed),
         }));
         let widened = Matrix {
             cols: matrix.cols,
@@ -2710,7 +2901,10 @@ impl Lower<'_> {
             _ => {
                 let literal = match &col.presence {
                     Presence::Var(_) | Presence::Bound(_) => Some(col.presence.formula()),
-                    Presence::Present | Presence::Absent | Presence::Undecided => None,
+                    Presence::Present
+                    | Presence::Absent
+                    | Presence::Recovered(_)
+                    | Presence::Undecided => None,
                 };
                 let path = tree.allowed.clone().and(matrix.assumed.clone());
                 let can_present = literal.as_ref().is_none_or(|literal| {
@@ -2772,16 +2966,26 @@ impl Lower<'_> {
         if matrix.untested() {
             return self.tree(matrix.dropped(), tree, body);
         }
-        let rep = self.rep(&col.ty);
+        // As with expression projection, the container's production type is
+        // authoritative about the representation (including a function's
+        // effect-evidence ABI) actually stored in this slot. Read at that shape,
+        // record it on the projected temp, then adapt to the pattern's
+        // instantiated field type.
+        let authority = self.holding(col.base, &col.base_ty);
+        let have = self
+            .member_of(&authority, &col.name)
+            .unwrap_or_else(|| col.ty.clone());
         let temp = self.emit(
             body,
             tree.span,
-            rep,
+            self.rep(&have),
             Op::Project {
                 base: col.base,
                 field: FieldKey::named(col.name.clone()),
             },
         );
+        self.contain(temp, &have);
+        let temp = self.fitted(&col.ty, &have, temp, body);
         let read = vec![Col::Value(Value {
             temp,
             ty: col.ty.clone(),

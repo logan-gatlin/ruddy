@@ -41,9 +41,7 @@
 //! sharing can only run in this direction: `ruddy-debug` depends on `ruddy`,
 //! and nothing may make the dependency run back.
 
-use std::fmt;
-
-use indexmap::IndexMap;
+use std::{collections::HashSet, fmt};
 
 use crate::{
     bundle,
@@ -52,8 +50,8 @@ use crate::{
     symbol::{Bundle, LOCAL_SEGMENT, Mint, Namespace, Symbol},
     token::{self, Kind},
     types::{
-        Assigned, Atom, Core, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense, Shape,
-        Ty,
+        Assigned, Atom, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Scheme, Sense,
+        Shape, Ty,
     },
 };
 
@@ -140,17 +138,6 @@ pub enum Prec {
     /// what makes `#A Nat | #B -> Nat` a function *from* the sum rather
     /// than a sum whose last case carries an arrow.
     Sum,
-    /// `<core> with { ... }` — the fields extend rightward, so a `with` needs
-    /// parentheses anywhere a field list could be mistaken for something
-    /// else's.
-    ///
-    /// Above the arrow and the sum, which is what leaves a `with` type bare on
-    /// either side of an arrow and puts the parentheses round an arrow or a sum
-    /// used as the core of one. Below [`Prec::Tag`], and so below an argument
-    /// position: a `with` type handed to a type constructor or carried by a tag
-    /// is bracketed, because the fields would otherwise read as the next thing
-    /// along.
-    With,
     /// `#A` with nothing after it — a tag takes the next atom as its
     /// payload, so a bare one needs parentheses anywhere one could follow.
     ///
@@ -182,18 +169,10 @@ impl<'a> Path<'a> {
     }
 }
 
-/// A row read as one of the two shapes: labels in braces, or cases with their
-/// `#`s.
-///
-/// What a spliced tail prints as, and the one place a row's notation is chosen
-/// by something other than the position the row sits in. A tail is written by
-/// the row it ends — see [`tail_of`] — so the shape travels down from the type
-/// whose row it is, and `#Err Nat | ..#Ok Nat` never comes out spelled with
-/// a colon. See [`Display for Labels`](Labels) for the two writers it picks
-/// between, and [`Display for Row`](Row) for what a row with no shape to hand
-/// down falls back to.
-struct Labels<'a> {
-    shape: Shape,
+/// An effect row lifted out of its arrow, in the same notation the arrow uses.
+/// Constraints need this wrapper because a bare [`Row`] has no shape of its
+/// own and therefore falls back to struct notation.
+struct EffectLabels<'a> {
     row: &'a Row,
 }
 
@@ -1081,12 +1060,13 @@ impl fmt::Display for Shape {
 /// twice and [`ir::ErrorKind::NotARow`] once.
 ///
 /// The rest of a struct is a whole type, so it has no phrase of its own: `..'r`
-/// in a struct puts whatever is written for `'r` in the type's core, and there is
+/// in a struct puts whatever is written for `'r` in the struct-row tail, and there is
 /// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Sense::Type => "a whole type",
+            Sense::Fields => "the rest of a struct's fields",
             Sense::Cases => "the rest of a sum's cases",
             Sense::Effects => "the rest of an arrow's effects",
             // What a `when` puts on a label, said as the reader's own word for
@@ -1110,8 +1090,8 @@ fn noun(shape: Shape) -> &'static str {
 /// and how it is written there.
 ///
 /// Both come off the shape the solver carried rather than off the type beside
-/// them, because the type no longer answers the question. Every type has fields
-/// *and* may have cases, so a base can be a sum-cored type that is missing a
+/// them, because the type no longer answers the question. Only structs have fields
+/// *and* may have cases, so a base can be a sum type that is missing a
 /// `field` — `(#A 1).x` is exactly that — and reading the word off the base
 /// would call it a case. The solver knows which row it was deciding at the
 /// moment it failed, and that is the only place the answer is not a guess.
@@ -1150,7 +1130,7 @@ pub fn label(shape: Shape, name: &str) -> String {
         // as the one bare name they share. Keep the old path spelling for the
         // diagnostic helper's explicitly path-shaped input.
         Shape::Effect => {
-            let name = name.split('\u{1f}').next().unwrap_or(name);
+            let name = EffectId::parse_row_key(name).map_or(name, |pair| pair.0);
             match name.rsplit_once("::") {
                 Some((modules, effect)) => format!("{modules}::!{effect}"),
                 None => format!("!{name}"),
@@ -1197,9 +1177,9 @@ impl fmt::Display for Prim {
 
 /// How much of the surface grammar a semantic type can be.
 ///
-/// A type that carries no fields groups as its core alone, because that is all
+/// A type that carries no fields groups as its type alone, because that is all
 /// it prints as. One that carries fields is either written in braces — which
-/// close it, so it is an atom, and which is every core a `..` has a spelling for
+/// close it, so it is an atom, and which is every row tail has a spelling
 /// — or a `with`, whose field list extends rightward and so has to be kept off
 /// anything that could be read as continuing it.
 ///
@@ -1210,217 +1190,277 @@ impl fmt::Display for Prim {
 /// reach every level of it.
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
-        match (self.fields.is_empty(), &self.core) {
-            (true, core) => core.prec(),
-            // Braces close it, however many fields are inside and whatever the
-            // `..` after them says.
-            (
-                false,
-                Core::Unit | Core::Var(_) | Core::Bound(_) | Core::Rigid { .. } | Core::Undecided,
-            ) => Prec::Atom,
-            (false, _) => Prec::With,
-        }
-    }
-}
-
-/// How much of the surface grammar a core can be. The arrow extends rightward,
-/// an application extends rightward by argument, and a sum extends rightward by
-/// case; everything else — a primitive, unit, a variable — is a form nothing
-/// can be appended to.
-impl Grouped for Core {
-    fn prec(&self) -> Prec {
         match self {
-            Core::Arrow(..) => Prec::Arrow,
-            // A sum is written as its cases with nothing around them, so
-            // anything that could follow a case has to be kept off it — an
-            // argument, a payload, another case.
-            Core::Sum(_) => Prec::Sum,
-            // Applied to something, a declared type groups as the application
-            // it is: `Pair Nat Nat` needs parentheses wherever an argument
-            // could follow it.
-            Core::Named { args, .. } if !args.is_empty() => Prec::Apply,
-            // Applied to nothing it is an atom whatever it stands for: it
-            // prints as its name, and a name is one word however many arrows
-            // are behind it. Unit is one too: its braces close it.
-            Core::Unit
-            | Core::Nat
-            | Core::Int
-            | Core::Real
-            | Core::String
-            | Core::Boolean
-            | Core::Named { .. }
-            | Core::Var(_)
-            | Core::Bound(_)
-            | Core::Rigid { .. }
-            | Core::Undecided => Prec::Atom,
+            Ty::Arrow(..) => Prec::Arrow,
+            Ty::Sum(_) => Prec::Sum,
+            Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
+            _ => Prec::Atom,
         }
     }
 }
 
-/// Types print in the surface type grammar, so a printed type reads the same
-/// as one the user could have written. The two forms with no surface spelling
-/// print as what they mean: a quantified variable as the bare letter its
-/// a variable declares it as, and an unsolved or
-/// undecided type as `?` — inference's way of saying it has nothing to report.
-///
-/// Three forms, and which one a type takes is decided by its two halves rather
-/// than by a variant. A type carrying no fields prints as its core alone, which
-/// is every type the language had before fields were a property of all of them.
-/// A type carrying fields whose core is one a `..` can be written with —
-/// [`Core::Unit`], which writes no `..` at all, a variable, a quantified
-/// variable, or the undecided type — prints as its fields in braces, which is
-/// how a struct has always printed and is what makes `{ x: 'a, ..'b }` come out
-/// as something a reader could have written. And anything else carrying fields
-/// prints as `<core> with { ... }` — a form inference can build and no source
-/// syntax can write, which is why it exists here and nowhere in the parser, and
-/// which is reachable only through a declaration whose `..` was handed a known
-/// type.
-///
-/// The `..` spelling is [`tail_of`]'s table read off the core rather than off a
-/// tail, and that is the whole of what keeps a printed type re-lowerable to the
-/// type it was printed from: `b with { x: a }` is not something the parser
-/// could read back, and `{ x: 'a, ..'b }` is.
-///
-/// The grouping comes from [`write_arrow`] and the braces from [`write_row`]
-/// below, both of which the debugger's two tree printers also write through.
-/// So the punctuation a type is written with is one rule rather than two
-/// copies of a rule agreeing: where a diagnostic puts a parenthesis, a comma
-/// or a `when` clause, the debugger's IR tab puts one too.
-///
-/// Not the whole string, though, and deliberately not. A tail is written by
-/// whoever knows what it stands for, and the two readers know different
-/// things: the IR tab is showing a type as it was written, so it spells a
-/// named tail `..'r`, while a scheme is showing what the definition was
-/// inferred to be, so it spells the same tail `..'a`. `tests/src/print.rs`
-/// pins both.
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.fields.is_empty() {
-            return self.core.fmt(f);
-        }
-        match core_tail(&self.core) {
-            Some(tail) => write_fields(f, &self.fields, tail.as_ref().map(shown)),
-            None => {
-                write_grouped(f, self.core.prec() < Prec::With, &self.core)?;
-                f.write_str(" with ")?;
-                write_fields(f, &self.fields, None)
+        format_semantic(f, SemanticRoot::Ty(self))
+    }
+}
+
+/// One explicit-stack semantic formatter shared by types, rows, and row tails.
+/// Imported artifacts are allowed to be deeply nested recovery input, so a
+/// formatter used by diagnostics and debugger stages may not mirror that depth
+/// with Rust calls.
+enum SemanticRoot<'a> {
+    Ty(&'a Ty),
+    Row(&'a Row),
+    Rest(&'a Rest),
+    EffectLabels(&'a Row),
+}
+
+enum SemanticJob<'a> {
+    Ty(&'a Ty, bool),
+    Applied(&'a Ty),
+    Row(&'a Row),
+    Rest(&'a Rest),
+    Fields(&'a Row),
+    Cases(&'a Row, bool),
+    Effects(&'a Row),
+    Tail(&'a Rest),
+    Field(&'a str, &'a RowField),
+    Case(&'a str, &'a RowField, bool),
+    Effect(&'a str, &'a Presence),
+    Text(&'static str),
+}
+
+fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::Result {
+    let first = match root {
+        SemanticRoot::Ty(ty) => SemanticJob::Ty(ty, false),
+        SemanticRoot::Row(row) => SemanticJob::Row(row),
+        SemanticRoot::Rest(rest) => SemanticJob::Rest(rest),
+        SemanticRoot::EffectLabels(row) => SemanticJob::Effects(row),
+    };
+    let mut work = vec![first];
+    while let Some(part) = work.pop() {
+        match part {
+            SemanticJob::Text(text) => f.write_str(text)?,
+            SemanticJob::Ty(ty, grouped) => {
+                if grouped {
+                    f.write_str("(")?;
+                    work.push(SemanticJob::Text(")"));
+                }
+                match ty {
+                    Ty::Nat => f.write_str(Prim::Nat.name())?,
+                    Ty::Int => f.write_str(Prim::Int.name())?,
+                    Ty::Real => f.write_str(Prim::Real.name())?,
+                    Ty::String => f.write_str(Prim::String.name())?,
+                    Ty::Boolean => f.write_str(Prim::Boolean.name())?,
+                    Ty::Arrow(from, to, effects) => {
+                        let shown = effect_row_shown(effects);
+                        if shown {
+                            work.push(SemanticJob::Effects(effects));
+                            work.push(SemanticJob::Text(" + "));
+                        }
+                        work.push(SemanticJob::Ty(to, shown && matches!(&**to, Ty::Arrow(..))));
+                        work.push(SemanticJob::Text(" -> "));
+                        work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
+                    }
+                    Ty::Struct(row) => work.push(SemanticJob::Fields(row)),
+                    Ty::Sum(row) => work.push(SemanticJob::Cases(row, false)),
+                    Ty::Named { name, args, .. } => {
+                        for arg in args.iter().rev() {
+                            work.push(SemanticJob::Applied(arg));
+                            work.push(SemanticJob::Text(" "));
+                        }
+                        f.write_str(name)?;
+                    }
+                    Ty::Var(var) => write!(f, "?{var}")?,
+                    Ty::Bound(index) => f.write_str(&name_at(*index))?,
+                    Ty::Rigid { name, .. } => write!(f, "'{name}")?,
+                    Ty::Undecided => f.write_str("?")?,
+                }
+            }
+            SemanticJob::Applied(ty) => {
+                let grouped = ty.prec() < Prec::Atom;
+                if grouped {
+                    f.write_str("(")?;
+                    work.push(SemanticJob::Text(")"));
+                }
+                match ty {
+                    Ty::Sum(row)
+                        if flattened_row(row)
+                            .0
+                            .iter()
+                            .any(|(name, _)| EffectId::parse_canonical_row_key(name).is_some()) =>
+                    {
+                        work.push(SemanticJob::Cases(row, true));
+                    }
+                    ty => work.push(SemanticJob::Ty(ty, false)),
+                }
+            }
+            SemanticJob::Row(row) => {
+                let (fields, rest) = flattened_row(row);
+                match fields.is_empty() {
+                    true => work.push(SemanticJob::Rest(rest)),
+                    false => work.push(SemanticJob::Fields(row)),
+                }
+            }
+            SemanticJob::Rest(rest) => match rest {
+                Rest::Closed => f.write_str("∅")?,
+                Rest::Var(var) => write!(f, "?{var}")?,
+                Rest::Bound(index) => f.write_str(&name_at(*index))?,
+                Rest::Rigid { name, .. } => write!(f, "'{name}")?,
+                Rest::Undecided => f.write_str("?")?,
+                Rest::More(row) => work.push(SemanticJob::Row(row)),
+            },
+            SemanticJob::Fields(row) => {
+                let (fields, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Struct, rest);
+                if fields.is_empty() && tail.is_none() {
+                    f.write_str("{}")?;
+                    continue;
+                }
+                f.write_str("{ ")?;
+                work.push(SemanticJob::Text(" }"));
+                if let Some(tail) = tail {
+                    work.push(SemanticJob::Tail(tail));
+                    work.push(SemanticJob::Text(".."));
+                    if !fields.is_empty() {
+                        work.push(SemanticJob::Text(", "));
+                    }
+                }
+                for (at, (name, field)) in fields.into_iter().enumerate().rev() {
+                    work.push(SemanticJob::Field(name, field));
+                    if at != 0 {
+                        work.push(SemanticJob::Text(", "));
+                    }
+                }
+            }
+            SemanticJob::Cases(row, strip_interface) => {
+                let (cases, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Sum, rest);
+                if cases.is_empty() {
+                    f.write_str("|")?;
+                }
+                if let Some(tail) = tail {
+                    work.push(SemanticJob::Tail(tail));
+                    work.push(SemanticJob::Text(if cases.is_empty() {
+                        " .."
+                    } else {
+                        " | .."
+                    }));
+                }
+                for (at, (name, field)) in cases.into_iter().enumerate().rev() {
+                    work.push(SemanticJob::Case(name, field, strip_interface));
+                    if at != 0 {
+                        work.push(SemanticJob::Text(" | "));
+                    }
+                }
+            }
+            SemanticJob::Effects(row) => {
+                let (effects, rest) = flattened_row(row);
+                let tail = semantic_tail(Shape::Effect, rest);
+                if effects.is_empty() && tail.is_none() {
+                    f.write_str("|")?;
+                    continue;
+                }
+                if let Some(tail) = tail {
+                    work.push(SemanticJob::Tail(tail));
+                    work.push(SemanticJob::Text(".."));
+                    if !effects.is_empty() {
+                        work.push(SemanticJob::Text(" + "));
+                    }
+                }
+                for (at, (name, field)) in effects.into_iter().enumerate().rev() {
+                    work.push(SemanticJob::Effect(name, &field.presence));
+                    if at != 0 {
+                        work.push(SemanticJob::Text(" + "));
+                    }
+                }
+            }
+            SemanticJob::Tail(Rest::Undecided) => {}
+            SemanticJob::Tail(rest) => work.push(SemanticJob::Rest(rest)),
+            SemanticJob::Field(name, field) => {
+                write_field_label(f, name)?;
+                write_semantic_mark(f, &field.presence, false)?;
+                f.write_str(": ")?;
+                work.push(SemanticJob::Ty(&field.ty, false));
+            }
+            SemanticJob::Case(name, field, strip_interface) => {
+                let name = if strip_interface {
+                    EffectId::parse_canonical_row_key(name).map_or(name, |pair| pair.0)
+                } else {
+                    name
+                };
+                write_tag_label(f, name)?;
+                write_semantic_mark(f, &field.presence, true)?;
+                if !unit_type(&field.ty) {
+                    f.write_str(" ")?;
+                    work.push(SemanticJob::Ty(&field.ty, field.ty.prec() < Prec::Atom));
+                }
+            }
+            SemanticJob::Effect(name, presence) => {
+                f.write_str(&label(Shape::Effect, name))?;
+                write_semantic_mark(f, presence, true)?;
             }
         }
     }
+    Ok(())
 }
 
-/// What follows a fielded type's `..`, or `None` when the core is not one a
-/// `..` can be written with at all and the type has to wear a `with` instead.
-///
-/// [`tail_of`]'s table moved from a row's tail to a type's core, which is where
-/// a struct's `..` now lives. The four it answers about are exactly the four a
-/// written `..` could stand for: nothing further at all, which writes no `..`;
-/// a solver variable; one a scheme quantified; and the undecided type, which
-/// writes the bare `..` a reader would have written.
-///
-/// `Some(None)` and `None` are two different answers and the difference matters:
-/// the first is unit, which closes the braces with no `..` in them, and the
-/// second is a `Nat`, an arrow, a sum or a declared name, none of which a `..`
-/// has a spelling for.
-fn core_tail(core: &Core) -> Option<Option<String>> {
-    match core {
-        Core::Unit => Some(None),
-        Core::Var(var) => Some(Some(format!("?{var}"))),
-        Core::Bound(index) => Some(Some(name_at(*index))),
-        // A struct's rest declared by a variable prints as the name it was
-        // declared with, which is what the reader wrote and what re-lowers to
-        // the same rest.
-        Core::Rigid { name, .. } => Some(Some(format!("'{name}"))),
-        Core::Undecided => Some(Some(String::new())),
-        Core::Nat
-        | Core::Int
-        | Core::Real
-        | Core::String
-        | Core::Boolean
-        | Core::Arrow(..)
-        | Core::Sum(_)
-        | Core::Named { .. } => None,
-    }
-}
-
-/// One argument of a declared type application.
-///
-/// Effect rows are represented as sum-shaped types while they travel through a
-/// declaration parameter. Their generated keys carry an opaque interface after
-/// a unit separator; keep hiding that implementation detail here, at the one
-/// erased-shape boundary that needs it, rather than truncating ordinary sum
-/// labels everywhere they are printed.
-struct AppliedArgument<'a>(&'a Ty);
-
-impl Grouped for AppliedArgument<'_> {
-    fn prec(&self) -> Prec {
-        self.0.prec()
-    }
-}
-
-impl fmt::Display for AppliedArgument<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Core::Sum(row) = &self.0.core else {
-            return self.0.fmt(f);
-        };
-        if !self.0.fields.is_empty() || !row.labels.keys().any(|name| name.contains('\u{1f}')) {
-            return self.0.fmt(f);
-        }
-
-        let entries = row
-            .labels
-            .iter()
-            .filter_map(|(name, field)| match mark(&field.presence) {
-                Absence::Absent => None,
-                Absence::There(mark) => Some(Entry::Written {
-                    name: name
-                        .split_once('\u{1f}')
-                        .map_or(name.as_str(), |(name, _)| name),
-                    mark,
-                    holds: payload(&field.ty),
-                }),
-            });
-        let tail = tail_of(Shape::Sum, &row.rest);
-        write_sum(f, entries, tail.as_ref().map(shown))
-    }
-}
-
-/// A core prints as the whole type would if it carried no fields, which is what
-/// [`Display for Ty`](Ty) writes it as.
-impl fmt::Display for Core {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Unit falls out of this as `{}` rather than `()`, on purpose:
-            // there is one type here, and one spelling for it. See
-            // [`Core::Unit`].
-            Core::Unit => write_fields(f, &IndexMap::new(), None),
-            Core::Nat => f.write_str(Prim::Nat.name()),
-            Core::Int => f.write_str(Prim::Int.name()),
-            Core::Real => f.write_str(Prim::Real.name()),
-            Core::String => f.write_str(Prim::String.name()),
-            Core::Boolean => f.write_str(Prim::Boolean.name()),
-            Core::Arrow(from, to, effects) => {
-                let row = effects_of(effects);
-                write_arrow(f, &**from, &**to, row.as_ref().map(shown))
+/// Flatten a semantic row with the same outer-wins rule as inference. A name
+/// is claimed before its presence is inspected, so an outer absent entry masks
+/// an inner present one rather than merely disappearing beside it.
+fn flattened_row(row: &Row) -> (Vec<(&str, &RowField)>, &Rest) {
+    let mut names = HashSet::new();
+    let mut fields = Vec::new();
+    let mut row = row;
+    loop {
+        for (name, field) in &row.labels {
+            if names.insert(name.as_str()) && !matches!(field.presence, Presence::Absent) {
+                fields.push((name.as_str(), field));
             }
-            Core::Sum(cases) => write_cases(f, cases, Shape::Sum),
-            // A declared type prints as what the user called it rather than as
-            // what it stands for, applied to whatever it was given. It is
-            // shorter, it is what they wrote, and it is the only way a type
-            // that names itself can be printed at all.
-            Core::Named { name, args, .. } if args.is_empty() => f.write_str(name),
-            Core::Named { name, args, .. } => {
-                write_applied(f, &**name, args.iter().map(|arg| AppliedArgument(arg)))
-            }
-            // A solver variable has no name, only an index; it is numbered so
-            // that two different unknowns in one message stay distinguishable.
-            Core::Var(var) => write!(f, "?{var}"),
-            Core::Bound(index) => f.write_str(&name_at(*index)),
-            // A rigid prints as the name its a variable gave it: the reader
-            // wrote it, and it is what tells two of them apart in one message.
-            Core::Rigid { name, .. } => write!(f, "'{name}"),
-            Core::Undecided => f.write_str("?"),
         }
+        match &row.rest {
+            Rest::More(more) => row = more,
+            rest => return (fields, rest),
+        }
+    }
+}
+
+fn semantic_tail(shape: Shape, rest: &Rest) -> Option<&Rest> {
+    match rest {
+        Rest::Closed => None,
+        Rest::Undecided if matches!(shape, Shape::Effect) => None,
+        rest => Some(rest),
+    }
+}
+
+fn effect_row_shown(row: &Row) -> bool {
+    let (fields, rest) = flattened_row(row);
+    !fields.is_empty() || semantic_tail(Shape::Effect, rest).is_some()
+}
+
+fn unit_type(ty: &Ty) -> bool {
+    let Ty::Struct(row) = ty else {
+        return false;
+    };
+    let (fields, rest) = flattened_row(row);
+    fields.is_empty() && matches!(rest, Rest::Closed)
+}
+
+fn write_semantic_mark(
+    f: &mut fmt::Formatter<'_>,
+    presence: &Presence,
+    parenthesized: bool,
+) -> fmt::Result {
+    let (open, close) = match parenthesized {
+        true => (" (when ", ")"),
+        false => (" when ", ""),
+    };
+    match presence {
+        Presence::Present | Presence::Absent => Ok(()),
+        Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
+        Presence::Var(var) => write!(f, "{open}?{var}{close}"),
+        Presence::Bound(index) => write!(f, "{open}{}{close}", name_at(*index)),
     }
 }
 
@@ -1435,145 +1475,24 @@ impl fmt::Display for Core {
 /// nobody left to hand it one. So a sum's tail bound in the Solve tab reads
 /// `?2 := { B: Nat }` rather than in cases, and the braces there are notation
 /// for a set of labels rather than a claim that they are fields. Everywhere a
-/// shape *is* known the row goes through [`Labels`] instead, which is every row
-/// printed as part of a type.
+/// shape *is* known the containing type hands it directly to the iterative
+/// semantic formatter instead.
 ///
 /// A row that names nothing prints as its rest alone, so closing one reads
 /// `?4 := ∅` rather than as an empty pair of braces standing for the same
 /// thing.
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.labels.is_empty() {
-            true => self.rest.fmt(f),
-            false => write_braced(f, self),
-        }
+        format_semantic(f, SemanticRoot::Row(self))
     }
 }
 
-/// A row in the notation of the shape it belongs to, which is the one thing
+/// An effect row in the notation its arrow supplies, which is the one thing
 /// [`Display for Row`](Row) cannot know.
-impl fmt::Display for Labels<'_> {
+impl fmt::Display for EffectLabels<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.shape {
-            Shape::Struct => write_braced(f, self.row),
-            // One notation for the two, because an effect row is written the
-            // way a sum's cases are — tags, bars and a `..` — minus the payload
-            // an effect never carries.
-            Shape::Sum | Shape::Effect => write_cases(f, self.row, self.shape),
-        }
+        format_semantic(f, SemanticRoot::EffectLabels(self.row))
     }
-}
-
-/// A whole [`Row`] in braces: its labels, and its tail read as a struct's would
-/// be. What the solver's own record of a row falls back to, and what a spliced
-/// tail prints as where the shape says fields.
-fn write_braced(f: &mut fmt::Formatter<'_>, row: &Row) -> fmt::Result {
-    write_fields(
-        f,
-        &row.labels,
-        tail_of(Shape::Struct, &row.rest).as_ref().map(shown),
-    )
-}
-
-/// A set of labels and whatever follows their `..`, in braces.
-///
-/// A field prints by what its presence resolved to: there for certain as
-/// `name: T`, absent not at all — a field that is not there is not part of what
-/// the type says — and anything still undecided as `name?: T`, the surface
-/// spelling for "may or may not be there". `tail` is what follows the `..`, and
-/// `None` writes no `..` at all — which is what makes this collapse to the old
-/// notation whenever nothing is open.
-fn write_fields(
-    f: &mut fmt::Formatter<'_>,
-    labels: &IndexMap<String, RowField>,
-    tail: Option<&dyn fmt::Display>,
-) -> fmt::Result {
-    let entries = labels
-        .iter()
-        .filter_map(|(name, field)| match mark(&field.presence) {
-            Absence::Absent => None,
-            Absence::There(mark) => Some(Entry::Written {
-                name,
-                mark,
-                holds: &field.ty,
-            }),
-        });
-    write_row(f, entries, tail)
-}
-
-/// [`write_braced`] about the other shape: the cases of a row and its tail, each
-/// wearing the `#` that makes it one.
-///
-/// Absent not at all, undecided as `#A? T`, and the tail after them. The one
-/// thing a sum has that a struct has not is a case carrying unit, which prints
-/// as no payload at all — `#None` is how it was written, and `#None {}`
-/// is the same type spelled longer.
-fn write_cases(f: &mut fmt::Formatter<'_>, row: &Row, shape: Shape) -> fmt::Result {
-    let marked = row
-        .labels
-        .iter()
-        .filter_map(|(name, field)| match mark(&field.presence) {
-            Absence::Absent => None,
-            Absence::There(mark) => Some((name, mark, &field.ty)),
-        });
-    let tail = tail_of(shape, &row.rest);
-    let tail = tail.as_ref().map(shown);
-    // The one thing the two readings differ in: an effect carries nothing, so
-    // its label writes no payload and the unit it holds is never inspected.
-    // See R18.
-    match shape {
-        Shape::Effect => {
-            let effects: Vec<Entry<&str, ()>> = marked
-                .map(|(name, mark, _)| Entry::Written {
-                    name: name.split('\u{1f}').next().unwrap_or(name),
-                    mark,
-                    holds: (),
-                })
-                .collect();
-            write_effects(f, &effects, tail)
-        }
-        _ => write_sum(
-            f,
-            marked.map(|(name, mark, ty)| Entry::Written {
-                name,
-                mark,
-                holds: payload(ty),
-            }),
-            tail,
-        ),
-    }
-}
-
-/// What an arrow's effect row prints as, or `None` for the empty closed row —
-/// which prints as nothing at all, so a pure arrow prints bare.
-///
-/// The one question R24's parenthesization turns on, and the one thing that
-/// makes `A -> B` and `A -> B + |` print the same: both mean "performs
-/// nothing", and there is one spelling for that.
-///
-/// A label settled absent counts for nothing here, on the same grounds as
-/// everywhere else: an effect that is not performed is no part of what the
-/// arrow says. So a row that came to nothing but absences prints as nothing,
-/// exactly as one that named nothing does.
-fn effects_of(row: &Row) -> Option<String> {
-    let named = row.labels.values().any(|field| !absent(field));
-    let tail = tail_of(Shape::Effect, &row.rest);
-    if !named && tail.is_none() {
-        return None;
-    }
-    let mut out = String::new();
-    // Writing to a `String` cannot fail.
-    let _ = fmt::write(
-        &mut out,
-        format_args!(
-            "{}",
-            Labels {
-                shape: Shape::Effect,
-                row,
-            }
-        ),
-    );
-    Some(out)
 }
 
 /// What is known about the cases a row does not name.
@@ -1584,17 +1503,7 @@ fn effects_of(row: &Row) -> Option<String> {
 /// says it has nothing more to come.
 impl fmt::Display for Rest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Rest::Closed => f.write_str("∅"),
-            Rest::Var(var) => write!(f, "?{var}"),
-            Rest::Bound(index) => f.write_str(&name_at(*index)),
-            Rest::Rigid { name, .. } => write!(f, "'{name}"),
-            Rest::Undecided => f.write_str("?"),
-            // A tail already decided to be more labels prints as those labels,
-            // so `..{ y: Nat }` says what the row has come to be without
-            // pretending the splice has happened.
-            Rest::More(row) => row.fmt(f),
-        }
+        format_semantic(f, SemanticRoot::Rest(self))
     }
 }
 
@@ -1610,7 +1519,7 @@ impl fmt::Display for Presence {
             Presence::Absent => f.write_str("absent"),
             Presence::Var(var) => write!(f, "?{var}"),
             Presence::Bound(index) => f.write_str(&name_at(*index)),
-            Presence::Undecided => f.write_str("?"),
+            Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
         }
     }
 }
@@ -1657,32 +1566,6 @@ fn name_at(index: u32) -> String {
     }
 }
 
-/// Whether a label is part of what its type says, and — when it is — the mark
-/// it wears.
-///
-/// Three presences and two answers: absent is no part of the type at all, and
-/// everything else is there with whatever mark says how sure that is.
-enum Absence {
-    Absent,
-    There(Option<Mark>),
-}
-
-/// How one presence prints on the label it belongs to.
-///
-/// A presence certainly there wears nothing, absent is not written, and
-/// everything else is a `when` clause naming it — a letter for one a scheme
-/// quantified, and the solver's own `?3` for one still open. The single
-/// exception is the presence a failure abandoned, which keeps the `?` no syntax
-/// reads: what it reports is precisely that there is nothing to write.
-fn mark(presence: &Presence) -> Absence {
-    match presence {
-        Presence::Absent => Absence::Absent,
-        Presence::Present => Absence::There(None),
-        Presence::Undecided => Absence::There(Some(Mark::Undecided)),
-        decided => Absence::There(Some(Mark::When(decided.to_string()))),
-    }
-}
-
 /// How tightly a printed formula binds, on the `where` grammar's own ladder:
 /// `0` for the non-associative `=` and `!=`, `1` for `or`, `2` for `and`, `3`
 /// for `not`, `4` for a name.
@@ -1718,51 +1601,60 @@ impl Named<'_> {
     /// Write `formula` for a position that binds at least as tightly as
     /// `level`, bracketing it when it does not.
     fn at(&self, f: &mut fmt::Formatter<'_>, formula: &Formula, level: u8) -> fmt::Result {
-        let parens = prec(formula) < level;
-        if parens {
-            f.write_str("(")?;
+        enum Work<'a> {
+            Formula(&'a Formula, u8),
+            Text(&'static str),
+            Close,
         }
-        match formula {
-            // Neither constant has a spelling in the grammar, and neither has
-            // to: a formula that says nothing writes no clause at all, and one
-            // nothing satisfies is a complaint rather than a type. They print
-            // as the words they are, for the debugger and for a message that
-            // has to show one.
-            Formula::True => f.write_str("always")?,
-            Formula::False => f.write_str("never")?,
-            Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
-            Formula::Not(inner) => {
-                f.write_str("not ")?;
-                self.at(f, inner, 3)?;
+
+        let mut work = vec![Work::Formula(formula, level)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => f.write_str(text)?,
+                Work::Close => f.write_str(")")?,
+                Work::Formula(formula, level) => {
+                    let parens = prec(formula) < level;
+                    if parens {
+                        f.write_str("(")?;
+                        work.push(Work::Close);
+                    }
+                    match formula {
+                        // Neither constant has a spelling in the grammar, and
+                        // neither has to: they are debugger/recovery readings.
+                        Formula::True => f.write_str("always")?,
+                        Formula::False => f.write_str("never")?,
+                        Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
+                        Formula::Not(inner) => {
+                            f.write_str("not ")?;
+                            work.push(Work::Formula(inner, 3));
+                        }
+                        // Left-associative, so the right side is written one
+                        // level tighter and retains required parentheses.
+                        Formula::And(left, right) => {
+                            work.push(Work::Formula(right, 3));
+                            work.push(Work::Text(" and "));
+                            work.push(Work::Formula(left, 2));
+                        }
+                        Formula::Or(left, right) => {
+                            work.push(Work::Formula(right, 2));
+                            work.push(Work::Text(" or "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                        // Comparisons are non-associative, so both operands are
+                        // one precedence level tighter.
+                        Formula::Iff(left, right) => {
+                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Text(" = "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                        Formula::Xor(left, right) => {
+                            work.push(Work::Formula(right, 1));
+                            work.push(Work::Text(" != "));
+                            work.push(Work::Formula(left, 1));
+                        }
+                    }
+                }
             }
-            // Left-associative, so the right side is written one level tighter
-            // and a right-nested `or` inside an `or` keeps its parentheses.
-            Formula::And(left, right) => {
-                self.at(f, left, 2)?;
-                f.write_str(" and ")?;
-                self.at(f, right, 3)?;
-            }
-            Formula::Or(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" or ")?;
-                self.at(f, right, 2)?;
-            }
-            // Non-associative, so both sides are written one level tighter: a
-            // comparison inside a comparison takes parentheses, because the
-            // grammar refuses to read one without them.
-            Formula::Iff(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" = ")?;
-                self.at(f, right, 1)?;
-            }
-            Formula::Xor(left, right) => {
-                self.at(f, left, 1)?;
-                f.write_str(" != ")?;
-                self.at(f, right, 1)?;
-            }
-        }
-        if parens {
-            f.write_str(")")?;
         }
         Ok(())
     }
@@ -1800,80 +1692,6 @@ impl fmt::Display for Formula {
             labels: &[],
         }
         .fmt(f)
-    }
-}
-
-/// What follows a row's `..`, or `None` when the row allows nothing more and no
-/// `..` is written at all: a quantified `a`, a solver variable's `?3`, the
-/// labels a tail has been decided to be, or the empty string where the rest is
-/// undecided and there is nothing to report.
-///
-/// A tail decided to be more labels is the one part of this the shape is needed
-/// for, and the reason it is passed down: those labels are the row's own,
-/// written in the row's own notation, so a sum's spliced tail reads
-/// `..#Ok Nat` and not `..{ Ok: Nat }`. Everything else about a tail reads
-/// the same either way — it stands for the labels not named, and what it stands
-/// for is spelled by what it resolved to.
-///
-/// A splice that came to nothing is no tail. `..'r` handed a closed row that
-/// names nothing leaves a tail saying exactly what [`Rest::Closed`] says, and
-/// the answer has to be the same for both: `∅` is the solver's mark for a row
-/// with nothing more to come and is never part of a printed type, so
-/// `Fallible (#Ok Nat)` prints its cases and no `..` — which is what it is.
-/// A label the splice settled absent counts for nothing here, on the same
-/// grounds as everywhere else: a label that is not there is not part of what the
-/// type says.
-///
-/// A struct's `..` does not come through here at all any more: its tail is the
-/// core beside its fields, and [`core_tail`] is the same table read off that.
-fn tail_of(shape: Shape, rest: &Rest) -> Option<String> {
-    match rest {
-        Rest::Closed => None,
-        Rest::More(row) if row.labels.values().all(absent) => tail_of(shape, &row.rest),
-        // An abandoned effect row says nothing, so it writes nothing: the `?`
-        // on the type beside it already reports the failure, and a `+ ..` would
-        // claim the function may still perform something. The other two shapes
-        // write the `..` a reader would have written, because there a tail is
-        // part of what the type says whatever it came to.
-        Rest::Undecided if matches!(shape, Shape::Effect) => None,
-        Rest::Undecided => Some(String::new()),
-        Rest::More(row) => Some(Labels { shape, row }.to_string()),
-        open => Some(open.to_string()),
-    }
-}
-
-/// Whether one label is settled not to be there, and so is no part of what the
-/// row it sits in says.
-fn absent(field: &RowField) -> bool {
-    matches!(field.presence, Presence::Absent)
-}
-
-/// A borrowed tail as the trait object [`write_row`] and [`write_sum`] take.
-/// One line, but `map(shown)` reads where the turbofished cast it replaces did
-/// not.
-fn shown(tail: &String) -> &dyn fmt::Display {
-    tail
-}
-
-/// What a case carries, or `None` when it carries unit and so is written with
-/// no payload at all.
-///
-/// Unit is what a tag with no payload lowers to — `#None` is `#None ()`
-/// — so this is the inverse of that lowering, and it is what makes a printed
-/// sum re-lower to the sum it was printed from. A payload that is unit however
-/// it was written goes the same way, `{}` and `()` alike: the two spell one
-/// type, and `#None {}` is that type written longer. Everything else
-/// prints.
-fn payload(ty: &Ty) -> Option<&Ty> {
-    // A field settled absent is not part of what the type says, so a type that
-    // prints as `{}` is unit however many labels the solver left in the map. A
-    // unit core writes no `..` after them, which is the whole of what makes this
-    // the same question a printed type asks: a case carrying a struct that came
-    // to nothing is still a case carrying unit, and still prints as `#A`.
-    let empty = matches!(ty.core, Core::Unit) && ty.fields.values().all(absent);
-    match empty {
-        true => None,
-        false => Some(ty),
     }
 }
 
@@ -2028,6 +1846,7 @@ impl ConstraintKind {
     /// rather than with prose that may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
+            ConstraintKind::Project { .. } => "project",
             ConstraintKind::Equal { .. } => "equal",
             ConstraintKind::Let { .. } => "let",
             ConstraintKind::Instance { .. } => "instance",
@@ -2048,6 +1867,14 @@ impl fmt::Display for Constraint {
 impl fmt::Display for ConstraintKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConstraintKind::Project {
+                base,
+                field,
+                result,
+                ..
+            } => {
+                write!(f, "{base}.{field} -> {result}")
+            }
             ConstraintKind::Equal { expected, actual } => write!(f, "{expected} ~ {actual}"),
             // A header rather than a line, because a `let` carries two lists of
             // constraints and a list is not a line: what it says of itself is
@@ -2111,11 +1938,7 @@ impl fmt::Display for ConstraintKind {
 /// is written with rather than as nothing at all, which would leave the line
 /// with a gap in it.
 fn effects_shown(row: &Row) -> String {
-    Labels {
-        shape: Shape::Effect,
-        row,
-    }
-    .to_string()
+    EffectLabels { row }.to_string()
 }
 
 /// A goal prints as a constraint does, in whichever of the three sorts it is
@@ -2137,6 +1960,7 @@ impl inference::ErrorKind {
     /// rather than on the message, which is prose and may be reworded.
     pub fn code(&self) -> &'static str {
         match self {
+            inference::ErrorKind::NotAStruct { .. } => "not-a-struct",
             inference::ErrorKind::Mismatch { .. } => "type-mismatch",
             inference::ErrorKind::Recursive => "recursive-type",
             // A missing case and a missing field are one complaint, so they
@@ -2167,6 +1991,9 @@ impl inference::ErrorKind {
 impl fmt::Display for inference::ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            inference::ErrorKind::NotAStruct { base } => {
+                write!(f, "`{base}` is not a struct, so it has no fields to read")
+            }
             inference::ErrorKind::Mismatch { expected, actual } => {
                 write!(f, "type mismatch: expected `{expected}`, found `{actual}`")
             }
@@ -2199,6 +2026,15 @@ impl fmt::Display for inference::ErrorKind {
             } => write!(
                 f,
                 "this decides what it may perform, but `'{name}` stands for whatever effects the caller allows",
+            ),
+            inference::ErrorKind::RigidBroken {
+                found,
+                name,
+                sense: Sense::Fields,
+                ..
+            } => write!(
+                f,
+                "this is `{found}`, but `'{name}` stands for whatever the caller picks for the rest of a struct's fields",
             ),
             inference::ErrorKind::RigidBroken { found, name, .. } => write!(
                 f,

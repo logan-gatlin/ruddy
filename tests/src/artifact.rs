@@ -8,7 +8,7 @@ use std::{
 use indexmap::IndexMap;
 use ruddy::{
     artifact::{
-        self, Artifact, Block, Callee, Core, End, Formula, Global, Instr, Lir, Literal, Op, Param,
+        self, Artifact, Block, Callee, End, Formula, Global, Instr, Lir, Literal, Op, Param,
         Presence, Rep, Rest, Row, RowField, Scheme, Type,
     },
     inference, ir, lir, parse, patterns,
@@ -41,39 +41,27 @@ fn built(source: &str) -> Artifact {
     Artifact::build(&mint, &program, &inferred, &lowered)
 }
 
-fn plain(core: Core) -> Type {
-    Type {
-        core,
-        fields: Vec::new(),
-    }
+fn plain(ty: Type) -> Type {
+    ty
+}
+fn unit() -> Type {
+    Type::Struct(Row {
+        labels: Vec::new(),
+        rest: Rest::Closed,
+    })
 }
 
-fn field(presence: Presence, core: Core) -> RowField {
-    RowField {
-        presence,
-        ty: plain(core),
-    }
+fn field(presence: Presence, ty: Type) -> RowField {
+    RowField { presence, ty }
 }
 
-fn rich(core: Core) -> Type {
-    Type {
-        core,
-        fields: vec![
-            ("present".to_string(), field(Presence::Present, Core::Unit)),
-            ("absent".to_string(), field(Presence::Absent, Core::Nat)),
-            ("var".to_string(), field(Presence::Var(1), Core::Int)),
-            ("bound".to_string(), field(Presence::Bound(2), Core::Real)),
-            (
-                "undecided".to_string(),
-                field(Presence::Undecided, Core::String),
-            ),
-        ],
-    }
+fn rich(ty: Type) -> Type {
+    ty
 }
 
 fn row(rest: Rest) -> Row {
     Row {
-        labels: vec![("label".to_string(), field(Presence::Present, Core::Boolean))],
+        labels: vec![("label".to_string(), field(Presence::Present, Type::Boolean))],
         rest,
     }
 }
@@ -94,35 +82,56 @@ fn model_artifact() -> Artifact {
         Formula::Xor(Box::new(Formula::False), Box::new(Formula::Bound(6))),
     ];
     let types = vec![
-        rich(Core::Unit),
-        rich(Core::Nat),
-        rich(Core::Int),
-        rich(Core::Real),
-        rich(Core::String),
-        rich(Core::Boolean),
-        rich(Core::Arrow(
-            Box::new(plain(Core::Var(7))),
-            Box::new(plain(Core::Bound(8))),
+        Type::Struct(Row {
+            labels: vec![
+                (
+                    "present".to_string(),
+                    field(
+                        Presence::Present,
+                        Type::Struct(Row {
+                            labels: Vec::new(),
+                            rest: Rest::Closed,
+                        }),
+                    ),
+                ),
+                ("absent".to_string(), field(Presence::Absent, Type::Nat)),
+                ("var".to_string(), field(Presence::Var(1), Type::Int)),
+                ("bound".to_string(), field(Presence::Bound(2), Type::Real)),
+                (
+                    "undecided".to_string(),
+                    field(Presence::Undecided, Type::String),
+                ),
+            ],
+            rest: Rest::Closed,
+        }),
+        rich(Type::Nat),
+        rich(Type::Int),
+        rich(Type::Real),
+        rich(Type::String),
+        rich(Type::Boolean),
+        rich(Type::Arrow(
+            Box::new(plain(Type::Var(7))),
+            Box::new(plain(Type::Bound(8))),
             row(Rest::More(Box::new(row(Rest::Rigid {
                 id: 9,
                 name: "tail".to_string(),
             })))),
         )),
-        rich(Core::Sum(row(Rest::Closed))),
-        rich(Core::Sum(row(Rest::Var(10)))),
-        rich(Core::Sum(row(Rest::Bound(11)))),
-        rich(Core::Sum(row(Rest::Undecided))),
-        rich(Core::Var(12)),
-        rich(Core::Bound(13)),
-        rich(Core::Rigid {
+        rich(Type::Sum(row(Rest::Closed))),
+        rich(Type::Sum(row(Rest::Var(10)))),
+        rich(Type::Sum(row(Rest::Bound(11)))),
+        rich(Type::Sum(row(Rest::Undecided))),
+        rich(Type::Var(12)),
+        rich(Type::Bound(13)),
+        rich(Type::Rigid {
             id: 14,
             name: "rigid".to_string(),
         }),
-        rich(Core::Named {
+        rich(Type::Named {
             name: "other@1.2.3::T".to_string(),
-            args: vec![plain(Core::Nat), plain(Core::Undecided)],
+            args: vec![plain(Type::Nat), plain(Type::Undecided)],
         }),
-        rich(Core::Undecided),
+        rich(Type::Undecided),
     ];
     let values = types
         .into_iter()
@@ -269,7 +278,21 @@ fn model_artifact() -> Artifact {
                         count: 1,
                         presences: 0,
                         formula: Formula::True,
-                        body: plain(Core::Unit),
+                        body: plain(unit()),
+                    },
+                },
+                artifact::DeclaredType {
+                    name: "bundle@1.0.0::Fields".to_string(),
+                    params: vec![artifact::Parameter {
+                        sense: artifact::Sense::Fields,
+                        lacks: vec!["field".to_string()],
+                        relevant: true,
+                    }],
+                    scheme: Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: Formula::True,
+                        body: rich(unit()),
                     },
                 },
                 artifact::DeclaredType {
@@ -283,7 +306,7 @@ fn model_artifact() -> Artifact {
                         count: 2,
                         presences: 1,
                         formula: Formula::Var(0),
-                        body: plain(Core::Sum(row(Rest::Closed))),
+                        body: plain(Type::Sum(row(Rest::Closed))),
                     },
                 },
                 artifact::DeclaredType {
@@ -297,9 +320,9 @@ fn model_artifact() -> Artifact {
                         count: 3,
                         presences: 2,
                         formula: Formula::Bound(1),
-                        body: plain(Core::Arrow(
-                            Box::new(plain(Core::Nat)),
-                            Box::new(plain(Core::Unit)),
+                        body: plain(Type::Arrow(
+                            Box::new(plain(Type::Nat)),
+                            Box::new(plain(unit())),
                             row(Rest::Closed),
                         )),
                     },
@@ -314,8 +337,8 @@ fn model_artifact() -> Artifact {
                     }),
                     kind: artifact::EffectKind::Operations(vec![artifact::Operation {
                         selector: artifact::OperationSelector::Named("write".to_string()),
-                        from: plain(Core::Nat),
-                        to: plain(Core::Unit),
+                        from: plain(Type::Nat),
+                        to: plain(unit()),
                     }]),
                 },
                 artifact::DeclaredEffect {
@@ -652,25 +675,25 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     let mut fields = IndexMap::new();
     fields.insert(
         "int".to_string(),
-        compiler_field(types::Presence::Var(0), types::Core::Int),
+        compiler_field(types::Presence::Var(0), types::Ty::Int),
     );
     fields.insert(
         "real".to_string(),
-        compiler_field(types::Presence::Undecided, types::Core::Real),
+        compiler_field(types::Presence::Undecided, types::Ty::Real),
     );
     fields.insert(
         "boolean".to_string(),
-        compiler_field(types::Presence::Absent, types::Core::Boolean),
+        compiler_field(types::Presence::Absent, types::Ty::Boolean),
     );
     fields.insert(
         "var".to_string(),
-        compiler_field(types::Presence::Present, types::Core::Var(1)),
+        compiler_field(types::Presence::Present, types::Ty::Var(1)),
     );
     fields.insert(
         "rigid".to_string(),
         compiler_field(
             types::Presence::Bound(2),
-            types::Core::Rigid {
+            types::Ty::Rigid {
                 id: 3,
                 name: Rc::from("rigid"),
             },
@@ -680,31 +703,31 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         "var-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Var(4))),
+            types::Ty::Sum(types::Row::of(types::Rest::Var(4))),
         ),
     );
     fields.insert(
         "bound-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Bound(5))),
+            types::Ty::Sum(types::Row::of(types::Rest::Bound(5))),
         ),
     );
     fields.insert(
         "undecided-rest".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Sum(types::Row::of(types::Rest::Undecided)),
+            types::Ty::Sum(types::Row::of(types::Rest::Undecided)),
         ),
     );
     fields.insert(
         "named".to_string(),
         compiler_field(
             types::Presence::Present,
-            types::Core::Named {
+            types::Ty::Named {
                 symbol: type_symbol,
                 name: Rc::from("OpenCases"),
-                args: vec![compiler_plain(types::Core::Undecided)].into(),
+                args: vec![compiler_plain(types::Ty::Undecided)].into(),
             },
         ),
     );
@@ -712,7 +735,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     let mut inner_labels = IndexMap::new();
     inner_labels.insert(
         "effect".to_string(),
-        compiler_field(types::Presence::Present, types::Core::String),
+        compiler_field(types::Presence::Present, types::Ty::String),
     );
     let inner_row = types::Row {
         labels: inner_labels,
@@ -722,14 +745,21 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
         },
     };
     let effects = types::Row::of(types::Rest::More(Rc::new(inner_row)));
-    let body = Rc::new(types::Ty {
-        core: types::Core::Arrow(
-            compiler_plain(types::Core::Int),
-            compiler_plain(types::Core::Real),
-            effects,
+    fields.insert(
+        "arrow".to_string(),
+        compiler_field(
+            types::Presence::Present,
+            types::Ty::Arrow(
+                compiler_plain(types::Ty::Int),
+                compiler_plain(types::Ty::Real),
+                effects,
+            ),
         ),
-        fields,
-    });
+    );
+    let body = Rc::new(types::Ty::Struct(types::Row {
+        labels: fields,
+        rest: types::Rest::Closed,
+    }));
     let formula = types::Formula::Iff(
         Rc::new(types::Formula::False),
         Rc::new(types::Formula::Xor(
@@ -928,11 +958,11 @@ fn canonical_text_escapes_and_parses_every_control_character() {
     let escaped = format!("{controls}\\");
     let mut artifact = model_artifact();
     artifact.header.identity.name = escaped.clone();
-    artifact.header.values[0].scheme.body = plain(Core::Arrow(
-        Box::new(plain(Core::Unit)),
-        Box::new(plain(Core::Unit)),
+    artifact.header.values[0].scheme.body = plain(Type::Arrow(
+        Box::new(plain(unit())),
+        Box::new(plain(unit())),
         Row {
-            labels: vec![(controls.clone(), field(Presence::Present, Core::Unit))],
+            labels: vec![(controls.clone(), field(Presence::Present, unit()))],
             rest: Rest::Closed,
         },
     ));
@@ -1017,8 +1047,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(alias ", "(aliases "),
         ("(scheme ", "(polytype "),
         ("(ty ", "(type-value "),
-        ("(fields ", "(record-fields "),
-        ("(ty unit ", "(ty void "),
+        ("(struct ", "(record-type "),
         ("(arrow ", "(function-type "),
         ("(sum ", "(variant-type "),
         ("(named ", "(external-type "),
@@ -1071,7 +1100,7 @@ fn malformed_text_returns_errors_while_trusted_api_panics() {
         ("(identity \"bundle\" \"1.0.0\")", "(identity \"bundle\")"),
         ("(dependency \"base\" \"2.1.0\")", "(dependency \"base\")"),
         ("(scheme 15 7", "(scheme 15"),
-        ("(ty unit (fields", "(ty unit extra (fields"),
+        ("(ty nat)", "(ty nat extra)"),
         ("(param 0 nat)", "(param 0 nat extra)"),
         ("(tag \"Case\")", "(tag \"Case\" 1 2)"),
         ("(direct 0)", "(direct 0 1)"),
@@ -1121,7 +1150,7 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
         "operations",
     ));
     assert_malformed(&replace_balanced(&valid, "(named \"other@", "(named)"));
-    assert_bad_replacement(&valid, "(ty unit (fields", "(ty \"wrong\" (fields");
+    assert_bad_replacement(&valid, "(ty nat)", "(ty \"wrong\")");
     assert_bad_replacement(&valid, "field present", "field (wrong)");
     assert_bad_replacement(&valid, " 7 true ", " 7 \"wrong\" ");
     assert_bad_replacement(&valid, " 7 true ", " 7 wrong ");
@@ -1182,6 +1211,120 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
 }
 
 #[test]
+fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-artifact-formula-write".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (mint, program, mut inferred, lowered) = compiled("let value = 1n");
+            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let mut formula = types::Formula::var(9)
+                .and(types::Formula::bound(0))
+                .or(types::Formula::True.iff(types::Formula::False))
+                .xor(types::Formula::var(10));
+            for _ in 0..DEPTH {
+                formula = types::Formula::Not(Rc::new(formula));
+            }
+            inferred.schemes.insert(
+                symbol,
+                types::Scheme::constrained(1, 1, Rc::new(types::Ty::Nat), formula),
+            );
+            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+            let printed = artifact.print();
+            assert!(printed.contains("(not"));
+            assert!(printed.contains("(bound 0)"));
+            drop(artifact);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep artifact formula conversion and writing use bounded stack");
+}
+
+#[test]
+fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
+    std::thread::Builder::new()
+        .name("deep-artifact-types".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (mut mint, program, mut inferred, lowered) = compiled("let value = 1n");
+            let symbol = *program.terms.keys().next().expect("the value symbol");
+            let layer = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a type symbol");
+
+            let mut arrow = Rc::new(types::Ty::Nat);
+            let mut named = Rc::new(types::Ty::Nat);
+            let mut payload = Rc::new(types::Ty::Nat);
+            let mut more = types::Row::closed();
+            for index in 0..DEPTH {
+                arrow = Rc::new(types::Ty::Arrow(
+                    Rc::new(types::Ty::Nat),
+                    arrow,
+                    types::Row::closed(),
+                ));
+                named = Rc::new(types::Ty::Named {
+                    symbol: layer,
+                    name: "Layer".into(),
+                    args: vec![named].into(),
+                });
+                payload = Rc::new(types::Ty::Struct(types::Row {
+                    labels: [(format!("field{index}"), types::RowField::present(payload))]
+                        .into_iter()
+                        .collect(),
+                    rest: types::Rest::Closed,
+                }));
+                more = types::Row::of(types::Rest::More(Rc::new(more)));
+            }
+            let body = Rc::new(types::Ty::Struct(types::Row {
+                labels: [
+                    ("arrow".into(), types::RowField::present(arrow)),
+                    ("named".into(), types::RowField::present(named)),
+                    ("payload".into(), types::RowField::present(payload)),
+                    (
+                        "more".into(),
+                        types::RowField::present(Rc::new(types::Ty::Sum(more))),
+                    ),
+                    (
+                        "boolean".into(),
+                        types::RowField::present(Rc::new(types::Ty::Boolean)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                rest: types::Rest::Closed,
+            }));
+            inferred.schemes.insert(symbol, types::Scheme::new(0, body));
+
+            let artifact = Artifact::build(&mint, &program, &inferred, &lowered);
+            let value = artifact
+                .header
+                .values
+                .iter()
+                .find(|value| value.name.ends_with("value"))
+                .expect("the built value");
+            let Type::Struct(row) = &value.scheme.body else {
+                panic!("semantic root changed schema")
+            };
+            assert_eq!(
+                row.labels
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                ["arrow", "named", "payload", "more", "boolean"]
+            );
+            let printed = artifact.print();
+            assert!(printed.contains("(more (row"));
+            let reparsed = Artifact::try_parse(&printed).expect("deep semantics print readably");
+            assert_eq!(reparsed.print(), printed);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("artifact type, row, field and rest conversion uses bounded stack");
+}
+
+#[test]
 fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
     const DEPTH: usize = 400;
     let mut value = Artifact {
@@ -1197,7 +1340,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                     count: 0,
                     presences: 0,
                     formula: Formula::True,
-                    body: plain(Core::Unit),
+                    body: plain(unit()),
                 },
             }],
             types: Vec::new(),
@@ -1220,11 +1363,11 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
             &mut value.header.values[0].scheme.formula,
             Formula::True,
         )));
-        value.header.values[0].scheme.body = plain(Core::Named {
+        value.header.values[0].scheme.body = plain(Type::Named {
             name: "deep@1::Layer".to_string(),
             args: vec![std::mem::replace(
                 &mut value.header.values[0].scheme.body,
-                plain(Core::Unit),
+                plain(unit()),
             )],
         });
         value.lir.globals[0].body = Block {
@@ -1273,6 +1416,343 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
 }
 
 #[test]
+fn iterative_artifact_equality_preserves_every_derived_distinction() {
+    assert_ne!(Type::Var(0), Type::Var(1));
+    assert_ne!(Type::Bound(0), Type::Bound(1));
+    assert_ne!(
+        Type::Rigid {
+            id: 0,
+            name: "same".into(),
+        },
+        Type::Rigid {
+            id: 1,
+            name: "same".into(),
+        }
+    );
+    assert_ne!(
+        Type::Rigid {
+            id: 0,
+            name: "left".into(),
+        },
+        Type::Rigid {
+            id: 0,
+            name: "right".into(),
+        }
+    );
+    assert_ne!(
+        Type::Named {
+            name: "Left".into(),
+            args: vec![Type::Nat],
+        },
+        Type::Named {
+            name: "Right".into(),
+            args: vec![Type::Nat],
+        }
+    );
+    assert_ne!(
+        Type::Named {
+            name: "Same".into(),
+            args: vec![Type::Nat],
+        },
+        Type::Named {
+            name: "Same".into(),
+            args: Vec::new(),
+        }
+    );
+    assert_ne!(Type::Nat, Type::Int);
+
+    let row = |name: &str, presence, rest| Row {
+        labels: vec![(name.into(), field(presence, Type::Nat))],
+        rest,
+    };
+    let same = row("field", Presence::Present, Rest::Closed);
+    assert_eq!(same.clone(), same);
+    assert_ne!(
+        same,
+        Row {
+            labels: Vec::new(),
+            rest: Rest::Closed
+        }
+    );
+    assert_ne!(
+        row("left", Presence::Present, Rest::Closed),
+        row("right", Presence::Present, Rest::Closed)
+    );
+    assert_ne!(
+        row("field", Presence::Present, Rest::Closed),
+        row("field", Presence::Absent, Rest::Closed)
+    );
+    assert_ne!(
+        row("field", Presence::Present, Rest::Closed),
+        row("field", Presence::Present, Rest::Undecided)
+    );
+
+    assert_ne!(Rest::Var(0), Rest::Var(1));
+    assert_ne!(Rest::Bound(0), Rest::Bound(1));
+    assert_ne!(
+        Rest::Rigid {
+            id: 0,
+            name: "same".into(),
+        },
+        Rest::Rigid {
+            id: 1,
+            name: "same".into(),
+        }
+    );
+    assert_ne!(
+        Rest::Rigid {
+            id: 0,
+            name: "left".into(),
+        },
+        Rest::Rigid {
+            id: 0,
+            name: "right".into(),
+        }
+    );
+    assert_ne!(Rest::Closed, Rest::Undecided);
+    assert_ne!(
+        Rest::More(Box::new(Row {
+            labels: Vec::new(),
+            rest: Rest::Closed,
+        })),
+        Rest::More(Box::new(Row {
+            labels: Vec::new(),
+            rest: Rest::Undecided,
+        }))
+    );
+
+    assert_ne!(Formula::Var(0), Formula::Var(1));
+    assert_ne!(Formula::Bound(0), Formula::Bound(1));
+    assert_ne!(Formula::True, Formula::False);
+    assert_ne!(
+        Formula::Not(Box::new(Formula::True)),
+        Formula::Not(Box::new(Formula::False))
+    );
+}
+
+#[test]
+fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-artifact-ownership".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+
+            let deep_formula = || {
+                let mut value = Formula::True;
+                for _ in 0..DEPTH {
+                    value = Formula::Not(Box::new(value));
+                }
+                value
+            };
+            let deep_type = || {
+                let mut value = Type::Nat;
+                for _ in 0..DEPTH {
+                    value = Type::Named {
+                        name: "deep@1::Layer".into(),
+                        args: vec![value],
+                    };
+                }
+                value
+            };
+            let deep_row_type = || {
+                let mut row = Row {
+                    labels: Vec::new(),
+                    rest: Rest::Closed,
+                };
+                for _ in 0..DEPTH {
+                    row = Row {
+                        labels: Vec::new(),
+                        rest: Rest::More(Box::new(row)),
+                    };
+                }
+                Type::Struct(row)
+            };
+            let empty_block = || Block {
+                instrs: Vec::new(),
+                end: End::Ret(0),
+            };
+            let deep_block = || {
+                let mut block = empty_block();
+                for depth in 0..DEPTH {
+                    let op = match depth % 5 {
+                        0 => Op::Catch {
+                            tag: 0,
+                            body: Box::new(block),
+                        },
+                        1 => Op::SwitchTag {
+                            on: 0,
+                            cases: vec![artifact::TagCase {
+                                name: "A".into(),
+                                block,
+                            }],
+                            fallback: Some(Box::new(empty_block())),
+                        },
+                        2 => Op::SwitchPrim {
+                            on: 0,
+                            cases: vec![artifact::PrimCase {
+                                value: Literal::Boolean(true),
+                                block,
+                            }],
+                            fallback: Some(Box::new(empty_block())),
+                        },
+                        3 => Op::SwitchPresence {
+                            on: 0,
+                            field: "x".into(),
+                            present: Box::new(block),
+                            absent: Box::new(empty_block()),
+                        },
+                        _ => Op::SwitchRest {
+                            on: 0,
+                            fields: vec!["x".into()],
+                            none: Box::new(empty_block()),
+                            some: Box::new(block),
+                        },
+                    };
+                    block = Block {
+                        instrs: vec![Instr {
+                            temp: depth as u32,
+                            rep: Rep::Any,
+                            op,
+                        }],
+                        end: End::Ret(depth as u32),
+                    };
+                }
+                block
+            };
+
+            let artifact = Artifact {
+                header: artifact::Header {
+                    identity: artifact::Identity {
+                        name: "deep".into(),
+                        version: "1".into(),
+                    },
+                    dependencies: Vec::new(),
+                    values: vec![artifact::Value {
+                        name: "deep@1::value".into(),
+                        scheme: Scheme {
+                            count: 0,
+                            presences: 0,
+                            formula: deep_formula(),
+                            body: deep_type(),
+                        },
+                    }],
+                    types: vec![artifact::DeclaredType {
+                        name: "deep@1::Rows".into(),
+                        params: Vec::new(),
+                        scheme: Scheme {
+                            count: 0,
+                            presences: 0,
+                            formula: Formula::True,
+                            body: deep_row_type(),
+                        },
+                    }],
+                    effects: Vec::new(),
+                },
+                lir: Lir {
+                    externs: Vec::new(),
+                    functions: vec![artifact::Function {
+                        name: "deep".into(),
+                        params: Vec::new(),
+                        body: deep_block(),
+                    }],
+                    globals: Vec::new(),
+                },
+            };
+            let cloned = artifact.clone();
+            assert_eq!(cloned, artifact);
+            drop(cloned);
+            drop(artifact);
+
+            // Public header components can also outlive their containing
+            // artifact, and must not depend on `Artifact::drop` for safety.
+            drop(artifact::Value {
+                name: "deep@1::standalone".into(),
+                scheme: Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: deep_formula(),
+                    body: deep_type(),
+                },
+            });
+            drop(artifact::DeclaredType {
+                name: "deep@1::StandaloneType".into(),
+                params: Vec::new(),
+                scheme: Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: Formula::True,
+                    body: deep_row_type(),
+                },
+            });
+            drop(deep_type());
+            drop(deep_row_type());
+            drop(deep_formula());
+
+            let block = deep_block();
+            let cloned = block.clone();
+            assert_eq!(cloned, block);
+            assert_ne!(
+                empty_block(),
+                Block {
+                    instrs: Vec::new(),
+                    end: End::Yield(0),
+                }
+            );
+            assert_ne!(Op::Neg(0), Op::Neg(1));
+            drop(cloned);
+            drop(block);
+
+            let instr = Instr {
+                temp: 0,
+                rep: Rep::Any,
+                op: Op::Catch {
+                    tag: 0,
+                    body: Box::new(deep_block()),
+                },
+            };
+            let cloned = instr.clone();
+            assert_eq!(cloned, instr);
+            drop(cloned);
+            drop(instr);
+
+            let op = Op::Catch {
+                tag: 0,
+                body: Box::new(deep_block()),
+            };
+            let cloned = op.clone();
+            assert_eq!(cloned, op);
+            drop(cloned);
+            drop(op);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("recursive artifact ownership uses bounded stack");
+}
+
+#[test]
+fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
+    const DEPTH: usize = 30_000;
+    let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
+    let valid = format!(
+        "(artifact (header (identity \"deep\" \"1\") (dependencies) \
+         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty nat)))) \
+         (types) (effects)) (lir (functions) (globals)))"
+    );
+
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let parsed = Artifact::try_parse(&valid).expect("valid deep artifact parses");
+            assert_eq!(parsed.header.values.len(), 1);
+            drop(parsed);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
     let malformed = "(".repeat(50_000);
     let handle = std::thread::Builder::new()
@@ -1318,7 +1798,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty unit (fields))))) \
+         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty (struct (row (labels) closed)))))) \
          (types) (effects)) (lir (externs) (functions) wrong))"
     );
 
@@ -1329,6 +1809,16 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
         .join()
         .unwrap();
     assert_eq!(error.message(), "expected `globals` list");
+}
+
+#[test]
+fn non_struct_fields_are_not_representable_in_artifact_text() {
+    let valid = compact(&model_artifact().print());
+    assert_bad_replacement(
+        &valid,
+        "(ty nat)",
+        "(ty nat (fields (\"x\" (field present (ty nat)))))",
+    );
 }
 
 #[test]

@@ -12,15 +12,21 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{ParamKind, Prim, Sense, Shape},
+    types::{ParamKind, Presence, Prim, Rest, Sense, Shape, Ty},
 };
 use ruddy_debug::print;
 
 /// A parameter standing for a whole type that may not name any of `labels` —
 /// which is what a struct's `..'r` is, since the rest of a struct is its core.
 fn row(labels: &[&str]) -> ParamKind {
-    ParamKind::Type {
+    ParamKind::Fields {
         lacks: labels.iter().map(|label| label.to_string()).collect(),
+    }
+}
+
+fn whole() -> ParamKind {
+    ParamKind::Type {
+        lacks: Default::default(),
     }
 }
 
@@ -1280,8 +1286,8 @@ fn recursion_may_not_make_its_argument_bigger() {
 fn a_parameter_stands_for_what_the_body_uses_it_as() {
     for (src, expected) in [
         ("type WithX 'r = { x: Nat, ..'r }", vec![row(&["x"])]),
-        ("type Box 'A = { it: 'A }", vec![row(&[])]),
-        ("type Ghost 'a = Nat", vec![row(&[])]),
+        ("type Box 'A = { it: 'A }", vec![whole()]),
+        ("type Ghost 'a = Nat", vec![whole()]),
         ("type Bare 'r = { ..'r }", vec![row(&[])]),
         (
             "type Two 'r = { x: Nat, y: Nat, ..'r }",
@@ -1295,9 +1301,9 @@ fn a_parameter_stands_for_what_the_body_uses_it_as() {
         ),
         (
             "type Both 'A 'r = { it: 'A, ..'r }",
-            vec![row(&[]), row(&["it"])],
+            vec![whole(), row(&["it"])],
         ),
-        ("type Fn 'A 'B = 'A -> 'B", vec![row(&[]), row(&[])]),
+        ("type Fn 'A 'B = 'A -> 'B", vec![whole(), whole()]),
     ] {
         let (_, out) = built(src);
         let decl = out.program.types.values().next().expect("one declaration");
@@ -1362,57 +1368,23 @@ fn a_parameter_may_not_stand_for_both() {
         );
     }
 
-    // And a parameter used as a field's type and as a struct's `..` is not one:
-    // both say "a type", so the declaration simply takes the union of what they
-    // demand, which is the lacks set.
-    let (mint, out) = built("type W 'r = { f: 'r, ..'r }");
-    assert!(out.errors.is_empty(), "{:#?}", out.errors);
-    let w = &out.program.types[&type_symbol(&mint, &out, "W")];
-    assert_eq!(w.params[0].kind, row(&["f"]));
+    // A field payload is a whole type while a struct tail is a field row.
+    let (_, out) = build_src("type W 'r = { f: 'r, ..'r }");
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::MixedParameter {
+                first: Sense::Type,
+                second: Sense::Fields,
+            },
+            ..
+        }]
+    ));
 }
 
 /// What a parameter stands for is read off the declaration that binds it, in
 /// whichever order the declarations were written. A use site handing it the
 /// wrong thing is the use site's mistake, not evidence about the declaration.
-#[test]
-fn a_parameter_kind_does_not_depend_on_declaration_order() {
-    for src in [
-        "type Or 'r = #A | ..'r  type Bad = Or Nat",
-        "type Bad = Or Nat  type Or 'r = #A | ..'r",
-    ] {
-        let (mint, out) = build_src(src);
-        assert_eq!(out.errors.len(), 1, "{src}: {:#?}", out.errors);
-        assert!(
-            matches!(
-                out.errors[0].kind,
-                ErrorKind::NotARow {
-                    sense: Sense::Cases
-                }
-            ),
-            "{src}"
-        );
-        assert_eq!(
-            out.errors[0].span.start,
-            src.find("Or Nat").expect("the use") + "Or ".len(),
-            "{src}: reported at the argument"
-        );
-        let or = &out.program.types[&type_symbol(&mint, &out, "Or")];
-        assert_eq!(or.params[0].kind, cases(&["A"]), "{src}");
-    }
-
-    // A struct's `..` reads the same either way round, and takes anything at
-    // all: `WithX Nat` is well-formed however the two were ordered.
-    for src in [
-        "type WithX 'r = { x: Nat, ..'r }  type Fine = WithX Nat",
-        "type Fine = WithX Nat  type WithX 'r = { x: Nat, ..'r }",
-    ] {
-        let (mint, out) = build_src(src);
-        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
-        let with_x = &out.program.types[&type_symbol(&mint, &out, "WithX")];
-        assert_eq!(with_x.params[0].kind, row(&["x"]), "{src}");
-    }
-}
-
 /// A parameter used two ways is reported against the parameter that was used
 /// two ways. The other declaration is right and is left alone — which the
 /// order the two were written in must not decide.
@@ -1549,24 +1521,6 @@ fn only_a_row_may_be_written_where_a_row_goes() {
 /// A struct's `..` admits any argument at all, because it *is* the type's core
 /// and every type is one of those. `WithX Nat` is a type nothing constructs a
 /// term of, and that is allowed.
-#[test]
-fn a_struct_tail_admits_any_argument() {
-    for src in [
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX Nat -> Nat = fn p => p.x",
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX (Nat -> Nat) -> Nat = fn p => p.x",
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX (#A | #B) -> Nat = fn p => p.x",
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX { y: Nat } -> Nat = fn p => p.x",
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX { y: Nat, .. } -> Nat = fn p => p.x",
-        "type WithX 'r = { x: Nat, ..'r }  type Foo = { y: Nat }  \
-         let f : WithX Foo -> Nat = fn p => p.y",
-        "type WithX 'r = { x: Nat, ..'r }  type Pass 's = WithX 's",
-        "type WithX 'r = { x: Nat, ..'r }  let f : WithX {} -> Nat = fn p => p.x",
-    ] {
-        let (_, out) = build_src(src);
-        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
-    }
-}
-
 /// A `..` covers only the fields its row does not already name, so a row
 /// written where a row parameter goes may not name any of them. Which labels
 /// those are is part of what the parameter stands for, so it is known here —
@@ -1869,8 +1823,16 @@ fn a_row_parameter_knows_which_shape_it_is() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(out.errors[0].kind, ErrorKind::NotARow { .. }));
 
-    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Fine = WithX (#A Nat)");
-    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX (#A Nat)");
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::NotARow {
+                sense: Sense::Fields
+            },
+            ..
+        }]
+    ));
 
     // And a parameter handed to both is a parameter that has to say which it
     // meant: a whole type in one place, the rest of a sum in the other.
@@ -1890,6 +1852,27 @@ fn a_row_parameter_knows_which_shape_it_is() {
 /// A row handed to a sum's tail may not name a case the declaration already
 /// names, for the reason it may not name such a field: the type would allow
 /// the case twice, and the two copies could carry different things.
+#[test]
+fn operation_signatures_validate_every_row_argument_sense() {
+    let (_, out) = build_src(
+        "type Fields 'r = { ..'r }\n\
+         type Cases 'r = | ..'r\n\
+         type Effects 'r = () -> () + ..'r\n\
+         effect Bad = { fields: Fields Nat -> Nat, cases: Cases Nat -> Nat, effects: Effects Nat -> Nat }",
+    );
+    assert_eq!(out.errors.len(), 3, "{:#?}", out.errors);
+    assert_eq!(
+        out.errors
+            .iter()
+            .filter_map(|error| match error.kind {
+                ErrorKind::NotARow { sense } => Some(sense),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [Sense::Fields, Sense::Cases, Sense::Effects]
+    );
+}
+
 #[test]
 fn a_sum_argument_may_not_repeat_a_case() {
     let (_, out) = build_src("type Cases 'r = #A Nat | ..'r  type Bad = Cases (#A Nat)");
@@ -1969,7 +1952,7 @@ fn one_tail_name_is_one_shape_of_rest() {
         matches!(
             out.errors[0].kind,
             ErrorKind::MixedTail {
-                first: Sense::Type,
+                first: Sense::Fields,
                 second: Sense::Cases,
                 ..
             }
@@ -2002,7 +1985,7 @@ fn one_tail_name_is_one_shape_of_rest() {
             out.errors[0].kind,
             ErrorKind::MixedTail {
                 first: Sense::Cases,
-                second: Sense::Type,
+                second: Sense::Fields,
                 ..
             }
         ),
@@ -2340,6 +2323,22 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
         assert_eq!(error.kind.code(), "circular-type");
     }
 
+    // An empty struct-row forwarding constructor adds no field either. Its
+    // braces say which kind of parameter this is, but do not make the cycle
+    // endless by themselves.
+    let (_, out) = build_src("type RowId 'r = { ..'r }\ntype T = RowId T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-type");
+
+    // An absent label constrains the tail but adds no field on the way round.
+    // A present or optional label can be there, so each is genuinely endless.
+    let (_, out) = build_src("type NoY 'r = { \\y, ..'r }\ntype T = NoY T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-type");
+    let (_, out) = build_src("type Add 'r = { y: Nat, ..'r }\ntype T = Add T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "endless-fields");
+
     // And a declaration that names itself inside a *field* is on no core loop
     // at all: its core is unit, and the recursion is in what a field holds.
     let (_, out) = build_src("type List = { next: List }");
@@ -2350,35 +2349,6 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
 /// already names — and what it names reaches through a declared name as much as
 /// it is written out, since a `..` handed a name ends up carrying whatever that
 /// name carries.
-#[test]
-fn what_an_argument_carries_is_read_through_its_name() {
-    // Written out: the field is right there.
-    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX { x: Nat }");
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert_eq!(out.errors[0].kind.code(), "repeated-row-field");
-
-    // Through the name: `WithX Nat` carries an `x`, so handing it to `WithX`
-    // again names `x` twice.
-    let (_, out) = build_src("type WithX 'r = { x: Nat, ..'r }  type Bad = WithX (WithX Nat)");
-    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
-    assert!(
-        matches!(&out.errors[0].kind, ErrorKind::RepeatedRowField { field, .. } if field == "x"),
-        "{:#?}",
-        out.errors
-    );
-
-    // And a name that carries something else is fine, however deep it is.
-    for src in [
-        "type WithX 'r = { x: Nat, ..'r }  type Foo = { y: Nat }  type Fine = WithX Foo",
-        "type WithY 'r = { y: Nat, ..'r }  type WithX 'r = { x: Nat, ..'r }  \
-         type Also = WithX (WithY Nat)",
-        "type WithX 'r = { x: Nat, ..'r }  type Id 'a = 'a  type Fine = WithX (Id Nat)",
-    ] {
-        let (_, out) = build_src(src);
-        assert!(out.errors.is_empty(), "{src}: {:#?}", out.errors);
-    }
-}
-
 /// An argument lowering has already erased is let through wherever a sum's rest
 /// goes: the complaint about it was made where it was written, and a second one
 /// about a row nobody wrote would be that mistake said twice.
@@ -4801,7 +4771,10 @@ fn an_undeclared_name_is_undefined_wherever_it_is_used() {
 fn a_declared_variable_takes_its_sort_from_its_uses() {
     for (src, sense) in [
         ("let f : 'a -> 'a = fn x => x", Sense::Type),
-        ("let f : { x: Nat, ..'a } -> Nat = fn p => p.x", Sense::Type),
+        (
+            "let f : { x: Nat, ..'a } -> Nat = fn p => p.x",
+            Sense::Fields,
+        ),
         ("let f : (#A Nat | ..'a) -> Nat = fn p => 0n", Sense::Cases),
         (
             "let f : { x when 'a: Nat } -> Nat = fn p => 0n",
@@ -4833,7 +4806,7 @@ fn a_declared_variable_takes_its_sort_from_its_uses() {
         [
             ("a", Sense::Presence),
             ("c", Sense::Type),
-            ("b", Sense::Type)
+            ("b", Sense::Fields)
         ]
     );
     let ids: Vec<u32> = annotation.variables.iter().map(|v| v.id).collect();
@@ -4862,13 +4835,13 @@ fn a_declared_variable_used_at_two_sorts_is_refused() {
     for (src, first, second) in [
         (
             "let f : { x: Nat, ..'a } -> (#A Nat | ..'a) -> Nat = fn p => fn q => 0n",
-            Sense::Type,
+            Sense::Fields,
             Sense::Cases,
         ),
         (
             "let f : (#A Nat | ..'a) -> { x: Nat, ..'a } -> Nat = fn p => fn q => 0n",
             Sense::Cases,
-            Sense::Type,
+            Sense::Fields,
         ),
         (
             "let f : { x when 'a: Nat } -> 'a = fn r => r",
@@ -5414,11 +5387,17 @@ fn a_module_with_no_body_is_declared_and_empty() {
     );
 }
 
-fn artifact_type(core: a::Core) -> a::Type {
-    a::Type {
-        core,
-        fields: Vec::new(),
-    }
+fn artifact_type(ty: a::Type) -> a::Type {
+    ty
+}
+fn artifact_unit() -> a::Type {
+    artifact_struct(Vec::new())
+}
+fn artifact_struct(labels: Vec<(String, a::RowField)>) -> a::Type {
+    a::Type::Struct(a::Row {
+        labels,
+        rest: a::Rest::Closed,
+    })
 }
 
 fn artifact_scheme(body: a::Type) -> a::Scheme {
@@ -5479,8 +5458,8 @@ fn imported_unnamed_operation_selectors_are_preserved() {
     };
     operations.push(a::Operation {
         selector: a::OperationSelector::Unnamed,
-        from: artifact_type(a::Core::Nat),
-        to: artifact_type(a::Core::Unit),
+        from: artifact_type(a::Type::Nat),
+        to: artifact_type(artifact_unit()),
     });
     let parsed = parse::parse(lex("let operation = dep::!IO", FileID::GENERATED).tokens);
     assert!(parsed.errors.is_empty());
@@ -5503,8 +5482,8 @@ fn imported_unnamed_handlers_are_complete_without_panicking() {
     };
     operations.push(a::Operation {
         selector: a::OperationSelector::Unnamed,
-        from: artifact_type(a::Core::Nat),
-        to: artifact_type(a::Core::Unit),
+        from: artifact_type(a::Type::Nat),
+        to: artifact_type(artifact_unit()),
     });
     let src = "let main = fn n => handle dep::!IO n with | dep::!IO value => () end";
     let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
@@ -5522,6 +5501,256 @@ fn imported_unnamed_handlers_are_complete_without_panicking() {
     assert_eq!(handler.arms.len(), 1);
     assert_eq!(handler.discharges.len(), 1);
     assert_eq!(handler.discharges[0], handler.arms[0].effect);
+}
+
+#[test]
+fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
+    let raw = "IO\u{1f}x";
+    let canonical = ruddy::types::EffectId::structural("IO".into(), "0#o1:x;".into()).row_key();
+    let effect_row = || a::Row {
+        labels: Vec::new(),
+        rest: a::Rest::More(Box::new(a::Row {
+            labels: vec![(
+                raw.into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: artifact_type(artifact_unit()),
+                },
+            )],
+            rest: a::Rest::Closed,
+        })),
+    };
+    let nested_effect_argument = || {
+        artifact_type(a::Type::Named {
+            name: "dep@1.0.0::Effects".into(),
+            args: vec![artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Effects".into(),
+                args: vec![artifact_type(a::Type::Sum(effect_row()))],
+            })],
+        })
+    };
+
+    let mut dependency = effect_artifact("dep", "x");
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Unnamed,
+        from: artifact_type(artifact_unit()),
+        to: artifact_type(artifact_unit()),
+    });
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::action".into(),
+            scheme: artifact_scheme(artifact_type(a::Type::Arrow(
+                Box::new(artifact_type(artifact_unit())),
+                Box::new(artifact_type(artifact_unit())),
+                effect_row(),
+            ))),
+        },
+        a::Value {
+            name: "dep@1.0.0::nested".into(),
+            scheme: artifact_scheme(nested_effect_argument()),
+        },
+        // Missing declarations have no published argument sense. Their sum is
+        // recovery data, not an effect row, even when its label looks generated.
+        a::Value {
+            name: "dep@1.0.0::unresolved".into(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "missing@1.0.0::Unknown".into(),
+                args: vec![artifact_type(a::Type::Sum(effect_row()))],
+            })),
+        },
+    ]);
+    dependency.header.types.extend([
+        a::DeclaredType {
+            name: "dep@1.0.0::Effects".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Effects,
+                lacks: vec![raw.into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Cases".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
+                labels: vec![(
+                    raw.into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_type(artifact_unit()),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            }))),
+        },
+    ]);
+
+    let parsed = parse::parse(
+        lex(
+            "let main : () -> () = fn unit => handle dep::action (dep::!IO unit) with | dep::!IO value => value end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let imported_value = |name: &str| {
+        out.program
+            .external_schemes
+            .iter()
+            .find_map(|(symbol, scheme)| (mint.name(*symbol) == name).then_some(scheme))
+            .unwrap_or_else(|| panic!("missing imported value {name}"))
+    };
+    let Ty::Arrow(_, _, effects) = &**imported_value("dep@1.0.0::action").body() else {
+        panic!("action is an arrow")
+    };
+    let Rest::More(more) = &effects.rest else {
+        panic!("action keeps its composed row")
+    };
+    assert!(more.labels.contains_key(&canonical));
+
+    let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::nested").body() else {
+        panic!("nested outer alias")
+    };
+    let Ty::Named { args, .. } = &*args[0] else {
+        panic!("nested inner alias")
+    };
+    let Ty::Sum(row) = &*args[0] else {
+        panic!("effect argument row")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("effect argument keeps its composed row")
+    };
+    assert!(more.labels.contains_key(&canonical));
+
+    let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::unresolved").body() else {
+        panic!("unresolved named type")
+    };
+    let Ty::Sum(row) = &*args[0] else {
+        panic!("unresolved ordinary sum argument")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("unresolved sum keeps its composed row")
+    };
+    assert!(more.labels.contains_key(raw));
+
+    let imported_type = |name: &str| {
+        out.program
+            .external_types
+            .iter()
+            .find_map(|(symbol, declaration)| (mint.name(*symbol) == name).then_some(declaration))
+            .unwrap_or_else(|| panic!("missing imported type {name}"))
+    };
+    assert!(matches!(
+        &imported_type("dep@1.0.0::Effects").params[0],
+        ParamKind::Effects { lacks } if lacks.contains(&canonical)
+    ));
+    let Ty::Sum(cases) = &**imported_type("dep@1.0.0::Cases").scheme.body() else {
+        panic!("ordinary imported sum")
+    };
+    assert!(cases.labels.contains_key(raw));
+    assert!(!cases.labels.contains_key(&canonical));
+
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
+#[test]
+fn legacy_operation_effects_get_fallback_identity_before_row_normalization() {
+    let mut dependency = effect_artifact("dep", "ignored");
+    dependency.header.effects[0].identity = None;
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("run".into()),
+        from: artifact_unit(),
+        to: artifact_unit(),
+    });
+    let legacy_key = "IO\u{1f}unresolved:dep@1.0.0::IO";
+    let effects = a::Row {
+        labels: vec![(
+            legacy_key.into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )],
+        rest: a::Rest::Closed,
+    };
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::action".into(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            effects,
+        )),
+    });
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Effects".into(),
+        params: vec![a::Parameter {
+            sense: a::Sense::Effects,
+            lacks: vec![legacy_key.into()],
+            relevant: true,
+        }],
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Bound(0),
+        },
+    });
+
+    let parsed = parse::parse(
+        lex(
+            "let main = fn unit => handle dep::action unit with | dep::!IO.run value => value end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identity = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(_, identity)| (identity.name() == "IO").then_some(identity))
+        .expect("legacy operation identity");
+    let key = identity.row_key();
+    let action = out
+        .program
+        .external_schemes
+        .iter()
+        .find_map(|(symbol, scheme)| (mint.name(*symbol) == "dep@1.0.0::action").then_some(scheme))
+        .expect("legacy action");
+    let Ty::Arrow(_, _, effects) = &**action.body() else {
+        panic!("action arrow")
+    };
+    assert!(effects.labels.contains_key(&key));
+    let effects_type = out
+        .program
+        .external_types
+        .iter()
+        .find_map(|(symbol, declaration)| {
+            (mint.name(*symbol) == "dep@1.0.0::Effects").then_some(declaration)
+        })
+        .expect("legacy effects type");
+    assert!(matches!(
+        &effects_type.params[0],
+        ParamKind::Effects { lacks } if lacks.contains(&key)
+    ));
 }
 
 #[test]
@@ -5585,13 +5814,13 @@ fn named_io_artifact(bundle: &str, interface: &str) -> a::Artifact {
     operations.extend([
         a::Operation {
             selector: a::OperationSelector::Named("write".into()),
-            from: artifact_type(a::Core::Nat),
-            to: artifact_type(a::Core::Unit),
+            from: artifact_type(a::Type::Nat),
+            to: artifact_type(artifact_unit()),
         },
         a::Operation {
             selector: a::OperationSelector::Named("flush".into()),
-            from: artifact_type(a::Core::Unit),
-            to: artifact_type(a::Core::Unit),
+            from: artifact_type(artifact_unit()),
+            to: artifact_type(artifact_unit()),
         },
     ]);
     dependency
@@ -5696,9 +5925,9 @@ fn a_direct_only_interface_with_a_transitive_type_recovers_without_panicking() {
             types: vec![a::DeclaredType {
                 name: "dep@1.0.0::Wrapper".to_string(),
                 params: Vec::new(),
-                scheme: artifact_scheme(artifact_type(a::Core::Named {
+                scheme: artifact_scheme(artifact_type(a::Type::Named {
                     name: "base@1.0.0::Hidden".to_string(),
-                    args: vec![artifact_type(a::Core::Nat)],
+                    args: vec![artifact_type(a::Type::Nat)],
                 })),
             }],
             effects: Vec::new(),
@@ -5722,7 +5951,7 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     let alias = |name: &str, argument| a::DeclaredType {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
-        scheme: artifact_scheme(artifact_type(a::Core::Named {
+        scheme: artifact_scheme(artifact_type(a::Type::Named {
             name: "base@1.0.0::Hidden".into(),
             args: vec![artifact_type(argument)],
         })),
@@ -5739,8 +5968,8 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
             }],
             values: Vec::new(),
             types: vec![
-                alias("Natural", a::Core::Nat),
-                alias("Text", a::Core::String),
+                alias("Natural", a::Type::Nat),
+                alias("Text", a::Type::String),
             ],
             effects: Vec::new(),
         },
@@ -5762,6 +5991,33 @@ fn missing_transitive_type_applications_keep_distinct_effect_identities() {
     assert_ne!(
         identities[0], identities[1],
         "Hidden Nat and Hidden String must not canonicalize as one recovery type"
+    );
+}
+
+#[test]
+fn an_unproductive_local_alias_has_a_finite_effect_recovery_identity() {
+    let (mint, out) = build_src("type Loop = Loop\neffect Probe = { inspect: Loop -> () }");
+    assert!(
+        out.errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::Circular { .. })),
+        "{:#?}",
+        out.errors
+    );
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+            })
+        })
+        .expect("Probe has a recovery identity");
+    assert!(
+        interface.contains("inspect") && interface.contains('?'),
+        "{interface}"
     );
 }
 
@@ -5869,7 +6125,7 @@ fn direct_only_transitive_effects_keep_qualified_recovery_identity() {
     assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
     assert_eq!(inferred.schemes.len(), 3);
     for scheme in inferred.schemes.values() {
-        let ruddy::types::Core::Arrow(_, _, effects) = &scheme.body().core else {
+        let ruddy::types::Ty::Arrow(_, _, effects) = &**scheme.body() else {
             panic!("expected inferred arrow")
         };
         assert_eq!(effects.labels.len(), 1, "inference lost recovered effect");
@@ -5897,11 +6153,32 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
                let uses_alias : () -> () + !Alias = fn x => x";
     let (mint, out) = build_src(src);
     assert!(
-        out.errors
-            .iter()
-            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        out.errors.iter().all(|error| {
+            matches!(
+                error.kind,
+                ErrorKind::ImpureOperation
+                    | ErrorKind::RepeatedRowField {
+                        shape: Shape::Effect,
+                        ..
+                    }
+            )
+        }),
         "{:#?}",
         out.errors
+    );
+    assert_eq!(
+        out.errors
+            .iter()
+            .filter(|error| matches!(
+                error.kind,
+                ErrorKind::RepeatedRowField {
+                    shape: Shape::Effect,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "effect-row arguments in operation signatures are validated"
     );
     assert!(
         out.program
@@ -5932,6 +6209,510 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
     let expanded = effects.effects.values().next().expect("expanded IO label");
     assert!(expanded.expanded());
     assert!(expanded.name_span().width > 0);
+}
+
+#[test]
+fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
+    let local = "effect IO = { write: Nat -> () }\n\
+                 effect Wrap = { use: (() -> () + !IO) -> () }";
+    let interface = |source: &str, effect: &str| {
+        let (mint, out) = build_src(source);
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == effect).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface.clone(),
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .expect("effect identity")
+    };
+    let expected = interface(local, "Wrap");
+    let io = interface(local, "IO");
+    let dependency = effect_artifact("dep", &io);
+    let parsed = parse::parse(
+        lex(
+            "effect Wrap = { use: (() -> () + dep::!IO) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let imported = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| (mint.name(*symbol) == "Wrap").then_some(identity))
+        .expect("wrapper identity");
+    assert!(matches!(
+        imported,
+        ruddy::types::EffectId::Structural { interface, .. } if interface == &expected
+    ));
+
+    // Artifact identity text is untrusted. Exercise every delimiter and bounds
+    // failure in the decoder; all are exact opaque recovery identities.
+    let _ = build_src("effect Open = { get: { x: Nat, .. } -> () }");
+
+    for malformed in [
+        "",
+        "x",
+        "0x",
+        "0#",
+        "0#x",
+        "0#1",
+        "0#999:x",
+        "0#1:é;",
+        "0#1:a|",
+        "0#1:a|1",
+        "0#1:a|9:x",
+        "0#1:a|1:x?",
+        "0#1:a|1:x>",
+        "0#1:a|1:x>0",
+        "0#1:a?",
+        "1#1:a;",
+        "0#1:a|1:x>1;",
+        "0#18446744073709551615:x",
+        "18446744073709551616#1:a;",
+        "0#1:a|1:x>18446744073709551616;",
+    ] {
+        let dependency = effect_artifact("bad", malformed);
+        let parsed = parse::parse(
+            lex(
+                "effect Wrap = { use: (() -> () + bad::!IO) -> () }",
+                FileID::GENERATED,
+            )
+            .tokens,
+        );
+        let mut mint = dummy_mint();
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+        assert!(out.program.effect_ids.values().any(|identity| matches!(
+            identity,
+            ruddy::types::EffectId::Structural { name, .. } if name == "Wrap"
+        )));
+    }
+
+    let mut semantic = effect_artifact("semantic", &io);
+    semantic.header.types.push(a::DeclaredType {
+        name: "semantic@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            a::Row {
+                labels: vec![
+                    (
+                        format!("IO\u{1f}{io}"),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: artifact_unit(),
+                        },
+                    ),
+                    (
+                        "Ghost".into(),
+                        a::RowField {
+                            presence: a::Presence::Undecided,
+                            ty: artifact_unit(),
+                        },
+                    ),
+                ],
+                rest: a::Rest::Closed,
+            },
+        )),
+    });
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: semantic::Carrier -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[semantic]);
+    assert!(
+        out.program
+            .effect_ids
+            .keys()
+            .any(|symbol| mint.name(*symbol) == "Probe")
+    );
+}
+
+#[test]
+fn imported_presence_variables_keep_alpha_correlation_in_effect_identity() {
+    let mut dependency = effect_artifact("dep", "presence-correlation");
+    let declaration = |name: &str, left, right| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Struct(a::Row {
+            labels: vec![
+                (
+                    "x".into(),
+                    a::RowField {
+                        presence: left,
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "y".into(),
+                    a::RowField {
+                        presence: right,
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ],
+            rest: a::Rest::Closed,
+        })),
+    };
+    dependency.header.types = vec![
+        declaration("Bound", a::Presence::Bound(9), a::Presence::Bound(9)),
+        declaration("Var", a::Presence::Var(41), a::Presence::Var(41)),
+        declaration("Independent", a::Presence::Bound(9), a::Presence::Bound(10)),
+        declaration("Unknown", a::Presence::Undecided, a::Presence::Undecided),
+    ];
+    let parsed = parse::parse(
+        lex(
+            "module B = effect Probe = { op: dep::Bound -> () } end\n\
+             module V = effect Probe = { op: dep::Var -> () } end\n\
+             module I = effect Probe = { op: dep::Independent -> () } end\n\
+             module U = effect Probe = { op: dep::Unknown -> () } end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 4);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+    assert_ne!(identities[0], identities[3]);
+}
+
+#[test]
+fn effect_identity_alpha_normalizes_presence_variables_and_keeps_correlation() {
+    let source = "module P =\n\
+                    effect Probe = { op: { x when 'p: Nat, y when 'p: Nat } -> () }\n\
+                  end\n\
+                  module Q =\n\
+                    effect Probe = { op: { x when 'q: Nat, y when 'q: Nat } -> () }\n\
+                  end\n\
+                  module Independent =\n\
+                    effect Probe = { op: { x when 'p: Nat, y when 'q: Nat } -> () }\n\
+                  end";
+    let (mint, out) = build_src(source);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
+fn operation_inputs_and_outputs_share_one_presence_alpha_scope() {
+    let source = "module Shared =
+                    effect Probe = { op: { x when 'p: Nat } -> { y when 'p: Nat } }
+                  end
+                  module Renamed =
+                    effect Probe = { op: { x when 'q: Nat } -> { y when 'q: Nat } }
+                  end
+                  module Independent =
+                    effect Probe = { op: { x when 'p: Nat } -> { y when 'q: Nat } }
+                  end";
+    let (mint, out) = build_src(source);
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
+fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
+    let mut dependency = effect_artifact("dep", "bound-scopes");
+    let declaration = |name: &str| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::True,
+            body: artifact_struct(vec![
+                (
+                    "x".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "y".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ]),
+        },
+    };
+    dependency.header.types = vec![declaration("A"), declaration("B")];
+    let parsed = parse::parse(
+        lex(
+            "module Imported = effect Probe = { op: { a: dep::A, b: dep::B } -> () } end
+\
+             module Independent = effect Probe = { op: { a: { x when 'p: Nat, y when 'p: Nat }, b: { x when 'q: Nat, y when 'q: Nat } } -> () } end
+\
+             module Correlated = effect Probe = { op: { a: { x when 'p: Nat, y when 'p: Nat }, b: { x when 'p: Nat, y when 'p: Nat } } -> () } end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3, "{:#?}", out.errors);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
+fn imported_presence_vars_use_a_disjoint_recovery_variant() {
+    let mut dependency = effect_artifact("dep", "recovered-presence");
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::True,
+            body: artifact_struct(vec![
+                (
+                    "bound".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "foreign".into(),
+                    a::RowField {
+                        presence: a::Presence::Var(0x8000_0000),
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ]),
+        },
+    });
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { op: dep::Carrier -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let carrier = out
+        .program
+        .external_types
+        .iter()
+        .find_map(|(symbol, declaration)| {
+            (mint.name(*symbol) == "dep@1.0.0::Carrier").then_some(declaration)
+        })
+        .expect("the imported carrier");
+    let Ty::Struct(row) = &**carrier.scheme.body() else {
+        panic!("carrier body was not a struct")
+    };
+    assert!(matches!(row.labels["bound"].presence, Presence::Bound(0)));
+    assert!(matches!(
+        row.labels["foreign"].presence,
+        Presence::Recovered(0x8000_0000)
+    ));
+}
+
+#[test]
+fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion() {
+    let mut source = String::from("effect Branch0 = { op: () -> () }\n");
+    for depth in 1..=30 {
+        let previous = depth - 1;
+        source.push_str(&format!(
+            "effect Branch{depth} = {{ op: (() -> () + !Branch{previous}) -> (() -> () + !Branch{previous}) }}\n"
+        ));
+    }
+    source.push_str(
+        "module A =\n  effect Loop = { op: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module B =\n  effect Loop = { op: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module C =\n  effect Loop = { other: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module D =\n  effect Loop = { op: (() -> () + E::!Loop) -> (() -> () + E::!Loop) }\nend\n\
+         module E =\n  effect Loop = { op: (() -> () + D::!Loop) -> (() -> () + D::!Loop) }\nend",
+    );
+    let (mint, out) = build_src(&source);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let branch = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| (mint.name(*symbol) == "Branch30").then_some(identity))
+        .expect("deep branching effect identity");
+    let ruddy::types::EffectId::Structural { interface, .. } = branch else {
+        panic!("effect identity was not finalized")
+    };
+    assert!(
+        interface.len() < 100_000,
+        "shared depth-30 graph was expanded to {} bytes",
+        interface.len()
+    );
+
+    let loops: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Loop")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(loops.len(), 5);
+    assert_eq!(loops[0], loops[1], "equivalent recursive graphs differ");
+    assert_eq!(loops[0], loops[3], "one- and two-state cycles differ");
+    assert_eq!(loops[0], loops[4], "cycle entry point changed identity");
+    assert_ne!(loops[0], loops[2], "operation names disappeared");
+}
+
+#[test]
+fn source_and_imported_absent_effect_payloads_have_one_identity() {
+    let io_source = "effect IO = { run: () -> () }";
+    let io = local_effect_interface(io_source, "IO");
+    let mut dependency = effect_artifact("dep", &io);
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            a::Row {
+                labels: vec![(
+                    format!("IO\u{1f}{io}"),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        // An absent effect payload is semantically ignored.
+                        ty: a::Type::String,
+                    },
+                )],
+                rest: a::Rest::Undecided,
+            },
+        )),
+    });
+    let source = format!(
+        "{io_source}\n\
+         module Source =\n\
+           effect Probe = {{ op: (() -> () + \\!IO + ..) -> () }}\n\
+         end\n\
+         module Imported =\n\
+           effect Probe = {{ op: dep::Carrier -> () }}\n\
+         end"
+    );
+    let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0], identities[1]);
+}
+
+#[test]
+fn recovery_row_tails_remain_unknown_in_every_canonical_shape() {
+    let src = "module Closed =\n\
+                 effect Struct = { get: { x: Nat } -> () }\n\
+                 effect Cases = { get: (#X) -> () }\n\
+                 effect Effects = { get: (() -> ()) -> () }\n\
+               end\n\
+               module Open =\n\
+                 effect Struct = { get: { x: Nat, .. } -> () }\n\
+                 effect Cases = { get: (#X | ..) -> () }\n\
+                 effect Effects = { get: (() -> () + ..) -> () }\n\
+               end\n\
+               effect StructBoth = Closed::!Struct + Open::!Struct\n\
+               effect CasesBoth = Closed::!Cases + Open::!Cases\n\
+               effect EffectsBoth = Closed::!Effects + Open::!Effects";
+    let (mint, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        [
+            "impure-operation",
+            "impure-operation",
+            "impure-operation",
+            "impure-operation"
+        ],
+        "an unknown recovery tail must not collapse to a closed tail"
+    );
+    for name in ["Struct", "Cases", "Effects"] {
+        let identities: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1], "{name} tail was closed");
+    }
 }
 
 #[test]
@@ -5998,13 +6779,140 @@ fn local_row_applications_flatten_records_sums_and_effects_without_losing_labels
 }
 
 #[test]
+fn imported_structural_identity_respects_effect_and_case_parameter_senses() {
+    let mut dependency = effect_artifact("dep", "x");
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let effect_row = || a::Row {
+        labels: vec![("IO\u{1f}x".into(), present(artifact_unit()))],
+        rest: a::Rest::Closed,
+    };
+    let case_row = || a::Row {
+        labels: vec![("IO\u{1f}x".into(), present(artifact_unit()))],
+        rest: a::Rest::Closed,
+    };
+    let parameter = |sense| a::Parameter {
+        sense,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    let declared = |name: &str, params, count, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params,
+        scheme: a::Scheme {
+            count,
+            presences: 0,
+            formula: a::Formula::True,
+            body,
+        },
+    };
+    dependency.header.types = vec![
+        declared("EffectRows", Vec::new(), 0, a::Type::Sum(effect_row())),
+        declared(
+            "Effects",
+            vec![parameter(a::Sense::Effects)],
+            1,
+            a::Type::Arrow(
+                Box::new(artifact_unit()),
+                Box::new(artifact_unit()),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                },
+            ),
+        ),
+        declared(
+            "ComposedEffects",
+            Vec::new(),
+            0,
+            a::Type::Named {
+                name: "dep@1.0.0::Effects".into(),
+                args: vec![a::Type::Named {
+                    name: "dep@1.0.0::EffectRows".into(),
+                    args: Vec::new(),
+                }],
+            },
+        ),
+        declared(
+            "FlatEffects",
+            Vec::new(),
+            0,
+            a::Type::Arrow(
+                Box::new(artifact_unit()),
+                Box::new(artifact_unit()),
+                effect_row(),
+            ),
+        ),
+        declared(
+            "Cases",
+            vec![parameter(a::Sense::Cases)],
+            1,
+            a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        ),
+        declared(
+            "ComposedCases",
+            Vec::new(),
+            0,
+            a::Type::Named {
+                name: "dep@1.0.0::Cases".into(),
+                args: vec![a::Type::Sum(case_row())],
+            },
+        ),
+        declared("FlatCases", Vec::new(), 0, a::Type::Sum(case_row())),
+    ];
+    let parsed = parse::parse(
+        lex(
+            "module EC =\n\
+               effect Probe = { op: dep::ComposedEffects -> () }\n\
+             end\n\
+             module EF =\n\
+               effect Probe = { op: dep::FlatEffects -> () }\n\
+             end\n\
+             module CC =\n\
+               effect Probe = { op: dep::ComposedCases -> () }\n\
+             end\n\
+             module CF =\n\
+               effect Probe = { op: dep::FlatCases -> () }\n\
+             end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 4);
+    assert_eq!(identities[0], identities[1]);
+    assert_eq!(identities[2], identities[3]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
 fn row_composition_is_flattened_across_local_and_imported_types() {
     let present = |ty| a::RowField {
         presence: a::Presence::Present,
         ty,
     };
     let named = |name: &str| {
-        artifact_type(a::Core::Named {
+        artifact_type(a::Type::Named {
             name: format!("dep@1.0.0::{name}"),
             args: Vec::new(),
         })
@@ -6015,7 +6923,7 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
         scheme: artifact_scheme(body),
     };
     let row = |label: &str| a::Row {
-        labels: vec![(label.into(), present(artifact_type(a::Core::Unit)))],
+        labels: vec![(label.into(), present(artifact_type(artifact_unit())))],
         rest: a::Rest::Closed,
     };
     let dependency = a::Artifact {
@@ -6029,37 +6937,28 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
             types: vec![
                 declared(
                     "RecordTail",
-                    a::Type {
-                        core: a::Core::Unit,
-                        fields: vec![("y".into(), present(artifact_type(a::Core::Nat)))],
-                    },
+                    artifact_struct(vec![("y".into(), present(artifact_type(a::Type::Nat)))]),
                 ),
                 declared(
                     "Record",
-                    a::Type {
-                        core: a::Core::Named {
-                            name: "dep@1.0.0::RecordTail".into(),
-                            args: Vec::new(),
-                        },
-                        fields: vec![("x".into(), present(artifact_type(a::Core::Nat)))],
-                    },
+                    artifact_struct(vec![
+                        ("x".into(), present(artifact_type(a::Type::Nat))),
+                        ("y".into(), present(artifact_type(a::Type::Nat))),
+                    ]),
                 ),
                 declared(
                     "OtherRecord",
-                    a::Type {
-                        core: a::Core::Unit,
-                        fields: vec![("z".into(), present(artifact_type(a::Core::Nat)))],
-                    },
+                    artifact_struct(vec![("z".into(), present(artifact_type(a::Type::Nat)))]),
                 ),
-                declared("CaseTail", artifact_type(a::Core::Sum(row("Y")))),
+                declared("CaseTail", artifact_type(a::Type::Sum(row("Y")))),
                 declared(
                     "Cases",
-                    artifact_type(a::Core::Sum(a::Row {
-                        labels: row("X").labels,
+                    artifact_type(a::Type::Sum(a::Row {
+                        labels: row("X").labels.clone(),
                         rest: a::Rest::More(Box::new(row("Y"))),
                     })),
                 ),
-                declared("OtherCases", artifact_type(a::Core::Sum(row("Z")))),
+                declared("OtherCases", artifact_type(a::Type::Sum(row("Z")))),
                 // Keep a named indirection in the artifact too: flattening is
                 // deliberately performed after all regular nodes are built.
                 declared("RecordAlias", named("Record")),
@@ -6097,6 +6996,113 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
 }
 
 #[test]
+fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels() {
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let absent = || a::RowField {
+        presence: a::Presence::Absent,
+        ty: a::Type::Undecided,
+    };
+    let sum = |name: &str, field| {
+        a::Type::Sum(a::Row {
+            labels: vec![(name.into(), field)],
+            rest: a::Rest::Closed,
+        })
+    };
+    let declared = |name: &str, params, count, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params,
+        scheme: a::Scheme {
+            count,
+            presences: 0,
+            formula: a::Formula::True,
+            body,
+        },
+    };
+    let named = |name: &str, args| a::Type::Named {
+        name: format!("dep@1.0.0::{name}"),
+        args,
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![
+                declared(
+                    "Mask",
+                    vec![a::Parameter {
+                        sense: a::Sense::Cases,
+                        lacks: vec!["X".into()],
+                        relevant: true,
+                    }],
+                    1,
+                    a::Type::Sum(a::Row {
+                        labels: vec![("X".into(), absent())],
+                        rest: a::Rest::Bound(0),
+                    }),
+                ),
+                declared(
+                    "Composed",
+                    Vec::new(),
+                    0,
+                    named("Mask", vec![sum("X", present(a::Type::Nat))]),
+                ),
+                declared("Flat", Vec::new(), 0, sum("X", absent())),
+                declared(
+                    "Separator",
+                    Vec::new(),
+                    0,
+                    sum("A\u{1f}x", present(a::Type::Nat)),
+                ),
+                declared(
+                    "LooksGenerated",
+                    Vec::new(),
+                    0,
+                    sum("!A<x>", present(a::Type::Nat)),
+                ),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            externs: Vec::new(),
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module A = effect Shadow = { get: dep::Composed -> () } end\n\
+               module B = effect Shadow = { get: dep::Flat -> () } end\n\
+               module C = effect Separator = { get: dep::Separator -> () } end\n\
+               module D = effect Separator = { get: dep::LooksGenerated -> () } end";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identities = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>()
+    };
+    let shadow = identities("Shadow");
+    assert_eq!(shadow.len(), 2);
+    assert_eq!(shadow[0], shadow[1], "outer absence did not mask inner X");
+    let separator = identities("Separator");
+    assert_eq!(separator.len(), 2);
+    assert_ne!(
+        separator[0], separator[1],
+        "ordinary sum separator was mistaken for an effect identity"
+    );
+}
+
+#[test]
 fn absent_semantic_payloads_do_not_affect_structural_identity() {
     let absent = |ty| a::RowField {
         presence: a::Presence::Absent,
@@ -6107,7 +7113,7 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         params: Vec::new(),
         scheme: artifact_scheme(body),
     };
-    let types = [a::Core::Nat, a::Core::String]
+    let types = [a::Type::Nat, a::Type::String]
         .into_iter()
         .enumerate()
         .flat_map(|(index, payload)| {
@@ -6115,14 +7121,14 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
             [
                 declared(
                     &format!("Record{suffix}"),
-                    a::Type {
-                        core: a::Core::Unit,
-                        fields: vec![("hidden".into(), absent(artifact_type(payload.clone())))],
-                    },
+                    artifact_struct(vec![(
+                        "hidden".into(),
+                        absent(artifact_type(payload.clone())),
+                    )]),
                 ),
                 declared(
                     &format!("Cases{suffix}"),
-                    artifact_type(a::Core::Sum(a::Row {
+                    artifact_type(a::Type::Sum(a::Row {
                         labels: vec![("Hidden".into(), absent(artifact_type(payload)))],
                         rest: a::Rest::Closed,
                     })),
@@ -6168,17 +7174,104 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
 }
 
 #[test]
+fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts() {
+    let mut dependency = effect_artifact("dep", "absent-payload-walks");
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::ghost".into(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Struct(a::Row {
+                labels: vec![(
+                    "hidden".into(),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        ty: a::Type::Arrow(
+                            Box::new(a::Type::Bound(0)),
+                            Box::new(a::Type::Bound(0)),
+                            a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Bound(0),
+                            },
+                        ),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            }),
+        },
+    });
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::nested".into(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::Bound(0),
+            body: a::Type::Struct(a::Row {
+                labels: vec![
+                    (
+                        "outer".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "inner".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Bound(0),
+                                        ty: a::Type::Nat,
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            }),
+                        },
+                    ),
+                    (
+                        "gone".into(),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "invisible".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Bound(0),
+                                        ty: a::Type::Nat,
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            }),
+                        },
+                    ),
+                ],
+                rest: a::Rest::Closed,
+            }),
+        },
+    });
+    let parsed = parse::parse(
+        lex(
+            "let ghost = dep::ghost\nlet nested = dep::nested",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let scheme = inferred.schemes.values().next().expect("ghost scheme");
+    assert_eq!(scheme.count(), 0);
+    assert_eq!(scheme.presences(), 0);
+}
+
+#[test]
 fn local_and_imported_structural_types_share_one_canonical_encoding() {
-    let unit = || artifact_type(a::Core::Unit);
+    let unit = || artifact_type(artifact_unit());
     let present = |ty| a::RowField {
         presence: a::Presence::Present,
         ty,
     };
-    let record = a::Type {
-        core: a::Core::Unit,
-        fields: vec![("x".into(), present(artifact_type(a::Core::Nat)))],
-    };
-    let sum = artifact_type(a::Core::Sum(a::Row {
+    let record = artifact_struct(vec![("x".into(), present(artifact_type(a::Type::Nat)))]);
+    let sum = artifact_type(a::Type::Sum(a::Row {
         labels: vec![("X".into(), present(unit()))],
         rest: a::Rest::Closed,
     }));
@@ -6200,17 +7293,14 @@ fn local_and_imported_structural_types_share_one_canonical_encoding() {
                 declared("Cases", sum),
                 declared(
                     "Alias",
-                    artifact_type(a::Core::Named {
+                    artifact_type(a::Type::Named {
                         name: "dep@1.0.0::Record".into(),
                         args: Vec::new(),
                     }),
                 ),
                 declared(
                     "Different",
-                    a::Type {
-                        core: a::Core::Unit,
-                        fields: vec![("z".into(), present(artifact_type(a::Core::Nat)))],
-                    },
+                    artifact_struct(vec![("z".into(), present(artifact_type(a::Type::Nat)))]),
                 ),
             ],
             effects: Vec::new(),
@@ -6279,7 +7369,7 @@ fn imported_interfaces_keep_applied_types_effects_and_alias_overlap_structural()
                     count: 1,
                     presences: 0,
                     formula: a::Formula::True,
-                    body: artifact_type(a::Core::Bound(0)),
+                    body: artifact_type(a::Type::Bound(0)),
                 },
             }],
             effects: [
@@ -6396,11 +7486,11 @@ fn imported_effects_in_recovery_signatures_compare_structurally() {
 #[test]
 fn imported_declared_types_exercise_every_semantic_identity_form() {
     let field = |presence, ty| a::RowField { presence, ty };
-    let unit = || artifact_type(a::Core::Unit);
+    let unit = || artifact_type(artifact_unit());
     let row_type = |name: &str, labels, rest| a::DeclaredType {
         name: format!("dep@1.0.0::{name}"),
         params: Vec::new(),
-        scheme: artifact_scheme(artifact_type(a::Core::Sum(a::Row { labels, rest }))),
+        scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row { labels, rest }))),
     };
     let declared = |name: &str, body| a::DeclaredType {
         name: format!("dep@1.0.0::{name}"),
@@ -6408,24 +7498,24 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         scheme: artifact_scheme(body),
     };
     let mut types = vec![
-        declared("Int", artifact_type(a::Core::Int)),
-        declared("Real", artifact_type(a::Core::Real)),
-        declared("Boolean", artifact_type(a::Core::Boolean)),
-        declared("Var", artifact_type(a::Core::Var(7))),
+        declared("Int", artifact_type(a::Type::Int)),
+        declared("Real", artifact_type(a::Type::Real)),
+        declared("Boolean", artifact_type(a::Type::Boolean)),
+        declared("Var", artifact_type(a::Type::Var(7))),
         declared(
             "Rigid",
-            artifact_type(a::Core::Rigid {
+            artifact_type(a::Type::Rigid {
                 id: 8,
                 name: "rigid".into(),
             }),
         ),
-        declared("Undecided", artifact_type(a::Core::Undecided)),
-        declared("Bound", artifact_type(a::Core::Bound(10))),
+        declared("Undecided", artifact_type(a::Type::Undecided)),
+        declared("Bound", artifact_type(a::Type::Bound(10))),
         declared(
             "Arrow",
-            artifact_type(a::Core::Arrow(
-                Box::new(artifact_type(a::Core::Int)),
-                Box::new(artifact_type(a::Core::Boolean)),
+            artifact_type(a::Type::Arrow(
+                Box::new(artifact_type(a::Type::Int)),
+                Box::new(artifact_type(a::Type::Boolean)),
                 a::Row {
                     labels: vec![(
                         "IO\u{1f}run:{}->{}".into(),
@@ -6437,14 +7527,11 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
         ),
         declared(
             "Fields",
-            a::Type {
-                core: a::Core::Unit,
-                fields: vec![
-                    ("variable".into(), field(a::Presence::Var(1), unit())),
-                    ("bound".into(), field(a::Presence::Bound(2), unit())),
-                    ("unknown".into(), field(a::Presence::Undecided, unit())),
-                ],
-            },
+            artifact_struct(vec![
+                ("variable".into(), field(a::Presence::Var(1), unit())),
+                ("bound".into(), field(a::Presence::Bound(2), unit())),
+                ("unknown".into(), field(a::Presence::Undecided, unit())),
+            ]),
         ),
         row_type(
             "RowPresences",
@@ -6471,17 +7558,11 @@ fn imported_declared_types_exercise_every_semantic_identity_form() {
     // visits the self edge once rather than recursing forever.
     types.push(declared(
         "RowCycle",
-        a::Type {
-            core: a::Core::Named {
-                name: "dep@1.0.0::RowCycle".into(),
-                args: Vec::new(),
-            },
-            fields: vec![("x".into(), field(a::Presence::Present, unit()))],
-        },
+        artifact_struct(vec![("x".into(), field(a::Presence::Present, unit()))]),
     ));
     types.push(declared(
         "BareCycle",
-        artifact_type(a::Core::Named {
+        artifact_type(a::Type::Named {
             name: "dep@1.0.0::BareCycle".into(),
             args: Vec::new(),
         }),
@@ -6531,18 +7612,18 @@ fn malformed_dependency_declarations_are_ignored_without_shadow_symbols() {
     let mut dependency = effect_artifact("dep", "read:{}->Nat");
     let value = a::Value {
         name: "dep@1.0.0::answer".into(),
-        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+        scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     };
     dependency.header.values = vec![value.clone(), value];
     dependency.header.types.push(a::DeclaredType {
         name: "dep@1.0.0::".into(),
         params: Vec::new(),
-        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+        scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.types.push(a::DeclaredType {
         name: "other@1.0.0::Ignored".into(),
         params: Vec::new(),
-        scheme: artifact_scheme(artifact_type(a::Core::Nat)),
+        scheme: artifact_scheme(artifact_type(a::Type::Nat)),
     });
     dependency.header.effects.push(a::DeclaredEffect {
         name: "other@1.0.0::Ignored".into(),
@@ -6670,40 +7751,17 @@ fn duplicate_dependency_aliases_are_rejected_without_merging_roots() {
 
 #[test]
 fn dependency_interfaces_import_every_semantic_form() {
-    let unit = || artifact_type(a::Core::Unit);
-    let field = |presence| a::RowField {
-        presence,
-        ty: unit(),
-    };
-    let rich = a::Type {
-        core: a::Core::Arrow(
-            Box::new(artifact_type(a::Core::Named {
-                name: "other@2.0.0::Remote".to_string(),
-                args: vec![artifact_type(a::Core::Bound(1))],
-            })),
-            Box::new(artifact_type(a::Core::Rigid {
-                id: 4,
-                name: "r".to_string(),
-            })),
-            a::Row {
-                labels: vec![
-                    ("present".to_string(), field(a::Presence::Present)),
-                    ("absent".to_string(), field(a::Presence::Absent)),
-                    ("var".to_string(), field(a::Presence::Var(2))),
-                    ("bound".to_string(), field(a::Presence::Bound(0))),
-                    ("unknown".to_string(), field(a::Presence::Undecided)),
-                ],
-                rest: a::Rest::More(Box::new(a::Row {
-                    labels: Vec::new(),
-                    rest: a::Rest::Rigid {
-                        id: 5,
-                        name: "tail".to_string(),
-                    },
-                })),
-            },
-        ),
-        fields: vec![("x".to_string(), field(a::Presence::Present))],
-    };
+    let unit = || artifact_type(artifact_unit());
+    let rich = artifact_struct(vec![(
+        "x".to_string(),
+        a::RowField {
+            presence: a::Presence::Present,
+            ty: artifact_type(a::Type::Named {
+                name: "other@2.0.0::Remote".into(),
+                args: Vec::new(),
+            }),
+        },
+    )]);
     let formula = a::Formula::And(
         Box::new(a::Formula::Not(Box::new(a::Formula::Var(0)))),
         Box::new(a::Formula::Or(
@@ -6727,39 +7785,86 @@ fn dependency_interfaces_import_every_semantic_form() {
         },
     }];
     for (name, core) in [
-        ("unit", a::Core::Unit),
-        ("nat", a::Core::Nat),
-        ("int", a::Core::Int),
-        ("real", a::Core::Real),
-        ("string", a::Core::String),
-        ("boolean", a::Core::Boolean),
-        ("var", a::Core::Var(0)),
-        ("bound", a::Core::Bound(0)),
-        ("undecided", a::Core::Undecided),
+        ("unit", artifact_unit()),
+        ("nat", a::Type::Nat),
+        ("int", a::Type::Int),
+        ("real", a::Type::Real),
+        ("string", a::Type::String),
+        ("boolean", a::Type::Boolean),
+        ("var", a::Type::Var(0)),
+        ("bound", a::Type::Bound(0)),
+        ("undecided", a::Type::Undecided),
+        (
+            "struct-absent-more",
+            a::Type::Struct(a::Row {
+                labels: vec![(
+                    "gone".into(),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        ty: artifact_type(a::Type::Nat),
+                    },
+                )],
+                rest: a::Rest::More(Box::new(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                })),
+            }),
+        ),
+        (
+            "struct-var",
+            a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Var(0),
+            }),
+        ),
+        (
+            "struct-bound",
+            a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        ),
+        (
+            "struct-rigid",
+            a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Rigid {
+                    id: 7,
+                    name: "r".into(),
+                },
+            }),
+        ),
+        (
+            "struct-undecided",
+            a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Undecided,
+            }),
+        ),
         (
             "sum-closed",
-            a::Core::Sum(a::Row {
+            a::Type::Sum(a::Row {
                 labels: Vec::new(),
                 rest: a::Rest::Closed,
             }),
         ),
         (
             "sum-var",
-            a::Core::Sum(a::Row {
+            a::Type::Sum(a::Row {
                 labels: Vec::new(),
                 rest: a::Rest::Var(0),
             }),
         ),
         (
             "sum-bound",
-            a::Core::Sum(a::Row {
+            a::Type::Sum(a::Row {
                 labels: Vec::new(),
                 rest: a::Rest::Bound(0),
             }),
         ),
         (
             "sum-undecided",
-            a::Core::Sum(a::Row {
+            a::Type::Sum(a::Row {
                 labels: Vec::new(),
                 rest: a::Rest::Undecided,
             }),
@@ -6783,30 +7888,159 @@ fn dependency_interfaces_import_every_semantic_form() {
             },
             dependencies: Vec::new(),
             values,
-            types: vec![a::DeclaredType {
-                name: "dep@1.0.0::M::T".to_string(),
-                params: vec![
-                    a::Parameter {
-                        sense: a::Sense::Type,
-                        lacks: vec!["x".to_string()],
-                        relevant: true,
-                    },
-                    a::Parameter {
-                        sense: a::Sense::Cases,
-                        lacks: Vec::new(),
-                        relevant: false,
-                    },
-                    a::Parameter {
-                        sense: a::Sense::Effects,
-                        lacks: Vec::new(),
-                        relevant: true,
-                    },
-                ],
-                scheme: artifact_scheme(artifact_type(a::Core::Named {
+            types: vec![
+                a::DeclaredType {
                     name: "dep@1.0.0::M::T".to_string(),
-                    args: Vec::new(),
-                })),
-            }],
+                    params: vec![
+                        a::Parameter {
+                            sense: a::Sense::Type,
+                            lacks: vec!["x".to_string()],
+                            relevant: true,
+                        },
+                        a::Parameter {
+                            sense: a::Sense::Cases,
+                            lacks: Vec::new(),
+                            relevant: false,
+                        },
+                        a::Parameter {
+                            sense: a::Sense::Effects,
+                            lacks: Vec::new(),
+                            relevant: true,
+                        },
+                    ],
+                    scheme: artifact_scheme(artifact_type(a::Type::Named {
+                        name: "dep@1.0.0::M::T".to_string(),
+                        args: Vec::new(),
+                    })),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructMore".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                        labels: vec![
+                            (
+                                "present".into(),
+                                a::RowField {
+                                    presence: a::Presence::Present,
+                                    ty: artifact_type(a::Type::Nat),
+                                },
+                            ),
+                            (
+                                "absent".into(),
+                                a::RowField {
+                                    presence: a::Presence::Absent,
+                                    ty: artifact_type(a::Type::Nat),
+                                },
+                            ),
+                            (
+                                "var".into(),
+                                a::RowField {
+                                    presence: a::Presence::Var(1),
+                                    ty: artifact_type(a::Type::Nat),
+                                },
+                            ),
+                            (
+                                "bound".into(),
+                                a::RowField {
+                                    presence: a::Presence::Bound(2),
+                                    ty: artifact_type(a::Type::Nat),
+                                },
+                            ),
+                            (
+                                "unknown".into(),
+                                a::RowField {
+                                    presence: a::Presence::Undecided,
+                                    ty: artifact_type(a::Type::Nat),
+                                },
+                            ),
+                        ],
+                        rest: a::Rest::More(Box::new(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        })),
+                    }))),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructVar".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Var(3),
+                    }))),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructBound".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Fields,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: artifact_type(a::Type::Struct(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Bound(0),
+                        })),
+                    },
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructMissing".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Bound(9),
+                    }))),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructRigid".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Rigid {
+                            id: 4,
+                            name: "r".into(),
+                        },
+                    }))),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::StructUnknown".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Undecided,
+                    }))),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::RowLoop".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Fields,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: artifact_type(a::Type::Struct(a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Bound(0),
+                        })),
+                    },
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::RowCycle".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_type(a::Type::Named {
+                        name: "dep@1.0.0::RowLoop".into(),
+                        args: vec![artifact_type(a::Type::Named {
+                            name: "dep@1.0.0::RowCycle".into(),
+                            args: Vec::new(),
+                        })],
+                    })),
+                },
+            ],
             effects: vec![
                 a::DeclaredEffect {
                     name: "dep@1.0.0::M::Read".to_string(),
@@ -6814,11 +8048,108 @@ fn dependency_interfaces_import_every_semantic_form() {
                         name: "Read".to_string(),
                         interface: "get:{}->Nat".to_string(),
                     }),
-                    kind: a::EffectKind::Operations(vec![a::Operation {
-                        selector: a::OperationSelector::Named("get".to_string()),
-                        from: unit(),
-                        to: artifact_type(a::Core::Nat),
-                    }]),
+                    kind: a::EffectKind::Operations(vec![
+                        a::Operation {
+                            selector: a::OperationSelector::Named("get".to_string()),
+                            from: unit(),
+                            to: artifact_type(a::Type::Nat),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("absent_more".into()),
+                            from: artifact_type(a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "gone".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Absent,
+                                        ty: artifact_type(a::Type::Nat),
+                                    },
+                                )],
+                                rest: a::Rest::More(Box::new(a::Row {
+                                    labels: Vec::new(),
+                                    rest: a::Rest::Closed,
+                                })),
+                            })),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("var".into()),
+                            from: artifact_type(a::Type::Struct(a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Var(4),
+                            })),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("bound".into()),
+                            from: artifact_type(a::Type::Struct(a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Bound(4),
+                            })),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("rigid".into()),
+                            from: artifact_type(a::Type::Struct(a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Rigid {
+                                    id: 4,
+                                    name: "r".into(),
+                                },
+                            })),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("undecided".into()),
+                            from: artifact_type(a::Type::Struct(a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Undecided,
+                            })),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("named_more".into()),
+                            from: artifact_type(a::Type::Named {
+                                name: "dep@1.0.0::StructMore".into(),
+                                args: Vec::new(),
+                            }),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("named_var".into()),
+                            from: artifact_type(a::Type::Named {
+                                name: "dep@1.0.0::StructVar".into(),
+                                args: Vec::new(),
+                            }),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("named_bound".into()),
+                            from: artifact_type(a::Type::Named {
+                                name: "dep@1.0.0::StructBound".into(),
+                                args: vec![artifact_type(a::Type::Struct(a::Row {
+                                    labels: Vec::new(),
+                                    rest: a::Rest::Closed,
+                                }))],
+                            }),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("named_rigid".into()),
+                            from: artifact_type(a::Type::Named {
+                                name: "dep@1.0.0::StructRigid".into(),
+                                args: Vec::new(),
+                            }),
+                            to: unit(),
+                        },
+                        a::Operation {
+                            selector: a::OperationSelector::Named("named_unknown".into()),
+                            from: artifact_type(a::Type::Named {
+                                name: "dep@1.0.0::StructUnknown".into(),
+                                args: Vec::new(),
+                            }),
+                            to: unit(),
+                        },
+                    ]),
                 },
                 a::DeclaredEffect {
                     name: "dep@1.0.0::Alias".to_string(),
@@ -6842,8 +8173,24 @@ fn dependency_interfaces_import_every_semantic_form() {
     duplicate.header.values.clear();
     duplicate.header.types.clear();
     duplicate.header.effects.clear();
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = {\n\
+               more: dep::StructMore -> (),\n\
+               var: dep::StructVar -> (),\n\
+               bound: (dep::StructBound {}) -> (),\n\
+               missing: dep::StructMissing -> (),\n\
+               rigid: dep::StructRigid -> (),\n\
+               unknown: dep::StructUnknown -> (),\n\
+               cycle: dep::RowCycle -> (),\n\
+             }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
     let mut mint = dummy_mint();
-    let out = build_with_dependencies(&mut mint, Vec::new(), &[dependency, duplicate]);
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency, duplicate]);
 
     assert_eq!(out.errors.len(), 1);
     assert!(matches!(
@@ -6852,8 +8199,8 @@ fn dependency_interfaces_import_every_semantic_form() {
     ));
     // The declared type plus a recovery interface for the transitive `Remote`
     // reference whose header was deliberately not supplied.
-    assert_eq!(out.program.external_types.len(), 2);
-    assert_eq!(out.program.external_operations.len(), 1);
+    assert_eq!(out.program.external_types.len(), 10);
+    assert_eq!(out.program.external_operations.len(), 11);
     assert!(
         out.program
             .external_names
@@ -6921,4 +8268,2923 @@ fn externs_accept_every_annotation_type() {
     );
     assert!(output.errors.is_empty(), "{:#?}", output.errors);
     assert_eq!(output.program.externs.len(), 3);
+}
+
+#[test]
+fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
+    let (mint, out) = built(
+        "type WithX 'r = { x: Nat, ..'r }\n\
+         type Plain = { y: Nat }\n\
+         type Chain = Plain\n\
+         type Box 'a = { value: 'a }\n\
+         type Identity 'a = 'a\n\
+         type Recursive = { next: Recursive }\n\
+         type A = WithX { y: Nat }\n\
+         type C = WithX {}\n\
+         type D = WithX Plain\n\
+         type E = WithX Chain\n\
+         type F = WithX (Box Nat)\n\
+         type G = WithX Recursive\n\
+         type H = WithX (Identity Plain)\n\
+         let open : WithX { y: Nat, .. } -> Nat = fn p => p.x",
+    );
+    let with_x = type_symbol(&mint, &out, "WithX");
+    assert!(matches!(
+        out.program.types[&with_x].params[0].kind,
+        ParamKind::Fields { .. }
+    ));
+
+    for argument in ["Nat", "(Nat -> Nat)", "(#A | #B)"] {
+        let (_, out) = build_src(&format!(
+            "type WithX 'r = {{ x: Nat, ..'r }}\ntype Bad = WithX {argument}"
+        ));
+        let [error] = out.errors.as_slice() else {
+            panic!("{argument}: {:#?}", out.errors);
+        };
+        assert!(matches!(
+            error.kind,
+            ErrorKind::NotARow {
+                sense: Sense::Fields
+            }
+        ));
+    }
+
+    for source in [
+        "type WithX 'r = { x: Nat, ..'r } type A = B type B = A type Bad = WithX A",
+        "type WithX 'r = { x: Nat, ..'r } type A 'r = B 'r type B 'r = A 'r type Bad = WithX (A {})",
+    ] {
+        let (_, out) = build_src(source);
+        assert!(!out.errors.is_empty());
+    }
+
+    let (_, out) = build_src("type Mixed 'a = { value: 'a, ..'a }");
+    let [error] = out.errors.as_slice() else {
+        panic!("{:#?}", out.errors);
+    };
+    assert!(matches!(
+        error.kind,
+        ErrorKind::MixedParameter {
+            first: Sense::Type,
+            second: Sense::Fields
+        }
+    ));
+}
+
+#[test]
+fn sum_row_aliases_are_normalized_for_repetition_and_lacks() {
+    for argument in ["Alias", "Transitive", "(AddB (#C | #A))"] {
+        let source = format!(
+            "type Cases 'r = #A | ..'r\n\
+             type Alias = #B | #A\n\
+             type Transitive = Alias\n\
+             type AddB 'r = #B | ..'r\n\
+             type Bad = Cases {argument}"
+        );
+        let (_, out) = build_src(&source);
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error]
+                    if matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Sum, field } if field == "A")
+            ),
+            "{argument}: {:#?}",
+            out.errors
+        );
+    }
+
+    // `Forward`'s parameter reaches `Cases` through another row constructor;
+    // it inherits A as well as AddB's own B, in source order.
+    let (_, out) = build_src(
+        "type Cases 'r = #A | ..'r\n\
+         type AddB 'r = #B | ..'r\n\
+         type Forward 'r = Cases (AddB 'r)\n\
+         type Bad = Forward (#C | #A | #B)",
+    );
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error]
+                if matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Sum, field } if field == "A")
+        ),
+        "{:#?}",
+        out.errors
+    );
+
+    // Effect rows use the same normalization machinery without borrowing the
+    // sum or struct sense.
+    let (_, out) = build_src(
+        "effect Log = { write: () -> () }\n\
+         type Eff 'e = Nat -> Nat + ..'e\n\
+         type Forward 'e = Eff (!Log + ..'e)",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
+fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
+    let mut dependency = effect_artifact("dep", "forwarding");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Id".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Struct(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Identity".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::First".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::MissingSelect".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Identity".into(),
+                args: Vec::new(),
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::GenericUnknown".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: false,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Undecided),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Twice".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Identity".into(),
+                    args: vec![artifact_type(a::Type::Named {
+                        name: "dep@1.0.0::Identity".into(),
+                        args: vec![artifact_type(a::Type::Bound(0))],
+                    })],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Chain".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Id".into(),
+                    args: vec![artifact_type(a::Type::Bound(0))],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Second".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+                a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Chain".into(),
+                    args: vec![artifact_type(a::Type::Bound(1))],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::WithX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::MaybeX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Undecided,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::AbsentX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: artifact_type(a::Type::Undecided),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+    ];
+    if include_cycle {
+        dependency.header.types.extend([
+            a::DeclaredType {
+                name: "dep@1.0.0::Cycle".into(),
+                params: Vec::new(),
+                scheme: artifact_scheme(artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Cycle".into(),
+                    args: Vec::new(),
+                })),
+            },
+            a::DeclaredType {
+                name: "dep@1.0.0::BrokenSlot".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: a::Type::Struct(a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Bound(9),
+                    }),
+                },
+            },
+        ]);
+    }
+    dependency
+}
+
+fn case_rows_artifact() -> a::Artifact {
+    let mut dependency = forwarding_rows_artifact(false);
+    dependency.header.types.extend([
+        a::DeclaredType {
+            name: "dep@1.0.0::CaseAlias".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
+                labels: ["B", "A"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: artifact_type(a::Type::Nat),
+                            },
+                        )
+                    })
+                    .collect(),
+                rest: a::Rest::Closed,
+            }))),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::CaseTransitive".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::CaseAlias".into(),
+                args: Vec::new(),
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::AddB".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Cases,
+                lacks: vec!["B".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Sum(a::Row {
+                    labels: vec![(
+                        "B".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::SelectSecond".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+                a::Parameter {
+                    sense: a::Sense::Cases,
+                    lacks: vec!["B".into()],
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::AddB".into(),
+                    args: vec![artifact_type(a::Type::Bound(1))],
+                }),
+            },
+        },
+        // No parameters, despite the malformed semantic rest. The importer
+        // must absorb slot zero rather than assigning it to a local parameter.
+        a::DeclaredType {
+            name: "dep@1.0.0::BrokenBare".into(),
+            params: Vec::new(),
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Sum(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+    ]);
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("cases".into()),
+        from: artifact_type(a::Type::Named {
+            name: "dep@1.0.0::AddB".into(),
+            args: vec![artifact_type(a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            }))],
+        }),
+        to: artifact_type(a::Type::Nat),
+    });
+    dependency
+}
+
+#[test]
+fn imported_case_rows_are_normalized_and_bad_slots_do_not_escape() {
+    let dependency = case_rows_artifact();
+    let parsed = parse::parse(
+        lex(
+            "type Cases 'r = #A | ..'r\n\
+             type BadDirect = Cases dep::CaseAlias\n\
+             type BadTransitive = Cases dep::CaseTransitive\n\
+             type BadParameterized = Cases (dep::AddB (#C | #A))\n\
+             type BadSelected = Cases (dep::SelectSecond Nat (#C | #A))\n\
+             type CasesB 'r = #B | ..'r\n\
+             type Local 'r = { one: Cases 'r, two: CasesB dep::BrokenBare }\n\
+             type Good = Local (#B)\n\
+             effect UsesImportedCases = { run: dep::AddB (#C) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 4, "{:#?}", out.errors);
+    assert!(out.errors.iter().all(|error| matches!(
+        &error.kind,
+        ErrorKind::RepeatedRowField {
+            shape: Shape::Sum,
+            field,
+        } if field == "A"
+    )));
+}
+
+#[test]
+fn imported_forwarding_aliases_classify_local_recursion() {
+    let dependency = forwarding_rows_artifact(false);
+    let parsed = parse::parse(
+        lex(
+            "type ViaBound = dep::Identity ViaBound\n\
+             type ViaRow = dep::Id ViaRow\n\
+             type ViaSelection = dep::Second Nat ViaSelection\n\
+             type Endless = dep::WithX Endless\n\
+             type Optional = dep::MaybeX Optional\n\
+             type Absent = dep::AbsentX Absent\n\
+             type ValidExit = dep::WithX (dep::Twice { y: Nat })\n\
+             type ValidUnknown = dep::WithX (dep::GenericUnknown {})\n\
+             type ValidMissing = dep::MissingSelect\n\
+             type ValidSelection = dep::First Nat ValidSelection",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 6, "{:#?}", out.errors);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        [
+            "circular-type",
+            "circular-type",
+            "circular-type",
+            "endless-fields",
+            "endless-fields",
+            "circular-type",
+        ]
+    );
+}
+
+#[test]
+fn malformed_named_applications_of_unequal_arity_are_not_congruent() {
+    let mut dependency = effect_artifact("dep", "bad-arity");
+    dependency.header.types = vec![a::DeclaredType {
+        name: "dep@1.0.0::Box".into(),
+        params: vec![a::Parameter {
+            sense: a::Sense::Type,
+            lacks: Vec::new(),
+            relevant: true,
+        }],
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: artifact_struct(vec![(
+                "value".into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Bound(0),
+                },
+            )]),
+        },
+    }];
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::short".into(),
+        scheme: artifact_scheme(a::Type::Named {
+            name: "dep@1.0.0::Box".into(),
+            args: Vec::new(),
+        }),
+    });
+    let parsed = parse::parse(lex("let use : dep::Box Nat = dep::short", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(
+        inferred
+            .steps
+            .iter()
+            .all(|step| !matches!(step.rule, inference::Rule::Congruent)),
+        "{:#?}",
+        inferred.steps
+    );
+    assert!(
+        inferred
+            .steps
+            .iter()
+            .any(|step| matches!(step.rule, inference::Rule::Unfold)),
+        "{:#?}",
+        inferred.steps
+    );
+}
+
+#[test]
+fn malformed_nested_imported_applications_recover_during_effect_identity() {
+    let mut dependency = effect_artifact("dep", "bad-nested-arity");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Box".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Broken".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Box".into(),
+                args: Vec::new(),
+            }),
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Local = { op: dep::Broken -> () }\nlet value = 1n",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(out.program.effect_ids.values().any(|identity| {
+        matches!(identity, ruddy::types::EffectId::Structural { name, .. } if name == "Local")
+    }));
+}
+
+#[test]
+fn deep_acyclic_operation_effect_dependencies_use_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-operation-effect-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 512;
+
+            let mut source = String::new();
+            for index in 0..DEPTH - 1 {
+                source.push_str(&format!(
+                    "effect E{index} = {{ op: (() -> () + !E{}) -> () }}\n",
+                    index + 1
+                ));
+            }
+            source.push_str(&format!("effect E{} = {{ op: () -> () }}", DEPTH - 1));
+
+            let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build(&mut mint, parsed.stmts);
+            assert!(
+                out.errors
+                    .iter()
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                "{:#?}",
+                out.errors
+            );
+            assert_eq!(out.program.effect_ids.len(), DEPTH);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("operation effect dependencies are iterative");
+}
+
+#[test]
+fn deep_local_type_and_effect_identity_dependencies_use_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-local-effect-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+
+            let mut source = String::new();
+            for index in 0..DEPTH - 1 {
+                source.push_str(&format!("type E{index} = E{}\n", index + 1));
+            }
+            source.push_str(&format!(
+                "type E{} = () -> () + !Leaf\n\
+                 effect Probe = {{ inspect: E0 -> () }}\n\
+                 effect Leaf = {{ touch: () -> () }}",
+                DEPTH - 1
+            ));
+
+            let parsed = parse::parse(lex(&source, FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build(&mut mint, parsed.stmts);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            assert!(out.program.effect_ids.iter().any(|(symbol, identity)| {
+                mint.name(*symbol) == "Probe"
+                    && matches!(identity, ruddy::types::EffectId::Structural { interface, .. } if interface.contains("Leaf"))
+            }));
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("source type/effect identity dependencies are iterative");
+}
+
+#[test]
+fn imported_effect_identity_graph_is_stack_safe_and_absorbs_growing_types() {
+    std::thread::Builder::new()
+        .name("imported-effect-identity-graph".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 4_096;
+
+            let mut deep = a::Type::Nat;
+            for _ in 0..DEPTH {
+                deep = a::Type::Arrow(
+                    Box::new(a::Type::Nat),
+                    Box::new(deep),
+                    // No structural separator: malformed artifact effect keys
+                    // are recovery input, not a reason to panic.
+                    a::Row {
+                        labels: vec![(
+                            "legacy".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: artifact_unit(),
+                            },
+                        )],
+                        rest: a::Rest::Closed,
+                    },
+                );
+            }
+            let mut dependency = effect_artifact("dep", "identity-graph");
+            dependency.header.types = vec![
+                a::DeclaredType {
+                    name: "dep@1.0.0::Deep".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::Grow".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Named {
+                            name: "dep@1.0.0::Grow".into(),
+                            args: vec![a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "next".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Present,
+                                        ty: a::Type::Bound(0),
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            })],
+                        },
+                    },
+                },
+            ];
+
+            let parsed = parse::parse(
+                lex(
+                    "effect DeepProbe = { inspect: dep::Deep -> () }\n\
+                     effect GrowProbe = { inspect: dep::Grow Nat -> () }",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                out.errors
+                    .iter()
+                    .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+                "{:#?}",
+                out.errors
+            );
+            for name in ["DeepProbe", "GrowProbe"] {
+                assert!(
+                    out.program
+                        .effect_ids
+                        .keys()
+                        .any(|symbol| mint.name(*symbol) == name),
+                    "{name} retained no recovery identity"
+                );
+            }
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("imported effect identity graph building is iterative and total");
+}
+
+#[test]
+fn imported_recursive_instantiations_close_through_forwarding_aliases() {
+    let mut dependency = effect_artifact("dep", "forwarding-loop");
+    let parameter = || a::Parameter {
+        sense: a::Sense::Type,
+        lacks: Vec::new(),
+        relevant: true,
+    };
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Id".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Loop".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Loop".into(),
+                    args: vec![a::Type::Named {
+                        name: "dep@1.0.0::Id".into(),
+                        args: vec![a::Type::Bound(0)],
+                    }],
+                },
+            },
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Loop Nat -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("pending identity"),
+            })
+        })
+        .expect("Probe identity");
+    assert!(interface.len() < 500, "{interface}");
+}
+
+#[test]
+fn a_finite_imported_rotation_longer_than_256_states_remains_exact() {
+    const PARAMETERS: usize = 257;
+
+    let mut dependency = effect_artifact("dep", "long-rotation");
+    let parameters = (0..PARAMETERS)
+        .map(|_| a::Parameter {
+            sense: a::Sense::Type,
+            lacks: Vec::new(),
+            relevant: true,
+        })
+        .collect::<Vec<_>>();
+    let rotated = (1..PARAMETERS)
+        .chain(std::iter::once(0))
+        .map(|index| a::Type::Bound(index as u32))
+        .collect();
+    let rotate = a::DeclaredType {
+        name: "dep@1.0.0::Rotate".into(),
+        params: parameters,
+        scheme: a::Scheme {
+            count: PARAMETERS as u32,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Arrow(
+                Box::new(a::Type::Bound(0)),
+                Box::new(a::Type::Named {
+                    name: "dep@1.0.0::Rotate".into(),
+                    args: rotated,
+                }),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            ),
+        },
+    };
+    // Every argument root is a different state of one 257-node recursive SCC.
+    // Rotating those roots is not constructor growth: all states mutually
+    // retain each other. The final state's marker still has to remain semantic.
+    let ring = |prefix: &str, marker: a::Type| {
+        let prefix = prefix.to_string();
+        (0..PARAMETERS)
+            .map(move |index| {
+                let mut fields = vec![(
+                    "next".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: a::Type::Named {
+                            name: format!("dep@1.0.0::{prefix}{}", (index + 1) % PARAMETERS),
+                            args: Vec::new(),
+                        },
+                    },
+                )];
+                if index + 1 == PARAMETERS {
+                    fields.push((
+                        "marker".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: marker.clone(),
+                        },
+                    ));
+                }
+                a::DeclaredType {
+                    name: format!("dep@1.0.0::{prefix}{index}"),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(artifact_struct(fields)),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let alias = |name: &str, prefix: &str| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Named {
+            name: "dep@1.0.0::Rotate".into(),
+            args: (0..PARAMETERS)
+                .map(|index| a::Type::Named {
+                    name: format!("dep@1.0.0::{prefix}{index}"),
+                    args: Vec::new(),
+                })
+                .collect(),
+        }),
+    };
+    dependency.header.types = std::iter::once(rotate)
+        .chain(ring("StringRing", a::Type::String))
+        .chain(ring("BooleanRing", a::Type::Boolean))
+        .chain([
+            alias("Strings", "StringRing"),
+            alias("Booleans", "BooleanRing"),
+        ])
+        .collect();
+
+    let parsed = parse::parse(
+        lex(
+            "effect StringProbe = { inspect: dep::Strings -> () }\n\
+             effect BooleanProbe = { inspect: dep::Booleans -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_ne!(
+        interface("StringProbe"),
+        interface("BooleanProbe"),
+        "the differing 257th rotation state is semantic"
+    );
+}
+
+#[test]
+fn structurally_growing_imported_rotation_recovers_without_a_depth_cap() {
+    let mut dependency = effect_artifact("dep", "growing-rotation");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Grow".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Grow".into(),
+                    args: vec![
+                        a::Type::Bound(1),
+                        artifact_struct(vec![(
+                            "next".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: a::Type::Bound(0),
+                            },
+                        )]),
+                    ],
+                },
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Loop".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Arrow(
+                Box::new(a::Type::Nat),
+                Box::new(a::Type::Named {
+                    name: "dep@1.0.0::Loop".into(),
+                    args: Vec::new(),
+                }),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            )),
+        },
+        // A malformed changing arity is finite here and must not be mistaken
+        // for constructor growth merely because its active vectors differ.
+        a::DeclaredType {
+            name: "dep@1.0.0::Odd".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Named {
+                    name: "dep@1.0.0::Odd".into(),
+                    args: vec![a::Type::Bound(0), a::Type::Bound(0)],
+                },
+            },
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Grow String dep::Loop -> () }\n\
+             effect OddProbe = { inspect: dep::Odd Nat -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+            })
+        })
+        .expect("Probe has a recovery identity");
+    assert!(interface.contains(":?"), "{interface}");
+    assert!(interface.len() < 1_000, "{interface}");
+}
+
+#[test]
+fn sequential_imported_instantiations_do_not_exhaust_the_active_recursion_limit() {
+    const APPLICATIONS: usize = 300;
+
+    let mut dependency = effect_artifact("dep", "wide-instantiations");
+    let fields = (0..APPLICATIONS)
+        .map(|index| {
+            (
+                format!("slot{index}"),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Named {
+                        name: "dep@1.0.0::Box".into(),
+                        args: vec![artifact_struct(vec![(
+                            format!("marker{index}"),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: a::Type::Nat,
+                            },
+                        )])],
+                    },
+                },
+            )
+        })
+        .collect();
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Box".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Bound(0),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Wide".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_struct(fields)),
+        },
+    ];
+
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: dep::Wide -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let interface = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| {
+            (mint.name(*symbol) == "Probe").then(|| match identity {
+                ruddy::types::EffectId::Structural { interface, .. } => interface,
+                ruddy::types::EffectId::Pending(_) => panic!("effect identity was not finalized"),
+            })
+        })
+        .expect("Probe has a structural identity");
+    assert!(interface.contains("marker0"), "{interface}");
+    assert!(
+        interface.contains(&format!("marker{}", APPLICATIONS - 1)),
+        "late sequential applications must not recover as undecided: {interface}"
+    );
+}
+
+#[test]
+fn canonical_unknown_effect_interfaces_decode_as_graph_nodes() {
+    let dependency = effect_artifact("dep", "0#u;");
+    let parsed = parse::parse(lex("type Use = Nat", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.program.effect_ids.values().any(|identity| matches!(
+        identity,
+        ruddy::types::EffectId::Structural { interface, .. } if interface == "0#u;"
+    )));
+}
+
+#[test]
+fn malformed_interfaces_cannot_collide_with_encoded_ordinary_atoms() {
+    let raw = effect_artifact("raw", "x");
+    let ordinary = effect_artifact("ordinary", "0#18:opaque-interface:x;");
+    let round_trip = effect_artifact("round", "0#o1:x;");
+    let parsed = parse::parse(
+        lex(
+            "effect RawProbe = { op: (() -> () + raw::!IO) -> () }\n\
+             effect OrdinaryProbe = { op: (() -> () + ordinary::!IO) -> () }\n\
+             effect RoundProbe = { op: (() -> () + round::!IO) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, ordinary, round_trip]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_eq!(interface("RawProbe"), interface("RoundProbe"));
+    assert_ne!(interface("RawProbe"), interface("OrdinaryProbe"));
+}
+
+#[test]
+fn imported_effect_ids_are_normalized_before_alias_duplicate_checks() {
+    let raw = effect_artifact("raw", "x");
+    let encoded = effect_artifact("encoded", "0#o1:x;");
+    let parsed =
+        parse::parse(lex("effect Both = raw::!IO + encoded::!IO", FileID::GENERATED).tokens);
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[raw, encoded]);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        ["duplicate-case"]
+    );
+    let imported: Vec<_> = out
+        .program
+        .effect_ids
+        .values()
+        .filter_map(|identity| match identity {
+            ruddy::types::EffectId::Structural { name, interface } if name == "IO" => {
+                Some(interface.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imported, ["0#o1:x;", "0#o1:x;"]);
+}
+
+#[test]
+fn noncanonical_graph_encodings_are_opaque_without_identity_collisions() {
+    for noncanonical in [
+        "00#1:a;",                        // padded node number
+        "0#01:a;",                        // padded label length
+        "0#1:a;1#1:b;",                   // unreachable record
+        "0#1:r|1:b>0|1:a>0;",             // noncanonical edge order
+        "0#1:r|1:a>1|1:b>2;1#1:x;2#1:x;", // nonminimal duplicate states
+        "0#1:r|1:a>2|1:b>1;1#1:y;2#1:x;", // construction numbering
+        "0#1:a|1:x>00;",                  // padded backreference
+    ] {
+        let bad = effect_artifact("bad", noncanonical);
+        let opaque = effect_artifact(
+            "opaque",
+            &format!("0#o{}:{noncanonical};", noncanonical.len()),
+        );
+        let parsed =
+            parse::parse(lex("effect Both = bad::!IO + opaque::!IO", FileID::GENERATED).tokens);
+        assert!(
+            parsed.errors.is_empty(),
+            "{noncanonical}: {:#?}",
+            parsed.errors
+        );
+        let mut mint = dummy_mint();
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[bad, opaque]);
+        assert_eq!(
+            out.errors
+                .iter()
+                .map(|error| error.kind.code())
+                .collect::<Vec<_>>(),
+            ["duplicate-case"],
+            "{noncanonical} was accepted as a graph rather than opaque text"
+        );
+    }
+}
+
+#[test]
+fn malformed_effect_keys_cannot_collide_with_encoded_unknown_atoms() {
+    let mut dependency = effect_artifact("dep", "key-collisions");
+    let effectful = |key: &str| {
+        a::Type::Arrow(
+            Box::new(a::Type::Nat),
+            Box::new(a::Type::Nat),
+            a::Row {
+                labels: vec![(
+                    key.into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_unit(),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            },
+        )
+    };
+    dependency.header.types = [
+        ("Raw", "IO"),
+        ("Ordinary", "IO\u{1f}0#17:unknown-interface;"),
+        ("Round", "IO\u{1f}0#u;"),
+    ]
+    .into_iter()
+    .map(|(name, key)| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: artifact_scheme(effectful(key)),
+    })
+    .collect();
+    let parsed = parse::parse(
+        lex(
+            "effect RawProbe = { op: dep::Raw -> () }\n\
+             effect OrdinaryProbe = { op: dep::Ordinary -> () }\n\
+             effect RoundProbe = { op: dep::Round -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let interface = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == name).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface,
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_ne!(interface("RawProbe"), interface("RoundProbe"));
+    assert_eq!(interface("RoundProbe"), interface("OrdinaryProbe"));
+}
+
+#[test]
+fn forwarded_field_addition_respects_outer_absent_shadowing() {
+    let mut dependency = effect_artifact("dep", "shadow");
+    dependency.header.types = vec![a::DeclaredType {
+        name: "dep@1.0.0::Shadow".into(),
+        params: vec![a::Parameter {
+            sense: a::Sense::Fields,
+            lacks: Vec::new(),
+            relevant: true,
+        }],
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Struct(a::Row {
+                labels: vec![(
+                    "x".into(),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        ty: a::Type::Undecided,
+                    },
+                )],
+                rest: a::Rest::More(Box::new(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: a::Type::Nat,
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            }),
+        },
+    }];
+    let parsed = parse::parse(lex("type Loop = dep::Shadow Loop", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if error.kind.code() == "circular-type"
+        ),
+        "{:#?}",
+        out.errors
+    );
+}
+
+#[test]
+fn imported_field_rows_forward_outer_lacks_constraints() {
+    let dependency = forwarding_rows_artifact(false);
+    let parsed = parse::parse(
+        lex(
+            "type WithXY 'r = { x: Nat, y: Nat, ..'r }\n\
+             type Direct 'r = WithXY (dep::Id { ..'r })\n\
+             type Chained 'r = WithXY (dep::Chain { ..'r })\n\
+             type Parameterized 'r = WithXY (dep::Second Nat { ..'r })\n\
+             type BadDirect = Direct { y: String, x: String }\n\
+             type BadChained = Chained { y: String, x: String }\n\
+             type BadParameterized = Parameterized { y: String, x: String }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 3, "{:#?}", out.errors);
+    assert!(
+        out.errors.iter().all(|error| matches!(
+            &error.kind,
+            ErrorKind::RepeatedRowField {
+                shape: Shape::Struct,
+                field,
+            } if field == "y"
+        )),
+        "{:#?}",
+        out.errors
+    );
+}
+
+fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::Artifact {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = (0..depth)
+        .map(|index| {
+            let stem = if cycle { "Cycle" } else { "Link" };
+            let name = format!("dep@1.0.0::{stem}{index}");
+            let params = if cycle {
+                Vec::new()
+            } else {
+                vec![a::Parameter {
+                    sense: a::Sense::Fields,
+                    lacks: vec!["z".into()],
+                    relevant: true,
+                }]
+            };
+            let body = if !cycle && index + 1 == depth {
+                a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "z".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })
+            } else {
+                let next = if index + 1 == depth { 0 } else { index + 1 };
+                a::Type::Named {
+                    name: format!("dep@1.0.0::{stem}{next}"),
+                    args: if cycle {
+                        Vec::new()
+                    } else {
+                        vec![artifact_type(a::Type::Bound(0))]
+                    },
+                }
+            };
+            a::DeclaredType {
+                name,
+                params,
+                scheme: a::Scheme {
+                    count: u32::from(!cycle),
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: artifact_type(body),
+                },
+            }
+        })
+        .collect();
+    dependency
+}
+
+#[test]
+fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
+    std::thread::Builder::new()
+        .name("deep-imported-more-row".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let mut row = a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(DEPTH as u32 + 1),
+            };
+            for index in (0..DEPTH).rev() {
+                row = a::Row {
+                    labels: vec![(
+                        format!("field{index:05}"),
+                        a::RowField {
+                            presence: if index == 0 {
+                                a::Presence::Absent
+                            } else {
+                                a::Presence::Present
+                            },
+                            ty: a::Type::Nat,
+                        },
+                    )],
+                    rest: a::Rest::More(Box::new(row)),
+                };
+            }
+            let mut dependency = effect_artifact("dep", "deep-more");
+            dependency.header.types = vec![a::DeclaredType {
+                name: "dep@1.0.0::Deep".into(),
+                params: Vec::new(),
+                scheme: artifact_scheme(a::Type::Struct(row)),
+            }];
+            let parsed = parse::parse(lex("type Use = dep::Deep", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let out =
+                build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            let imported = out
+                .program
+                .external_types
+                .values()
+                .find(|declaration| matches!(&**declaration.scheme.body(), Ty::Struct(_)))
+                .expect("the imported deep row");
+            let Ty::Struct(row) = &**imported.scheme.body() else {
+                unreachable!()
+            };
+            let Rest::More(row) = &row.rest else {
+                panic!("the normalized composition marker was lost")
+            };
+            assert_eq!(row.labels.len(), DEPTH);
+            assert_eq!(row.labels.first().unwrap().0, "field00000");
+            assert_eq!(row.labels.last().unwrap().0, "field29999");
+            assert!(matches!(
+                row.labels["field00000"].presence,
+                Presence::Absent
+            ));
+            assert!(matches!(row.rest, Rest::Undecided));
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep Rest::More import and clamping are stack safe and linear");
+}
+
+#[test]
+fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-imported-semantics".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            const TYPE_DEPTH: usize = 30_000;
+            const NAMED_DEPTH: usize = 30_000;
+
+            let mut named = a::Type::Nat;
+            for _ in 0..NAMED_DEPTH {
+                named = a::Type::Named {
+                    name: "dep@1.0.0::Phantom".into(),
+                    args: vec![named],
+                };
+            }
+            let mut payload = a::Type::Nat;
+            for _ in 0..TYPE_DEPTH {
+                payload = a::Type::Arrow(
+                    Box::new(a::Type::Nat),
+                    Box::new(payload),
+                    a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::Closed,
+                    },
+                );
+            }
+            let mut tail = a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            };
+            for _ in 0..TYPE_DEPTH {
+                tail = a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::More(Box::new(tail)),
+                };
+            }
+            let body = a::Type::Arrow(
+                Box::new(named),
+                Box::new(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "deep".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: payload,
+                        },
+                    )],
+                    rest: a::Rest::Closed,
+                })),
+                tail,
+            );
+
+            let mut formula = a::Formula::Bound(0);
+            for depth in 0..DEPTH {
+                formula = match depth % 3 {
+                    0 => a::Formula::Not(Box::new(formula)),
+                    1 => a::Formula::And(Box::new(formula), Box::new(a::Formula::True)),
+                    _ => a::Formula::Or(Box::new(a::Formula::False), Box::new(formula)),
+                };
+            }
+
+            let mut malformed_formula = a::Formula::Var(999);
+            for _ in 0..DEPTH {
+                malformed_formula = a::Formula::Not(Box::new(malformed_formula));
+            }
+
+            let mut dependency = effect_artifact("dep", "deep-semantics");
+            dependency.header.types.push(a::DeclaredType {
+                name: "dep@1.0.0::Deep".into(),
+                params: Vec::new(),
+                scheme: artifact_scheme(a::Type::Nat),
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::deep_type".into(),
+                scheme: artifact_scheme(body),
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::deep_formula".into(),
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 1,
+                    formula,
+                    body: a::Type::Nat,
+                },
+            });
+            dependency.header.values.push(a::Value {
+                name: "dep@1.0.0::malformed_formula".into(),
+                scheme: a::Scheme {
+                    count: 0,
+                    presences: 0,
+                    formula: malformed_formula,
+                    body: a::Type::Nat,
+                },
+            });
+
+            // Importing alone only clamps the tree. Naming the value also
+            // instantiates, substitutes, reads, and solves the deep formula.
+            let parsed = parse::parse(
+                lex(
+                    "let answer = dep::deep_formula\n\
+                     let typed = dep::deep_type\n\
+                     let ignore = fn value => 0n\n\
+                     let guarded = fn choice => match choice with\n\
+                     | {left, ..} => ignore dep::deep_type\n\
+                     | {right, ..} => 0n end\n\
+                     let bad : Nat = dep::deep_type",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let dependencies = vec![dependency];
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &dependencies);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            assert!(out.program.external_types.len() >= 2);
+            assert_eq!(out.program.external_schemes.len(), 3);
+            assert_eq!(
+                out.program
+                    .external_schemes
+                    .values()
+                    .filter(|scheme| scheme.formula().is_true())
+                    .count(),
+                2
+            );
+
+            // Naming both values semantically instantiates the deep formula
+            // and the deep arrow/name/field-payload type on this small stack.
+            let mut program = out.program;
+            let inferred = inference::infer(&mint, &mut program);
+            assert_eq!(inferred.errors.len(), 1);
+            assert_eq!(inferred.errors[0].kind.code(), "type-mismatch");
+            let guarded_step = inferred
+                .steps
+                .iter()
+                .any(|step| matches!(step.effect, inference::Effect::Guarded { .. }));
+            assert!(guarded_step);
+
+            // Build both readings of the Types stage. Node meanings use
+            // semantic Display and the raw dump deliberately does not use the
+            // recursively derived Debug implementation.
+            let dependency_declarations = IndexMap::new();
+            let symbols = std::collections::HashMap::new();
+            let cx = ruddy_debug::stage::Cx {
+                files: &[],
+                bundle: None,
+                program: Some(&program),
+                inference: Some(&inferred),
+                patterns: None,
+                lir: None,
+                artifact: None,
+                linked: None,
+                dependency_declarations: &dependency_declarations,
+                dependency_aliases: &[],
+                dependencies: &[],
+                dependency_interfaces: &[],
+                dependencies_valid: true,
+                artifact_panicked: false,
+                link_error: None,
+                link_panicked: false,
+                mint: Some(&mint),
+                symbols: &symbols,
+                micros: ruddy_debug::stage::Phases::default(),
+                errored: true,
+            };
+            let spec = ruddy_debug::stage::REGISTRY
+                .iter()
+                .find(|spec| spec.id == "types")
+                .expect("the Types stage spec");
+            let stage = ruddy_debug::stage::types::build(spec, &cx);
+            assert!(stage.nodes.iter().any(|node| node.text.contains("Phantom")));
+            assert!(stage.debug.contains("externs:"));
+            assert!(stage.debug.contains("Phantom"));
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep semantic imports and clamping do not recurse");
+}
+
+#[test]
+fn malformed_imported_scheme_bounds_recover_for_types_and_values() {
+    let malformed = a::Scheme {
+        count: 1,
+        presences: 2,
+        formula: a::Formula::And(Box::new(a::Formula::Bound(9)), Box::new(a::Formula::True)),
+        body: a::Type::Struct(a::Row {
+            labels: vec![(
+                "x".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(9),
+                    ty: a::Type::Bound(0),
+                },
+            )],
+            rest: a::Rest::Bound(9),
+        }),
+    };
+    let mut dependency = effect_artifact("dep", "bad-bounds");
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::bad".into(),
+        scheme: malformed.clone(),
+    });
+    let valid_body = a::Type::Struct(a::Row {
+        labels: vec![(
+            "x".into(),
+            a::RowField {
+                presence: a::Presence::Bound(0),
+                ty: a::Type::Bound(1),
+            },
+        )],
+        rest: a::Rest::Bound(1),
+    });
+    for (name, formula) in [
+        ("not", a::Formula::Not(Box::new(a::Formula::Bound(9)))),
+        (
+            "and",
+            a::Formula::And(Box::new(a::Formula::Bound(0)), Box::new(a::Formula::True)),
+        ),
+        (
+            "or",
+            a::Formula::Or(Box::new(a::Formula::True), Box::new(a::Formula::Bound(9))),
+        ),
+        (
+            "iff",
+            a::Formula::Iff(
+                Box::new(a::Formula::Bound(0)),
+                Box::new(a::Formula::Bound(0)),
+            ),
+        ),
+        (
+            "xor",
+            a::Formula::Xor(
+                Box::new(a::Formula::Bound(0)),
+                Box::new(a::Formula::Bound(9)),
+            ),
+        ),
+    ] {
+        dependency.header.values.push(a::Value {
+            name: format!("dep@1.0.0::{name}"),
+            scheme: a::Scheme {
+                count: 2,
+                presences: 1,
+                formula,
+                body: valid_body.clone(),
+            },
+        });
+    }
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::presence_as_row".into(),
+        scheme: a::Scheme {
+            count: 2,
+            presences: 1,
+            formula: a::Formula::True,
+            body: a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(0),
+            }),
+        },
+    });
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Broken".into(),
+        params: Vec::new(),
+        scheme: malformed,
+    });
+    let parsed = parse::parse(
+        lex(
+            "type Local = dep::Broken\nlet recovered = dep::bad",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let value = out
+        .program
+        .external_schemes
+        .values()
+        .find(|scheme| scheme.count() == 1)
+        .expect("the malformed value scheme was imported");
+    assert_eq!(value.presences(), 1);
+    assert!(value.formula().is_true());
+}
+
+#[test]
+fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
+    let row = |presence, rest, ty| {
+        a::Type::Struct(a::Row {
+            labels: vec![("x".into(), a::RowField { presence, ty })],
+            rest,
+        })
+    };
+    let mut dependency = effect_artifact("dep", "foreign-locals");
+    for (name, body) in [
+        ("TypeVar", a::Type::Var(999)),
+        (
+            "TypeRigid",
+            a::Type::Rigid {
+                id: 999,
+                name: "foreign".into(),
+            },
+        ),
+        ("TypeUnknown", a::Type::Undecided),
+        (
+            "RestVar",
+            row(a::Presence::Present, a::Rest::Var(999), a::Type::Nat),
+        ),
+        (
+            "RestRigid",
+            row(
+                a::Presence::Present,
+                a::Rest::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+                a::Type::Nat,
+            ),
+        ),
+        (
+            "PresenceVar",
+            row(a::Presence::Var(999), a::Rest::Closed, a::Type::Nat),
+        ),
+    ] {
+        dependency.header.types.push(a::DeclaredType {
+            name: format!("dep@1.0.0::{name}"),
+            params: Vec::new(),
+            scheme: artifact_scheme(body),
+        });
+    }
+    for (name, formula) in [
+        ("formula_var", a::Formula::Var(999)),
+        (
+            "nested_formula_var",
+            a::Formula::And(
+                Box::new(a::Formula::True),
+                Box::new(a::Formula::Not(Box::new(a::Formula::Var(999)))),
+            ),
+        ),
+    ] {
+        dependency.header.values.push(a::Value {
+            name: format!("dep@1.0.0::{name}"),
+            scheme: a::Scheme {
+                count: 0,
+                presences: 0,
+                formula,
+                body: a::Type::Nat,
+            },
+        });
+    }
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("foreign".into()),
+        from: a::Type::Arrow(
+            Box::new(row(
+                a::Presence::Var(999),
+                a::Rest::Var(999),
+                a::Type::Var(999),
+            )),
+            Box::new(row(
+                a::Presence::Undecided,
+                a::Rest::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+                a::Type::Rigid {
+                    id: 999,
+                    name: "foreign".into(),
+                },
+            )),
+            a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Var(999),
+            },
+        ),
+        to: a::Type::Rigid {
+            id: 999,
+            name: "foreign".into(),
+        },
+    });
+
+    let parsed = parse::parse(
+        lex(
+            "type A = dep::TypeVar\n\
+             type B = dep::TypeRigid\n\
+             type C = dep::RestVar\n\
+             type D = dep::RestRigid\n\
+             type E = dep::PresenceVar\n\
+             let a = dep::formula_var\n\
+             let b = dep::nested_formula_var\n\
+             let operation = dep::!IO.foreign (fn x => x)",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(
+        out.program
+            .external_schemes
+            .values()
+            .all(|scheme| scheme.formula().is_true())
+    );
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(matches!(
+        inferred.errors.as_slice(),
+        [error] if matches!(error.kind, inference::ErrorKind::Unhandled { .. })
+    ));
+}
+
+#[test]
+fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
+    let effect = |name: &str| {
+        (
+            format!("{name}\u{1f}interface"),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )
+    };
+    let plain = || {
+        (
+            "plain".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )
+    };
+    let arrow = |labels, rest| {
+        a::Type::Arrow(
+            Box::new(a::Type::Nat),
+            Box::new(a::Type::Nat),
+            a::Row { labels, rest },
+        )
+    };
+    let mut dependency = effect_artifact("dep", "effect-more-equality");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Effectful".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Effects,
+                lacks: vec!["A\u{1f}interface".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: arrow(vec![effect("A"), plain()], a::Rest::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Composed".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Effectful".into(),
+                args: vec![a::Type::Sum(a::Row {
+                    labels: vec![effect("B")],
+                    rest: a::Rest::Closed,
+                })],
+            }),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Flat".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(arrow(
+                vec![effect("A"), plain(), effect("B")],
+                a::Rest::Closed,
+            )),
+        },
+    ];
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::composed".into(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Composed".into(),
+                args: Vec::new(),
+            }),
+        },
+        a::Value {
+            name: "dep@1.0.0::flat".into(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Flat".into(),
+                args: Vec::new(),
+            }),
+        },
+    ]);
+    let parsed = parse::parse(
+        lex(
+            "let forward : dep::Flat = dep::composed\n\
+             let reverse : dep::Composed = dep::flat",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
+#[test]
+fn deep_equal_imported_types_unify_on_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-equal-imported-solve".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let deep = |hidden, bottom| {
+                let mut named = bottom;
+                let mut payload = a::Type::Nat;
+                let mut effects = a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                };
+                for index in 0..DEPTH {
+                    named = a::Type::Named {
+                        name: "dep@1.0.0::Wrap".into(),
+                        args: vec![named],
+                    };
+                    payload = a::Type::Struct(a::Row {
+                        labels: vec![(
+                            format!("field{index}"),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: payload,
+                            },
+                        )],
+                        rest: a::Rest::Closed,
+                    });
+                    effects = a::Row {
+                        labels: Vec::new(),
+                        rest: a::Rest::More(Box::new(effects)),
+                    };
+                }
+                let mut ty = a::Type::Arrow(Box::new(named), Box::new(payload), effects);
+                for _ in 1..DEPTH {
+                    ty = a::Type::Arrow(
+                        Box::new(a::Type::Nat),
+                        Box::new(ty),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    );
+                }
+                a::Type::Struct(a::Row {
+                    labels: vec![
+                        (
+                            "value".into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty,
+                            },
+                        ),
+                        (
+                            "hidden".into(),
+                            a::RowField {
+                                presence: a::Presence::Absent,
+                                ty: hidden,
+                            },
+                        ),
+                    ],
+                    rest: a::Rest::Closed,
+                })
+            };
+
+            let mut dependency = effect_artifact("dep", "deep-equal");
+            dependency.header.types = vec![
+                a::DeclaredType {
+                    name: "dep@1.0.0::Wrap".into(),
+                    params: vec![a::Parameter {
+                        sense: a::Sense::Type,
+                        lacks: Vec::new(),
+                        relevant: true,
+                    }],
+                    scheme: a::Scheme {
+                        count: 1,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Bound(0),
+                    },
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::A".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::Nat, a::Type::Nat)),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::B".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::String, a::Type::Nat)),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::C".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::Nat, a::Type::String)),
+                },
+            ];
+            dependency.header.values.extend([
+                a::Value {
+                    name: "dep@1.0.0::value".into(),
+                    scheme: artifact_scheme(a::Type::Named {
+                        name: "dep@1.0.0::B".into(),
+                        args: Vec::new(),
+                    }),
+                },
+                a::Value {
+                    name: "dep@1.0.0::bad".into(),
+                    scheme: artifact_scheme(a::Type::Named {
+                        name: "dep@1.0.0::C".into(),
+                        args: Vec::new(),
+                    }),
+                },
+                a::Value {
+                    name: "dep@1.0.0::accept".into(),
+                    scheme: artifact_scheme(a::Type::Arrow(
+                        Box::new(a::Type::Named {
+                            name: "dep@1.0.0::A".into(),
+                            args: Vec::new(),
+                        }),
+                        Box::new(a::Type::Nat),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    )),
+                },
+                // Grow the table before the 30,000 nested `Wrap`s disagree.
+                // Per-depth snapshots would retain DEPTH × 5,000 slots; the
+                // single outer transaction remains O(DEPTH + variables).
+                a::Value {
+                    name: "dep@1.0.0::padding".into(),
+                    scheme: a::Scheme {
+                        count: 5_000,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Nat,
+                    },
+                },
+            ]);
+            let parsed = parse::parse(
+                lex(
+                    "let padding = dep::padding\n\
+                     let imported = dep::accept dep::value\n\
+                     let mismatch = dep::accept dep::bad",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let mut out =
+                build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            let inferred = inference::infer(&mint, &mut out.program);
+            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            assert!(matches!(
+                inferred.errors[0].kind,
+                inference::ErrorKind::Mismatch { .. }
+            ));
+            assert!(
+                inferred
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.rule, inference::Rule::Arrow)),
+                "the deep bodies were decomposed"
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("successful deep Arrow/Named/Row unification is iterative");
+}
+
+#[test]
+fn deep_alias_reentry_shares_one_congruence_transaction() {
+    std::thread::Builder::new()
+        .name("deep-alias-congruence-transaction".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let named = |name: String| a::Type::Named {
+                name,
+                args: Vec::new(),
+            };
+            let wrapped = |name: String| a::Type::Named {
+                name: "dep@1.0.0::Wrap".into(),
+                args: vec![named(name)],
+            };
+            let mut dependency = effect_artifact("dep", "deep-alias-transaction");
+            dependency.header.types.push(a::DeclaredType {
+                name: "dep@1.0.0::Wrap".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: a::Type::Bound(0),
+                },
+            });
+            for side in ["X", "Y"] {
+                for index in 0..DEPTH {
+                    let body = match index + 1 == DEPTH {
+                        true if side == "X" => a::Type::Nat,
+                        true => a::Type::String,
+                        false => wrapped(format!("dep@1.0.0::{side}{}", index + 1)),
+                    };
+                    dependency.header.types.push(a::DeclaredType {
+                        name: format!("dep@1.0.0::{side}{index}"),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(body),
+                    });
+                }
+            }
+            dependency.header.values.extend([
+                a::Value {
+                    name: "dep@1.0.0::value".into(),
+                    scheme: artifact_scheme(named("dep@1.0.0::Y0".into())),
+                },
+                a::Value {
+                    name: "dep@1.0.0::accept".into(),
+                    scheme: artifact_scheme(a::Type::Arrow(
+                        Box::new(named("dep@1.0.0::X0".into())),
+                        Box::new(a::Type::Nat),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    )),
+                },
+                a::Value {
+                    name: "dep@1.0.0::padding".into(),
+                    scheme: a::Scheme {
+                        count: 5_000,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Nat,
+                    },
+                },
+            ]);
+            let parsed = parse::parse(
+                lex(
+                    "let padding = dep::padding\nlet mismatch = dep::accept dep::value",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            let inferred = inference::infer(&mint, &mut out.program);
+            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            assert!(matches!(
+                inferred.errors[0].kind,
+                inference::ErrorKind::Mismatch { .. }
+            ));
+            assert!(
+                inferred
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.rule, inference::Rule::Unfold))
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("alias unfolding shares the explicit congruence transaction");
+}
+
+#[test]
+fn recursive_imported_alias_reentry_compares_malformed_arities() {
+    let recursive = |name: &str, extra: bool| {
+        let mut args = vec![a::Type::Bound(0)];
+        if extra {
+            args.push(a::Type::Nat);
+        }
+        a::Type::Struct(a::Row {
+            labels: vec![(
+                "next".into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Named {
+                        name: name.into(),
+                        args,
+                    },
+                },
+            )],
+            rest: a::Rest::Closed,
+        })
+    };
+    let parameter = || a::Parameter {
+        sense: a::Sense::Type,
+        lacks: Vec::new(),
+        relevant: false,
+    };
+    let mut dependency = effect_artifact("dep", "malformed-recursive-arity");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::A".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: recursive("dep@1.0.0::A", true),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::B".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: recursive("dep@1.0.0::B", false),
+            },
+        },
+    ];
+    let applied = |name: &str| a::Type::Named {
+        name: name.into(),
+        args: vec![a::Type::String],
+    };
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::value".into(),
+            scheme: artifact_scheme(applied("dep@1.0.0::A")),
+        },
+        a::Value {
+            name: "dep@1.0.0::accept".into(),
+            scheme: artifact_scheme(a::Type::Arrow(
+                Box::new(applied("dep@1.0.0::B")),
+                Box::new(a::Type::Nat),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            )),
+        },
+    ]);
+    let parsed =
+        parse::parse(lex("let compared = dep::accept dep::value", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(
+        inferred
+            .steps
+            .iter()
+            .any(|step| matches!(step.rule, inference::Rule::Assume))
+    );
+}
+
+#[test]
+fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-unequal-imported-rows".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            for (actual_label, actual_presence, extra_absent, expected_errors) in [
+                ("other", a::Presence::Present, false, 2),
+                ("bottom", a::Presence::Absent, false, 1),
+                ("bottom", a::Presence::Present, true, 0),
+            ] {
+                let nested = |label: &str, presence, extra_absent| {
+                    let mut labels = vec![(
+                        label.into(),
+                        a::RowField {
+                            presence,
+                            ty: a::Type::Nat,
+                        },
+                    )];
+                    if extra_absent {
+                        labels.push((
+                            "explicitly-absent".into(),
+                            a::RowField {
+                                presence: a::Presence::Absent,
+                                ty: a::Type::String,
+                            },
+                        ));
+                    }
+                    let mut ty = a::Type::Struct(a::Row {
+                        labels,
+                        rest: a::Rest::Closed,
+                    });
+                    for _ in 0..DEPTH {
+                        ty = a::Type::Struct(a::Row {
+                            labels: vec![(
+                                "payload".into(),
+                                a::RowField {
+                                    presence: a::Presence::Present,
+                                    ty,
+                                },
+                            )],
+                            rest: a::Rest::Closed,
+                        });
+                    }
+                    ty
+                };
+
+                let mut dependency = effect_artifact("dep", "deep-unequal-rows");
+                dependency.header.types = vec![
+                    a::DeclaredType {
+                        name: "dep@1.0.0::Expected".into(),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(nested("bottom", a::Presence::Present, false)),
+                    },
+                    a::DeclaredType {
+                        name: "dep@1.0.0::Actual".into(),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(nested(
+                            actual_label,
+                            actual_presence,
+                            extra_absent,
+                        )),
+                    },
+                ];
+                dependency.header.values.extend([
+                    a::Value {
+                        name: "dep@1.0.0::bad".into(),
+                        scheme: artifact_scheme(a::Type::Named {
+                            name: "dep@1.0.0::Actual".into(),
+                            args: Vec::new(),
+                        }),
+                    },
+                    a::Value {
+                        name: "dep@1.0.0::accept".into(),
+                        scheme: artifact_scheme(a::Type::Arrow(
+                            Box::new(a::Type::Named {
+                                name: "dep@1.0.0::Expected".into(),
+                                args: Vec::new(),
+                            }),
+                            Box::new(a::Type::Nat),
+                            a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Closed,
+                            },
+                        )),
+                    },
+                ]);
+                let parsed = parse::parse(
+                    lex("let mismatch = dep::accept dep::bad", FileID::GENERATED).tokens,
+                );
+                let mut mint = dummy_mint();
+                let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+                assert!(out.errors.is_empty(), "{:#?}", out.errors);
+                let inferred = inference::infer(&mint, &mut out.program);
+                let messages: Vec<String> = inferred
+                    .errors
+                    .iter()
+                    .map(|error| error.kind.to_string())
+                    .collect();
+                assert_eq!(messages.len(), expected_errors, "{messages:#?}");
+                assert!(
+                    messages.iter().all(|message| message.contains("bottom"))
+                        && (actual_label != "other"
+                            || messages.iter().all(|message| message.contains("other"))),
+                    "direction was lost: {messages:#?}"
+                );
+                assert!(
+                    inferred
+                        .steps
+                        .iter()
+                        .any(|step| matches!(step.rule, inference::Rule::Struct)),
+                    "the deep rows did not use the struct decomposition path"
+                );
+            }
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep unequal row payloads use one explicit continuation stack");
+}
+
+#[test]
+fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
+    std::thread::Builder::new()
+        .name("deep-imported-field-summaries".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 512;
+
+            let dependency = deep_field_summary_artifact(DEPTH, false);
+            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
+
+            let dependency = deep_field_summary_artifact(DEPTH, false);
+            let parsed = parse::parse(
+                lex(
+                    "type WithZ 'r = { z: Nat, ..'r }\n\
+                     type Bad = WithZ (dep::Link0 {})",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                used.errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ErrorKind::RepeatedRowField {
+                        shape: Shape::Struct,
+                        field,
+                    } if field == "z"
+                )),
+                "{:#?}",
+                used.errors
+            );
+
+            let dependency = deep_field_summary_artifact(DEPTH, true);
+            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
+
+            let dependency = deep_field_summary_artifact(DEPTH, true);
+            let parsed = parse::parse(
+                lex(
+                    "type WithX 'r = { x: Nat, ..'r }\n\
+                     type Safe = WithX dep::Cycle0",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                used.errors.iter().any(|error| matches!(
+                    error.kind,
+                    ErrorKind::NotARow {
+                        sense: Sense::Fields
+                    }
+                )),
+                "{:#?}",
+                used.errors
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep imported field summaries terminate without overflowing");
+}
+
+#[test]
+fn deep_used_imported_forwarding_is_stack_safe_for_recursion_classification() {
+    std::thread::Builder::new()
+        .name("deep-used-imported-forwarding".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let dependency = deep_field_summary_artifact(2_048, false);
+            let parsed = parse::parse(lex("type Used = dep::Link0 {}", FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("a deep used forwarding chain is classified without overflowing");
+}
+
+#[test]
+fn malformed_imported_alias_cycles_are_absorbed_without_recursing() {
+    std::thread::Builder::new()
+        .name("imported-field-cycle".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let dependency = forwarding_rows_artifact(true);
+            let parsed = parse::parse(
+                lex(
+                    "type WithX 'r = { x: Nat, ..'r }\n\
+                     type SafeCycle = WithX (dep::Id dep::Cycle)\n\
+                     type SafeBrokenSlot = WithX (dep::BrokenSlot {})",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                matches!(
+                    out.errors.as_slice(),
+                    [error]
+                        if matches!(
+                            error.kind,
+                            ErrorKind::NotARow {
+                                sense: Sense::Fields
+                            }
+                        )
+                ),
+                "{:#?}",
+                out.errors
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("an imported alias cycle terminates without crashing");
+}
+
+#[test]
+fn imported_struct_aliases_are_valid_field_row_arguments() {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Record".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_struct(vec![(
+                "y".into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: artifact_type(a::Type::Nat),
+                },
+            )])),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Fields".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: a::Type::Struct(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::IdentityRow".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::ForwardRow".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::IdentityRow".into(),
+                    args: vec![artifact_type(a::Type::Bound(0))],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Cases".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            }))),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::MissingTail".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Bound(9),
+            }))),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Nat".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Nat)),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::More".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Struct(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::More(Box::new(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Closed,
+                })),
+            }))),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Cycle".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Cycle".into(),
+                args: Vec::new(),
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Unknown".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Undecided)),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Pass".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Fields".into(),
+                    args: vec![artifact_type(a::Type::Bound(0))],
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Box".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_struct(vec![(
+                    "value".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_type(a::Type::Bound(0)),
+                    },
+                )]),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Alias".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Box".into(),
+                args: vec![artifact_struct(vec![(
+                    "x".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_type(a::Type::Nat),
+                    },
+                )])],
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Phantom".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: false,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_struct(vec![(
+                    "phantom".into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_type(a::Type::Nat),
+                    },
+                )]),
+            },
+        },
+    ];
+    let parsed = parse::parse(
+        lex(
+            "type WithX 'r = { x: Nat, ..'r }\n\
+             type A = WithX dep::Record\n\
+             type B = WithX (dep::Box Nat)\n\
+             type Payload = WithX dep::Alias\n\
+             type Phantom = WithX (dep::Phantom { x: Nat })\n\
+             type Rows = WithX (dep::Pass { y: Nat })\n\
+             type Direct = WithX (dep::IdentityRow { y: Nat })\n\
+             type Local = { y: Nat }\n\
+             type Forward = WithX (dep::ForwardRow Local)\n\
+             type Unknown = WithX dep::Unknown\n\
+             type MissingTail = WithX dep::MissingTail\n\
+             type SumCases 'r = #A | ..'r\n\
+             type ImportedCases = SumCases dep::Cases",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    for argument in ["dep::Cases", "dep::Cycle", "dep::Nat"] {
+        let parsed = parse::parse(
+            lex(
+                &format!("type WithX 'r = {{ x: Nat, ..'r }}\ntype Bad = WithX {argument}"),
+                FileID::GENERATED,
+            )
+            .tokens,
+        );
+        let mut mint = dummy_mint();
+        let out =
+            build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error] if matches!(error.kind, ErrorKind::NotARow { sense: Sense::Fields })
+            ),
+            "{argument}: {:#?}",
+            out.errors
+        );
+    }
+
+    let parsed = parse::parse(
+        lex(
+            "type WithX 'r = { x: Nat, ..'r }\n\
+             type Bad = WithX (dep::Pass { x: Nat })\n\
+             type AlsoBad = WithX dep::More",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [first, second]
+                if [first, second].iter().all(|error| matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Struct, field } if field == "x"))
+        ),
+        "{:#?}",
+        out.errors
+    );
+
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = vec![a::DeclaredType {
+        name: "dep@1.0.0::Record".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(artifact_struct(vec![(
+            "x".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_type(a::Type::Nat),
+            },
+        )])),
+    }];
+    let parsed = parse::parse(
+        lex(
+            "type WithX 'r = { x: Nat, ..'r }\ntype Bad = WithX dep::Record",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error] if matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Struct, field } if field == "x")
+        ),
+        "{:#?}",
+        out.errors
+    );
 }

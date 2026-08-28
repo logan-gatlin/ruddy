@@ -191,6 +191,12 @@ fn the_answer_is_what_bounds_a_projection() {
     let keep: Vec<Atom> = (0..10).map(Atom::Var).collect();
     assert!(sat::project(&spare, &keep).is_true());
 
+    // A caller's atom list is a set semantically. Repeats must neither inflate
+    // cubes nor make the budget fallback mistake a complete projection for one
+    // that eliminated something.
+    let repeated: Vec<Atom> = keep.iter().copied().chain(keep.iter().copied()).collect();
+    assert_eq!(sat::project(&parity, &repeated), parity);
+
     // And eliminating enough of it leaves an answer that fits, which is
     // answered rather than given up on: a parity says nothing about any two of
     // its presences.

@@ -428,8 +428,9 @@ pub fn stands_for(mint: &Mint, param: &Param) -> String {
     // cannot use.
     let name = format!("'{}", mint.name(param.symbol));
     let lacks = param.kind.lacks();
-    let (opener, shape) = match param.kind.cases() {
+    let (opener, shape) = match param.kind.row() {
         Some((shape @ Shape::Effect, _)) => (format!("..{name} (effects)"), shape),
+        Some((shape @ Shape::Struct, _)) => (format!("..{name} (struct)"), shape),
         Some((shape, _)) => (format!("..{name} (sum)"), shape),
         None if lacks.is_empty() => return name,
         None => (format!("..{name} (struct)"), Shape::Struct),

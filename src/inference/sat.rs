@@ -144,11 +144,12 @@ pub fn model(formula: &Formula) -> Option<HashMap<Atom, bool>> {
 pub fn project(formula: &Formula, keep: &[Atom]) -> Formula {
     let mut named = Vec::new();
     formula.atoms(&mut named);
-    let kept: Vec<Atom> = keep
-        .iter()
-        .copied()
-        .filter(|atom| named.contains(atom))
-        .collect();
+    let mut kept: Vec<Atom> = Vec::new();
+    for atom in keep.iter().copied().filter(|atom| named.contains(atom)) {
+        if !kept.contains(&atom) {
+            kept.push(atom);
+        }
+    }
     let Some(cover) = eliminate(formula, &kept) else {
         // More products than [`CUBES`] allows, so what comes back errs the one
         // way it may: `true` says less about the kept atoms than the truth
@@ -186,7 +187,12 @@ fn eliminate(formula: &Formula, kept: &[Atom]) -> Option<Vec<Cube>> {
         justify(formula, true, &|atom| model[&atom], &mut needed);
         let mut cube: Cube = vec![None; kept.len()];
         for (atom, there) in needed {
+            // Justification may visit one atom through several agreeing paths.
+            // Collapse those visits into the one literal a cube can carry, and
+            // discard eliminated atoms outright rather than letting either
+            // affect the projected cover.
             if let Some(at) = kept.iter().position(|known| *known == atom) {
+                debug_assert!(cube[at].is_none_or(|known| known == there));
                 cube[at] = Some(there);
             }
         }
@@ -212,34 +218,37 @@ fn justify(
     model: &dyn Fn(Atom) -> bool,
     out: &mut Vec<(Atom, bool)>,
 ) {
-    match formula {
-        // A constant is what it is with nothing to hold it there.
-        Formula::True | Formula::False => {}
-        Formula::Atom(atom) => out.push((*atom, want)),
-        Formula::Not(inner) => justify(inner, !want, model, out),
-        Formula::And(left, right) => match want {
-            true => {
-                justify(left, true, model, out);
-                justify(right, true, model, out);
-            }
-            false => match left.eval(model) {
-                false => justify(left, false, model, out),
-                true => justify(right, false, model, out),
+    let mut work = vec![(formula, want)];
+    while let Some((formula, want)) = work.pop() {
+        match formula {
+            // A constant is what it is with nothing to hold it there.
+            Formula::True | Formula::False => {}
+            Formula::Atom(atom) => out.push((*atom, want)),
+            Formula::Not(inner) => work.push((inner, !want)),
+            Formula::And(left, right) => match want {
+                true => {
+                    work.push((right, true));
+                    work.push((left, true));
+                }
+                false => match left.eval(model) {
+                    false => work.push((left, false)),
+                    true => work.push((right, false)),
+                },
             },
-        },
-        Formula::Or(left, right) => match want {
-            true => match left.eval(model) {
-                true => justify(left, true, model, out),
-                false => justify(right, true, model, out),
+            Formula::Or(left, right) => match want {
+                true => match left.eval(model) {
+                    true => work.push((left, true)),
+                    false => work.push((right, true)),
+                },
+                false => {
+                    work.push((right, false));
+                    work.push((left, false));
+                }
             },
-            false => {
-                justify(left, false, model, out);
-                justify(right, false, model, out);
+            Formula::Iff(left, right) | Formula::Xor(left, right) => {
+                work.push((right, right.eval(model)));
+                work.push((left, left.eval(model)));
             }
-        },
-        Formula::Iff(left, right) | Formula::Xor(left, right) => {
-            justify(left, left.eval(model), model, out);
-            justify(right, right.eval(model), model, out);
         }
     }
 }
@@ -492,61 +501,95 @@ impl Encoding {
     /// A literal that holds exactly when `formula` does, with the clauses that
     /// make it so added to the solver.
     fn encode(&mut self, formula: &Formula) -> Lit {
-        match formula {
-            Formula::True => {
-                let lit = self.fresh();
-                self.solver.add_clause(&[lit]);
-                lit
-            }
-            Formula::False => {
-                let lit = self.fresh();
-                self.solver.add_clause(&[!lit]);
-                lit
-            }
-            Formula::Atom(atom) => {
-                let next = self.next;
-                let var = *self.atoms.entry(*atom).or_insert_with(|| {
-                    self.next += 1;
-                    Var::from_index(next)
-                });
-                Lit::from_var(var, true)
-            }
-            Formula::Not(inner) => !self.encode(inner),
-            Formula::And(left, right) => {
-                let (left, right) = (self.encode(left), self.encode(right));
-                let out = self.fresh();
-                self.solver.add_clause(&[!out, left]);
-                self.solver.add_clause(&[!out, right]);
-                self.solver.add_clause(&[out, !left, !right]);
-                out
-            }
-            Formula::Or(left, right) => {
-                let (left, right) = (self.encode(left), self.encode(right));
-                let out = self.fresh();
-                self.solver.add_clause(&[out, !left]);
-                self.solver.add_clause(&[out, !right]);
-                self.solver.add_clause(&[!out, left, right]);
-                out
-            }
-            Formula::Iff(left, right) => {
-                let (left, right) = (self.encode(left), self.encode(right));
-                let out = self.fresh();
-                self.solver.add_clause(&[!out, !left, right]);
-                self.solver.add_clause(&[!out, left, !right]);
-                self.solver.add_clause(&[out, left, right]);
-                self.solver.add_clause(&[out, !left, !right]);
-                out
-            }
-            Formula::Xor(left, right) => {
-                let (left, right) = (self.encode(left), self.encode(right));
-                let out = self.fresh();
-                self.solver.add_clause(&[!out, left, right]);
-                self.solver.add_clause(&[!out, !left, !right]);
-                self.solver.add_clause(&[out, !left, right]);
-                self.solver.add_clause(&[out, left, !right]);
-                out
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Binary(u8),
+        }
+
+        let mut work = vec![Work::Formula(formula)];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => {
+                    let lit = self.fresh();
+                    self.solver.add_clause(&[lit]);
+                    values.push(lit);
+                }
+                Work::Formula(Formula::False) => {
+                    let lit = self.fresh();
+                    self.solver.add_clause(&[!lit]);
+                    values.push(lit);
+                }
+                Work::Formula(Formula::Atom(atom)) => {
+                    let next = self.next;
+                    let var = *self.atoms.entry(*atom).or_insert_with(|| {
+                        self.next += 1;
+                        Var::from_index(next)
+                    });
+                    values.push(Lit::from_var(var, true));
+                }
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Binary(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Binary(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Binary(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Binary(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = values.pop().expect("a visited formula literal");
+                    values.push(!inner);
+                }
+                Work::Binary(kind) => {
+                    let right = values.pop().expect("a visited right formula literal");
+                    let left = values.pop().expect("a visited left formula literal");
+                    let out = self.fresh();
+                    match kind {
+                        0 => {
+                            self.solver.add_clause(&[!out, left]);
+                            self.solver.add_clause(&[!out, right]);
+                            self.solver.add_clause(&[out, !left, !right]);
+                        }
+                        1 => {
+                            self.solver.add_clause(&[out, !left]);
+                            self.solver.add_clause(&[out, !right]);
+                            self.solver.add_clause(&[!out, left, right]);
+                        }
+                        2 => {
+                            self.solver.add_clause(&[!out, !left, right]);
+                            self.solver.add_clause(&[!out, left, !right]);
+                            self.solver.add_clause(&[out, left, right]);
+                            self.solver.add_clause(&[out, !left, !right]);
+                        }
+                        _ => {
+                            self.solver.add_clause(&[!out, left, right]);
+                            self.solver.add_clause(&[!out, !left, !right]);
+                            self.solver.add_clause(&[out, !left, right]);
+                            self.solver.add_clause(&[out, left, !right]);
+                        }
+                    }
+                    values.push(out);
+                }
             }
         }
+        values.pop().expect("every formula has an encoding")
     }
 
     /// One more solver variable, standing for a connective rather than for an

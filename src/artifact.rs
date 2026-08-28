@@ -66,6 +66,12 @@ pub struct Artifact {
     pub lir: Lir,
 }
 
+impl Drop for Artifact {
+    fn drop(&mut self) {
+        text::discard_artifact(self);
+    }
+}
+
 /// The public interface of one bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
@@ -126,6 +132,7 @@ pub struct Parameter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sense {
     Type,
+    Fields,
     Cases,
     Effects,
 }
@@ -178,23 +185,17 @@ pub struct Scheme {
     pub body: Type,
 }
 
-/// A normalized semantic type, independent of compiler symbols and spans.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Type {
-    pub core: Core,
-    pub fields: Vec<(String, RowField)>,
-}
-
-/// A type's core, before its structural fields are laid over it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Core {
-    Unit,
+/// A normalized semantic type. Structural fields are representable only by
+/// the `Struct` constructor.
+#[derive(Debug)]
+pub enum Type {
     Nat,
     Int,
     Real,
     String,
     Boolean,
     Arrow(Box<Type>, Box<Type>, Row),
+    Struct(Row),
     Sum(Row),
     Var(u32),
     Bound(u32),
@@ -210,14 +211,14 @@ pub enum Core {
 }
 
 /// A normalized sum or effect row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Row {
     pub labels: Vec<(String, RowField)>,
     pub rest: Rest,
 }
 
 /// The part of a sum or effect row beyond its named labels.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Rest {
     Closed,
     Var(u32),
@@ -245,7 +246,7 @@ pub enum Presence {
 }
 
 /// A propositional constraint over presence variables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Formula {
     True,
     False,
@@ -256,6 +257,483 @@ pub enum Formula {
     Or(Box<Formula>, Box<Formula>),
     Iff(Box<Formula>, Box<Formula>),
     Xor(Box<Formula>, Box<Formula>),
+}
+
+// These values are part of the public artifact schema, so callers can own and
+// destroy and compare them independently of `Artifact`. Keep their recursive
+// ownership and equality walks on explicit heap stacks: real generated schemes
+// can be tens of thousands of constructors deep.
+enum SemanticRef<'a> {
+    Type(&'a Type),
+    Row(&'a Row),
+}
+
+enum SemanticPair<'a> {
+    Type(&'a Type, &'a Type),
+    Row(&'a Row, &'a Row),
+    Rest(&'a Rest, &'a Rest),
+}
+
+fn semantic_eq(root: SemanticPair<'_>) -> bool {
+    let mut pending = vec![root];
+    while let Some(pair) = pending.pop() {
+        match pair {
+            SemanticPair::Type(left, right) => match (left, right) {
+                (Type::Nat, Type::Nat)
+                | (Type::Int, Type::Int)
+                | (Type::Real, Type::Real)
+                | (Type::String, Type::String)
+                | (Type::Boolean, Type::Boolean)
+                | (Type::Undecided, Type::Undecided) => {}
+                (Type::Var(left), Type::Var(right)) | (Type::Bound(left), Type::Bound(right))
+                    if left == right => {}
+                (
+                    Type::Rigid {
+                        id: left_id,
+                        name: left_name,
+                    },
+                    Type::Rigid {
+                        id: right_id,
+                        name: right_name,
+                    },
+                ) if left_id == right_id && left_name == right_name => {}
+                (
+                    Type::Arrow(left_from, left_to, left_effects),
+                    Type::Arrow(right_from, right_to, right_effects),
+                ) => {
+                    pending.push(SemanticPair::Row(left_effects, right_effects));
+                    pending.push(SemanticPair::Type(left_to, right_to));
+                    pending.push(SemanticPair::Type(left_from, right_from));
+                }
+                (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
+                    pending.push(SemanticPair::Row(left, right));
+                }
+                (
+                    Type::Named {
+                        name: left_name,
+                        args: left_args,
+                    },
+                    Type::Named {
+                        name: right_name,
+                        args: right_args,
+                    },
+                ) if left_name == right_name && left_args.len() == right_args.len() => {
+                    pending.extend(
+                        left_args
+                            .iter()
+                            .zip(right_args)
+                            .rev()
+                            .map(|(left, right)| SemanticPair::Type(left, right)),
+                    );
+                }
+                _ => return false,
+            },
+            SemanticPair::Row(left, right) => {
+                if left.labels.len() != right.labels.len() {
+                    return false;
+                }
+                for ((left_name, left_field), (right_name, right_field)) in
+                    left.labels.iter().zip(&right.labels)
+                {
+                    if left_name != right_name || left_field.presence != right_field.presence {
+                        return false;
+                    }
+                    pending.push(SemanticPair::Type(&left_field.ty, &right_field.ty));
+                }
+                pending.push(SemanticPair::Rest(&left.rest, &right.rest));
+            }
+            SemanticPair::Rest(left, right) => match (left, right) {
+                (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
+                (Rest::Var(left), Rest::Var(right)) | (Rest::Bound(left), Rest::Bound(right))
+                    if left == right => {}
+                (
+                    Rest::Rigid {
+                        id: left_id,
+                        name: left_name,
+                    },
+                    Rest::Rigid {
+                        id: right_id,
+                        name: right_name,
+                    },
+                ) if left_id == right_id && left_name == right_name => {}
+                (Rest::More(left), Rest::More(right)) => {
+                    pending.push(SemanticPair::Row(left, right));
+                }
+                _ => return false,
+            },
+        }
+    }
+    true
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Type(self, other))
+    }
+}
+
+impl Eq for Type {}
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Row(self, other))
+    }
+}
+
+impl Eq for Row {}
+
+impl PartialEq for Rest {
+    fn eq(&self, other: &Self) -> bool {
+        semantic_eq(SemanticPair::Rest(self, other))
+    }
+}
+
+impl Eq for Rest {}
+
+impl PartialEq for Formula {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        while let Some((left, right)) = pending.pop() {
+            match (left, right) {
+                (Formula::True, Formula::True) | (Formula::False, Formula::False) => {}
+                (Formula::Var(left), Formula::Var(right))
+                | (Formula::Bound(left), Formula::Bound(right))
+                    if left == right => {}
+                (Formula::Not(left), Formula::Not(right)) => pending.push((left, right)),
+                (Formula::And(left_a, left_b), Formula::And(right_a, right_b))
+                | (Formula::Or(left_a, left_b), Formula::Or(right_a, right_b))
+                | (Formula::Iff(left_a, left_b), Formula::Iff(right_a, right_b))
+                | (Formula::Xor(left_a, left_b), Formula::Xor(right_a, right_b)) => {
+                    pending.push((left_b, right_b));
+                    pending.push((left_a, right_a));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Formula {}
+
+enum CloneWork<'a> {
+    Semantic(SemanticRef<'a>),
+    Arrow,
+    Struct,
+    Sum,
+    Named {
+        name: String,
+        count: usize,
+    },
+    FinishRow {
+        labels: Vec<(String, Presence)>,
+        rest: Option<Rest>,
+    },
+}
+
+fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
+    let mut work = vec![CloneWork::Semantic(root)];
+    let mut types = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            CloneWork::Semantic(SemanticRef::Type(value)) => match value {
+                Type::Nat => types.push(Type::Nat),
+                Type::Int => types.push(Type::Int),
+                Type::Real => types.push(Type::Real),
+                Type::String => types.push(Type::String),
+                Type::Boolean => types.push(Type::Boolean),
+                Type::Arrow(from, to, effects) => {
+                    work.push(CloneWork::Arrow);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(to)));
+                    work.push(CloneWork::Semantic(SemanticRef::Type(from)));
+                }
+                Type::Struct(row) => {
+                    work.push(CloneWork::Struct);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(row)));
+                }
+                Type::Sum(row) => {
+                    work.push(CloneWork::Sum);
+                    work.push(CloneWork::Semantic(SemanticRef::Row(row)));
+                }
+                Type::Var(value) => types.push(Type::Var(*value)),
+                Type::Bound(value) => types.push(Type::Bound(*value)),
+                Type::Rigid { id, name } => types.push(Type::Rigid {
+                    id: *id,
+                    name: name.clone(),
+                }),
+                Type::Named { name, args } => {
+                    work.push(CloneWork::Named {
+                        name: name.clone(),
+                        count: args.len(),
+                    });
+                    work.extend(
+                        args.iter()
+                            .rev()
+                            .map(|arg| CloneWork::Semantic(SemanticRef::Type(arg))),
+                    );
+                }
+                Type::Undecided => types.push(Type::Undecided),
+            },
+            CloneWork::Semantic(SemanticRef::Row(value)) => {
+                let labels = value
+                    .labels
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.presence.clone()))
+                    .collect();
+                let rest = match &value.rest {
+                    Rest::Closed => Some(Rest::Closed),
+                    Rest::Var(value) => Some(Rest::Var(*value)),
+                    Rest::Bound(value) => Some(Rest::Bound(*value)),
+                    Rest::Rigid { id, name } => Some(Rest::Rigid {
+                        id: *id,
+                        name: name.clone(),
+                    }),
+                    Rest::Undecided => Some(Rest::Undecided),
+                    Rest::More(_) => None,
+                };
+                work.push(CloneWork::FinishRow { labels, rest });
+                if let Rest::More(more) = &value.rest {
+                    work.push(CloneWork::Semantic(SemanticRef::Row(more)));
+                }
+                work.extend(
+                    value
+                        .labels
+                        .iter()
+                        .rev()
+                        .map(|(_, field)| CloneWork::Semantic(SemanticRef::Type(&field.ty))),
+                );
+            }
+            CloneWork::Arrow => {
+                let effects = rows.pop().expect("cloned arrow effects");
+                let to = types.pop().expect("cloned arrow result");
+                let from = types.pop().expect("cloned arrow parameter");
+                types.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            CloneWork::Struct => {
+                types.push(Type::Struct(rows.pop().expect("cloned struct row")));
+            }
+            CloneWork::Sum => {
+                types.push(Type::Sum(rows.pop().expect("cloned sum row")));
+            }
+            CloneWork::Named { name, count } => {
+                let split = types.len() - count;
+                let args = types.drain(split..).collect();
+                types.push(Type::Named { name, args });
+            }
+            CloneWork::FinishRow { labels, rest } => {
+                let mut cloned = Vec::with_capacity(labels.len());
+                for (name, presence) in labels.into_iter().rev() {
+                    cloned.push((
+                        name,
+                        RowField {
+                            presence,
+                            ty: types.pop().expect("cloned row field"),
+                        },
+                    ));
+                }
+                cloned.reverse();
+                let rest = match rest {
+                    Some(rest) => rest,
+                    None => Rest::More(Box::new(rows.pop().expect("cloned row rest"))),
+                };
+                rows.push(Row {
+                    labels: cloned,
+                    rest,
+                });
+            }
+        }
+    }
+    (types, rows)
+}
+
+impl Clone for Type {
+    fn clone(&self) -> Self {
+        let (mut types, rows) = clone_semantic(SemanticRef::Type(self));
+        debug_assert!(rows.is_empty());
+        types.pop().expect("cloned type")
+    }
+}
+
+impl Clone for Row {
+    fn clone(&self) -> Self {
+        let (types, mut rows) = clone_semantic(SemanticRef::Row(self));
+        debug_assert!(types.is_empty());
+        rows.pop().expect("cloned row")
+    }
+}
+
+enum SemanticOwned {
+    Type(Type),
+    Row(Row),
+}
+
+fn empty_row() -> Row {
+    Row {
+        labels: Vec::new(),
+        rest: Rest::Closed,
+    }
+}
+
+fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
+    match value {
+        Type::Arrow(from, to, effects) => {
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                from.as_mut(),
+                Type::Undecided,
+            )));
+            pending.push(SemanticOwned::Type(std::mem::replace(
+                to.as_mut(),
+                Type::Undecided,
+            )));
+            pending.push(SemanticOwned::Row(std::mem::replace(effects, empty_row())));
+        }
+        Type::Struct(row) | Type::Sum(row) => {
+            pending.push(SemanticOwned::Row(std::mem::replace(row, empty_row())));
+        }
+        Type::Named { args, .. } => {
+            pending.extend(std::mem::take(args).into_iter().map(SemanticOwned::Type))
+        }
+        Type::Nat
+        | Type::Int
+        | Type::Real
+        | Type::String
+        | Type::Boolean
+        | Type::Var(_)
+        | Type::Bound(_)
+        | Type::Rigid { .. }
+        | Type::Undecided => {}
+    }
+}
+
+fn drain_row(value: &mut Row, pending: &mut Vec<SemanticOwned>) {
+    pending.extend(
+        std::mem::take(&mut value.labels)
+            .into_iter()
+            .map(|(_, field)| SemanticOwned::Type(field.ty)),
+    );
+    if let Rest::More(more) = &mut value.rest {
+        pending.push(SemanticOwned::Row(std::mem::replace(
+            more.as_mut(),
+            empty_row(),
+        )));
+    }
+}
+
+fn discard_semantic(root: SemanticRefMut<'_>) {
+    let mut pending = Vec::new();
+    match root {
+        SemanticRefMut::Type(value) => drain_type(value, &mut pending),
+        SemanticRefMut::Row(value) => drain_row(value, &mut pending),
+    }
+    while let Some(mut value) = pending.pop() {
+        match &mut value {
+            SemanticOwned::Type(value) => drain_type(value, &mut pending),
+            SemanticOwned::Row(value) => drain_row(value, &mut pending),
+        }
+    }
+}
+
+enum SemanticRefMut<'a> {
+    Type(&'a mut Type),
+    Row(&'a mut Row),
+}
+
+impl Drop for Type {
+    fn drop(&mut self) {
+        discard_semantic(SemanticRefMut::Type(self));
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        discard_semantic(SemanticRefMut::Row(self));
+    }
+}
+
+impl Clone for Formula {
+    fn clone(&self) -> Self {
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Pair(u8),
+        }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => out.push(Formula::True),
+                Work::Formula(Formula::False) => out.push(Formula::False),
+                Work::Formula(Formula::Var(value)) => out.push(Formula::Var(*value)),
+                Work::Formula(Formula::Bound(value)) => out.push(Formula::Bound(*value)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Pair(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Pair(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Pair(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Pair(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = out.pop().expect("cloned formula operand");
+                    out.push(Formula::Not(Box::new(inner)));
+                }
+                Work::Pair(kind) => {
+                    let right = out.pop().expect("cloned right formula operand");
+                    let left = out.pop().expect("cloned left formula operand");
+                    out.push(match kind {
+                        0 => Formula::And(Box::new(left), Box::new(right)),
+                        1 => Formula::Or(Box::new(left), Box::new(right)),
+                        2 => Formula::Iff(Box::new(left), Box::new(right)),
+                        _ => Formula::Xor(Box::new(left), Box::new(right)),
+                    });
+                }
+            }
+        }
+        out.pop().expect("cloned formula")
+    }
+}
+
+impl Drop for Formula {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_formula(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            drain_formula(&mut value, &mut pending);
+        }
+    }
+}
+
+fn drain_formula(value: &mut Formula, pending: &mut Vec<Formula>) {
+    match value {
+        Formula::Not(inner) => pending.push(std::mem::replace(inner.as_mut(), Formula::True)),
+        Formula::And(left, right)
+        | Formula::Or(left, right)
+        | Formula::Iff(left, right)
+        | Formula::Xor(left, right) => {
+            pending.push(std::mem::replace(left.as_mut(), Formula::True));
+            pending.push(std::mem::replace(right.as_mut(), Formula::True));
+        }
+        Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+    }
 }
 
 /// The span-free LIR portion of an artifact.
@@ -302,7 +780,7 @@ pub struct Global {
 }
 
 /// An ordered instruction list and one terminator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Block {
     pub instrs: Vec<Instr>,
     pub end: End,
@@ -324,7 +802,7 @@ pub enum FieldKey {
 }
 
 /// A span-free LIR operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Op {
     Const(Literal),
     Neg(u32),
@@ -465,6 +943,587 @@ pub enum Rep {
     Any,
 }
 
+// `Block` and `Op` form a mutually recursive ownership tree. They are public
+// artifact values in their own right, so their ordinary ownership operations
+// must not depend on an enclosing `Artifact` to provide a safe traversal.
+enum LirCloneWork<'a> {
+    Block(&'a Block),
+    Op(&'a Op),
+    FinishBlock {
+        instrs: Vec<(u32, Rep)>,
+        end: End,
+    },
+    FinishCatch(u32),
+    FinishSwitchTag {
+        on: u32,
+        names: Vec<String>,
+        fallback: bool,
+    },
+    FinishSwitchPrim {
+        on: u32,
+        values: Vec<Literal>,
+        fallback: bool,
+    },
+    FinishSwitchPresence {
+        on: u32,
+        field: String,
+    },
+    FinishSwitchRest {
+        on: u32,
+        fields: Vec<String>,
+    },
+}
+
+fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
+    let mut work = vec![root];
+    let mut blocks = Vec::new();
+    let mut ops = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            LirCloneWork::Block(block) => {
+                work.push(LirCloneWork::FinishBlock {
+                    instrs: block
+                        .instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect(),
+                    end: block.end.clone(),
+                });
+                work.extend(
+                    block
+                        .instrs
+                        .iter()
+                        .rev()
+                        .map(|instr| LirCloneWork::Op(&instr.op)),
+                );
+            }
+            LirCloneWork::Op(op) => match op {
+                Op::Const(value) => ops.push(Op::Const(value.clone())),
+                Op::Neg(value) => ops.push(Op::Neg(*value)),
+                Op::Not(value) => ops.push(Op::Not(*value)),
+                Op::And { left, right } => ops.push(Op::And {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Or { left, right } => ops.push(Op::Or {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Xor { left, right } => ops.push(Op::Xor {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Add { left, right } => ops.push(Op::Add {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Sub { left, right } => ops.push(Op::Sub {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Mul { left, right } => ops.push(Op::Mul {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Div { left, right } => ops.push(Op::Div {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Struct(fields) => ops.push(Op::Struct(fields.clone())),
+                Op::Merge(values) => ops.push(Op::Merge(values.clone())),
+                Op::Project { base, field } => ops.push(Op::Project {
+                    base: *base,
+                    field: field.clone(),
+                }),
+                Op::Tag { name, payload } => ops.push(Op::Tag {
+                    name: name.clone(),
+                    payload: *payload,
+                }),
+                Op::Payload(value) => ops.push(Op::Payload(*value)),
+                Op::Closure { func, captures } => ops.push(Op::Closure {
+                    func: *func,
+                    captures: captures.clone(),
+                }),
+                Op::Call { callee, args } => ops.push(Op::Call {
+                    callee: callee.clone(),
+                    args: args.clone(),
+                }),
+                Op::Global { target } => ops.push(Op::Global {
+                    target: target.clone(),
+                }),
+                Op::NewTag => ops.push(Op::NewTag),
+                Op::Catch { tag, body } => {
+                    work.push(LirCloneWork::FinishCatch(*tag));
+                    work.push(LirCloneWork::Block(body));
+                }
+                Op::SwitchTag {
+                    on,
+                    cases,
+                    fallback,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchTag {
+                        on: *on,
+                        names: cases.iter().map(|case| case.name.clone()).collect(),
+                        fallback: fallback.is_some(),
+                    });
+                    if let Some(fallback) = fallback {
+                        work.push(LirCloneWork::Block(fallback));
+                    }
+                    work.extend(
+                        cases
+                            .iter()
+                            .rev()
+                            .map(|case| LirCloneWork::Block(&case.block)),
+                    );
+                }
+                Op::SwitchPrim {
+                    on,
+                    cases,
+                    fallback,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchPrim {
+                        on: *on,
+                        values: cases.iter().map(|case| case.value.clone()).collect(),
+                        fallback: fallback.is_some(),
+                    });
+                    if let Some(fallback) = fallback {
+                        work.push(LirCloneWork::Block(fallback));
+                    }
+                    work.extend(
+                        cases
+                            .iter()
+                            .rev()
+                            .map(|case| LirCloneWork::Block(&case.block)),
+                    );
+                }
+                Op::SwitchPresence {
+                    on,
+                    field,
+                    present,
+                    absent,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchPresence {
+                        on: *on,
+                        field: field.clone(),
+                    });
+                    work.push(LirCloneWork::Block(absent));
+                    work.push(LirCloneWork::Block(present));
+                }
+                Op::SwitchRest {
+                    on,
+                    fields,
+                    none,
+                    some,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchRest {
+                        on: *on,
+                        fields: fields.clone(),
+                    });
+                    work.push(LirCloneWork::Block(some));
+                    work.push(LirCloneWork::Block(none));
+                }
+            },
+            LirCloneWork::FinishBlock { instrs, end } => {
+                let split = ops.len() - instrs.len();
+                let instrs = instrs
+                    .into_iter()
+                    .zip(ops.drain(split..))
+                    .map(|((temp, rep), op)| Instr { temp, rep, op })
+                    .collect();
+                blocks.push(Block { instrs, end });
+            }
+            LirCloneWork::FinishCatch(tag) => {
+                ops.push(Op::Catch {
+                    tag,
+                    body: Box::new(blocks.pop().expect("cloned catch body")),
+                });
+            }
+            LirCloneWork::FinishSwitchTag {
+                on,
+                names,
+                fallback,
+            } => {
+                let fallback =
+                    fallback.then(|| Box::new(blocks.pop().expect("cloned tag fallback")));
+                let split = blocks.len() - names.len();
+                let cases = names
+                    .into_iter()
+                    .zip(blocks.drain(split..))
+                    .map(|(name, block)| TagCase { name, block })
+                    .collect();
+                ops.push(Op::SwitchTag {
+                    on,
+                    cases,
+                    fallback,
+                });
+            }
+            LirCloneWork::FinishSwitchPrim {
+                on,
+                values,
+                fallback,
+            } => {
+                let fallback =
+                    fallback.then(|| Box::new(blocks.pop().expect("cloned primitive fallback")));
+                let split = blocks.len() - values.len();
+                let cases = values
+                    .into_iter()
+                    .zip(blocks.drain(split..))
+                    .map(|(value, block)| PrimCase { value, block })
+                    .collect();
+                ops.push(Op::SwitchPrim {
+                    on,
+                    cases,
+                    fallback,
+                });
+            }
+            LirCloneWork::FinishSwitchPresence { on, field } => {
+                let absent = Box::new(blocks.pop().expect("cloned absent branch"));
+                let present = Box::new(blocks.pop().expect("cloned present branch"));
+                ops.push(Op::SwitchPresence {
+                    on,
+                    field,
+                    present,
+                    absent,
+                });
+            }
+            LirCloneWork::FinishSwitchRest { on, fields } => {
+                let some = Box::new(blocks.pop().expect("cloned nonempty-rest branch"));
+                let none = Box::new(blocks.pop().expect("cloned empty-rest branch"));
+                ops.push(Op::SwitchRest {
+                    on,
+                    fields,
+                    none,
+                    some,
+                });
+            }
+        }
+    }
+    (blocks, ops)
+}
+
+impl Clone for Block {
+    fn clone(&self) -> Self {
+        let (mut blocks, ops) = clone_lir_tree(LirCloneWork::Block(self));
+        debug_assert!(ops.is_empty());
+        blocks.pop().expect("cloned block")
+    }
+}
+
+impl Clone for Op {
+    fn clone(&self) -> Self {
+        let (blocks, mut ops) = clone_lir_tree(LirCloneWork::Op(self));
+        debug_assert!(blocks.is_empty());
+        ops.pop().expect("cloned operation")
+    }
+}
+
+#[derive(PartialEq)]
+enum OpHead<'a> {
+    Const(&'a Literal),
+    Unary(u8, u32),
+    Binary(u8, u32, u32),
+    Struct(&'a [(FieldKey, u32)]),
+    Merge(&'a [u32]),
+    Project(u32, &'a FieldKey),
+    Tag(&'a str, Option<u32>),
+    Closure(u64, &'a [u32]),
+    Call(&'a Callee, &'a [u32]),
+    Global(&'a str),
+    NewTag,
+    Catch(u32),
+    SwitchTag(u32, Vec<&'a str>, bool),
+    SwitchPrim(u32, Vec<&'a Literal>, bool),
+    SwitchPresence(u32, &'a str),
+    SwitchRest(u32, &'a [String]),
+}
+
+impl<'a> From<&'a Op> for OpHead<'a> {
+    fn from(op: &'a Op) -> Self {
+        match op {
+            Op::Const(value) => Self::Const(value),
+            Op::Neg(value) => Self::Unary(0, *value),
+            Op::Not(value) => Self::Unary(1, *value),
+            Op::And { left, right } => Self::Binary(0, *left, *right),
+            Op::Or { left, right } => Self::Binary(1, *left, *right),
+            Op::Xor { left, right } => Self::Binary(2, *left, *right),
+            Op::Add { left, right } => Self::Binary(3, *left, *right),
+            Op::Sub { left, right } => Self::Binary(4, *left, *right),
+            Op::Mul { left, right } => Self::Binary(5, *left, *right),
+            Op::Div { left, right } => Self::Binary(6, *left, *right),
+            Op::Struct(fields) => Self::Struct(fields),
+            Op::Merge(values) => Self::Merge(values),
+            Op::Project { base, field } => Self::Project(*base, field),
+            Op::Tag { name, payload } => Self::Tag(name, *payload),
+            Op::Payload(value) => Self::Unary(2, *value),
+            Op::Closure { func, captures } => Self::Closure(*func, captures),
+            Op::Call { callee, args } => Self::Call(callee, args),
+            Op::Global { target } => Self::Global(target),
+            Op::NewTag => Self::NewTag,
+            Op::Catch { tag, .. } => Self::Catch(*tag),
+            Op::SwitchTag {
+                on,
+                cases,
+                fallback,
+            } => Self::SwitchTag(
+                *on,
+                cases.iter().map(|case| case.name.as_str()).collect(),
+                fallback.is_some(),
+            ),
+            Op::SwitchPrim {
+                on,
+                cases,
+                fallback,
+            } => Self::SwitchPrim(
+                *on,
+                cases.iter().map(|case| &case.value).collect(),
+                fallback.is_some(),
+            ),
+            Op::SwitchPresence { on, field, .. } => Self::SwitchPresence(*on, field),
+            Op::SwitchRest { on, fields, .. } => Self::SwitchRest(*on, fields),
+        }
+    }
+}
+
+enum LirPair<'a> {
+    Block(&'a Block, &'a Block),
+    Op(&'a Op, &'a Op),
+}
+
+fn lir_tree_eq(root: LirPair<'_>) -> bool {
+    let mut work = vec![root];
+    while let Some(part) = work.pop() {
+        match part {
+            LirPair::Block(left, right) => {
+                let left_head = (
+                    &left.end,
+                    left.instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect::<Vec<_>>(),
+                );
+                let right_head = (
+                    &right.end,
+                    right
+                        .instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect::<Vec<_>>(),
+                );
+                if left_head != right_head {
+                    return false;
+                }
+                work.extend(
+                    left.instrs
+                        .iter()
+                        .zip(&right.instrs)
+                        .map(|(left, right)| LirPair::Op(&left.op, &right.op)),
+                );
+            }
+            LirPair::Op(left, right) => {
+                if OpHead::from(left) != OpHead::from(right) {
+                    return false;
+                }
+                match (left, right) {
+                    (Op::Catch { body: left, .. }, Op::Catch { body: right, .. }) => {
+                        work.push(LirPair::Block(left, right));
+                    }
+                    (
+                        Op::SwitchTag {
+                            cases: left_cases,
+                            fallback: left_fallback,
+                            ..
+                        },
+                        Op::SwitchTag {
+                            cases: right_cases,
+                            fallback: right_fallback,
+                            ..
+                        },
+                    ) => {
+                        work.extend(
+                            left_cases
+                                .iter()
+                                .zip(right_cases)
+                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
+                        );
+                        work.extend(
+                            left_fallback
+                                .iter()
+                                .zip(right_fallback)
+                                .map(|(left, right)| LirPair::Block(left, right)),
+                        );
+                    }
+                    (
+                        Op::SwitchPrim {
+                            cases: left_cases,
+                            fallback: left_fallback,
+                            ..
+                        },
+                        Op::SwitchPrim {
+                            cases: right_cases,
+                            fallback: right_fallback,
+                            ..
+                        },
+                    ) => {
+                        work.extend(
+                            left_cases
+                                .iter()
+                                .zip(right_cases)
+                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
+                        );
+                        work.extend(
+                            left_fallback
+                                .iter()
+                                .zip(right_fallback)
+                                .map(|(left, right)| LirPair::Block(left, right)),
+                        );
+                    }
+                    (
+                        Op::SwitchPresence {
+                            present: left_present,
+                            absent: left_absent,
+                            ..
+                        },
+                        Op::SwitchPresence {
+                            present: right_present,
+                            absent: right_absent,
+                            ..
+                        },
+                    ) => {
+                        work.push(LirPair::Block(left_absent, right_absent));
+                        work.push(LirPair::Block(left_present, right_present));
+                    }
+                    (
+                        Op::SwitchRest {
+                            none: left_none,
+                            some: left_some,
+                            ..
+                        },
+                        Op::SwitchRest {
+                            none: right_none,
+                            some: right_some,
+                            ..
+                        },
+                    ) => {
+                        work.push(LirPair::Block(left_some, right_some));
+                        work.push(LirPair::Block(left_none, right_none));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    true
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        lir_tree_eq(LirPair::Block(self, other))
+    }
+}
+
+impl Eq for Block {}
+
+impl PartialEq for Op {
+    fn eq(&self, other: &Self) -> bool {
+        lir_tree_eq(LirPair::Op(self, other))
+    }
+}
+
+impl Eq for Op {}
+
+fn empty_block() -> Block {
+    Block {
+        instrs: Vec::new(),
+        end: End::Ret(0),
+    }
+}
+
+fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
+    match op {
+        Op::Catch { body, .. } => pending.push(std::mem::replace(body.as_mut(), empty_block())),
+        Op::SwitchTag {
+            cases, fallback, ..
+        } => {
+            pending.extend(
+                cases
+                    .iter_mut()
+                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
+            );
+            if let Some(block) = fallback.take() {
+                pending.push(*block);
+            }
+        }
+        Op::SwitchPrim {
+            cases, fallback, ..
+        } => {
+            pending.extend(
+                cases
+                    .iter_mut()
+                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
+            );
+            if let Some(block) = fallback.take() {
+                pending.push(*block);
+            }
+        }
+        Op::SwitchPresence {
+            present, absent, ..
+        } => {
+            pending.push(std::mem::replace(present.as_mut(), empty_block()));
+            pending.push(std::mem::replace(absent.as_mut(), empty_block()));
+        }
+        Op::SwitchRest { none, some, .. } => {
+            pending.push(std::mem::replace(none.as_mut(), empty_block()));
+            pending.push(std::mem::replace(some.as_mut(), empty_block()));
+        }
+        Op::Const(_)
+        | Op::Neg(_)
+        | Op::Not(_)
+        | Op::And { .. }
+        | Op::Or { .. }
+        | Op::Xor { .. }
+        | Op::Add { .. }
+        | Op::Sub { .. }
+        | Op::Mul { .. }
+        | Op::Div { .. }
+        | Op::Struct(_)
+        | Op::Merge(_)
+        | Op::Project { .. }
+        | Op::Tag { .. }
+        | Op::Payload(_)
+        | Op::Closure { .. }
+        | Op::Call { .. }
+        | Op::Global { .. }
+        | Op::NewTag => {}
+    }
+}
+
+fn drain_lir_block(block: &mut Block, pending: &mut Vec<Block>) {
+    for instr in &mut block.instrs {
+        drain_lir_op(&mut instr.op, pending);
+    }
+    block.instrs.clear();
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_lir_block(self, &mut pending);
+        while let Some(mut block) = pending.pop() {
+            drain_lir_block(&mut block, &mut pending);
+        }
+    }
+}
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_lir_op(self, &mut pending);
+        while let Some(mut block) = pending.pop() {
+            drain_lir_block(&mut block, &mut pending);
+        }
+    }
+}
+
 /// Build an artifact after inference and LIR lowering succeeded.
 pub fn build(
     mint: &Mint,
@@ -512,6 +1571,7 @@ pub fn build_with_dependencies(
                     .map(|param| Parameter {
                         sense: match &param.kind {
                             types::ParamKind::Type { .. } => Sense::Type,
+                            types::ParamKind::Fields { .. } => Sense::Fields,
                             types::ParamKind::Cases { .. } => Sense::Cases,
                             types::ParamKind::Effects { .. } => Sense::Effects,
                         },
@@ -657,94 +1717,200 @@ fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
 }
 
 fn ty(mint: &Mint, value: &types::Ty) -> Type {
-    Type {
-        core: match &value.core {
-            types::Core::Unit => Core::Unit,
-            types::Core::Nat => Core::Nat,
-            types::Core::Int => Core::Int,
-            types::Core::Real => Core::Real,
-            types::Core::String => Core::String,
-            types::Core::Boolean => Core::Boolean,
-            types::Core::Arrow(from, to, effects) => Core::Arrow(
-                Box::new(ty(mint, from)),
-                Box::new(ty(mint, to)),
-                row(mint, effects),
-            ),
-            types::Core::Sum(row_) => Core::Sum(row(mint, row_)),
-            types::Core::Var(value) => Core::Var(*value),
-            types::Core::Bound(value) => Core::Bound(*value),
-            types::Core::Rigid { id, name } => Core::Rigid {
-                id: *id,
-                name: name.to_string(),
-            },
-            types::Core::Named { symbol, args, .. } => Core::Named {
-                name: qualified(mint, *symbol),
-                args: args.iter().map(|arg| ty(mint, arg)).collect(),
-            },
-            types::Core::Undecided => Core::Undecided,
+    enum Work<'a> {
+        Ty(&'a types::Ty),
+        Row(&'a types::Row),
+        Arrow,
+        Struct,
+        Sum,
+        Named {
+            name: QualifiedName,
+            count: usize,
         },
-        fields: value
-            .fields
-            .iter()
-            .map(|(name, field)| (name.clone(), row_field(mint, field)))
-            .collect(),
+        FinishRow {
+            labels: Vec<(String, Presence)>,
+            rest: Option<Rest>,
+        },
     }
-}
 
-fn row(mint: &Mint, value: &types::Row) -> Row {
-    Row {
-        labels: value
-            .labels
-            .iter()
-            .map(|(name, field)| (name.clone(), row_field(mint, field)))
-            .collect(),
-        rest: match &value.rest {
-            types::Rest::Closed => Rest::Closed,
-            types::Rest::Var(value) => Rest::Var(*value),
-            types::Rest::Bound(value) => Rest::Bound(*value),
-            types::Rest::Rigid { id, name } => Rest::Rigid {
-                id: *id,
-                name: name.to_string(),
-            },
-            types::Rest::Undecided => Rest::Undecided,
-            types::Rest::More(row_) => Rest::More(Box::new(row(mint, row_))),
-        },
-    }
-}
+    let presence = |value: &types::Presence| match value {
+        types::Presence::Present => Presence::Present,
+        types::Presence::Absent => Presence::Absent,
+        types::Presence::Var(value) => Presence::Var(*value),
+        types::Presence::Bound(value) => Presence::Bound(*value),
+        types::Presence::Recovered(_) | types::Presence::Undecided => Presence::Undecided,
+    };
+    let rest = |value: &types::Rest| match value {
+        types::Rest::Closed => Some(Rest::Closed),
+        types::Rest::Var(value) => Some(Rest::Var(*value)),
+        types::Rest::Bound(value) => Some(Rest::Bound(*value)),
+        types::Rest::Rigid { id, name } => Some(Rest::Rigid {
+            id: *id,
+            name: name.to_string(),
+        }),
+        types::Rest::Undecided => Some(Rest::Undecided),
+        types::Rest::More(_) => None,
+    };
 
-fn row_field(mint: &Mint, value: &types::RowField) -> RowField {
-    RowField {
-        presence: match &value.presence {
-            types::Presence::Present => Presence::Present,
-            types::Presence::Absent => Presence::Absent,
-            types::Presence::Var(value) => Presence::Var(*value),
-            types::Presence::Bound(value) => Presence::Bound(*value),
-            types::Presence::Undecided => Presence::Undecided,
-        },
-        ty: ty(mint, &value.ty),
+    let mut work = vec![Work::Ty(value)];
+    let mut tys = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(value) => match value {
+                types::Ty::Nat => tys.push(Type::Nat),
+                types::Ty::Int => tys.push(Type::Int),
+                types::Ty::Real => tys.push(Type::Real),
+                types::Ty::String => tys.push(Type::String),
+                types::Ty::Boolean => tys.push(Type::Boolean),
+                types::Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Arrow);
+                    work.push(Work::Row(effects));
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                types::Ty::Struct(row) => {
+                    work.push(Work::Struct);
+                    work.push(Work::Row(row));
+                }
+                types::Ty::Sum(row) => {
+                    work.push(Work::Sum);
+                    work.push(Work::Row(row));
+                }
+                types::Ty::Var(value) => tys.push(Type::Var(*value)),
+                types::Ty::Bound(value) => tys.push(Type::Bound(*value)),
+                types::Ty::Rigid { id, name } => tys.push(Type::Rigid {
+                    id: *id,
+                    name: name.to_string(),
+                }),
+                types::Ty::Named { symbol, args, .. } => {
+                    work.push(Work::Named {
+                        name: qualified(mint, *symbol),
+                        count: args.len(),
+                    });
+                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                }
+                types::Ty::Undecided => tys.push(Type::Undecided),
+            },
+            Work::Row(value) => {
+                let labels = value
+                    .labels
+                    .iter()
+                    .map(|(name, field)| (name.clone(), presence(&field.presence)))
+                    .collect();
+                work.push(Work::FinishRow {
+                    labels,
+                    rest: rest(&value.rest),
+                });
+                if let types::Rest::More(more) = &value.rest {
+                    work.push(Work::Row(more));
+                }
+                work.extend(value.labels.values().rev().filter_map(|field| {
+                    (!matches!(field.presence, types::Presence::Absent))
+                        .then_some(Work::Ty(&field.ty))
+                }));
+            }
+            Work::Arrow => {
+                let effects = rows.pop().expect("artifact arrow effects");
+                let to = tys.pop().expect("artifact arrow result");
+                let from = tys.pop().expect("artifact arrow parameter");
+                tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            Work::Struct => {
+                let row = rows.pop().expect("artifact struct row");
+                tys.push(Type::Struct(row));
+            }
+            Work::Sum => {
+                let row = rows.pop().expect("artifact sum row");
+                tys.push(Type::Sum(row));
+            }
+            Work::Named { name, count } => {
+                let split = tys.len() - count;
+                let args = tys.drain(split..).collect();
+                tys.push(Type::Named { name, args });
+            }
+            Work::FinishRow { labels, rest } => {
+                let mut labels_out = Vec::with_capacity(labels.len());
+                for (name, presence) in labels.into_iter().rev() {
+                    let ty = match presence {
+                        Presence::Absent => Type::Undecided,
+                        _ => tys.pop().expect("artifact field payload"),
+                    };
+                    labels_out.push((name, RowField { presence, ty }));
+                }
+                labels_out.reverse();
+                let labels = labels_out;
+                let rest = match rest {
+                    Some(rest) => rest,
+                    None => Rest::More(Box::new(rows.pop().expect("artifact nested row"))),
+                };
+                rows.push(Row { labels, rest });
+            }
+        }
     }
+    tys.pop().expect("artifact type result")
 }
 
 fn formula(value: &types::Formula) -> Formula {
-    match value {
-        types::Formula::True => Formula::True,
-        types::Formula::False => Formula::False,
-        types::Formula::Atom(types::Atom::Var(value)) => Formula::Var(*value),
-        types::Formula::Atom(types::Atom::Bound(value)) => Formula::Bound(*value),
-        types::Formula::Not(value) => Formula::Not(Box::new(formula(value))),
-        types::Formula::And(left, right) => {
-            Formula::And(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Or(left, right) => {
-            Formula::Or(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Iff(left, right) => {
-            Formula::Iff(Box::new(formula(left)), Box::new(formula(right)))
-        }
-        types::Formula::Xor(left, right) => {
-            Formula::Xor(Box::new(formula(left)), Box::new(formula(right)))
+    enum Work<'a> {
+        Formula(&'a types::Formula),
+        Not,
+        Pair(u8),
+    }
+
+    let mut work = vec![Work::Formula(value)];
+    let mut out = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Formula(types::Formula::True) => out.push(Formula::True),
+            Work::Formula(types::Formula::False) => out.push(Formula::False),
+            Work::Formula(types::Formula::Atom(types::Atom::Var(value))) => {
+                out.push(Formula::Var(*value))
+            }
+            Work::Formula(types::Formula::Atom(types::Atom::Bound(value))) => {
+                out.push(Formula::Bound(*value))
+            }
+            Work::Formula(types::Formula::Not(inner)) => {
+                work.push(Work::Not);
+                work.push(Work::Formula(inner));
+            }
+            Work::Formula(types::Formula::And(left, right)) => {
+                work.push(Work::Pair(0));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Or(left, right)) => {
+                work.push(Work::Pair(1));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Iff(left, right)) => {
+                work.push(Work::Pair(2));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Formula(types::Formula::Xor(left, right)) => {
+                work.push(Work::Pair(3));
+                work.push(Work::Formula(right));
+                work.push(Work::Formula(left));
+            }
+            Work::Not => {
+                let inner = out.pop().expect("formula conversion postorder");
+                out.push(Formula::Not(Box::new(inner)));
+            }
+            Work::Pair(kind) => {
+                let right = Box::new(out.pop().expect("right formula conversion postorder"));
+                let left = Box::new(out.pop().expect("left formula conversion postorder"));
+                out.push(match kind {
+                    0 => Formula::And(left, right),
+                    1 => Formula::Or(left, right),
+                    2 => Formula::Iff(left, right),
+                    _ => Formula::Xor(left, right),
+                });
+            }
         }
     }
+    out.pop().expect("a converted formula")
 }
 
 fn lower_lir(mint: &Mint, output: &lir::Output) -> Lir {
@@ -983,6 +2149,10 @@ pub mod text {
     enum S {
         Atom(String),
         Str(String),
+        /// Already-canonical deep syntax. Pretty-printing a 30,000-level list
+        /// would build and render an equally deep document (and quadratic
+        /// indentation); compact syntax remains canonical and stack safe.
+        Raw(String),
         List(Vec<S>),
     }
 
@@ -1008,7 +2178,7 @@ pub mod text {
         }
     }
 
-    use S::{Atom as A, List as L, Str as Q};
+    use S::{Atom as A, List as L, Raw, Str as Q};
 
     /// Print one artifact as canonical text, pretty-printed at a fixed width
     /// and always ending in one newline.
@@ -1094,6 +2264,7 @@ pub mod text {
             A("param".into()),
             A(match value.sense {
                 Sense::Type => "type",
+                Sense::Fields => "fields",
                 Sense::Cases => "cases",
                 Sense::Effects => "effects",
             }
@@ -1152,98 +2323,252 @@ pub mod text {
         ])
     }
     fn ty(value: &Type) -> S {
-        L(vec![
-            A("ty".into()),
-            core(&value.core),
-            L(std::iter::once(A("fields".into()))
-                .chain(
-                    value
-                        .fields
-                        .iter()
-                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
-                )
-                .collect()),
-        ])
-    }
-    fn core(value: &Core) -> S {
-        match value {
-            Core::Unit => A("unit".into()),
-            Core::Nat => A("nat".into()),
-            Core::Int => A("int".into()),
-            Core::Real => A("real".into()),
-            Core::String => A("string".into()),
-            Core::Boolean => A("boolean".into()),
-            Core::Arrow(from, to, row_) => L(vec![A("arrow".into()), ty(from), ty(to), row(row_)]),
-            Core::Sum(row_) => L(vec![A("sum".into()), row(row_)]),
-            Core::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Core::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Core::Rigid { id, name } => {
-                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
+        enum Work<'a> {
+            Ty(&'a Type),
+            Row(&'a Row),
+            Rest(&'a Rest),
+            Field(&'a RowField),
+            Presence(&'a Presence),
+            Text(&'static str),
+            Owned(String),
+            Quoted(&'a str),
+        }
+
+        let mut out = String::new();
+        let mut work = vec![Work::Ty(value)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => out.push_str(text),
+                Work::Owned(text) => out.push_str(&text),
+                Work::Quoted(text) => out.push_str(&quoted(text)),
+                Work::Ty(value) => {
+                    out.push_str("(ty ");
+                    work.push(Work::Text(")"));
+                    match value {
+                        Type::Nat => work.push(Work::Text("nat")),
+                        Type::Int => work.push(Work::Text("int")),
+                        Type::Real => work.push(Work::Text("real")),
+                        Type::String => work.push(Work::Text("string")),
+                        Type::Boolean => work.push(Work::Text("boolean")),
+                        Type::Arrow(from, to, row) => {
+                            out.push_str("(arrow ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Row(row));
+                            work.push(Work::Text(" "));
+                            work.push(Work::Ty(to));
+                            work.push(Work::Text(" "));
+                            work.push(Work::Ty(from));
+                        }
+                        Type::Struct(row) | Type::Sum(row) => {
+                            out.push('(');
+                            out.push_str(if matches!(value, Type::Struct(_)) {
+                                "struct "
+                            } else {
+                                "sum "
+                            });
+                            work.push(Work::Text(")"));
+                            work.push(Work::Row(row));
+                        }
+                        Type::Var(value) => out.push_str(&format!("(var {value})")),
+                        Type::Bound(value) => out.push_str(&format!("(bound {value})")),
+                        Type::Rigid { id, name } => {
+                            out.push_str("(rigid ");
+                            out.push_str(&id.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(')');
+                        }
+                        Type::Named { name, args } => {
+                            out.push_str("(named ");
+                            out.push_str(&quoted(name));
+                            work.push(Work::Text(")"));
+                            for arg in args.iter().rev() {
+                                work.push(Work::Ty(arg));
+                                work.push(Work::Text(" "));
+                            }
+                        }
+                        Type::Undecided => work.push(Work::Text("undecided")),
+                    }
+                }
+                Work::Row(row) => {
+                    out.push_str("(row (labels");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Rest(&row.rest));
+                    work.push(Work::Text(") "));
+                    for (name, field) in row.labels.iter().rev() {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Field(field));
+                        work.push(Work::Text(" "));
+                        work.push(Work::Quoted(name));
+                        work.push(Work::Text(" ("));
+                    }
+                }
+                Work::Rest(rest) => match rest {
+                    Rest::Closed => work.push(Work::Text("closed")),
+                    Rest::Var(value) => work.push(Work::Owned(format!("(var {value})"))),
+                    Rest::Bound(value) => work.push(Work::Owned(format!("(bound {value})"))),
+                    Rest::Rigid { id, name } => {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Quoted(name));
+                        work.push(Work::Owned(format!("(rigid {id} ")));
+                    }
+                    Rest::Undecided => work.push(Work::Text("undecided")),
+                    Rest::More(row) => {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Row(row));
+                        work.push(Work::Text("(more "));
+                    }
+                },
+                Work::Field(field) => {
+                    work.push(Work::Text(")"));
+                    work.push(Work::Ty(&field.ty));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Presence(&field.presence));
+                    work.push(Work::Text("(field "));
+                }
+                Work::Presence(presence) => match presence {
+                    Presence::Present => work.push(Work::Text("present")),
+                    Presence::Absent => work.push(Work::Text("absent")),
+                    Presence::Var(value) => work.push(Work::Owned(format!("(var {value})"))),
+                    Presence::Bound(value) => work.push(Work::Owned(format!("(bound {value})"))),
+                    Presence::Undecided => work.push(Work::Text("undecided")),
+                },
             }
-            Core::Named { name, args } => L(std::iter::once(A("named".into()))
-                .chain(std::iter::once(Q(name.clone())))
-                .chain(args.iter().map(ty))
-                .collect()),
-            Core::Undecided => A("undecided".into()),
         }
-    }
-    fn row(value: &Row) -> S {
-        L(vec![
-            A("row".into()),
-            L(std::iter::once(A("labels".into()))
-                .chain(
-                    value
-                        .labels
-                        .iter()
-                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
-                )
-                .collect()),
-            rest(&value.rest),
-        ])
-    }
-    fn rest(value: &Rest) -> S {
-        match value {
-            Rest::Closed => A("closed".into()),
-            Rest::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Rest::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Rest::Rigid { id, name } => {
-                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
-            }
-            Rest::Undecided => A("undecided".into()),
-            Rest::More(value) => L(vec![A("more".into()), row(value)]),
-        }
-    }
-    fn row_field(value: &RowField) -> S {
-        L(vec![
-            A("field".into()),
-            presence(&value.presence),
-            ty(&value.ty),
-        ])
-    }
-    fn presence(value: &Presence) -> S {
-        match value {
-            Presence::Present => A("present".into()),
-            Presence::Absent => A("absent".into()),
-            Presence::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Presence::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Presence::Undecided => A("undecided".into()),
-        }
+        Raw(out)
     }
     fn formula(value: &Formula) -> S {
-        match value {
-            Formula::True => A("true".into()),
-            Formula::False => A("false".into()),
-            Formula::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Formula::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Formula::Not(value) => L(vec![A("not".into()), formula(value)]),
-            Formula::And(left, right) => pair("and", left, right),
-            Formula::Or(left, right) => pair("or", left, right),
-            Formula::Iff(left, right) => pair("iff", left, right),
-            Formula::Xor(left, right) => pair("xor", left, right),
+        let mut depth = vec![(value, 1usize)];
+        while let Some((formula, at)) = depth.pop() {
+            if at > 1_024 {
+                return Raw(compact_formula(value));
+            }
+            match formula {
+                Formula::Not(inner) => depth.push((inner, at + 1)),
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    depth.push((right, at + 1));
+                    depth.push((left, at + 1));
+                }
+                Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
+            }
         }
+
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Pair(&'static str),
+        }
+        let mut work = vec![Work::Formula(value)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => out.push(A("true".into())),
+                Work::Formula(Formula::False) => out.push(A("false".into())),
+                Work::Formula(Formula::Var(value)) => {
+                    out.push(L(vec![A("var".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Bound(value)) => {
+                    out.push(L(vec![A("bound".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Pair("and"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Pair("or"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Pair("iff"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Pair("xor"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = out.pop().expect("formula text postorder");
+                    out.push(L(vec![A("not".into()), inner]));
+                }
+                Work::Pair(tag) => {
+                    let right = out.pop().expect("right formula text postorder");
+                    let left = out.pop().expect("left formula text postorder");
+                    out.push(L(vec![A(tag.into()), left, right]));
+                }
+            }
+        }
+        out.pop().expect("formula text")
     }
-    fn pair(tag: &str, left: &Formula, right: &Formula) -> S {
-        L(vec![A(tag.into()), formula(left), formula(right)])
+
+    fn compact_formula(root: &Formula) -> String {
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Text(&'static str),
+        }
+        let mut out = String::new();
+        let mut work = vec![Work::Formula(root)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => out.push_str(text),
+                Work::Formula(Formula::True) => out.push_str("true"),
+                Work::Formula(Formula::False) => out.push_str("false"),
+                Work::Formula(Formula::Var(value)) => {
+                    out.push_str("(var ");
+                    out.push_str(&value.to_string());
+                    out.push(')');
+                }
+                Work::Formula(Formula::Bound(value)) => {
+                    out.push_str("(bound ");
+                    out.push_str(&value.to_string());
+                    out.push(')');
+                }
+                Work::Formula(Formula::Not(inner)) => {
+                    out.push_str("(not ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    out.push_str("(and ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    out.push_str("(or ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    out.push_str("(iff ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    out.push_str("(xor ");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Formula(left));
+                }
+            }
+        }
+        out
     }
 
     fn lir(value: &Lir) -> S {
@@ -1486,14 +2811,35 @@ pub mod text {
     }
 
     fn doc(value: &S) -> RcDoc<'_, ()> {
-        match value {
-            A(value) => RcDoc::text(value.as_str()),
-            Q(value) => RcDoc::text(quoted(value)),
-            L(values) => RcDoc::text("(")
-                .append(RcDoc::intersperse(values.iter().map(doc), RcDoc::line()).nest(2))
-                .append(")")
-                .group(),
+        enum Work<'a> {
+            Value(&'a S),
+            List(usize),
         }
+        let mut work = vec![Work::Value(value)];
+        let mut out = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Value(A(value)) | Work::Value(Raw(value)) => {
+                    out.push(RcDoc::text(value.as_str()))
+                }
+                Work::Value(Q(value)) => out.push(RcDoc::text(quoted(value))),
+                Work::Value(L(values)) => {
+                    work.push(Work::List(values.len()));
+                    work.extend(values.iter().rev().map(Work::Value));
+                }
+                Work::List(len) => {
+                    let at = out.len() - len;
+                    let children = out.split_off(at);
+                    out.push(
+                        RcDoc::text("(")
+                            .append(RcDoc::intersperse(children, RcDoc::line()).nest(2))
+                            .append(")")
+                            .group(),
+                    );
+                }
+            }
+        }
+        out.pop().expect("one document root")
     }
 
     fn quoted(value: &str) -> String {
@@ -1666,67 +3012,16 @@ pub mod text {
         }
     }
 
-    /// Destroy a rejected, partially decoded model without following its
-    /// recursive ownership on the call stack. Successful artifacts remain
-    /// ordinary values and use their normal derived destruction.
-    fn discard_artifact(artifact: Artifact) {
+    /// Destroy recursive artifact contents without following their ownership
+    /// on the call stack. Draining first also makes the artifact's subsequent
+    /// field destruction constant-depth.
+    pub(super) fn discard_artifact(artifact: &mut Artifact) {
         fn discard_formula(formula: Formula) {
-            let mut pending = vec![formula];
-            while let Some(formula) = pending.pop() {
-                match formula {
-                    Formula::Not(value) => pending.push(*value),
-                    Formula::And(left, right)
-                    | Formula::Or(left, right)
-                    | Formula::Iff(left, right)
-                    | Formula::Xor(left, right) => {
-                        pending.push(*left);
-                        pending.push(*right);
-                    }
-                    Formula::True | Formula::False | Formula::Var(_) | Formula::Bound(_) => {}
-                }
-            }
+            drop(formula);
         }
 
-        enum Semantic {
-            Ty(Type),
-            Row(Row),
-        }
         fn discard_type(ty: Type) {
-            let mut pending = vec![Semantic::Ty(ty)];
-            while let Some(value) = pending.pop() {
-                match value {
-                    Semantic::Ty(Type { core, fields }) => {
-                        pending.extend(fields.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
-                        match core {
-                            Core::Arrow(from, to, effects) => {
-                                pending.push(Semantic::Ty(*from));
-                                pending.push(Semantic::Ty(*to));
-                                pending.push(Semantic::Row(effects));
-                            }
-                            Core::Sum(row) => pending.push(Semantic::Row(row)),
-                            Core::Named { args, .. } => {
-                                pending.extend(args.into_iter().map(Semantic::Ty));
-                            }
-                            Core::Unit
-                            | Core::Nat
-                            | Core::Int
-                            | Core::Real
-                            | Core::String
-                            | Core::Boolean
-                            | Core::Var(_)
-                            | Core::Bound(_)
-                            | Core::Rigid { .. }
-                            | Core::Undecided => {}
-                        }
-                    }
-                    Semantic::Row(Row { labels, rest }) => {
-                        pending.extend(labels.into_iter().map(|(_, field)| Semantic::Ty(field.ty)));
-                        if let Rest::More(row) = rest {
-                            pending.push(Semantic::Row(*row));
-                        }
-                    }
-                }
-            }
+            drop(ty);
         }
 
         fn discard_scheme(scheme: Scheme) {
@@ -1735,47 +3030,16 @@ pub mod text {
         }
 
         fn discard_block(block: Block) {
-            let mut pending = vec![block];
-            while let Some(Block { instrs, .. }) = pending.pop() {
-                for Instr { op, .. } in instrs {
-                    match op {
-                        Op::Catch { body, .. } => pending.push(*body),
-                        Op::SwitchTag {
-                            cases, fallback, ..
-                        } => {
-                            pending.extend(cases.into_iter().map(|case| case.block));
-                            pending.extend(fallback.map(|block| *block));
-                        }
-                        Op::SwitchPrim {
-                            cases, fallback, ..
-                        } => {
-                            pending.extend(cases.into_iter().map(|case| case.block));
-                            pending.extend(fallback.map(|block| *block));
-                        }
-                        Op::SwitchPresence {
-                            present, absent, ..
-                        } => {
-                            pending.push(*present);
-                            pending.push(*absent);
-                        }
-                        Op::SwitchRest { none, some, .. } => {
-                            pending.push(*none);
-                            pending.push(*some);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            drop(block);
         }
 
-        let Artifact { header, lir } = artifact;
-        for value in header.values {
+        for value in artifact.header.values.drain(..) {
             discard_scheme(value.scheme);
         }
-        for declared in header.types {
+        for declared in artifact.header.types.drain(..) {
             discard_scheme(declared.scheme);
         }
-        for effect in header.effects {
+        for effect in artifact.header.effects.drain(..) {
             if let EffectKind::Operations(operations) = effect.kind {
                 for operation in operations {
                     discard_type(operation.from);
@@ -1783,10 +3047,10 @@ pub mod text {
                 }
             }
         }
-        for function in lir.functions {
+        for function in artifact.lir.functions.drain(..) {
             discard_block(function.body);
         }
-        for global in lir.globals {
+        for global in artifact.lir.globals.drain(..) {
             discard_block(global.body);
         }
     }
@@ -1803,10 +3067,10 @@ pub mod text {
         }
 
         fn artifact(self, value: S) -> Result<Artifact, ParseError> {
-            let artifact = self.read_artifact(value);
+            let mut artifact = self.read_artifact(value);
             match self.error.into_inner() {
                 Some(error) => {
-                    discard_artifact(artifact);
+                    discard_artifact(&mut artifact);
                     Err(error)
                 }
                 None => Ok(artifact),
@@ -1976,6 +3240,7 @@ pub mod text {
             Parameter {
                 sense: match self.atom(self.take(&mut value)).as_str() {
                     "type" => Sense::Type,
+                    "fields" => Sense::Fields,
                     "cases" => Sense::Cases,
                     "effects" => Sense::Effects,
                     _ => self.invalid("invalid parameter sense", Sense::Type),
@@ -2060,12 +3325,11 @@ pub mod text {
         fn read_ty(&self, value: S) -> Type {
             enum Task {
                 Ty(S),
-                Core(S),
                 Row(S),
                 Rest(S),
                 Field(S),
-                BuildTy { fields: Vec<String> },
                 BuildArrow,
+                BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
                 BuildRow { labels: Vec<String> },
@@ -2073,93 +3337,75 @@ pub mod text {
                 BuildField(Presence),
             }
             let mut tasks = vec![Task::Ty(value)];
-            // Each task has one statically known result sort. Keep those sorts
-            // on separate stacks so an impossible internal mismatch is not
-            // modeled as malformed artifact input with a semantic fallback.
-            let mut tys = Vec::new();
-            let mut cores = Vec::new();
-            let mut rows = Vec::new();
-            let mut rests = Vec::new();
-            let mut fields_out = Vec::new();
+            let (mut tys, mut rows, mut rests, mut fields_out) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             while let Some(task) = tasks.pop() {
                 match task {
                     Task::Ty(value) => {
-                        let mut values = self.exact(self.list(value, "ty"), 2, "ty");
-                        let core = self.take(&mut values);
-                        let fields = self.many(self.take(&mut values), "fields");
-                        let mut names = Vec::with_capacity(fields.len());
-                        let mut field_values = Vec::with_capacity(fields.len());
-                        for field in fields {
-                            let values = list_contents(field)
-                                .unwrap_or_else(|| self.invalid("bad type field", Vec::new()));
-                            let mut values = self.exact(values, 2, "type field");
-                            names.push(self.string(self.take(&mut values)));
-                            field_values.push(self.take(&mut values));
-                        }
-                        tasks.push(Task::BuildTy { fields: names });
-                        for value in field_values.into_iter().rev() {
-                            tasks.push(Task::Field(value));
-                        }
-                        tasks.push(Task::Core(core));
-                    }
-                    Task::Core(mut value) => match &mut value {
-                        A(value) => cores.push(match value.as_str() {
-                            "unit" => Core::Unit,
-                            "nat" => Core::Nat,
-                            "int" => Core::Int,
-                            "real" => Core::Real,
-                            "string" => Core::String,
-                            "boolean" => Core::Boolean,
-                            "undecided" => Core::Undecided,
-                            _ => self.invalid("invalid type core", Core::Undecided),
-                        }),
-                        L(values) => {
-                            let mut values = std::mem::take(values);
-                            let tag = self.atom(self.take(&mut values));
-                            match tag.as_str() {
-                                "arrow" => {
-                                    let mut values = self.exact(values, 3, "arrow");
-                                    let from = self.take(&mut values);
-                                    let to = self.take(&mut values);
-                                    let effects = self.take(&mut values);
-                                    tasks.push(Task::BuildArrow);
-                                    tasks.push(Task::Row(effects));
-                                    tasks.push(Task::Ty(to));
-                                    tasks.push(Task::Ty(from));
-                                }
-                                "sum" => {
-                                    let value = self.exact(values, 1, "sum").remove(0);
-                                    tasks.push(Task::BuildSum);
-                                    tasks.push(Task::Row(value));
-                                }
-                                "var" => cores.push(Core::Var(
-                                    self.number(self.exact(values, 1, "var").remove(0)),
-                                )),
-                                "bound" => cores.push(Core::Bound(
-                                    self.number(self.exact(values, 1, "bound").remove(0)),
-                                )),
-                                "rigid" => {
-                                    let mut values = self.exact(values, 2, "rigid");
-                                    let id = self.number(self.take(&mut values));
-                                    let name = self.string(self.take(&mut values));
-                                    cores.push(Core::Rigid { id, name });
-                                }
-                                "named" => {
-                                    if values.is_empty() {
-                                        self.fail("named type is missing name");
+                        let mut wrapper = self.exact(self.list(value, "ty"), 1, "ty");
+                        let mut value = self.take(&mut wrapper);
+                        match &mut value {
+                            A(value) => tys.push(match value.as_str() {
+                                "nat" => Type::Nat,
+                                "int" => Type::Int,
+                                "real" => Type::Real,
+                                "string" => Type::String,
+                                "boolean" => Type::Boolean,
+                                "undecided" => Type::Undecided,
+                                _ => self.invalid("invalid type", Type::Undecided),
+                            }),
+                            L(values) => {
+                                let mut values = std::mem::take(values);
+                                match self.atom(self.take(&mut values)).as_str() {
+                                    "arrow" => {
+                                        let mut values = self.exact(values, 3, "arrow");
+                                        let from = self.take(&mut values);
+                                        let to = self.take(&mut values);
+                                        let effects = self.take(&mut values);
+                                        tasks.push(Task::BuildArrow);
+                                        tasks.push(Task::Row(effects));
+                                        tasks.push(Task::Ty(to));
+                                        tasks.push(Task::Ty(from));
                                     }
-                                    let name = self.string(self.take(&mut values));
-                                    let count = values.len();
-                                    tasks.push(Task::BuildNamed { name, count });
-                                    for value in values.into_iter().rev() {
-                                        tasks.push(Task::Ty(value));
+                                    "struct" => {
+                                        let row = self.exact(values, 1, "struct").remove(0);
+                                        tasks.push(Task::BuildStruct);
+                                        tasks.push(Task::Row(row));
                                     }
+                                    "sum" => {
+                                        let row = self.exact(values, 1, "sum").remove(0);
+                                        tasks.push(Task::BuildSum);
+                                        tasks.push(Task::Row(row));
+                                    }
+                                    "var" => tys.push(Type::Var(
+                                        self.number(self.exact(values, 1, "var").remove(0)),
+                                    )),
+                                    "bound" => tys.push(Type::Bound(
+                                        self.number(self.exact(values, 1, "bound").remove(0)),
+                                    )),
+                                    "rigid" => {
+                                        let mut values = self.exact(values, 2, "rigid");
+                                        let id = self.number(self.take(&mut values));
+                                        let name = self.string(self.take(&mut values));
+                                        tys.push(Type::Rigid { id, name });
+                                    }
+                                    "named" => {
+                                        if values.is_empty() {
+                                            self.fail("named type is missing name");
+                                        }
+                                        let name = self.string(self.take(&mut values));
+                                        let count = values.len();
+                                        tasks.push(Task::BuildNamed { name, count });
+                                        for value in values.into_iter().rev() {
+                                            tasks.push(Task::Ty(value));
+                                        }
+                                    }
+                                    _ => tys.push(self.invalid("invalid type", Type::Undecided)),
                                 }
-                                _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
                             }
+                            _ => tys.push(self.invalid("invalid type", Type::Undecided)),
                         }
-                        _ => cores.push(self.invalid("invalid type core", Core::Undecided)),
-                    },
+                    }
                     Task::Row(value) => {
                         let mut values = self.exact(self.list(value, "row"), 2, "row");
                         let labels = self.many(self.take(&mut values), "labels");
@@ -2215,35 +3461,30 @@ pub mod text {
                         tasks.push(Task::Ty(ty));
                     }
                     Task::BuildField(presence) => {
-                        let ty = tys.pop().expect("a field task produces a type");
+                        let ty = tys.pop().expect("field type");
                         fields_out.push(RowField { presence, ty });
                     }
-                    Task::BuildTy { fields } => {
-                        let split = fields_out.len() - fields.len();
-                        let decoded = fields_out.split_off(split);
-                        let core = cores.pop().expect("a type task produces a core");
-                        tys.push(Type {
-                            core,
-                            fields: fields.into_iter().zip(decoded).collect(),
-                        });
-                    }
                     Task::BuildArrow => {
-                        let effects = rows.pop().expect("an arrow task produces an effects row");
-                        let to = tys.pop().expect("an arrow task produces a result type");
-                        let from = tys.pop().expect("an arrow task produces an argument type");
-                        cores.push(Core::Arrow(Box::new(from), Box::new(to), effects));
+                        let effects = rows.pop().expect("effects");
+                        let to = tys.pop().expect("to");
+                        let from = tys.pop().expect("from");
+                        tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+                    }
+                    Task::BuildStruct => {
+                        let row = rows.pop().expect("struct row");
+                        tys.push(Type::Struct(row));
                     }
                     Task::BuildSum => {
-                        let row = rows.pop().expect("a sum task produces a row");
-                        cores.push(Core::Sum(row));
+                        let row = rows.pop().expect("sum row");
+                        tys.push(Type::Sum(row));
                     }
                     Task::BuildNamed { name, count } => {
                         let split = tys.len() - count;
                         let args = tys.split_off(split);
-                        cores.push(Core::Named { name, args });
+                        tys.push(Type::Named { name, args });
                     }
                     Task::BuildRow { labels } => {
-                        let rest = rests.pop().expect("a row task produces a rest");
+                        let rest = rests.pop().expect("rest");
                         let split = fields_out.len() - labels.len();
                         let fields = fields_out.split_off(split);
                         rows.push(Row {
@@ -2252,12 +3493,12 @@ pub mod text {
                         });
                     }
                     Task::BuildMore => {
-                        let row = rows.pop().expect("a more task produces a row");
+                        let row = rows.pop().expect("more row");
                         rests.push(Rest::More(Box::new(row)));
                     }
                 }
             }
-            tys.pop().expect("the root type task produces a type")
+            tys.pop().expect("root type")
         }
         fn read_presence(&self, mut value: S) -> Presence {
             match &mut value {

@@ -10,7 +10,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token::lex,
     tracking::FileID,
-    types::{Core, Formula, Rest, Row, Ty},
+    types::{Formula, Rest, Row, Ty},
 };
 
 fn dummy_mint() -> Mint {
@@ -196,26 +196,65 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
     // Coverage can mention a solver atom with no corresponding readable path.
     // A malformed nested path exercises the same conservative fallback after
     // the path lookup itself fails.
-    let mut missing_path = inferred.clone();
-    let paths = missing_path
+    for malformed in [
+        vec!["missing.field".to_string()],
+        vec!["a.b".to_string()],
+        vec!["a".to_string(), "below".to_string()],
+    ] {
+        let mut missing_path = inferred.clone();
+        let paths = missing_path
+            .store
+            .batches
+            .iter_mut()
+            .find_map(|batch| match &mut batch.origin {
+                inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
+                _ => None,
+            })
+            .expect("the coverage batch carries paths");
+        assert!(!paths.is_empty());
+        for (path, _) in paths {
+            *path = malformed.clone();
+        }
+        let checks = patterns::check(&out.program, &missing_path);
+        assert!(checks.errors.is_empty(), "{checks:#?}");
+        assert!(matches!(
+            sole_report(&checks).coverage,
+            Coverage::Exhaustive
+        ));
+    }
+}
+
+#[test]
+fn struct_pattern_compatibility_flattens_forwarded_rows() {
+    let checks = clean(
+        "type WithX 'r = { x: Nat, ..'r }\n\
+         let f : WithX { y: Nat } -> Nat = fn v =>\n\
+         match v with | { y, .. } => y end",
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable]);
+}
+
+#[test]
+fn a_struct_pattern_with_a_corrupted_non_struct_type_is_skipped_safely() {
+    let src = "let f = fn v => match v with | { a } => 1n | _ => 2n end";
+    let (mut out, mut inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    scrutinee.ty = Rc::new(Ty::Nat);
+    inferred
         .store
         .batches
-        .iter_mut()
-        .find_map(|batch| match &mut batch.origin {
-            inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
-            _ => None,
-        })
-        .expect("the coverage batch carries paths");
-    assert!(!paths.is_empty());
-    for (path, _) in paths {
-        *path = "missing.field".to_string();
-    }
-    let checks = patterns::check(&out.program, &missing_path);
-    assert!(checks.errors.is_empty(), "{checks:#?}");
-    assert!(matches!(
-        sole_report(&checks).coverage,
-        Coverage::Exhaustive
-    ));
+        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
+    let checked = patterns::check(&out.program, &inferred);
+    assert!(matches!(sole_report(&checked).coverage, Coverage::Skipped));
 }
 
 #[test]
@@ -250,14 +289,69 @@ fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
 }
 
 #[test]
+fn dotted_quoted_presence_paths_remain_structured_in_nested_matches() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {\"a.b\": x} => 0n | {y} => 0n end in\n\
+               \x20   match v with | {\"a.b\": 1n} => 1n | {\"a.b\": n} => 2n | {y} => 3n end in\n\
+               \x20 0n";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("the nested guarded match");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+    assert!(inferred.store.batches.iter().any(|batch| {
+        matches!(
+            &batch.origin,
+            inference::Origin::Coverage(coverage)
+                if coverage.paths.iter().any(|(path, _)| path == &["a.b".to_string()])
+        )
+    }));
+}
+
+#[test]
 fn nested_presence_paths_are_translated_for_arm_guards() {
-    let checks = clean(
-        "let f = fn v => match v with \
-         | {box: {x}} => 1n | {box: {y}} => 2n end",
-    );
+    let src = "let f = fn v => match v with \
+               | {box: {x}} => 1n | {box: {y}} => 2n end";
+    let checks = clean(src);
     let report = sole_report(&checks);
     assert!(matches!(report.coverage, Coverage::Exhaustive));
     assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+    // Forward both components of the stored `box.x` path through More links.
+    // The assumptions must still rename to the same bound presences, or the
+    // second arm is incorrectly declared unreachable.
+    let (mut out, inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    let Ty::Struct(outer) = &*scrutinee.ty else {
+        panic!("struct scrutinee fixture")
+    };
+    let mut outer = outer.clone();
+    let field = outer.labels.get_mut("box").expect("box field");
+    let Ty::Struct(inner) = &*field.ty else {
+        panic!("nested struct fixture")
+    };
+    let inner = inner.clone();
+    field.ty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(inner)),
+    }));
+    scrutinee.ty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(outer)),
+    }));
+    let checks = patterns::check(&out.program, &inferred);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    assert_eq!(verdicts(sole_report(&checks)), [Verdict::Reachable; 2]);
 }
 
 #[test]
@@ -272,7 +366,7 @@ fn ordered_overlap_and_nested_guards_agree_with_pattern_reachability() {
         inferred.refinements[1]
             .facts
             .iter()
-            .any(|fact| fact.field == "x" && !fact.present)
+            .any(|fact| fact.field == ["x".to_string()] && !fact.present)
     );
 
     let checks = clean(
@@ -546,14 +640,18 @@ fn an_empty_match_over_an_open_sum_is_skipped() {
     let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
         panic!("the body is an empty match");
     };
-    let row = Row {
-        rest: Rest::Bound(0),
-        ..Row::default()
-    };
-    scrutinee.ty = Rc::new(Ty::plain(Core::Sum(row)));
+    let row = Row::of(Rest::Bound(0));
+    scrutinee.ty = Rc::new(Ty::plain(Ty::Sum(row)));
 
     let checks = patterns::check(&out.program, &inferred);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+    assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
+}
+
+#[test]
+fn an_unresolved_struct_scrutinee_skips_shape_specific_usefulness() {
+    let (out, _, checks) = checked("let f = match nope with | { x } => 1n end");
+    assert!(!out.errors.is_empty());
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 }
 
@@ -737,6 +835,28 @@ fn an_abandoned_presence_skips_the_checks() {
 /// A sum position whose every case is ruled out and whose rest stays open:
 /// what escapes is anything at all, and the witness says so rather than
 /// being "anything other than" nothing.
+#[test]
+fn an_abandoned_struct_tail_skips_reachability_cascade() {
+    let src = "let f = fn v => match v with | {a} => 1n | {} => 2n end";
+    let (mut out, mut inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    scrutinee.ty = Rc::new(Ty::Struct(Row::of(Rest::Undecided)));
+    inferred
+        .store
+        .batches
+        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
+    let checks = patterns::check(&out.program, &inferred);
+    assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+    assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
+}
+
 #[test]
 fn an_open_sum_with_no_cases_witnesses_as_anything() {
     let src = "let f : { a: Nat, b: (\\#X | ..'r), .. } -> Nat = \

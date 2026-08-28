@@ -605,3 +605,11 @@ fn extern_is_reserved_as_a_declaration_keyword() {
     );
     assert!(matches!(&kinds("external")[..], [Kind::Identifier(name)] if name == "external"));
 }
+
+#[test]
+fn a_sigil_followed_by_a_non_identifier_word_is_rejected() {
+    let out = lex("'1", FileID::GENERATED);
+    assert!(!out.errors.is_empty());
+    let out = lex("1.a", FileID::GENERATED);
+    assert!(out.errors.is_empty());
+}

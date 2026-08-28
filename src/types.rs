@@ -12,10 +12,8 @@ use crate::symbol::Symbol;
 /// [`ir::TypeKind`](crate::ir::TypeKind) and the semantic type language, so the
 /// two can never disagree about which primitives exist.
 ///
-/// Unit is deliberately not one of them. `()` is a spelling of the type with
-/// nothing of its own and no fields, not a type of its own, so there is nothing
-/// here for it to name; see [`Core::Unit`] for why it stays that way even though
-/// it means the compiler answers in `{}` where the user wrote `()`.
+/// Unit is deliberately not one of them. `()` is the empty closed
+/// [`Ty::Struct`], so there is no primitive for it to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim {
     /// The type of unsigned 64-bit integer literals.
@@ -58,14 +56,56 @@ impl EffectId {
         Self::Structural { name, interface }
     }
 
-    /// The stable semantic row key. The separator cannot occur in an
-    /// identifier, and keeps incompatible same-named effects distinct without
-    /// leaking their interface into printed types.
+    /// The stable semantic row key. Both components are byte-length prefixed:
+    /// imported recovery data is allowed to contain every character, including
+    /// the separator used by older artifacts, so a delimiter alone cannot be
+    /// an unambiguous identity boundary.
     pub fn row_key(&self) -> String {
         match self {
-            Self::Structural { name, interface } => format!("{name}\u{1f}{interface}"),
+            Self::Structural { name, interface } => {
+                format!(
+                    "\u{1e}e{}:{name}{}:{interface}",
+                    name.len(),
+                    interface.len()
+                )
+            }
             Self::Pending(_) => panic!("effect row reached inference before structuralization"),
         }
+    }
+
+    /// Decode a semantic effect-row key. The length-prefixed spelling is
+    /// canonical; the unit-separator spelling remains readable so old artifact
+    /// rows can be normalized while importing them.
+    pub fn parse_row_key(key: &str) -> Option<(&str, &str)> {
+        Self::parse_canonical_row_key(key).or_else(|| key.split_once('\u{1f}'))
+    }
+
+    /// Decode only the canonical generated spelling. UI code uses this when a
+    /// sum-shaped type argument has no explicit row sense: legacy separators
+    /// are artifact input, not enough evidence that an ordinary sum is effects.
+    pub fn parse_canonical_row_key(key: &str) -> Option<(&str, &str)> {
+        fn component<'a>(key: &'a str, at: &mut usize) -> Option<&'a str> {
+            let bytes = key.as_bytes();
+            let start = *at;
+            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            if start == *at || bytes.get(*at) != Some(&b':') {
+                return None;
+            }
+            let length: usize = key.get(start..*at)?.parse().ok()?;
+            *at += 1;
+            let end = at.checked_add(length)?;
+            let value = key.get(*at..end)?;
+            *at = end;
+            Some(value)
+        }
+
+        let rest = key.strip_prefix("\u{1e}e")?;
+        let mut at = 0;
+        let name = component(rest, &mut at)?;
+        let interface = component(rest, &mut at)?;
+        (at == rest.len()).then_some((name, interface))
     }
 
     pub fn name(&self) -> &str {
@@ -85,11 +125,8 @@ impl EffectId {
 /// unified, flattened, generalized and printed by the same code, and this is the
 /// only thing that tells them apart.
 ///
-/// What each says about the names it does not list is the one place the two
-/// differ. A struct's is the core beside it — [`Ty::fields`] is a bare label map
-/// and [`Ty::core`] is what its `..` stands for — and a sum's is the
-/// [`Rest`] inside its [`Row`]. So a struct's fields have no tail of their own,
-/// and [`Row`] and [`Rest`] survive for [`Core::Sum`] alone.
+/// Every shape uses an explicit [`Row`] and [`Rest`]; the containing `Ty`
+/// variant determines whether its labels are fields, cases, or effects.
 ///
 /// Stored nowhere. Where a set of labels sits already says which it is, so the
 /// shape is a *reading* the caller carries down — the way `solve::Rowed` does —
@@ -118,22 +155,14 @@ pub enum Shape {
 /// What one parameter of a `type` declaration stands for, without the labels it
 /// carries.
 ///
-/// The question by itself, so that a complaint about a parameter read two ways
-/// can name the two readings without quoting a set of labels nobody asked
-/// about. See [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind).
-///
-/// Four of them rather than two, because a variable can be two
-/// things a declaration's parameter never can: the presence a `when` names, and
-/// nothing here — the rest of a struct *is* a type, since `..'r` in a struct
-/// puts whatever is written for `'r` in the type's core. A sum's rest and an
-/// arrow's effects are readings of their own, for the reason [`Rest`] gives:
-/// neither is a position a whole type could go in.
-///
-/// [`ParamKind`] answers with the first three alone: a declaration binds no
-/// presence, so nothing there can ever be read the fourth way.
+/// Struct fields, sum cases, and arrow effects are distinct row sorts. A row
+/// parameter can only be forwarded to a position with the same sense; none is a
+/// whole type. Presence is the additional annotation-only sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sense {
     Type,
+    /// The rest of a struct's fields.
+    Fields,
     Cases,
     /// The effects an arrow may perform: `..'e` in `type Runner 'e = (Nat -> Nat
     /// + ..'e) -> Nat + ..'e`.
@@ -158,7 +187,7 @@ pub enum Sense {
 ///
 /// Both carry the labels an argument written there may not name. `'r` in
 /// `type WithX 'r = { x: Nat, ..'r }` is a [`ParamKind::Type`] whose set is
-/// `{x}`: the core covers the fields the declaration does not write out, so an
+/// `{x}`: the constructor covers the fields the declaration does not write out, so an
 /// `'r` with an `x` of its own would give the type two fields of one name, and
 /// the two copies could disagree. Carrying the set rather than a bare flag is what lets
 /// the condition be said where the argument is written, at the span the reader
@@ -171,17 +200,16 @@ pub enum Sense {
 /// about an argument breaking the rule twice always names the same label first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
-    /// Stands for a type. `'A` in `type Pair 'A 'B`, and `'r` in
-    /// `type WithX 'r = { x: Nat, ..'r }` alike — the rest of a struct is a
-    /// type, so there is nothing else for it to be, and `WithX Nat` is as
-    /// well-formed
-    /// as `WithX { y: Nat }`.
+    /// Stands for a whole type. `'A` in `type Pair 'A 'B`.
     Type { lacks: IndexSet<String> },
+    /// Stands for fields a struct does not name. `'r` in
+    /// `type WithX 'r = { x: Nat, ..'r }`.
+    Fields { lacks: IndexSet<String> },
     /// Stands for the cases a sum does not name — and, with them, the cases it
     /// may therefore not name itself. `'r` in `type Or 'r = #A | ..'r`.
     ///
     /// The one reading that is not a type, and the reason it is enforced rather
-    /// than substituted: a sum's rest is spliced into [`Core::Sum`]'s row, so
+    /// than substituted: a sum's rest is spliced into [`Ty::Sum`]'s row, so
     /// anything else written there would leave a row holding what no row can
     /// hold. See [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind).
     Cases { lacks: IndexSet<String> },
@@ -190,7 +218,7 @@ pub enum ParamKind {
     /// `type Runner 'e = (Nat -> Nat + ..'e) -> Nat + ..'e`.
     ///
     /// [`ParamKind::Cases`]'s twin, and enforced for the same reason: an effect
-    /// row's rest is spliced into the row [`Core::Arrow`] carries, so anything
+    /// row's rest is spliced into the row [`Ty::Arrow`] carries, so anything
     /// else written there would leave a row holding what no row can hold.
     Effects { lacks: IndexSet<String> },
 }
@@ -264,42 +292,10 @@ pub struct Scheme {
     formula: Formula,
 }
 
-/// A type: what it is, and the struct fields it carries.
-///
-/// Every type has both halves. `Nat` is the `Nat` core with no fields; a struct
-/// is the [`Core::Unit`] core with fields; and a `Nat` that carries an `x` is
-/// the `Nat` core with an `x`, which the solver can infer and the printer can
-/// show even though no source syntax writes one.
-///
-/// Splitting them this way is what makes "has fields" a property of every type
-/// rather than of one shape of type. Two types are equal when they name the same
-/// labels and their cores agree about everything else, which is one rule where
-/// there used to be a rule about structs and a complaint for everything else.
-///
-/// The fields are a bare label map with no tail of their own, because the core
-/// beside them *is* their tail: `{ x: Nat, ..'r }` is the type `'r` carrying an
-/// `x`, and what the type says about the fields it does not name is the whole of
-/// what its core says. So one variable does the work two used to — `fn a => a.x`
-/// is `{ x: 'a, ..'b } -> 'a` — and substituting for a struct's `..` is
-/// substituting a type, which is the one substitution the compiler already has.
+/// A semantic type. Only `Struct` contains structural fields; every other
+/// constructor is fieldless by construction.
 #[derive(Debug, Clone, Default)]
-pub struct Ty {
-    pub core: Core,
-    /// The labels this type carries, each either there or not. What the type
-    /// says about the labels it does *not* name is [`Ty::core`]: a `Unit`,
-    /// `Nat`, `Arrow`, `Sum` or `Named` core names no others, a [`Core::Var`]
-    /// stands for whatever that variable has, a [`Core::Bound`] for whatever the
-    /// parameter has, and [`Core::Undecided`] has nothing further to report.
-    pub fields: IndexMap<String, RowField>,
-}
-
-/// What a type is, before the fields it carries.
-#[derive(Debug, Clone, Default)]
-pub enum Core {
-    /// A type with nothing of its own. `{}` and `()` are this with no fields,
-    /// which is why unit falls out of the printer as `{}` rather than as `()`:
-    /// there is one type here and one spelling for it.
-    Unit,
+pub enum Ty {
     Nat,
     Int,
     Real,
@@ -314,30 +310,28 @@ pub enum Core {
     /// what the printer writes as nothing at all.
     ///
     /// The third position is [`Shape::Effect`]'s only home, the way
-    /// [`Core::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
+    /// [`Ty::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
     /// property of every type, so there is nowhere else for the row to live.
     Arrow(Rc<Ty>, Rc<Ty>, Row),
+    /// A structural record and its true field-row tail.
+    Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
     /// tail saying what is known about the cases not named.
     ///
     /// A value *is* one of the cases the row says is there, where the fields
-    /// beside this core are labels a value *has*. Everything between those two
+    /// in this struct are labels a value *has*. Everything between those two
     /// sentences — unification, flattening, the lacks condition, generalization
     /// — is written once and reaches both, with [`Shape`] as the only thing
     /// saying which is being read.
     ///
-    /// The one place a [`Row`] survives, and so the one place a [`Rest`] does.
-    /// A struct's `..` moved into the core beside its fields because every type
-    /// has fields and so every core can carry them; "is one of these cases" is
-    /// not a property of every type, and this is the only core with a case row,
-    /// so there is no core position for a sum's tail to move into.
+    /// Sum cases and their explicit tail.
     Sum(Row),
     Var(TyVar),
     /// A variable some [`Scheme`] binds, by its position in that scheme.
     ///
     /// Which scheme depends on where the type came from, and the two never
     /// meet. In a definition's scheme it is a variable generalization
-    /// quantified, and instantiation hands it a fresh [`Core::Var`]. In a
+    /// quantified, and instantiation hands it a fresh [`Ty::Var`]. In a
     /// declaration's scheme it is one of the declaration's parameters, and
     /// unfolding hands it the argument written at the use site. Both are the
     /// same substitution — see `open` in [`inference`](crate::inference) — which
@@ -364,13 +358,13 @@ pub enum Core {
     ///
     /// `id` is unique per declaration occurrence across the whole program, so
     /// two annotations that each write `a` never collide however alike they
-    /// look. `name` is the spelling, carried for the reason [`Core::Named`]
+    /// look. `name` is the spelling, carried for the reason [`Ty::Named`]
     /// carries one: [`Display`](std::fmt::Display) is handed a bare type with no
     /// table to ask.
     ///
-    /// A leaf, unlike [`Core::Bound`]. Nothing supplies a value for it — the
-    /// scheme the annotation publishes re-quantifies it into a [`Core::Bound`]
-    /// at generalization — so the fields written beside one are the whole of
+    /// A leaf, unlike [`Ty::Bound`]. Nothing supplies a value for it — the
+    /// scheme the annotation publishes re-quantifies it into a [`Ty::Bound`]
+    /// at generalization — so the fields written in one are the whole of
     /// what a type carrying it says.
     Rigid {
         id: u32,
@@ -442,13 +436,8 @@ pub enum Core {
     Undecided,
 }
 
-/// The cases a sum allows, each either there or not, and what is known about
+/// The fields/cases/effects a row allows and what is known beyond its labels.
 /// the ones it does not list.
-///
-/// A sum's business and nothing else: this appears inside [`Core::Sum`] and
-/// nowhere else in the type language, because a struct's fields are a bare label
-/// map on [`Ty`] whose tail is the core beside them. See [`Rest`] for why the
-/// two are not the same shape of thing.
 ///
 /// A type of its own rather than a shape of [`Ty`], and that is what makes the
 /// recursion terminate: a closed tail is a [`Rest::Closed`], not a type that
@@ -459,21 +448,8 @@ pub struct Row {
     pub rest: Rest,
 }
 
-/// What is known about the cases a [`Row`] does not name.
-///
-/// A sum's alone. A struct once had one of these too, and it said the same thing
-/// twice: a [`Core::Var`] beside a field map already stands for a whole type
-/// that may carry fields of its own, so the tail variable next to it was a
-/// second mechanism for one meaning. The two are now one, and what a struct says
-/// about the fields it does not name is its core.
-///
-/// The same merge cannot be done here, and that asymmetry is why this type
-/// survives. "Has fields" is a property of every type, so every core can carry
-/// them; "is one of these cases" is not, and [`Core::Sum`] is the only core with
-/// a case row, so there is no core position for a sum's tail to move into. It is
-/// also why [`Sense`], [`ir::ErrorKind::NotARow`](crate::ir::ErrorKind) and
-/// [`ir::ErrorKind::MixedParameter`](crate::ir::ErrorKind) still have two things
-/// to tell apart.
+/// What is known beyond the labels a [`Row`] names. The containing type fixes
+/// whether this is a field, case, or effect-row tail.
 #[derive(Debug, Clone, Default)]
 pub enum Rest {
     /// Every case not named is absent: the row lists all of them.
@@ -483,14 +459,14 @@ pub enum Rest {
     /// A tail a scheme quantified, or one a declaration takes as a sum's rest.
     /// A leaf: what it stands for is supplied from outside.
     Bound(u32),
-    /// A rest an annotation introduced: [`Core::Rigid`] about a
+    /// A rest an annotation introduced: [`Ty::Rigid`] about a
     /// sum's cases, and rigid for the same reason and on the same terms.
     Rigid {
         id: u32,
         name: Rc<str>,
     },
     /// A failure abandoned the question, or a reporter froze it. Absorbs, the
-    /// way [`Core::Undecided`] does.
+    /// way [`Ty::Undecided`] does.
     Undecided,
     /// A tail that has been decided to be more cases, and then whatever is
     /// past them: a sum's row parameter handed a written sum, or a tail variable
@@ -530,6 +506,10 @@ pub enum Presence {
     /// a closed one that lacks the label.
     Absent,
     Var(TyVar),
+    /// A foreign solver variable retained only long enough to canonicalize an
+    /// imported interface. Its namespace is disjoint from both local variables
+    /// and scheme bounds; opening an imported scheme recovers it to undecided.
+    Recovered(TyVar),
     /// A presence a scheme quantified, which prints as the `when` clause on its
     /// label: `{x when a: Nat}`, and `#A (when a) Nat`.
     Bound(u32),
@@ -565,6 +545,7 @@ impl ParamKind {
     pub fn lacks(&self) -> &IndexSet<String> {
         match self {
             ParamKind::Type { lacks }
+            | ParamKind::Fields { lacks }
             | ParamKind::Cases { lacks }
             | ParamKind::Effects { lacks } => lacks,
         }
@@ -574,6 +555,7 @@ impl ParamKind {
     pub fn sense(&self) -> Sense {
         match self {
             ParamKind::Type { .. } => Sense::Type,
+            ParamKind::Fields { .. } => Sense::Fields,
             ParamKind::Cases { .. } => Sense::Cases,
             ParamKind::Effects { .. } => Sense::Effects,
         }
@@ -583,9 +565,10 @@ impl ParamKind {
     /// be spliced into — or `None` when the parameter stands for a type. What
     /// the one check that is still about a shape asks: a sum's rest and an
     /// arrow's effects are both spliced into a row, so only a row can go there.
-    pub fn cases(&self) -> Option<(Shape, &IndexSet<String>)> {
+    pub fn row(&self) -> Option<(Shape, &IndexSet<String>)> {
         match self {
             ParamKind::Type { .. } => None,
+            ParamKind::Fields { lacks } => Some((Shape::Struct, lacks)),
             ParamKind::Cases { lacks } => Some((Shape::Sum, lacks)),
             ParamKind::Effects { lacks } => Some((Shape::Effect, lacks)),
         }
@@ -597,14 +580,14 @@ impl Assigned {
     ///
     /// A type is what a type position is opened to, and every caller hands one:
     /// a declaration's argument is a written type, and a scheme's fresh
-    /// variable is a bare core. A row or a presence reaching a type position
+    /// variable is an unconstrained type. A row or a presence reaching a type position
     /// would be a parameter used at two sorts, which nothing can write — so
     /// rather than a rule for it there is a type that says nothing, which
     /// absorbs the way every other unanswerable type does.
     pub fn as_ty(&self) -> Rc<Ty> {
         match self {
             Assigned::Ty(ty) => ty.clone(),
-            Assigned::Row(_) | Assigned::Presence(_) => Rc::new(Ty::plain(Core::Undecided)),
+            Assigned::Row(_) | Assigned::Presence(_) => Rc::new(Ty::Undecided),
         }
     }
 
@@ -620,7 +603,7 @@ impl Assigned {
     /// sum's tail wants that variable standing for the rest rather than for a
     /// type with no cases at all.
     ///
-    /// No shape to be told any more. A struct's `..` is its core, and opening
+    /// No shape to be told any more. A struct's `..` is its row tail, and opening
     /// one is [`as_ty`](Self::as_ty); only a sum's rest is still a row, so this
     /// is about cases and nothing else.
     ///
@@ -629,9 +612,10 @@ impl Assigned {
     pub fn as_row(&self) -> Row {
         match self {
             Assigned::Row(row) => (**row).clone(),
-            Assigned::Ty(ty) => match (&ty.core, ty.fields.is_empty()) {
-                (Core::Var(var), true) => Row::of(Rest::Var(*var)),
-                _ => ty.cases(),
+            Assigned::Ty(ty) => match &**ty {
+                Ty::Var(var) => Row::of(Rest::Var(*var)),
+                Ty::Struct(row) | Ty::Sum(row) => row.clone(),
+                _ => Row::of(Rest::Undecided),
             },
             Assigned::Presence(_) => Row::closed(),
         }
@@ -656,7 +640,7 @@ impl Assigned {
     /// minted for.
     pub fn variable(&self, var: TyVar) -> Self {
         match self {
-            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::plain(Core::Var(var)))),
+            Assigned::Ty(_) => Assigned::Ty(Rc::new(Ty::Var(var))),
             Assigned::Row(_) => Assigned::Row(Rc::new(Row::of(Rest::Var(var)))),
             Assigned::Presence(_) => Assigned::Presence(Presence::Var(var)),
         }
@@ -674,50 +658,254 @@ impl Assigned {
     }
 }
 
-impl Core {
+fn take_row_children(row: &mut Row, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    types.extend(
+        std::mem::take(&mut row.labels)
+            .into_values()
+            .map(|field| field.ty),
+    );
+    if let Rest::More(more) = std::mem::take(&mut row.rest) {
+        rows.push(more);
+    }
+}
+
+fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    match ty {
+        Ty::Arrow(from, to, effects) => {
+            types.push(std::mem::replace(from, Rc::new(Ty::Undecided)));
+            types.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
+            take_row_children(effects, types, rows);
+        }
+        Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
+        Ty::Named { args, .. } => {
+            types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
+        }
+        Ty::Nat
+        | Ty::Int
+        | Ty::Real
+        | Ty::String
+        | Ty::Boolean
+        | Ty::Var(_)
+        | Ty::Bound(_)
+        | Ty::Rigid { .. }
+        | Ty::Undecided => {}
+    }
+}
+
+fn discard_semantic_children(types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+    loop {
+        while let Some(row) = rows.pop() {
+            if let Ok(mut row) = Rc::try_unwrap(row) {
+                take_row_children(&mut row, types, rows);
+                // The recursive owners have been removed, so Row::drop sees an
+                // empty shell and does constant-depth work.
+                drop(row);
+            }
+        }
+        let Some(ty) = types.pop() else { break };
+        if let Ok(mut ty) = Rc::try_unwrap(ty) {
+            take_ty_children(&mut ty, types, rows);
+            // Every recursive owner was replaced above. Its ordinary Drop is
+            // therefore constant-depth and can release scalar fields.
+            drop(ty);
+        }
+    }
+}
+
+impl Drop for Ty {
+    fn drop(&mut self) {
+        let mut types = Vec::new();
+        let mut rows = Vec::new();
+        take_ty_children(self, &mut types, &mut rows);
+        discard_semantic_children(&mut types, &mut rows);
+    }
+}
+
+impl Drop for Row {
+    fn drop(&mut self) {
+        let mut types = Vec::new();
+        let mut rows = Vec::new();
+        take_row_children(self, &mut types, &mut rows);
+        discard_semantic_children(&mut types, &mut rows);
+    }
+}
+
+/// Exact equality of finite semantic type syntax.
+///
+/// Declared names and rigid spellings are diagnostic data, not identities:
+/// their symbols and minted ids are. The explicit work list keeps deeply nested
+/// alias arguments and [`Rest::More`] chains off the native stack.
+pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
+    enum Pair<'a> {
+        Ty(&'a Ty, &'a Ty),
+        Row(&'a Row, &'a Row),
+    }
+
+    fn same_presence(left: &Presence, right: &Presence) -> bool {
+        match (left, right) {
+            (Presence::Present, Presence::Present)
+            | (Presence::Absent, Presence::Absent)
+            | (Presence::Undecided, Presence::Undecided) => true,
+            (Presence::Var(left), Presence::Var(right))
+            | (Presence::Bound(left), Presence::Bound(right))
+            | (Presence::Recovered(left), Presence::Recovered(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    let mut pending = vec![Pair::Ty(left, right)];
+    let mut seen_types = std::collections::HashSet::new();
+    let mut seen_rows = std::collections::HashSet::new();
+    while let Some(pair) = pending.pop() {
+        match pair {
+            Pair::Ty(left, right) => {
+                if std::ptr::eq(left, right)
+                    || !seen_types.insert((left as *const Ty, right as *const Ty))
+                {
+                    continue;
+                }
+                match (left, right) {
+                    (Ty::Nat, Ty::Nat)
+                    | (Ty::Int, Ty::Int)
+                    | (Ty::Real, Ty::Real)
+                    | (Ty::String, Ty::String)
+                    | (Ty::Boolean, Ty::Boolean)
+                    | (Ty::Undecided, Ty::Undecided) => {}
+                    (Ty::Var(left), Ty::Var(right)) | (Ty::Bound(left), Ty::Bound(right)) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Ty::Rigid { id: left, .. }, Ty::Rigid { id: right, .. }) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (
+                        Ty::Arrow(left_from, left_to, left_row),
+                        Ty::Arrow(right_from, right_to, right_row),
+                    ) => {
+                        pending.push(Pair::Row(left_row, right_row));
+                        pending.push(Pair::Ty(left_to, right_to));
+                        pending.push(Pair::Ty(left_from, right_from));
+                    }
+                    (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
+                        pending.push(Pair::Row(left, right))
+                    }
+                    (
+                        Ty::Named {
+                            symbol: left_symbol,
+                            args: left_args,
+                            ..
+                        },
+                        Ty::Named {
+                            symbol: right_symbol,
+                            args: right_args,
+                            ..
+                        },
+                    ) => {
+                        if left_symbol != right_symbol || left_args.len() != right_args.len() {
+                            return false;
+                        }
+                        pending.extend(
+                            left_args
+                                .iter()
+                                .zip(right_args.iter())
+                                .map(|(left, right)| Pair::Ty(left, right)),
+                        );
+                    }
+                    _ => return false,
+                }
+            }
+            Pair::Row(left, right) => {
+                if std::ptr::eq(left, right)
+                    || !seen_rows.insert((left as *const Row, right as *const Row))
+                {
+                    continue;
+                }
+                if left.labels.len() != right.labels.len() {
+                    return false;
+                }
+                for (name, left_field) in &left.labels {
+                    let Some(right_field) = right.labels.get(name) else {
+                        return false;
+                    };
+                    if !same_presence(&left_field.presence, &right_field.presence) {
+                        return false;
+                    }
+                    // An absent label has no payload; recovery is free to leave
+                    // any finite type in that semantically unreachable slot.
+                    if !matches!(left_field.presence, Presence::Absent) {
+                        pending.push(Pair::Ty(&left_field.ty, &right_field.ty));
+                    }
+                }
+                match (&left.rest, &right.rest) {
+                    (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => {}
+                    (Rest::Var(left), Rest::Var(right))
+                    | (Rest::Bound(left), Rest::Bound(right)) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Rest::Rigid { id: left, .. }, Rest::Rigid { id: right, .. }) => {
+                        if left != right {
+                            return false;
+                        }
+                    }
+                    (Rest::More(left), Rest::More(right)) => {
+                        pending.push(Pair::Row(left, right));
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    true
+}
+
+impl Ty {
     /// `from -> to`, performing nothing: [`Row::closed`] with no labels, which
     /// is what a bare `A -> B` means and what the printer writes as nothing at
     /// all. Every position that builds an arrow with no effects to put on it
     /// goes through here rather than spelling the empty row again.
     pub fn pure(from: Rc<Ty>, to: Rc<Ty>) -> Self {
-        Core::Arrow(from, to, Row::closed())
+        Ty::Arrow(from, to, Row::closed())
     }
 }
 
-impl From<Prim> for Core {
+impl From<Prim> for Ty {
     fn from(value: Prim) -> Self {
         match value {
-            Prim::Nat => Core::Nat,
-            Prim::Int => Core::Int,
-            Prim::Real => Core::Real,
-            Prim::String => Core::String,
-            Prim::Boolean => Core::Boolean,
+            Prim::Nat => Ty::Nat,
+            Prim::Int => Ty::Int,
+            Prim::Real => Ty::Real,
+            Prim::String => Ty::String,
+            Prim::Boolean => Ty::Boolean,
         }
     }
 }
 
 impl Ty {
-    /// A type that is only its core, carrying no fields at all. Every type the
-    /// language can currently *write* is one of these or a [`Ty::unit`] with
-    /// fields, so this is what nearly every constructor in the compiler wants.
-    pub fn plain(core: Core) -> Self {
-        Self {
-            core,
-            fields: IndexMap::new(),
+    /// Compatibility constructor for callers that already have a complete
+    /// explicit type value.
+    pub fn plain(ty: Ty) -> Self {
+        ty
+    }
+
+    /// The empty closed struct, also used for unit.
+    pub fn unit() -> Self {
+        Self::Struct(Row::closed())
+    }
+
+    /// The field row inside a struct, if this is one.
+    pub fn fields(&self) -> Option<&Row> {
+        match self {
+            Ty::Struct(row) => Some(row),
+            _ => None,
         }
     }
 
-    /// The type with nothing of its own and no fields: what `()` and `{}` both
-    /// spell, what a case written with no payload carries, and what a struct
-    /// type is before its fields are put in.
-    ///
-    /// One spelling and one constructor, because a second empty type would be
-    /// one the solver could find not quite equal to the first.
-    pub fn unit() -> Self {
-        Self::plain(Core::Unit)
-    }
-
-    /// The cases this type allows: the row inside a [`Core::Sum`], and the one
+    /// The cases this type allows: the row inside a [`Ty::Sum`].
     /// thing anything still asks a type for a row about.
     ///
     /// Anything else is an argument [`ir::build`](crate::ir::build) already
@@ -725,8 +913,8 @@ impl Ty {
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {
-        match &self.core {
-            Core::Sum(cases) => cases.clone(),
+        match self {
+            Ty::Sum(cases) => cases.clone(),
             _ => Row::of(Rest::Undecided),
         }
     }
@@ -752,6 +940,18 @@ impl Row {
     pub fn closed() -> Self {
         Self::of(Rest::Closed)
     }
+
+    /// Consume a row into its labels and tail.
+    ///
+    /// Rows have a custom destructor so a deep [`Rest::More`] chain is released
+    /// iteratively. This is the ownership-preserving replacement for moving the
+    /// public fields directly out of a row.
+    pub fn into_parts(mut self) -> (IndexMap<String, RowField>, Rest) {
+        (
+            std::mem::take(&mut self.labels),
+            std::mem::take(&mut self.rest),
+        )
+    }
 }
 
 impl RowField {
@@ -768,14 +968,14 @@ impl RowField {
 
 impl Scheme {
     /// Close `body` over the type and row variables it binds, requiring nothing
-    /// of its presences. Every [`Core::Bound`] and [`Rest::Bound`] in `body`
+    /// of its presences. Every [`Ty::Bound`] and [`Rest::Bound`] in `body`
     /// must be an index below `count`; opening one trusts that.
     ///
     /// Two things are closed this way and the difference is only in who
     /// supplies the values: a definition's scheme binds what generalization
     /// quantified, and instantiation hands each one a fresh variable; a
     /// declaration's binds its parameters, and unfolding hands each one the
-    /// argument written at the use site. See [`Core::Bound`].
+    /// argument written at the use site. See [`Ty::Bound`].
     ///
     /// A declaration's scheme is always one of these: a declaration's body
     /// holds no presence variable — lowering refuses a `when` there for the
@@ -842,32 +1042,58 @@ impl Formula {
 
     /// The negation, with the two constants and a double negative folded away.
     #[allow(clippy::should_implement_trait)]
-    pub fn not(self) -> Self {
-        match self {
-            Formula::True => Formula::False,
-            Formula::False => Formula::True,
-            Formula::Not(inner) => (*inner).clone(),
-            other => Formula::Not(Rc::new(other)),
+    pub fn not(mut self) -> Self {
+        if matches!(self, Formula::True) {
+            return Formula::False;
         }
+        if matches!(self, Formula::False) {
+            return Formula::True;
+        }
+        if let Formula::Not(inner) = &mut self {
+            let inner = std::mem::replace(inner, Rc::new(Formula::True));
+            drop(self);
+            return Rc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone());
+        }
+        Formula::Not(Rc::new(self))
     }
 
     /// Both, with the constants folded away — which is what makes "says
     /// nothing" the value [`Formula::True`] rather than a tree of them.
     pub fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Formula::False, _) | (_, Formula::False) => Formula::False,
-            (Formula::True, kept) | (kept, Formula::True) => kept,
-            (left, right) => Formula::And(Rc::new(left), Rc::new(right)),
+        if matches!(self, Formula::False) {
+            drop_formula_iterative(other);
+            return Formula::False;
         }
+        if matches!(self, Formula::True) {
+            return other;
+        }
+        if matches!(other, Formula::False) {
+            drop_formula_iterative(self);
+            return Formula::False;
+        }
+        if matches!(other, Formula::True) {
+            return self;
+        }
+        Formula::And(Rc::new(self), Rc::new(other))
     }
 
     /// Either, folded the same way.
     pub fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Formula::True, _) | (_, Formula::True) => Formula::True,
-            (Formula::False, kept) | (kept, Formula::False) => kept,
-            (left, right) => Formula::Or(Rc::new(left), Rc::new(right)),
+        if matches!(self, Formula::True) {
+            drop_formula_iterative(other);
+            return Formula::True;
         }
+        if matches!(self, Formula::False) {
+            return other;
+        }
+        if matches!(other, Formula::True) {
+            drop_formula_iterative(self);
+            return Formula::True;
+        }
+        if matches!(other, Formula::False) {
+            return self;
+        }
+        Formula::Or(Rc::new(self), Rc::new(other))
     }
 
     /// Both or neither: what `a = b` says.
@@ -894,36 +1120,83 @@ impl Formula {
     /// First-appearance order is what decides the printed alphabet, so it is
     /// what the walk preserves.
     pub fn atoms(&self, out: &mut Vec<Atom>) {
-        match self {
-            Formula::True | Formula::False => {}
-            Formula::Atom(atom) => {
-                if !out.contains(atom) {
-                    out.push(*atom);
+        let mut work = vec![self];
+        while let Some(formula) = work.pop() {
+            match formula {
+                Formula::True | Formula::False => {}
+                Formula::Atom(atom) => {
+                    if !out.contains(atom) {
+                        out.push(*atom);
+                    }
                 }
-            }
-            Formula::Not(inner) => inner.atoms(out),
-            Formula::And(left, right)
-            | Formula::Or(left, right)
-            | Formula::Iff(left, right)
-            | Formula::Xor(left, right) => {
-                left.atoms(out);
-                right.atoms(out);
+                Formula::Not(inner) => work.push(inner),
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    work.push(right);
+                    work.push(left);
+                }
             }
         }
     }
 
     /// Whether this formula holds when each atom is read by `assign`.
     pub fn eval(&self, assign: &dyn Fn(Atom) -> bool) -> bool {
-        match self {
-            Formula::True => true,
-            Formula::False => false,
-            Formula::Atom(atom) => assign(*atom),
-            Formula::Not(inner) => !inner.eval(assign),
-            Formula::And(left, right) => left.eval(assign) && right.eval(assign),
-            Formula::Or(left, right) => left.eval(assign) || right.eval(assign),
-            Formula::Iff(left, right) => left.eval(assign) == right.eval(assign),
-            Formula::Xor(left, right) => left.eval(assign) != right.eval(assign),
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Binary(u8),
         }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => values.push(true),
+                Work::Formula(Formula::False) => values.push(false),
+                Work::Formula(Formula::Atom(atom)) => values.push(assign(*atom)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Binary(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Binary(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Binary(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Binary(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let value = values.pop().expect("a visited formula value");
+                    values.push(!value);
+                }
+                Work::Binary(kind) => {
+                    let right = values.pop().expect("a visited right formula value");
+                    let left = values.pop().expect("a visited left formula value");
+                    values.push(match kind {
+                        0 => left && right,
+                        1 => left || right,
+                        2 => left == right,
+                        _ => left != right,
+                    });
+                }
+            }
+        }
+        values.pop().expect("every formula has a value")
     }
 
     /// One formula with each atom replaced by what `of` makes of it, rebuilt
@@ -934,16 +1207,60 @@ impl Formula {
     /// one into a scheme — so there is one place for a connective to be handled
     /// and no way for three copies to disagree about `Iff`.
     pub fn substitute(&self, of: &dyn Fn(Atom) -> Formula) -> Self {
-        match self {
-            Formula::True => Formula::True,
-            Formula::False => Formula::False,
-            Formula::Atom(atom) => of(*atom),
-            Formula::Not(inner) => inner.substitute(of).not(),
-            Formula::And(left, right) => left.substitute(of).and(right.substitute(of)),
-            Formula::Or(left, right) => left.substitute(of).or(right.substitute(of)),
-            Formula::Iff(left, right) => left.substitute(of).iff(right.substitute(of)),
-            Formula::Xor(left, right) => left.substitute(of).xor(right.substitute(of)),
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Binary(u8),
         }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => values.push(Formula::True),
+                Work::Formula(Formula::False) => values.push(Formula::False),
+                Work::Formula(Formula::Atom(atom)) => values.push(of(*atom)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Binary(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Binary(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Binary(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Binary(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = values.pop().expect("a visited formula value");
+                    values.push(inner.not());
+                }
+                Work::Binary(kind) => {
+                    let right = values.pop().expect("a visited right formula value");
+                    let left = values.pop().expect("a visited left formula value");
+                    values.push(match kind {
+                        0 => left.and(right),
+                        1 => left.or(right),
+                        2 => left.iff(right),
+                        _ => left.xor(right),
+                    });
+                }
+            }
+        }
+        values.pop().expect("every formula has a substitution")
     }
 
     /// [`substitute`](Self::substitute) over the *solver's* variables alone: a
@@ -979,6 +1296,40 @@ impl Formula {
     }
 }
 
+impl Drop for Formula {
+    fn drop(&mut self) {
+        fn take_children(formula: &mut Formula, pending: &mut Vec<Rc<Formula>>) {
+            match formula {
+                Formula::Not(inner) => {
+                    pending.push(std::mem::replace(inner, Rc::new(Formula::True)));
+                }
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    pending.push(std::mem::replace(left, Rc::new(Formula::True)));
+                    pending.push(std::mem::replace(right, Rc::new(Formula::True)));
+                }
+                Formula::True | Formula::False | Formula::Atom(_) => {}
+            }
+        }
+
+        let mut pending = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(formula) = pending.pop() {
+            if let Ok(mut formula) = Rc::try_unwrap(formula) {
+                take_children(&mut formula, &mut pending);
+                drop(formula);
+            }
+        }
+    }
+}
+
+/// Release an owned formula without recursively dropping its `Rc` tree.
+pub(crate) fn drop_formula_iterative(root: Formula) {
+    drop(root);
+}
+
 impl Presence {
     /// This presence read as a formula: what a literal about the label says.
     pub fn formula(&self) -> Formula {
@@ -987,10 +1338,9 @@ impl Presence {
             Presence::Absent => Formula::False,
             Presence::Var(var) => Formula::var(*var),
             Presence::Bound(index) => Formula::bound(*index),
-            // A failure abandoned the question, so there is nothing here to
-            // require — and requiring anything would be the first complaint
-            // said again in a second place.
-            Presence::Undecided => Formula::True,
+            // Recovery and an abandoned question impose no requirement; doing
+            // otherwise would repeat the original failure in a second place.
+            Presence::Recovered(_) | Presence::Undecided => Formula::True,
         }
     }
 }

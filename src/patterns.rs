@@ -47,7 +47,7 @@ use crate::{
     ir::{Literal, Pattern, PatternKind, Program, Term, TermKind, Witness},
     symbol::Symbol,
     tracking::Span,
-    types::{Atom, Core, Formula, Presence, Rest, Row, Scheme, Ty},
+    types::{Atom, Formula, Presence, Rest, Row, Scheme, Ty},
 };
 
 /// What the phase found, over the whole program: one report per match, in the
@@ -178,7 +178,7 @@ enum Col {
         ty: Rc<Ty>,
     },
     /// The fields beyond the named ones. `open` says whether the solved row
-    /// admits any — a core still free or quantified does, the fieldless unit
+    /// admits any — a row tail still free or quantified does, the fieldless unit
     /// an exact column closed to does not.
     Rest {
         open: bool,
@@ -196,9 +196,9 @@ enum Mode {
     Exhaustiveness,
 }
 
-/// The primitive cores accepted by [`Check::scalars`]. Keeping this narrower
-/// than [`Core`] makes the scalar witness match exhaustive without an
-/// untestable fallback for cores its caller can never pass.
+/// The primitive types accepted by [`Check::scalars`]. Keeping this narrower
+/// than the explicit type variants makes the scalar witness match exhaustive without an
+/// untestable fallback for types its caller can never pass.
 #[derive(Clone, Copy)]
 enum Scalar {
     Infinite(InfiniteScalar),
@@ -527,8 +527,8 @@ impl Check<'_> {
         // constraint failed, in which case the type error already speaks.
         if arms.is_empty() {
             let shaped = self.shape(&ty);
-            let empty = match &shaped.core {
-                Core::Sum(row) => {
+            let empty = match &*shaped {
+                Ty::Sum(row) => {
                     let row = flat(row);
                     matches!(row.rest, Rest::Closed)
                         && row
@@ -780,18 +780,17 @@ impl Check<'_> {
         Some(effective_conditions(&raw))
     }
 
-    fn presence_at(&self, ty: &Rc<Ty>, path: &str) -> Option<Presence> {
-        match path.split_once('.') {
-            Some((name, below)) => {
-                let shaped = self.shape(ty);
-                let field = shaped.fields.get(name)?;
-                self.presence_at(&field.ty, below)
-            }
-            None => self
-                .shape(ty)
-                .fields
-                .get(path)
-                .map(|field| field.presence.clone()),
+    fn presence_at(&self, ty: &Rc<Ty>, path: &[String]) -> Option<Presence> {
+        let (name, below) = path.split_first()?;
+        let shaped = self.shape(ty);
+        let Ty::Struct(row) = &*shaped else {
+            return None;
+        };
+        let row = flat(row);
+        let field = row.labels.get(name)?;
+        match below.is_empty() {
+            true => Some(field.presence.clone()),
+            false => self.presence_at(&field.ty, below),
         }
     }
 
@@ -923,15 +922,15 @@ impl Check<'_> {
         let ty = self.shape(ty);
         match cell {
             Cell::Literal(literal) => matches!(
-                (literal, &ty.core),
-                (Literal::Natural(_), Core::Nat)
-                    | (Literal::Integer(_), Core::Int)
-                    | (Literal::Real(_), Core::Real)
-                    | (Literal::String(_), Core::String)
-                    | (Literal::Boolean(_), Core::Boolean)
+                (literal, &*ty),
+                (Literal::Natural(_), Ty::Nat)
+                    | (Literal::Integer(_), Ty::Int)
+                    | (Literal::Real(_), Ty::Real)
+                    | (Literal::String(_), Ty::String)
+                    | (Literal::Boolean(_), Ty::Boolean)
             ),
-            Cell::Tag { name, payload } => match &ty.core {
-                Core::Sum(row) => {
+            Cell::Tag { name, payload } => match &*ty {
+                Ty::Sum(row) => {
                     let row = flat(row);
                     // A rest a failure abandoned: whatever the row lists, the
                     // question of what else it holds was given up, and the
@@ -953,19 +952,28 @@ impl Check<'_> {
                 _ => false,
             },
             Cell::Struct { fields, .. } => {
-                fields.iter().all(|(name, sub)| match ty.fields.get(name) {
+                let Ty::Struct(row) = &*ty else { return false };
+                let row = flat(row);
+                // The struct demand follows the same cascade rule as a sum
+                // demand above. Once typing abandoned the row tail, its labels
+                // are recovery debris rather than facts from which reachability
+                // can be proved.
+                if matches!(row.rest, Rest::Undecided) {
+                    return false;
+                }
+                fields.iter().all(|(name, sub)| match row.labels.get(name) {
                     Some(field) => match &field.presence {
                         Presence::Absent => true,
                         Presence::Undecided => false,
                         _ => self.compatible(&field.ty, sub),
                     },
                     // A tested field the type does not name: over the
-                    // fieldless unit core that is a proof of absence — a
+                    // closed empty struct that is a proof of absence — a
                     // value of the type has exactly the named fields — and
                     // the arm is unreachable, which is the check's to say.
-                    // Over any other core the demand failed to stick, and
+                    // Over any open row the demand failed to stick, and
                     // the type error already speaks.
-                    None => matches!(ty.core, Core::Unit),
+                    None => matches!(row.rest, Rest::Closed),
                 })
             }
             // A wildcard tests nothing — and the presence cells the widening
@@ -1003,8 +1011,8 @@ impl Check<'_> {
 
     /// One whole position. A column something reaches into fields at is
     /// widened first — one presence column per field the type names, then the
-    /// core — so the rest of the walk only ever sees flat cells; a column
-    /// nothing reaches into is its core alone.
+    /// row tail — so the rest of the walk only ever sees flat cells; a column
+    /// nothing reaches into is its type alone.
     fn whole(
         &self,
         rows: &[Vec<Cell>],
@@ -1020,12 +1028,12 @@ impl Check<'_> {
         if structs {
             return self.widened(rows, &ty, later, q, walk);
         }
-        self.core(rows, &ty, later, q, walk)
+        self.shape_column(rows, &ty, later, q, walk)
     }
 
     /// The widening step: the fields the solved type names become one
     /// presence column apiece — an exact pattern demands absence of every one
-    /// it does not mention, an open one says nothing — the core keeps a
+    /// it does not mention, an open one says nothing — the constructor keeps a
     /// column of its own for the tags and numbers, and a rest column carries
     /// what each pattern says about fields beyond the named ones: an exact
     /// struct demands there are none, everything else accepts any. The
@@ -1040,13 +1048,17 @@ impl Check<'_> {
         q: &[Cell],
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
-        let mut named: Vec<(String, Presence, Rc<Ty>)> = ty
-            .fields
+        let struct_row = flat(
+            ty.fields()
+                .expect("struct cells are created only for a struct-compatible column"),
+        );
+        let mut named: Vec<(String, Presence, Rc<Ty>)> = struct_row
+            .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
             .collect();
         // A tested field the type does not name is provably absent —
-        // compatibility let it through only over the fieldless unit core — so
+        // compatibility let it through only over the closed empty struct — so
         // it still gets a column, with the one-value universe absence is.
         for cell in std::iter::once(&q[0]).chain(rows.iter().map(|row| &row[0])) {
             if let Cell::Struct { fields, .. } = cell {
@@ -1058,7 +1070,7 @@ impl Check<'_> {
             }
         }
         let widen = |cell: &Cell| -> Vec<Cell> {
-            let mut wide = Vec::with_capacity(named.len() + 2);
+            let mut wide = Vec::with_capacity(named.len() + 1);
             match cell {
                 Cell::Struct { fields, exact } => {
                     for (name, _, _) in &named {
@@ -1069,11 +1081,7 @@ impl Check<'_> {
                             (None, false) => Cell::Wild,
                         });
                     }
-                    // A struct pattern says nothing about the core beside the
-                    // fields; what it demanded of the row, the types already
-                    // enforced.
-                    wide.push(Cell::Wild);
-                    // The rest, though, is the pattern's to speak to: exact
+                    // The rest is the pattern's to speak to: exact
                     // means no field beyond the mentioned ones, and the
                     // mentioned ones beyond the type's are provably absent
                     // columns of their own above — so beyond the *named*
@@ -1083,9 +1091,8 @@ impl Check<'_> {
                         false => Cell::Wild,
                     });
                 }
-                cell => {
+                _ => {
                     wide.extend(std::iter::repeat_with(|| Cell::Wild).take(named.len()));
-                    wide.push(cell.clone());
                     wide.push(Cell::Wild);
                 }
             }
@@ -1098,15 +1105,14 @@ impl Check<'_> {
                 ty: ty.clone(),
             })
             .collect();
-        wide_cols.push(Col::Whole(Rc::new(Ty::plain(ty.core.clone()))));
         // Whether fields beyond the named ones exist to be had. The fieldless
-        // unit an exact column closes the row to admits none; any other core
-        // leaves the question to the value. (A settled core like `Nat` only
+        // empty struct an exact column closes the row to admits none; any open row
+        // leaves the question to the value. (A non-struct type only
         // solves beside open struct patterns — an exact one would have pinned
         // it to unit or failed — so no cell demands its rest empty and the
         // flag is moot there.)
         wide_cols.push(Col::Rest {
-            open: !matches!(ty.core, Core::Unit),
+            open: !matches!(struct_row.rest, Rest::Closed),
         });
         wide_cols.extend(later.iter().cloned());
         let wide_rows: Vec<Vec<Cell>> = rows
@@ -1121,20 +1127,20 @@ impl Check<'_> {
         wide_q.extend(q[1..].iter().cloned());
 
         let mut wits = self.useful(&wide_rows, &wide_cols, &wide_q, walk)?;
-        let after = wits.split_off(named.len() + 2);
+        let after = wits.split_off(named.len() + 1);
         // The rest entry has nothing to print: its empty half witnesses as
         // `None`, and its nonempty half is only walked judging reachability,
         // whose witness is discarded.
         wits.pop();
-        let core = wits.pop().flatten().unwrap_or(Witness::Any);
         let fields: IndexMap<String, Witness> = named
             .iter()
             .zip(wits)
             .filter_map(|((name, _, _), wit)| wit.map(|witness| (name.clone(), witness)))
             .collect();
-        let folded = match fields.is_empty() {
-            true => core,
-            false => Witness::Struct(fields),
+        let folded = if fields.is_empty() {
+            Witness::Any
+        } else {
+            Witness::Struct(fields)
         };
         Some(std::iter::once(Some(folded)).chain(after).collect())
     }
@@ -1270,10 +1276,10 @@ impl Check<'_> {
         }
     }
 
-    /// One position's core, the fields already peeled off: scalar literals,
-    /// cases when it is a sum, and nothing testable otherwise — a core the
+    /// One position's scalar or sum shape, the fields already peeled off: scalar literals,
+    /// cases when it is a sum, and nothing testable otherwise — a type the
     /// arms cannot reach into is covered by the wildcards that got here.
-    fn core(
+    fn shape_column(
         &self,
         rows: &[Vec<Cell>],
         ty: &Rc<Ty>,
@@ -1281,21 +1287,19 @@ impl Check<'_> {
         q: &[Cell],
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
-        match &ty.core {
-            Core::Nat => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Nat), later, q, walk),
-            Core::Int => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Int), later, q, walk),
-            Core::Real => {
-                self.scalars(rows, Scalar::Infinite(InfiniteScalar::Real), later, q, walk)
-            }
-            Core::String => self.scalars(
+        match &**ty {
+            Ty::Nat => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Nat), later, q, walk),
+            Ty::Int => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Int), later, q, walk),
+            Ty::Real => self.scalars(rows, Scalar::Infinite(InfiniteScalar::Real), later, q, walk),
+            Ty::String => self.scalars(
                 rows,
                 Scalar::Infinite(InfiniteScalar::String),
                 later,
                 q,
                 walk,
             ),
-            Core::Boolean => self.scalars(rows, Scalar::Boolean, later, q, walk),
-            Core::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
+            Ty::Boolean => self.scalars(rows, Scalar::Boolean, later, q, walk),
+            Ty::Sum(row) => self.cases(rows, &flat(row), later, q, walk),
             // Unit, an arrow, a quantified variable, the undecided type:
             // nothing tests it — compatibility said so, and the widening
             // flattened every struct — so every cell here is a wildcard, the
@@ -1308,7 +1312,7 @@ impl Check<'_> {
         }
     }
 
-    /// A scalar primitive core. Boolean has precisely two values, so its two
+    /// A scalar primitive type. Boolean has precisely two values, so its two
     /// exact patterns cover it. The other scalar types deliberately keep the
     /// literal-pattern rule `Nat` had: no finite list of literals is total, so
     /// a wildcard is needed to accept the value outside that list.
@@ -1416,7 +1420,7 @@ impl Check<'_> {
         }
     }
 
-    /// A sum core: the universe is the cases the solved row says a value may
+    /// A sum: the universe is the cases the solved row says a value may
     /// be — a case settled absent has no values, so an arm demanding it is
     /// never useful — plus "anything else" when the rest is still open.
     fn cases(

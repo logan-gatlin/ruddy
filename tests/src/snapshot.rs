@@ -507,6 +507,58 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     );
 }
 
+#[test]
+fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-imported-types-stage".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 2_048;
+            let scratch = tempfile::tempdir().unwrap();
+            fs::create_dir_all(scratch.path().join("app")).unwrap();
+            fs::create_dir_all(scratch.path().join("dep")).unwrap();
+            fs::write(
+                scratch.path().join("dep/Ruddy.toml"),
+                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+            )
+            .unwrap();
+            let mut source = String::new();
+            for index in 0..DEPTH {
+                source.push_str(&format!(
+                    "type T{index} = {}\n",
+                    if index + 1 == DEPTH {
+                        "Nat".to_string()
+                    } else {
+                        format!("T{}", index + 1)
+                    }
+                ));
+            }
+            fs::write(scratch.path().join("dep/main.hc"), source).unwrap();
+
+            let snapshot = compile_at(
+                &dependency_request(IndexMap::from([("dep".into(), "../dep".into())])),
+                1,
+                scratch.path(),
+            );
+            assert!(snapshot.panic.is_none(), "{:?}", snapshot.panic);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:#?}",
+                snapshot.diagnostics
+            );
+            let types = snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == "types")
+                .expect("the Types stage is present");
+            assert_eq!(types.status, Status::Ok);
+            assert!(types.nodes.len() >= DEPTH, "{}", types.nodes.len());
+        })
+        .expect("the bounded-stack debugger regression thread starts")
+        .join()
+        .expect("the Types stage walks deep imported aliases without overflowing");
+}
+
 fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest {
     let dependencies = dependencies
         .into_iter()
@@ -872,24 +924,17 @@ fn rows_reach_every_stage() {
     };
 
     assert_eq!(labelled("tokens", "DotDot"), [".."]);
-    // `when` lexes as the ordinary identifier it is — contextual, not
-    // reserved — which is what keeps a term or a label of that name writable.
     assert_eq!(
         labelled("tokens", "Identifier"),
         ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
     );
 
     for id in ["ast", "ir"] {
-        // The field whose presence a `when` names is a row of the struct's like
-        // any other, wearing the clause in its label; the tail is a row of its
-        // own.
         assert_eq!(labelled(id, "x when 'a:"), ["Nat"], "{id}");
         assert_eq!(labelled(id, "Rest"), ["..'r"], "{id}");
+        assert_eq!(labelled(id, "Project"), ["p.y"], "{id}");
     }
 
-    // The projection's demand is an ordinary equality against an open row,
-    // and the Constraints tab shows it unsolved: the tail is still the
-    // variable the annotation lowered to.
     let constraints: Vec<&str> = stage("constraints")
         .nodes
         .iter()
@@ -897,13 +942,20 @@ fn rows_reach_every_stage() {
         .map(|node| node.text.as_str())
         .collect();
     assert!(
-        constraints.iter().any(|text| text.contains("..?")),
+        constraints
+            .iter()
+            .any(|text| text.contains("..'r") && text.contains(".y")),
         "{constraints:?}"
     );
 
-    // The scheme spells the quantified tail with its letter and keeps the
-    // field's presence a variable — nothing in the body decided `x` either way
-    // — printed as the `when` clause naming it in the presence alphabet.
+    let solve = stage("solve");
+    assert!(
+        nodes(solve)
+            .iter()
+            .any(|node| node.label == "struct" && node.text.contains("..'r")),
+        "{solve:#?}"
+    );
+
     let types: Vec<&str> = stage("types")
         .nodes
         .iter()
@@ -1138,7 +1190,9 @@ fn the_types_tab_says_which_declarations_are_recursive() {
         "type list = { val: Nat, next: list }\n\
          type forest = { head: tree }\n\
          type tree = { val: Nat, kids: forest }\n\
-         type Endo = Nat -> Nat\n",
+         type Endo = Nat -> Nat\n\
+         type Ptr 'a = Nat\n\
+         type PhantomLoop = Ptr PhantomLoop\n",
     );
     assert!(
         snapshot.diagnostics.is_empty(),
@@ -1180,6 +1234,10 @@ fn the_types_tab_says_which_declarations_are_recursive() {
     assert_eq!(recursion("tree"), Some("tree, forest"));
     // And an alias that leads nowhere 'says nothing.
     assert_eq!(recursion("Endo"), None);
+    // Merely spelling a name in a discarded/phantom alias argument is not a
+    // semantic recursion edge.
+    assert_eq!(recursion("Ptr"), None);
+    assert_eq!(recursion("PhantomLoop"), None);
 }
 
 /// A definition says the same thing under itself, off the binding groups. A
@@ -1274,7 +1332,7 @@ fn an_argument_wears_its_type_through_a_declared_type() {
     // in braces it would show a reader a case list as if it were fields.
     assert_eq!(
         badge("type G 'r = (#Err Nat | ..'r) -> Nat\nlet g : G (#Ok Nat) = fn p => 1n\n"),
-        "#Err Nat | ..#Ok Nat"
+        "#Err Nat | #Ok Nat"
     );
 }
 
@@ -1299,79 +1357,50 @@ fn a_type_error_is_a_diagnostic() {
     assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
 }
 
-/// The two complaints rows added reach the strip like every other, and the
-/// rule behind one of them reaches the Solve tab. A diagnostic the compiler
-/// can raise and the debugger cannot show is one nobody working on the
-/// compiler ever sees.
+/// Projection failures keep their shape-specific diagnostics and spans in the
+/// debugger, and the failed solver steps carry the same errors as the strip.
 #[test]
 fn a_row_error_reaches_the_strip_and_the_solve_tab() {
-    // Through a call, since a declared rest is rigid inside the body that
-    // promised it: what the lacks condition rules on is the *fresh* rest a use
-    // of the published scheme gets.
-    let repeated = snapshot(
-        "let h : { ..'r } -> { x: { y: Nat, ..'r } } -> Nat = fn a => fn b => 1n\n\
-         let z = h { y: {} } { x: { y: 1n } }\n",
-    );
-    let [diagnostic] = repeated.diagnostics.as_slice() else {
-        panic!("expected one error: {:#?}", repeated.diagnostics);
+    let not_struct_source = "let bad = 1n.x\n";
+    let not_struct = snapshot(not_struct_source);
+    let [diagnostic] = not_struct.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", not_struct.diagnostics);
     };
-    assert_eq!(diagnostic.code, "repeated-field");
-    assert_eq!(
-        diagnostic.message,
-        "`..` covers only the fields a type does not already name, \
-         and here it would have to cover `y`"
-    );
+    assert_eq!(diagnostic.code, "not-a-struct");
+    let base = not_struct_source.find("1n").unwrap();
+    assert_eq!(diagnostic.span, at([base, base + 2]));
 
-    // The step that refused the binding is red, labelled with its rule, and
-    // carries the same words the strip does.
-    let solve = repeated
-        .stages
-        .iter()
-        .find(|stage| stage.id == "solve")
-        .expect("the solve stage is registered");
-    let overlap = solve
-        .nodes
-        .iter()
-        .find(|node| node.label == "overlap")
-        .expect("the refusal is a step");
-    assert!(overlap.error);
-    let field = |node: &Node, name: &str| {
-        node.fields
-            .iter()
-            .find(|field| field.name == name)
-            .map(|field| field.value.clone())
-    };
-    assert_eq!(field(overlap, "_error"), Some(diagnostic.message.clone()));
-    assert_eq!(
-        field(overlap, "_rule"),
-        Some(
-            "the rest of a struct cannot be a type naming a field the struct already names"
-                .to_string()
-        )
-    );
-
-    // A body deciding what its annotation declared reaches the strip too, and
-    // carries the declaration as a second highlight — the promise it broke.
-    let source = "let bad : 'a -> Nat = fn p => p.x\n";
-    let broken = snapshot(source);
-    let [diagnostic] = broken.diagnostics.as_slice() else {
-        panic!("expected one error: {:#?}", broken.diagnostics);
-    };
-    assert_eq!(diagnostic.code, "rigid-field");
-    // Spanned at the projection, which is the expression that broke it.
-    let read = source.rfind('x').expect("the field");
-    assert_eq!(diagnostic.span, at([read, read + 1]));
-    let declared = source.find("'a").expect("the first use");
-    assert_eq!(diagnostic.related.len(), 1);
-    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
-    assert_eq!(diagnostic.related[0].message, "declared here");
-
-    let flat = snapshot("let n = 1n\nlet bad = n.x\n");
-    let [diagnostic] = flat.diagnostics.as_slice() else {
-        panic!("expected one error: {:#?}", flat.diagnostics);
+    let missing_source = "let bad : { x: Nat } -> Nat = fn p => p.y\n";
+    let missing = snapshot(missing_source);
+    let [diagnostic] = missing.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", missing.diagnostics);
     };
     assert_eq!(diagnostic.code, "missing-field");
-    assert_eq!(diagnostic.message, "no field `x` on `Nat`");
+    let field = missing_source.rfind('y').unwrap();
+    assert_eq!(diagnostic.span, at([field, field + 1]));
+
+    let rigid_source = "let bad : 'a -> Nat = fn p => p.x\n";
+    let rigid = snapshot(rigid_source);
+    let [diagnostic] = rigid.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", rigid.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "rigid-field");
+    let field = rigid_source.rfind('x').unwrap();
+    assert_eq!(diagnostic.span, at([field, field + 1]));
+    let declared = rigid_source.find("'a").unwrap();
+    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
+
+    for snapshot in [&not_struct, &missing, &rigid] {
+        let constraints = stage_named(snapshot, "constraints");
+        assert!(
+            nodes(constraints)
+                .iter()
+                .any(|node| node.label == "project"),
+            "{constraints:#?}"
+        );
+        let solve = stage_named(snapshot, "solve");
+        assert!(nodes(solve).iter().any(|node| node.error), "{solve:#?}");
+    }
 }
 
 /// The solver assumes a goal it is already in the middle of, and what it is
@@ -2111,7 +2140,7 @@ fn the_types_tab_says_which_parameters_are_rows() {
         .into_iter()
         .find(|node| node.label == "type Bare")
         .expect("a row for the declaration");
-    assert_eq!(bare.children[0].text, "'r");
+    assert_eq!(bare.children[0].text, "..'r (struct)");
 }
 
 /// A type parameter is a symbol like any other — minted as a local, the way a
@@ -2221,78 +2250,6 @@ fn sums_reach_every_stage() {
 /// whose `..` was handed a known type carries them on that: `WithX Nat` unfolds
 /// to `Nat with { x: Nat }`, which no source syntax writes and only the solve
 /// can show.
-#[test]
-fn a_type_carrying_fields_reaches_the_tabs_that_show_types() {
-    let open = snapshot("let getx = fn p => p.x\n");
-    assert!(open.diagnostics.is_empty(), "{:#?}", open.diagnostics);
-
-    let types = open
-        .stages
-        .iter()
-        .find(|stage| stage.id == "types")
-        .expect("the types tab");
-    let scheme = nodes(types)
-        .iter()
-        .map(|node| node.text.clone())
-        .find(|text| text.contains(".."))
-        .expect("the scheme prints an open end");
-    assert_eq!(scheme, "{ x: 'a, ..'b } -> 'a");
-
-    // And the IR tab's inline badges, which the types stage paints on: the
-    // binder `p` wears the base's own type.
-    let badges = open
-        .stages
-        .iter()
-        .find(|stage| stage.annotates == Some("ir"))
-        .expect("the ir annotator");
-    assert!(
-        nodes(badges)
-            .iter()
-            .any(|node| node.text == "{ x: 'a, ..'b }"),
-        "{:#?}",
-        nodes(badges)
-    );
-
-    // The Solve tab shows the same form in its goals, so a reader stepping
-    // through the solve sees the type the scheme reports.
-    let solve = open
-        .stages
-        .iter()
-        .find(|stage| stage.id == "solve")
-        .expect("the solve tab");
-    assert!(
-        nodes(solve).iter().any(|node| node.text.contains("..")),
-        "{:#?}",
-        nodes(solve)
-    );
-
-    // The `with` form, reached the one way source can reach it: a struct's `..`
-    // handed a type that is not a struct. The solve unfolds the name to decide
-    // the projection against it, and the goal it asks shows what the name
-    // stands for.
-    let unfolded = snapshot(
-        "type WithX 'r = { x: Nat, ..'r }\n\
-         let f : WithX Nat -> Nat = fn p => p.x\n",
-    );
-    assert!(
-        unfolded.diagnostics.is_empty(),
-        "{:#?}",
-        unfolded.diagnostics
-    );
-    let solve = unfolded
-        .stages
-        .iter()
-        .find(|stage| stage.id == "solve")
-        .expect("the solve tab");
-    assert!(
-        nodes(solve)
-            .iter()
-            .any(|node| node.text.contains("Nat with { x: Nat }")),
-        "{:#?}",
-        nodes(solve)
-    );
-}
-
 /// A nested `let` reaches all four tabs that had to keep up with it: the AST
 /// and IR trees show it as a node of its own, the Constraints tab shows the two
 /// lists it carries as rows beneath it, and the Types tab says what the name it

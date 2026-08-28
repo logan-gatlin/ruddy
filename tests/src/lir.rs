@@ -7,7 +7,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Version},
     token,
     tracking::FileManager,
-    types::{Formula, Presence},
+    types::{Formula, Presence, Rest, Row, RowField, Scheme, Ty},
 };
 use ruddy_debug::print;
 
@@ -200,6 +200,118 @@ fn a_shadowed_name_is_put_back_afterwards() {
 /// One case per representation. The primitive representations come off the
 /// core; the empty struct is `unit` and a struct with fields is `struct`; and
 /// anything a scheme quantified is `any`, since monomorphization is deferred.
+#[test]
+fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
+    let source = "type RowId 'r = { ..'r }\n\
+                  let id : RowId {} -> RowId {} = fn x => x\n\
+                  let called = id {}";
+    let function = section(source, "fn id(");
+    assert!(function.starts_with("fn id(%0: unit):"), "{function}");
+    let call = section(source, "global called");
+    assert!(call.contains(": unit = struct {}"), "{call}");
+    assert!(call.contains(": unit = call id"), "{call}");
+
+    let absent = section(
+        "type NoY 'r = { \\y, ..'r }\nlet value : NoY {} = {}",
+        "global value",
+    );
+    assert!(absent.contains(": unit = struct {}"), "{absent}");
+
+    let open = section(
+        "type RowId 'r = { ..'r }\n\
+         let open : RowId { ..'s } -> RowId { ..'s } = fn x => x",
+        "fn open(",
+    );
+    assert!(open.starts_with("fn open(%0: struct):"), "{open}");
+    let nonempty = section(
+        "type RowId 'r = { ..'r }\n\
+         let point : RowId { x: Nat } = { x: 1n }",
+        "global point",
+    );
+    assert!(nonempty.contains(": struct = struct { x:"), "{nonempty}");
+}
+
+#[test]
+fn sibling_row_substitutions_have_identical_unit_representations() {
+    let source = "type Empty = {}\n\
+                  type Dup 'r = { a: { ..'r }, b: { ..'r } }\n\
+                  type Rev 'r = { b: { ..'r }, a: { ..'r } }\n\
+                  let dup : Dup Empty -> { a: Empty, b: Empty } = fn p => { a: p.a, b: p.b }\n\
+                  let rev : Rev Empty -> { a: Empty, b: Empty } = fn p => { a: p.a, b: p.b }";
+    for name in ["dup", "rev"] {
+        let function = section(source, &format!("fn {name}("));
+        assert_eq!(
+            function.matches(": unit = project").count(),
+            2,
+            "both independent fields must open identically regardless of order:\n{function}"
+        );
+    }
+}
+
+#[test]
+fn imported_forwarding_cycles_recover_before_lir_representation() {
+    std::thread::Builder::new()
+        .name("forwarding-cycle-lir".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let scheme = |count, body| a::Scheme {
+                count,
+                presences: 0,
+                formula: a::Formula::True,
+                body,
+            };
+            let dependency = a::Artifact {
+                header: a::Header {
+                    identity: a::Identity {
+                        name: "dep".into(),
+                        version: "1.0.0".into(),
+                    },
+                    dependencies: Vec::new(),
+                    values: Vec::new(),
+                    types: vec![
+                        a::DeclaredType {
+                            name: "dep@1.0.0::A".into(),
+                            params: Vec::new(),
+                            scheme: scheme(
+                                0,
+                                a::Type::Named {
+                                    name: "dep@1.0.0::Id".into(),
+                                    args: vec![a::Type::Named {
+                                        name: "dep@1.0.0::A".into(),
+                                        args: Vec::new(),
+                                    }],
+                                },
+                            ),
+                        },
+                        a::DeclaredType {
+                            name: "dep@1.0.0::Id".into(),
+                            params: vec![a::Parameter {
+                                sense: a::Sense::Type,
+                                lacks: Vec::new(),
+                                relevant: true,
+                            }],
+                            scheme: scheme(1, a::Type::Bound(0)),
+                        },
+                    ],
+                    effects: Vec::new(),
+                },
+                lir: a::Lir {
+                    externs: Vec::new(),
+                    functions: Vec::new(),
+                    globals: Vec::new(),
+                },
+            };
+
+            let source = "let id : dep::A -> dep::A = fn x => x";
+            let (output, labels) = lowered_with_dependencies(source, &[dependency]);
+            let printed = print::lir::program(&output, &labels);
+            assert!(printed.contains("fn id(%0: any):"), "{printed}");
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("a forwarding cycle reaches LIR without hanging");
+}
+
 #[test]
 fn every_representation_comes_off_the_solved_type() {
     let source = "let n = 1n\nlet u = {}\nlet s = { x: 1n }\nlet c = #A\nlet i = fn x => x\n\
@@ -485,6 +597,34 @@ fn an_impossible_presence_path_is_rejected() {
 
 /// Replace the named field on the sole match scrutinee in the small defensive
 /// fixtures above. Pattern checking happens before this adjustment.
+#[test]
+fn a_corrupted_container_type_uses_the_written_member_type() {
+    let (output, labels) = lowered_after_check("let value = { x: 1n }", |program, _| {
+        program.terms.values_mut().next().unwrap().value.ty = Rc::new(Ty::Nat);
+    });
+    let printed = print::lir::program(&output, &labels);
+    assert!(printed.contains("struct { x:"), "{printed}");
+}
+
+#[test]
+fn a_corrupted_non_struct_match_type_recovers_in_lir() {
+    let (output, labels) = lowered_after_check(
+        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+        |program, _| {
+            let definition = &mut program.terms.values_mut().next().unwrap().value;
+            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                panic!("function fixture")
+            };
+            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                panic!("match fixture")
+            };
+            scrutinee.ty = Rc::new(Ty::Nat);
+        },
+    );
+    let printed = print::lir::program(&output, &labels);
+    assert!(printed.contains("%1: nat = const 2n"), "{printed}");
+}
+
 fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Presence) {
     let definition = &mut program
         .terms
@@ -498,8 +638,10 @@ fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Pr
     let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
         panic!("the fixture function immediately matches")
     };
-    Rc::make_mut(&mut scrutinee.ty)
-        .fields
+    let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+        panic!("struct scrutinee")
+    };
+    row.labels
         .get_mut(field)
         .expect("the scrutinee type names the tested field")
         .presence = presence;
@@ -544,7 +686,7 @@ fn an_exact_pattern_over_an_open_type_tests_the_rest() {
             "let f = fn s => match s with | {x} => 1n | {x, ..} => 2n end",
             "fn f("
         ),
-        "fn f(%0: any):\n\
+        "fn f(%0: struct):\n\
          \x20 %1: any = project %0, \"x\"\n\
          \x20 %4: nat = switch_rest %0, [\"x\"]:\n\
          \x20   none =>\n\
@@ -708,9 +850,12 @@ fn structurally_equivalent_handler_arms_build_one_complete_record() {
 fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
     let declaration = "effect Log = { write: Nat -> (), flush: () -> () }";
     let interface = local_effect_interface(declaration);
-    let plain = |core| a::Type {
-        core,
-        fields: Vec::new(),
+    let plain = |ty| ty;
+    let unit = || {
+        a::Type::Struct(a::Row {
+            labels: Vec::new(),
+            rest: a::Rest::Closed,
+        })
     };
     let dependency = a::Artifact {
         header: a::Header {
@@ -730,13 +875,13 @@ fn imported_and_local_handler_arms_build_one_complete_evidence_record() {
                 kind: a::EffectKind::Operations(vec![
                     a::Operation {
                         selector: a::OperationSelector::Named("write".into()),
-                        from: plain(a::Core::Nat),
-                        to: plain(a::Core::Unit),
+                        from: plain(a::Type::Nat),
+                        to: unit(),
                     },
                     a::Operation {
                         selector: a::OperationSelector::Named("flush".into()),
-                        from: plain(a::Core::Unit),
-                        to: plain(a::Core::Unit),
+                        from: unit(),
+                        to: unit(),
                     },
                 ]),
             }],
@@ -1053,7 +1198,7 @@ fn an_open_pattern_says_nothing_about_a_field_it_omits() {
             "let f = fn s => match s with | {x, ..} => 1n | {y} => 2n | _ => 3n end",
             "fn f("
         ),
-        "fn f(%0: any):\n\
+        "fn f(%0: struct):\n\
          \x20 %9: nat = switch_presence %0, \"x\":\n\
          \x20   present =>\n\
          \x20     %1: any = project %0, \"x\"\n\
@@ -1090,6 +1235,32 @@ fn a_field_no_arm_asks_about_is_never_read() {
         ),
         "fn f(%0: struct):\n  %1: nat = project %0, \"x\"\n  ret %1"
     );
+}
+
+/// A field absent from a closed solved row still receives an absent dispatch
+/// column when a syntactically valid but unreachable arm asks for it.
+#[test]
+fn a_pattern_field_absent_from_the_solved_row_is_lowered_as_absent() {
+    let (output, labels) = lowered_after_check(
+        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+        |program, _| {
+            let definition = &mut program.terms.values_mut().next().unwrap().value;
+            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                panic!("function fixture")
+            };
+            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                panic!("match fixture")
+            };
+            let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+                panic!("struct fixture")
+            };
+            row.labels.clear();
+            row.rest = ruddy::types::Rest::Closed;
+        },
+    );
+    let printed = print::lir::program(&output, &labels);
+    assert!(!printed.contains("project"), "{printed}");
+    assert!(printed.contains("const 2n"), "{printed}");
 }
 
 /// A field whose presence decides the arm but whose value nothing looks at is
@@ -1243,6 +1414,374 @@ fn a_level_no_type_pins_down_is_crossed_rather_than_repacked() {
 /// of evidence, and a position declaring only `Log` passes one. The adapter
 /// packs what it was given into the bundle the value expects, keyed by the
 /// effect's name, and hands the record itself over unchanged.
+#[test]
+fn recursive_arrow_fitting_reuses_one_guarded_adapter() {
+    let source = "effect Log = { write: Nat -> () }\n\
+         type Runs 'r = Nat -> Runs 'r + ..'r\n\
+         let poly : Runs (..'r) = fn n => poly\n\
+         let takes : Runs (!Log) -> Nat + !Log = fn f => 1n\n\
+         let go = fn w => handle takes poly with | !Log.write n => {} end";
+    let adapter = section(source, "fn go#3");
+    assert!(adapter.contains("struct { Log:"), "{adapter}");
+    assert!(adapter.contains("call %"), "{adapter}");
+    assert_eq!(adapter.matches("closure go#3").count(), 1, "{adapter}");
+}
+
+/// Alias arguments carry semantic identities that their diagnostic spelling
+/// deliberately hides. In this recovery input, `A` and `B` (and `C` and `D`)
+/// are all displayed as `Arg`, but the second pair reaches a new effect shape.
+/// It therefore needs its own recursive adapter rather than closing the cycle
+/// over the adapter for the first, merely same-spelled, applications.
+#[test]
+fn same_spelling_does_not_coinduct_distinct_recursive_alias_arguments() {
+    let (output, _) = lowered_after_check(
+        "type X 'a = 'a\n\
+         type Y 'a = 'a\n\
+         type A = Nat\n\
+         type B = Nat\n\
+         type C = Nat\n\
+         type D = Nat\n\
+         let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+         let have : Nat -> Nat = fn n => n\n\
+         let go = takes have",
+        |program, inferred| {
+            let aliases: Vec<_> = inferred.aliases.keys().copied().collect();
+            let [x, y, a, b, c, d] = aliases.as_slice() else {
+                panic!("the six test aliases remain available")
+            };
+            let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
+                Rc::new(Ty::Named {
+                    symbol,
+                    name: Rc::from(name),
+                    args: args.into(),
+                })
+            };
+            let application = |outer, argument| named(outer, "Recursive", vec![argument]);
+            let hidden = |symbol| named(symbol, "Arg", Vec::new());
+            let arrow = |result, effects| Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, effects));
+
+            inferred
+                .aliases
+                .insert(*x, Scheme::new(1, Rc::new(Ty::Bound(0))));
+            inferred
+                .aliases
+                .insert(*y, Scheme::new(1, Rc::new(Ty::Bound(0))));
+            inferred.aliases.insert(
+                *a,
+                Scheme::new(0, arrow(application(*x, hidden(*b)), Row::closed())),
+            );
+            inferred.aliases.insert(
+                *b,
+                Scheme::new(
+                    0,
+                    arrow(
+                        application(*x, hidden(*b)),
+                        Row {
+                            labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                .into_iter()
+                                .collect(),
+                            rest: Rest::Closed,
+                        },
+                    ),
+                ),
+            );
+            inferred.aliases.insert(
+                *c,
+                Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
+            );
+            inferred.aliases.insert(
+                *d,
+                Scheme::new(0, arrow(application(*y, hidden(*d)), Row::closed())),
+            );
+
+            let want = application(*x, hidden(*a));
+            let have = application(*y, hidden(*c));
+            let terms: Vec<_> = program.terms.keys().copied().collect();
+            program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+            program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+            let ir::TermKind::Apply { arg, .. } =
+                &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+            else {
+                panic!("go is the checked application")
+            };
+            arg.ty = have;
+        },
+    );
+
+    let adapters: Vec<_> = output
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with("go#"))
+        .collect();
+    assert_eq!(adapters.len(), 2, "{:#?}", output.functions);
+    assert!(adapters.iter().any(|function| {
+        function
+            .body
+            .instrs
+            .iter()
+            .any(|instr| matches!(instr.op, lir::Op::Closure { .. }))
+    }));
+}
+
+/// Recursive adapter states use recovered presence identities as exact syntax.
+/// Repeating the same recovery identity closes the guarded cycle immediately;
+/// changing it reaches one distinct state before the stable suffix coalesces.
+#[test]
+fn recursive_adapter_coalescing_preserves_recovered_presence_correlation() {
+    let adapters = |first_id| {
+        let (output, _) = lowered_after_check(
+            "type X 'a 'b = 'a\n\
+             type Y 'a 'b = 'a\n\
+             let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+             let have : Nat -> Nat = fn n => n\n\
+             let go = takes have",
+            |program, inferred| {
+                let aliases: Vec<_> = inferred.aliases.keys().copied().collect();
+                let [x, y] = aliases.as_slice() else {
+                    panic!("the two test aliases remain available")
+                };
+                let named = |symbol, args: Vec<Rc<Ty>>| {
+                    Rc::new(Ty::Named {
+                        symbol,
+                        name: Rc::from("Recursive"),
+                        args: args.into(),
+                    })
+                };
+                let recovered = |id| {
+                    Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "field".into(),
+                            RowField {
+                                presence: Presence::Recovered(id),
+                                ty: Rc::new(Ty::Nat),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    }))
+                };
+                let recursive = |symbol, effects| {
+                    Scheme::new(
+                        2,
+                        Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            named(symbol, vec![Rc::new(Ty::Bound(1)), Rc::new(Ty::Bound(1))]),
+                            effects,
+                        )),
+                    )
+                };
+                inferred.aliases.insert(
+                    *x,
+                    recursive(
+                        *x,
+                        Row {
+                            labels: [("Log".into(), RowField::present(Rc::new(Ty::unit())))]
+                                .into_iter()
+                                .collect(),
+                            rest: Rest::Closed,
+                        },
+                    ),
+                );
+                inferred.aliases.insert(*y, recursive(*y, Row::closed()));
+
+                let want = named(*x, vec![recovered(first_id), recovered(2)]);
+                let have = named(*y, vec![recovered(first_id), recovered(2)]);
+                let terms: Vec<_> = program.terms.keys().copied().collect();
+                program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                    Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                let ir::TermKind::Apply { arg, .. } =
+                    &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                else {
+                    panic!("go is the checked application")
+                };
+                arg.ty = have;
+            },
+        );
+        output
+            .functions
+            .iter()
+            .filter(|function| function.name.starts_with("go#"))
+            .count()
+    };
+
+    assert_eq!(adapters(2), 1);
+    assert_eq!(adapters(1), 2);
+}
+
+#[test]
+fn recursive_alias_argument_equality_is_stack_safe_at_thirty_thousand_layers() {
+    std::thread::Builder::new()
+        .name("deep-semantic-alias-equality".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (output, _) = lowered_after_check(
+                "type X 'a = 'a\n\
+                 type Y 'a = 'a\n\
+                 type Carrier 'a = 'a\n\
+                 type A = Nat\n\
+                 type B = Nat\n\
+                 type C = Nat\n\
+                 let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+                 let have : Nat -> Nat = fn n => n\n\
+                 let go = takes have",
+                |program, inferred| {
+                    let symbols: Vec<_> = inferred.aliases.keys().copied().collect();
+                    let [x, y, carrier, a, b, c] = symbols.as_slice() else {
+                        panic!("the six test aliases remain available")
+                    };
+                    let named = |symbol, name: &str, args: Vec<Rc<Ty>>| {
+                        Rc::new(Ty::Named {
+                            symbol,
+                            name: Rc::from(name),
+                            args: args.into(),
+                        })
+                    };
+                    let nested = |leaf| {
+                        (0..DEPTH).fold(leaf, |inner, _| named(*carrier, "Carrier", vec![inner]))
+                    };
+                    let deep_a = nested(named(*a, "Leaf", Vec::new()));
+                    let deep_b = nested(named(*b, "Leaf", Vec::new()));
+                    let deep_c = nested(named(*c, "Leaf", Vec::new()));
+                    let application = |outer, argument| named(outer, "Recursive", vec![argument]);
+
+                    inferred
+                        .aliases
+                        .insert(*carrier, Scheme::new(1, Rc::new(Ty::Bound(0))));
+                    inferred.aliases.insert(
+                        *x,
+                        Scheme::new(
+                            1,
+                            Rc::new(Ty::Arrow(
+                                Rc::new(Ty::Nat),
+                                application(*x, deep_b.clone()),
+                                Row::closed(),
+                            )),
+                        ),
+                    );
+                    inferred.aliases.insert(
+                        *y,
+                        Scheme::new(
+                            1,
+                            Rc::new(Ty::Arrow(
+                                Rc::new(Ty::Nat),
+                                application(*y, deep_c.clone()),
+                                Row::closed(),
+                            )),
+                        ),
+                    );
+
+                    let want = application(*x, deep_a);
+                    let have = application(*y, deep_c);
+                    let terms: Vec<_> = program.terms.keys().copied().collect();
+                    program.terms.get_mut(&terms[0]).unwrap().value.ty =
+                        Rc::new(Ty::Arrow(want, Rc::new(Ty::Nat), Row::closed()));
+                    program.terms.get_mut(&terms[1]).unwrap().value.ty = have.clone();
+                    let ir::TermKind::Apply { arg, .. } =
+                        &mut program.terms.get_mut(&terms[2]).unwrap().value.kind
+                    else {
+                        panic!("go is the checked application")
+                    };
+                    arg.ty = have;
+                },
+            );
+            assert!(output.globals.iter().any(|global| global.name == "go"));
+        })
+        .expect("the bounded-stack semantic equality regression starts")
+        .join()
+        .expect("finite alias syntax equality is iterative");
+}
+
+/// One mismatch above thirty thousand equal result arrows used to recurse once
+/// in `fitted` and then once per suffix in `fits`. The adapter still packs the
+/// concrete record into the value's effect bundle, but both walks fit on a
+/// deliberately small native stack.
+#[test]
+fn thirty_thousand_fitted_arrow_levels_use_bounded_stack() {
+    std::thread::Builder::new()
+        .name("deep-lir-fitting".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let (output, _) = lowered_after_check(
+                "let takes : (Nat -> Nat) -> Nat = fn f => 1n\n\
+                 let have : Nat -> Nat = fn n => n\n\
+                 let go = takes have",
+                |program, _| {
+                    let symbols: Vec<_> = program.terms.keys().copied().collect();
+                    let mut want_to = Rc::new(Ty::Nat);
+                    let mut have_to = Rc::new(Ty::Nat);
+                    for _ in 0..DEPTH {
+                        want_to = Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            want_to,
+                            Row::closed(),
+                        ));
+                        have_to = Rc::new(Ty::Arrow(
+                            Rc::new(Ty::Nat),
+                            have_to,
+                            Row::closed(),
+                        ));
+                    }
+                    let want = Rc::new(Ty::Arrow(
+                        Rc::new(Ty::Nat),
+                        want_to,
+                        Row {
+                            labels: [(
+                                "Log".to_string(),
+                                RowField {
+                                    presence: Presence::Present,
+                                    ty: Rc::new(Ty::Undecided),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            rest: Rest::Closed,
+                        },
+                    ));
+                    let have = Rc::new(Ty::Arrow(
+                        Rc::new(Ty::Nat),
+                        have_to,
+                        Row::of(Rest::Bound(0)),
+                    ));
+
+                    program.terms.get_mut(&symbols[0]).unwrap().value.ty = Rc::new(Ty::Arrow(
+                        want,
+                        Rc::new(Ty::Nat),
+                        Row::closed(),
+                    ));
+                    program.terms.get_mut(&symbols[1]).unwrap().value.ty = have.clone();
+                    let ir::TermKind::Apply { arg, .. } =
+                        &mut program.terms.get_mut(&symbols[2]).unwrap().value.kind
+                    else {
+                        panic!("go is the checked application")
+                    };
+                    arg.ty = have;
+                },
+            );
+            let adapter = output
+                .functions
+                .iter()
+                .find(|function| {
+                    function.body.instrs.iter().any(|instr| {
+                        matches!(&instr.op, lir::Op::Struct(fields) if fields.contains_key(&lir::FieldKey::Named("Log".into())))
+                    })
+                })
+                .expect("the effect-packing adapter remains present");
+            assert!(adapter
+                .body
+                .instrs
+                .iter()
+                .any(|instr| matches!(instr.op, lir::Op::Call { .. })));
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("LIR fitting uses bounded stack");
+}
+
 #[test]
 fn an_adapter_packs_a_record_into_the_bundle_a_value_expects() {
     let source = "effect Log = { write: Nat -> () }\n\
@@ -1655,6 +2194,62 @@ fn a_function_read_out_of_a_struct_field_is_called_at_the_shape_the_field_holds(
          \x20 %47: struct = struct { Log: %44, Fail: %45 }\n\
          \x20 %48: any = call %43, %47, %46\n\
          \x20 ret %48"
+    );
+}
+
+/// Containers returned by both direct and indirect calls retain the type at
+/// which the callee produced them. Projecting an effect-polymorphic member must
+/// therefore install the same ABI adapters as projecting from a global struct.
+#[test]
+fn call_results_keep_container_production_metadata_for_projection() {
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
+         let stored = { f: fn g => fn n => g n }\n\
+         let direct = fn u => stored\n\
+         let indirect = fn k => k {}\n\
+         let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
+           let a = !Log.write n in let b = !Fail.oops n in n\n\
+         let go = fn w => handle handle\n\
+           let a = (direct {}).f both 1n in\n\
+           (indirect direct).f both a\n\
+           with | !Log.write x => {} end with | !Fail.oops y => {} end";
+    let go = section(source, "fn go(");
+    assert_eq!(go.matches("project ").count(), 2, "{go}");
+    // Each stored `f` is read through a bundle-shaped adapter before being
+    // specialized to the two concrete effect records at this use.
+    assert!(go.matches("closure go#").count() >= 4, "{go}");
+    assert!(go.contains("struct { Fail:") && go.contains("Log:"), "{go}");
+}
+
+/// A struct-pattern projection has the same storage authority as an expression
+/// projection. In particular, it reads the function at the bundle ABI the
+/// polymorphic container was built with before fitting the pattern binding to
+/// this effect-specialized use.
+#[test]
+fn a_function_bound_by_a_struct_pattern_keeps_the_stored_effect_abi() {
+    let source = "effect Log = { write: Nat -> () }\n\
+         effect Fail = { oops: Nat -> () }\n\
+         let s = { f: fn g => fn n => g n }\n\
+         let both : Nat -> Nat + !Log + !Fail = fn n =>\n\
+           let a = !Log.write n in let b = !Fail.oops n in n\n\
+         let go = fn w => handle handle\n\
+           (match s with | { f } => f both 1n end)\n\
+           with | !Log.write x => {} end with | !Fail.oops y => {} end";
+    let go = section(source, "fn go(");
+    assert!(go.contains("fn = project") && go.contains("\"f\""), "{go}");
+    // Fitting the stored bundle-taking function to the specialized binding
+    // introduces adapters on both sides of the binding. A raw projection at
+    // the specialized ABI would have no closures here.
+    assert!(go.matches("closure go#").count() >= 1, "{go}");
+    let adapter = section(source, "fn go#6");
+    assert!(
+        adapter.contains("closure go#4") && adapter.contains("closure go#5"),
+        "{adapter}"
+    );
+    let packed = section(source, "fn go#5");
+    assert!(
+        packed.contains("struct = struct { Log:") && packed.contains("Fail:"),
+        "{packed}"
     );
 }
 

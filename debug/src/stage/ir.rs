@@ -13,7 +13,7 @@ use ruddy::{
     },
     symbol::{Mint, Symbol},
     tracking::Span,
-    types::{Core, Sense, Shape},
+    types::{Sense, Shape, Ty},
 };
 
 use crate::{
@@ -297,7 +297,7 @@ fn term_node(ids: &mut Ids, cx: &Cx, mint: &Mint, term: &Term, trace: &mut Trace
             let shape = cx
                 .inference
                 .map(|inferred| inference::unfold(&inferred.aliases, &term.ty));
-            if let Some(Core::Arrow(from, _, _)) = shape.as_deref().map(|ty| &ty.core) {
+            if let Some(Ty::Arrow(from, _, _)) = shape.as_deref() {
                 trace.terms.push((bound.id, from.clone()));
             }
             Node {
@@ -683,7 +683,7 @@ fn annotation_node(ids: &mut Ids, cx: &Cx, mint: &Mint, annotation: &Annotation)
 fn stands_for_variable(variable: &Variable) -> String {
     let written = match variable.sense {
         Sense::Type => format!("'{}", variable.name),
-        Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
+        Sense::Fields | Sense::Cases | Sense::Effects => format!("..'{}", variable.name),
         Sense::Presence => format!("when '{}", variable.name),
     };
     format!("{written} ({})", variable.sense)

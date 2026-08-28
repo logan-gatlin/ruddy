@@ -22,8 +22,8 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
-    types::{Assigned, Core, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
-    ui,
+    types::{Assigned, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
+    ui::{self, Entry, Mark},
 };
 use ruddy_debug::print;
 
@@ -33,7 +33,7 @@ use ruddy_debug::print;
 /// that adding one means coming back.
 fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     let span = Span::generated(0, 1);
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
 
     let mut all: Vec<(&str, &str, String)> = Vec::new();
     for kind in [
@@ -206,6 +206,7 @@ fn diagnostics() -> Vec<(&'static str, &'static str, String)> {
     }
 
     for kind in [
+        TypeError::NotAStruct { base: nat.clone() },
         TypeError::Mismatch {
             expected: nat.clone(),
             actual: Rc::new(Ty::default()),
@@ -470,14 +471,14 @@ fn a_loop_of_bare_names_is_worded_for_its_namespace() {
 /// shows it in. `~` is "must unify with".
 #[test]
 fn a_constraint_reads_as_what_it_demands() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let span = Span::generated(0, 1);
 
     let equal = Constraint {
         span,
         kind: ConstraintKind::Equal {
             expected: nat.clone(),
-            actual: Rc::new(Ty::plain(Core::Var(0))),
+            actual: Rc::new(Ty::plain(Ty::Var(0))),
         },
     };
     assert_eq!(equal.to_string(), "Nat ~ ?0");
@@ -494,7 +495,7 @@ fn an_effect_reads_as_the_one_thing_that_changed() {
     assert_eq!(
         Effect::Bound {
             var: 3,
-            value: Assigned::Ty(Rc::new(Ty::plain(Core::Nat)))
+            value: Assigned::Ty(Rc::new(Ty::plain(Ty::Nat)))
         }
         .to_string(),
         "?3 := Nat"
@@ -584,8 +585,8 @@ fn round_trip(prelude: &str, printed: &str) -> String {
 /// whole claim a diagnostic quoting a type makes.
 #[test]
 fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
-    let endo = Rc::new(Ty::plain(Core::pure(nat.clone(), nat.clone())));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
+    let endo = Rc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone())));
 
     // A declared type prints as its name and is an atom whatever it stands
     // for, so the arrow behind this one leaks no parentheses through it. It
@@ -594,7 +595,7 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
     let symbol = mint
         .global(None, Namespace::Types, "Endo")
         .expect("a fresh name");
-    let named = Rc::new(Ty::plain(Core::Named {
+    let named = Rc::new(Ty::plain(Ty::Named {
         symbol,
         name: "Endo".into(),
         args: Rc::from([]),
@@ -606,33 +607,26 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
         // the right side must not acquire any.
         (
             "",
-            Rc::new(Ty::plain(Core::pure(endo.clone(), endo.clone()))),
+            Rc::new(Ty::plain(Ty::pure(endo.clone(), endo.clone()))),
             "(Nat -> Nat) -> Nat -> Nat",
         ),
         // The empty struct is unit, and prints as the one spelling this
-        // language has for it. See `Core::Unit` for why it is `{}` and not
+        // language has for it. See `Ty::Unit` for why it is `{}` and not
         // `()`.
+        ("", Rc::new(Ty::unit()), "{}"),
         (
             "",
-            Rc::new(Ty {
-                core: Core::Unit,
-                fields: Default::default(),
-            }),
-            "{}",
-        ),
-        (
-            "",
-            Rc::new(Ty {
-                core: Core::Unit,
-                fields: [("x".to_string(), RowField::present(endo.clone()))]
+            Rc::new(Ty::Struct(Row {
+                labels: [("x".to_string(), RowField::present(endo.clone()))]
                     .into_iter()
                     .collect(),
-            }),
+                rest: Rest::Closed,
+            })),
             "{ x: Nat -> Nat }",
         ),
         (
             "type Endo = Nat -> Nat\n",
-            Rc::new(Ty::plain(Core::pure(named.clone(), named.clone()))),
+            Rc::new(Ty::plain(Ty::pure(named.clone(), named.clone()))),
             "Endo -> Endo",
         ),
     ] {
@@ -646,16 +640,16 @@ fn a_printed_closed_type_reads_back_as_the_type_it_was_printed_from() {
 /// the same control character remain user data.
 #[test]
 fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let unit = Rc::new(Ty::unit());
     let row = Row {
         labels: [
             (
-                "Log\u{1f}write:Nat".to_string(),
+                EffectId::structural("Log".into(), "write:Nat".into()).row_key(),
                 RowField::present(unit.clone()),
             ),
             (
-                "Gone\u{1f}gone:Nat".to_string(),
+                EffectId::structural("Gone".into(), "gone:Nat".into()).row_key(),
                 RowField {
                     presence: Presence::Absent,
                     ty: unit.clone(),
@@ -667,28 +661,28 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
         .collect(),
         rest: Rest::Closed,
     };
-    let effect_argument = Rc::new(Ty::plain(Core::Sum(row.clone())));
-    let ordinary_sum_argument = Rc::new(Ty::plain(Core::Sum(Row {
+    let effect_argument = Rc::new(Ty::plain(Ty::Sum(row.clone())));
+    let ordinary_sum_argument = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
-            "ordinary".to_string(),
-            RowField::present(Rc::new(Ty::unit())),
+            "user\u{1f}payload".to_string(),
+            RowField::present(nat.clone()),
         )]
         .into_iter()
         .collect(),
         rest: Rest::Closed,
     })));
-    let fielded_argument = Rc::new(Ty {
-        core: Core::Sum(row),
-        fields: [("x".to_string(), RowField::present(nat))]
+    let fielded_argument = Rc::new(Ty::Struct(Row {
+        labels: [("x".to_string(), RowField::present(nat))]
             .into_iter()
             .collect(),
-    });
+        rest: Rest::Closed,
+    }));
 
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let symbol = mint
         .global(None, Namespace::Types, "Runner")
         .expect("a fresh name");
-    let applied = Ty::plain(Core::Named {
+    let applied = Ty::plain(Ty::Named {
         symbol,
         name: "Runner".into(),
         args: Rc::from([effect_argument, ordinary_sum_argument, fielded_argument]),
@@ -696,10 +690,10 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
     .to_string();
 
     assert!(
-        applied.starts_with("Runner (#Log | #plain) (#ordinary) "),
+        applied.starts_with("Runner (#Log | #plain) (#\"user\u{1f}payload\" Nat) "),
         "{applied:?}"
     );
-    assert!(applied.contains("Log\u{1f}write:Nat"), "{applied:?}");
+    assert!(applied.ends_with("{ x: Nat }"), "{applied:?}");
 }
 
 /// An open row prints in the surface notation too, and cannot be read back
@@ -719,50 +713,42 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
 /// compile, which is what makes that the right trade.
 #[test]
 fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
 
     // A row's tail prints in the surface spelling, after the fields; a
     // quantified tail wears its letter and an undecided one has nothing to
     // report. An open row with no fields still shows it is open.
     assert_eq!(
-        Ty {
-            core: Core::Bound(0),
-            fields: [("x".to_string(), RowField::present(nat.clone()))]
+        Ty::Struct(Row {
+            labels: [("x".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
-        }
+            rest: Rest::Bound(0)
+        })
         .to_string(),
         "{ x: Nat, ..'a }"
     );
     assert_eq!(
-        Ty {
-            core: Core::Undecided,
-            fields: [("x".to_string(), RowField::present(nat.clone()))]
+        Ty::Struct(Row {
+            labels: [("x".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
-        }
+            rest: Rest::Undecided
+        })
         .to_string(),
         "{ x: Nat, .. }"
     );
     // A type carrying no labels prints as its core alone, whatever the core is:
     // there is no `..` to write when there is nothing for it to follow, and a
     // quantified core is exactly a quantified type.
-    assert_eq!(
-        Ty {
-            core: Core::Bound(0),
-            fields: Default::default(),
-        }
-        .to_string(),
-        "'a"
-    );
+    assert_eq!(Ty::Bound(0).to_string(), "'a");
 
     // A field's presence prints as its surface spelling too: certainly there
     // is unmarked, undecided either way is `?`, and certainly absent is not
     // part of what the type says at all.
     assert_eq!(
-        Ty {
-            core: Core::Unit,
-            fields: [
+        Ty::Struct(Row {
+            labels: [
                 (
                     "x".to_string(),
                     RowField {
@@ -780,7 +766,8 @@ fn an_open_row_prints_in_surface_notation_it_cannot_be_read_back_from() {
             ]
             .into_iter()
             .collect(),
-        }
+            rest: Rest::Closed
+        })
         .to_string(),
         "{ x when 'a: Nat }"
     );
@@ -835,19 +822,19 @@ fn the_notes_pointing_elsewhere_are_worded_once() {
 /// what this pins.
 #[test]
 fn a_complaint_about_a_sum_says_case_and_writes_the_sigil() {
-    let sum = Rc::new(Ty::plain(Core::Sum(Row {
+    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
             RowField {
                 presence: Presence::Present,
-                ty: Rc::new(Ty::plain(Core::Nat)),
+                ty: Rc::new(Ty::plain(Ty::Nat)),
             },
         )]
         .into_iter()
         .collect(),
         rest: Rest::Closed,
     })));
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
 
     let missing = TypeError::MissingField {
         shape: Shape::Sum,
@@ -1123,17 +1110,17 @@ fn a_primitive_prints_as_the_name_it_is_written_with() {
 /// does not have.
 #[test]
 fn a_case_settled_absent_is_not_part_of_the_sum() {
-    let sum = Rc::new(Ty::plain(Core::Sum(Row {
+    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [
             (
                 "A".to_string(),
-                RowField::present(Rc::new(Ty::plain(Core::Nat))),
+                RowField::present(Rc::new(Ty::plain(Ty::Nat))),
             ),
             (
                 "B".to_string(),
                 RowField {
                     presence: Presence::Absent,
-                    ty: Rc::new(Ty::plain(Core::Nat)),
+                    ty: Rc::new(Ty::plain(Ty::Nat)),
                 },
             ),
         ]
@@ -1146,15 +1133,15 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
     // A case carrying anything that is not unit keeps its payload: only the
     // type with nothing of its own and no fields is written as no payload at
     // all.
-    let open = Rc::new(Ty::plain(Core::Sum(Row {
+    let open = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
-            RowField::present(Rc::new(Ty {
-                core: Core::Bound(0),
-                fields: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
+            RowField::present(Rc::new(Ty::Struct(Row {
+                labels: [("x".to_string(), RowField::present(Rc::new(Ty::unit())))]
                     .into_iter()
                     .collect(),
-            })),
+                rest: Rest::Bound(0),
+            }))),
         )]
         .into_iter()
         .collect(),
@@ -1164,12 +1151,12 @@ fn a_case_settled_absent_is_not_part_of_the_sum() {
 
     // The two forms that write no case at all keep the leading bar, which is
     // the only thing that makes either read back as a sum.
-    let empty = Rc::new(Ty::plain(Core::Sum(Row {
+    let empty = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: Default::default(),
         rest: Rest::Closed,
     })));
     assert_eq!(empty.to_string(), "|");
-    let only_tail = Rc::new(Ty::plain(Core::Sum(Row {
+    let only_tail = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: Default::default(),
         rest: Rest::Bound(0),
     })));
@@ -1249,12 +1236,51 @@ fn every_failure_is_reported(what: &str, shown: &dyn fmt::Display) {
 /// buffers. A printer that swallowed the failure would hand back a type or a
 /// program that was never written, which is worse than the error it hid.
 #[test]
+fn generic_rows_render_undecided_marks() {
+    struct Marked;
+    impl fmt::Display for Marked {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            ui::write_row(
+                f,
+                [Entry::Written {
+                    name: "x",
+                    mark: Some(Mark::Undecided),
+                    holds: "Nat",
+                }],
+                None,
+            )?;
+            f.write_str(" / ")?;
+            ui::write_sum(
+                f,
+                [Entry::Written {
+                    name: "A",
+                    mark: Some(Mark::Undecided),
+                    holds: Some(&Ty::Nat),
+                }],
+                None,
+            )?;
+            f.write_str(" / ")?;
+            ui::write_effects(
+                f,
+                &[Entry::Written {
+                    name: "Log",
+                    mark: Some(Mark::Undecided),
+                    holds: (),
+                }],
+                None,
+            )
+        }
+    }
+    assert_eq!(Marked.to_string(), "{ x?: Nat } / #A? Nat / !Log?");
+}
+
+#[test]
 fn a_printer_reports_a_writer_that_refuses_it() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let module = mint.module(None, "util").expect("a fresh name");
     let local = mint.local(Some(module), Namespace::Terms, "x");
-    let named = Rc::new(Ty::plain(Core::Named {
+    let named = Rc::new(Ty::plain(Ty::Named {
         symbol: mint
             .global(None, Namespace::Types, "Pair")
             .expect("a fresh name"),
@@ -1277,24 +1303,24 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     for (what, ty) in [
         (
             "an arrow",
-            Rc::new(Ty::plain(Core::pure(nat.clone(), nat.clone()))),
+            Rc::new(Ty::plain(Ty::pure(nat.clone(), nat.clone()))),
         ),
         ("an application", named.clone()),
         (
             "an open struct",
-            Rc::new(Ty {
-                core: Core::Bound(0),
-                fields: [
+            Rc::new(Ty::Struct(Row {
+                labels: [
                     ("x".to_string(), RowField::present(nat.clone())),
                     ("y".to_string(), optional.clone()),
                 ]
                 .into_iter()
                 .collect(),
-            }),
+                rest: Rest::Bound(0),
+            })),
         ),
         (
             "an open sum",
-            Rc::new(Ty::plain(Core::Sum(Row {
+            Rc::new(Ty::plain(Ty::Sum(Row {
                 labels: [
                     ("A".to_string(), RowField::present(nat.clone())),
                     ("B".to_string(), optional.clone()),
@@ -1306,41 +1332,24 @@ fn a_printer_reports_a_writer_that_refuses_it() {
         ),
         (
             "the empty sum",
-            Rc::new(Ty::plain(Core::Sum(Row {
+            Rc::new(Ty::plain(Ty::Sum(Row {
                 labels: Default::default(),
                 rest: Rest::Closed,
             }))),
         ),
         (
             "the sum that is only its tail",
-            Rc::new(Ty::plain(Core::Sum(Row {
+            Rc::new(Ty::plain(Ty::Sum(Row {
                 labels: Default::default(),
                 rest: Rest::Bound(0),
             }))),
         ),
-        // The `with` form, whose core and whose braces are two writes with a
-        // word between them: a refusal on any of the three has to come back.
-        (
-            "a type carrying fields",
-            Rc::new(Ty {
-                core: Core::Nat,
-                fields: [("x".to_string(), RowField::present(nat.clone()))]
-                    .into_iter()
-                    .collect(),
-            }),
-        ),
         (
             "a case carrying unit",
-            Rc::new(Ty::plain(Core::Sum(Row {
-                labels: [(
-                    "None".to_string(),
-                    RowField::present(Rc::new(Ty {
-                        core: Core::Unit,
-                        fields: Default::default(),
-                    })),
-                )]
-                .into_iter()
-                .collect(),
+            Rc::new(Ty::plain(Ty::Sum(Row {
+                labels: [("None".to_string(), RowField::present(Rc::new(Ty::unit())))]
+                    .into_iter()
+                    .collect(),
                 rest: Rest::Closed,
             }))),
         ),
@@ -1482,74 +1491,6 @@ fn a_printer_reports_a_writer_that_refuses_it() {
     }
 }
 
-/// A type carrying fields, whatever its core: the shape no source syntax writes
-/// and inference builds every time a projection is left unannotated. What the
-/// core is decides everything about how it prints — braces with a `..`, or a
-/// `with` — so it is the one thing the caller varies.
-fn with_fields(core: Core, labels: Vec<(&str, RowField)>) -> Rc<Ty> {
-    Rc::new(Ty {
-        core,
-        fields: labels
-            .into_iter()
-            .map(|(name, field)| (name.to_string(), field))
-            .collect(),
-    })
-}
-
-/// Where a `with` type needs parentheses and where it does not. It sits above
-/// the arrow and the sum, so neither side of an arrow brackets it; it sits
-/// below an atom, so every position that takes one — a type constructor's
-/// argument, a tag's payload — does.
-#[test]
-fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
-    let quantified = with_fields(
-        Core::Nat,
-        vec![("x", RowField::present(Rc::new(Ty::plain(Core::Bound(0)))))],
-    );
-    assert_eq!(quantified.to_string(), "Nat with { x: 'a }");
-
-    // Either side of an arrow, bare: nothing in an arrow can swallow the
-    // fields, and bracketing here would be noise on the commonest form there
-    // is — the type of an unannotated accessor.
-    assert_eq!(
-        Ty::plain(Core::pure(quantified.clone(), nat.clone())).to_string(),
-        "Nat with { x: 'a } -> Nat"
-    );
-    assert_eq!(
-        Ty::plain(Core::pure(nat.clone(), quantified.clone())).to_string(),
-        "Nat -> Nat with { x: 'a }"
-    );
-
-    // An argument of a declared type, bracketed: the fields would otherwise
-    // read as the next argument along.
-    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
-    let symbol = mint
-        .global(None, Namespace::Types, "Pair")
-        .expect("a fresh name");
-    assert_eq!(
-        Ty::plain(Core::Named {
-            symbol,
-            name: "Pair".into(),
-            args: Rc::from([quantified.clone(), nat.clone()]),
-        })
-        .to_string(),
-        "Pair (Nat with { x: 'a }) Nat"
-    );
-
-    // And a tag's payload, for the same reason.
-    assert_eq!(
-        Ty::plain(Core::Sum(Row {
-            labels: [("Some".to_string(), RowField::present(quantified.clone()))]
-                .into_iter()
-                .collect(),
-            rest: Rest::Closed,
-        }))
-        .to_string(),
-        "#Some (Nat with { x: 'a })"
-    );
-}
-
 /// A sum's tail decided to be more cases prints as those cases, in the notation
 /// of the row it ends — and a splice that came to nothing prints as no tail at
 /// all.
@@ -1561,12 +1502,11 @@ fn a_with_type_is_bracketed_wherever_something_could_follow_its_fields() {
 /// allows nothing more, which is what a closed row already says — and the
 /// solver's own mark for that is never part of a printed type.
 ///
-/// A struct has none of this any more. Its `..` is the core beside its fields,
-/// and a core standing for a type with fields is spliced by `Table::resolve`
-/// before anything prints it, so no chain ever reaches the page.
+/// Struct rows use the same explicit `Rest`, so a decided empty splice likewise
+/// prints as no tail at all.
 #[test]
 fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let more = |labels: Vec<(&str, RowField)>, rest: Rest| {
         Rest::More(Rc::new(Row {
             labels: labels
@@ -1580,7 +1520,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
     // `type G 'r = #Err Nat | ..'r` applied to `#Ok Nat`, and to a row
     // naming nothing, which leaves the sum closed at the case it wrote.
     let err_nat = |rest: Rest| {
-        Rc::new(Ty::plain(Core::Sum(Row {
+        Rc::new(Ty::plain(Ty::Sum(Row {
             labels: [("Err".to_string(), RowField::present(nat.clone()))]
                 .into_iter()
                 .collect(),
@@ -1593,7 +1533,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
             Rest::Closed
         ))
         .to_string(),
-        "#Err Nat | ..#Ok Nat"
+        "#Err Nat | #Ok Nat"
     );
     assert_eq!(err_nat(more(vec![], Rest::Closed)).to_string(), "#Err Nat");
 
@@ -1622,7 +1562,7 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
     // A case whose payload is unit is still a case carrying unit, so it prints
     // with no payload at all.
     assert_eq!(
-        Ty::plain(Core::Sum(Row {
+        Ty::plain(Ty::Sum(Row {
             labels: [("A".to_string(), RowField::present(Rc::new(Ty::unit())))]
                 .into_iter()
                 .collect(),
@@ -1630,6 +1570,37 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         }))
         .to_string(),
         "#A"
+    );
+    let nested_empty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(Row::closed())),
+    }));
+    assert_eq!(
+        Ty::Sum(Row {
+            labels: [("Nested".into(), RowField::present(nested_empty))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        })
+        .to_string(),
+        "#Nested"
+    );
+    let nested_open = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(Row {
+            labels: Default::default(),
+            rest: Rest::Var(9),
+        })),
+    }));
+    assert_eq!(
+        Ty::Sum(Row {
+            labels: [("Nested".into(), RowField::present(nested_open))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        })
+        .to_string(),
+        "#Nested { ..?9 }"
     );
 }
 
@@ -1654,7 +1625,7 @@ fn the_three_sorts_each_print_on_their_own() {
         Row {
             labels: [(
                 "x".to_string(),
-                RowField::present(Rc::new(Ty::plain(Core::Nat)))
+                RowField::present(Rc::new(Ty::plain(Ty::Nat)))
             )]
             .into_iter()
             .collect(),
@@ -1689,7 +1660,7 @@ fn the_three_sorts_each_print_on_their_own() {
     // A binding prints as the value, whichever sort it is, so the Solve tab's
     // one column serves all three.
     for (value, printed) in [
-        (Assigned::Ty(Rc::new(Ty::plain(Core::Nat))), "?2 := Nat"),
+        (Assigned::Ty(Rc::new(Ty::plain(Ty::Nat))), "?2 := Nat"),
         (Assigned::Row(Rc::new(Row::closed())), "?2 := ∅"),
         (Assigned::Presence(Presence::Absent), "?2 := absent"),
     ] {
@@ -1705,11 +1676,11 @@ fn the_three_sorts_each_print_on_their_own() {
 /// other two are what taking a type apart reaches.
 #[test]
 fn a_goal_prints_as_the_constraint_it_is() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     assert_eq!(
         Goal::Type {
             expected: nat.clone(),
-            actual: Rc::new(Ty::plain(Core::Var(0))),
+            actual: Rc::new(Ty::plain(Ty::Var(0))),
         }
         .to_string(),
         "Nat ~ ?0"
@@ -1741,10 +1712,10 @@ fn a_goal_prints_as_the_constraint_it_is() {
 /// *field*, and reading the word off the base would call it a case.
 #[test]
 fn a_label_complaint_reads_the_shape_it_was_handed() {
-    let sum = Rc::new(Ty::plain(Core::Sum(Row {
+    let sum = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
             "A".to_string(),
-            RowField::present(Rc::new(Ty::plain(Core::Nat))),
+            RowField::present(Rc::new(Ty::plain(Ty::Nat))),
         )]
         .into_iter()
         .collect(),
@@ -1788,21 +1759,21 @@ fn a_label_complaint_reads_the_shape_it_was_handed() {
     );
 }
 
-/// The complaint about a base with no fields is gone, and with it its code. A
-/// projection now demands a fresh core rather than a struct, so it fits any
-/// type carrying the field and the only way it can fail is the field itself.
+/// Projection from a known non-struct has its own stable diagnostic.
 #[test]
-fn nothing_is_coded_as_not_a_struct_any_more() {
-    assert!(
-        diagnostics()
-            .iter()
-            .all(|(_, code, _)| *code != "not-a-struct"),
-        "{:#?}",
-        diagnostics()
+fn not_a_struct_is_coded_and_worded() {
+    let diagnostics = diagnostics();
+    let (_, _, message) = diagnostics
+        .iter()
+        .find(|(_, code, _)| *code == "not-a-struct")
+        .expect("the projection diagnostic");
+    assert_eq!(
+        message,
+        "`Nat` is not a struct, so it has no fields to read"
     );
-    // And the codes the change leaves alone are still there.
-    let codes: HashSet<&str> = diagnostics().iter().map(|(_, code, _)| *code).collect();
+    let codes: HashSet<&str> = diagnostics.iter().map(|(_, code, _)| *code).collect();
     for code in [
+        "not-a-struct",
         "missing-field",
         "extra-field",
         "type-mismatch",
@@ -1864,7 +1835,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     // out to be beside what it had promised to be.
     assert_eq!(
         TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Core::Nat)),
+            found: Rc::new(Ty::plain(Ty::Nat)),
             name: "a".into(),
             sense: Sense::Type,
             declared: span,
@@ -1877,7 +1848,7 @@ fn the_variable_complaints_read_as_what_went_wrong() {
     // wrote.
     assert_eq!(
         TypeError::RigidBroken {
-            found: Rc::new(Ty::plain(Core::Nat)),
+            found: Rc::new(Ty::plain(Ty::Nat)),
             name: "e".into(),
             sense: Sense::Effects,
             declared: span,
@@ -1913,141 +1884,6 @@ fn the_variable_complaints_read_as_what_went_wrong() {
         TypeError::RigidEscapes { name: "a".into() }.to_string(),
         "`\'a` stands for whatever the caller picks, so it can't be part of a type \
          outside the annotation that declared it"
-    );
-}
-
-/// Every form a type prints as, by its core and whether it carries labels.
-///
-/// The table in one test, because it is one rule: a type carrying nothing
-/// prints as its core alone; one carrying labels prints in braces whenever its
-/// core is something a `..` has a spelling for; and anything else wears the
-/// `with` that no source syntax writes.
-///
-/// The braced forms are the point. `{ x: a, ..'b }` is what a reader would
-/// have written, and `'b with { x: a }` is not something the parser could read
-/// back — so the `..` spelling is what keeps a printed type re-lowerable to the
-/// type it was printed from.
-#[test]
-fn a_type_prints_by_its_core_and_whether_it_carries_labels() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
-    let x = || vec![("x", RowField::present(nat.clone()))];
-    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
-    let symbol = mint
-        .global(None, Namespace::Types, "WithX")
-        .expect("a fresh name");
-    let with_x = || Core::Named {
-        symbol,
-        name: "WithX".into(),
-        args: Rc::from([nat.clone()]),
-    };
-
-    // No labels: the core alone, whatever the core is.
-    for (core, printed) in [
-        (Core::Nat, "Nat"),
-        (Core::Bound(0), "'a"),
-        (Core::Var(3), "?3"),
-        (Core::Undecided, "?"),
-        (Core::Unit, "{}"),
-        (with_x(), "WithX Nat"),
-    ] {
-        assert_eq!(Ty::plain(core).to_string(), printed);
-    }
-
-    // Labels, and a core a `..` can be written with: braces, and the `..`
-    // spelled by what the core is.
-    assert_eq!(with_fields(Core::Unit, x()).to_string(), "{ x: Nat }");
-    assert_eq!(
-        with_fields(Core::Var(3), x()).to_string(),
-        "{ x: Nat, ..?3 }"
-    );
-    assert_eq!(
-        with_fields(
-            Core::Bound(1),
-            vec![("x", RowField::present(Rc::new(Ty::plain(Core::Bound(0)))))],
-        )
-        .to_string(),
-        "{ x: 'a, ..'b }"
-    );
-    assert_eq!(
-        with_fields(Core::Undecided, x()).to_string(),
-        "{ x: Nat, .. }"
-    );
-    assert_eq!(
-        with_fields(
-            Core::Undecided,
-            vec![(
-                "x",
-                RowField {
-                    presence: Presence::Undecided,
-                    ty: nat.clone(),
-                }
-            )],
-        )
-        .to_string(),
-        // The one presence still written `?`: nothing parses it, and what it
-        // reports is that there is nothing to write.
-        "{ x?: Nat, .. }"
-    );
-    // Every other undecided presence wears the `when` clause that names it.
-    assert_eq!(
-        with_fields(
-            Core::Undecided,
-            vec![(
-                "x",
-                RowField {
-                    presence: Presence::Bound(0),
-                    ty: nat.clone(),
-                }
-            )],
-        )
-        .to_string(),
-        "{ x when 'a: Nat, .. }"
-    );
-
-    // A field the solver settled absent is not part of what the type says, so
-    // it is not written at all — and a type whose every field settled absent is
-    // its `..` alone, with no comma in front of it separating it from the
-    // nothing that precedes it.
-    let gone = || {
-        vec![(
-            "x",
-            RowField {
-                presence: Presence::Absent,
-                ty: nat.clone(),
-            },
-        )]
-    };
-    assert_eq!(with_fields(Core::Var(3), gone()).to_string(), "{ ..?3 }");
-    assert_eq!(with_fields(Core::Undecided, gone()).to_string(), "{ .. }");
-    // And one whose core names no others either is unit, which it prints as.
-    assert_eq!(with_fields(Core::Unit, gone()).to_string(), "{}");
-
-    // Labels, and a core a `..` has no spelling for: the `with` form, with the
-    // core bracketed wherever it extends rightward.
-    assert_eq!(
-        with_fields(Core::Nat, x()).to_string(),
-        "Nat with { x: Nat }"
-    );
-    assert_eq!(
-        with_fields(Core::pure(nat.clone(), nat.clone()), x()).to_string(),
-        "(Nat -> Nat) with { x: Nat }"
-    );
-    assert_eq!(
-        with_fields(
-            Core::Sum(Row {
-                labels: [("A".to_string(), RowField::present(Rc::new(Ty::unit())))]
-                    .into_iter()
-                    .collect(),
-                rest: Rest::Closed,
-            }),
-            x(),
-        )
-        .to_string(),
-        "(#A) with { x: Nat }"
-    );
-    assert_eq!(
-        with_fields(with_x(), vec![("y", RowField::present(nat))]).to_string(),
-        "WithX Nat with { y: Nat }"
     );
 }
 
@@ -2125,12 +1961,11 @@ fn a_mixed_tail_names_the_two_senses_it_was_given() {
 }
 
 /// A row lifted out of the type it belongs to has no shape to be read in, so it
-/// falls back to braces — including a tail already spliced to more labels, which
-/// prints as those labels in the same notation. The solver's own record is where
-/// one surfaces.
+/// falls back to braces. A spliced tail is flattened into the same canonical,
+/// source-representable row; the solver's own record is where one surfaces.
 #[test]
 fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let row = Row {
         labels: [("x".to_string(), RowField::present(nat.clone()))]
             .into_iter()
@@ -2142,7 +1977,85 @@ fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
             rest: Rest::Closed,
         })),
     };
-    assert_eq!(row.to_string(), "{ x: Nat, ..{ y: Nat } }");
+    assert_eq!(row.to_string(), "{ x: Nat, y: Nat }");
+}
+
+#[test]
+fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
+    let nat = Rc::new(Ty::Nat);
+    let inner = Row {
+        labels: [
+            ("masked".into(), RowField::present(nat.clone())),
+            (
+                "Log\u{1f}generated-interface".into(),
+                RowField::present(Rc::new(Ty::unit())),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    let outer = Row {
+        labels: [(
+            "masked".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: Rc::new(Ty::String),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::More(Rc::new(inner)),
+    };
+
+    assert_eq!(
+        Ty::Struct(outer.clone()).to_string(),
+        "{ \"Log\u{1f}generated-interface\": {} }"
+    );
+    assert_eq!(
+        outer.to_string(),
+        "{ \"Log\u{1f}generated-interface\": {} }"
+    );
+    // In a normalized applied effect-interface position, every More layer
+    // participates in identity stripping; a legacy separator alone remains
+    // ordinary sum data, as the assertions above show.
+    let effect_inner = Row {
+        labels: [(
+            EffectId::structural("Log".into(), "generated-interface".into()).row_key(),
+            RowField::present(Rc::new(Ty::unit())),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    let effect_outer = Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(effect_inner)),
+    };
+    let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).unwrap());
+    let runner = mint.global(None, Namespace::Types, "Runner").unwrap();
+    let applied = Ty::Named {
+        symbol: runner,
+        name: "Runner".into(),
+        args: vec![Rc::new(Ty::Sum(effect_outer))].into(),
+    };
+    assert_eq!(applied.to_string(), "Runner (#Log)");
+
+    let absent = Row {
+        labels: [(
+            "gone".into(),
+            RowField {
+                presence: Presence::Absent,
+                ty: nat,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    assert_eq!(absent.to_string(), "∅");
+    assert_eq!(Ty::Struct(absent.clone()).to_string(), "{}");
+    assert_eq!(Ty::Sum(absent).to_string(), "|");
 }
 
 /// A constraint kind is coded the way an error kind is, and for the same
@@ -2150,11 +2063,17 @@ fn a_row_with_no_shape_to_hand_down_prints_in_braces() {
 /// code would make two different demands read as one.
 #[test]
 fn no_two_kinds_of_constraint_are_coded_the_same() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let symbol = mint.local(None, Namespace::Terms, "x");
 
     let kinds = [
+        ConstraintKind::Project {
+            base: nat.clone(),
+            field: "x".into(),
+            result: nat.clone(),
+            base_span: Span::generated(0, 1),
+        },
         ConstraintKind::Equal {
             expected: nat.clone(),
             actual: nat.clone(),
@@ -2202,7 +2121,7 @@ fn no_two_kinds_of_constraint_are_coded_the_same() {
 /// scheme the `let` publishes requires of its presences.
 #[test]
 fn the_scoping_constraints_read_as_what_they_do() {
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).expect("valid bundle"));
     let symbol = mint.local(None, Namespace::Terms, "x");
 
@@ -2238,7 +2157,7 @@ fn the_scoping_constraints_read_as_what_they_do() {
 
     let use_site = ConstraintKind::Instance {
         symbol,
-        ty: Rc::new(Ty::plain(Core::Var(4))),
+        ty: Rc::new(Ty::plain(Ty::Var(4))),
         requirement: 0,
     };
     assert_eq!(use_site.code(), "instance");
@@ -2628,15 +2547,15 @@ fn an_abandoned_presence_still_prints_as_a_question_mark() {
         presence: Presence::Undecided,
         ty,
     };
-    let nat = Rc::new(Ty::plain(Core::Nat));
+    let nat = Rc::new(Ty::plain(Ty::Nat));
     let fields: IndexMap<String, RowField> = [("x".to_string(), undecided(nat.clone()))]
         .into_iter()
         .collect();
     assert_eq!(
-        Ty {
-            core: Core::Unit,
-            fields
-        }
+        Ty::Struct(Row {
+            labels: fields,
+            rest: Rest::Closed
+        })
         .to_string(),
         "{ x?: Nat }"
     );
@@ -2644,7 +2563,7 @@ fn an_abandoned_presence_still_prints_as_a_question_mark() {
     let cases: IndexMap<String, RowField> =
         [("A".to_string(), undecided(nat))].into_iter().collect();
     assert_eq!(
-        Ty::plain(Core::Sum(Row {
+        Ty::plain(Ty::Sum(Row {
             labels: cases,
             rest: Rest::Closed,
         }))
@@ -2659,7 +2578,7 @@ fn an_abandoned_presence_still_prints_as_a_question_mark() {
 /// keeps two of them from ever colliding.
 #[test]
 fn the_two_alphabets_are_told_apart_by_the_quote() {
-    assert_eq!(Core::Bound(0).to_string(), "'a");
+    assert_eq!(Ty::Bound(0).to_string(), "'a");
     assert_eq!(Presence::Bound(0).to_string(), "'a");
     assert_eq!(Presence::Bound(26).to_string(), "'a1");
     assert_eq!(Formula::bound(25).to_string(), "'z");
@@ -2801,9 +2720,9 @@ fn the_effect_complaints_are_read_in_effects() {
         (
             TypeError::ExtraField {
                 shape: Shape::Effect,
-                base: Rc::new(Ty::plain(Core::pure(
-                    Rc::new(Ty::plain(Core::Nat)),
-                    Rc::new(Ty::plain(Core::Nat)),
+                base: Rc::new(Ty::plain(Ty::pure(
+                    Rc::new(Ty::plain(Ty::Nat)),
+                    Rc::new(Ty::plain(Ty::Nat)),
                 ))),
                 field: "Log".to_string(),
             },
