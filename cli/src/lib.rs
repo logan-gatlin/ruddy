@@ -314,6 +314,17 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         exit_code: 1,
     })?;
     let last = graph.projects.len().checked_sub(1);
+    // Generation is deliberately completed before any build output is touched.
+    // The backend consumes the already linked root rather than relinking or
+    // reading an artifact back from disk.
+    let javascript = match last.and_then(|index| graph.projects.get(index)) {
+        Some(project) if project.target == Target::Js => {
+            Some(ruddy_js::generate(&linked).map_err(|error| {
+                CliError::one(format!("could not generate JavaScript: {error}"))
+            })?)
+        }
+        _ => None,
+    };
     let mut root = None;
     for (index, project) in graph.projects.into_iter().enumerate() {
         if project.source == ProjectSource::GitCache {
@@ -336,6 +347,10 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         };
         replace_file(&path, artifact.print().as_bytes())?;
         if Some(index) == last {
+            if let Some(javascript) = &javascript {
+                let path = build.join(format!("{}.js", project.artifact.header.identity.name));
+                replace_file(&path, javascript.as_bytes())?;
+            }
             root = Some(path);
         }
     }
@@ -484,12 +499,24 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Target {
+    /// Write only the canonical linked artifact.
+    #[default]
+    Lib,
+    /// Write the canonical linked artifact and a JavaScript ESM module.
+    Js,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     name: String,
     version: String,
     root: PathBuf,
+    #[serde(default)]
+    target: Target,
     dependencies: IndexMap<String, ManifestDependency>,
 }
 
@@ -704,6 +731,10 @@ pub struct CompiledProject {
     pub directory: PathBuf,
     /// Whether this project is local or from the immutable Git cache.
     pub source: ProjectSource,
+    /// The output target configured by this project's manifest.
+    ///
+    /// Only the requested root's target affects [`build_project`].
+    pub target: Target,
     /// The project's canonical in-memory artifact.
     pub artifact: Artifact,
 }
@@ -1092,6 +1123,7 @@ impl GraphCompiler {
             .iter()
             .map(|project| project.artifact.clone())
             .collect();
+        let target = manifest.target;
         let artifact = compile_one(
             &directory,
             manifest,
@@ -1119,6 +1151,7 @@ impl GraphCompiler {
                 ProjectSource::Local
             },
             directory: directory.clone(),
+            target,
             artifact,
         });
         self.completed.insert(directory, index);

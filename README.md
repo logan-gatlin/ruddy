@@ -17,3 +17,24 @@ A Git dependency accepts at most one of `branch`, `tag`, or `rev`; without one, 
 Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—Ruddy never invokes a Git executable. `RUDDY_HOME` uses a non-empty explicit override when set and otherwise defaults to `$HOME/.ruddy` (independent of `XDG_CACHE_HOME`). All global Git cache data lives beneath `$RUDDY_HOME/cache/git`: checkouts are in `$RUDDY_HOME/cache/git/checkouts`, with temporary clones and the advisory lock alongside them under that cache directory. The project-local `Ruddy.lock` is not part of this cache. Resolution can populate the cache even if compilation later fails. Cached trees are restored to their locked commit under a cross-process lock before every compilation. `compile` and `compile_graph` write no artifacts, but may fetch dependencies and update `Ruddy.lock`; `build` writes local artifacts only after the entire graph compiles and never writes into Git cache checkouts.
 
 `ruddy new NAME` (or `ruddy n NAME`) creates a project and initializes its repository. `ruddy build` (`ruddy b`) compiles and writes artifacts, `ruddy check` compiles without writing artifacts, and `ruddy clean` removes project build output. `Ruddy.lock` is generated on the first dependency resolution and is intentionally not ignored; only `/build/` is listed in a new project's `.gitignore`.
+
+## JavaScript target
+
+A project is an artifact-only library by default. Set the root manifest's target to JavaScript to also emit an ECMAScript module:
+
+```toml
+name = "app"
+version = "0.1.0"
+root = "main.hc"
+target = "js"
+
+[dependencies]
+```
+
+`ruddy build` then writes both `build/app.artifact` and `build/app.js`. Generation uses the fully linked in-memory root artifact, so the JavaScript module is self-contained with respect to Ruddy dependencies. A dependency's own `target` never causes JavaScript output while building a parent, and Ruddy never writes into an immutable Git checkout. The default `target = "lib"` writes only the canonical artifact. `ruddy check` generates neither file.
+
+The generated file is deterministic JavaScript ESM. Its exports follow the bundle's public Ruddy value/module structure. Ruddy `extern` declarations are resolved from their dotted JavaScript target at module initialization; the embedding environment must provide those target values.
+
+Compiler integrations can invoke the backend directly with `ruddy_js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation returns the module source or a validation error and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
+
+Switching a project back to `"lib"` leaves an existing JavaScript file in place until `ruddy clean` removes the build directory.

@@ -1229,6 +1229,100 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
 }
 
 #[test]
+fn manifest_targets_select_root_javascript_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    new_project(&app).unwrap();
+
+    // Omission and an explicit library target retain artifact-only behavior.
+    let artifact = build_project(&app).unwrap();
+    assert!(artifact.is_file());
+    assert!(!app.join("build/app.js").exists());
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"lib\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert!(!app.join("build/app.js").exists());
+
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("target = \"lib\"", "target = \"js\""),
+    )
+    .unwrap();
+    assert_eq!(build_project(&app).unwrap(), artifact);
+    let javascript = fs::read_to_string(app.join("build/app.js")).unwrap();
+    assert!(!javascript.is_empty());
+
+    // Switching back does not implicitly clean a stale sibling product.
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("target = \"js\"", "target = \"lib\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert_eq!(
+        fs::read_to_string(app.join("build/app.js")).unwrap(),
+        javascript
+    );
+    clean_project(&app).unwrap();
+    assert!(!app.join("build").exists());
+}
+
+#[test]
+fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dep");
+    let app = directory.path().join("app");
+    write_project(&dependency, "dep", "1.0.0", &[]);
+    write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
+    let manifest = fs::read_to_string(dependency.join("Ruddy.toml")).unwrap();
+    fs::write(
+        dependency.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    build_project(&app).unwrap();
+    assert!(dependency.join("build/dep.artifact").is_file());
+    assert!(!dependency.join("build/dep.js").exists());
+    assert!(!app.join("build/app.js").exists());
+
+    // A JS root with a dependency also proves generation receives the linked
+    // artifact: the compiler's pre-link root artifact still has dependencies
+    // and is intentionally rejected by the backend.
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert!(app.join("build/app.js").is_file());
+    assert!(!dependency.join("build/dep.js").exists());
+}
+
+#[test]
+fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
+    for target in ["\"native\"", "42"] {
+        let directory = project();
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!(
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = {target}\n[dependencies]\n"
+            ),
+        )
+        .unwrap();
+        let error = compile(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("could not parse manifest"), "{error}");
+    }
+}
+
+#[test]
 fn build_surfaces_compile_directory_and_artifact_write_failures() {
     let missing = tempfile::tempdir().unwrap();
     let compile_error = build_project(missing.path()).unwrap_err();
