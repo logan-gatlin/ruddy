@@ -437,11 +437,11 @@ pub enum Rule {
     /// effects the callee certainly performs. The one rule that widens rather
     /// than equates; see [`ConstraintKind::Performs`].
     Performs,
-    /// A type carrying fields, taken apart: the fields both sides name against
+    /// A struct type, taken apart: the fields both sides name against
     /// each other, the fields only one names into what the other side allows
-    /// beyond its own, and then the two cores.
+    /// beyond its own, and then the two struct rows.
     ///
-    /// Recorded whenever either side carries a label, whatever the cores are —
+    /// Recorded whenever either side carries a label, whatever the constructors and row tails are —
     /// so it is over a struct against a struct, as it always was, and over the
     /// `Nat` carrying an `x` that only a declaration can reach.
     Struct,
@@ -633,8 +633,8 @@ pub enum ErrorKind {
     /// message can be written once here instead of once per reporter.
     ///
     /// Which of the two it is, is carried, because `base` no longer answers
-    /// it. Every type has fields *and* may have cases, so a base can be a
-    /// sum-cored type that is missing a *field* — `(#A 1).x` is exactly
+    /// it. Only structs have fields *and* may have cases, so a base can be a
+    /// sum type that is missing a *field* — `(#A 1).x` is exactly
     /// that, and reading the noun off the base would call it a case. The
     /// solver knows which row it was deciding at the moment it failed, so the
     /// shape is set there. One complaint, because it is one thing gone wrong —
@@ -650,8 +650,8 @@ pub enum ErrorKind {
     /// because the type is the side that says what is allowed. The shape is
     /// carried for the reason [`ErrorKind::MissingField`]'s is.
     ///
-    /// The base need not be a struct, now that every type carries labels. A
-    /// type whose core allows nothing more and which names none allows no label
+    /// The base need not be a struct, now that only structs carry labels. A
+    /// type whose closed struct row allows nothing more and which names none allows no label
     /// at all, so a
     /// projection's demand landing on the *actual* side of a goal against `Nat`
     /// is refused here rather than as a missing field: `let g = fn p => p.x` and
@@ -798,7 +798,7 @@ enum Slot {
 /// condition came from.
 ///
 /// The shape is stored rather than read back off wherever the variable ends up,
-/// because there is no longer anywhere to read it from — a core variable stands
+/// because there is no longer anywhere to read it from — a row-tail variable stands
 /// for a whole type, and the labels forbidden of it are that type's fields. See
 /// [`Table::lacks`].
 type Lacks = (Shape, IndexSet<String>);
@@ -953,8 +953,8 @@ struct Table {
     /// `{ x: Nat, ..?3 }` reads "an `x`, and whatever else `?3` is", so a `?3`
     /// standing for a type with an `x` of its own would give the type two
     /// fields of one name. This is now the *only* way a struct's condition is
-    /// recorded, and the core variable is the only place left to put it: there
-    /// is no tail variable beside it any more, because the core is the tail.
+    /// recorded, and the row-tail variable is the only place left to put it: there
+    /// is no tail variable beside it any more, because the constructor is the tail.
     /// Nothing in [`Ty`] can express the side condition, so it is held here,
     /// beside the slots, and enforced at the one place a variable acquires a
     /// value.
@@ -962,7 +962,7 @@ struct Table {
     /// A sum's tail is under the same condition, for the same reason and with
     /// its own labels: `#A Nat | ..?3` reads the same sentence about cases.
     /// So the shape says which of the two a condition came from, and a
-    /// [`Shape::Struct`] one is always on a core variable while a
+    /// [`Shape::Struct`] one is always on a row-tail variable while a
     /// [`Shape::Sum`] one is always on a tail.
     ///
     /// Insertion-ordered, so that a value breaking the rule twice always names
@@ -1650,7 +1650,7 @@ impl Table {
         var
     }
 
-    /// A variable standing for a whole type: a bare core, carrying no fields
+    /// A variable standing for a whole type: an unconstrained type
     /// of its own, so that binding it takes whatever it is against entire.
     fn fresh_type(&mut self) -> Rc<Ty> {
         let var = self.mint();
@@ -1671,13 +1671,8 @@ impl Table {
     /// the head is resolved; a composite's children still need their own
     /// resolution, which is what [`zonk`](Self::zonk) does exhaustively.
     ///
-    /// The splice is what makes this more than a lookup, and it is now the only
-    /// splice a struct has. A core variable stands for a whole type, so
-    /// `{ x: Nat, ..?3 }` becomes, once `?3` is known, that type's core carrying
-    /// both its own labels and the `x` — the outer labels winning, the way
-    /// [`Table::canon`] settles a sum tail's. Every reader of a type goes
-    /// through here, so no reader has to know that a core can stand for
-    /// something with fields of its own.
+    /// This follows only whole-type variables. Struct-row-tail variables are
+    /// [`Rest::Var`] values and are flattened separately by [`Table::canon`].
     ///
     /// What guarantees this terminates is the occurs check, not anything here:
     /// [`assign`](Solve::assign) refuses every binding that would put a
@@ -1708,7 +1703,7 @@ impl Table {
     /// variable, [`Rest::Closed`] or [`Rest::Undecided`] — as far as the solver
     /// has got.
     ///
-    /// A sum's tails and nothing else, now that a struct's `..` is its core and
+    /// A sum's tails and nothing else, now that a struct's `..` is its row tail and
     /// [`resolve`](Self::resolve) is the splice that settles one.
     ///
     /// A read and nothing else, and one an [`IndexMap`] settles: the outer
@@ -1854,7 +1849,7 @@ impl Table {
             })
     }
 
-    /// [`alike`](Self::alike) about two cores.
+    /// [`alike`](Self::alike) about two types.
     /// [`alike_labels`](Self::alike_labels) about a sum's cases: flattened
     /// first, so that a row spliced into a tail is recognized as the row written
     /// out flat, and then the tails as well.
@@ -1874,7 +1869,7 @@ impl Table {
     }
 
     /// Whether `var` occurs in what it is about to be bound to, whichever sort
-    /// that is. One variable space, so a core variable hiding inside a row is
+    /// that is. One variable space, so a row-tail variable hiding inside a row is
     /// as much a cycle as one hiding inside a type.
     ///
     /// Asked by listing every variable the value mentions and then looking for
@@ -1892,12 +1887,12 @@ impl Table {
     /// whole value to reach it is what that costs, and this is not the place the
     /// solver's time goes.
     ///
-    /// It is answered yes only about a core variable, and that is a fact about
+    /// It is answered yes only about a row-tail variable, and that is a fact about
     /// the solver rather than a hole in the walk. Two reasons, and between them
     /// they cover every route here:
     ///
     /// - A variable's sort is fixed where it was minted and never changes, so a
-    ///   presence variable is never the same variable as a row or core one. Most
+    ///   presence variable is never the same variable as a row or type one. Most
     ///   of what this walk turns up is therefore of the wrong sort to be the one
     ///   being bound, and no comparison across two sorts can say yes.
     /// - The same-sort cases are turned away before a binding is ever proposed.
@@ -1956,7 +1951,7 @@ impl Table {
         }
     }
 
-    /// Every variable `ty` mentions — in its core, and in the fields it carries.
+    /// Every variable `ty` mentions — in its constructor, and in the fields it carries.
     fn mentions_ty(&self, ty: &Rc<Ty>, found: &mut Vec<TyVar>) {
         let ty = self.resolve(ty);
         match &*ty {
@@ -2103,7 +2098,6 @@ impl Table {
     /// every later condition on it is read in — so a tail carried across a
     /// binding by a row that happened to name no labels would leave a sum's
     /// tail being complained about in fields.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn forbidden(&mut self, var: TyVar, shape: Shape, labels: impl IntoIterator<Item = String>) {
         let mut labels = labels.into_iter().peekable();
         if labels.peek().is_none() {
@@ -2674,7 +2668,7 @@ impl Table {
     /// In the row's own order rather than in the order the condition was
     /// recorded, so that a complaint names the label a reader would reach
     /// first reading the type left to right. The shape comes off the recorded
-    /// condition, since a core variable's labels are the fields of whatever it
+    /// condition, since a row-tail variable's labels are the fields of whatever it
     /// is being bound to and there is no row here to read a shape from.
     fn lacked(&self, var: TyVar, value: &Assigned) -> Option<(Shape, Vec<(String, Presence)>)> {
         let (shape, lacks) = self.lacks.get(&var)?;
@@ -2950,12 +2944,12 @@ impl Table {
     /// One numbering pass over one type: over everything but the presence
     /// slots, or — when `presences` — over only them. A variable can only be one
     /// or the other, so the two passes cannot number one twice. Either way the
-    /// descent is the same: the fields first and then the core they sit on,
+    /// descent is the same: the fields first and then the constructor they sit on,
     /// which is what makes `{ x: 'a, ..'b }` number left to right.
     ///
-    /// Fields first because the core is what the `..` prints, and a tail is read
-    /// last. The rule used to be the other way round, when a core was one thing
-    /// a type had and its tail was another; now the core *is* the tail, so
+    /// Fields first because the constructor is what the `..` prints, and a tail is read
+    /// last. The rule used to be the other way round, when the type and row tail were separate
+    /// a type had and its tail was another; now the constructor *is* the tail, so
     /// numbering it first would call the rightmost thing on the line `a`. No
     /// special case for it either way — it is descended into exactly where it
     /// sits.
@@ -2989,7 +2983,7 @@ impl Table {
     }
 
     /// [`quantify_walk`](Self::quantify_walk) over a sum's cases: the labels,
-    /// and then the tail, which is read last for the reason a struct's core is.
+    /// and then the tail, which is read last for the reason a struct-row tail is.
     fn quantify_row(&self, row: &Row, subst: &mut Subst, level: u32, presences: bool) {
         let row = self.canon(row);
         self.quantify_labels(&row.labels, subst, level, presences);
@@ -2998,7 +2992,7 @@ impl Table {
         }
         match row.rest {
             Rest::Var(var) => self.quantify_var(var, subst, level),
-            // The struct core's rule about a sum's tail; see
+            // The struct row tail's rule about a sum's tail; see
             // [`quantify_walk`](Self::quantify_walk).
             Rest::Rigid { id, .. } => {
                 let next = subst.next();
@@ -3091,13 +3085,13 @@ impl Table {
         let row = self.canon(row);
         let labels = self.zonk_labels(&row.labels, subst);
         let rest = match row.rest {
-            // Left standing where it has no number, for the reason a core
+            // Left standing where it has no number, for the reason a type variable
             // variable is; see [`Table::zonk`].
             Rest::Var(var) => match subst.types.get(&var) {
                 Some(at) => Rest::Bound(*at),
                 None => Rest::Var(var),
             },
-            // Indexed for the reason a struct's core is; see
+            // Indexed for the reason a struct-row tail is; see
             // [`zonk`](Self::zonk).
             Rest::Rigid { id, .. } => Rest::Bound(subst.rigids[&id]),
             decided => decided,
@@ -3670,7 +3664,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             Ty::Struct(row(table, tails, labels, tail))
         }
         // The struct arm again, about cases — except that a sum's cases are its
-        // core and it carries no fields of its own. The one other difference is
+        // constructor, distinct from struct fields. The one other difference is
         // the payload a case may not have written, which is unit
         // — the same type `()` is, built here rather than in the tree so that
         // what the reader wrote and what the compiler means stay two separate
@@ -3875,7 +3869,7 @@ impl Row {
 }
 
 /// [`Ty::open`] over a label map: each label's presence and what it holds. The
-/// map itself has no tail to open — a struct's is the core beside it, which
+/// map itself has no tail to open — a struct's is the constructor beside it, which
 /// [`Ty::open`] handles where it sits.
 fn open_labels(
     labels: &IndexMap<String, RowField>,
@@ -3914,7 +3908,7 @@ impl Presence {
 /// things.
 ///
 /// This is a gate, not the rule. Two structs that name different fields can
-/// still be one type — that is what the core beside them decides, in
+/// still be one type — that is what the constructor beside them decides, in
 /// [`Solve::labels`] — so failing here only means checking cannot push the
 /// expected fields in
 /// one by one and the literal is inferred and equated instead.

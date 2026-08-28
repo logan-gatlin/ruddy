@@ -846,6 +846,72 @@ fn the_surface_prerequisites_reach_every_stage() {
 /// every panel that renders them: the tokens they lex to, the field and tail
 /// rows of both trees, the constraint the projection becomes, and the scheme
 /// the definition ends with.
+#[test]
+fn rows_reach_every_stage() {
+    let source = "let f : { x when 'a: Nat, y: Nat, ..'r } -> Nat = fn p => p.y\n";
+    let snapshot = snapshot(source);
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:#?}",
+        snapshot.diagnostics
+    );
+
+    let stage = |id: &str| {
+        snapshot
+            .stages
+            .iter()
+            .find(|stage| stage.id == id)
+            .expect("the stage is registered")
+    };
+    let labelled = |id: &str, label: &str| -> Vec<String> {
+        nodes(stage(id))
+            .into_iter()
+            .filter(|node| node.label == label)
+            .map(|node| node.text.clone())
+            .collect()
+    };
+
+    assert_eq!(labelled("tokens", "DotDot"), [".."]);
+    assert_eq!(
+        labelled("tokens", "Identifier"),
+        ["f", "x", "when", "Nat", "y", "Nat", "Nat", "p", "p", "y"]
+    );
+
+    for id in ["ast", "ir"] {
+        assert_eq!(labelled(id, "x when 'a:"), ["Nat"], "{id}");
+        assert_eq!(labelled(id, "Rest"), ["..'r"], "{id}");
+        assert_eq!(labelled(id, "Project"), ["p.y"], "{id}");
+    }
+
+    let constraints: Vec<&str> = stage("constraints")
+        .nodes
+        .iter()
+        .flat_map(|group| &group.children)
+        .map(|node| node.text.as_str())
+        .collect();
+    assert!(
+        constraints
+            .iter()
+            .any(|text| text.contains("..'r") && text.contains(".y")),
+        "{constraints:?}"
+    );
+
+    let solve = stage("solve");
+    assert!(
+        nodes(solve)
+            .iter()
+            .any(|node| node.label == "struct" && node.text.contains("..'r")),
+        "{solve:#?}"
+    );
+
+    let types: Vec<&str> = stage("types")
+        .nodes
+        .iter()
+        .map(|node| node.text.as_str())
+        .collect();
+    assert_eq!(types, ["{ x when 'a: Nat, y: Nat, ..'b } -> Nat"]);
+}
+
 /// `()` is one piece of punctuation in the surface syntax, and the AST keeps
 /// it that way — a term position and a type position both read back as `()`.
 /// Lowering folds both into the struct with no fields, so the IR reads every
@@ -1233,10 +1299,52 @@ fn a_type_error_is_a_diagnostic() {
     assert_eq!(diagnostic.message, "no field `y` on `{ x: Nat }`");
 }
 
-/// The two complaints rows added reach the strip like every other, and the
-/// rule behind one of them reaches the Solve tab. A diagnostic the compiler
-/// can raise and the debugger cannot show is one nobody working on the
-/// compiler ever sees.
+/// Projection failures keep their shape-specific diagnostics and spans in the
+/// debugger, and the failed solver steps carry the same errors as the strip.
+#[test]
+fn a_row_error_reaches_the_strip_and_the_solve_tab() {
+    let not_struct_source = "let bad = 1n.x\n";
+    let not_struct = snapshot(not_struct_source);
+    let [diagnostic] = not_struct.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", not_struct.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "not-a-struct");
+    let base = not_struct_source.find("1n").unwrap();
+    assert_eq!(diagnostic.span, at([base, base + 2]));
+
+    let missing_source = "let bad : { x: Nat } -> Nat = fn p => p.y\n";
+    let missing = snapshot(missing_source);
+    let [diagnostic] = missing.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", missing.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "missing-field");
+    let field = missing_source.rfind('y').unwrap();
+    assert_eq!(diagnostic.span, at([field, field + 1]));
+
+    let rigid_source = "let bad : 'a -> Nat = fn p => p.x\n";
+    let rigid = snapshot(rigid_source);
+    let [diagnostic] = rigid.diagnostics.as_slice() else {
+        panic!("expected one error: {:#?}", rigid.diagnostics);
+    };
+    assert_eq!(diagnostic.code, "rigid-field");
+    let field = rigid_source.rfind('x').unwrap();
+    assert_eq!(diagnostic.span, at([field, field + 1]));
+    let declared = rigid_source.find("'a").unwrap();
+    assert_eq!(diagnostic.related[0].span, at([declared, declared + 2]));
+
+    for snapshot in [&not_struct, &missing, &rigid] {
+        let constraints = stage_named(snapshot, "constraints");
+        assert!(
+            nodes(constraints)
+                .iter()
+                .any(|node| node.label == "project"),
+            "{constraints:#?}"
+        );
+        let solve = stage_named(snapshot, "solve");
+        assert!(nodes(solve).iter().any(|node| node.error), "{solve:#?}");
+    }
+}
+
 /// The solver assumes a goal it is already in the middle of, and what it is
 /// keyed on is the whole goal — both declared types with their arguments. The
 /// Solve tab shows that key without being given anything of its own: a step's

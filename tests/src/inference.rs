@@ -549,18 +549,6 @@ fn a_failed_definition_is_undecided_rather_than_polymorphic() {
     );
 }
 
-/// A definition whose fields could not be made to agree publishes a type
-/// something can satisfy, so the mistake is reported where it was made and not
-/// again at every use.
-///
-/// The core is why this needs saying. A projection demands a fresh core carrying
-/// the field, and asking the same base for something else — to be a function,
-/// say — binds that core to the something else. If the fields then turn out not
-/// to fit on it, the binding was part of the goal that failed: left standing it
-/// makes the parameter a function that also carries an `x`, which no term can
-/// be and no annotation can write, and every call is then refused for a mistake
-/// already reported one line up.
-
 /// The occurs check failing is not a variable taking a type. A step naming
 /// `Rule::Bind` above an effect reading "this type would have to contain itself" tells whoever is
 /// stepping through the solve the opposite of what happened.
@@ -2652,14 +2640,6 @@ fn a_recursive_constructor_carrying_an_arrow_comes_back_round() {
         "List (Nat -> Nat) -> Seq (Nat -> Nat)"
     );
 }
-
-/// The demand a projection makes can land on either side of a goal, because
-/// which side it lands on is decided by whoever emitted the constraint rather
-/// than by the projection. Reading a field off a definition the annotation
-/// says is a `Nat` puts the demand on the `actual` half — and it is still the
-/// `Nat` that has no such field, said as the extra field it would need rather
-/// than as the one it is missing, since it is the annotation that says what is
-/// allowed.
 
 /// An assumption is compared to the goal in front of it argument by argument,
 /// and an argument still holding a variable is compared as that variable: two
@@ -4840,7 +4820,9 @@ fn structural_families_ignore_unknown_core_contributors() {
          let sums = fn v => match v with\n\
          | {x} => #A x | {y} => y end\n\
          let names = fn v => match v with\n\
-         | {x} => boxed | {y} => y end",
+         | {x} => boxed | {y} => y end\n\
+         let structs = fn v => match v with\n\
+         | {x} => { value: x } | {y} => y end",
     );
 }
 

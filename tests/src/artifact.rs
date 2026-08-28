@@ -1258,6 +1258,28 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
 }
 
 #[test]
+fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
+    const DEPTH: usize = 30_000;
+    let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
+    let valid = format!(
+        "(artifact (header (identity \"deep\" \"1\") (dependencies) \
+         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty nat)))) \
+         (types) (effects)) (lir (functions) (globals)))"
+    );
+
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let parsed = Artifact::try_parse(&valid).expect("valid deep artifact parses");
+            assert_eq!(parsed.header.values.len(), 1);
+            drop(parsed);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn malformed_deep_syntax_fails_without_exhausting_the_stack() {
     let malformed = "(".repeat(50_000);
     let handle = std::thread::Builder::new()

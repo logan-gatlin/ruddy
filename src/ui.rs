@@ -1069,7 +1069,7 @@ impl fmt::Display for Shape {
 /// twice and [`ir::ErrorKind::NotARow`] once.
 ///
 /// The rest of a struct is a whole type, so it has no phrase of its own: `..'r`
-/// in a struct puts whatever is written for `'r` in the type's core, and there is
+/// in a struct puts whatever is written for `'r` in the struct-row tail, and there is
 /// nothing narrower to call that.
 impl fmt::Display for Sense {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1099,8 +1099,8 @@ fn noun(shape: Shape) -> &'static str {
 /// and how it is written there.
 ///
 /// Both come off the shape the solver carried rather than off the type beside
-/// them, because the type no longer answers the question. Every type has fields
-/// *and* may have cases, so a base can be a sum-cored type that is missing a
+/// them, because the type no longer answers the question. Only structs have fields
+/// *and* may have cases, so a base can be a sum type that is missing a
 /// `field` — `(#A 1).x` is exactly that — and reading the word off the base
 /// would call it a case. The solver knows which row it was deciding at the
 /// moment it failed, and that is the only place the answer is not a guess.
@@ -1186,9 +1186,9 @@ impl fmt::Display for Prim {
 
 /// How much of the surface grammar a semantic type can be.
 ///
-/// A type that carries no fields groups as its core alone, because that is all
+/// A type that carries no fields groups as its type alone, because that is all
 /// it prints as. One that carries fields is either written in braces — which
-/// close it, so it is an atom, and which is every core a `..` has a spelling for
+/// close it, so it is an atom, and which is every row tail has a spelling
 /// — or a `with`, whose field list extends rightward and so has to be kept off
 /// anything that could be read as continuing it.
 ///
@@ -1669,7 +1669,7 @@ impl fmt::Display for Formula {
 /// type says.
 ///
 /// A struct's `..` does not come through here at all any more: its tail is the
-/// core beside its fields, and [`core_tail`] is the same table read off that.
+/// struct row tail, which is printed directly.
 fn tail_of(shape: Shape, rest: &Rest) -> Option<String> {
     match rest {
         Rest::Closed => None,
@@ -1711,10 +1711,9 @@ fn shown(tail: &String) -> &dyn fmt::Display {
 fn payload(ty: &Ty) -> Option<&Ty> {
     // A field settled absent is not part of what the type says, so a type that
     // prints as `{}` is unit however many labels the solver left in the map. A
-    // unit core writes no `..` after them, which is the whole of what makes this
+    // closed empty row writes no `..` after them, which is the whole of what makes this
     // the same question a printed type asks: a case carrying a struct that came
     // to nothing is still a case carrying unit, and still prints as `#A`.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn empty_row(row: &Row) -> bool {
         row.labels.values().all(absent)
             && match &row.rest {

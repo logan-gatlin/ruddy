@@ -178,7 +178,7 @@ enum Col {
         ty: Rc<Ty>,
     },
     /// The fields beyond the named ones. `open` says whether the solved row
-    /// admits any — a core still free or quantified does, the fieldless unit
+    /// admits any — a row tail still free or quantified does, the fieldless unit
     /// an exact column closed to does not.
     Rest {
         open: bool,
@@ -196,9 +196,9 @@ enum Mode {
     Exhaustiveness,
 }
 
-/// The primitive cores accepted by [`Check::scalars`]. Keeping this narrower
+/// The primitive types accepted by [`Check::scalars`]. Keeping this narrower
 /// than the explicit type variants makes the scalar witness match exhaustive without an
-/// untestable fallback for cores its caller can never pass.
+/// untestable fallback for types its caller can never pass.
 #[derive(Clone, Copy)]
 enum Scalar {
     Infinite(InfiniteScalar),
@@ -780,7 +780,6 @@ impl Check<'_> {
         Some(effective_conditions(&raw))
     }
 
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn presence_at(&self, ty: &Rc<Ty>, path: &str) -> Option<Presence> {
         match path.split_once('.') {
             Some((name, below)) => {
@@ -922,7 +921,6 @@ impl Check<'_> {
     /// tested *field's* presence is the column rule's fresh variable, which
     /// absence can settle without a word — so an absent field is compatible,
     /// and the arm demanding it is the unreachable arm the checks report.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn compatible(&self, ty: &Rc<Ty>, cell: &Cell) -> bool {
         let ty = self.shape(ty);
         match cell {
@@ -965,10 +963,10 @@ impl Check<'_> {
                         _ => self.compatible(&field.ty, sub),
                     },
                     // A tested field the type does not name: over the
-                    // fieldless unit core that is a proof of absence — a
+                    // closed empty struct that is a proof of absence — a
                     // value of the type has exactly the named fields — and
                     // the arm is unreachable, which is the check's to say.
-                    // Over any other core the demand failed to stick, and
+                    // Over any open row the demand failed to stick, and
                     // the type error already speaks.
                     None => matches!(row.rest, Rest::Closed),
                 })
@@ -1008,8 +1006,8 @@ impl Check<'_> {
 
     /// One whole position. A column something reaches into fields at is
     /// widened first — one presence column per field the type names, then the
-    /// core — so the rest of the walk only ever sees flat cells; a column
-    /// nothing reaches into is its core alone.
+    /// row tail — so the rest of the walk only ever sees flat cells; a column
+    /// nothing reaches into is its type alone.
     fn whole(
         &self,
         rows: &[Vec<Cell>],
@@ -1030,14 +1028,13 @@ impl Check<'_> {
 
     /// The widening step: the fields the solved type names become one
     /// presence column apiece — an exact pattern demands absence of every one
-    /// it does not mention, an open one says nothing — the core keeps a
+    /// it does not mention, an open one says nothing — the constructor keeps a
     /// column of its own for the tags and numbers, and a rest column carries
     /// what each pattern says about fields beyond the named ones: an exact
     /// struct demands there are none, everything else accepts any. The
     /// witness folds back the other way: the fields settled present in
     /// braces, presence kept even where any value serves, since under
     /// exactness the presence is the information.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn widened(
         &self,
         rows: &[Vec<Cell>],
@@ -1046,17 +1043,17 @@ impl Check<'_> {
         q: &[Cell],
         walk: &Walk,
     ) -> Option<Vec<Option<Witness>>> {
-        let Ty::Struct(struct_row) = &**ty else {
-            return None;
-        };
-        let struct_row = flat(struct_row);
+        let struct_row = flat(
+            ty.fields()
+                .expect("struct cells are created only for a struct-compatible column"),
+        );
         let mut named: Vec<(String, Presence, Rc<Ty>)> = struct_row
             .labels
             .iter()
             .map(|(name, field)| (name.clone(), field.presence.clone(), field.ty.clone()))
             .collect();
         // A tested field the type does not name is provably absent —
-        // compatibility let it through only over the fieldless unit core — so
+        // compatibility let it through only over the closed empty struct — so
         // it still gets a column, with the one-value universe absence is.
         for cell in std::iter::once(&q[0]).chain(rows.iter().map(|row| &row[0])) {
             if let Cell::Struct { fields, .. } = cell {
@@ -1104,8 +1101,8 @@ impl Check<'_> {
             })
             .collect();
         // Whether fields beyond the named ones exist to be had. The fieldless
-        // unit an exact column closes the row to admits none; any other core
-        // leaves the question to the value. (A settled core like `Nat` only
+        // empty struct an exact column closes the row to admits none; any open row
+        // leaves the question to the value. (A non-struct type only
         // solves beside open struct patterns — an exact one would have pinned
         // it to unit or failed — so no cell demands its rest empty and the
         // flag is moot there.)
@@ -1274,8 +1271,8 @@ impl Check<'_> {
         }
     }
 
-    /// One position's core, the fields already peeled off: scalar literals,
-    /// cases when it is a sum, and nothing testable otherwise — a core the
+    /// One position's scalar or sum shape, the fields already peeled off: scalar literals,
+    /// cases when it is a sum, and nothing testable otherwise — a type the
     /// arms cannot reach into is covered by the wildcards that got here.
     fn shape_column(
         &self,
@@ -1310,7 +1307,7 @@ impl Check<'_> {
         }
     }
 
-    /// A scalar primitive core. Boolean has precisely two values, so its two
+    /// A scalar primitive type. Boolean has precisely two values, so its two
     /// exact patterns cover it. The other scalar types deliberately keep the
     /// literal-pattern rule `Nat` had: no finite list of literals is total, so
     /// a wildcard is needed to accept the value outside that list.
@@ -1418,7 +1415,7 @@ impl Check<'_> {
         }
     }
 
-    /// A sum core: the universe is the cases the solved row says a value may
+    /// A sum: the universe is the cases the solved row says a value may
     /// be — a case settled absent has no values, so an arm demanding it is
     /// never useful — plus "anything else" when the rest is still open.
     fn cases(

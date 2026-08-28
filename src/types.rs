@@ -145,7 +145,7 @@ pub enum Sense {
 ///
 /// Both carry the labels an argument written there may not name. `'r` in
 /// `type WithX 'r = { x: Nat, ..'r }` is a [`ParamKind::Type`] whose set is
-/// `{x}`: the core covers the fields the declaration does not write out, so an
+/// `{x}`: the constructor covers the fields the declaration does not write out, so an
 /// `'r` with an `x` of its own would give the type two fields of one name, and
 /// the two copies could disagree. Carrying the set rather than a bare flag is what lets
 /// the condition be said where the argument is written, at the span the reader
@@ -277,7 +277,7 @@ pub enum Ty {
     /// tail saying what is known about the cases not named.
     ///
     /// A value *is* one of the cases the row says is there, where the fields
-    /// beside this core are labels a value *has*. Everything between those two
+    /// in this struct are labels a value *has*. Everything between those two
     /// sentences — unification, flattening, the lacks condition, generalization
     /// — is written once and reaches both, with [`Shape`] as the only thing
     /// saying which is being read.
@@ -322,7 +322,7 @@ pub enum Ty {
     ///
     /// A leaf, unlike [`Ty::Bound`]. Nothing supplies a value for it — the
     /// scheme the annotation publishes re-quantifies it into a [`Ty::Bound`]
-    /// at generalization — so the fields written beside one are the whole of
+    /// at generalization — so the fields written in one are the whole of
     /// what a type carrying it says.
     Rigid {
         id: u32,
@@ -534,7 +534,7 @@ impl Assigned {
     ///
     /// A type is what a type position is opened to, and every caller hands one:
     /// a declaration's argument is a written type, and a scheme's fresh
-    /// variable is a bare core. A row or a presence reaching a type position
+    /// variable is an unconstrained type. A row or a presence reaching a type position
     /// would be a parameter used at two sorts, which nothing can write — so
     /// rather than a rule for it there is a type that says nothing, which
     /// absorbs the way every other unanswerable type does.
@@ -557,7 +557,7 @@ impl Assigned {
     /// sum's tail wants that variable standing for the rest rather than for a
     /// type with no cases at all.
     ///
-    /// No shape to be told any more. A struct's `..` is its core, and opening
+    /// No shape to be told any more. A struct's `..` is its row tail, and opening
     /// one is [`as_ty`](Self::as_ty); only a sum's rest is still a row, so this
     /// is about cases and nothing else.
     ///
@@ -644,6 +644,14 @@ impl Ty {
     /// The empty closed struct, also used for unit.
     pub fn unit() -> Self {
         Self::Struct(Row::closed())
+    }
+
+    /// The field row inside a struct, if this is one.
+    pub fn fields(&self) -> Option<&Row> {
+        match self {
+            Ty::Struct(row) => Some(row),
+            _ => None,
+        }
     }
 
     /// The cases this type allows: the row inside a [`Ty::Sum`].

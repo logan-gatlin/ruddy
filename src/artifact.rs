@@ -66,6 +66,12 @@ pub struct Artifact {
     pub lir: Lir,
 }
 
+impl Drop for Artifact {
+    fn drop(&mut self) {
+        text::discard_artifact(self);
+    }
+}
+
 /// The public interface of one bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
@@ -1602,10 +1608,10 @@ pub mod text {
         }
     }
 
-    /// Destroy a rejected, partially decoded model without following its
-    /// recursive ownership on the call stack. Successful artifacts remain
-    /// ordinary values and use their normal derived destruction.
-    fn discard_artifact(artifact: Artifact) {
+    /// Destroy recursive artifact contents without following their ownership
+    /// on the call stack. Draining first also makes the artifact's subsequent
+    /// field destruction constant-depth.
+    pub(super) fn discard_artifact(artifact: &mut Artifact) {
         fn discard_formula(formula: Formula) {
             let mut pending = vec![formula];
             while let Some(formula) = pending.pop() {
@@ -1700,14 +1706,13 @@ pub mod text {
             }
         }
 
-        let Artifact { header, lir } = artifact;
-        for value in header.values {
+        for value in artifact.header.values.drain(..) {
             discard_scheme(value.scheme);
         }
-        for declared in header.types {
+        for declared in artifact.header.types.drain(..) {
             discard_scheme(declared.scheme);
         }
-        for effect in header.effects {
+        for effect in artifact.header.effects.drain(..) {
             if let EffectKind::Operations(operations) = effect.kind {
                 for operation in operations {
                     discard_type(operation.from);
@@ -1715,10 +1720,10 @@ pub mod text {
                 }
             }
         }
-        for function in lir.functions {
+        for function in artifact.lir.functions.drain(..) {
             discard_block(function.body);
         }
-        for global in lir.globals {
+        for global in artifact.lir.globals.drain(..) {
             discard_block(global.body);
         }
     }
@@ -1735,10 +1740,10 @@ pub mod text {
         }
 
         fn artifact(self, value: S) -> Result<Artifact, ParseError> {
-            let artifact = self.read_artifact(value);
+            let mut artifact = self.read_artifact(value);
             match self.error.into_inner() {
                 Some(error) => {
-                    discard_artifact(artifact);
+                    discard_artifact(&mut artifact);
                     Err(error)
                 }
                 None => Ok(artifact),

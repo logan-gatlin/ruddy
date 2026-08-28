@@ -196,26 +196,49 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
     // Coverage can mention a solver atom with no corresponding readable path.
     // A malformed nested path exercises the same conservative fallback after
     // the path lookup itself fails.
-    let mut missing_path = inferred.clone();
-    let paths = missing_path
+    for malformed in ["missing.field", "a.b", "a.b.c"] {
+        let mut missing_path = inferred.clone();
+        let paths = missing_path
+            .store
+            .batches
+            .iter_mut()
+            .find_map(|batch| match &mut batch.origin {
+                inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
+                _ => None,
+            })
+            .expect("the coverage batch carries paths");
+        assert!(!paths.is_empty());
+        for (path, _) in paths {
+            *path = malformed.to_string();
+        }
+        let checks = patterns::check(&out.program, &missing_path);
+        assert!(checks.errors.is_empty(), "{checks:#?}");
+        assert!(matches!(
+            sole_report(&checks).coverage,
+            Coverage::Exhaustive
+        ));
+    }
+}
+
+#[test]
+fn a_struct_pattern_with_a_corrupted_non_struct_type_is_skipped_safely() {
+    let src = "let f = fn v => match v with | { a } => 1n | _ => 2n end";
+    let (mut out, mut inferred, initial) = checked(src);
+    assert!(initial.errors.is_empty(), "{initial:#?}");
+    let definition = out.program.terms.values_mut().next().unwrap();
+    let ir::TermKind::Fn { body, .. } = &mut definition.value.kind else {
+        panic!("function fixture")
+    };
+    let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+        panic!("match fixture")
+    };
+    scrutinee.ty = Rc::new(Ty::Nat);
+    inferred
         .store
         .batches
-        .iter_mut()
-        .find_map(|batch| match &mut batch.origin {
-            inference::Origin::Coverage(coverage) => Some(&mut coverage.paths),
-            _ => None,
-        })
-        .expect("the coverage batch carries paths");
-    assert!(!paths.is_empty());
-    for (path, _) in paths {
-        *path = "missing.field".to_string();
-    }
-    let checks = patterns::check(&out.program, &missing_path);
-    assert!(checks.errors.is_empty(), "{checks:#?}");
-    assert!(matches!(
-        sole_report(&checks).coverage,
-        Coverage::Exhaustive
-    ));
+        .retain(|batch| !matches!(batch.origin, inference::Origin::Coverage(_)));
+    let checked = patterns::check(&out.program, &inferred);
+    assert!(matches!(sole_report(&checked).coverage, Coverage::Skipped));
 }
 
 #[test]
@@ -554,6 +577,13 @@ fn an_empty_match_over_an_open_sum_is_skipped() {
 
     let checks = patterns::check(&out.program, &inferred);
     assert!(checks.errors.is_empty(), "{:#?}", checks.errors);
+    assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
+}
+
+#[test]
+fn an_unresolved_struct_scrutinee_skips_shape_specific_usefulness() {
+    let (out, _, checks) = checked("let f = match nope with | { x } => 1n end");
+    assert!(!out.errors.is_empty());
     assert!(matches!(sole_report(&checks).coverage, Coverage::Skipped));
 }
 

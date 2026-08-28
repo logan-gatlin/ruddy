@@ -485,6 +485,33 @@ fn an_impossible_presence_path_is_rejected() {
 
 /// Replace the named field on the sole match scrutinee in the small defensive
 /// fixtures above. Pattern checking happens before this adjustment.
+#[test]
+fn a_corrupted_container_type_uses_the_written_member_type() {
+    let (output, labels) = lowered_after_check("let value = { x: 1n }", |program, _| {
+        program.terms.values_mut().next().unwrap().value.ty = Rc::new(Ty::Nat);
+    });
+    let printed = print::lir::program(&output, &labels);
+    assert!(printed.contains("struct { x:"), "{printed}");
+}
+
+#[test]
+#[should_panic(expected = "struct pattern on non-struct")]
+fn a_corrupted_non_struct_match_type_is_rejected_by_lir() {
+    let _ = lowered_after_check(
+        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+        |program, _| {
+            let definition = &mut program.terms.values_mut().next().unwrap().value;
+            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                panic!("function fixture")
+            };
+            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                panic!("match fixture")
+            };
+            scrutinee.ty = Rc::new(Ty::Nat);
+        },
+    );
+}
+
 fn set_match_field_presence(program: &mut ir::Program, field: &str, presence: Presence) {
     let definition = &mut program
         .terms
@@ -1094,6 +1121,32 @@ fn a_field_no_arm_asks_about_is_never_read() {
         ),
         "fn f(%0: struct):\n  %1: nat = project %0, \"x\"\n  ret %1"
     );
+}
+
+/// A field absent from a closed solved row still receives an absent dispatch
+/// column when a syntactically valid but unreachable arm asks for it.
+#[test]
+fn a_pattern_field_absent_from_the_solved_row_is_lowered_as_absent() {
+    let (output, labels) = lowered_after_check(
+        "let f = fn s => match s with | { x } => 1n | _ => 2n end",
+        |program, _| {
+            let definition = &mut program.terms.values_mut().next().unwrap().value;
+            let ir::TermKind::Fn { body, .. } = &mut definition.kind else {
+                panic!("function fixture")
+            };
+            let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
+                panic!("match fixture")
+            };
+            let Ty::Struct(row) = Rc::make_mut(&mut scrutinee.ty) else {
+                panic!("struct fixture")
+            };
+            row.labels.clear();
+            row.rest = ruddy::types::Rest::Closed;
+        },
+    );
+    let printed = print::lir::program(&output, &labels);
+    assert!(!printed.contains("project"), "{printed}");
+    assert!(printed.contains("const 2n"), "{printed}");
 }
 
 /// A field whose presence decides the arm but whose value nothing looks at is

@@ -521,7 +521,7 @@ impl Constrain<'_> {
                 // A literal's fields are all there, and are all it has: the
                 // tail is closed. Openness belongs to demands, not to values.
                 // Nothing of its own beside them, which is what makes a struct
-                // unit carrying fields rather than a shape of its own.
+                // a struct rather than a shape of its own.
                 Rc::new(Ty::Struct(Row {
                     labels: tys,
                     rest: Rest::Closed,
@@ -561,7 +561,7 @@ impl Constrain<'_> {
             // has depends on a base the walk is in no position to know — but
             // it can say everything a projection demands of the base: a type
             // that has the field, whatever else it may also have. Two variables
-            // say that — the core the field sits on, and the field's own type —
+            // say that — the constructor the field sits on, and the field's own type —
             // so `fn p => p.x` is not a base waiting to be explained; it is a
             // definition polymorphic in everything but the field it reads.
             TermKind::Project { base, field } => {
@@ -804,10 +804,10 @@ impl Constrain<'_> {
     /// entry of the column is a struct pattern mentioning it — otherwise its
     /// presence is a fresh variable, which is what lets unification infer an
     /// optional field — and each field's type comes from its sub-position
-    /// across the arms that mention it. The demand is closed — its core the
-    /// fieldless [`Ty::Unit`], so no further fields can attach — iff every
+    /// across the arms that mention it. The demand is closed — its constructor the
+    /// closed empty struct, so no further fields can attach — iff every
     /// entry is an exact struct or unit pattern; any `..`, binder or wildcard
-    /// entry leaves it open, a fresh core with the projection's lacks note.
+    /// entry leaves it open, a fresh struct-row tail with the projection's lacks note.
     /// `()` and `{}` are one pattern — an exact struct naming no fields — so a
     /// column of them alone demands unit, exactly as it always has.
     ///
@@ -968,9 +968,9 @@ impl Constrain<'_> {
             // entries do without gets a fresh presence variable, so whether it
             // is there is the scrutinee's to decide — the inference behind an
             // optional field. The demand closes over the named fields exactly
-            // when every entry is exact: its core is then the fieldless unit,
+            // when every entry is exact: its constructor is then the fieldless unit,
             // which no further field can attach to. An open demand keeps a
-            // fresh core with the projection's lacks note, asking only for
+            // fresh struct-row tail with the projection's lacks note, asking only for
             // the named fields' presences.
             let total = entries.len();
             for (name, subs) in &fields {

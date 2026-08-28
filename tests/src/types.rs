@@ -83,10 +83,7 @@ fn each_empty_type_has_one_constructor() {
     assert!(matches!(Ty::plain(Ty::Nat), Ty::Nat));
 }
 
-/// A type is a core and the labels it carries, and the labels have no tail of
-/// their own: what a struct says about the fields it does not name is the core
-/// beside them. So `{ x: Nat }` is unit with an `x`, `{ x: Nat, .. }` is a
-/// variable with an `x`, and `Nat` with an `x` is a closed type with a field.
+/// Structs own field rows; non-struct types do not expose fields.
 #[test]
 fn only_struct_types_carry_fields() {
     let ty = Ty::Struct(Row {
@@ -96,6 +93,8 @@ fn only_struct_types_carry_fields() {
         rest: Rest::Var(3),
     });
     assert_eq!(ty.to_string(), "{ x: {}, ..?3 }");
+    assert!(ty.fields().is_some());
+    assert!(Ty::Nat.fields().is_none());
 }
 
 /// [`Row`] and [`Rest`] survive for a sum's cases and reach nothing else: the

@@ -1532,6 +1532,37 @@ fn a_spliced_tail_prints_in_the_notation_of_the_row_it_ends() {
         .to_string(),
         "#A"
     );
+    let nested_empty = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(Row::closed())),
+    }));
+    assert_eq!(
+        Ty::Sum(Row {
+            labels: [("Nested".into(), RowField::present(nested_empty))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        })
+        .to_string(),
+        "#Nested"
+    );
+    let nested_open = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(Row {
+            labels: Default::default(),
+            rest: Rest::Var(9),
+        })),
+    }));
+    assert_eq!(
+        Ty::Sum(Row {
+            labels: [("Nested".into(), RowField::present(nested_open))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        })
+        .to_string(),
+        "#Nested { ..?9 }"
+    );
 }
 
 /// The three sorts print on their own as well as inside a type, because the
@@ -1816,18 +1847,6 @@ fn the_variable_complaints_read_as_what_went_wrong() {
          outside the annotation that declared it"
     );
 }
-
-/// Every form a type prints as, by its core and whether it carries labels.
-///
-/// The table in one test, because it is one rule: a type carrying nothing
-/// prints as its core alone; one carrying labels prints in braces whenever its
-/// core is something a `..` has a spelling for; and anything else wears the
-/// `with` that no source syntax writes.
-///
-/// The braced forms are the point. `{ x: a, ..'b }` is what a reader would
-/// have written, and `'b with { x: a }` is not something the parser could read
-/// back — so the `..` spelling is what keeps a printed type re-lowerable to the
-/// type it was printed from.
 
 /// The new complaint about a declaration whose fields never run out, and the
 /// reworded one about an argument that names a label twice.

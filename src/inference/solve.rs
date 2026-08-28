@@ -22,11 +22,11 @@ use super::{
 /// What a set of labels says about the ones it does not name.
 ///
 /// The one thing the two shapes still differ in, and so the one thing the shared
-/// label rule has to be told. A struct's fields run out where the core beside
+/// label rule has to be told. A struct's fields run out where the constructor beside
 /// them says they do — `{ x: Nat, ..'r }` is the type `'r` carrying an `x` —
 /// and a
 /// sum's cases run out where its row's [`Rest`] says they do, because
-/// [`Ty::Sum`] is the only core with a case row and there is nowhere else for
+/// [`Ty::Sum`] is the only type with a case row and there is nowhere else for
 /// a sum's tail to live.
 ///
 /// Everything else about matching two sets of labels — the extras each way, the
@@ -42,7 +42,7 @@ enum Tail {
     ///
     /// A variant of its own rather than a shape carried beside a [`Rest`],
     /// because what a complaint about it names is different: a sum's labels are
-    /// the whole of its core, and an arrow's effects are one of three things
+    /// the whole of its constructor, and an arrow's effects are one of three things
     /// the arrow says. The two sides ride along so that
     /// [`rebuild`](Rowed::rebuild) can put the arrow back together — they are
     /// what the goal that failed did *not* decide, so they stand as they were.
@@ -62,7 +62,7 @@ enum Tail {
 /// the tail's — and nothing further in that could come to disagree with it.
 ///
 /// The type is carried as well as the labels because a complaint is about the
-/// type. `(#A 1).x` is a missing *field* on a sum-cored type: the labels that
+/// type. `(#A 1).x` is a missing *field* on a sum type: the labels that
 /// went wrong are that type's fields, and the type beside the word is the whole
 /// of what the reader wrote.
 #[derive(Clone, Copy)]
@@ -117,7 +117,7 @@ impl Tail {
 
     /// Whether this tail allows nothing more at all — every label it does not
     /// name is absent. Neither open nor abandoned is the whole of it: `Nat`
-    /// carries the fields written beside it and no others, exactly as a closed
+    /// carries the fields written in it and no others, exactly as a closed
     /// row of cases allows the cases it names and no others.
     ///
     /// A rigid is not one, and that is the whole of what it costs the shared
@@ -178,8 +178,8 @@ impl<'a> Rowed<'a> {
         }
     }
 
-    /// The cases a sum-cored type allows. The row is handed in rather than
-    /// matched out, so that the one caller that knows the core is a sum is the
+    /// The cases a sum type allows. The row is handed in rather than
+    /// matched out, so that the one caller that knows the constructor is a sum is the
     /// one that says so.
     fn cases(ty: &'a Rc<Ty>, cases: &'a IndexMap<String, RowField>, tail: &'a Tail) -> Self {
         Self {
@@ -530,7 +530,7 @@ impl Solve<'_> {
     }
 
     /// A finite structural family for the arm body types. Every label in the
-    /// finite union gets one fresh result presence; cores, tails and payloads
+    /// finite union gets one fresh result presence; constructors, tails and payloads
     /// remain ordinary structural types and are checked by the unifications
     /// that follow.
     fn family_type(&mut self, types: &[Rc<Ty>]) -> Rc<Ty> {
@@ -597,14 +597,10 @@ impl Solve<'_> {
                 )
             }
             Ty::Struct(..) => {
-                #[cfg_attr(coverage_nightly, coverage(off))]
-                fn row(ty: &Ty) -> Option<Row> {
-                    match ty {
-                        Ty::Struct(row) => Some(row.clone()),
-                        _ => None,
-                    }
-                }
-                let rows: Vec<_> = resolved.iter().filter_map(|ty| row(ty)).collect();
+                let rows: Vec<_> = resolved
+                    .iter()
+                    .filter_map(|ty| ty.fields().cloned())
+                    .collect();
                 Ty::Struct(self.family_row(&rows, unfolding))
             }
             Ty::Sum(..) => {
@@ -955,10 +951,9 @@ impl Solve<'_> {
     /// recorded once and the solve continues.
     ///
     /// Two types are equal when they name the same labels with the same
-    /// presences and types, and their cores agree about everything else. One
+    /// presences and types, and their constructors and row tails agree about everything else. One
     /// function decides a type; there is no separate rule for a struct, because
-    /// a struct is a [`Ty::Unit`] carrying labels and every other type carries
-    /// labels too.
+    /// a struct has an explicit row and non-struct types do not have fields.
     ///
     /// Four steps, in this order:
     ///
@@ -971,7 +966,7 @@ impl Solve<'_> {
     ///    less thing to unfold later.
     /// 3. A name beside labels is unfolded and the goal asked again. See
     ///    [`Solve::unwrapped`].
-    /// 4. Everything else is [`Solve::fielded`]: the labels and the core, in the
+    /// 4. Everything else is [`Solve::fielded`]: the labels and the constructor, in the
     ///    order it gives.
     fn unify(&mut self, span: Span, expected: &Rc<Ty>, actual: &Rc<Ty>) {
         let lhs = self.table.resolve(expected);
@@ -983,32 +978,32 @@ impl Solve<'_> {
         self.types(span, goal, &lhs, &rhs);
     }
 
-    /// Decide two types by their labels and their cores.
+    /// Decide two types by their labels and their constructors and row tails.
     ///
-    /// A type carrying no labels on either side is its core and nothing else, so
-    /// the core's own rule is the whole step and the trace reads exactly as it
+    /// A type with no struct labels on either side is its constructor and nothing else, so
+    /// the constructor's own rule is the whole step and the trace reads exactly as it
     /// did before fields were a property of every type: `Nat` against `Nat` is
     /// one [`Rule::Prim`] and nothing more.
     ///
     /// Where either side carries a label there is a [`Rule::Struct`] over the
-    /// whole of it, with the label steps and the core step one level under. Two
-    /// [`Ty::Unit`] cores record no step of their own — they are already the
+    /// whole of it, with the label steps and the row-tail step one level under. Two
+    /// identical closed row tails record no step of their own — they are already the
     /// same thing — which is what keeps a struct against a struct reading byte
     /// for byte as it always has.
     ///
-    /// Which of the two halves goes first is decided by whether a core variable
+    /// Which of the two halves goes first is decided by whether a row-tail variable
     /// is involved, and only there does the order differ from what it was. A
-    /// core variable is what the extras have to be absorbed into, so the labels
+    /// row-tail variable is what the extras have to be absorbed into, so the labels
     /// have to be settled before it can be told what it stands for: `1.x`
-    /// records the fields and their failure, and no longer binds the base's core
-    /// first. Where neither core is a variable there is nothing to absorb into
-    /// and the cores are the larger question — two types that cannot be equal at
+    /// records the fields and their failure, and no longer binds the base's row tail
+    /// first. Where neither row tail is a variable there is nothing to absorb into
+    /// and the constructors and row tails are the larger question — two types that cannot be equal at
     /// all are a mismatch of what the reader wrote, not a field missing from a
     /// type that was never the right one — so those are decided first and the
     /// labels only if they agreed.
     ///
     /// Either way the two halves are one goal, so a failure in one abandons the
-    /// other: a core bound to a fieldless type with labels it could not take
+    /// other: a row tail bound inconsistently with its labels
     /// beside it is a type nothing can be. See [`Solve::abandon`].
     fn types(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         match (&**lhs, &**rhs) {
@@ -1262,8 +1257,8 @@ impl Solve<'_> {
     /// same way both times: a reader who meets the two complaints should not have
     /// to check whether they abandon the same things.
     ///
-    /// Named as the two whole types rather than as their cores: a `Nat` against
-    /// `{ x: Nat }` is a mismatch of what the reader wrote, and the cores alone
+    /// Named as the two whole types rather than as their constructors and row tails: a `Nat` against
+    /// `{ x: Nat }` is a mismatch of what the reader wrote, and the constructors and row tails alone
     /// would quote them a unit they never mentioned.
     /// A variable met something it cannot be: report it, abandon
     /// what the goal was about, and say the labels beside them are not worth
@@ -1431,7 +1426,7 @@ impl Solve<'_> {
     }
 
     /// A variable standing for whatever a set of labels of this shape allows
-    /// beyond the ones it names: a fresh core for a struct's fields, a fresh
+    /// beyond the ones it names: a fresh tail for a struct's fields, a fresh
     /// tail for a sum's cases. One variable table and one sort per position, as
     /// everywhere else.
     fn fresh_tail(&mut self, shape: Shape) -> Tail {
@@ -1451,7 +1446,7 @@ impl Solve<'_> {
     }
 
     /// Decide what two tails allow beyond the labels their sides name, in
-    /// whichever sort they are: the core rule for a struct's fields, and
+    /// whichever sort they are: the row-tail rule for a struct's fields, and
     /// [`Solve::rests`] for a sum's cases.
     ///
     /// The one place the shared rule has to know which shape it is on, and the
@@ -1464,7 +1459,7 @@ impl Solve<'_> {
 
     /// Make two of a sum's tails the same tail: a variable takes the other, and
     /// an undecided one absorbs it. The struct's half of [`Solve::tails`] is the
-    /// core rule; this is the other.
+    /// row-tail rule; this is the other.
     ///
     /// Only reached where the two rows name the same cases, so there is
     /// nothing to push into either side and the question is what the two allow
@@ -1496,7 +1491,7 @@ impl Solve<'_> {
             (Rest::Var(a), Rest::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
-            // The core rule's arms about a sum's rest, and the same rule: a
+            // The row-tail rule's arms about a sum's rest, and the same rule: a
             // declared rest is equal to itself, takes an unbound variable as
             // any row would, and breaks its promise against anything else.
             (Rest::Rigid { id: a, .. }, Rest::Rigid { id: b, .. }) if a == b => {
@@ -1593,7 +1588,7 @@ impl Solve<'_> {
         };
         if self.guard.is_some() {
             self.guarded_presence(span, &p1, &p2);
-            // Payload/core typing is not dependent on the branch premise. An
+            // Payload typing is not dependent on the branch premise. An
             // explicitly absent slot carries no payload to compare; everything
             // else keeps ordinary structural compatibility.
             match (&p1, &p2) {
@@ -2004,7 +1999,7 @@ impl Solve<'_> {
     /// The lacks check beside it is the row's version of the same idea: a tail
     /// stands for the labels its row does not write out, so a row that
     /// certainly has one of them is not a value that tail can take — and a
-    /// core variable is under the same condition, since it stands for a type
+    /// row-tail variable is under the same condition, since it stands for a type
     /// the labels beside it are already on. Refused here rather than noticed
     /// later for a reason the occurs check does not share — nothing later is
     /// guaranteed to notice. Two rows sharing a tail are only compared again
@@ -2032,7 +2027,7 @@ impl Solve<'_> {
             return;
         }
         // Binding a shared structural variable still installs the ordinary
-        // core/tail shape, but no presence constant or alias from this arm may
+        // row-tail shape, but no presence constant or alias from this arm may
         // hitch a ride and become global. Give every such slot a shared fresh
         // presence and relate it to the arm's view under the premise.
         let value = match (self.guard.is_some(), value) {
@@ -2086,7 +2081,6 @@ impl Solve<'_> {
         self.step(span, Rule::Bind, goal, Effect::Bound { var, value });
     }
 
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
         let ty = self.table.resolve(ty);
         Rc::new(match &*ty {
@@ -2185,7 +2179,7 @@ impl Solve<'_> {
         }
     }
 
-    /// [`recover`](Self::recover) over a type: its core, and then the fields it
+    /// [`recover`](Self::recover) over a type: its constructor, and then the fields it
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
     fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>) {

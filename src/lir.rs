@@ -1131,7 +1131,6 @@ impl Lower<'_> {
     /// name the member — a use may dispatch on a case the production type
     /// never listed — or does not pin its shape down, in which case the use
     /// site's own reading is all there is to go on.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn member_of(&self, ty: &Rc<Ty>, name: &str) -> Option<Rc<Ty>> {
         let ty = unfold(&self.inference.aliases, ty);
         let member = match &*ty {
@@ -2402,7 +2401,7 @@ impl Lower<'_> {
     }
 
     /// One whole position. A column any arm reaches into fields at is widened
-    /// first — one presence column per field the type names, the core, and then
+    /// first — one presence column per field the type names, the constructor, and then
     /// whatever fields lie beyond — so everything below only ever sees a flat
     /// cell.
     fn column(&mut self, col: &Value, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
@@ -2605,8 +2604,7 @@ impl Lower<'_> {
     }
 
     /// Widen a struct position: one presence column per field the solved type
-    /// names, then the core, then whatever fields lie beyond the named ones.
-    #[cfg_attr(coverage_nightly, coverage(off))]
+    /// names, then the constructor, then whatever fields lie beyond the named ones.
     fn widen(
         &mut self,
         temp: Temp,
@@ -2615,10 +2613,7 @@ impl Lower<'_> {
         tree: &Tree,
         body: &mut Body,
     ) -> Temp {
-        let Ty::Struct(row) = &**ty else {
-            panic!("struct pattern on non-struct")
-        };
-        let row = flat(row);
+        let row = flat(ty.fields().expect("struct pattern on non-struct"));
         let mut named: Vec<(String, Presence, Rc<Ty>)> = row
             .labels
             .iter()
@@ -2696,7 +2691,6 @@ impl Lower<'_> {
     /// out; one it proves absent tests nothing and starves the arms demanding
     /// it; one still open is the `switch_presence` the optional fields exist
     /// for.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     fn presence(&mut self, col: &Field, matrix: Matrix, tree: &Tree, body: &mut Body) -> Temp {
         // Nothing anywhere in the column asks about this field, so neither the
         // presence nor the value is worth reading.

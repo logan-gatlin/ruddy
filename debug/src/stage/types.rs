@@ -317,8 +317,8 @@ fn walk(
 /// a name rather than looking up what it stands for — following one is the
 /// caller's business, and the reason this cannot run away.
 ///
-/// Both halves of a type, since both can name one: the core it is, and the
-/// fields it carries. A type carrying fields is one inference built rather than
+/// Both halves of a type, since both can name one: the constructor it is, and the
+/// fields it carries. A struct type is one inference built rather than
 /// one anybody wrote, but it prints in this tab like any other and a declared
 /// name inside its fields is mentioned just as much.
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
@@ -363,8 +363,8 @@ fn names_in_row(row: &Row, out: &mut Vec<Symbol>) {
 }
 
 /// [`names_in`] over a label map: what each label holds. A type's fields are one
-/// — they have no tail of their own, their tail being the core beside them,
-/// which [`names_in`] descends where it sits. So a name sitting in a core under
+/// — they have no tail of their own, their tail being the constructor beside them,
+/// which [`names_in`] descends where it sits. So a name sitting in a payload under
 /// rows, so every declared name inside a field payload is still found.
 fn names_in_labels(labels: &IndexMap<String, RowField>, out: &mut Vec<Symbol>) {
     for field in labels.values() {
