@@ -2302,6 +2302,13 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
         assert_eq!(error.kind.code(), "circular-type");
     }
 
+    // An empty struct-row forwarding constructor adds no field either. Its
+    // braces say which kind of parameter this is, but do not make the cycle
+    // endless by themselves.
+    let (_, out) = build_src("type RowId 'r = { ..'r }\ntype T = RowId T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-type");
+
     // And a declaration that names itself inside a *field* is on no core loop
     // at all: its core is unit, and the recursion is in what a field holds.
     let (_, out) = build_src("type List = { next: List }");
@@ -7281,6 +7288,128 @@ fn imported_field_rows_forward_outer_lacks_constraints() {
         "{:#?}",
         out.errors
     );
+}
+
+fn deep_field_summary_artifact(depth: usize, cycle: bool) -> a::Artifact {
+    let mut dependency = effect_artifact("dep", "empty");
+    dependency.header.types = (0..depth)
+        .map(|index| {
+            let stem = if cycle { "Cycle" } else { "Link" };
+            let name = format!("dep@1.0.0::{stem}{index}");
+            let params = (!cycle)
+                .then(|| {
+                    vec![a::Parameter {
+                        sense: a::Sense::Fields,
+                        lacks: vec!["z".into()],
+                        relevant: true,
+                    }]
+                })
+                .unwrap_or_default();
+            let body = if !cycle && index + 1 == depth {
+                a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "z".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })
+            } else {
+                let next = if index + 1 == depth { 0 } else { index + 1 };
+                a::Type::Named {
+                    name: format!("dep@1.0.0::{stem}{next}"),
+                    args: if cycle {
+                        Vec::new()
+                    } else {
+                        vec![artifact_type(a::Type::Bound(0))]
+                    },
+                }
+            };
+            a::DeclaredType {
+                name,
+                params,
+                scheme: a::Scheme {
+                    count: u32::from(!cycle),
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: artifact_type(body),
+                },
+            }
+        })
+        .collect();
+    dependency
+}
+
+#[test]
+fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
+    std::thread::Builder::new()
+        .name("deep-imported-field-summaries".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 512;
+
+            let dependency = deep_field_summary_artifact(DEPTH, false);
+            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
+
+            let dependency = deep_field_summary_artifact(DEPTH, false);
+            let parsed = parse::parse(
+                lex(
+                    "type WithZ 'r = { z: Nat, ..'r }\n\
+                     type Bad = WithZ (dep::Link0 {})",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                used.errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ErrorKind::RepeatedRowField {
+                        shape: Shape::Struct,
+                        field,
+                    } if field == "z"
+                )),
+                "{:#?}",
+                used.errors
+            );
+
+            let dependency = deep_field_summary_artifact(DEPTH, true);
+            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            let mut mint = dummy_mint();
+            let unused = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(unused.errors.is_empty(), "{:#?}", unused.errors);
+
+            let dependency = deep_field_summary_artifact(DEPTH, true);
+            let parsed = parse::parse(
+                lex(
+                    "type WithX 'r = { x: Nat, ..'r }\n\
+                     type Safe = WithX dep::Cycle0",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let used = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(
+                used.errors.iter().any(|error| matches!(
+                    error.kind,
+                    ErrorKind::NotARow {
+                        sense: Sense::Fields
+                    }
+                )),
+                "{:#?}",
+                used.errors
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep imported field summaries terminate without overflowing");
 }
 
 #[test]

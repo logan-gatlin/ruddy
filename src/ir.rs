@@ -3610,6 +3610,7 @@ impl Follow<'_> {
             // other struct — closed, or open in the way only an annotation may
             // be — is a shape like any other.
             TypeKind::Struct {
+                fields,
                 tail:
                     Some(Tail {
                         of: Row::Param { index, .. },
@@ -3618,7 +3619,7 @@ impl Follow<'_> {
                 ..
             } => Stands::Param {
                 index: *index,
-                fields: true,
+                fields: !fields.is_empty(),
             },
             // A shape one step in, which is all a declaration has to reach.
             // `Error` absorbs, as everywhere else.
@@ -5399,167 +5400,227 @@ struct FieldSummary {
 /// outer row. Resolving both forms through one summary table makes kind/lacks
 /// inference and argument checking agree across an import boundary.
 ///
-/// Resolution is depth-first to retain that source order. An active declaration
-/// contributes nothing when met again, making malformed imported alias cycles
-/// and unresolved names absorbing rather than recursive. Local unproductive
-/// cycles have already been diagnosed and erased, but the guard keeps this
-/// normalization total independently of that ordering.
+/// Resolution is depth-first to retain that source order, but uses an explicit
+/// work stack rather than the call stack. Completed declarations are memoized
+/// by symbol. An active declaration contributes nothing when met again, making
+/// malformed imported alias cycles and unresolved names absorbing rather than
+/// recursive. Local unproductive cycles have already been diagnosed and
+/// erased, but the guard keeps this normalization total independently of that
+/// ordering.
 fn field_summaries(
     types: &IndexMap<Symbol, Decl<Type>>,
     external: &IndexMap<Symbol, ExternalType>,
 ) -> HashMap<Symbol, FieldSummary> {
-    fn substitute(
-        head: FieldSummary,
-        mut argument: impl FnMut(u32) -> FieldSummary,
-    ) -> FieldSummary {
-        let mut out = FieldSummary {
-            labels: head.labels,
-            slots: IndexSet::new(),
-        };
-        for index in head.slots {
-            let inner = argument(index);
-            out.labels.extend(inner.labels);
-            out.slots.extend(inner.slots);
-        }
-        out
+    enum Work<'a> {
+        Named(Symbol),
+        FinishNamed(Symbol),
+        Semantic(&'a Ty),
+        Artifact(&'a Type),
+        SemanticApply(&'a [Rc<Ty>]),
+        ArtifactApply(&'a [Type]),
+        FinishApply {
+            labels: IndexSet<String>,
+            arguments: usize,
+            crossed_cycle: bool,
+        },
+        Value(FieldSummary),
     }
 
-    fn semantic_row(row: &crate::types::Row) -> FieldSummary {
-        let mut out = FieldSummary {
-            labels: row.labels.keys().cloned().collect(),
-            slots: IndexSet::new(),
-        };
-        match &row.rest {
-            Rest::Bound(index) => {
-                out.slots.insert(*index);
-            }
-            Rest::More(more) => {
-                let inner = semantic_row(more);
-                out.labels.extend(inner.labels);
-                out.slots.extend(inner.slots);
-            }
-            Rest::Closed | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {}
-        }
-        out
-    }
-
-    fn semantic(
-        ty: &Ty,
-        types: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        active: &mut HashSet<Symbol>,
-    ) -> FieldSummary {
-        match ty {
-            Ty::Bound(index) => FieldSummary {
-                labels: IndexSet::new(),
-                slots: std::iter::once(*index).collect(),
-            },
-            Ty::Struct(row) => semantic_row(row),
-            Ty::Named {
-                symbol,
-                args: supplied,
-                ..
-            } => {
-                let head = named(*symbol, types, external, active);
-                substitute(head, |index| {
-                    supplied
-                        .get(index as usize)
-                        .map(|arg| semantic(arg, types, external, active))
-                        .unwrap_or_default()
-                })
-            }
-            Ty::Nat
-            | Ty::Int
-            | Ty::Real
-            | Ty::String
-            | Ty::Boolean
-            | Ty::Arrow(..)
-            | Ty::Sum(_)
-            | Ty::Var(_)
-            | Ty::Rigid { .. }
-            | Ty::Undecided => FieldSummary::default(),
-        }
-    }
-
-    fn artifact(
-        ty: &Type,
-        types: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        active: &mut HashSet<Symbol>,
-    ) -> FieldSummary {
-        match &ty.tracked {
-            TypeKind::Struct { fields, tail } => {
-                let mut slots = IndexSet::new();
-                if let Some(Tail {
-                    of: Row::Param { index, .. },
-                    ..
-                }) = tail
-                {
-                    slots.insert(*index);
+    fn semantic_row(mut row: &crate::types::Row) -> FieldSummary {
+        let mut out = FieldSummary::default();
+        loop {
+            out.labels.extend(row.labels.keys().cloned());
+            match &row.rest {
+                Rest::Bound(index) => {
+                    out.slots.insert(*index);
+                    return out;
                 }
-                FieldSummary {
-                    labels: fields.keys().cloned().collect(),
-                    slots,
+                Rest::More(more) => row = more,
+                Rest::Closed | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
+                    return out;
                 }
             }
-            TypeKind::Param { index, .. } => FieldSummary {
-                labels: IndexSet::new(),
-                slots: std::iter::once(*index).collect(),
-            },
-            TypeKind::Ident(symbol) => named(*symbol, types, external, active),
-            TypeKind::Apply {
-                head,
-                args: supplied,
-                ..
-            } => {
-                let head = named(*head, types, external, active);
-                substitute(head, |index| {
-                    supplied
-                        .get(index as usize)
-                        .map(|arg| artifact(arg, types, external, active))
-                        .unwrap_or_default()
-                })
+        }
+    }
+
+    fn resolve<'a>(
+        root: Symbol,
+        types: &'a IndexMap<Symbol, Decl<Type>>,
+        external: &'a IndexMap<Symbol, ExternalType>,
+        done: &mut HashMap<Symbol, FieldSummary>,
+    ) {
+        let mut active = HashSet::new();
+        let mut work = vec![Work::Named(root)];
+        let mut values: Vec<(FieldSummary, bool)> = Vec::new();
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Named(symbol) => {
+                    if let Some(summary) = done.get(&symbol) {
+                        values.push((summary.clone(), false));
+                    } else if !active.insert(symbol) {
+                        values.push((FieldSummary::default(), true));
+                    } else {
+                        work.push(Work::FinishNamed(symbol));
+                        match types.get(&symbol) {
+                            Some(declaration) => work.push(Work::Artifact(&declaration.value)),
+                            None => {
+                                let declaration = external.get(&symbol).expect(
+                                    "every semantic name has an imported recovery interface",
+                                );
+                                work.push(Work::Semantic(declaration.scheme.body()));
+                            }
+                        }
+                    }
+                }
+                Work::FinishNamed(symbol) => {
+                    let (summary, crossed_cycle) =
+                        values.pop().expect("a declaration leaves one summary");
+                    active.remove(&symbol);
+                    // A nested result reached under an active-cycle assumption
+                    // is valid only for that walk. The root is valid for its
+                    // own symbol; caching an intermediate assumption would make
+                    // a cycle's summary depend on declaration order.
+                    if !crossed_cycle || symbol == root {
+                        done.insert(symbol, summary.clone());
+                    }
+                    values.push((summary, crossed_cycle));
+                }
+                Work::Semantic(ty) => match ty {
+                    Ty::Bound(index) => work.push(Work::Value(FieldSummary {
+                        labels: IndexSet::new(),
+                        slots: std::iter::once(*index).collect(),
+                    })),
+                    Ty::Struct(row) => work.push(Work::Value(semantic_row(row))),
+                    Ty::Named {
+                        symbol,
+                        args: supplied,
+                        ..
+                    } => {
+                        work.push(Work::SemanticApply(supplied));
+                        work.push(Work::Named(*symbol));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Arrow(..)
+                    | Ty::Sum(_)
+                    | Ty::Var(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => work.push(Work::Value(FieldSummary::default())),
+                },
+                Work::Artifact(ty) => match &ty.tracked {
+                    TypeKind::Struct { fields, tail } => {
+                        let mut slots = IndexSet::new();
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = tail
+                        {
+                            slots.insert(*index);
+                        }
+                        work.push(Work::Value(FieldSummary {
+                            labels: fields.keys().cloned().collect(),
+                            slots,
+                        }));
+                    }
+                    TypeKind::Param { index, .. } => work.push(Work::Value(FieldSummary {
+                        labels: IndexSet::new(),
+                        slots: std::iter::once(*index).collect(),
+                    })),
+                    TypeKind::Ident(symbol) => work.push(Work::Named(*symbol)),
+                    TypeKind::Apply {
+                        head,
+                        args: supplied,
+                        ..
+                    } => {
+                        work.push(Work::ArtifactApply(supplied));
+                        work.push(Work::Named(*head));
+                    }
+                    TypeKind::Sum { .. }
+                    | TypeKind::Arrow { .. }
+                    | TypeKind::Effects(_)
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => work.push(Work::Value(FieldSummary::default())),
+                },
+                Work::SemanticApply(supplied) => {
+                    let (head, crossed_cycle) = values
+                        .pop()
+                        .expect("an application head leaves one summary");
+                    let arguments: Vec<_> = head
+                        .slots
+                        .into_iter()
+                        .filter_map(|index| supplied.get(index as usize))
+                        .collect();
+                    work.push(Work::FinishApply {
+                        labels: head.labels,
+                        arguments: arguments.len(),
+                        crossed_cycle,
+                    });
+                    for argument in arguments.into_iter().rev() {
+                        work.push(Work::Semantic(argument));
+                    }
+                }
+                Work::ArtifactApply(supplied) => {
+                    let (head, crossed_cycle) = values
+                        .pop()
+                        .expect("an application head leaves one summary");
+                    let arguments: Vec<_> = head
+                        .slots
+                        .into_iter()
+                        .filter_map(|index| supplied.get(index as usize))
+                        .collect();
+                    work.push(Work::FinishApply {
+                        labels: head.labels,
+                        arguments: arguments.len(),
+                        crossed_cycle,
+                    });
+                    for argument in arguments.into_iter().rev() {
+                        work.push(Work::Artifact(argument));
+                    }
+                }
+                Work::FinishApply {
+                    labels,
+                    arguments,
+                    mut crossed_cycle,
+                } => {
+                    let at = values
+                        .len()
+                        .checked_sub(arguments)
+                        .expect("every selected argument leaves one summary");
+                    let mut out = FieldSummary {
+                        labels,
+                        slots: IndexSet::new(),
+                    };
+                    for (argument, cycle) in values.drain(at..) {
+                        out.labels.extend(argument.labels);
+                        out.slots.extend(argument.slots);
+                        crossed_cycle |= cycle;
+                    }
+                    values.push((out, crossed_cycle));
+                }
+                Work::Value(summary) => values.push((summary, false)),
             }
-            TypeKind::Sum { .. }
-            | TypeKind::Arrow { .. }
-            | TypeKind::Effects(_)
-            | TypeKind::Prim(_)
-            | TypeKind::Var(_)
-            | TypeKind::Hole
-            | TypeKind::Error => FieldSummary::default(),
         }
+        let (summary, _) = values.pop().expect("the root leaves one summary");
+        debug_assert!(values.is_empty());
+        debug_assert_eq!(
+            done.get(&root).map(|value| value.labels.len()),
+            Some(summary.labels.len())
+        );
     }
 
-    fn named(
-        symbol: Symbol,
-        types: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        active: &mut HashSet<Symbol>,
-    ) -> FieldSummary {
-        if !active.insert(symbol) {
-            return FieldSummary::default();
+    let mut done = HashMap::new();
+    for symbol in types.keys().chain(external.keys()) {
+        if !done.contains_key(symbol) {
+            resolve(*symbol, types, external, &mut done);
         }
-        let out = match types.get(&symbol) {
-            Some(declaration) => artifact(&declaration.value, types, external, active),
-            None => external
-                .get(&symbol)
-                .map(|declaration| semantic(declaration.scheme.body(), types, external, active))
-                .unwrap_or_default(),
-        };
-        active.remove(&symbol);
-        out
     }
-
-    types
-        .keys()
-        .chain(external.keys())
-        .map(|symbol| {
-            (
-                *symbol,
-                named(*symbol, types, external, &mut HashSet::new()),
-            )
-        })
-        .collect()
+    done.retain(|symbol, _| types.contains_key(symbol) || external.contains_key(symbol));
+    done
 }
 
 /// What one written type carries, given the normalized local and imported
