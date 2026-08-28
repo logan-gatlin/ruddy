@@ -1,6 +1,7 @@
 //! Filesystem-facing Ruddy compiler entry point used by the command-line tool.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ffi::{OsStr, OsString},
     fmt, fs,
@@ -8,10 +9,16 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::atomic::Ordering,
 };
 
 use boa_engine::{
-    Context, JsError, Module, Source, builtins::promise::PromiseState, module::SimpleModuleLoader,
+    Context, JsError, JsValue, Module, Source,
+    builtins::promise::{OperationType, Promise, PromiseState},
+    context::HostHooks,
+    job::{NativeJob, SimpleJobExecutor, TimeoutJob},
+    module::SimpleModuleLoader,
+    object::{JsObject, builtins::JsPromise},
 };
 use boa_runtime::{
     extensions::{ConsoleExtension, FetchExtension},
@@ -405,13 +412,117 @@ pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     Ok(javascript)
 }
 
-fn execute_javascript_module(path: &Path) -> Result<(), CliError> {
+type RejectedPromises = Rc<RefCell<Vec<(JsObject<Promise>, JsValue)>>>;
+
+#[derive(Default)]
+struct RuntimeHooks {
+    evaluation: RefCell<Option<JsObject<Promise>>>,
+    unhandled: RejectedPromises,
+    executor: Rc<RefCell<Option<Rc<SimpleJobExecutor>>>>,
+}
+
+impl RuntimeHooks {
+    fn watch_evaluation(&self, evaluation: &JsPromise, executor: Rc<SimpleJobExecutor>) {
+        *self.evaluation.borrow_mut() = Some(std::ops::Deref::deref(evaluation).clone());
+        *self.executor.borrow_mut() = Some(executor);
+    }
+
+    fn first_unhandled(&self) -> Option<JsValue> {
+        self.unhandled
+            .borrow()
+            .first()
+            .map(|(_, reason)| reason.clone())
+    }
+}
+
+impl HostHooks for RuntimeHooks {
+    fn promise_rejection_tracker(
+        &self,
+        promise: &JsObject<Promise>,
+        operation: OperationType,
+        context: &mut Context,
+    ) {
+        match operation {
+            OperationType::Reject => {
+                let PromiseState::Rejected(reason) = JsPromise::from(promise.clone()).state()
+                else {
+                    return;
+                };
+                self.unhandled.borrow_mut().push((promise.clone(), reason));
+                if self.evaluation.borrow().as_ref() == Some(promise) {
+                    if let Some(executor) = self.executor.borrow().as_ref() {
+                        executor
+                            .get_cancellation_token()
+                            .store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    // Let already queued promise and microtask jobs attach a
+                    // handler before deciding that the rejection is unhandled.
+                    let promise = promise.clone();
+                    let unhandled = self.unhandled.clone();
+                    let executor = self.executor.clone();
+                    context.enqueue_job(
+                        TimeoutJob::new(
+                            NativeJob::new(move |_| {
+                                if unhandled
+                                    .borrow()
+                                    .iter()
+                                    .any(|(candidate, _)| candidate == &promise)
+                                    && let Some(executor) = executor.borrow().as_ref()
+                                {
+                                    executor
+                                        .get_cancellation_token()
+                                        .store(true, Ordering::Relaxed);
+                                }
+                                Ok(JsValue::undefined())
+                            }),
+                            1,
+                        )
+                        .into(),
+                    );
+                }
+            }
+            OperationType::Handle => {
+                self.unhandled
+                    .borrow_mut()
+                    .retain(|(unhandled, _)| unhandled != promise);
+                let evaluation_rejected =
+                    self.evaluation.borrow().as_ref().is_some_and(|evaluation| {
+                        matches!(
+                            JsPromise::from(evaluation.clone()).state(),
+                            PromiseState::Rejected(_)
+                        )
+                    });
+                if self.unhandled.borrow().is_empty()
+                    && !evaluation_rejected
+                    && let Some(executor) = self.executor.borrow().as_ref()
+                {
+                    executor
+                        .get_cancellation_token()
+                        .store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Execute one JavaScript module with the same Boa runtime used by [`run_project`].
+///
+/// Module initialization and queued jobs run to completion. A rejected module
+/// or a promise that remains unhandled after its microtask checkpoint is
+/// returned as a runtime error.
+pub fn execute_javascript_module(path: impl AsRef<Path>) -> Result<(), CliError> {
+    let path = path.as_ref();
     let parent = path.parent().ok_or_else(|| {
         CliError::one(format!("JavaScript path {} has no parent", path.display()))
     })?;
     let loader = Rc::new(SimpleModuleLoader::new(parent).map_err(boa_error)?);
+    let executor = Rc::new(SimpleJobExecutor::new());
+    let hooks = Rc::new(RuntimeHooks::default());
     let mut context = Context::builder()
         .module_loader(loader)
+        .job_executor(executor.clone())
+        .host_hooks(hooks.clone())
         .build()
         .map_err(boa_error)?;
     boa_runtime::register(
@@ -431,13 +542,26 @@ fn execute_javascript_module(path: &Path) -> Result<(), CliError> {
     })?;
     let module = Module::parse(source, None, &mut context).map_err(boa_error)?;
     let evaluation = module.load_link_evaluate(&mut context);
-    context.run_jobs().map_err(boa_error)?;
-    match evaluation.state() {
+    if matches!(evaluation.state(), PromiseState::Pending) {
+        hooks.watch_evaluation(&evaluation, executor.clone());
+        context.run_jobs().map_err(boa_error)?;
+    }
+    let state = evaluation.state();
+    if let PromiseState::Rejected(value) = state {
+        return Err(boa_error(JsError::from_opaque(value)));
+    }
+    if let Some(reason) = hooks.first_unhandled() {
+        return Err(CliError::one(format!(
+            "JavaScript runtime: unhandled promise rejection: {}",
+            JsError::from_opaque(reason)
+        )));
+    }
+    match state {
         PromiseState::Fulfilled(_) => Ok(()),
-        PromiseState::Rejected(value) => Err(boa_error(JsError::from_opaque(value))),
         PromiseState::Pending => Err(CliError::one(
             "JavaScript module evaluation remained pending after the job queue completed",
         )),
+        PromiseState::Rejected(_) => unreachable!("handled above"),
     }
 }
 

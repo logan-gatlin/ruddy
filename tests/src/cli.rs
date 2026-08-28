@@ -8,8 +8,8 @@ use std::{
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{
-    Lockfile, Outcome, build_project, check_project, clean_project, compile, new_project, run,
-    run_project,
+    Lockfile, Outcome, build_project, check_project, clean_project, compile,
+    execute_javascript_module, new_project, run, run_project,
 };
 use tempfile::TempDir;
 
@@ -1520,6 +1520,59 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     assert!(rendered.contains(" at "), "{rendered}");
     assert!(app.join("build/queued.js").is_file());
     assert!(app.join("build/queued.artifact").is_file());
+}
+
+#[test]
+fn javascript_evaluation_rejection_does_not_wait_for_recurring_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("rejects.mjs");
+    fs::write(
+        &module,
+        "setInterval(() => {}, 60_000);\nthrow new Error('initialization failed');\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(
+        error.to_string().contains("initialization failed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn javascript_reports_unhandled_promises_despite_recurring_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("unhandled.mjs");
+    fs::write(
+        &module,
+        "Promise.reject(new Error('orphaned rejection'));\n\
+         setInterval(() => {}, 60_000);\n",
+    )
+    .unwrap();
+
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(
+        error.to_string().contains("unhandled promise rejection"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("orphaned rejection"), "{error}");
+}
+
+#[test]
+fn javascript_does_not_report_a_rejection_handled_by_a_later_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("handled.mjs");
+    fs::write(
+        &module,
+        "const promise = Promise.reject(new Error('handled later'));\n\
+         Promise.resolve().then(() => promise.catch(() => {}));\n",
+    )
+    .unwrap();
+
+    execute_javascript_module(&module).expect("the queued handler makes the rejection handled");
 }
 
 #[test]
