@@ -612,6 +612,63 @@ impl Assigned {
     }
 }
 
+impl Drop for Ty {
+    fn drop(&mut self) {
+        fn take_row(row: &mut Row, pending: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+            let mut owned = std::mem::take(row);
+            pending.extend(
+                std::mem::take(&mut owned.labels)
+                    .into_values()
+                    .map(|field| field.ty),
+            );
+            if let Rest::More(more) = std::mem::take(&mut owned.rest) {
+                rows.push(more);
+            }
+        }
+
+        fn take_ty(ty: &mut Ty, pending: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>>) {
+            match ty {
+                Ty::Arrow(from, to, effects) => {
+                    pending.push(std::mem::replace(from, Rc::new(Ty::Undecided)));
+                    pending.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
+                    take_row(effects, pending, rows);
+                }
+                Ty::Struct(row) | Ty::Sum(row) => take_row(row, pending, rows),
+                Ty::Named { args, .. } => {
+                    pending.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
+                }
+                Ty::Nat
+                | Ty::Int
+                | Ty::Real
+                | Ty::String
+                | Ty::Boolean
+                | Ty::Var(_)
+                | Ty::Bound(_)
+                | Ty::Rigid { .. }
+                | Ty::Undecided => {}
+            }
+        }
+
+        let mut pending = Vec::new();
+        let mut rows = Vec::new();
+        take_ty(self, &mut pending, &mut rows);
+        loop {
+            while let Some(row) = rows.pop() {
+                if let Ok(mut row) = Rc::try_unwrap(row) {
+                    take_row(&mut row, &mut pending, &mut rows);
+                }
+            }
+            let Some(ty) = pending.pop() else { break };
+            if let Ok(mut ty) = Rc::try_unwrap(ty) {
+                take_ty(&mut ty, &mut pending, &mut rows);
+                // Every recursive owner was replaced above. Its ordinary Drop
+                // is therefore constant-depth and can release scalar fields.
+                drop(ty);
+            }
+        }
+    }
+}
+
 impl Ty {
     /// `from -> to`, performing nothing: [`Row::closed`] with no labels, which
     /// is what a bare `A -> B` means and what the printer writes as nothing at
@@ -779,52 +836,58 @@ impl Formula {
 
     /// The negation, with the two constants and a double negative folded away.
     #[allow(clippy::should_implement_trait)]
-    pub fn not(self) -> Self {
-        match self {
-            Formula::True => Formula::False,
-            Formula::False => Formula::True,
-            Formula::Not(inner) => Rc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone()),
-            other => Formula::Not(Rc::new(other)),
+    pub fn not(mut self) -> Self {
+        if matches!(self, Formula::True) {
+            return Formula::False;
         }
+        if matches!(self, Formula::False) {
+            return Formula::True;
+        }
+        if let Formula::Not(inner) = &mut self {
+            let inner = std::mem::replace(inner, Rc::new(Formula::True));
+            drop(self);
+            return Rc::try_unwrap(inner).unwrap_or_else(|shared| (*shared).clone());
+        }
+        Formula::Not(Rc::new(self))
     }
 
     /// Both, with the constants folded away — which is what makes "says
     /// nothing" the value [`Formula::True`] rather than a tree of them.
     pub fn and(self, other: Self) -> Self {
-        match self {
-            Formula::False => {
-                drop_formula_iterative(other);
-                Formula::False
-            }
-            Formula::True => other,
-            left => match other {
-                Formula::False => {
-                    drop_formula_iterative(left);
-                    Formula::False
-                }
-                Formula::True => left,
-                right => Formula::And(Rc::new(left), Rc::new(right)),
-            },
+        if matches!(self, Formula::False) {
+            drop_formula_iterative(other);
+            return Formula::False;
         }
+        if matches!(self, Formula::True) {
+            return other;
+        }
+        if matches!(other, Formula::False) {
+            drop_formula_iterative(self);
+            return Formula::False;
+        }
+        if matches!(other, Formula::True) {
+            return self;
+        }
+        Formula::And(Rc::new(self), Rc::new(other))
     }
 
     /// Either, folded the same way.
     pub fn or(self, other: Self) -> Self {
-        match self {
-            Formula::True => {
-                drop_formula_iterative(other);
-                Formula::True
-            }
-            Formula::False => other,
-            left => match other {
-                Formula::True => {
-                    drop_formula_iterative(left);
-                    Formula::True
-                }
-                Formula::False => left,
-                right => Formula::Or(Rc::new(left), Rc::new(right)),
-            },
+        if matches!(self, Formula::True) {
+            drop_formula_iterative(other);
+            return Formula::True;
         }
+        if matches!(self, Formula::False) {
+            return other;
+        }
+        if matches!(other, Formula::True) {
+            drop_formula_iterative(self);
+            return Formula::True;
+        }
+        if matches!(other, Formula::False) {
+            return self;
+        }
+        Formula::Or(Rc::new(self), Rc::new(other))
     }
 
     /// Both or neither: what `a = b` says.
@@ -1027,33 +1090,38 @@ impl Formula {
     }
 }
 
-/// Release an owned formula without recursively dropping its `Rc` tree.
-///
-/// Constructor simplification can throw away an arbitrarily deep operand. It
-/// must first retain every child on an explicit heap stack, so releasing its
-/// parent cannot become the last reference to a deep chain on the host stack.
-pub(crate) fn drop_formula_iterative(root: Formula) {
-    fn retain_children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
-        match formula {
-            Formula::Not(inner) => work.push(inner.clone()),
-            Formula::And(left, right)
-            | Formula::Or(left, right)
-            | Formula::Iff(left, right)
-            | Formula::Xor(left, right) => {
-                work.push(left.clone());
-                work.push(right.clone());
+impl Drop for Formula {
+    fn drop(&mut self) {
+        fn take_children(formula: &mut Formula, pending: &mut Vec<Rc<Formula>>) {
+            match formula {
+                Formula::Not(inner) => {
+                    pending.push(std::mem::replace(inner, Rc::new(Formula::True)));
+                }
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    pending.push(std::mem::replace(left, Rc::new(Formula::True)));
+                    pending.push(std::mem::replace(right, Rc::new(Formula::True)));
+                }
+                Formula::True | Formula::False | Formula::Atom(_) => {}
             }
-            Formula::True | Formula::False | Formula::Atom(_) => {}
+        }
+
+        let mut pending = Vec::new();
+        take_children(self, &mut pending);
+        while let Some(formula) = pending.pop() {
+            if let Ok(mut formula) = Rc::try_unwrap(formula) {
+                take_children(&mut formula, &mut pending);
+                drop(formula);
+            }
         }
     }
+}
 
-    let mut work = Vec::new();
-    retain_children(&root, &mut work);
+/// Release an owned formula without recursively dropping its `Rc` tree.
+pub(crate) fn drop_formula_iterative(root: Formula) {
     drop(root);
-    while let Some(formula) = work.pop() {
-        retain_children(&formula, &mut work);
-        drop(formula);
-    }
 }
 
 impl Presence {

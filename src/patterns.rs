@@ -780,24 +780,17 @@ impl Check<'_> {
         Some(effective_conditions(&raw))
     }
 
-    fn presence_at(&self, ty: &Rc<Ty>, path: &str) -> Option<Presence> {
-        match path.split_once('.') {
-            Some((name, below)) => {
-                let shaped = self.shape(ty);
-                let Ty::Struct(row) = &*shaped else {
-                    return None;
-                };
-                let row = flat(row);
-                let field = row.labels.get(name)?;
-                self.presence_at(&field.ty, below)
-            }
-            None => match &*self.shape(ty) {
-                Ty::Struct(row) => flat(row)
-                    .labels
-                    .get(path)
-                    .map(|field| field.presence.clone()),
-                _ => None,
-            },
+    fn presence_at(&self, ty: &Rc<Ty>, path: &[String]) -> Option<Presence> {
+        let (name, below) = path.split_first()?;
+        let shaped = self.shape(ty);
+        let Ty::Struct(row) = &*shaped else {
+            return None;
+        };
+        let row = flat(row);
+        let field = row.labels.get(name)?;
+        match below.is_empty() {
+            true => Some(field.presence.clone()),
+            false => self.presence_at(&field.ty, below),
         }
     }
 

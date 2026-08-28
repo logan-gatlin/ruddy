@@ -2512,7 +2512,11 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
             name: Rc<str>,
             args: usize,
         },
-        BuiltRow(&'a crate::types::Row),
+        BuiltRow {
+            labels: Vec<(&'a String, &'a crate::types::RowField)>,
+            rest: Rest,
+            composed: bool,
+        },
     }
     let mut types = Vec::new();
     let mut rows = Vec::new();
@@ -2556,11 +2560,37 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 }
             },
             Work::Row(value) => {
-                work.push(Work::BuiltRow(value));
-                if let Rest::More(more) = &value.rest {
-                    work.push(Work::Row(more));
-                }
-                work.extend(value.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+                let composed = matches!(value.rest, Rest::More(_));
+                let mut labels = Vec::new();
+                let mut claimed = HashSet::new();
+                let mut row = value;
+                let rest = loop {
+                    for (name, field) in &row.labels {
+                        if claimed.insert(name.as_str()) {
+                            labels.push((name, field));
+                        }
+                    }
+                    match &row.rest {
+                        Rest::More(more) => row = more,
+                        Rest::Closed => break Rest::Closed,
+                        Rest::Bound(index)
+                            if (*index as usize) < count && (*index as usize) >= presences =>
+                        {
+                            break Rest::Bound(*index);
+                        }
+                        Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
+                            break Rest::Undecided;
+                        }
+                    }
+                };
+                work.push(Work::BuiltRow {
+                    labels: labels.clone(),
+                    rest,
+                    composed,
+                });
+                work.extend(labels.into_iter().rev().filter_map(|(_, field)| {
+                    (!matches!(field.presence, Presence::Absent)).then_some(Work::Ty(&field.ty))
+                }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("row postorder stays balanced");
@@ -2588,32 +2618,13 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     args: imported.into(),
                 }));
             }
-            Work::BuiltRow(value) => {
-                let rest = match &value.rest {
-                    Rest::Closed => Rest::Closed,
-                    Rest::Bound(index)
-                        if (*index as usize) < count && (*index as usize) >= presences =>
-                    {
-                        Rest::Bound(*index)
-                    }
-                    Rest::More(_) => {
-                        let mut inner = rows.pop().expect("row postorder stays balanced");
-                        while let Rest::More(deeper) = &inner.rest {
-                            let deeper_labels = deeper.labels.clone();
-                            let deeper_rest = deeper.rest.clone();
-                            for (name, field) in deeper_labels {
-                                inner.labels.entry(name).or_insert(field);
-                            }
-                            inner.rest = deeper_rest;
-                        }
-                        Rest::More(Rc::new(inner))
-                    }
-                    Rest::Bound(_) | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
-                        Rest::Undecided
-                    }
-                };
-                let mut fields = Vec::with_capacity(value.labels.len());
-                for (name, field) in value.labels.iter().rev() {
+            Work::BuiltRow {
+                labels,
+                rest,
+                composed,
+            } => {
+                let mut fields = Vec::with_capacity(labels.len());
+                for (name, field) in labels.into_iter().rev() {
                     let presence = match field.presence {
                         Presence::Present => Presence::Present,
                         Presence::Absent => Presence::Absent,
@@ -2624,18 +2635,20 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                             Presence::Undecided
                         }
                     };
-                    fields.push((
-                        name.clone(),
-                        crate::types::RowField {
-                            presence,
-                            ty: types.pop().expect("type postorder stays balanced"),
-                        },
-                    ));
+                    let ty = match presence {
+                        Presence::Absent => Rc::new(Ty::Undecided),
+                        _ => types.pop().expect("type postorder stays balanced"),
+                    };
+                    fields.push((name.clone(), crate::types::RowField { presence, ty }));
                 }
                 fields.reverse();
-                rows.push(crate::types::Row {
+                let row = crate::types::Row {
                     labels: fields.into_iter().collect(),
                     rest,
+                };
+                rows.push(match composed {
+                    true => crate::types::Row::of(Rest::More(Rc::new(row))),
+                    false => row,
                 });
             }
         }
@@ -2808,13 +2821,10 @@ fn import_type(
                 if let artifact::Rest::More(more) = &value.rest {
                     work.push(Work::Row(more));
                 }
-                work.extend(
-                    value
-                        .labels
-                        .iter()
-                        .rev()
-                        .map(|(_, field)| Work::Ty(&field.ty)),
-                );
+                work.extend(value.labels.iter().rev().filter_map(|(_, field)| {
+                    (!matches!(field.presence, artifact::Presence::Absent))
+                        .then_some(Work::Ty(&field.ty))
+                }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("row postorder stays balanced");
@@ -2863,13 +2873,11 @@ fn import_type(
                             Presence::Undecided
                         }
                     };
-                    fields.push((
-                        name.clone(),
-                        crate::types::RowField {
-                            presence,
-                            ty: types.pop().expect("type postorder stays balanced"),
-                        },
-                    ));
+                    let ty = match presence {
+                        Presence::Absent => Rc::new(Ty::Undecided),
+                        _ => types.pop().expect("type postorder stays balanced"),
+                    };
+                    fields.push((name.clone(), crate::types::RowField { presence, ty }));
                 }
                 fields.reverse();
                 rows.push(crate::types::Row {
@@ -3290,7 +3298,7 @@ impl RegularType<'_> {
             Ty::Arrow(a, b, r) => {
                 let a = self.semantic(a, args);
                 let b = self.semantic(b, args);
-                let r = self.semantic_row(r, args);
+                let r = self.semantic_row(r, args, true);
                 self.node(
                     "arrow",
                     vec![("from".into(), a), ("to".into(), b), ("effects".into(), r)],
@@ -3302,7 +3310,7 @@ impl RegularType<'_> {
                 self.atom("Unit")
             }
             Ty::Struct(r) => self.semantic_fields(r, args),
-            Ty::Sum(r) => self.semantic_row(r, args),
+            Ty::Sum(r) => self.semantic_row(r, args, false),
             Ty::Bound(i) => self.argument(args, *i),
             Ty::Named {
                 symbol,
@@ -3342,7 +3350,7 @@ impl RegularType<'_> {
         self.node("fields", edges)
     }
 
-    fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize]) -> usize {
+    fn semantic_row(&mut self, row: &crate::types::Row, args: &[usize], effects: bool) -> usize {
         use crate::types::Rest;
         let mut edges = Vec::new();
         for (name, field) in &row.labels {
@@ -3358,16 +3366,17 @@ impl RegularType<'_> {
             } else {
                 self.semantic(&field.ty, args)
             };
-            edges.push((
-                format!("label:{}:{presence}", canonical_effect_key(name)),
-                ty,
-            ));
+            let name = match effects {
+                true => canonical_effect_key(name),
+                false => name.clone(),
+            };
+            edges.push((format!("label:{name}:{presence}"), ty));
         }
         let tail = match &row.rest {
             Rest::Closed => self.atom("closed"),
             Rest::Bound(id) => self.argument(args, *id),
             Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => self.atom("?"),
-            Rest::More(more) => self.semantic_row(more, args),
+            Rest::More(more) => self.semantic_row(more, args, effects),
         };
         edges.push(("tail".into(), tail));
         self.node("sum", edges)
@@ -3388,6 +3397,7 @@ impl RegularType<'_> {
             };
             let mut pending = vec![root];
             let mut seen = HashSet::new();
+            let mut claimed = HashSet::new();
             let mut edges = Vec::new();
             while let Some(node) = pending.pop() {
                 if !seen.insert(node) {
@@ -3396,8 +3406,19 @@ impl RegularType<'_> {
                 for (label, child) in &original[node].edges {
                     if label == join && original[*child].label == kind {
                         pending.push(*child);
-                    } else {
+                    } else if label == join {
                         edges.push((label.clone(), *child));
+                    } else {
+                        // Presence is the final colon-delimited component.
+                        // Claiming the semantic label before inspecting it is
+                        // the row rule: an outer absent edge masks an inner
+                        // present one just as surely as an outer present does.
+                        let key = label
+                            .rsplit_once(':')
+                            .map_or(label.as_str(), |(key, _)| key);
+                        if claimed.insert(key.to_string()) {
+                            edges.push((label.clone(), *child));
+                        }
                     }
                 }
             }
@@ -3537,10 +3558,10 @@ fn canonical_type(
 
 /// Imported and source effect labels share this structural spelling.
 fn canonical_effect_key(name: &str) -> String {
-    match name.split_once('\u{1f}') {
-        Some((name, interface)) => format!("!{name}<{interface}>"),
-        None => name.to_string(),
-    }
+    let (name, interface) = name
+        .split_once('\u{1f}')
+        .expect("an effect row key has a generated structural identity");
+    format!("!{name}<{interface}>")
 }
 
 fn canonical_written_presence(when: &Option<Box<When>>) -> String {
@@ -4047,8 +4068,13 @@ impl<'a> Follow<'a> {
                             // shadowing. An outer absence therefore forbids an
                             // inner presence from counting as field addition.
                             fields |= row.labels.iter().any(|(name, field)| {
-                                seen.insert(name.clone())
-                                    && !matches!(field.presence, Presence::Absent)
+                                match (
+                                    seen.insert(name.clone()),
+                                    matches!(field.presence, Presence::Absent),
+                                ) {
+                                    (true, false) => true,
+                                    (true, true) | (false, true) | (false, false) => false,
+                                }
                             });
                             match &row.rest {
                                 Rest::Bound(index) => {

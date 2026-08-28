@@ -1875,9 +1875,6 @@ fn alias_unfolding_opens_deep_semantic_bodies_on_a_small_stack() {
             let use_ = semantic_named(alias, vec![Rc::new(Ty::Nat)]);
             let opened = inference::unfold(&aliases, &use_);
             assert!(!matches!(&*opened, Ty::Undecided));
-            std::mem::forget(aliases);
-            std::mem::forget(use_);
-            std::mem::forget(opened);
         })
         .unwrap()
         .join()
@@ -1904,8 +1901,6 @@ fn alias_unfolding_is_linear_and_stack_safe_for_deep_forwarding() {
                 &*inference::unfold(&output.aliases, &deep),
                 Ty::Nat
             ));
-            // Recursive Rc destruction is unrelated to the bounded-stack walk.
-            std::mem::forget(deep);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -1946,14 +1941,69 @@ fn deep_more_identity_is_linear_and_stack_safe() {
             let deep = semantic_named(id, vec![Rc::new(Ty::Struct(row))]);
             let opened = inference::unfold(&aliases, &deep);
             assert!(matches!(&*opened, Ty::Struct(_)));
-            // Recursive Rc destruction is unrelated to identity normalization.
-            std::mem::forget(aliases);
-            std::mem::forget(deep);
-            std::mem::forget(opened);
         })
         .expect("the bounded-stack identity regression starts")
         .join()
         .expect("one deep More chain is normalized once");
+}
+
+#[test]
+fn recursive_goal_comparison_ignores_two_absent_payloads() {
+    let (_, _, output) = inferred(
+        "type A 'r = { \\gone, next: A 'r, ..'r }\n\
+         type B 'r = { \\gone, next: B 'r, ..'r }\n\
+         let convert : A {} -> B {} = fn value => value",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert!(
+        output
+            .steps
+            .iter()
+            .any(|step| matches!(step.rule, Rule::Assume))
+    );
+}
+
+#[test]
+fn structural_presence_paths_stop_at_absent_payloads() {
+    let nested = |name: &str| {
+        Rc::new(Ty::Struct(Row {
+            labels: [(name.into(), RowField::present(Rc::new(Ty::Nat)))]
+                .into_iter()
+                .collect(),
+            rest: Rest::Closed,
+        }))
+    };
+    let ty = Rc::new(Ty::Struct(Row {
+        labels: [
+            (
+                "absent".into(),
+                RowField {
+                    presence: Presence::Absent,
+                    ty: nested("hidden"),
+                },
+            ),
+            ("present".into(), RowField::present(nested("visible"))),
+        ]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    }));
+    let paths = inference::structural_presence_paths(&ty);
+    assert!(
+        paths
+            .iter()
+            .any(|(path, _)| path == &["absent".to_string()])
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|(path, _)| { path == &["present".to_string(), "visible".to_string()] })
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|(path, _)| path.iter().any(|name| name == "hidden"))
+    );
 }
 
 #[test]
@@ -1994,15 +2044,32 @@ fn growing_alias_cycles_retain_only_linear_path_state() {
                 &*inference::unfold(&finite, &semantic_named(add, Vec::new())),
                 Ty::Struct(_)
             ));
+            let empty = mint
+                .global(None, Namespace::Types, "Empty")
+                .expect("an empty forwarding alias");
+            let empty_aliases = IndexMap::from([
+                (forward, Scheme::new(1, Rc::new(Ty::Bound(0)))),
+                (
+                    empty,
+                    Scheme::new(0, semantic_named(forward, vec![Rc::new(Ty::unit())])),
+                ),
+            ]);
+            assert!(matches!(
+                &*inference::unfold(&empty_aliases, &semantic_named(empty, Vec::new())),
+                Ty::Struct(row) if row.labels.is_empty()
+            ));
 
             let mut aliases = IndexMap::new();
             for (index, symbol) in symbols.iter().copied().enumerate() {
                 let next = symbols[(index + 1) % ALIASES];
                 let added = Rc::new(Ty::Struct(Row {
-                    labels: [(format!("field{index}"), RowField::present(Rc::new(Ty::Nat)))]
-                        .into_iter()
-                        .collect(),
-                    rest: Rest::Bound(0),
+                    labels: IndexMap::new(),
+                    rest: Rest::More(Rc::new(Row {
+                        labels: [(format!("field{index}"), RowField::present(Rc::new(Ty::Nat)))]
+                            .into_iter()
+                            .collect(),
+                        rest: Rest::Bound(0),
+                    })),
                 }));
                 aliases.insert(symbol, Scheme::new(1, semantic_named(next, vec![added])));
             }
@@ -2011,10 +2078,6 @@ fn growing_alias_cycles_retain_only_linear_path_state() {
                 &*inference::unfold(&aliases, &root),
                 Ty::Undecided
             ));
-            // The regression measures the unfolding walk, not recursive Rc
-            // destruction of its deliberately malformed recovery graph.
-            std::mem::forget(aliases);
-            std::mem::forget(root);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -5233,7 +5296,12 @@ fn nested_presence_guards_conjoin_and_name_nested_paths() {
         .find(|refinement| refinement.match_span != outer_match)
         .expect("the nested match report");
     assert!(ruddy::inference::sat::entails(&inner.effective, &outer));
-    assert!(inner.fields.iter().any(|(name, _)| name == "x"));
+    assert!(
+        inner
+            .fields
+            .iter()
+            .any(|(name, _)| name == &["x".to_string()])
+    );
 
     let (_, _, output) =
         inferred("let paths = fn v => match v with | {box: {x}} => 1n | {other} => 2n end");
@@ -5241,7 +5309,7 @@ fn nested_presence_guards_conjoin_and_name_nested_paths() {
         output.refinements[0]
             .fields
             .iter()
-            .any(|(name, _)| name == "box.x")
+            .any(|(name, _)| name == &["box".to_string(), "x".to_string()])
     );
 }
 
@@ -5271,7 +5339,7 @@ fn overlap_uses_exclusion_and_arm_assumptions_do_not_leak() {
         second
             .facts
             .iter()
-            .any(|fact| fact.field == "x" && !fact.present)
+            .any(|fact| fact.field == ["x".to_string()] && !fact.present)
     );
 
     let (mint, _, output) = inferred(

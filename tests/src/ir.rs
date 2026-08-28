@@ -12,7 +12,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{ParamKind, Prim, Sense, Shape},
+    types::{ParamKind, Presence, Prim, Rest, Sense, Shape, Ty},
 };
 use ruddy_debug::print;
 
@@ -6083,6 +6083,112 @@ fn row_composition_is_flattened_across_local_and_imported_types() {
 }
 
 #[test]
+fn structural_rows_mask_inner_duplicates_and_preserve_ordinary_separator_labels() {
+    let present = |ty| a::RowField {
+        presence: a::Presence::Present,
+        ty,
+    };
+    let absent = || a::RowField {
+        presence: a::Presence::Absent,
+        ty: a::Type::Undecided,
+    };
+    let sum = |name: &str, field| {
+        a::Type::Sum(a::Row {
+            labels: vec![(name.into(), field)],
+            rest: a::Rest::Closed,
+        })
+    };
+    let declared = |name: &str, params, count, body| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params,
+        scheme: a::Scheme {
+            count,
+            presences: 0,
+            formula: a::Formula::True,
+            body,
+        },
+    };
+    let named = |name: &str, args| a::Type::Named {
+        name: format!("dep@1.0.0::{name}"),
+        args,
+    };
+    let dependency = a::Artifact {
+        header: a::Header {
+            identity: a::Identity {
+                name: "dep".into(),
+                version: "1.0.0".into(),
+            },
+            dependencies: Vec::new(),
+            values: Vec::new(),
+            types: vec![
+                declared(
+                    "Mask",
+                    vec![a::Parameter {
+                        sense: a::Sense::Cases,
+                        lacks: vec!["X".into()],
+                        relevant: true,
+                    }],
+                    1,
+                    a::Type::Sum(a::Row {
+                        labels: vec![("X".into(), absent())],
+                        rest: a::Rest::Bound(0),
+                    }),
+                ),
+                declared(
+                    "Composed",
+                    Vec::new(),
+                    0,
+                    named("Mask", vec![sum("X", present(a::Type::Nat))]),
+                ),
+                declared("Flat", Vec::new(), 0, sum("X", absent())),
+                declared(
+                    "Separator",
+                    Vec::new(),
+                    0,
+                    sum("A\u{1f}x", present(a::Type::Nat)),
+                ),
+                declared(
+                    "LooksGenerated",
+                    Vec::new(),
+                    0,
+                    sum("!A<x>", present(a::Type::Nat)),
+                ),
+            ],
+            effects: Vec::new(),
+        },
+        lir: a::Lir {
+            functions: Vec::new(),
+            globals: Vec::new(),
+        },
+    };
+    let src = "module A = effect Shadow = { get: dep::Composed -> () } end\n\
+               module B = effect Shadow = { get: dep::Flat -> () } end\n\
+               module C = effect Separator = { get: dep::Separator -> () } end\n\
+               module D = effect Separator = { get: dep::LooksGenerated -> () } end";
+    let parsed = parse::parse(lex(src, FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let identities = |name: &str| {
+        out.program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>()
+    };
+    let shadow = identities("Shadow");
+    assert_eq!(shadow.len(), 2);
+    assert_eq!(shadow[0], shadow[1], "outer absence did not mask inner X");
+    let separator = identities("Separator");
+    assert_eq!(separator.len(), 2);
+    assert_ne!(
+        separator[0], separator[1],
+        "ordinary sum separator was mistaken for an effect identity"
+    );
+}
+
+#[test]
 fn absent_semantic_payloads_do_not_affect_structural_identity() {
     let absent = |ty| a::RowField {
         presence: a::Presence::Absent,
@@ -6150,6 +6256,96 @@ fn absent_semantic_payloads_do_not_affect_structural_identity() {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], ids[1], "absent {name} payload leaked into identity");
     }
+}
+
+#[test]
+fn absent_imported_payloads_do_not_create_visible_quantifiers_or_effect_counts() {
+    let mut dependency = effect_artifact("dep", "absent-payload-walks");
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::ghost".into(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 0,
+            formula: a::Formula::True,
+            body: a::Type::Struct(a::Row {
+                labels: vec![(
+                    "hidden".into(),
+                    a::RowField {
+                        presence: a::Presence::Absent,
+                        ty: a::Type::Arrow(
+                            Box::new(a::Type::Bound(0)),
+                            Box::new(a::Type::Bound(0)),
+                            a::Row {
+                                labels: Vec::new(),
+                                rest: a::Rest::Bound(0),
+                            },
+                        ),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            }),
+        },
+    });
+    dependency.header.values.push(a::Value {
+        name: "dep@1.0.0::nested".into(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::Bound(0),
+            body: a::Type::Struct(a::Row {
+                labels: vec![
+                    (
+                        "outer".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "inner".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Bound(0),
+                                        ty: a::Type::Nat,
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            }),
+                        },
+                    ),
+                    (
+                        "gone".into(),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: a::Type::Struct(a::Row {
+                                labels: vec![(
+                                    "invisible".into(),
+                                    a::RowField {
+                                        presence: a::Presence::Bound(0),
+                                        ty: a::Type::Nat,
+                                    },
+                                )],
+                                rest: a::Rest::Closed,
+                            }),
+                        },
+                    ),
+                ],
+                rest: a::Rest::Closed,
+            }),
+        },
+    });
+    let parsed = parse::parse(
+        lex(
+            "let ghost = dep::ghost\nlet nested = dep::nested",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    let scheme = inferred.schemes.values().next().expect("ghost scheme");
+    assert_eq!(scheme.count(), 0);
+    assert_eq!(scheme.presences(), 0);
 }
 
 #[test]
@@ -7916,23 +8112,22 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
         .name("deep-imported-more-row".into())
         .stack_size(256 * 1024)
         .spawn(|| {
+            const DEPTH: usize = 30_000;
             let mut row = a::Row {
-                labels: vec![(
-                    "last".into(),
-                    a::RowField {
-                        presence: a::Presence::Present,
-                        ty: a::Type::Nat,
-                    },
-                )],
-                rest: a::Rest::Bound(9),
+                labels: Vec::new(),
+                rest: a::Rest::Bound(DEPTH as u32 + 1),
             };
-            for _ in 0..4_096 {
+            for index in (0..DEPTH).rev() {
                 row = a::Row {
                     labels: vec![(
-                        "last".into(),
+                        format!("field{index:05}"),
                         a::RowField {
-                            presence: a::Presence::Absent,
-                            ty: a::Type::Undecided,
+                            presence: if index == 0 {
+                                a::Presence::Absent
+                            } else {
+                                a::Presence::Present
+                            },
+                            ty: a::Type::Nat,
                         },
                     )],
                     rest: a::Rest::More(Box::new(row)),
@@ -7949,13 +8144,30 @@ fn deeply_nested_imported_more_rows_are_imported_and_clamped_iteratively() {
             let out =
                 build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
-            // The deliberately recursive artifact owner is irrelevant after
-            // import; avoid testing Rust's recursive Box destructor here.
-            std::mem::forget(dependency);
+            let imported = out
+                .program
+                .external_types
+                .values()
+                .find(|declaration| matches!(&**declaration.scheme.body(), Ty::Struct(_)))
+                .expect("the imported deep row");
+            let Ty::Struct(row) = &**imported.scheme.body() else {
+                unreachable!()
+            };
+            let Rest::More(row) = &row.rest else {
+                panic!("the normalized composition marker was lost")
+            };
+            assert_eq!(row.labels.len(), DEPTH);
+            assert_eq!(row.labels.first().unwrap().0, "field00000");
+            assert_eq!(row.labels.last().unwrap().0, "field29999");
+            assert!(matches!(
+                row.labels["field00000"].presence,
+                Presence::Absent
+            ));
+            assert!(matches!(row.rest, Rest::Undecided));
         })
         .expect("the bounded-stack regression thread starts")
         .join()
-        .expect("deep Rest::More import and clamping are stack safe");
+        .expect("deep Rest::More import and clamping are stack safe and linear");
 }
 
 #[test]
@@ -8131,13 +8343,6 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             assert!(stage.nodes.iter().any(|node| node.text.contains("Phantom")));
             assert!(stage.debug.contains("externs:"));
             assert!(stage.debug.contains("Phantom"));
-
-            // Recursive ownership is not what this regression measures. Both
-            // imported representations remain live until the bounded-stack
-            // semantic use and debugger rendering have demonstrably completed.
-            std::mem::forget(program);
-            std::mem::forget(inferred);
-            std::mem::forget(dependencies);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -8378,14 +8583,108 @@ fn imported_interfaces_discard_foreign_solver_local_ids_before_inference() {
 }
 
 #[test]
+fn arrow_effect_more_rows_use_one_canonical_form_in_both_directions() {
+    let effect = |name: &str| {
+        (
+            format!("{name}\u{1f}interface"),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )
+    };
+    let plain = || {
+        (
+            "plain".into(),
+            a::RowField {
+                presence: a::Presence::Present,
+                ty: artifact_unit(),
+            },
+        )
+    };
+    let arrow = |labels, rest| {
+        a::Type::Arrow(
+            Box::new(a::Type::Nat),
+            Box::new(a::Type::Nat),
+            a::Row { labels, rest },
+        )
+    };
+    let mut dependency = effect_artifact("dep", "effect-more-equality");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::Effectful".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Effects,
+                lacks: vec!["A\u{1f}interface".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: arrow(vec![effect("A"), plain()], a::Rest::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Composed".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Effectful".into(),
+                args: vec![a::Type::Sum(a::Row {
+                    labels: vec![effect("B")],
+                    rest: a::Rest::Closed,
+                })],
+            }),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Flat".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(arrow(
+                vec![effect("A"), plain(), effect("B")],
+                a::Rest::Closed,
+            )),
+        },
+    ];
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::composed".into(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Composed".into(),
+                args: Vec::new(),
+            }),
+        },
+        a::Value {
+            name: "dep@1.0.0::flat".into(),
+            scheme: artifact_scheme(a::Type::Named {
+                name: "dep@1.0.0::Flat".into(),
+                args: Vec::new(),
+            }),
+        },
+    ]);
+    let parsed = parse::parse(
+        lex(
+            "let forward : dep::Flat = dep::composed\n\
+             let reverse : dep::Composed = dep::flat",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
+#[test]
 fn deep_equal_imported_types_unify_on_a_bounded_stack() {
     std::thread::Builder::new()
         .name("deep-equal-imported-solve".into())
         .stack_size(256 * 1024)
         .spawn(|| {
             const DEPTH: usize = 30_000;
-            let deep = |hidden| {
-                let mut named = a::Type::Nat;
+            let deep = |hidden, bottom| {
+                let mut named = bottom;
                 let mut payload = a::Type::Nat;
                 let mut effects = a::Row {
                     labels: Vec::new(),
@@ -8462,12 +8761,17 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                 a::DeclaredType {
                     name: "dep@1.0.0::A".into(),
                     params: Vec::new(),
-                    scheme: artifact_scheme(deep(a::Type::Nat)),
+                    scheme: artifact_scheme(deep(a::Type::Nat, a::Type::Nat)),
                 },
                 a::DeclaredType {
                     name: "dep@1.0.0::B".into(),
                     params: Vec::new(),
-                    scheme: artifact_scheme(deep(a::Type::String)),
+                    scheme: artifact_scheme(deep(a::Type::String, a::Type::Nat)),
+                },
+                a::DeclaredType {
+                    name: "dep@1.0.0::C".into(),
+                    params: Vec::new(),
+                    scheme: artifact_scheme(deep(a::Type::Nat, a::Type::String)),
                 },
             ];
             dependency.header.values.extend([
@@ -8475,6 +8779,13 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     name: "dep@1.0.0::value".into(),
                     scheme: artifact_scheme(a::Type::Named {
                         name: "dep@1.0.0::B".into(),
+                        args: Vec::new(),
+                    }),
+                },
+                a::Value {
+                    name: "dep@1.0.0::bad".into(),
+                    scheme: artifact_scheme(a::Type::Named {
+                        name: "dep@1.0.0::C".into(),
                         args: Vec::new(),
                     }),
                 },
@@ -8494,7 +8805,12 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                 },
             ]);
             let parsed = parse::parse(
-                lex("let imported = dep::accept dep::value", FileID::GENERATED).tokens,
+                lex(
+                    "let imported = dep::accept dep::value\n\
+                     let mismatch = dep::accept dep::bad",
+                    FileID::GENERATED,
+                )
+                .tokens,
             );
             assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
             let mut mint = dummy_mint();
@@ -8502,7 +8818,11 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                 build_with_dependencies(&mut mint, parsed.stmts, std::slice::from_ref(&dependency));
             assert!(out.errors.is_empty(), "{:#?}", out.errors);
             let inferred = inference::infer(&mint, &mut out.program);
-            assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            assert!(matches!(
+                inferred.errors[0].kind,
+                inference::ErrorKind::Mismatch { .. }
+            ));
             assert!(
                 inferred
                     .steps
@@ -8510,11 +8830,6 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
                     .any(|step| matches!(step.rule, inference::Rule::Arrow)),
                 "the deep bodies were decomposed"
             );
-            // Recursive imported owners are deliberately not destroyed on the
-            // bounded test stack.
-            std::mem::forget(dependency);
-            std::mem::forget(out);
-            std::mem::forget(inferred);
         })
         .expect("the bounded-stack regression thread starts")
         .join()

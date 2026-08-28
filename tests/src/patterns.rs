@@ -196,7 +196,11 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
     // Coverage can mention a solver atom with no corresponding readable path.
     // A malformed nested path exercises the same conservative fallback after
     // the path lookup itself fails.
-    for malformed in ["missing.field", "a.b", "a.b.c"] {
+    for malformed in [
+        vec!["missing.field".to_string()],
+        vec!["a.b".to_string()],
+        vec!["a".to_string(), "below".to_string()],
+    ] {
         let mut missing_path = inferred.clone();
         let paths = missing_path
             .store
@@ -209,7 +213,7 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
             .expect("the coverage batch carries paths");
         assert!(!paths.is_empty());
         for (path, _) in paths {
-            *path = malformed.to_string();
+            *path = malformed.clone();
         }
         let checks = patterns::check(&out.program, &missing_path);
         assert!(checks.errors.is_empty(), "{checks:#?}");
@@ -285,6 +289,29 @@ fn an_outer_presence_guard_applies_to_a_nested_literal_match() {
 }
 
 #[test]
+fn dotted_quoted_presence_paths_remain_structured_in_nested_matches() {
+    let src = "let outer = fn z =>\n\
+               \x20 let g = fn v =>\n\
+               \x20   let w = match v with | {\"a.b\": x} => 0n | {y} => 0n end in\n\
+               \x20   match v with | {\"a.b\": 1n} => 1n | {\"a.b\": n} => 2n | {y} => 3n end in\n\
+               \x20 0n";
+    let (out, inferred, checks) = checked(src);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(checks.errors.is_empty(), "{checks:#?}");
+    let report = checks.reports.last().expect("the nested guarded match");
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 3]);
+    assert!(inferred.store.batches.iter().any(|batch| {
+        matches!(
+            &batch.origin,
+            inference::Origin::Coverage(coverage)
+                if coverage.paths.iter().any(|(path, _)| path == &["a.b".to_string()])
+        )
+    }));
+}
+
+#[test]
 fn nested_presence_paths_are_translated_for_arm_guards() {
     let src = "let f = fn v => match v with \
                | {box: {x}} => 1n | {box: {y}} => 2n end";
@@ -305,13 +332,15 @@ fn nested_presence_paths_are_translated_for_arm_guards() {
     let ir::TermKind::Match { scrutinee, .. } = &mut body.kind else {
         panic!("match fixture")
     };
-    let Ty::Struct(mut outer) = (*scrutinee.ty).clone() else {
+    let Ty::Struct(outer) = &*scrutinee.ty else {
         panic!("struct scrutinee fixture")
     };
+    let mut outer = outer.clone();
     let field = outer.labels.get_mut("box").expect("box field");
-    let Ty::Struct(inner) = (*field.ty).clone() else {
+    let Ty::Struct(inner) = &*field.ty else {
         panic!("nested struct fixture")
     };
+    let inner = inner.clone();
     field.ty = Rc::new(Ty::Struct(Row {
         labels: Default::default(),
         rest: Rest::More(Rc::new(inner)),
@@ -337,7 +366,7 @@ fn ordered_overlap_and_nested_guards_agree_with_pattern_reachability() {
         inferred.refinements[1]
             .facts
             .iter()
-            .any(|fact| fact.field == "x" && !fact.present)
+            .any(|fact| fact.field == ["x".to_string()] && !fact.present)
     );
 
     let checks = clean(

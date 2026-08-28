@@ -1192,9 +1192,6 @@ fn deep_formula_conversion_and_artifact_writing_are_stack_safe() {
             assert!(printed.contains("(not"));
             assert!(printed.contains("(bound 0)"));
             drop(artifact);
-            // The semantic inference output owns the original Rc chain. Its
-            // public destructor is outside the artifact-boundary regression.
-            std::mem::forget(inferred);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -1246,6 +1243,10 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                         "more".into(),
                         types::RowField::present(Rc::new(types::Ty::Sum(more))),
                     ),
+                    (
+                        "boolean".into(),
+                        types::RowField::present(Rc::new(types::Ty::Boolean)),
+                    ),
                 ]
                 .into_iter()
                 .collect(),
@@ -1268,11 +1269,12 @@ fn deep_semantic_artifact_building_is_stack_safe_in_every_position() {
                     .iter()
                     .map(|(name, _)| name.as_str())
                     .collect::<Vec<_>>(),
-                ["arrow", "named", "payload", "more"]
+                ["arrow", "named", "payload", "more", "boolean"]
             );
-            // Recursive Rc/Box destruction is outside conversion itself.
-            std::mem::forget(inferred);
-            std::mem::forget(artifact);
+            let printed = artifact.print();
+            assert!(printed.contains("(more (row"));
+            let reparsed = Artifact::try_parse(&printed).expect("deep semantics print readably");
+            assert_eq!(reparsed.print(), printed);
         })
         .expect("the bounded-stack regression thread starts")
         .join()

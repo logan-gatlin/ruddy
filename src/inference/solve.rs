@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     Batch, Constraint, ConstraintKind, DeferredRequirement, Effect, Error, ErrorKind, Goal,
-    GuardedArm, GuardedObligation, GuardedOrigin, Named, Origin, Refinement, RefinementFact, Rule,
-    Side, Slot, Step, Table,
+    GuardedArm, GuardedObligation, GuardedOrigin, Known, Named, Origin, Refinement, RefinementFact,
+    Rule, Side, Slot, Step, Table,
 };
 
 /// What a set of labels says about the ones it does not name.
@@ -452,8 +452,9 @@ impl Solve<'_> {
             let reachable = crate::inference::sat::satisfiable(&allowed);
 
             let mut named = IndexMap::new();
-            self.table.presence_paths(scrutinee, "", &mut named);
-            let fields: Vec<(String, Presence)> = named.into_iter().collect();
+            self.table
+                .presence_paths(scrutinee, &mut Vec::new(), &mut named);
+            let fields: Vec<(super::PresencePath, Presence)> = named.into_iter().collect();
             let facts = if reachable {
                 fields
                     .iter()
@@ -988,18 +989,6 @@ impl Solve<'_> {
     /// equality there; every other equal composite can be replayed by the
     /// explicit-stack path below.
     fn direct_equal(&self, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
-        if !self.table.alike(lhs, rhs) {
-            // Leaf mismatches need no recursive work, but routing them through
-            // the same trampoline gives its fallback the ordinary directional
-            // mismatch rule rather than leaving an impossible continuation.
-            return matches!(
-                (&**lhs, &**rhs),
-                (
-                    Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean,
-                    Ty::Nat | Ty::Int | Ty::Real | Ty::String | Ty::Boolean
-                )
-            );
-        }
         enum Work {
             Ty(Rc<Ty>, Rc<Ty>),
             Row(Row, Row),
@@ -1018,10 +1007,15 @@ impl Solve<'_> {
                         (Ty::Struct(a), Ty::Struct(b)) | (Ty::Sum(a), Ty::Sum(b)) => {
                             work.push(Work::Row(a.clone(), b.clone()));
                         }
-                        (Ty::Named { symbol, args, .. }, Ty::Named { args: others, .. })
-                            if !args.is_empty() =>
-                        {
-                            if !self.nominal.contains(symbol) {
+                        (
+                            Ty::Named { symbol, args, .. },
+                            Ty::Named {
+                                symbol: other,
+                                args: others,
+                                ..
+                            },
+                        ) if symbol == other && args.len() == others.len() => {
+                            if !args.is_empty() && !self.nominal.contains(symbol) {
                                 return false;
                             }
                             work.extend(
@@ -1031,14 +1025,27 @@ impl Solve<'_> {
                                     .map(|(a, b)| Work::Ty(a.clone(), b.clone())),
                             );
                         }
+                        // Every leaf pair, equal or not, is safe for the
+                        // trampoline's ordinary directional fallback. A name
+                        // that cannot use congruence still has to unfold.
+                        (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => return false,
                         _ => {}
                     }
                 }
                 Work::Row(lhs, rhs) => {
                     let (lhs, rhs) = (self.table.canon(&lhs), self.table.canon(&rhs));
+                    if lhs.labels.len() != rhs.labels.len()
+                        || lhs.labels.keys().any(|name| !rhs.labels.contains_key(name))
+                    {
+                        return false;
+                    }
                     for (name, field) in lhs.labels {
                         let other = &rhs.labels[&name];
                         let presence = self.table.presence_of(&field.presence);
+                        let other_presence = self.table.presence_of(&other.presence);
+                        if presence != other_presence {
+                            return false;
+                        }
                         if !matches!(presence, Presence::Absent) {
                             work.push(Work::Ty(field.ty, other.ty.clone()));
                         }
@@ -1056,12 +1063,24 @@ impl Solve<'_> {
     fn unify_equal(&mut self, span: Span, lhs: Rc<Ty>, rhs: Rc<Ty>) {
         enum Work {
             Ty(Rc<Ty>, Rc<Ty>, u32),
-            Row(Row, Row, u32),
+            Row(Row, Row, Shape, u32),
             Field(RowField, RowField, u32),
             Rest(Rest, Rest, Shape, u32),
+            FinishCongruent {
+                lhs: Rc<Ty>,
+                rhs: Rc<Ty>,
+                depth: u32,
+                reported: usize,
+                stepped: usize,
+                stored: usize,
+                traced: Vec<usize>,
+                known: Known,
+                nested: bool,
+            },
         }
 
         let original_depth = self.depth;
+        let mut congruences = 0usize;
         let mut work = vec![Work::Ty(lhs, rhs, original_depth)];
         while let Some(part) = work.pop() {
             match part {
@@ -1077,22 +1096,59 @@ impl Solve<'_> {
                             self.step(span, Rule::Absorb, goal, Effect::None);
                             self.recover_ty(span, &rhs);
                         }
-                        (Ty::Var(_), Ty::Var(_)) | (Ty::Rigid { .. }, Ty::Rigid { .. }) => {
-                            self.step(span, Rule::Same, goal, Effect::None);
+                        (_, Ty::Undecided) => {
+                            self.step(span, Rule::Absorb, goal, Effect::None);
+                            self.recover_ty(span, &lhs);
                         }
-                        (Ty::Named { args, .. }, Ty::Named { args: others, .. })
-                            if args.is_empty() =>
-                        {
-                            self.step(span, Rule::Same, goal, Effect::None);
-                        }
+                        (Ty::Var(a), Ty::Var(b)) => match a == b {
+                            true => self.step(span, Rule::Same, goal, Effect::None),
+                            false => {
+                                self.types(span, goal, &lhs, &rhs);
+                            }
+                        },
+                        (Ty::Rigid { id: a, .. }, Ty::Rigid { id: b, .. }) => match a == b {
+                            true => self.step(span, Rule::Same, goal, Effect::None),
+                            false => {
+                                self.types(span, goal, &lhs, &rhs);
+                            }
+                        },
                         (Ty::Named { args, .. }, Ty::Named { args: others, .. }) => {
-                            self.step(span, Rule::Congruent, goal, Effect::Decomposed);
-                            work.extend(
-                                args.iter()
-                                    .zip(others.iter())
-                                    .rev()
-                                    .map(|(a, b)| Work::Ty(a.clone(), b.clone(), depth + 1)),
-                            );
+                            match args.is_empty() {
+                                true => self.step(span, Rule::Same, goal, Effect::None),
+                                false => {
+                                    // `direct_equal` preflights symbol, arity,
+                                    // and nominal relevance for every nested
+                                    // application before this replay begins.
+                                    let reported = self.errors.len();
+                                    let stepped = self.steps.len();
+                                    let stored = self.table.store.batches.len();
+                                    let traced = self
+                                        .refinements
+                                        .iter()
+                                        .map(|refinement| refinement.obligations.len())
+                                        .collect();
+                                    let known = self.table.snapshot();
+                                    let nested = congruences != 0;
+                                    congruences += 1;
+                                    self.step(span, Rule::Congruent, goal, Effect::Decomposed);
+                                    work.push(Work::FinishCongruent {
+                                        lhs: lhs.clone(),
+                                        rhs: rhs.clone(),
+                                        depth,
+                                        reported,
+                                        stepped,
+                                        stored,
+                                        traced,
+                                        known,
+                                        nested,
+                                    });
+                                    work.extend(
+                                        args.iter().zip(others.iter()).rev().map(|(a, b)| {
+                                            Work::Ty(a.clone(), b.clone(), depth + 1)
+                                        }),
+                                    );
+                                }
+                            }
                         }
                         (Ty::Nat, Ty::Nat)
                         | (Ty::Int, Ty::Int)
@@ -1103,7 +1159,12 @@ impl Solve<'_> {
                         }
                         (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
                             self.step(span, Rule::Arrow, goal, Effect::Decomposed);
-                            work.push(Work::Row(effects.clone(), performs.clone(), depth + 1));
+                            work.push(Work::Row(
+                                self.table.canon(effects),
+                                self.table.canon(performs),
+                                Shape::Effect,
+                                depth + 1,
+                            ));
                             work.push(Work::Ty(to.clone(), result.clone(), depth + 1));
                             work.push(Work::Ty(from.clone(), other.clone(), depth + 1));
                         }
@@ -1122,7 +1183,7 @@ impl Solve<'_> {
                                 Goal::Type { expected, actual },
                                 Effect::Decomposed,
                             );
-                            work.push(Work::Row(want, have, depth + 1));
+                            work.push(Work::Row(want, have, Shape::Struct, depth + 1));
                         }
                         (Ty::Sum(cases), Ty::Sum(others)) => {
                             let (want, have) = (self.table.canon(cases), self.table.canon(others));
@@ -1134,28 +1195,18 @@ impl Solve<'_> {
                                 Goal::Type { expected, actual },
                                 Effect::Decomposed,
                             );
-                            work.push(Work::Row(want, have, depth + 1));
+                            work.push(Work::Row(want, have, Shape::Sum, depth + 1));
                         }
                         _ => {
                             self.types(span, goal, &lhs, &rhs);
                         }
                     }
                 }
-                Work::Row(lhs, rhs, depth) => {
+                Work::Row(lhs, rhs, shape, depth) => {
                     self.depth = depth;
                     let rest = (!(matches!(lhs.rest, Rest::Closed)
                         && matches!(rhs.rest, Rest::Closed)))
-                    .then(|| {
-                        Work::Rest(
-                            lhs.rest.clone(),
-                            rhs.rest.clone(),
-                            // Payload behavior is shape-independent on an
-                            // already equal row. Struct is the neutral reading
-                            // for the bare rest goal recorded here.
-                            Shape::Struct,
-                            depth,
-                        )
-                    });
+                    .then(|| Work::Rest(lhs.rest.clone(), rhs.rest.clone(), shape, depth));
                     let mut fields: Vec<_> = lhs
                         .labels
                         .into_iter()
@@ -1186,6 +1237,48 @@ impl Solve<'_> {
                 Work::Rest(lhs, rhs, shape, depth) => {
                     self.depth = depth;
                     self.rests(span, &lhs, &rhs, shape);
+                }
+                Work::FinishCongruent {
+                    lhs,
+                    rhs,
+                    depth,
+                    reported,
+                    stepped,
+                    stored,
+                    traced,
+                    known,
+                    nested,
+                } => {
+                    self.depth = depth;
+                    congruences -= 1;
+                    if self.errors.len() > reported {
+                        self.errors.truncate(reported);
+                        self.steps.truncate(stepped);
+                        self.table.store.batches.truncate(stored);
+                        for (refinement, obligations) in self.refinements.iter_mut().zip(traced) {
+                            refinement.obligations.truncate(obligations);
+                        }
+                        self.table.restore(known);
+                        if nested {
+                            // A containing congruence will roll this attempt
+                            // back too. Leave only a cheap failure marker for
+                            // it rather than repeatedly recovering every
+                            // suffix of a deep nominal argument.
+                            self.errors.push(Error {
+                                span,
+                                kind: ErrorKind::Mismatch {
+                                    expected: lhs,
+                                    actual: rhs,
+                                },
+                            });
+                        } else {
+                            let goal = Goal::Type {
+                                expected: lhs.clone(),
+                                actual: rhs.clone(),
+                            };
+                            self.mismatch(span, goal, &lhs, &rhs);
+                        }
+                    }
                 }
             }
         }
@@ -1221,19 +1314,6 @@ impl Solve<'_> {
     /// beside it is a type nothing can be. See [`Solve::abandon`].
     fn types(&mut self, span: Span, goal: Goal, lhs: &Rc<Ty>, rhs: &Rc<Ty>) -> bool {
         match (&**lhs, &**rhs) {
-            // Two types with nothing of their own are already the same thing,
-            // and saying so would be a step about nothing — which is what keeps
-            // a struct against a struct recording exactly what it always did.
-            (Ty::Undecided, _) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_ty(span, rhs);
-                true
-            }
-            (_, Ty::Undecided) => {
-                self.step(span, Rule::Absorb, goal, Effect::None);
-                self.recover_ty(span, lhs);
-                true
-            }
             (Ty::Var(var), _) => {
                 let var = *var;
                 self.assign(span, goal, var, Assigned::Ty(rhs.clone()));
@@ -1260,83 +1340,9 @@ impl Solve<'_> {
                 let (name, id) = (name.clone(), *id);
                 self.rigid_broken(span, goal, name, id, Sense::Type, lhs)
             }
-            // Equal nullary declarations were discharged by the iterative
-            // direct path. Different declarations fall through to unfolding
-            // and are equal whenever what they stand for is.
-            // Two applications of one declaration are equal when their
-            // arguments are — and this is a shortcut to unfolding rather than a
-            // rule that could contradict it, which is the whole of what
-            // [`Solve::nominal`] is checked for. Where every parameter reaches a
-            // position of the body, the two answers are the same answer, and
-            // this one is reached without building either body and complains in
-            // words about the types the reader wrote. Where a parameter is
-            // discarded they differ — `Ptr A` and `Ptr B` both stand for `Nat`,
-            // so they are one type — and the arm below decides it by unfolding.
-            //
-            // Not termination either: the assumption stack catches a
-            // declaration leading back to itself, since it is keyed on the goal
-            // and a recursion may not grow its arguments. See [`Ty::Named`].
-            //
-            // Imported interfaces are recovery input and may carry malformed
-            // applications, so congruence checks arity rather than letting zip
-            // silently discard unmatched arguments.
-            (
-                Ty::Named {
-                    symbol: a,
-                    args: xs,
-                    ..
-                },
-                Ty::Named {
-                    symbol: b,
-                    args: ys,
-                    ..
-                },
-            ) if a == b && xs.len() == ys.len() && self.nominal.contains(a) => {
-                let pairs: Vec<_> = xs.iter().cloned().zip(ys.iter().cloned()).collect();
-                // Where to put everything back if the arguments turn out not to
-                // agree. A congruence that fails is a failure of the two
-                // applications, so what the reader is shown is the
-                // applications, not a complaint about the third field of a
-                // struct they wrote the name of.
-                //
-                // Which means the attempt leaves nothing behind — the
-                // complaints it made, the steps it recorded and the bindings it
-                // took. The bindings because a goal that failed decides nothing
-                // and [`Solve::fail`] below is what decides what it abandons;
-                // the steps because a reader replaying them builds the
-                // solution out of them, and a step whose binding is no longer
-                // in the table would put them one type ahead of the solver. So
-                // the trace shows the answer rather than the working, which is
-                // the same bargain [`Solve::fail`] already makes: one failure,
-                // said once, with everything it touched pointed at the
-                // undecided type.
-                let reported = self.errors.len();
-                let stepped = self.steps.len();
-                let stored = self.table.store.batches.len();
-                let traced: Vec<usize> = self
-                    .refinements
-                    .iter()
-                    .map(|refinement| refinement.obligations.len())
-                    .collect();
-                let known = self.table.snapshot();
-                self.step(span, Rule::Congruent, goal.clone(), Effect::Decomposed);
-                self.depth += 1;
-                for (x, y) in pairs {
-                    self.unify(span, &x, &y);
-                }
-                self.depth -= 1;
-                if self.errors.len() <= reported {
-                    return true;
-                }
-                self.errors.truncate(reported);
-                self.steps.truncate(stepped);
-                self.table.store.batches.truncate(stored);
-                for (refinement, obligations) in self.refinements.iter_mut().zip(traced) {
-                    refinement.obligations.truncate(obligations);
-                }
-                self.table.restore(known);
-                self.mismatch(span, goal, lhs, rhs)
-            }
+            // Congruent applications, including rollback on a disagreeing
+            // argument, are handled by the explicit-stack path before this
+            // matcher. A name reaching here therefore has to unfold.
             (Ty::Named { .. }, _) | (_, Ty::Named { .. }) => {
                 self.unfold(span, goal, lhs, rhs);
                 false
@@ -1884,7 +1890,13 @@ impl Solve<'_> {
         let formula = premise.clone().not().or(obligation.clone());
         let labels = self
             .active_refinement
-            .map(|at| self.refinements[at].fields.clone())
+            .map(|at| {
+                self.refinements[at]
+                    .fields
+                    .iter()
+                    .map(|(path, presence)| (super::display_presence_path(path), presence.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let origin = Origin::Guarded(GuardedOrigin {
             premise: premise.clone(),

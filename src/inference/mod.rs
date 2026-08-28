@@ -243,6 +243,22 @@ pub struct GuardedOrigin {
 
 /// What a match-coverage batch carries beyond its formula, so that the two
 /// readers who need more than "is this satisfiable" have it.
+pub type PresencePath = Vec<String>;
+
+pub fn display_presence_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| crate::ui::label(Shape::Struct, segment))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Every reachable structural field path and the presence worn at that path.
+/// An absent field contributes its own path but never exposes its meaningless
+/// payload.
+pub fn structural_presence_paths(ty: &Rc<Ty>) -> Vec<(PresencePath, Presence)> {
+    constrain::structural_presence_paths(ty)
+}
+
 #[derive(Debug, Clone)]
 pub struct Coverage {
     /// One disjunct per written arm, in order: the conjunction of presence
@@ -255,7 +271,7 @@ pub struct Coverage {
     pub fields: Vec<(String, Presence)>,
     /// Every nested struct path and its presence, for translating the raw
     /// formulas into the zonked alphabet used while walking nested terms.
-    pub paths: Vec<(String, Presence)>,
+    pub paths: Vec<(PresencePath, Presence)>,
 }
 
 /// Ordered effective arm conditions, in one linear fold.
@@ -303,14 +319,14 @@ pub struct Refinement {
     pub raw: Formula,
     pub effective: Formula,
     pub reachable: bool,
-    pub fields: Vec<(String, Presence)>,
+    pub fields: Vec<(PresencePath, Presence)>,
     pub facts: Vec<RefinementFact>,
     pub obligations: Vec<GuardedObligation>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RefinementFact {
-    pub field: String,
+    pub field: PresencePath,
     pub present: bool,
 }
 
@@ -1812,6 +1828,7 @@ impl Table {
             Row(Row, Row),
         }
 
+        let mut same = true;
         let mut work = vec![Work::Ty(a.clone(), b.clone())];
         while let Some(part) = work.pop() {
             match part {
@@ -1824,8 +1841,8 @@ impl Table {
                         | (Ty::String, Ty::String)
                         | (Ty::Boolean, Ty::Boolean)
                         | (Ty::Undecided, Ty::Undecided) => {}
-                        (Ty::Var(x), Ty::Var(y)) if x == y => {}
-                        (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) if x == y => {}
+                        (Ty::Var(x), Ty::Var(y)) => same &= x == y,
+                        (Ty::Rigid { id: x, .. }, Ty::Rigid { id: y, .. }) => same &= x == y,
                         (Ty::Arrow(from, to, effects), Ty::Arrow(other, result, performs)) => {
                             work.push(Work::Row(effects.clone(), performs.clone()));
                             work.push(Work::Ty(to.clone(), result.clone()));
@@ -1845,14 +1862,15 @@ impl Table {
                                 args: ys,
                                 ..
                             },
-                        ) if a == b && xs.len() == ys.len() => {
-                            work.extend(
+                        ) => match (a == b, xs.len() == ys.len()) {
+                            (true, true) => work.extend(
                                 xs.iter()
                                     .zip(ys.iter())
                                     .rev()
                                     .map(|(x, y)| Work::Ty(x.clone(), y.clone())),
-                            );
-                        }
+                            ),
+                            (true, false) | (false, true) | (false, false) => return false,
+                        },
                         _ => return false,
                     }
                 }
@@ -1873,9 +1891,10 @@ impl Table {
                         // An absent slot denotes no payload. Imported recovery
                         // artifacts may put arbitrary, even recursive, trees in
                         // it; those trees are not part of row equality.
-                        if !matches!((&left, &right), (Presence::Absent, Presence::Absent)) {
-                            work.push(Work::Ty(field.ty.clone(), other.ty.clone()));
-                        }
+                        work.extend(
+                            (!matches!((&left, &right), (Presence::Absent, Presence::Absent)))
+                                .then(|| Work::Ty(field.ty.clone(), other.ty.clone())),
+                        );
                     }
                     let same_rest = match (&a.rest, &b.rest) {
                         (Rest::Closed, Rest::Closed) | (Rest::Undecided, Rest::Undecided) => true,
@@ -1889,7 +1908,7 @@ impl Table {
                 }
             }
         }
-        true
+        same
     }
 
     /// Whether `var` occurs in what it is about to be bound to, whichever sort
@@ -2013,10 +2032,13 @@ impl Table {
                         found.push(var);
                     }
                     for field in row.labels.values().rev() {
-                        if let Presence::Var(var) = self.presence_of(&field.presence) {
+                        let presence = self.presence_of(&field.presence);
+                        if let Presence::Var(var) = presence {
                             found.push(var);
                         }
-                        work.push(Work::Ty(field.ty.clone()));
+                        if !matches!(presence, Presence::Absent) {
+                            work.push(Work::Ty(field.ty.clone()));
+                        }
                     }
                 }
             }
@@ -2039,8 +2061,11 @@ impl Table {
     /// tail: each label's presence, and what it holds.
     fn mentions_labels(&self, labels: &IndexMap<String, RowField>, found: &mut Vec<TyVar>) {
         for field in labels.values() {
-            self.mentions_presence(&field.presence, found);
-            self.mentions_ty(&field.ty, found);
+            let presence = self.presence_of(&field.presence);
+            self.mentions_presence(&presence, found);
+            if !matches!(presence, Presence::Absent) {
+                self.mentions_ty(&field.ty, found);
+            }
         }
     }
 
@@ -2126,6 +2151,9 @@ impl Table {
                         flat.labels
                             .values()
                             .rev()
+                            .filter(|field| {
+                                !matches!(self.presence_of(&field.presence), Presence::Absent)
+                            })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
                     if let Rest::Var(var) = flat.rest {
@@ -2143,7 +2171,9 @@ impl Table {
         let flat = self.canon(row);
         let labels: IndexSet<String> = flat.labels.keys().cloned().collect();
         for field in flat.labels.values() {
-            self.note_lacks(&field.ty);
+            if !matches!(self.presence_of(&field.presence), Presence::Absent) {
+                self.note_lacks(&field.ty);
+            }
         }
         if let Rest::Var(var) = flat.rest {
             self.forbidden(var, shape, labels);
@@ -2546,8 +2576,11 @@ impl Table {
                 Work::Row(row) => {
                     let row = self.canon(&row);
                     for field in row.labels.values().rev() {
-                        work.push(Work::Ty(field.ty.clone()));
-                        work.push(Work::Presence(field.presence.clone()));
+                        let presence = self.presence_of(&field.presence);
+                        if !matches!(presence, Presence::Absent) {
+                            work.push(Work::Ty(field.ty.clone()));
+                        }
+                        work.push(Work::Presence(presence));
                     }
                 }
                 Work::Presence(presence) => {
@@ -2601,19 +2634,23 @@ impl Table {
     /// deciding it. Unlike diagnostic labels, paths retain their parents so
     /// `x.a` and `y.a` remain two readable facts in a refinement trace. Match
     /// demands are structural, so a declared name cannot reach this walk.
-    fn presence_paths(&self, ty: &Rc<Ty>, prefix: &str, found: &mut IndexMap<String, Presence>) {
+    fn presence_paths(
+        &self,
+        ty: &Rc<Ty>,
+        prefix: &mut PresencePath,
+        found: &mut IndexMap<PresencePath, Presence>,
+    ) {
         let ty = self.resolve(ty);
         if let Ty::Struct(row) = &*ty {
             for (name, field) in &self.canon(row).labels {
-                let path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}.{name}")
-                };
+                prefix.push(name.clone());
                 found
-                    .entry(path.clone())
+                    .entry(prefix.clone())
                     .or_insert_with(|| self.presence_of(&field.presence));
-                self.presence_paths(&field.ty, &path, found)
+                if !matches!(self.presence_of(&field.presence), Presence::Absent) {
+                    self.presence_paths(&field.ty, prefix, found);
+                }
+                prefix.pop();
             }
         }
     }
@@ -2623,32 +2660,57 @@ impl Table {
     /// in. The first spelling of a label wins, which is the one a reader
     /// reading the type left to right meets.
     fn labels_in(&self, ty: &Rc<Ty>, found: &mut IndexMap<String, (String, Presence)>) {
-        let ty = self.resolve(ty);
-        match &*ty {
-            Ty::Arrow(a, b, r) => {
-                self.labels_in(a, found);
-                self.labels_in(b, found);
-                for (name, field) in &self.canon(r).labels {
-                    found.entry(name.clone()).or_insert_with(|| {
-                        let shown = name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0);
-                        (shown.to_string(), self.presence_of(&field.presence))
-                    });
+        enum Work {
+            Ty(Rc<Ty>),
+            Field(String, RowField),
+            Effects(Row),
+        }
+
+        let mut work = vec![Work::Ty(ty.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Ty(ty) => {
+                    let ty = self.resolve(&ty);
+                    match &*ty {
+                        Ty::Arrow(a, b, effects) => {
+                            work.push(Work::Effects(effects.clone()));
+                            work.push(Work::Ty(b.clone()));
+                            work.push(Work::Ty(a.clone()));
+                        }
+                        Ty::Struct(row) | Ty::Sum(row) => {
+                            work.extend(
+                                self.canon(row)
+                                    .labels
+                                    .into_iter()
+                                    .rev()
+                                    .map(|(name, field)| Work::Field(name, field)),
+                            );
+                        }
+                        Ty::Named { args, .. } => {
+                            work.extend(args.iter().rev().cloned().map(Work::Ty));
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            Ty::Struct(r) | Ty::Sum(r) => {
-                for (name, field) in &self.canon(r).labels {
+                Work::Field(name, field) => {
+                    let presence = self.presence_of(&field.presence);
                     found
                         .entry(name.clone())
-                        .or_insert_with(|| (name.clone(), self.presence_of(&field.presence)));
-                    self.labels_in(&field.ty, found)
+                        .or_insert_with(|| (name, presence.clone()));
+                    match presence {
+                        Presence::Absent => {}
+                        _ => work.push(Work::Ty(field.ty)),
+                    }
+                }
+                Work::Effects(row) => {
+                    for (name, field) in self.canon(&row).labels {
+                        found.entry(name.clone()).or_insert_with(|| {
+                            let shown = name.split_once('\u{1f}').map_or(name.as_str(), |x| x.0);
+                            (shown.to_string(), self.presence_of(&field.presence))
+                        });
+                    }
                 }
             }
-            Ty::Named { args, .. } => {
-                for a in args.iter() {
-                    self.labels_in(a, found)
-                }
-            }
-            _ => {}
         }
     }
 
@@ -2741,6 +2803,9 @@ impl Table {
                         row.labels
                             .values()
                             .rev()
+                            .filter(|field| {
+                                !matches!(self.presence_of(&field.presence), Presence::Absent)
+                            })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
                     if let Rest::Rigid { id, name } = row.rest {
@@ -2901,6 +2966,9 @@ impl Table {
                         row.labels
                             .values()
                             .rev()
+                            .filter(|field| {
+                                !matches!(self.presence_of(&field.presence), Presence::Absent)
+                            })
                             .map(|field| Work::Ty(field.ty.clone())),
                     );
                 }
@@ -3100,9 +3168,12 @@ impl Table {
                         work.push(Work::Tail(row.rest.clone()));
                     }
                     for field in row.labels.values().rev() {
-                        work.push(Work::Ty(field.ty.clone()));
+                        let presence = self.presence_of(&field.presence);
+                        if !matches!(presence, Presence::Absent) {
+                            work.push(Work::Ty(field.ty.clone()));
+                        }
                         if presences {
-                            work.push(Work::Presence(field.presence.clone()));
+                            work.push(Work::Presence(presence));
                         }
                     }
                 }
@@ -3228,13 +3299,16 @@ impl Table {
                             (name.clone(), presence)
                         })
                         .collect();
-                    work.push(Work::BuiltRow { labels, rest });
-                    work.extend(
-                        row.labels
-                            .values()
-                            .rev()
-                            .map(|field| Work::Ty(field.ty.clone())),
-                    );
+                    work.push(Work::BuiltRow {
+                        labels: labels.clone(),
+                        rest,
+                    });
+                    work.extend(row.labels.values().zip(labels).rev().filter_map(
+                        |(field, (_, presence))| {
+                            (!matches!(presence, Presence::Absent))
+                                .then(|| Work::Ty(field.ty.clone()))
+                        },
+                    ));
                 }
                 Work::Arrow => {
                     let effects = rows.pop().expect("zonked effects row");
@@ -3265,13 +3339,11 @@ impl Table {
                 Work::BuiltRow { labels, rest } => {
                     let mut built = Vec::with_capacity(labels.len());
                     for (name, presence) in labels.into_iter().rev() {
-                        built.push((
-                            name,
-                            RowField {
-                                presence,
-                                ty: types.pop().expect("zonked field payload"),
-                            },
-                        ));
+                        let ty = match presence {
+                            Presence::Absent => Rc::new(Ty::Undecided),
+                            _ => types.pop().expect("zonked field payload"),
+                        };
+                        built.push((name, RowField { presence, ty }));
                     }
                     built.reverse();
                     rows.push(Row {
@@ -3516,7 +3588,10 @@ fn shift_labels(labels: &IndexMap<String, RowField>, by: u32) -> IndexMap<String
         .map(|(name, field)| {
             let field = RowField {
                 presence: field.presence.clone(),
-                ty: shift(&field.ty, by),
+                ty: match field.presence {
+                    Presence::Absent => Rc::new(Ty::Undecided),
+                    _ => shift(&field.ty, by),
+                },
             };
             (name.clone(), field)
         })
@@ -3727,7 +3802,10 @@ fn close_rigids_row(row: &Row, at: &HashMap<u32, u32>) -> Row {
         .map(|(name, field)| {
             let field = RowField {
                 presence: field.presence.clone(),
-                ty: close_rigids(&field.ty, at),
+                ty: match field.presence {
+                    Presence::Absent => Rc::new(Ty::Undecided),
+                    _ => close_rigids(&field.ty, at),
+                },
             };
             (name.clone(), field)
         })
@@ -4051,7 +4129,18 @@ fn adds_argument_structure(ty: &Ty) -> bool {
         return false;
     };
     args.iter().any(|arg| match &**arg {
-        Ty::Struct(row) | Ty::Sum(row) => !row.labels.is_empty(),
+        Ty::Struct(row) | Ty::Sum(row) => {
+            let mut row = row;
+            loop {
+                if !row.labels.is_empty() {
+                    break true;
+                }
+                match &row.rest {
+                    Rest::More(more) => row = more,
+                    _ => break false,
+                }
+            }
+        }
         _ => false,
     })
 }
@@ -4278,7 +4367,16 @@ fn substitute_type(
                 if let Rest::More(more) = &row.rest {
                     work.push(Work::Row(more));
                 }
-                work.extend(row.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+                work.extend(row.labels.values().rev().filter_map(|field| {
+                    let presence = match &field.presence {
+                        Presence::Bound(index) => fresh
+                            .get(*index as usize)
+                            .map(Assigned::presence)
+                            .unwrap_or(Presence::Undecided),
+                        presence => presence.clone(),
+                    };
+                    (!matches!(presence, Presence::Absent)).then_some(Work::Ty(&field.ty))
+                }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("row substitution postorder");
@@ -4316,19 +4414,18 @@ fn substitute_type(
                 };
                 let mut labels = Vec::with_capacity(row.labels.len());
                 for (name, field) in row.labels.iter().rev() {
-                    labels.push((
-                        name.clone(),
-                        RowField {
-                            presence: match &field.presence {
-                                Presence::Bound(index) => fresh
-                                    .get(*index as usize)
-                                    .map(Assigned::presence)
-                                    .unwrap_or(Presence::Undecided),
-                                presence => presence.clone(),
-                            },
-                            ty: types.pop().expect("field substitution postorder"),
-                        },
-                    ));
+                    let presence = match &field.presence {
+                        Presence::Bound(index) => fresh
+                            .get(*index as usize)
+                            .map(Assigned::presence)
+                            .unwrap_or(Presence::Undecided),
+                        presence => presence.clone(),
+                    };
+                    let ty = match presence {
+                        Presence::Absent => Rc::new(Ty::Undecided),
+                        _ => types.pop().expect("field substitution postorder"),
+                    };
+                    labels.push((name.clone(), RowField { presence, ty }));
                 }
                 labels.reverse();
                 rows.push(Row {

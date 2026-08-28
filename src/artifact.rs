@@ -728,7 +728,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 if let types::Rest::More(more) = &value.rest {
                     work.push(Work::Row(more));
                 }
-                work.extend(value.labels.values().rev().map(|field| Work::Ty(&field.ty)));
+                work.extend(value.labels.values().rev().filter_map(|field| {
+                    (!matches!(field.presence, types::Presence::Absent))
+                        .then_some(Work::Ty(&field.ty))
+                }));
             }
             Work::Arrow => {
                 let effects = rows.pop().expect("artifact arrow effects");
@@ -750,13 +753,16 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 tys.push(Type::Named { name, args });
             }
             Work::FinishRow { labels, rest } => {
-                let split = tys.len() - labels.len();
-                let payloads: Vec<_> = tys.drain(split..).collect();
-                let labels = labels
-                    .into_iter()
-                    .zip(payloads)
-                    .map(|((name, presence), ty)| (name, RowField { presence, ty }))
-                    .collect();
+                let mut labels_out = Vec::with_capacity(labels.len());
+                for (name, presence) in labels.into_iter().rev() {
+                    let ty = match presence {
+                        Presence::Absent => Type::Undecided,
+                        _ => tys.pop().expect("artifact field payload"),
+                    };
+                    labels_out.push((name, RowField { presence, ty }));
+                }
+                labels_out.reverse();
+                let labels = labels_out;
                 let rest = match rest {
                     Some(rest) => rest,
                     None => Rest::More(Box::new(rows.pop().expect("artifact nested row"))),
@@ -1231,69 +1237,119 @@ pub mod text {
         ])
     }
     fn ty(value: &Type) -> S {
-        let value = match value {
-            Type::Nat => A("nat".into()),
-            Type::Int => A("int".into()),
-            Type::Real => A("real".into()),
-            Type::String => A("string".into()),
-            Type::Boolean => A("boolean".into()),
-            Type::Arrow(from, to, row_) => L(vec![A("arrow".into()), ty(from), ty(to), row(row_)]),
-            Type::Struct(row_) => L(vec![A("struct".into()), row(row_)]),
-            Type::Sum(row_) => L(vec![A("sum".into()), row(row_)]),
-            Type::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Type::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Type::Rigid { id, name } => {
-                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
-            }
-            Type::Named { name, args } => L(std::iter::once(A("named".into()))
-                .chain(std::iter::once(Q(name.clone())))
-                .chain(args.iter().map(ty))
-                .collect()),
-            Type::Undecided => A("undecided".into()),
-        };
-        L(vec![A("ty".into()), value])
-    }
-    fn row(value: &Row) -> S {
-        L(vec![
-            A("row".into()),
-            L(std::iter::once(A("labels".into()))
-                .chain(
-                    value
-                        .labels
-                        .iter()
-                        .map(|(name, field)| L(vec![Q(name.clone()), row_field(field)])),
-                )
-                .collect()),
-            rest(&value.rest),
-        ])
-    }
-    fn rest(value: &Rest) -> S {
-        match value {
-            Rest::Closed => A("closed".into()),
-            Rest::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Rest::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Rest::Rigid { id, name } => {
-                L(vec![A("rigid".into()), A(id.to_string()), Q(name.clone())])
-            }
-            Rest::Undecided => A("undecided".into()),
-            Rest::More(value) => L(vec![A("more".into()), row(value)]),
+        enum Work<'a> {
+            Ty(&'a Type),
+            Row(&'a Row),
+            Rest(&'a Rest),
+            Field(&'a RowField),
+            Presence(&'a Presence),
+            Text(&'static str),
+            Owned(String),
+            Quoted(&'a str),
         }
-    }
-    fn row_field(value: &RowField) -> S {
-        L(vec![
-            A("field".into()),
-            presence(&value.presence),
-            ty(&value.ty),
-        ])
-    }
-    fn presence(value: &Presence) -> S {
-        match value {
-            Presence::Present => A("present".into()),
-            Presence::Absent => A("absent".into()),
-            Presence::Var(value) => L(vec![A("var".into()), A(value.to_string())]),
-            Presence::Bound(value) => L(vec![A("bound".into()), A(value.to_string())]),
-            Presence::Undecided => A("undecided".into()),
+
+        let mut out = String::new();
+        let mut work = vec![Work::Ty(value)];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Text(text) => out.push_str(text),
+                Work::Owned(text) => out.push_str(&text),
+                Work::Quoted(text) => out.push_str(&quoted(text)),
+                Work::Ty(value) => {
+                    out.push_str("(ty ");
+                    work.push(Work::Text(")"));
+                    match value {
+                        Type::Nat => work.push(Work::Text("nat")),
+                        Type::Int => work.push(Work::Text("int")),
+                        Type::Real => work.push(Work::Text("real")),
+                        Type::String => work.push(Work::Text("string")),
+                        Type::Boolean => work.push(Work::Text("boolean")),
+                        Type::Arrow(from, to, row) => {
+                            out.push_str("(arrow ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Row(row));
+                            work.push(Work::Text(" "));
+                            work.push(Work::Ty(to));
+                            work.push(Work::Text(" "));
+                            work.push(Work::Ty(from));
+                        }
+                        Type::Struct(row) | Type::Sum(row) => {
+                            out.push('(');
+                            out.push_str(if matches!(value, Type::Struct(_)) {
+                                "struct "
+                            } else {
+                                "sum "
+                            });
+                            work.push(Work::Text(")"));
+                            work.push(Work::Row(row));
+                        }
+                        Type::Var(value) => out.push_str(&format!("(var {value})")),
+                        Type::Bound(value) => out.push_str(&format!("(bound {value})")),
+                        Type::Rigid { id, name } => {
+                            out.push_str("(rigid ");
+                            out.push_str(&id.to_string());
+                            out.push(' ');
+                            out.push_str(&quoted(name));
+                            out.push(')');
+                        }
+                        Type::Named { name, args } => {
+                            out.push_str("(named ");
+                            out.push_str(&quoted(name));
+                            work.push(Work::Text(")"));
+                            for arg in args.iter().rev() {
+                                work.push(Work::Ty(arg));
+                                work.push(Work::Text(" "));
+                            }
+                        }
+                        Type::Undecided => work.push(Work::Text("undecided")),
+                    }
+                }
+                Work::Row(row) => {
+                    out.push_str("(row (labels");
+                    work.push(Work::Text(")"));
+                    work.push(Work::Rest(&row.rest));
+                    work.push(Work::Text(") "));
+                    for (name, field) in row.labels.iter().rev() {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Field(field));
+                        work.push(Work::Text(" "));
+                        work.push(Work::Quoted(name));
+                        work.push(Work::Text(" ("));
+                    }
+                }
+                Work::Rest(rest) => match rest {
+                    Rest::Closed => work.push(Work::Text("closed")),
+                    Rest::Var(value) => work.push(Work::Owned(format!("(var {value})"))),
+                    Rest::Bound(value) => work.push(Work::Owned(format!("(bound {value})"))),
+                    Rest::Rigid { id, name } => {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Quoted(name));
+                        work.push(Work::Owned(format!("(rigid {id} ")));
+                    }
+                    Rest::Undecided => work.push(Work::Text("undecided")),
+                    Rest::More(row) => {
+                        work.push(Work::Text(")"));
+                        work.push(Work::Row(row));
+                        work.push(Work::Text("(more "));
+                    }
+                },
+                Work::Field(field) => {
+                    work.push(Work::Text(")"));
+                    work.push(Work::Ty(&field.ty));
+                    work.push(Work::Text(" "));
+                    work.push(Work::Presence(&field.presence));
+                    work.push(Work::Text("(field "));
+                }
+                Work::Presence(presence) => match presence {
+                    Presence::Present => work.push(Work::Text("present")),
+                    Presence::Absent => work.push(Work::Text("absent")),
+                    Presence::Var(value) => work.push(Work::Owned(format!("(var {value})"))),
+                    Presence::Bound(value) => work.push(Work::Owned(format!("(bound {value})"))),
+                    Presence::Undecided => work.push(Work::Text("undecided")),
+                },
+            }
         }
+        Raw(out)
     }
     fn formula(value: &Formula) -> S {
         let mut depth = vec![(value, 1usize)];

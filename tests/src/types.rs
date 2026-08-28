@@ -355,11 +355,6 @@ fn deep_formula_opening_and_use_site_walks_are_stack_safe() {
             opened.atoms(&mut atoms);
             assert_eq!(atoms, [Atom::Var(8), Atom::Var(7)]);
             let _ = opened.eval(&|atom| atom == Atom::Var(7));
-
-            // Recursive Rc destruction is not what the bounded-stack walk
-            // measures, and both trees have demonstrably remained valid.
-            std::mem::forget(opened);
-            std::mem::forget(formula);
         })
         .expect("the bounded-stack regression thread starts")
         .join()
@@ -400,7 +395,6 @@ fn deep_semantic_type_and_scheme_display_are_stack_safe() {
             let shown = scheme.to_string();
             assert!(shown.contains("Layer"));
             assert!(shown.contains("payload"));
-            std::mem::forget(scheme);
         })
         .expect("the bounded-stack display regression starts")
         .join()
@@ -473,6 +467,7 @@ fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
                 };
             }
             let opened = ty.open(&[Assigned::Ty(Rc::new(Ty::Nat))]);
+            assert!(matches!(&*opened, Ty::Struct(_)));
 
             let mut row = Row::of(Rest::Bound(0));
             for _ in 0..30_000 {
@@ -481,14 +476,6 @@ fn deep_type_opening_is_stack_safe_for_every_nested_semantic_position() {
             let row_ty = Ty::Struct(row);
             let opened_row = row_ty.open(&[Assigned::Ty(Rc::new(Ty::unit()))]);
             assert!(matches!(&*opened_row, Ty::Struct(_)));
-
-            // The owned semantic trees are deliberately retained: this test is
-            // about substitution and semantic use, not Rust's recursive Rc
-            // destructor for arbitrary public values.
-            std::mem::forget(ty);
-            std::mem::forget(opened);
-            std::mem::forget(row_ty);
-            std::mem::forget(opened_row);
         })
         .expect("the bounded-stack regression thread starts")
         .join()

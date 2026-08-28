@@ -19,7 +19,7 @@
 //! use site or the annotation it came from, exactly as the other stages do.
 
 use ruddy::{
-    inference::{Origin, effective_conditions, sat},
+    inference::{Origin, display_presence_path, effective_conditions, sat},
     tracking::Span,
     types::Formula,
 };
@@ -188,11 +188,12 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                 )
                 .at(refinement.arm_span),
             );
+            let path = |segments: &[String]| display_presence_path(segments);
             for (name, presence) in &refinement.fields {
                 arm = arm.child(
                     Node::new(
                         ids.next(),
-                        format!("presence {}", print::label(print::Shape::Struct, name)),
+                        format!("presence {}", path(name)),
                         presence.to_string(),
                     )
                     .at(refinement.arm_span),
@@ -206,7 +207,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
                         format!(
                             "{}{}",
                             if fact.present { "" } else { "not " },
-                            print::label(print::Shape::Struct, &fact.field)
+                            path(&fact.field)
                         ),
                     )
                     .at(refinement.arm_span),

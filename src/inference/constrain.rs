@@ -150,16 +150,26 @@ type Cover = Option<IndexMap<usize, Formula>>;
 /// A binder or a wildcard covers the position outright, which is the empty
 /// conjunction — and a disjunction with that in it is [`Formula::True`], so a
 /// column with one emits nothing, exactly as R6 says.
-fn presence_paths(ty: &Rc<Ty>, prefix: &str, found: &mut Vec<(String, Presence)>) {
+fn collect_presence_paths(
+    ty: &Rc<Ty>,
+    prefix: &mut super::PresencePath,
+    found: &mut Vec<(super::PresencePath, Presence)>,
+) {
     let Ty::Struct(row) = &**ty else { return };
     for (name, field) in &row.labels {
-        let path = match prefix.is_empty() {
-            true => name.clone(),
-            false => format!("{prefix}.{name}"),
-        };
-        found.push((path.clone(), field.presence.clone()));
-        presence_paths(&field.ty, &path, found);
+        prefix.push(name.clone());
+        found.push((prefix.clone(), field.presence.clone()));
+        if !matches!(field.presence, Presence::Absent) {
+            collect_presence_paths(&field.ty, prefix, found);
+        }
+        prefix.pop();
     }
+}
+
+pub(super) fn structural_presence_paths(ty: &Rc<Ty>) -> Vec<(super::PresencePath, Presence)> {
+    let mut found = Vec::new();
+    collect_presence_paths(ty, &mut Vec::new(), &mut found);
+    found
 }
 
 fn covered(
@@ -627,8 +637,7 @@ impl Constrain<'_> {
                                     .collect(),
                                 _ => Vec::new(),
                             };
-                            let mut paths = Vec::new();
-                            presence_paths(&demand, "", &mut paths);
+                            let paths = structural_presence_paths(&demand);
                             let formula = Formula::any(raw.clone());
                             self.table.require(
                                 span,
