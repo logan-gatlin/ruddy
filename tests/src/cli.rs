@@ -336,6 +336,14 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\n",
             "unknown field `title`",
         ),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = 1\n[dependencies]\n",
+            "invalid type",
+        ),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\n",
+            "unknown field `native`",
+        ),
         ("title = \"app\"\n", "unknown field `title`"),
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
@@ -1436,6 +1444,64 @@ fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
         fs::read_to_string(app.join("build/app.artifact")).unwrap(),
         built_artifact
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_uses_the_configured_javascript_shell_runner() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace(
+            "root = \"main.hc\"",
+            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        app.join("runner.sh"),
+        "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n",
+    )
+    .unwrap();
+
+    // Build configuration is inert until `run` is requested.
+    build_project(&app).unwrap();
+    assert!(!app.join("marker.txt").exists());
+
+    let expected = app.join("build/app.js");
+    assert_eq!(run_project(&app).unwrap(), expected);
+    assert_eq!(
+        fs::read_to_string(app.join("marker.txt")).unwrap(),
+        expected.to_string_lossy()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_javascript_runner_failures_preserve_build_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace(
+            "root = \"main.hc\"",
+            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"false\"",
+        ),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    assert!(error.to_string().contains("runner `false`"), "{error}");
+    assert!(error.to_string().contains("status: 1"), "{error}");
+    assert!(app.join("build/app.js").is_file());
+    assert!(app.join("build/app.artifact").is_file());
 }
 
 #[test]

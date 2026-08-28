@@ -30,6 +30,9 @@ const state = {
   name: "demo",
   version: "0.1.0",
   root: ROOT,
+  /// Runtime configuration is not used by snapshots, but is preserved when
+  /// debugger documents are loaded and saved.
+  run: {},
   /// Dependency project specs keyed by source module alias.
   dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
@@ -262,6 +265,7 @@ async function openDoc(name) {
   state.name = configured?.bundle_name ?? configured?.name ?? name;
   state.version = configured?.version ?? "0.1.0";
   state.root = configured?.root ?? ROOT;
+  state.run = configured?.run ?? {};
   state.dependencies = configured?.dependencies ?? {};
   state.snapshot = null;
   state.active = 0;
@@ -310,6 +314,7 @@ function sameDocumentConfiguration(cache, server, documentName) {
     cacheName === serverName &&
     (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
     (cache.root ?? ROOT) === (server.root ?? ROOT) &&
+    JSON.stringify(cache.run ?? {}) === JSON.stringify(server.run ?? {}) &&
     sameFiles(cache.files ?? [], server.files ?? []) &&
     JSON.stringify(cacheDependencies) === JSON.stringify(serverDependencies)
   );
@@ -331,6 +336,7 @@ function cacheLocally() {
           name: state.name,
           version: state.version,
           root: state.root,
+          run: state.run,
           dependencies: state.dependencies,
           at,
         }),
@@ -365,6 +371,7 @@ async function saveNow() {
         name: state.name,
         version: state.version,
         root: state.root,
+        run: state.run,
         dependencies: state.dependencies,
         files: state.files,
       }),

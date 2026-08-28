@@ -53,4 +53,13 @@ Switching a project back to `"lib"` leaves an existing JavaScript file in place 
 
 `ruddy run` accepts no path or program arguments and is available only when the root manifest sets `target = "js"`. It first performs the same complete, dependency-first build and atomic installation as `ruddy build`, then loads and evaluates the newly installed `build/<name>.js` as an ECMAScript module. Loading the module is the entire entry point: Ruddy does not require, inspect, call, or print a `main` export. A library target is rejected and stale JavaScript is never executed. Since installation finishes before execution starts, completed build files remain available when module initialization later fails.
 
+Boa is the default runtime. A root project can instead configure a shell command in `Ruddy.toml`:
+
+```toml
+[run]
+js = "node"
+```
+
+Ruddy runs this command from the project directory with the generated JavaScript file path appended as its final argument. The command may include shell syntax and arguments, for example `js = "node --enable-source-maps"`. A failure to start the shell or a nonzero runner exit status fails `ruddy run`; installed build files remain available. Run settings in dependency manifests have no effect.
+
 The embedded Boa runtime provides `console`, timers, `queueMicrotask`, text encoding, `URL`, base64, `structuredClone`, abort APIs, `process.cwd()` and `process.env`, and blocking network-enabled `fetch`. It intentionally provides no filesystem or standard-input API and Ruddy adds no custom host API. Boa's queued promises, microtasks, and timers are driven through completion; code that continually schedules more work can therefore keep `ruddy run` alive. Parse, linking, evaluation, rejected-promise, and queued-job errors exit with status 1 and include Boa's available JavaScript stack frames. A successful run is silent except for output produced by the module or runtime.

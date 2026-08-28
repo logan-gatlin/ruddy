@@ -8,6 +8,7 @@ use std::{
     fs::OpenOptions,
     io::Write as _,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     rc::Rc,
 };
 
@@ -323,6 +324,8 @@ struct InstalledBuild {
     artifact: PathBuf,
     javascript: Option<PathBuf>,
     target: Target,
+    run: RunConfig,
+    directory: PathBuf,
 }
 
 /// Compile the complete project graph, then write each local project's canonical
@@ -349,6 +352,8 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
         .and_then(|index| graph.projects.get(index))
         .ok_or_else(|| CliError::one("the project graph was empty"))?;
     let target = root_project.target;
+    let run = root_project.run.clone();
+    let directory = root_project.directory.clone();
     // Generation is deliberately completed before any build output is touched.
     // The backend consumes the already linked root rather than relinking or
     // reading an artifact back from disk.
@@ -394,11 +399,13 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
         artifact: root_artifact.ok_or_else(|| CliError::one("the project graph was empty"))?,
         javascript: root_javascript,
         target,
+        run,
+        directory,
     })
 }
 
-/// Build and execute the installed root JavaScript module with Boa's standard
-/// runtime extensions. Module initialization is the complete entry point.
+/// Build and execute the installed root JavaScript module. By default this uses
+/// Boa's standard runtime extensions; `[run].js` may select a shell runner.
 pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let installed = install_project(directory.as_ref())?;
     if installed.target != Target::Js {
@@ -409,8 +416,49 @@ pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     let javascript = installed
         .javascript
         .ok_or_else(|| CliError::one("the JavaScript build output was not installed"))?;
-    execute_javascript_module(&javascript)?;
+    match installed.run.js.as_deref() {
+        Some(runner) => execute_javascript_runner(runner, &javascript, &installed.directory)?,
+        None => execute_javascript_module(&javascript)?,
+    }
     Ok(javascript)
+}
+
+fn execute_javascript_runner(runner: &str, path: &Path, directory: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = ProcessCommand::new("sh");
+        // Pass the path positionally rather than interpolating it into shell
+        // source, while retaining the configured command's shell syntax.
+        command
+            .arg("-c")
+            .arg(format!("{runner} \"$1\""))
+            .arg("ruddy run")
+            .arg(path);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = ProcessCommand::new("cmd");
+        command
+            .arg("/S")
+            .arg("/C")
+            .arg(format!(r#"{runner} "%RUDDY_RUN_JAVASCRIPT%""#))
+            .env("RUDDY_RUN_JAVASCRIPT", path);
+        command
+    };
+    command.current_dir(directory);
+    let status = command.status().map_err(|error| {
+        CliError::one(format!(
+            "could not start JavaScript runner `{runner}`: {error}"
+        ))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::one(format!(
+            "JavaScript runner `{runner}` exited with {status}"
+        )))
+    }
 }
 
 type RejectedPromises = Rc<RefCell<Vec<(JsObject<Promise>, JsValue)>>>;
@@ -903,6 +951,20 @@ pub enum Target {
     Js,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunConfig {
+    /// Shell command used by `ruddy run` for a JavaScript target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub js: Option<String>,
+}
+
+impl RunConfig {
+    pub fn is_default(&self) -> bool {
+        self.js.is_none()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -911,6 +973,8 @@ struct Manifest {
     root: PathBuf,
     #[serde(default)]
     target: Target,
+    #[serde(default)]
+    run: RunConfig,
     dependencies: IndexMap<String, ManifestDependency>,
 }
 
@@ -1129,6 +1193,10 @@ pub struct CompiledProject {
     ///
     /// Only the requested root's target affects [`build_project`].
     pub target: Target,
+    /// Runtime configuration from this project's manifest.
+    ///
+    /// Only the requested root's configuration affects [`run_project`].
+    pub run: RunConfig,
     /// The project's canonical in-memory artifact.
     pub artifact: Artifact,
 }
@@ -1518,6 +1586,7 @@ impl GraphCompiler {
             .map(|project| project.artifact.clone())
             .collect();
         let target = manifest.target;
+        let run = manifest.run.clone();
         let artifact = compile_one(
             &directory,
             manifest,
@@ -1546,6 +1615,7 @@ impl GraphCompiler {
             },
             directory: directory.clone(),
             target,
+            run,
             artifact,
         });
         self.completed.insert(directory, index);
