@@ -3804,29 +3804,190 @@ fn effect_row(table: &mut Table, tails: &mut Tails, effects: &ir::EffectRow) -> 
 /// names itself unfolds forever if asked to, so nothing here asks: what comes
 /// back is one shape deep, and the names inside it are still names.
 ///
-/// What guarantees this terminates is the check in
-/// [`ir::build`](crate::ir::build), not anything here. Each round is one of
-/// two things and both run out: following a name to the name at the head of
-/// its body walks a chain of declarations that lowering refuses to let close a
-/// loop, and following one that stands for its own argument hands back a
-/// strictly smaller piece of the type that came in. The same bargain
-/// [`Table::resolve`] has with the occurs check.
+/// Source recursion checking proves the ordinary walk finite. Imported
+/// interfaces are recovery input, though, and can contain a forwarding cycle
+/// this compiler never checked. Exact application keys close those cycles
+/// coinductively; a declaration-count budget catches malformed growth whose
+/// applications never repeat. Forwarding through [`Ty::Bound`] renews that
+/// budget because it selects a strictly smaller argument, preserving valid
+/// nesting deeper than the number of declarations.
 ///
 /// A name with no declaration behind it is [`Ty::Undecided`]: the only way to
 /// write one is to repeat a type's name, which was already reported.
 pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
-    let mut ty = ty.clone();
-    let mut budget = aliases.len();
-    while let Ty::Named { symbol, args, .. } = &*ty.clone() {
-        let scheme = &aliases[symbol];
-        budget = match &**scheme.body() {
-            Ty::Bound(_) => aliases.len(),
-            _ => budget.checked_sub(1).expect("declaration loop"),
-        };
-        let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
-        ty = scheme.body().open_alias(&fresh, aliases)
+    Unfold {
+        aliases,
+        active: HashSet::new(),
     }
-    ty
+    .ty(ty)
+}
+
+/// One unfolding path. Row-bound forwarding can ask for the shape of an
+/// argument while its outer alias is still opening, so the active applications
+/// are shared through that nested request rather than reset at the row.
+struct Unfold<'a> {
+    aliases: &'a IndexMap<Symbol, Scheme>,
+    active: HashSet<Rc<[AliasPart]>>,
+}
+
+impl Unfold<'_> {
+    fn ty(&mut self, ty: &Rc<Ty>) -> Rc<Ty> {
+        let mut ty = ty.clone();
+        let mut budget = self.aliases.len();
+        let mut entered = Vec::new();
+        let result = loop {
+            let Ty::Named { symbol, args, .. } = &*ty.clone() else {
+                break ty;
+            };
+            // A forwarding declaration may select a genuinely smaller
+            // argument, so a declaration-count budget cannot be spent on those
+            // steps. It may also select an argument that expands straight back
+            // to the same application. Remember the whole application,
+            // arguments included, so `Id (Id Nat)` remains two different
+            // questions while `A = Id A` closes coinductively.
+            let key = alias_key(&ty);
+            if !self.active.insert(key.clone()) {
+                break Rc::new(Ty::Undecided);
+            }
+            entered.push(key);
+
+            let body = self.aliases[symbol].body().clone();
+            budget = match &*body {
+                Ty::Bound(_) => self.aliases.len(),
+                _ => match budget.checked_sub(1) {
+                    Some(left) => left,
+                    // Source declarations cannot reach this case: lowering
+                    // diagnosed their loop. A malformed imported interface
+                    // recovers to unknown rather than panicking.
+                    None => break Rc::new(Ty::Undecided),
+                },
+            };
+            let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
+            ty = body.open_alias(&fresh, self);
+        };
+        for key in entered {
+            self.active.remove(&key);
+        }
+        result
+    }
+}
+
+/// One token in an exact alias-application cycle key. Display-only names are
+/// omitted; every semantic constructor and value is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AliasPart {
+    Tag(u8),
+    Number(u32),
+    Size(usize),
+    Symbol(Symbol),
+    Text(String),
+}
+
+/// A stack-safe key for an alias application. Arguments can be much deeper
+/// than the declaration chain containing them, so the key is a flat token
+/// stream rather than a recursively owned mirror of [`Ty`].
+fn alias_key(ty: &Rc<Ty>) -> Rc<[AliasPart]> {
+    enum Part<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row),
+        Field(&'a str, &'a RowField),
+        Rest(&'a Rest),
+    }
+
+    let mut key = Vec::new();
+    let mut work = vec![Part::Ty(ty)];
+    while let Some(part) = work.pop() {
+        match part {
+            Part::Ty(ty) => match ty {
+                Ty::Nat => key.push(AliasPart::Tag(0)),
+                Ty::Int => key.push(AliasPart::Tag(1)),
+                Ty::Real => key.push(AliasPart::Tag(2)),
+                Ty::String => key.push(AliasPart::Tag(3)),
+                Ty::Boolean => key.push(AliasPart::Tag(4)),
+                Ty::Arrow(from, to, effects) => {
+                    key.push(AliasPart::Tag(5));
+                    work.push(Part::Row(effects));
+                    work.push(Part::Ty(to));
+                    work.push(Part::Ty(from));
+                }
+                Ty::Struct(row) => {
+                    key.push(AliasPart::Tag(6));
+                    work.push(Part::Row(row));
+                }
+                Ty::Sum(row) => {
+                    key.push(AliasPart::Tag(7));
+                    work.push(Part::Row(row));
+                }
+                Ty::Var(var) => {
+                    key.push(AliasPart::Tag(8));
+                    key.push(AliasPart::Number(*var));
+                }
+                Ty::Bound(index) => {
+                    key.push(AliasPart::Tag(9));
+                    key.push(AliasPart::Number(*index));
+                }
+                Ty::Rigid { id, .. } => {
+                    key.push(AliasPart::Tag(10));
+                    key.push(AliasPart::Number(*id));
+                }
+                Ty::Named { symbol, args, .. } => {
+                    key.push(AliasPart::Tag(11));
+                    key.push(AliasPart::Symbol(*symbol));
+                    key.push(AliasPart::Size(args.len()));
+                    work.extend(args.iter().rev().map(|arg| Part::Ty(arg)));
+                }
+                Ty::Undecided => key.push(AliasPart::Tag(12)),
+            },
+            Part::Row(row) => {
+                key.push(AliasPart::Size(row.labels.len()));
+                work.push(Part::Rest(&row.rest));
+                work.extend(
+                    row.labels
+                        .iter()
+                        .rev()
+                        .map(|(name, field)| Part::Field(name, field)),
+                );
+            }
+            Part::Field(name, field) => {
+                key.push(AliasPart::Text(name.to_string()));
+                match &field.presence {
+                    Presence::Present => key.push(AliasPart::Tag(13)),
+                    Presence::Absent => key.push(AliasPart::Tag(14)),
+                    Presence::Var(var) => {
+                        key.push(AliasPart::Tag(15));
+                        key.push(AliasPart::Number(*var));
+                    }
+                    Presence::Bound(index) => {
+                        key.push(AliasPart::Tag(16));
+                        key.push(AliasPart::Number(*index));
+                    }
+                    Presence::Undecided => key.push(AliasPart::Tag(17)),
+                }
+                work.push(Part::Ty(&field.ty));
+            }
+            Part::Rest(rest) => match rest {
+                Rest::Closed => key.push(AliasPart::Tag(18)),
+                Rest::Var(var) => {
+                    key.push(AliasPart::Tag(19));
+                    key.push(AliasPart::Number(*var));
+                }
+                Rest::Bound(index) => {
+                    key.push(AliasPart::Tag(20));
+                    key.push(AliasPart::Number(*index));
+                }
+                Rest::Rigid { id, .. } => {
+                    key.push(AliasPart::Tag(21));
+                    key.push(AliasPart::Number(*id));
+                }
+                Rest::Undecided => key.push(AliasPart::Tag(22)),
+                Rest::More(more) => {
+                    key.push(AliasPart::Tag(23));
+                    work.push(Part::Row(more));
+                }
+            },
+        }
+    }
+    key.into()
 }
 
 impl Ty {
@@ -3834,25 +3995,25 @@ impl Ty {
     /// named row alias, so look through that argument before converting it to
     /// the row spliced at [`Rest::More`]. Ordinary bound type positions keep
     /// the written named type intact.
-    fn open_alias(&self, fresh: &[Assigned], aliases: &IndexMap<Symbol, Scheme>) -> Rc<Ty> {
+    fn open_alias(&self, fresh: &[Assigned], unfold: &mut Unfold<'_>) -> Rc<Ty> {
         match self {
             Ty::Bound(i) => fresh
                 .get(*i as usize)
                 .map(Assigned::as_ty)
                 .unwrap_or_else(|| Rc::new(Ty::Undecided)),
             Ty::Arrow(a, b, r) => Rc::new(Ty::Arrow(
-                a.open_alias(fresh, aliases),
-                b.open_alias(fresh, aliases),
-                r.open_alias(fresh, aliases),
+                a.open_alias(fresh, unfold),
+                b.open_alias(fresh, unfold),
+                r.open_alias(fresh, unfold),
             )),
-            Ty::Struct(r) => Rc::new(Ty::Struct(r.open_alias(fresh, aliases))),
-            Ty::Sum(r) => Rc::new(Ty::Sum(r.open_alias(fresh, aliases))),
+            Ty::Struct(r) => Rc::new(Ty::Struct(r.open_alias(fresh, unfold))),
+            Ty::Sum(r) => Rc::new(Ty::Sum(r.open_alias(fresh, unfold))),
             Ty::Named { symbol, name, args } => Rc::new(Ty::Named {
                 symbol: *symbol,
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| arg.open_alias(fresh, aliases))
+                    .map(|arg| arg.open_alias(fresh, unfold))
                     .collect(),
             }),
             other => Rc::new(other.clone()),
@@ -3883,7 +4044,7 @@ impl Ty {
 }
 
 impl Row {
-    fn open_alias(&self, fresh: &[Assigned], aliases: &IndexMap<Symbol, Scheme>) -> Row {
+    fn open_alias(&self, fresh: &[Assigned], unfold: &mut Unfold<'_>) -> Row {
         let labels = self
             .labels
             .iter()
@@ -3892,7 +4053,7 @@ impl Row {
                     name.clone(),
                     RowField {
                         presence: field.presence.open(fresh),
-                        ty: field.ty.open_alias(fresh, aliases),
+                        ty: field.ty.open_alias(fresh, unfold),
                     },
                 )
             })
@@ -3901,7 +4062,7 @@ impl Row {
             Rest::Bound(index) => {
                 let row = fresh.get(*index as usize).map(Assigned::as_ty).map_or_else(
                     || Row::of(Rest::Undecided),
-                    |ty| match &*unfold(aliases, &ty) {
+                    |ty| match &*unfold.ty(&ty) {
                         Ty::Struct(row) | Ty::Sum(row) => row.clone(),
                         Ty::Var(var) => Row::of(Rest::Var(*var)),
                         Ty::Undecided => Row::of(Rest::Undecided),
@@ -3910,7 +4071,7 @@ impl Row {
                 );
                 Rest::More(Rc::new(row))
             }
-            Rest::More(more) => Rest::More(Rc::new(more.open_alias(fresh, aliases))),
+            Rest::More(more) => Rest::More(Rc::new(more.open_alias(fresh, unfold))),
             rest => rest.clone(),
         };
         Row { labels, rest }

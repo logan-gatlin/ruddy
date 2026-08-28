@@ -232,6 +232,69 @@ fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
 }
 
 #[test]
+fn imported_forwarding_cycles_recover_before_lir_representation() {
+    std::thread::Builder::new()
+        .name("forwarding-cycle-lir".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let scheme = |count, body| a::Scheme {
+                count,
+                presences: 0,
+                formula: a::Formula::True,
+                body,
+            };
+            let dependency = a::Artifact {
+                header: a::Header {
+                    identity: a::Identity {
+                        name: "dep".into(),
+                        version: "1.0.0".into(),
+                    },
+                    dependencies: Vec::new(),
+                    values: Vec::new(),
+                    types: vec![
+                        a::DeclaredType {
+                            name: "dep@1.0.0::A".into(),
+                            params: Vec::new(),
+                            scheme: scheme(
+                                0,
+                                a::Type::Named {
+                                    name: "dep@1.0.0::Id".into(),
+                                    args: vec![a::Type::Named {
+                                        name: "dep@1.0.0::A".into(),
+                                        args: Vec::new(),
+                                    }],
+                                },
+                            ),
+                        },
+                        a::DeclaredType {
+                            name: "dep@1.0.0::Id".into(),
+                            params: vec![a::Parameter {
+                                sense: a::Sense::Type,
+                                lacks: Vec::new(),
+                                relevant: true,
+                            }],
+                            scheme: scheme(1, a::Type::Bound(0)),
+                        },
+                    ],
+                    effects: Vec::new(),
+                },
+                lir: a::Lir {
+                    functions: Vec::new(),
+                    globals: Vec::new(),
+                },
+            };
+
+            let source = "let id : dep::A -> dep::A = fn x => x";
+            let (output, labels) = lowered_with_dependencies(source, &[dependency]);
+            let printed = print::lir::program(&output, &labels);
+            assert!(printed.contains("fn id(%0: any):"), "{printed}");
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("a forwarding cycle reaches LIR without hanging");
+}
+
+#[test]
 fn every_representation_comes_off_the_solved_type() {
     let source = "let n = 1n\nlet u = {}\nlet s = { x: 1n }\nlet c = #A\nlet i = fn x => x\n\
                   let int : Int -> Int = fn x => x\n\

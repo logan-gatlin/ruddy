@@ -507,6 +507,58 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     );
 }
 
+#[test]
+fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
+    std::thread::Builder::new()
+        .name("deep-imported-types-stage".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 2_048;
+            let scratch = tempfile::tempdir().unwrap();
+            fs::create_dir_all(scratch.path().join("app")).unwrap();
+            fs::create_dir_all(scratch.path().join("dep")).unwrap();
+            fs::write(
+                scratch.path().join("dep/Ruddy.toml"),
+                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+            )
+            .unwrap();
+            let mut source = String::new();
+            for index in 0..DEPTH {
+                source.push_str(&format!(
+                    "type T{index} = {}\n",
+                    if index + 1 == DEPTH {
+                        "Nat".to_string()
+                    } else {
+                        format!("T{}", index + 1)
+                    }
+                ));
+            }
+            fs::write(scratch.path().join("dep/main.hc"), source).unwrap();
+
+            let snapshot = compile_at(
+                &dependency_request(IndexMap::from([("dep".into(), "../dep".into())])),
+                1,
+                scratch.path(),
+            );
+            assert!(snapshot.panic.is_none(), "{:?}", snapshot.panic);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:#?}",
+                snapshot.diagnostics
+            );
+            let types = snapshot
+                .stages
+                .iter()
+                .find(|stage| stage.id == "types")
+                .expect("the Types stage is present");
+            assert_eq!(types.status, Status::Ok);
+            assert!(types.nodes.len() >= DEPTH, "{}", types.nodes.len());
+        })
+        .expect("the bounded-stack debugger regression thread starts")
+        .join()
+        .expect("the Types stage walks deep imported aliases without overflowing");
+}
+
 fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest {
     let dependencies = dependencies
         .into_iter()

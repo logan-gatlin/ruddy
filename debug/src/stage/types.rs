@@ -10,12 +10,14 @@
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
 
+use std::collections::HashSet;
+
 use indexmap::IndexMap;
 use ruddy::{
     ir::{Program, Term, TermKind},
     symbol::{Mint, Symbol},
     tracking::Tracked,
-    types::{Rest, Row, RowField, Scheme, Ty},
+    types::{Rest, Row, Scheme, Ty},
 };
 
 use crate::{
@@ -284,33 +286,60 @@ fn grouped_with(program: &Program, symbol: Symbol) -> Option<Vec<Symbol>> {
 /// asks, and showing every loop a declaration is part of is not what the row is
 /// for.
 fn loop_through(aliases: &IndexMap<Symbol, Scheme>, start: Symbol) -> Option<Vec<Symbol>> {
-    let mut path = Vec::new();
-    walk(aliases, start, start, &mut path).then_some(path)
-}
+    struct Frame {
+        at: Symbol,
+        named: Vec<Symbol>,
+        next: usize,
+    }
 
-/// Whether `at` leads back to `start`, pushing each declaration onto `path` as
-/// it is entered and popping it again when it leads nowhere. `path` doubles as
-/// the visited set, which is what keeps this finite: a declaration already on
-/// it is a loop that does not pass through `start` and is somebody else's row.
-fn walk(
-    aliases: &IndexMap<Symbol, Scheme>,
-    at: Symbol,
-    start: Symbol,
-    path: &mut Vec<Symbol>,
-) -> bool {
-    if path.contains(&at) {
-        return false;
-    }
-    path.push(at);
-    let mut named = Vec::new();
-    if let Some(scheme) = aliases.get(&at) {
+    let named = aliases.get(&start).map_or_else(Vec::new, |scheme| {
+        let mut named = Vec::new();
         names_in(scheme.body(), &mut named);
+        named
+    });
+    let mut path = vec![start];
+    if named.contains(&start) {
+        return Some(path);
     }
-    if named.contains(&start) || named.iter().any(|next| walk(aliases, *next, start, path)) {
-        return true;
+    let mut active = HashSet::from([start]);
+    let mut dead = HashSet::new();
+    let mut work = vec![Frame {
+        at: start,
+        named,
+        next: 0,
+    }];
+
+    while let Some(frame) = work.last_mut() {
+        let Some(next) = frame.named.get(frame.next).copied() else {
+            let frame = work.pop().expect("the exhausted frame is present");
+            active.remove(&frame.at);
+            dead.insert(frame.at);
+            path.pop();
+            continue;
+        };
+        frame.next += 1;
+        // An active name closes a different loop; a dead one has already been
+        // proved unable to reach this fixed start.
+        if active.contains(&next) || dead.contains(&next) {
+            continue;
+        }
+        let named = aliases.get(&next).map_or_else(Vec::new, |scheme| {
+            let mut named = Vec::new();
+            names_in(scheme.body(), &mut named);
+            named
+        });
+        active.insert(next);
+        path.push(next);
+        if named.contains(&start) {
+            return Some(path);
+        }
+        work.push(Frame {
+            at: next,
+            named,
+            next: 0,
+        });
     }
-    path.pop();
-    false
+    None
 }
 
 /// Every declaration a type mentions, in the order it mentions them. Stops at
@@ -322,53 +351,47 @@ fn walk(
 /// one anybody wrote, but it prints in this tab like any other and a declared
 /// name inside its fields is mentioned just as much.
 fn names_in(ty: &Ty, out: &mut Vec<Symbol>) {
-    match ty {
-        // The arguments are walked though the body is not: a declaration
-        // reached only through one — `type Rose 'a = { kids: List (Rose 'a) }` —
-        // is mentioned just as much as one written bare, and a row that missed
-        // it would not show as recursive.
-        Ty::Named { symbol, args, .. } => {
-            out.push(*symbol);
-            for arg in args.iter() {
-                names_in(arg, out);
+    enum Work<'a> {
+        Ty(&'a Ty),
+        Row(&'a Row),
+    }
+
+    let mut work = vec![Work::Ty(ty)];
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Ty(ty) => match ty {
+                // The arguments are walked though the body is not: a
+                // declaration reached only through one is mentioned just as
+                // much as one written bare.
+                Ty::Named { symbol, args, .. } => {
+                    out.push(*symbol);
+                    work.extend(args.iter().rev().map(|arg| Work::Ty(arg)));
+                }
+                // An effect row names effects and no declared types.
+                Ty::Arrow(from, to, _) => {
+                    work.push(Work::Ty(to));
+                    work.push(Work::Ty(from));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
+                Ty::Nat
+                | Ty::Int
+                | Ty::Real
+                | Ty::String
+                | Ty::Boolean
+                | Ty::Var(_)
+                | Ty::Bound(_)
+                | Ty::Rigid { .. }
+                | Ty::Undecided => {}
+            },
+            Work::Row(row) => {
+                // Labels precede the spliced tail, and each label keeps source
+                // order despite the LIFO work stack.
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::Row(more));
+                }
+                work.extend(row.labels.values().rev().map(|field| Work::Ty(&field.ty)));
             }
         }
-        // An effect row names effects and no declared types, so there is
-        // nothing in one for this to find.
-        Ty::Arrow(from, to, _) => {
-            names_in(from, out);
-            names_in(to, out);
-        }
-        Ty::Struct(fields) | Ty::Sum(fields) => names_in_row(fields, out),
-        Ty::Nat
-        | Ty::Int
-        | Ty::Real
-        | Ty::String
-        | Ty::Boolean
-        | Ty::Var(_)
-        | Ty::Bound(_)
-        | Ty::Rigid { .. }
-        | Ty::Undecided => {}
-    }
-}
-
-/// [`names_in`] over a sum's cases: what each case carries, and whatever a tail
-/// already spliced in carries. A presence never holds a name, but a tail bound
-/// to more cases does, and one missed there would not show as recursive.
-fn names_in_row(row: &Row, out: &mut Vec<Symbol>) {
-    names_in_labels(&row.labels, out);
-    if let Rest::More(more) = &row.rest {
-        names_in_row(more, out);
-    }
-}
-
-/// [`names_in`] over a label map: what each label holds. A type's fields are one
-/// — they have no tail of their own, their tail being the constructor beside them,
-/// which [`names_in`] descends where it sits. So a name sitting in a payload under
-/// rows, so every declared name inside a field payload is still found.
-fn names_in_labels(labels: &IndexMap<String, RowField>, out: &mut Vec<Symbol>) {
-    for field in labels.values() {
-        names_in(&field.ty, out);
     }
 }
 

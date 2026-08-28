@@ -2,11 +2,12 @@
 
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use ruddy::{
     inference::{self, ConstraintKind, Effect, ErrorKind, Rule},
     ir::{self, Decl, Term, TermKind},
     parse,
-    symbol::{Bundle, Mint, Symbol, Version},
+    symbol::{Bundle, Mint, Namespace, Symbol, Version},
     token::lex,
     tracking::FileID,
     types::{Formula, Presence, Rest, Row, Scheme, Sense, Shape, Ty, TyVar},
@@ -1480,6 +1481,170 @@ fn alias_row_opening_is_total_for_every_semantic_argument_exit() {
     assert!(matches!(
         &row.rest,
         Rest::More(first) if matches!(&first.rest, Rest::More(last) if matches!(last.rest, Rest::Closed))
+    ));
+}
+
+#[test]
+fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
+    let (mut mint, _, output) = inferred(
+        "type Id 'a = 'a\n\
+         type A 'a = Nat\n\
+         type RowId 'r = { ..'r }\n\
+         type RowA = Nat",
+    );
+    let id = symbol_named(&mint, output.aliases.keys().copied(), "Id");
+    let a = symbol_named(&mint, output.aliases.keys().copied(), "A");
+    let row_id = symbol_named(&mint, output.aliases.keys().copied(), "RowId");
+    let row_a = symbol_named(&mint, output.aliases.keys().copied(), "RowA");
+    let named = |symbol, args: Vec<Rc<Ty>>| {
+        Rc::new(Ty::Named {
+            symbol,
+            name: Rc::from("shown"),
+            args: args.into(),
+        })
+    };
+    let field = |presence, ty| ruddy::types::RowField { presence, ty };
+
+    let nested = Row {
+        labels: [(
+            "rigid-rest".into(),
+            field(Presence::Present, Rc::new(Ty::Int)),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Rigid {
+            id: 4,
+            name: Rc::from("r"),
+        },
+    };
+    let sum = Rc::new(Ty::Sum(Row {
+        labels: [(
+            "bound-rest".into(),
+            field(Presence::Absent, Rc::new(Ty::Real)),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Bound(3),
+    }));
+    let undecided_rest = Rc::new(Ty::Struct(Row {
+        labels: Default::default(),
+        rest: Rest::Undecided,
+    }));
+    let complex = Rc::new(Ty::Arrow(
+        Rc::new(Ty::Struct(Row {
+            labels: [
+                ("nat".into(), field(Presence::Present, Rc::new(Ty::Nat))),
+                (
+                    "string".into(),
+                    field(Presence::Absent, Rc::new(Ty::String)),
+                ),
+                (
+                    "boolean".into(),
+                    field(Presence::Var(1), Rc::new(Ty::Boolean)),
+                ),
+                ("var".into(), field(Presence::Bound(2), Rc::new(Ty::Var(5)))),
+                (
+                    "rigid".into(),
+                    field(
+                        Presence::Undecided,
+                        Rc::new(Ty::Rigid {
+                            id: 6,
+                            name: Rc::from("a"),
+                        }),
+                    ),
+                ),
+                (
+                    "bound".into(),
+                    field(Presence::Present, Rc::new(Ty::Bound(7))),
+                ),
+                (
+                    "unknown".into(),
+                    field(Presence::Present, Rc::new(Ty::Undecided)),
+                ),
+                (
+                    "named".into(),
+                    field(Presence::Present, named(id, vec![Rc::new(Ty::Nat)])),
+                ),
+                ("sum".into(), field(Presence::Present, sum)),
+                (
+                    "undecided-rest".into(),
+                    field(Presence::Present, undecided_rest),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            rest: Rest::More(Rc::new(nested)),
+        })),
+        Rc::new(Ty::Struct(Row::closed())),
+        Row {
+            labels: Default::default(),
+            rest: Rest::Var(8),
+        },
+    ));
+
+    let mut aliases = output.aliases.clone();
+    // The forwarding cycle `A a = Id (A a)` is malformed imported semantics;
+    // local source lowering would reject it before inference.
+    aliases.insert(
+        a,
+        Scheme::new(1, named(id, vec![named(a, vec![Rc::new(Ty::Bound(0))])])),
+    );
+    assert!(matches!(
+        &*inference::unfold(&aliases, &named(a, vec![complex])),
+        Ty::Undecided
+    ));
+
+    // Repeating a forwarding constructor is valid while its whole argument is
+    // getting smaller, even much deeper than the declaration table.
+    let mut deep = Rc::new(Ty::Nat);
+    for _ in 0..512 {
+        deep = named(id, vec![deep]);
+    }
+    assert!(matches!(&*inference::unfold(&aliases, &deep), Ty::Nat));
+
+    // A bound row asks to unfold its argument while the outer application is
+    // still active. The shared path closes that forwarding cycle as an unknown
+    // row rather than recursively starting the same unfold forever.
+    aliases.insert(
+        row_a,
+        Scheme::new(0, named(row_id, vec![named(row_a, Vec::new())])),
+    );
+    assert!(matches!(
+        &*inference::unfold(&aliases, &named(row_a, Vec::new())),
+        Ty::Struct(Row {
+            rest: Rest::More(more),
+            ..
+        }) if matches!(more.rest, Rest::Undecided)
+    ));
+
+    // A malformed imported constructor that grows its argument never repeats
+    // an exact key. The declaration budget remains the second termination
+    // guard and recovers to unknown instead of panicking.
+    let grow = mint
+        .global(None, Namespace::Types, "Grow")
+        .expect("a fresh test type");
+    let mut aliases = IndexMap::new();
+    aliases.insert(
+        grow,
+        Scheme::new(
+            1,
+            named(
+                grow,
+                vec![Rc::new(Ty::Struct(Row {
+                    labels: [(
+                        "next".into(),
+                        field(Presence::Present, Rc::new(Ty::Bound(0))),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                }))],
+            ),
+        ),
+    );
+    assert!(matches!(
+        &*inference::unfold(&aliases, &named(grow, vec![Rc::new(Ty::Nat)])),
+        Ty::Undecided
     ));
 }
 

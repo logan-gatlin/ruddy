@@ -1608,9 +1608,17 @@ enum Stands {
     Loop,
 }
 
-enum Selection<'a> {
+/// One explicit evaluator step in [`Follow::decl`]. The recursion classifier
+/// follows one chain, but imported forwarding chains can be arbitrarily deep,
+/// so the chain lives here rather than on the native stack.
+enum FollowWork<'a> {
+    Decl(Symbol),
     Written(&'a Type),
     Semantic(&'a Rc<Ty>),
+    SelectWritten(&'a [Type]),
+    SelectSemantic(&'a [Rc<Ty>]),
+    FinishSelect { fields: bool },
+    FinishDecl(Symbol),
 }
 
 /// Following what every declaration stands for, once, remembering the loops
@@ -3620,175 +3628,182 @@ fn looping(
     }
 }
 
-impl Follow<'_> {
+impl<'a> Follow<'a> {
     /// What one declaration stands for, followed once and remembered.
     fn decl(&mut self, symbol: Symbol) -> Stands {
-        if let Some(stands) = self.done.get(&symbol) {
-            return *stands;
-        }
-        // Meeting a declaration that is still being followed is the loop, and
-        // everything pushed since is on it with them. Whether a field was added
-        // on the way is whether the count has moved since it was pushed.
-        if let Some(at) = self.open.iter().position(|open| *open == symbol) {
-            self.looping.extend(self.open[at..].iter().copied());
-            if self.fielded > self.marks[at] {
-                self.endless.extend(self.open[at..].iter().copied());
-            }
-            return Stands::Loop;
-        }
-        self.open.push(symbol);
-        self.marks.push(self.fielded);
-        let stands = match self.types.get(&symbol) {
-            Some(decl) => self.ty(&decl.value),
-            None => {
-                let decl = self
-                    .external
-                    .get(&symbol)
-                    .expect("every resolved imported type has a recovery interface");
-                self.semantic(decl.scheme.body())
-            }
-        };
-        self.open.pop();
-        self.marks.pop();
-        self.done.insert(symbol, stands);
-        stands
-    }
-
-    /// What one written type stands for, in the scope of the declaration being
-    /// followed.
-    fn ty(&mut self, ty: &Type) -> Stands {
-        match &ty.tracked {
-            // A struct whose `..` names a parameter stands for that parameter:
-            // the `..` is the struct-row tail, so what the declaration is, is
-            // whatever is written there, field_summaries the fields in it. Every
-            // other struct — closed, or open in the way only an annotation may
-            // be — is a shape like any other.
-            TypeKind::Struct {
-                fields,
-                tail:
-                    Some(Tail {
-                        of: Row::Param { index, .. },
-                        ..
-                    }),
-                ..
-            } => Stands::Param {
-                index: *index,
-                fields: fields
-                    .values()
-                    .any(|field| !matches!(field, TypeField::Absent { .. })),
-            },
-            // A shape one step in, which is all a declaration has to reach.
-            // `Error` absorbs, as everywhere else.
-            TypeKind::Struct { .. }
-            | TypeKind::Sum { .. }
-            | TypeKind::Arrow { .. }
-            | TypeKind::Effects(_)
-            | TypeKind::Prim(_)
-            | TypeKind::Var(_)
-            | TypeKind::Hole
-            | TypeKind::Error => Stands::Shape,
-            TypeKind::Param { index, .. } => Stands::Param {
-                index: *index,
-                fields: false,
-            },
-            TypeKind::Ident(symbol) => self.decl(*symbol),
-            TypeKind::Apply { head, args, .. } => {
-                let stands = self.decl(*head);
-                self.select(
-                    stands,
-                    args.get(match stands {
-                        Stands::Param { index, .. } => index as usize,
-                        _ => 0,
-                    })
-                    .map(Selection::Written),
-                )
-            }
-        }
-    }
-
-    /// The semantic imported twin of [`Follow::ty`]. Imported aliases are
-    /// already lowered, but a bound type and a bound struct-row rest still mean
-    /// “select this argument”, including through transitive applications.
-    fn semantic(&mut self, ty: &Rc<Ty>) -> Stands {
-        match &**ty {
-            Ty::Bound(index) => Stands::Param {
-                index: *index,
-                fields: false,
-            },
-            Ty::Struct(row) => {
-                let mut row = row;
-                let mut fields = false;
-                loop {
-                    fields |= row
-                        .labels
-                        .values()
-                        .any(|field| !matches!(field.presence, Presence::Absent));
-                    match &row.rest {
-                        Rest::Bound(index) => {
-                            return Stands::Param {
-                                index: *index,
-                                fields,
-                            };
+        let mut work = vec![FollowWork::Decl(symbol)];
+        let mut answer = None;
+        while let Some(next) = work.pop() {
+            match next {
+                FollowWork::Decl(symbol) => {
+                    if let Some(stands) = self.done.get(&symbol) {
+                        answer = Some(*stands);
+                        continue;
+                    }
+                    // Meeting a declaration that is still being followed is
+                    // the loop, and everything pushed since is on it. Whether a
+                    // field was added is whether the count moved since its mark.
+                    if let Some(at) = self.open.iter().position(|open| *open == symbol) {
+                        self.looping.extend(self.open[at..].iter().copied());
+                        if self.fielded > self.marks[at] {
+                            self.endless.extend(self.open[at..].iter().copied());
                         }
-                        Rest::More(more) => row = more,
-                        Rest::Closed | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
-                            return Stands::Shape;
+                        answer = Some(Stands::Loop);
+                        continue;
+                    }
+                    self.open.push(symbol);
+                    self.marks.push(self.fielded);
+                    work.push(FollowWork::FinishDecl(symbol));
+                    match self.types.get(&symbol) {
+                        Some(decl) => work.push(FollowWork::Written(&decl.value)),
+                        None => {
+                            let decl = self
+                                .external
+                                .get(&symbol)
+                                .expect("every resolved imported type has a recovery interface");
+                            work.push(FollowWork::Semantic(decl.scheme.body()));
                         }
                     }
                 }
-            }
-            Ty::Named { symbol, args, .. } => {
-                let stands = self.decl(*symbol);
-                self.select(
-                    stands,
-                    args.get(match stands {
-                        Stands::Param { index, .. } => index as usize,
-                        _ => 0,
-                    })
-                    .map(Selection::Semantic),
-                )
-            }
-            Ty::Nat
-            | Ty::Int
-            | Ty::Real
-            | Ty::String
-            | Ty::Boolean
-            | Ty::Arrow(..)
-            | Ty::Sum(_)
-            | Ty::Var(_)
-            | Ty::Rigid { .. }
-            | Ty::Undecided => Stands::Shape,
-        }
-    }
-
-    /// Apply a declaration's forwarding answer to one supplied argument.
-    /// Missing imported arguments are malformed interface data and absorb.
-    fn select(&mut self, stands: Stands, arg: Option<Selection<'_>>) -> Stands {
-        match stands {
-            Stands::Param { fields, .. } => {
-                if fields {
-                    self.fielded += 1;
+                FollowWork::FinishDecl(symbol) => {
+                    let stands = answer.expect("a followed declaration has an answer");
+                    self.open.pop();
+                    self.marks.pop();
+                    self.done.insert(symbol, stands);
+                    answer = Some(stands);
                 }
-                let Some(arg) = arg else {
-                    return Stands::Shape;
-                };
-                let deeper = match arg {
-                    Selection::Written(value) => self.ty(value),
-                    Selection::Semantic(value) => self.semantic(value),
-                };
-                match deeper {
-                    Stands::Param {
-                        index,
-                        fields: below,
-                    } => Stands::Param {
-                        index,
-                        fields: fields || below,
-                    },
-                    stands => stands,
+                FollowWork::Written(ty) => match &ty.tracked {
+                    // A struct whose `..` names a parameter stands for that
+                    // parameter, with any fields written in front of it.
+                    TypeKind::Struct {
+                        fields,
+                        tail:
+                            Some(Tail {
+                                of: Row::Param { index, .. },
+                                ..
+                            }),
+                        ..
+                    } => {
+                        answer = Some(Stands::Param {
+                            index: *index,
+                            fields: fields
+                                .values()
+                                .any(|field| !matches!(field, TypeField::Absent { .. })),
+                        });
+                    }
+                    TypeKind::Struct { .. }
+                    | TypeKind::Sum { .. }
+                    | TypeKind::Arrow { .. }
+                    | TypeKind::Effects(_)
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => answer = Some(Stands::Shape),
+                    TypeKind::Param { index, .. } => {
+                        answer = Some(Stands::Param {
+                            index: *index,
+                            fields: false,
+                        });
+                    }
+                    TypeKind::Ident(symbol) => work.push(FollowWork::Decl(*symbol)),
+                    TypeKind::Apply { head, args, .. } => {
+                        work.push(FollowWork::SelectWritten(args));
+                        work.push(FollowWork::Decl(*head));
+                    }
+                },
+                FollowWork::Semantic(ty) => match &**ty {
+                    Ty::Bound(index) => {
+                        answer = Some(Stands::Param {
+                            index: *index,
+                            fields: false,
+                        });
+                    }
+                    Ty::Struct(row) => {
+                        let mut row = row;
+                        let mut fields = false;
+                        loop {
+                            fields |= row
+                                .labels
+                                .values()
+                                .any(|field| !matches!(field.presence, Presence::Absent));
+                            match &row.rest {
+                                Rest::Bound(index) => {
+                                    answer = Some(Stands::Param {
+                                        index: *index,
+                                        fields,
+                                    });
+                                    break;
+                                }
+                                Rest::More(more) => row = more,
+                                Rest::Closed
+                                | Rest::Var(_)
+                                | Rest::Rigid { .. }
+                                | Rest::Undecided => {
+                                    answer = Some(Stands::Shape);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ty::Named { symbol, args, .. } => {
+                        work.push(FollowWork::SelectSemantic(args));
+                        work.push(FollowWork::Decl(*symbol));
+                    }
+                    Ty::Nat
+                    | Ty::Int
+                    | Ty::Real
+                    | Ty::String
+                    | Ty::Boolean
+                    | Ty::Arrow(..)
+                    | Ty::Sum(_)
+                    | Ty::Var(_)
+                    | Ty::Rigid { .. }
+                    | Ty::Undecided => answer = Some(Stands::Shape),
+                },
+                FollowWork::SelectWritten(args) => {
+                    let stands = answer.expect("a forwarding head has an answer");
+                    if let Stands::Param { index, fields } = stands {
+                        if fields {
+                            self.fielded += 1;
+                        }
+                        // Written applications have already passed the arity
+                        // check, and imported forwarding slots are clamped to
+                        // their published arity while their interface is read.
+                        let arg = &args[index as usize];
+                        work.push(FollowWork::FinishSelect { fields });
+                        work.push(FollowWork::Written(arg));
+                    }
+                }
+                FollowWork::SelectSemantic(args) => {
+                    let stands = answer.expect("a forwarding head has an answer");
+                    if let Stands::Param { index, fields } = stands {
+                        if fields {
+                            self.fielded += 1;
+                        }
+                        match args.get(index as usize) {
+                            Some(arg) => {
+                                work.push(FollowWork::FinishSelect { fields });
+                                work.push(FollowWork::Semantic(arg));
+                            }
+                            None => answer = Some(Stands::Shape),
+                        }
+                    }
+                }
+                FollowWork::FinishSelect { fields } => {
+                    answer = Some(match answer.expect("a selected argument has an answer") {
+                        Stands::Param {
+                            index,
+                            fields: below,
+                        } => Stands::Param {
+                            index,
+                            fields: fields || below,
+                        },
+                        stands => stands,
+                    });
                 }
             }
-            stands => stands,
         }
+        answer.expect("every declaration has a recursion-classification answer")
     }
 }
 

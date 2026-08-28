@@ -7796,6 +7796,24 @@ fn deep_imported_field_summaries_are_stack_safe_when_unused_and_used() {
 }
 
 #[test]
+fn deep_used_imported_forwarding_is_stack_safe_for_recursion_classification() {
+    std::thread::Builder::new()
+        .name("deep-used-imported-forwarding".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let dependency = deep_field_summary_artifact(2_048, false);
+            let parsed = parse::parse(lex("type Used = dep::Link0 {}", FileID::GENERATED).tokens);
+            assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+            let mut mint = dummy_mint();
+            let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("a deep used forwarding chain is classified without overflowing");
+}
+
+#[test]
 fn malformed_imported_alias_cycles_are_absorbed_without_recursing() {
     std::thread::Builder::new()
         .name("imported-field-cycle".into())
