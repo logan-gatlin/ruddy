@@ -5503,6 +5503,169 @@ fn imported_unnamed_handlers_are_complete_without_panicking() {
 }
 
 #[test]
+fn imported_effect_row_keys_follow_canonical_identities_by_shape() {
+    let raw = "IO\u{1f}x";
+    let canonical = "IO\u{1f}0#o1:x;";
+    let effect_row = || a::Row {
+        labels: Vec::new(),
+        rest: a::Rest::More(Box::new(a::Row {
+            labels: vec![(
+                raw.into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: artifact_type(artifact_unit()),
+                },
+            )],
+            rest: a::Rest::Closed,
+        })),
+    };
+    let nested_effect_argument = || {
+        artifact_type(a::Type::Named {
+            name: "dep@1.0.0::Effects".into(),
+            args: vec![artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Effects".into(),
+                args: vec![artifact_type(a::Type::Sum(effect_row()))],
+            })],
+        })
+    };
+
+    let mut dependency = effect_artifact("dep", "x");
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Unnamed,
+        from: artifact_type(artifact_unit()),
+        to: artifact_type(artifact_unit()),
+    });
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::action".into(),
+            scheme: artifact_scheme(artifact_type(a::Type::Arrow(
+                Box::new(artifact_type(artifact_unit())),
+                Box::new(artifact_type(artifact_unit())),
+                effect_row(),
+            ))),
+        },
+        a::Value {
+            name: "dep@1.0.0::nested".into(),
+            scheme: artifact_scheme(nested_effect_argument()),
+        },
+        // Missing declarations have no published argument sense. Their sum is
+        // recovery data, not an effect row, even when its label looks generated.
+        a::Value {
+            name: "dep@1.0.0::unresolved".into(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "missing@1.0.0::Unknown".into(),
+                args: vec![artifact_type(a::Type::Sum(effect_row()))],
+            })),
+        },
+    ]);
+    dependency.header.types.extend([
+        a::DeclaredType {
+            name: "dep@1.0.0::Effects".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Effects,
+                lacks: vec![raw.into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Cases".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
+                labels: vec![(
+                    raw.into(),
+                    a::RowField {
+                        presence: a::Presence::Present,
+                        ty: artifact_type(artifact_unit()),
+                    },
+                )],
+                rest: a::Rest::Closed,
+            }))),
+        },
+    ]);
+
+    let parsed = parse::parse(
+        lex(
+            "let main : () -> () = fn unit => handle dep::action (dep::!IO unit) with | dep::!IO value => value end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(parsed.errors.is_empty(), "{:#?}", parsed.errors);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let imported_value = |name: &str| {
+        out.program
+            .external_schemes
+            .iter()
+            .find_map(|(symbol, scheme)| (mint.name(*symbol) == name).then_some(scheme))
+            .unwrap_or_else(|| panic!("missing imported value {name}"))
+    };
+    let Ty::Arrow(_, _, effects) = &**imported_value("dep@1.0.0::action").body() else {
+        panic!("action is an arrow")
+    };
+    let Rest::More(more) = &effects.rest else {
+        panic!("action keeps its composed row")
+    };
+    assert!(more.labels.contains_key(canonical));
+
+    let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::nested").body() else {
+        panic!("nested outer alias")
+    };
+    let Ty::Named { args, .. } = &*args[0] else {
+        panic!("nested inner alias")
+    };
+    let Ty::Sum(row) = &*args[0] else {
+        panic!("effect argument row")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("effect argument keeps its composed row")
+    };
+    assert!(more.labels.contains_key(canonical));
+
+    let Ty::Named { args, .. } = &**imported_value("dep@1.0.0::unresolved").body() else {
+        panic!("unresolved named type")
+    };
+    let Ty::Sum(row) = &*args[0] else {
+        panic!("unresolved ordinary sum argument")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("unresolved sum keeps its composed row")
+    };
+    assert!(more.labels.contains_key(raw));
+
+    let imported_type = |name: &str| {
+        out.program
+            .external_types
+            .iter()
+            .find_map(|(symbol, declaration)| (mint.name(*symbol) == name).then_some(declaration))
+            .unwrap_or_else(|| panic!("missing imported type {name}"))
+    };
+    assert!(matches!(
+        &imported_type("dep@1.0.0::Effects").params[0],
+        ParamKind::Effects { lacks } if lacks.contains(canonical)
+    ));
+    let Ty::Sum(cases) = &**imported_type("dep@1.0.0::Cases").scheme.body() else {
+        panic!("ordinary imported sum")
+    };
+    assert!(cases.labels.contains_key(raw));
+    assert!(!cases.labels.contains_key(canonical));
+
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+}
+
+#[test]
 fn imported_named_handler_coverage_and_diagnostics_use_artifact_selectors() {
     let dependency = named_io_artifact("dep", "artifact-interface");
     let build = |src: &str| {

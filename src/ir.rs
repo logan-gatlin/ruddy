@@ -2476,13 +2476,14 @@ fn import_scheme(
     scheme: &artifact::Scheme,
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+    effect_rows: &ImportedEffectRows,
 ) -> Scheme {
     // Published values own their quantifier metadata. Clamp inconsistent
     // presence counts and every bound use before the trusted opening paths can
     // index the fresh-variable vector.
     let count = scheme.count;
     let presences = scheme.presences.min(count);
-    let body = import_type(mint, &scheme.body, symbols, names);
+    let body = import_type(mint, &scheme.body, symbols, names, effect_rows);
     let body = clamp_bounds(body, count as usize, presences as usize);
     let (formula, sanitized) = import_formula(&scheme.formula);
     let formula = match sanitized && formula_bounds_valid(&formula, presences) {
@@ -2755,17 +2756,50 @@ fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool
     true
 }
 
+/// Imported effect identities are canonicalized independently of the semantic
+/// types which refer to them. Generated row labels still contain the published
+/// interface text, so carry the corresponding key rewrite and the published
+/// senses of named arguments through the stack-safe type importer.
+#[derive(Default)]
+struct ImportedEffectRows {
+    labels: HashMap<String, String>,
+    arguments: HashMap<artifact::QualifiedName, Vec<artifact::Sense>>,
+}
+
+impl ImportedEffectRows {
+    fn label(&self, label: &str) -> String {
+        self.labels
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| label.to_string())
+    }
+
+    fn argument_is_effects(&self, name: &str, index: usize) -> bool {
+        matches!(
+            self.arguments
+                .get(name)
+                .and_then(|senses| senses.get(index)),
+            Some(artifact::Sense::Effects)
+        )
+    }
+}
+
 /// Convert an artifact type without using the host call stack. Artifact types
-/// are untrusted and may be tens of thousands of constructors deep.
+/// are untrusted and may be tens of thousands of constructors deep. The boolean
+/// on type and row jobs is a shape, not a spelling heuristic: only an arrow's
+/// row or an argument published with `Sense::Effects` may have effect keys
+/// rewritten. In particular, an ordinary sum label containing the separator is
+/// still an ordinary sum label.
 fn import_type(
     mint: &mut Mint,
     value: &artifact::Type,
     symbols: &mut HashMap<(Namespace, String), Symbol>,
     names: &mut IndexMap<Symbol, artifact::QualifiedName>,
+    effect_rows: &ImportedEffectRows,
 ) -> Rc<Ty> {
     enum Work<'a> {
-        Ty(&'a artifact::Type),
-        Row(&'a artifact::Row),
+        Ty(&'a artifact::Type, bool),
+        Row(&'a artifact::Row, bool),
         Arrow,
         Struct,
         Sum,
@@ -2774,15 +2808,15 @@ fn import_type(
             name: Rc<str>,
             args: usize,
         },
-        BuiltRow(&'a artifact::Row),
+        BuiltRow(&'a artifact::Row, bool),
     }
     let mut types = Vec::new();
     let mut rows = Vec::new();
 
-    let mut work = vec![Work::Ty(value)];
+    let mut work = vec![Work::Ty(value, false)];
     while let Some(part) = work.pop() {
         match part {
-            Work::Ty(value) => match value {
+            Work::Ty(value, is_effect_row) => match value {
                 artifact::Type::Nat => types.push(Rc::new(Ty::Nat)),
                 artifact::Type::Int => types.push(Rc::new(Ty::Int)),
                 artifact::Type::Real => types.push(Rc::new(Ty::Real)),
@@ -2794,17 +2828,17 @@ fn import_type(
                 | artifact::Type::Undecided => types.push(Rc::new(Ty::Undecided)),
                 artifact::Type::Arrow(from, to, effects) => {
                     work.push(Work::Arrow);
-                    work.push(Work::Row(effects));
-                    work.push(Work::Ty(to));
-                    work.push(Work::Ty(from));
+                    work.push(Work::Row(effects, true));
+                    work.push(Work::Ty(to, false));
+                    work.push(Work::Ty(from, false));
                 }
                 artifact::Type::Struct(fields) => {
                     work.push(Work::Struct);
-                    work.push(Work::Row(fields));
+                    work.push(Work::Row(fields, false));
                 }
                 artifact::Type::Sum(cases) => {
                     work.push(Work::Sum);
-                    work.push(Work::Row(cases));
+                    work.push(Work::Row(cases, is_effect_row));
                 }
                 artifact::Type::Named { name, args } => {
                     let symbol = imported_symbol(mint, Namespace::Types, name, symbols, names);
@@ -2813,17 +2847,19 @@ fn import_type(
                         name: Rc::from(name.as_str()),
                         args: args.len(),
                     });
-                    work.extend(args.iter().rev().map(Work::Ty));
+                    work.extend(args.iter().enumerate().rev().map(|(index, arg)| {
+                        Work::Ty(arg, effect_rows.argument_is_effects(name, index))
+                    }));
                 }
             },
-            Work::Row(value) => {
-                work.push(Work::BuiltRow(value));
+            Work::Row(value, is_effect_row) => {
+                work.push(Work::BuiltRow(value, is_effect_row));
                 if let artifact::Rest::More(more) = &value.rest {
-                    work.push(Work::Row(more));
+                    work.push(Work::Row(more, is_effect_row));
                 }
                 work.extend(value.labels.iter().rev().filter_map(|(_, field)| {
                     (!matches!(field.presence, artifact::Presence::Absent))
-                        .then_some(Work::Ty(&field.ty))
+                        .then_some(Work::Ty(&field.ty, false))
                 }));
             }
             Work::Arrow => {
@@ -2852,7 +2888,7 @@ fn import_type(
                     args: imported.into(),
                 }));
             }
-            Work::BuiltRow(value) => {
+            Work::BuiltRow(value, is_effect_row) => {
                 let rest = match &value.rest {
                     artifact::Rest::Closed => Rest::Closed,
                     artifact::Rest::Bound(index) => Rest::Bound(*index),
@@ -2877,7 +2913,11 @@ fn import_type(
                         Presence::Absent => Rc::new(Ty::Undecided),
                         _ => types.pop().expect("type postorder stays balanced"),
                     };
-                    fields.push((name.clone(), crate::types::RowField { presence, ty }));
+                    let name = match is_effect_row {
+                        true => effect_rows.label(name),
+                        false => name.clone(),
+                    };
+                    fields.push((name, crate::types::RowField { presence, ty }));
                 }
                 fields.reverse();
                 rows.push(crate::types::Row {
@@ -7267,6 +7307,39 @@ impl Builder<'_> {
             }
         }
 
+        // Identities and named parameter senses are published independently of
+        // the schemes which contain their generated row keys. Gather both
+        // tables before converting any semantic type so forward references and
+        // transitive aliases receive the same shape-aware normalization.
+        let mut effect_rows = ImportedEffectRows::default();
+        for dependency in linked
+            .iter()
+            .chain(valid.iter().map(|import| import.artifact))
+        {
+            for declaration in &dependency.header.effects {
+                if dependency_path(dependency, &declaration.name).is_none() {
+                    continue;
+                }
+                let Some(identity) = &declaration.identity else {
+                    continue;
+                };
+                let raw = format!("{}\u{1f}{}", identity.name, identity.interface);
+                let canonical = canonical_effect_interface(&identity.interface);
+                effect_rows
+                    .labels
+                    .insert(raw, format!("{}\u{1f}{canonical}", identity.name));
+            }
+            for declaration in &dependency.header.types {
+                if dependency_path(dependency, &declaration.name).is_none() {
+                    continue;
+                }
+                effect_rows.arguments.insert(
+                    declaration.name.clone(),
+                    declaration.params.iter().map(|param| param.sense).collect(),
+                );
+            }
+        }
+
         // Every linked declaration gets a semantic symbol, including
         // transitive implementation dependencies. Only the direct pass below
         // installs those symbols into source resolution tables.
@@ -7383,6 +7456,7 @@ impl Builder<'_> {
                     &value.scheme,
                     &mut symbols,
                     &mut program.external_names,
+                    &effect_rows,
                 );
                 program.external_schemes.insert(symbol, scheme);
             }
@@ -7395,7 +7469,16 @@ impl Builder<'_> {
                     .params
                     .iter()
                     .map(|param| {
-                        let lacks = param.lacks.iter().cloned().collect();
+                        let lacks = match param.sense {
+                            artifact::Sense::Effects => param
+                                .lacks
+                                .iter()
+                                .map(|label| effect_rows.label(label))
+                                .collect(),
+                            artifact::Sense::Type
+                            | artifact::Sense::Fields
+                            | artifact::Sense::Cases => param.lacks.iter().cloned().collect(),
+                        };
                         match param.sense {
                             artifact::Sense::Type => ParamKind::Type { lacks },
                             artifact::Sense::Fields => ParamKind::Fields { lacks },
@@ -7413,6 +7496,7 @@ impl Builder<'_> {
                     &declaration.scheme.body,
                     &mut symbols,
                     &mut program.external_names,
+                    &effect_rows,
                 );
                 let body = clamp_bounds(body, params.len(), 0);
                 let scheme = Scheme::new(params.len() as u32, body);
@@ -7486,6 +7570,7 @@ impl Builder<'_> {
                                 &operation.from,
                                 &mut symbols,
                                 &mut program.external_names,
+                                &effect_rows,
                             );
                             let from = clamp_bounds(from, 0, 0);
                             let to = import_type(
@@ -7493,6 +7578,7 @@ impl Builder<'_> {
                                 &operation.to,
                                 &mut symbols,
                                 &mut program.external_names,
+                                &effect_rows,
                             );
                             let to = clamp_bounds(to, 0, 0);
                             let selector = match &operation.selector {
