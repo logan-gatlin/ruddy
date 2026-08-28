@@ -1601,6 +1601,70 @@ fn javascript_reports_a_rejection_before_a_zero_delay_timer_can_handle_it() {
 }
 
 #[test]
+fn javascript_runs_a_microtask_checkpoint_between_timer_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("timer-microtask-order.mjs");
+    fs::write(
+        &module,
+        "const order = [];\n\
+         setTimeout(() => {\n\
+           order.push('first timer');\n\
+           queueMicrotask(() => order.push('microtask'));\n\
+         }, 0);\n\
+         setTimeout(() => {\n\
+           order.push('second timer');\n\
+           if (order.join(',') !== 'first timer,microtask,second timer') {\n\
+             throw new Error(`wrong task order: ${order}`);\n\
+           }\n\
+         }, 0);\n",
+    )
+    .unwrap();
+
+    execute_javascript_module(&module).expect("microtasks run between timer tasks");
+}
+
+#[test]
+fn javascript_does_not_sleep_for_a_timer_cleared_by_an_earlier_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("cleared-future-timer.mjs");
+    fs::write(
+        &module,
+        "const future = setTimeout(() => {\n\
+           throw new Error('cleared timer ran');\n\
+         }, 2_000);\n\
+         setTimeout(() => clearTimeout(future), 0);\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    execute_javascript_module(&module).expect("clearing the only future timer ends execution");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "executor slept for the canceled timer: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn javascript_does_not_reschedule_an_interval_that_clears_itself() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("self-clearing-interval.mjs");
+    fs::write(
+        &module,
+        "const interval = setInterval(() => clearInterval(interval), 500);\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    execute_javascript_module(&module).expect("a self-clearing interval terminates");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(850),
+        "self-cleared interval was rescheduled: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn run_reports_missing_externs_with_javascript_source_locations() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("missing");

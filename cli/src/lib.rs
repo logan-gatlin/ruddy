@@ -478,7 +478,7 @@ struct RuntimeJobExecutor {
     promise_jobs: RefCell<VecDeque<PromiseJob>>,
     async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
     finalization_registry_jobs: RefCell<VecDeque<NativeAsyncJob>>,
-    clock_jobs: RefCell<BTreeMap<JsInstant, Vec<ClockJob>>>,
+    clock_jobs: RefCell<BTreeMap<JsInstant, VecDeque<ClockJob>>>,
     generic_jobs: RefCell<VecDeque<GenericJob>>,
     unhandled: RejectedPromises,
 }
@@ -496,6 +496,7 @@ impl RuntimeJobExecutor {
         self.async_jobs.borrow_mut().clear();
         self.clock_jobs.borrow_mut().clear();
         self.generic_jobs.borrow_mut().clear();
+        self.finalization_registry_jobs.borrow_mut().clear();
     }
 
     fn has_immediate_jobs(&self) -> bool {
@@ -518,6 +519,34 @@ impl RuntimeJobExecutor {
             }
         }
     }
+
+    fn prune_cancelled_clock_jobs(&self) {
+        self.clock_jobs.borrow_mut().retain(|_, jobs| {
+            jobs.retain(|job| !job.cancelled());
+            !jobs.is_empty()
+        });
+    }
+
+    fn pop_due_clock_job(&self, now: JsInstant) -> Option<ClockJob> {
+        let mut clock_jobs = self.clock_jobs.borrow_mut();
+        loop {
+            let at = *clock_jobs.first_key_value()?.0;
+            if at > now {
+                return None;
+            }
+            let (job, empty) = {
+                let jobs = clock_jobs.get_mut(&at).expect("deadline came from map");
+                let job = jobs.pop_front();
+                (job, jobs.is_empty())
+            };
+            if empty {
+                clock_jobs.remove(&at);
+            }
+            if job.as_ref().is_some_and(|job| !job.cancelled()) {
+                return job;
+            }
+        }
+    }
 }
 
 impl JobExecutor for RuntimeJobExecutor {
@@ -530,14 +559,14 @@ impl JobExecutor for RuntimeJobExecutor {
                     .borrow_mut()
                     .entry(context.clock().now() + job.timeout())
                     .or_default()
-                    .push(ClockJob::Timeout(job));
+                    .push_back(ClockJob::Timeout(job));
             }
             Job::IntervalJob(job) => {
                 self.clock_jobs
                     .borrow_mut()
                     .entry(context.clock().now() + job.interval())
                     .or_default()
-                    .push(ClockJob::Interval(job));
+                    .push_back(ClockJob::Interval(job));
             }
             Job::GenericJob(job) => self.generic_jobs.borrow_mut().push_back(job),
             Job::FinalizationRegistryCleanupJob(job) => {
@@ -587,39 +616,35 @@ impl JobExecutor for RuntimeJobExecutor {
             }
 
             let now = context.borrow().clock().now();
-            let jobs_to_run = {
-                let mut clock_jobs = self.clock_jobs.borrow_mut();
-                let mut jobs_to_keep = clock_jobs.split_off(&now);
-                jobs_to_keep.retain(|_, jobs| {
-                    jobs.retain(|job| !job.cancelled());
-                    !jobs.is_empty()
-                });
-                std::mem::replace(&mut *clock_jobs, jobs_to_keep)
-            };
-            for jobs in jobs_to_run.into_values() {
-                for job in jobs {
-                    if job.cancelled() {
-                        continue;
-                    }
-                    let result = match job {
-                        ClockJob::Timeout(job) => job.call(&mut context.borrow_mut()),
-                        ClockJob::Interval(job) => {
-                            let context = &mut context.borrow_mut();
-                            let now = context.clock().now();
-                            let interval = job.interval();
-                            let result = job.call(context);
+            if let Some(job) = self.pop_due_clock_job(now) {
+                let result = match job {
+                    ClockJob::Timeout(job) => job.call(&mut context.borrow_mut()),
+                    ClockJob::Interval(job) => {
+                        let interval = job.interval();
+                        let result = job.call(&mut context.borrow_mut());
+                        if result.is_ok() && !job.cancelled() {
                             self.clock_jobs
                                 .borrow_mut()
                                 .entry(now + interval)
                                 .or_default()
-                                .push(ClockJob::Interval(job));
-                            result
+                                .push_back(ClockJob::Interval(job));
                         }
-                    };
-                    if let Err(error) = result {
-                        self.clear();
-                        return Err(error);
+                        result
                     }
+                };
+                if let Err(error) = result {
+                    self.clear();
+                    return Err(error);
+                }
+                // A timer callback is one host task. Its microtasks and promise
+                // rejections become observable before any other work proceeds.
+                if let Err(error) = self.run_microtask_checkpoint(context) {
+                    self.clear();
+                    return Err(error);
+                }
+                if !self.unhandled.borrow().is_empty() {
+                    self.clear();
+                    return Ok(());
                 }
             }
 
@@ -641,6 +666,9 @@ impl JobExecutor for RuntimeJobExecutor {
                     _ if self.has_immediate_jobs() => continue,
                     _ => {}
                 }
+                // A task can cancel a later timer after the due job was selected.
+                // Remove it before choosing a deadline so cancellation never sleeps.
+                self.prune_cancelled_clock_jobs();
                 let deadline = self
                     .clock_jobs
                     .borrow()
