@@ -1745,6 +1745,69 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
 }
 
 #[test]
+fn transitive_forwarding_bodies_do_not_spend_growth_fuel() {
+    let (_, _, output) = infer_src(
+        "type Id 'a = 'a\n\
+         type F 'a = Id 'a\n\
+         let bad : F (F Nat) = {}",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert_eq!(
+        output.errors[0].kind.to_string(),
+        "type mismatch: expected `Nat`, found `{}`"
+    );
+    assert!(output.steps.iter().any(|step| {
+        matches!(
+            &step.goal,
+            inference::Goal::Type { expected, actual }
+                if matches!(&**expected, Ty::Nat) && matches!(&**actual, Ty::Struct(_))
+        )
+    }));
+
+    let bundle = Bundle::new("forwarding-shapes", Version::new(1, 0, 0)).unwrap();
+    let mut mint = Mint::new(bundle);
+    let id = mint.global(None, Namespace::Types, "Id").unwrap();
+    let nested = mint.global(None, Namespace::Types, "Nested").unwrap();
+    let left = mint.global(None, Namespace::Types, "Left").unwrap();
+    let right = mint.global(None, Namespace::Types, "Right").unwrap();
+    let missing = mint.global(None, Namespace::Types, "Missing").unwrap();
+    let absent = mint.global(None, Namespace::Types, "Absent").unwrap();
+    let mut aliases = IndexMap::new();
+    aliases.insert(id, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    aliases.insert(
+        nested,
+        Scheme::new(
+            1,
+            semantic_named(id, vec![semantic_named(id, vec![Rc::new(Ty::Bound(0))])]),
+        ),
+    );
+    aliases.insert(
+        left,
+        Scheme::new(1, semantic_named(right, vec![Rc::new(Ty::Bound(0))])),
+    );
+    aliases.insert(
+        right,
+        Scheme::new(1, semantic_named(left, vec![Rc::new(Ty::Bound(0))])),
+    );
+    aliases.insert(
+        missing,
+        Scheme::new(1, semantic_named(absent, vec![Rc::new(Ty::Bound(0))])),
+    );
+    assert!(matches!(
+        &*inference::unfold(&aliases, &semantic_named(nested, vec![Rc::new(Ty::Nat)])),
+        Ty::Nat
+    ));
+    assert!(matches!(
+        &*inference::unfold(&aliases, &semantic_named(left, vec![Rc::new(Ty::Nat)])),
+        Ty::Undecided
+    ));
+    assert!(matches!(
+        &*inference::unfold(&aliases, &semantic_named(missing, vec![Rc::new(Ty::Nat)])),
+        Ty::Undecided
+    ));
+}
+
+#[test]
 fn nested_row_identity_forwarding_neither_spends_fuel_nor_uses_alias_count() {
     let bundle = Bundle::new("row-id", Version::new(1, 0, 0)).unwrap();
     let mut mint = Mint::new(bundle);
@@ -1847,6 +1910,50 @@ fn alias_unfolding_is_linear_and_stack_safe_for_deep_forwarding() {
         .expect("the bounded-stack regression thread starts")
         .join()
         .expect("deep exact alias identity uses bounded stack and linear memory");
+}
+
+#[test]
+fn deep_more_identity_is_linear_and_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-more-row-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let bundle = Bundle::new("deep-row-id", Version::new(1, 0, 0)).unwrap();
+            let mut mint = Mint::new(bundle);
+            let id = mint
+                .global(None, Namespace::Types, "Id")
+                .expect("an identity symbol");
+            let aliases = IndexMap::from([(id, Scheme::new(1, Rc::new(Ty::Bound(0))))]);
+            let mut row = Row::closed();
+            for index in (0..30_000).rev() {
+                let name = match index % 3 {
+                    0 => "overlap".to_string(),
+                    _ => format!("field{index}"),
+                };
+                row = Row {
+                    labels: [(
+                        name,
+                        RowField {
+                            presence: Presence::Present,
+                            ty: Rc::new(Ty::Nat),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::More(Rc::new(row)),
+                };
+            }
+            let deep = semantic_named(id, vec![Rc::new(Ty::Struct(row))]);
+            let opened = inference::unfold(&aliases, &deep);
+            assert!(matches!(&*opened, Ty::Struct(_)));
+            // Recursive Rc destruction is unrelated to identity normalization.
+            std::mem::forget(aliases);
+            std::mem::forget(deep);
+            std::mem::forget(opened);
+        })
+        .expect("the bounded-stack identity regression starts")
+        .join()
+        .expect("one deep More chain is normalized once");
 }
 
 #[test]

@@ -75,7 +75,8 @@ pub mod sat;
 mod solve;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
 };
@@ -3969,6 +3970,7 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
         active: HashSet::new(),
         growing: HashSet::new(),
         identity: Identity::default(),
+        forwarding: Forwarding::default(),
     }
     .ty(ty)
 }
@@ -3984,6 +3986,7 @@ struct Unfold<'a> {
     /// Nested row opening is part of the path, while a completed sibling is not.
     growing: HashSet<Symbol>,
     identity: Identity,
+    forwarding: Forwarding,
 }
 
 impl Unfold<'_> {
@@ -4008,7 +4011,7 @@ impl Unfold<'_> {
                 break Rc::new(Ty::Undecided);
             };
             let body = scheme.body().clone();
-            let grows = growing_alias_body(&body);
+            let grows = self.forwarding.projection(self.aliases, &body).is_none();
             if grows && !self.growing.insert(*symbol) {
                 entered.push((key, None));
                 break Rc::new(Ty::Undecided);
@@ -4028,26 +4031,109 @@ impl Unfold<'_> {
     }
 }
 
-/// Whether opening this declaration adds structure before forwarding an
-/// argument. An empty row whose tail is a bound argument is a row identity:
-/// nesting it any number of times is valid and must not consume growth fuel.
-fn growing_alias_body(body: &Ty) -> bool {
-    match body {
-        Ty::Bound(_) => false,
-        Ty::Struct(row) | Ty::Sum(row) => {
-            let mut row = row;
-            loop {
-                if !row.labels.is_empty() {
-                    return true;
+/// Which parameter an expression forwards unchanged, if it is only a chain of
+/// applications of other forwarding declarations. The cache is allocation
+/// keyed and the evaluator is an explicit stack: imported interfaces can put
+/// tens of thousands of aliases between a body and its parameter.
+///
+/// A named node is not growth merely because it is named. `F a = Id a` adds no
+/// constructor at all when `Id a = a`, and counting the spelling as growth lets
+/// `F (F Nat)` consume the malformed-growth guard before it can reach `Nat`.
+/// Conversely, a cycle with no eventual parameter and an application that
+/// wraps the selected argument are not projections, so malformed growing
+/// imports retain the termination guard.
+#[derive(Default)]
+struct Forwarding {
+    expressions: HashMap<usize, Option<u32>>,
+    aliases: HashMap<Symbol, Option<u32>>,
+}
+
+impl Forwarding {
+    fn projection(&mut self, aliases: &IndexMap<Symbol, Scheme>, root: &Rc<Ty>) -> Option<u32> {
+        enum Work {
+            Expression(Rc<Ty>),
+            Alias(Symbol),
+            AfterAlias(Rc<[Rc<Ty>]>),
+            FinishExpression(usize),
+            FinishAlias(Symbol),
+            Value(Option<u32>),
+        }
+
+        let mut active = HashSet::new();
+        let mut values = Vec::new();
+        let mut work = vec![Work::Expression(root.clone())];
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Value(value) => values.push(value),
+                Work::Expression(ty) => {
+                    let address = Rc::as_ptr(&ty) as usize;
+                    if let Some(value) = self.expressions.get(&address) {
+                        values.push(*value);
+                    } else {
+                        work.push(Work::FinishExpression(address));
+                        match &*ty {
+                            Ty::Bound(index) => work.push(Work::Value(Some(*index))),
+                            Ty::Named { symbol, args, .. } => {
+                                work.push(Work::AfterAlias(args.clone()));
+                                work.push(Work::Alias(*symbol));
+                            }
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                let mut row = row;
+                                while row.labels.is_empty() {
+                                    match &row.rest {
+                                        Rest::More(more) => row = more,
+                                        Rest::Bound(index) => {
+                                            work.push(Work::Value(Some(*index)));
+                                            break;
+                                        }
+                                        _ => {
+                                            work.push(Work::Value(None));
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !row.labels.is_empty() {
+                                    work.push(Work::Value(None));
+                                }
+                            }
+                            _ => work.push(Work::Value(None)),
+                        }
+                    }
                 }
-                match &row.rest {
-                    Rest::More(more) => row = more,
-                    Rest::Bound(_) => return false,
-                    _ => return true,
+                Work::Alias(symbol) => {
+                    if let Some(value) = self.aliases.get(&symbol) {
+                        values.push(*value);
+                    } else if !active.insert(symbol) {
+                        values.push(None);
+                    } else {
+                        work.push(Work::FinishAlias(symbol));
+                        match aliases.get(&symbol) {
+                            Some(scheme) => work.push(Work::Expression(scheme.body().clone())),
+                            None => work.push(Work::Value(None)),
+                        }
+                    }
+                }
+                Work::AfterAlias(args) => {
+                    let selected = values.pop().expect("forwarding alias result");
+                    match selected.and_then(|index| args.get(index as usize)) {
+                        Some(arg) => work.push(Work::Expression(arg.clone())),
+                        None => work.push(Work::Value(None)),
+                    }
+                }
+                Work::FinishExpression(address) => {
+                    let value = values.pop().expect("forwarding expression result");
+                    self.expressions.insert(address, value);
+                    values.push(value);
+                }
+                Work::FinishAlias(symbol) => {
+                    let value = values.pop().expect("forwarding declaration result");
+                    active.remove(&symbol);
+                    self.aliases.insert(symbol, value);
+                    values.push(value);
                 }
             }
         }
-        _ => true,
+        values.pop().expect("forwarding root result")
     }
 }
 
@@ -4071,10 +4157,32 @@ enum TyIdentity {
     Named(Symbol, Vec<u32>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RowIdentity {
-    labels: Vec<(String, PresenceIdentity, Option<u32>)>,
+    labels: HashMap<String, (PresenceIdentity, Option<u32>)>,
     rest: RestIdentity,
+}
+
+impl Hash for RowIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.rest.hash(state);
+        self.labels.len().hash(state);
+        // HashMap equality is exactly the order-independent row equality we
+        // need, but HashMap deliberately has no Hash implementation. Fold
+        // independently hashed entries with commutative operations; a hash
+        // collision only reaches the exact HashMap equality check in `intern`.
+        let mut sum = 0_u64;
+        let mut xor = 0_u64;
+        for entry in &self.labels {
+            let mut hasher = DefaultHasher::new();
+            entry.hash(&mut hasher);
+            let hash = hasher.finish();
+            sum = sum.wrapping_add(hash);
+            xor ^= hash.rotate_left(23);
+        }
+        sum.hash(state);
+        xor.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -4151,27 +4259,33 @@ impl Identity {
                     self.tys.insert(Rc::as_ptr(ty) as usize, (ty.clone(), id));
                 }
                 Work::Row(row, false) => {
-                    let address = row as *const Row as usize;
-                    if self.rows.contains_key(&address) {
-                        continue;
-                    }
                     work.push(Work::Row(row, true));
-                    if let Rest::More(more) = &row.rest {
-                        work.push(Work::Row(more, false));
+                    // `More` is one semantic row chain, not a tree of rows to
+                    // normalize independently. Scheduling every suffix here
+                    // retained vectors of lengths n, n-1, ... and made one
+                    // 30,000-link row quadratic. Visit all payloads once and
+                    // intern only the root requested by its containing type.
+                    let mut current = row;
+                    loop {
+                        work.extend(
+                            current
+                                .labels
+                                .iter()
+                                .rev()
+                                .map(|(_, field)| Work::Ty(&field.ty, false)),
+                        );
+                        match &current.rest {
+                            Rest::More(more) => current = more,
+                            _ => break,
+                        }
                     }
-                    work.extend(
-                        row.labels
-                            .iter()
-                            .rev()
-                            .map(|(_, field)| Work::Ty(&field.ty, false)),
-                    );
                 }
                 Work::Row(row, true) => {
                     // A row is a record, not a source list. Flatten `More`
                     // with outer labels winning, ignore absent payloads, and
                     // sort by label so semantically equal rows intern together
                     // however an imported artifact happened to present them.
-                    let mut fields: IndexMap<String, (&Presence, &Rc<Ty>)> = IndexMap::new();
+                    let mut fields: HashMap<String, (&Presence, &Rc<Ty>)> = HashMap::new();
                     let mut current = row;
                     let rest = loop {
                         for (name, field) in &current.labels {
@@ -4188,7 +4302,7 @@ impl Identity {
                             Rest::Undecided => break RestIdentity::Undecided,
                         }
                     };
-                    let mut labels: Vec<_> = fields
+                    let labels = fields
                         .into_iter()
                         .map(|(name, (presence, ty))| {
                             let presence = match presence {
@@ -4200,10 +4314,9 @@ impl Identity {
                             };
                             let ty = (!matches!(presence, PresenceIdentity::Absent))
                                 .then(|| self.ty_id(ty));
-                            (name, presence, ty)
+                            (name, (presence, ty))
                         })
                         .collect();
-                    labels.sort_by(|left, right| left.0.cmp(&right.0));
                     let id = Self::intern(&mut self.row_nodes, RowIdentity { labels, rest });
                     self.rows.insert(row as *const Row as usize, id);
                 }

@@ -23,7 +23,7 @@ use ruddy::{
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
     types::{Assigned, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
-    ui,
+    ui::{self, Entry, Mark},
 };
 use ruddy_debug::print;
 
@@ -1235,6 +1235,45 @@ fn every_failure_is_reported(what: &str, shown: &dyn fmt::Display) {
 /// one that fails is a real thing — a socket, a full disk, the debugger's own
 /// buffers. A printer that swallowed the failure would hand back a type or a
 /// program that was never written, which is worse than the error it hid.
+#[test]
+fn generic_rows_render_undecided_marks() {
+    struct Marked;
+    impl fmt::Display for Marked {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            ui::write_row(
+                f,
+                [Entry::Written {
+                    name: "x",
+                    mark: Some(Mark::Undecided),
+                    holds: "Nat",
+                }],
+                None,
+            )?;
+            f.write_str(" / ")?;
+            ui::write_sum(
+                f,
+                [Entry::Written {
+                    name: "A",
+                    mark: Some(Mark::Undecided),
+                    holds: Some(&Ty::Nat),
+                }],
+                None,
+            )?;
+            f.write_str(" / ")?;
+            ui::write_effects(
+                f,
+                &[Entry::Written {
+                    name: "Log",
+                    mark: Some(Mark::Undecided),
+                    holds: (),
+                }],
+                None,
+            )
+        }
+    }
+    assert_eq!(Marked.to_string(), "{ x?: Nat } / #A? Nat / !Log?");
+}
+
 #[test]
 fn a_printer_reports_a_writer_that_refuses_it() {
     let nat = Rc::new(Ty::plain(Ty::Nat));

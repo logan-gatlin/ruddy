@@ -8058,7 +8058,13 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             // instantiates, substitutes, reads, and solves the deep formula.
             let parsed = parse::parse(
                 lex(
-                    "let answer = dep::deep_formula\nlet typed = dep::deep_type",
+                    "let answer = dep::deep_formula\n\
+                     let typed = dep::deep_type\n\
+                     let ignore = fn value => 0n\n\
+                     let guarded = fn choice => match choice with\n\
+                     | {left, ..} => ignore dep::deep_type\n\
+                     | {right, ..} => 0n end\n\
+                     let bad : Nat = dep::deep_type",
                     FileID::GENERATED,
                 )
                 .tokens,
@@ -8082,11 +8088,53 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
             // and the deep arrow/name/field-payload type on this small stack.
             let mut program = out.program;
             let inferred = inference::infer(&mint, &mut program);
-            assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+            assert_eq!(inferred.errors.len(), 1);
+            assert_eq!(inferred.errors[0].kind.code(), "type-mismatch");
+            let guarded_step = inferred
+                .steps
+                .iter()
+                .any(|step| matches!(step.effect, inference::Effect::Guarded { .. }));
+            assert!(guarded_step);
+
+            // Build both readings of the Types stage. Node meanings use
+            // semantic Display and the raw dump deliberately does not use the
+            // recursively derived Debug implementation.
+            let dependency_declarations = IndexMap::new();
+            let symbols = std::collections::HashMap::new();
+            let cx = ruddy_debug::stage::Cx {
+                files: &[],
+                bundle: None,
+                program: Some(&program),
+                inference: Some(&inferred),
+                patterns: None,
+                lir: None,
+                artifact: None,
+                linked: None,
+                dependency_declarations: &dependency_declarations,
+                dependency_aliases: &[],
+                dependencies: &[],
+                dependency_interfaces: &[],
+                dependencies_valid: true,
+                artifact_panicked: false,
+                link_error: None,
+                link_panicked: false,
+                mint: Some(&mint),
+                symbols: &symbols,
+                micros: ruddy_debug::stage::Phases::default(),
+                errored: true,
+            };
+            let spec = ruddy_debug::stage::REGISTRY
+                .iter()
+                .find(|spec| spec.id == "types")
+                .expect("the Types stage spec");
+            let stage = ruddy_debug::stage::types::build(spec, &cx);
+            assert!(stage.nodes.iter().any(|node| node.text.contains("Phantom")));
+            assert!(stage.debug.contains("externs:"));
+            assert!(stage.debug.contains("Phantom"));
 
             // Recursive ownership is not what this regression measures. Both
             // imported representations remain live until the bounded-stack
-            // semantic use has demonstrably completed.
+            // semantic use and debugger rendering have demonstrably completed.
             std::mem::forget(program);
             std::mem::forget(inferred);
             std::mem::forget(dependencies);

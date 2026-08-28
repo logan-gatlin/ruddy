@@ -10,7 +10,10 @@
 //! for: a stage naming another stage's id owns no tab, and its nodes carry
 //! *that* stage's node ids rather than ids of their own.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write,
+};
 
 use indexmap::IndexMap;
 use ruddy::{
@@ -151,10 +154,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
         // wire a second time on every keystroke, for a raw view nobody would
         // read them in. What is left out and not shown anywhere raw is
         // `errors`, which reaches the page as diagnostics instead.
-        debug: format!(
-            "aliases: {:#?}\n\nexterns: {:#?}\n\nschemes: {:#?}",
-            output.aliases, output.externs, output.schemes
-        ),
+        debug: raw_types(output),
         ..spec.stage(
             cx.status(),
             match output.externs.is_empty() {
@@ -167,6 +167,25 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             },
         )
     }
+}
+
+/// The Types tab's raw view without derived `Debug` walking semantic trees on
+/// the native stack. Surface rendering is the useful part of a scheme here,
+/// and its formatter is iterative even for malformed, deeply nested imports.
+fn raw_types(output: &ruddy::inference::Output) -> String {
+    let mut out = String::new();
+    for (title, schemes) in [
+        ("aliases", &output.aliases),
+        ("externs", &output.externs),
+        ("schemes", &output.schemes),
+    ] {
+        let _ = writeln!(out, "{title}:");
+        for (symbol, scheme) in schemes {
+            let _ = writeln!(out, "  {symbol:?}: {scheme}");
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Every name a nested `let` binds inside one definition's value, in the order

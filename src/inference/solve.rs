@@ -2087,61 +2087,148 @@ impl Solve<'_> {
     }
 
     fn guarded_type(&mut self, span: Span, ty: &Rc<Ty>) -> Rc<Ty> {
-        let ty = self.table.resolve(ty);
-        Rc::new(match &*ty {
-            Ty::Arrow(from, to, effects) => Ty::Arrow(
-                self.guarded_type(span, from),
-                self.guarded_type(span, to),
-                self.guarded_row(span, effects),
-            ),
-            Ty::Struct(fields) => Ty::Struct(self.guarded_row(span, fields)),
-            Ty::Sum(cases) => Ty::Sum(self.guarded_row(span, cases)),
-            Ty::Named { symbol, name, args } => Ty::Named {
-                symbol: *symbol,
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| self.guarded_type(span, arg))
-                    .collect(),
+        enum Work {
+            Type(Rc<Ty>),
+            Row(Row),
+            Fields {
+                pending: std::vec::IntoIter<(String, RowField)>,
+                labels: IndexMap<String, RowField>,
+                rest: Rest,
             },
-            other => other.clone(),
-        })
+            Field {
+                name: String,
+                presence: Presence,
+                pending: std::vec::IntoIter<(String, RowField)>,
+                labels: IndexMap<String, RowField>,
+                rest: Rest,
+            },
+            Arrow,
+            Struct,
+            Sum,
+            Named {
+                symbol: Symbol,
+                name: Rc<str>,
+                count: usize,
+            },
+        }
+
+        let mut work = vec![Work::Type(ty.clone())];
+        let mut types = Vec::new();
+        let mut rows = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Type(ty) => {
+                    let ty = self.table.resolve(&ty);
+                    match &*ty {
+                        Ty::Arrow(from, to, effects) => {
+                            work.push(Work::Arrow);
+                            work.push(Work::Row(effects.clone()));
+                            work.push(Work::Type(to.clone()));
+                            work.push(Work::Type(from.clone()));
+                        }
+                        Ty::Struct(row) => {
+                            work.push(Work::Struct);
+                            work.push(Work::Row(row.clone()));
+                        }
+                        Ty::Sum(row) => {
+                            work.push(Work::Sum);
+                            work.push(Work::Row(row.clone()));
+                        }
+                        Ty::Named { symbol, name, args } => {
+                            work.push(Work::Named {
+                                symbol: *symbol,
+                                name: name.clone(),
+                                count: args.len(),
+                            });
+                            work.extend(args.iter().rev().cloned().map(Work::Type));
+                        }
+                        other => types.push(Rc::new(other.clone())),
+                    }
+                }
+                Work::Row(row) => {
+                    let row = self.table.canon(&row);
+                    work.push(Work::Fields {
+                        pending: row.labels.into_iter().collect::<Vec<_>>().into_iter(),
+                        labels: IndexMap::new(),
+                        rest: row.rest,
+                    });
+                }
+                Work::Fields {
+                    mut pending,
+                    labels,
+                    rest,
+                } => match pending.next() {
+                    Some((name, field)) => {
+                        let resolved = self.table.presence_of(&field.presence);
+                        let presence = match resolved {
+                            Presence::Undecided => Presence::Undecided,
+                            resolved => {
+                                let shared = self.table.fresh_presence();
+                                self.guarded_presence(span, &shared, &resolved);
+                                shared
+                            }
+                        };
+                        work.push(Work::Field {
+                            name,
+                            presence,
+                            pending,
+                            labels,
+                            rest,
+                        });
+                        work.push(Work::Type(field.ty));
+                    }
+                    None => rows.push(Row { labels, rest }),
+                },
+                Work::Field {
+                    name,
+                    presence,
+                    pending,
+                    mut labels,
+                    rest,
+                } => {
+                    let ty = types.pop().expect("guarded field payload");
+                    labels.insert(name, RowField { presence, ty });
+                    work.push(Work::Fields {
+                        pending,
+                        labels,
+                        rest,
+                    });
+                }
+                Work::Arrow => {
+                    let effects = rows.pop().expect("guarded arrow effects");
+                    let to = types.pop().expect("guarded arrow result");
+                    let from = types.pop().expect("guarded arrow parameter");
+                    types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                }
+                Work::Struct => {
+                    let row = rows.pop().expect("guarded struct row");
+                    types.push(Rc::new(Ty::Struct(row)));
+                }
+                Work::Sum => {
+                    let row = rows.pop().expect("guarded sum row");
+                    types.push(Rc::new(Ty::Sum(row)));
+                }
+                Work::Named {
+                    symbol,
+                    name,
+                    count,
+                } => {
+                    let split = types.len() - count;
+                    let args: Vec<_> = types.drain(split..).collect();
+                    types.push(Rc::new(Ty::Named {
+                        symbol,
+                        name,
+                        args: args.into(),
+                    }));
+                }
+            }
+        }
+        types.pop().expect("guarded type result")
     }
 
     fn guarded_row(&mut self, span: Span, row: &Row) -> Row {
-        let row = self.table.canon(row);
-        Row {
-            labels: self.guarded_labels(span, &row.labels),
-            rest: row.rest,
-        }
-    }
-
-    fn guarded_labels(
-        &mut self,
-        span: Span,
-        labels: &IndexMap<String, RowField>,
-    ) -> IndexMap<String, RowField> {
-        labels
-            .iter()
-            .map(|(name, field)| {
-                let resolved = self.table.presence_of(&field.presence);
-                let presence = match resolved {
-                    Presence::Undecided => Presence::Undecided,
-                    resolved => {
-                        let shared = self.table.fresh_presence();
-                        self.guarded_presence(span, &shared, &resolved);
-                        shared
-                    }
-                };
-                (
-                    name.clone(),
-                    RowField {
-                        presence,
-                        ty: self.guarded_type(span, &field.ty),
-                    },
-                )
-            })
-            .collect()
+        let guarded = self.guarded_type(span, &Rc::new(Ty::Struct(row.clone())));
+        guarded.fields().cloned().unwrap_or_default()
     }
 
     /// Report a failure and abandon what it was about, in one act: the
@@ -2188,54 +2275,76 @@ impl Solve<'_> {
     /// carries. A composite is abandoned by abandoning what it is made of —
     /// the goal that would have decided `?1 -> ?2` decided neither half.
     fn recover_ty(&mut self, span: Span, ty: &Rc<Ty>) {
-        let ty = self.table.resolve(ty);
-        match &*ty {
-            Ty::Var(var) => self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided))),
-            Ty::Arrow(from, to, effects) => {
-                self.recover_ty(span, from);
-                self.recover_ty(span, to);
-                self.recover_row(span, effects);
-            }
-            Ty::Struct(row) | Ty::Sum(row) => self.recover_row(span, row),
-            Ty::Named { args, .. } => {
-                for arg in args.iter() {
-                    self.recover_ty(span, arg)
-                }
-            }
-            Ty::Nat
-            | Ty::Int
-            | Ty::Real
-            | Ty::String
-            | Ty::Boolean
-            | Ty::Bound(_)
-            | Ty::Rigid { .. }
-            | Ty::Undecided => {}
-        }
+        self.recover_parts(span, Some(ty.clone()), None);
     }
 
     /// [`recover`](Self::recover) over a sum's cases: every label, and then the
     /// tail saying what else the row might have had.
     fn recover_row(&mut self, span: Span, row: &Row) {
-        let row = self.table.canon(row);
-        self.recover_labels(span, &row.labels);
-        self.recover_rest(span, &row.rest);
+        self.recover_parts(span, None, Some(row.clone()));
     }
 
-    /// [`recover`](Self::recover) over a label map: each label whole, its
-    /// presence and its type. Missing one would leave a variable unbound for
-    /// generalization to quantify.
-    fn recover_labels(&mut self, span: Span, labels: &IndexMap<String, RowField>) {
-        for field in labels.values() {
-            let (presence, ty) = (field.presence.clone(), field.ty.clone());
-            self.recover_presence(span, &presence);
-            self.recover_ty(span, &ty);
+    /// Iterative recovery for imported semantic trees. A failure can abandon a
+    /// value whose artifact contains 30,000 arrows, names, rows, or field
+    /// payloads; recovery still has to settle every variable and presence in
+    /// it without borrowing the native call stack from the malformed input.
+    fn recover_parts(&mut self, span: Span, ty: Option<Rc<Ty>>, row: Option<Row>) {
+        enum Work {
+            Type(Rc<Ty>),
+            Row(Row),
+            Presence(Presence),
+            Rest(Rest),
         }
-    }
 
-    /// [`recover`](Self::recover) over a tail.
-    fn recover_rest(&mut self, span: Span, rest: &Rest) {
-        if let Rest::Var(var) = self.table.canon(&Row::of(rest.clone())).rest {
-            self.settle(span, var, Assigned::Row(Rc::new(Row::of(Rest::Undecided))));
+        let mut work = Vec::new();
+        if let Some(row) = row {
+            work.push(Work::Row(row));
+        }
+        if let Some(ty) = ty {
+            work.push(Work::Type(ty));
+        }
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Type(ty) => {
+                    let ty = self.table.resolve(&ty);
+                    match &*ty {
+                        Ty::Var(var) => {
+                            self.settle(span, *var, Assigned::Ty(Rc::new(Ty::Undecided)))
+                        }
+                        Ty::Arrow(from, to, effects) => {
+                            work.push(Work::Row(effects.clone()));
+                            work.push(Work::Type(to.clone()));
+                            work.push(Work::Type(from.clone()));
+                        }
+                        Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
+                        Ty::Named { args, .. } => {
+                            work.extend(args.iter().rev().cloned().map(Work::Type));
+                        }
+                        Ty::Nat
+                        | Ty::Int
+                        | Ty::Real
+                        | Ty::String
+                        | Ty::Boolean
+                        | Ty::Bound(_)
+                        | Ty::Rigid { .. }
+                        | Ty::Undecided => {}
+                    }
+                }
+                Work::Row(row) => {
+                    let row = self.table.canon(&row);
+                    work.push(Work::Rest(row.rest));
+                    for field in row.labels.into_values().rev() {
+                        work.push(Work::Type(field.ty));
+                        work.push(Work::Presence(field.presence));
+                    }
+                }
+                Work::Presence(presence) => self.recover_presence(span, &presence),
+                Work::Rest(rest) => {
+                    if let Rest::Var(var) = self.table.canon(&Row::of(rest)).rest {
+                        self.settle(span, var, Assigned::Row(Rc::new(Row::of(Rest::Undecided))));
+                    }
+                }
+            }
         }
     }
 

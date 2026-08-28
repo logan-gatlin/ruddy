@@ -9,6 +9,14 @@ use ruddy::types::{
     Sense, Shape, Ty,
 };
 
+fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
+    Rc::new(Ty::Named {
+        symbol,
+        name: Rc::from("Layer"),
+        args: vec![ty].into(),
+    })
+}
+
 fn pending_effect() -> EffectId {
     let bundle = Bundle::new("test", Version::new(1, 0, 0)).expect("valid bundle");
     let mut mint = Mint::new(bundle);
@@ -356,6 +364,47 @@ fn deep_formula_opening_and_use_site_walks_are_stack_safe() {
         .expect("the bounded-stack regression thread starts")
         .join()
         .expect("deep formula opening and reads use bounded stack");
+}
+
+#[test]
+fn deep_semantic_type_and_scheme_display_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-semantic-display".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let bundle = Bundle::new("deep-display", Version::new(1, 0, 0)).unwrap();
+            let mut mint = Mint::new(bundle);
+            let layer = mint
+                .global(None, Namespace::Types, "Layer")
+                .expect("a semantic name");
+            let mut ty = Rc::new(Ty::Nat);
+            for depth in 0..30_000 {
+                ty = match depth % 3 {
+                    0 => semantic_name(layer, ty),
+                    1 => Rc::new(Ty::Arrow(Rc::new(Ty::Nat), ty, Row::closed())),
+                    _ => Rc::new(Ty::Struct(Row {
+                        labels: [(
+                            "payload".into(),
+                            RowField {
+                                presence: Presence::Present,
+                                ty,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        rest: Rest::Closed,
+                    })),
+                };
+            }
+            let scheme = Scheme::new(0, ty);
+            let shown = scheme.to_string();
+            assert!(shown.contains("Layer"));
+            assert!(shown.contains("payload"));
+            std::mem::forget(scheme);
+        })
+        .expect("the bounded-stack display regression starts")
+        .join()
+        .expect("semantic display uses an explicit stack");
 }
 
 #[test]
