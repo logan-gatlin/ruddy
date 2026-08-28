@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::ROOT,
-    wire::{DependencySpec, Doc, DocMeta, FileSpec},
+    wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig},
 };
 
 const EXTENSION: &str = "hc";
@@ -31,6 +31,8 @@ struct Manifest {
     name: String,
     version: String,
     root: String,
+    #[serde(default, skip_serializing_if = "RunConfig::is_default")]
+    run: RunConfig,
     dependencies: IndexMap<String, DependencySpec>,
 }
 
@@ -153,6 +155,7 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
         bundle_name: manifest.name,
         version: manifest.version,
         root: manifest.root,
+        run: manifest.run,
         dependencies: manifest.dependencies,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
@@ -171,6 +174,7 @@ pub fn write(
     bundle_name: &str,
     version: &str,
     configured_root: &str,
+    run: &RunConfig,
     dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
@@ -180,6 +184,7 @@ pub fn write(
         name: bundle_name.to_string(),
         version: version.to_string(),
         root: configured_root.to_string(),
+        run: run.clone(),
         dependencies: dependencies.clone(),
     };
     let source = toml::to_string(&manifest).map_err(io::Error::other)?;

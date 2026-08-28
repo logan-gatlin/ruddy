@@ -415,6 +415,33 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         diagnostic.id = i as u32;
     }
 
+    // Code generation is always exposed by the debugger, independently of a
+    // project's manifest target. It consumes the same linked, in-memory root
+    // artifact as the command-line backend and is guarded like every other
+    // compiler phase.
+    let mut js_error = None;
+    let mut js_panicked = false;
+    let js = linked.as_ref().and_then(|linked| {
+        let started = Instant::now();
+        let out = guard("js", &mut panicked, || ruddy_js::generate(linked));
+        js_panicked = out.is_none();
+        micros.js = started.elapsed().as_micros() as u64;
+        match out {
+            Some(Ok(source)) => Some(source),
+            Some(Err(error)) => {
+                let message = error.to_string();
+                diagnostics.push(raw("js", "javascript-generation", message.clone(), None));
+                js_error = Some(message);
+                None
+            }
+            None => None,
+        }
+    });
+    diagnostics.sort_by_key(|d| d.span.map(|at| (at.file, at.range[0])).unwrap_or((0, 0)));
+    for (i, diagnostic) in diagnostics.iter_mut().enumerate() {
+        diagnostic.id = i as u32;
+    }
+
     // Every file the loader read, in load order, with what the page needs to
     // turn any `Loc` into a line and a column. Built from the loader's own list
     // rather than from the request, so a file no module declares is not in it
@@ -442,6 +469,9 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
         lir: lowered.as_ref(),
         artifact: artifact.as_ref(),
         linked: linked.as_ref(),
+        js: js.as_deref(),
+        js_error: js_error.as_deref(),
+        js_panicked,
         dependency_declarations: &req.dependencies,
         dependency_aliases: &dependency_aliases,
         dependencies: &dependency_artifacts,

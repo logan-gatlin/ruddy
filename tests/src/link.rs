@@ -475,8 +475,11 @@ fn compiled(source: &str) -> a::Artifact {
 }
 
 #[test]
-fn links_compiler_produced_wildcard_definitions_without_aliasing() {
+fn links_unexported_wildcard_definitions_without_aliasing() {
     let artifact = compiled("let _ = 1n\nlet _ = 2n\nlet keep = 3n\nlet _ = keep");
+    assert_eq!(artifact.header.values.len(), 1);
+    assert_eq!(artifact.header.values[0].name, "app@1.0.0::keep");
+
     let names: std::collections::HashSet<_> = artifact
         .lir
         .globals
@@ -486,6 +489,7 @@ fn links_compiler_produced_wildcard_definitions_without_aliasing() {
     assert_eq!(names.len(), 4);
 
     let linked = link::link(&[artifact]).unwrap();
+    assert_eq!(linked.header.values.len(), 1);
     assert_eq!(linked.lir.globals.len(), 4);
 }
 

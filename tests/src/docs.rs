@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use ruddy_debug::{
     docs::{delete, dependency_path, path, read, valid_file_path, valid_name, write},
-    wire::FileSpec,
+    wire::{FileSpec, RunConfig},
 };
 
 #[test]
@@ -96,12 +96,16 @@ fn a_document_round_trips_through_the_disk() {
         file("Math/Vec.hc", "let zero = 0n\n"),
     ];
     let dependencies = IndexMap::from([("base".into(), "../base".into())]);
+    let run = RunConfig {
+        js: Some("node".into()),
+    };
     write(
         &root,
         "demo",
         "configured",
         "1.2.3",
         "main.hc",
+        &run,
         &dependencies,
         &files,
     )
@@ -112,6 +116,7 @@ fn a_document_round_trips_through_the_disk() {
     assert_eq!(doc.bundle_name, "configured");
     assert_eq!(doc.version, "1.2.3");
     assert_eq!(doc.root, "main.hc");
+    assert_eq!(doc.run, run);
     assert!(matches!(
         &doc.dependencies["base"],
         ruddy_debug::wire::DependencySpec::Path(path)
@@ -144,6 +149,7 @@ fn the_configured_root_is_ordered_before_other_files() {
         "demo",
         "0.1.0",
         "start.hc",
+        &RunConfig::default(),
         &IndexMap::new(),
         &[file("main.hc", ""), file("start.hc", "")],
     )
@@ -172,6 +178,7 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "demo",
         "0.1.0",
         "main.hc",
+        &RunConfig::default(),
         &IndexMap::new(),
         &[
             file("main.hc", "module Math\n"),
@@ -186,6 +193,7 @@ fn a_write_deletes_a_file_dropped_from_the_set() {
         "demo",
         "0.1.0",
         "main.hc",
+        &RunConfig::default(),
         &IndexMap::new(),
         &[file("main.hc", "")],
     )

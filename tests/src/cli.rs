@@ -8,7 +8,8 @@ use std::{
 
 use ruddy::artifact::Artifact;
 use ruddy_cli::{
-    Lockfile, Outcome, build_project, check_project, clean_project, compile, new_project, run,
+    Lockfile, Outcome, build_project, check_project, clean_project, compile,
+    execute_javascript_module, new_project, run, run_project,
 };
 use tempfile::TempDir;
 
@@ -334,6 +335,14 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         (
             "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\n",
             "unknown field `title`",
+        ),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = 1\n[dependencies]\n",
+            "invalid type",
+        ),
+        (
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\n",
+            "unknown field `native`",
         ),
         ("title = \"app\"\n", "unknown field `title`"),
         (
@@ -1229,6 +1238,100 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
 }
 
 #[test]
+fn manifest_targets_select_root_javascript_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    new_project(&app).unwrap();
+
+    // Omission and an explicit library target retain artifact-only behavior.
+    let artifact = build_project(&app).unwrap();
+    assert!(artifact.is_file());
+    assert!(!app.join("build/app.js").exists());
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"lib\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert!(!app.join("build/app.js").exists());
+
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("target = \"lib\"", "target = \"js\""),
+    )
+    .unwrap();
+    assert_eq!(build_project(&app).unwrap(), artifact);
+    let javascript = fs::read_to_string(app.join("build/app.js")).unwrap();
+    assert!(!javascript.is_empty());
+
+    // Switching back does not implicitly clean a stale sibling product.
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("target = \"js\"", "target = \"lib\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert_eq!(
+        fs::read_to_string(app.join("build/app.js")).unwrap(),
+        javascript
+    );
+    clean_project(&app).unwrap();
+    assert!(!app.join("build").exists());
+}
+
+#[test]
+fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
+    let directory = tempfile::tempdir().unwrap();
+    let dependency = directory.path().join("dep");
+    let app = directory.path().join("app");
+    write_project(&dependency, "dep", "1.0.0", &[]);
+    write_project(&app, "app", "1.0.0", &[("dep", "../dep")]);
+    let manifest = fs::read_to_string(dependency.join("Ruddy.toml")).unwrap();
+    fs::write(
+        dependency.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    build_project(&app).unwrap();
+    assert!(dependency.join("build/dep.artifact").is_file());
+    assert!(!dependency.join("build/dep.js").exists());
+    assert!(!app.join("build/app.js").exists());
+
+    // A JS root with a dependency also proves generation receives the linked
+    // artifact: the compiler's pre-link root artifact still has dependencies
+    // and is intentionally rejected by the backend.
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+    build_project(&app).unwrap();
+    assert!(app.join("build/app.js").is_file());
+    assert!(!dependency.join("build/dep.js").exists());
+}
+
+#[test]
+fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
+    for target in ["\"native\"", "42"] {
+        let directory = project();
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!(
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = {target}\n[dependencies]\n"
+            ),
+        )
+        .unwrap();
+        let error = compile(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("could not parse manifest"), "{error}");
+    }
+}
+
+#[test]
 fn build_surfaces_compile_directory_and_artifact_write_failures() {
     let missing = tempfile::tempdir().unwrap();
     let compile_error = build_project(missing.path()).unwrap_err();
@@ -1295,6 +1398,8 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
         vec!["build", "elsewhere"],
         vec!["clean", "elsewhere"],
         vec!["check", "elsewhere"],
+        vec!["run", "elsewhere"],
+        vec!["r"],
         vec!["compile"],
     ] {
         let error = run(arguments, current.path()).unwrap_err();
@@ -1309,6 +1414,347 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
         assert_eq!(information.exit_code(), 0, "{information}");
         assert!(!information.is_usage(), "{information}");
     }
+}
+
+#[test]
+fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    fs::write(app.join("main.hc"), "let initialized = 1n\n").unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let expected = app.join("build/app.js");
+    assert_eq!(run_project(&app).unwrap(), expected);
+    assert_eq!(run(["run"], &app).unwrap(), Outcome::Ran(expected.clone()));
+    assert!(expected.is_file());
+    assert!(app.join("build/app.artifact").is_file());
+
+    let built_javascript = fs::read_to_string(&expected).unwrap();
+    let built_artifact = fs::read_to_string(app.join("build/app.artifact")).unwrap();
+    clean_project(&app).unwrap();
+    build_project(&app).unwrap();
+    assert_eq!(fs::read_to_string(&expected).unwrap(), built_javascript);
+    assert_eq!(
+        fs::read_to_string(app.join("build/app.artifact")).unwrap(),
+        built_artifact
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_uses_the_configured_javascript_shell_runner() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace(
+            "root = \"main.hc\"",
+            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        app.join("runner.sh"),
+        "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n",
+    )
+    .unwrap();
+
+    // Build configuration is inert until `run` is requested.
+    build_project(&app).unwrap();
+    assert!(!app.join("marker.txt").exists());
+
+    let expected = app.join("build/app.js");
+    assert_eq!(run_project(&app).unwrap(), expected);
+    assert_eq!(
+        fs::read_to_string(app.join("marker.txt")).unwrap(),
+        expected.to_string_lossy()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_javascript_runner_failures_preserve_build_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace(
+            "root = \"main.hc\"",
+            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"false\"",
+        ),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    assert!(error.to_string().contains("runner `false`"), "{error}");
+    assert!(error.to_string().contains("status: 1"), "{error}");
+    assert!(app.join("build/app.js").is_file());
+    assert!(app.join("build/app.artifact").is_file());
+}
+
+#[test]
+fn run_rejects_library_targets_without_executing_stale_javascript() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    fs::create_dir(app.join("build")).unwrap();
+    let stale = app.join("build/app.js");
+    fs::write(&stale, "throw new Error('stale JavaScript executed');\n").unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    assert!(error.to_string().contains("target = \"js\""), "{error}");
+    assert!(!error.to_string().contains("stale JavaScript"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&stale).unwrap(),
+        "throw new Error('stale JavaScript executed');\n"
+    );
+    assert!(app.join("build/app.artifact").is_file());
+}
+
+#[test]
+fn run_registers_the_standard_runtime_bundle() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("runtime");
+    write_project(&app, "runtime", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern cwd : {} -> String = process.cwd\n\
+         extern environment : {} = process.env\n\
+         extern console_object : {} = console\n\
+         extern url : {} = URL\n\
+         extern encoder : {} = TextEncoder\n\
+         extern decoder : {} = TextDecoder\n\
+         extern base64 : String -> String = btoa\n\
+         extern clone : {} -> {} = structuredClone\n\
+         extern microtask : ({} -> {}) -> {} = queueMicrotask\n\
+         extern timeout : ({} -> {}) -> Nat = setTimeout\n\
+         extern abort_controller : {} = AbortController\n\
+         extern fetch_value : String -> {} = fetch\n\
+         let initialized = 0n\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    run_project(&app).expect("all documented Boa runtime globals are registered");
+}
+
+#[test]
+fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("queued");
+    write_project(&app, "queued", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern queue : ({} -> {}) -> {} = queueMicrotask\n\
+         extern parse : String -> {} = JSON.parse\n\
+         let queued = queue (fn _ => parse \"{\")\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    let rendered = error.to_string().replace('\\', "/");
+    assert!(rendered.contains("JavaScript runtime"), "{rendered}");
+    assert!(rendered.contains("SyntaxError"), "{rendered}");
+    assert!(rendered.contains("build/queued.js"), "{rendered}");
+    assert!(rendered.contains(" at "), "{rendered}");
+    assert!(app.join("build/queued.js").is_file());
+    assert!(app.join("build/queued.artifact").is_file());
+}
+
+#[test]
+fn javascript_evaluation_rejection_does_not_wait_for_recurring_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("rejects.mjs");
+    fs::write(
+        &module,
+        "setInterval(() => {}, 60_000);\nthrow new Error('initialization failed');\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(
+        error.to_string().contains("initialization failed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn javascript_reports_unhandled_promises_despite_recurring_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("unhandled.mjs");
+    fs::write(
+        &module,
+        "Promise.reject(new Error('orphaned rejection'));\n\
+         setInterval(() => {}, 60_000);\n",
+    )
+    .unwrap();
+
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(
+        error.to_string().contains("unhandled promise rejection"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("orphaned rejection"), "{error}");
+}
+
+#[test]
+fn javascript_allows_a_deep_microtask_chain_to_handle_a_rejection() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("handled.mjs");
+    fs::write(
+        &module,
+        "const promise = Promise.reject(new Error('handled eventually'));\n\
+         function defer(depth) {\n\
+           Promise.resolve().then(() => {\n\
+             if (depth === 0) promise.catch(() => {});\n\
+             else defer(depth - 1);\n\
+           });\n\
+         }\n\
+         defer(10_000);\n",
+    )
+    .unwrap();
+
+    execute_javascript_module(&module).expect("the microtask checkpoint drains to quiescence");
+}
+
+#[test]
+fn javascript_reports_a_rejection_before_a_zero_delay_timer_can_handle_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("timer-is-too-late.mjs");
+    fs::write(
+        &module,
+        "const promise = Promise.reject(new Error('timer was too late'));\n\
+         setTimeout(() => promise.catch(() => {}), 0);\n",
+    )
+    .unwrap();
+
+    let error = execute_javascript_module(&module).unwrap_err();
+    assert!(
+        error.to_string().contains("unhandled promise rejection"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("timer was too late"), "{error}");
+}
+
+#[test]
+fn javascript_runs_a_microtask_checkpoint_between_timer_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("timer-microtask-order.mjs");
+    fs::write(
+        &module,
+        "const order = [];\n\
+         setTimeout(() => {\n\
+           order.push('first timer');\n\
+           queueMicrotask(() => order.push('microtask'));\n\
+         }, 0);\n\
+         setTimeout(() => {\n\
+           order.push('second timer');\n\
+           if (order.join(',') !== 'first timer,microtask,second timer') {\n\
+             throw new Error(`wrong task order: ${order}`);\n\
+           }\n\
+         }, 0);\n",
+    )
+    .unwrap();
+
+    execute_javascript_module(&module).expect("microtasks run between timer tasks");
+}
+
+#[test]
+fn javascript_does_not_sleep_for_a_timer_cleared_by_an_earlier_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("cleared-future-timer.mjs");
+    fs::write(
+        &module,
+        "const future = setTimeout(() => {\n\
+           throw new Error('cleared timer ran');\n\
+         }, 2_000);\n\
+         setTimeout(() => clearTimeout(future), 0);\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    execute_javascript_module(&module).expect("clearing the only future timer ends execution");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "executor slept for the canceled timer: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn javascript_does_not_reschedule_an_interval_that_clears_itself() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("self-clearing-interval.mjs");
+    fs::write(
+        &module,
+        "const interval = setInterval(() => clearInterval(interval), 500);\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    execute_javascript_module(&module).expect("a self-clearing interval terminates");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(850),
+        "self-cleared interval was rescheduled: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn run_reports_missing_externs_with_javascript_source_locations() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("missing");
+    write_project(&app, "missing", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern unavailable : Nat = ruddy_runtime.unavailable\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    let rendered = error.to_string().replace('\\', "/");
+    assert!(rendered.contains("missing Ruddy extern"), "{rendered}");
+    assert!(rendered.contains("ruddy_runtime.unavailable"), "{rendered}");
+    assert!(rendered.contains("build/missing.js"), "{rendered}");
+    assert!(app.join("build/missing.js").is_file());
+    assert!(app.join("build/missing.artifact").is_file());
 }
 
 #[test]

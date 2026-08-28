@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use ruddy::tracking::{FileID, Span};
-pub use ruddy_cli::{DependencyDetail, DependencySpec};
+pub use ruddy_cli::{DependencyDetail, DependencySpec, RunConfig};
 use serde::{Deserialize, Serialize};
 
 /// A byte range in one file, `[start, end)`. Always UTF-8 offsets, matching
@@ -299,6 +299,7 @@ pub struct Doc {
     pub bundle_name: String,
     pub version: String,
     pub root: String,
+    pub run: RunConfig,
     pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
@@ -314,6 +315,8 @@ pub struct DocBody {
     pub version: Option<String>,
     #[serde(default = "default_root")]
     pub root: String,
+    #[serde(default)]
+    pub run: RunConfig,
     #[serde(default)]
     pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,

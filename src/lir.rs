@@ -397,6 +397,19 @@ struct Capture {
     rep: Rep,
 }
 
+/// A local function whose binding is in scope in its own body.
+///
+/// Its closure cannot be captured from the surrounding block: that closure is
+/// the value the function is still in the middle of producing. Instead, the
+/// lifted body reconstructs the same closure from its own function identity
+/// and capture parameters. [`Lower::local`] creates that reconstruction lazily
+/// when the recursive name is actually used.
+struct Recursive {
+    symbol: Symbol,
+    ty: Rc<Ty>,
+    temp: Option<Temp>,
+}
+
 /// What one function being built knows: the names in scope, the evidence in
 /// scope, the handler a `raise` in it unwinds to, and what it has had to capture
 /// so far.
@@ -408,6 +421,14 @@ struct Capture {
 #[derive(Default)]
 struct Frame {
     locals: IndexMap<Symbol, Temp>,
+    /// Present on the frame of a directly let-bound local `fn`. The binding is
+    /// recursive at the language level, but costs nothing here unless its body
+    /// actually names itself.
+    recursive: Option<Recursive>,
+    /// Instructions that must run before the written body. A recursive
+    /// function's reconstructed self closure is emitted here after its capture
+    /// list is known.
+    prologue: Vec<Instr>,
     /// Effect name → the record of that effect's operation closures.
     evidence: IndexMap<String, Temp>,
     /// The bundles standing in for the variable part of a row, by which
@@ -1868,12 +1889,58 @@ impl Lower<'_> {
     }
 
     /// A local name's temp: the frame that binds it, threaded in.
+    ///
+    /// A recursive local function has no outer temp to capture while its value
+    /// is being built. On its first use, mint a temp in the function's own
+    /// frame for a closure over the lifted function and that frame's eventual
+    /// capture parameters. The instruction is held in the frame's prologue;
+    /// [`Lower::lambda`] fills in the function and captures once body lowering
+    /// has discovered both.
     fn local(&mut self, symbol: Symbol) -> Option<Temp> {
-        let at = self
-            .frames
-            .iter()
-            .rposition(|frame| frame.locals.contains_key(&symbol))?;
-        let temp = self.frames[at].locals[&symbol];
+        let at = self.frames.iter().rposition(|frame| {
+            frame.locals.contains_key(&symbol)
+                || frame
+                    .recursive
+                    .as_ref()
+                    .is_some_and(|recursive| recursive.symbol == symbol)
+        })?;
+        let temp = match self.frames[at].locals.get(&symbol).copied() {
+            Some(temp) => temp,
+            None => match self.frames[at]
+                .recursive
+                .as_ref()
+                .and_then(|recursive| recursive.temp)
+            {
+                Some(temp) => temp,
+                None => {
+                    let ty = self.frames[at]
+                        .recursive
+                        .as_ref()
+                        .expect("the matching frame has a recursive binding")
+                        .ty
+                        .clone();
+                    let temp = self.fresh(Rep::Fn);
+                    self.hold(temp, &ty);
+                    let frame = &mut self.frames[at];
+                    frame
+                        .recursive
+                        .as_mut()
+                        .expect("the matching frame has a recursive binding")
+                        .temp = Some(temp);
+                    frame.prologue.push(Instr {
+                        temp,
+                        rep: Rep::Fn,
+                        span: Span::default(),
+                        // Patched before this frame becomes a [`Function`].
+                        op: Op::Closure {
+                            func: FuncId::MAX,
+                            captures: Vec::new(),
+                        },
+                    });
+                    temp
+                }
+            },
+        };
         Some(self.thread(at, temp))
     }
 
@@ -1989,7 +2056,16 @@ impl Lower<'_> {
                 body: rest,
                 ..
             } => {
-                let temp = self.term(value, body);
+                // A local function's name is in scope in its own value. Its
+                // closure does not exist yet, so [`Lower::lambda`] gives the
+                // lifted body a way to reconstruct it instead of letting the
+                // name fall through to a bogus global read.
+                let temp = match &value.kind {
+                    TermKind::Fn { arg, body: inner } => {
+                        self.lambda(value, arg.tracked, inner, body, Some(name.tracked))
+                    }
+                    _ => self.term(value, body),
+                };
                 self.top().locals.insert(name.tracked, temp);
                 self.term(rest, body)
             }
@@ -2037,7 +2113,7 @@ impl Lower<'_> {
                     self.fitted(&term.ty, &have, temp, body)
                 }
             },
-            TermKind::Fn { arg, body: inner } => self.lambda(term, arg.tracked, inner, body),
+            TermKind::Fn { arg, body: inner } => self.lambda(term, arg.tracked, inner, body, None),
             TermKind::Apply { .. } => self.apply(term, body),
             TermKind::Operation { selector, .. } => {
                 self.operation_value(term, Self::operation_slot(&selector.tracked), body)
@@ -2065,10 +2141,29 @@ impl Lower<'_> {
     /// One source `fn`, lifted: a top-level function taking its captures, then
     /// its own arrow's evidence, then its one visible argument, and a `closure`
     /// here pairing the two.
-    fn lambda(&mut self, term: &Term, arg: Symbol, inner: &Term, body: &mut Body) -> Temp {
+    ///
+    /// `recursive` is the name of a directly enclosing local `let`, when there
+    /// is one. A use of it is reconstructed in the lifted body's prologue from
+    /// this function's identity and inner capture parameters; the outer closure
+    /// is still built here from the corresponding outer temps.
+    fn lambda(
+        &mut self,
+        term: &Term,
+        arg: Symbol,
+        inner: &Term,
+        body: &mut Body,
+        recursive: Option<Symbol>,
+    ) -> Temp {
         let (from, _, row) = self.arrow(&term.ty);
 
-        self.frames.push(Frame::default());
+        self.frames.push(Frame {
+            recursive: recursive.map(|symbol| Recursive {
+                symbol,
+                ty: term.ty.clone(),
+                temp: None,
+            }),
+            ..Frame::default()
+        });
         let mut params = Vec::new();
         self.evidence_params(&row, &mut params);
         let rep = self.rep(&from);
@@ -2079,13 +2174,28 @@ impl Lower<'_> {
 
         let mut lifted = Body::default();
         let value = self.term(inner, &mut lifted);
-        let frame = self.frames.pop().expect("the frame just pushed");
+        let mut frame = self.frames.pop().expect("the frame just pushed");
+        let name = self.lifted_name();
+        let id = self.slot(name.clone());
+        if frame
+            .recursive
+            .as_ref()
+            .is_some_and(|recursive| recursive.temp.is_some())
+        {
+            let captures: Vec<Temp> = frame.captures.iter().map(|capture| capture.inner).collect();
+            for self_closure in &mut frame.prologue {
+                self_closure.op = Op::Closure {
+                    func: id,
+                    captures: captures.clone(),
+                };
+            }
+        }
+        frame.prologue.append(&mut lifted.instrs);
+        lifted.instrs = std::mem::take(&mut frame.prologue);
         let lifted = lifted.seal(Terminator {
             span: inner.span,
             kind: End::Ret(value),
         });
-        let name = self.lifted_name();
-        let id = self.slot(name.clone());
         let captures: Vec<Temp> = frame.captures.iter().map(|capture| capture.outer).collect();
         let params = Self::with_captures(&frame, params);
         self.fill(

@@ -1737,7 +1737,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     let valid = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
          (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty nat)))) \
-         (types) (effects)) (lir (functions) (globals)))"
+         (types) (effects)) (lir (externs) (functions) (globals)))"
     );
 
     std::thread::Builder::new()
