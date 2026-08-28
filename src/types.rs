@@ -77,6 +77,13 @@ impl EffectId {
     /// canonical; the unit-separator spelling remains readable so old artifact
     /// rows can be normalized while importing them.
     pub fn parse_row_key(key: &str) -> Option<(&str, &str)> {
+        Self::parse_canonical_row_key(key).or_else(|| key.split_once('\u{1f}'))
+    }
+
+    /// Decode only the canonical generated spelling. UI code uses this when a
+    /// sum-shaped type argument has no explicit row sense: legacy separators
+    /// are artifact input, not enough evidence that an ordinary sum is effects.
+    pub fn parse_canonical_row_key(key: &str) -> Option<(&str, &str)> {
         fn component<'a>(key: &'a str, at: &mut usize) -> Option<&'a str> {
             let bytes = key.as_bytes();
             let start = *at;
@@ -94,13 +101,11 @@ impl EffectId {
             Some(value)
         }
 
-        if let Some(rest) = key.strip_prefix("\u{1e}e") {
-            let mut at = 0;
-            let name = component(rest, &mut at)?;
-            let interface = component(rest, &mut at)?;
-            return (at == rest.len()).then_some((name, interface));
-        }
-        key.split_once('\u{1f}')
+        let rest = key.strip_prefix("\u{1e}e")?;
+        let mut at = 0;
+        let name = component(rest, &mut at)?;
+        let interface = component(rest, &mut at)?;
+        (at == rest.len()).then_some((name, interface))
     }
 
     pub fn name(&self) -> &str {
@@ -501,6 +506,10 @@ pub enum Presence {
     /// a closed one that lacks the label.
     Absent,
     Var(TyVar),
+    /// A foreign solver variable retained only long enough to canonicalize an
+    /// imported interface. Its namespace is disjoint from both local variables
+    /// and scheme bounds; opening an imported scheme recovers it to undecided.
+    Recovered(TyVar),
     /// A presence a scheme quantified, which prints as the `when` clause on its
     /// label: `{x when a: Nat}`, and `#A (when a) Nat`.
     Bound(u32),
@@ -1328,10 +1337,9 @@ impl Presence {
             Presence::Absent => Formula::False,
             Presence::Var(var) => Formula::var(*var),
             Presence::Bound(index) => Formula::bound(*index),
-            // A failure abandoned the question, so there is nothing here to
-            // require — and requiring anything would be the first complaint
-            // said again in a second place.
-            Presence::Undecided => Formula::True,
+            // Recovery and an abandoned question impose no requirement; doing
+            // otherwise would repeat the original failure in a second place.
+            Presence::Recovered(_) | Presence::Undecided => Formula::True,
         }
     }
 }

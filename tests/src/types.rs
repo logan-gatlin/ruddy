@@ -21,6 +21,15 @@ fn effect_row_keys_are_unambiguous_and_read_legacy_artifacts() {
         Some(("A", "legacy"))
     );
     assert_eq!(EffectId::parse_row_key("\u{1e}e1:A1:xjunk"), None);
+    assert_eq!(
+        EffectId::parse_row_key("\u{1e}e1:A1:xjunk\u{1f}legacy"),
+        Some(("\u{1e}e1:A1:xjunk", "legacy"))
+    );
+    assert_eq!(
+        EffectId::parse_canonical_row_key(&first),
+        Some(("A\u{1f}B", "C:1"))
+    );
+    assert_eq!(EffectId::parse_canonical_row_key("A\u{1f}legacy"), None);
     assert_eq!(EffectId::parse_row_key("\u{1e}e"), None);
     assert_eq!(EffectId::parse_row_key("\u{1e}eA"), None);
     assert_eq!(EffectId::parse_row_key("\u{1e}e1A"), None);
@@ -37,6 +46,27 @@ fn semantic_name(symbol: ruddy::symbol::Symbol, ty: Rc<Ty>) -> Rc<Ty> {
         name: Rc::from("Layer"),
         args: vec![ty].into(),
     })
+}
+
+#[test]
+fn opening_scrubs_imported_recovery_presences_before_solving() {
+    let recovered = Ty::Struct(Row {
+        labels: [(
+            "x".into(),
+            RowField {
+                presence: Presence::Recovered(u32::MAX),
+                ty: Rc::new(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    });
+    let opened = recovered.open(&[]);
+    let Ty::Struct(row) = &*opened else {
+        panic!("opened recovery type was not a struct")
+    };
+    assert!(matches!(row.labels["x"].presence, Presence::Undecided));
 }
 
 #[test]

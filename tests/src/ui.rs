@@ -22,7 +22,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Namespace, Version},
     token::{self, ErrorKind as LexError, Kind as TokenKind},
     tracking::{FileID, Span},
-    types::{Assigned, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
+    types::{Assigned, EffectId, Formula, Presence, Prim, Rest, Row, RowField, Sense, Shape, Ty},
     ui::{self, Entry, Mark},
 };
 use ruddy_debug::print;
@@ -645,11 +645,11 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
     let row = Row {
         labels: [
             (
-                "Log\u{1f}write:Nat".to_string(),
+                EffectId::structural("Log".into(), "write:Nat".into()).row_key(),
                 RowField::present(unit.clone()),
             ),
             (
-                "Gone\u{1f}gone:Nat".to_string(),
+                EffectId::structural("Gone".into(), "gone:Nat".into()).row_key(),
                 RowField {
                     presence: Presence::Absent,
                     ty: unit.clone(),
@@ -664,8 +664,8 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
     let effect_argument = Rc::new(Ty::plain(Ty::Sum(row.clone())));
     let ordinary_sum_argument = Rc::new(Ty::plain(Ty::Sum(Row {
         labels: [(
-            "ordinary".to_string(),
-            RowField::present(Rc::new(Ty::unit())),
+            "user\u{1f}payload".to_string(),
+            RowField::present(nat.clone()),
         )]
         .into_iter()
         .collect(),
@@ -690,7 +690,7 @@ fn applied_effect_rows_hide_only_their_generated_identity_suffixes() {
     .to_string();
 
     assert!(
-        applied.starts_with("Runner (#Log | #plain) (#ordinary) "),
+        applied.starts_with("Runner (#Log | #plain) (#\"user\u{1f}payload\" Nat) "),
         "{applied:?}"
     );
     assert!(applied.ends_with("{ x: Nat }"), "{applied:?}");
@@ -2016,14 +2016,28 @@ fn flattened_rows_print_with_outer_wins_and_hide_interface_keys() {
         outer.to_string(),
         "{ \"Log\u{1f}generated-interface\": {} }"
     );
-    // In an applied effect-interface position, every More layer participates
-    // in identity stripping; the opaque separator and suffix never leak.
+    // In a normalized applied effect-interface position, every More layer
+    // participates in identity stripping; a legacy separator alone remains
+    // ordinary sum data, as the assertions above show.
+    let effect_inner = Row {
+        labels: [(
+            EffectId::structural("Log".into(), "generated-interface".into()).row_key(),
+            RowField::present(Rc::new(Ty::unit())),
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    };
+    let effect_outer = Row {
+        labels: Default::default(),
+        rest: Rest::More(Rc::new(effect_inner)),
+    };
     let mut mint = Mint::new(Bundle::new("test", Version::new(0, 1, 0)).unwrap());
     let runner = mint.global(None, Namespace::Types, "Runner").unwrap();
     let applied = Ty::Named {
         symbol: runner,
         name: "Runner".into(),
-        args: vec![Rc::new(Ty::Sum(outer))].into(),
+        args: vec![Rc::new(Ty::Sum(effect_outer))].into(),
     };
     assert_eq!(applied.to_string(), "Runner (#Log)");
 

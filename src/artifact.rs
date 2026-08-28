@@ -1719,7 +1719,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         types::Presence::Absent => Presence::Absent,
         types::Presence::Var(value) => Presence::Var(*value),
         types::Presence::Bound(value) => Presence::Bound(*value),
-        types::Presence::Undecided => Presence::Undecided,
+        types::Presence::Recovered(_) | types::Presence::Undecided => Presence::Undecided,
     };
     let rest = |value: &types::Rest| match value {
         types::Rest::Closed => Some(Rest::Closed),

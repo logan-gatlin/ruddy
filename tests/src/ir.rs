@@ -6430,6 +6430,139 @@ fn effect_identity_alpha_normalizes_presence_variables_and_keeps_correlation() {
 }
 
 #[test]
+fn operation_inputs_and_outputs_share_one_presence_alpha_scope() {
+    let source = "module Shared =
+                    effect Probe = { op: { x when 'p: Nat } -> { y when 'p: Nat } }
+                  end
+                  module Renamed =
+                    effect Probe = { op: { x when 'q: Nat } -> { y when 'q: Nat } }
+                  end
+                  module Independent =
+                    effect Probe = { op: { x when 'p: Nat } -> { y when 'q: Nat } }
+                  end";
+    let (mint, out) = build_src(source);
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
+fn imported_bound_presences_are_local_to_each_scheme_instantiation() {
+    let mut dependency = effect_artifact("dep", "bound-scopes");
+    let declaration = |name: &str| a::DeclaredType {
+        name: format!("dep@1.0.0::{name}"),
+        params: Vec::new(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::True,
+            body: artifact_struct(vec![
+                (
+                    "x".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "y".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ]),
+        },
+    };
+    dependency.header.types = vec![declaration("A"), declaration("B")];
+    let parsed = parse::parse(
+        lex(
+            "module Imported = effect Probe = { op: { a: dep::A, b: dep::B } -> () } end
+\
+             module Independent = effect Probe = { op: { a: { x when 'p: Nat, y when 'p: Nat }, b: { x when 'q: Nat, y when 'q: Nat } } -> () } end
+\
+             module Correlated = effect Probe = { op: { a: { x when 'p: Nat, y when 'p: Nat }, b: { x when 'p: Nat, y when 'p: Nat } } -> () } end",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let identities: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Probe")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(identities.len(), 3, "{:#?}", out.errors);
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[test]
+fn imported_presence_vars_use_a_disjoint_recovery_variant() {
+    let mut dependency = effect_artifact("dep", "recovered-presence");
+    dependency.header.types.push(a::DeclaredType {
+        name: "dep@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: a::Scheme {
+            count: 1,
+            presences: 1,
+            formula: a::Formula::True,
+            body: artifact_struct(vec![
+                (
+                    "bound".into(),
+                    a::RowField {
+                        presence: a::Presence::Bound(0),
+                        ty: a::Type::Nat,
+                    },
+                ),
+                (
+                    "foreign".into(),
+                    a::RowField {
+                        presence: a::Presence::Var(0x8000_0000),
+                        ty: a::Type::Nat,
+                    },
+                ),
+            ]),
+        },
+    });
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { op: dep::Carrier -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let carrier = out
+        .program
+        .external_types
+        .iter()
+        .find_map(|(symbol, declaration)| {
+            (mint.name(*symbol) == "dep@1.0.0::Carrier").then_some(declaration)
+        })
+        .expect("the imported carrier");
+    let Ty::Struct(row) = &**carrier.scheme.body() else {
+        panic!("carrier body was not a struct")
+    };
+    assert!(matches!(row.labels["bound"].presence, Presence::Bound(0)));
+    assert!(matches!(
+        row.labels["foreign"].presence,
+        Presence::Recovered(0x8000_0000)
+    ));
+}
+
+#[test]
 fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion() {
     let mut source = String::from("effect Branch0 = { op: () -> () }\n");
     for depth in 1..=30 {

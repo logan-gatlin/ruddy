@@ -632,7 +632,7 @@ impl Solve<'_> {
                         Presence::Present => tagged(0, []),
                         Presence::Absent => tagged(1, []),
                         Presence::Var(var) | Presence::Bound(var) => tagged(2, [u64::from(*var)]),
-                        Presence::Undecided => tagged(3, []),
+                        Presence::Recovered(_) | Presence::Undecided => tagged(3, []),
                     }
                 }
 
@@ -1597,19 +1597,38 @@ impl Solve<'_> {
                             let growing =
                                 pair.as_ref()
                                     .is_some_and(|(key, _, (later_left, later_right))| {
-                                        (self.nominal.contains(&key.0)
-                                            == self.nominal.contains(&key.1))
-                                            && assumption_index.get(key).is_some_and(|entries| {
-                                                entries.iter().any(|at| {
-                                                let (earlier_left, earlier_right) =
-                                                    &assumption_arguments[at];
-                                                let left =
-                                                    self.embeds_arguments(earlier_left, later_left);
-                                                let right = self
-                                                    .embeds_arguments(earlier_right, later_right);
-                                                matches!((left, right), (Some(a), Some(b)) if a | b)
-                                            })
-                                            })
+                                        assumption_index.get(key).is_some_and(|entries| {
+                                            let mixed = self.nominal.contains(&key.0)
+                                                != self.nominal.contains(&key.1);
+                                            // A mixed relevance class may make
+                                            // one finite change before reaching
+                                            // its real mismatch. Require growth
+                                            // on two successive open goals in
+                                            // that recovery-only case; malformed
+                                            // constructor growth remains
+                                            // unbounded and reaches this guard.
+                                            (!mixed || entries.len() >= 2)
+                                                && entries
+                                                    .iter()
+                                                    .rev()
+                                                    .take(if mixed { 1 } else { entries.len() })
+                                                    .any(|at| {
+                                                        let (earlier_left, earlier_right) =
+                                                            &assumption_arguments[at];
+                                                        let left = self.embeds_arguments(
+                                                            earlier_left,
+                                                            later_left,
+                                                        );
+                                                        let right = self.embeds_arguments(
+                                                            earlier_right,
+                                                            later_right,
+                                                        );
+                                                        matches!(
+                                                            (left, right),
+                                                            (Some(a), Some(b)) if a | b
+                                                        )
+                                                    })
+                                        })
                                     });
                             if already {
                                 self.step(span, Rule::Assume, goal, Effect::None);

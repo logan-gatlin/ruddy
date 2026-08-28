@@ -2936,6 +2936,83 @@ fn malformed_nominal_cross_alias_growth_is_absorbed() {
     assert!(output.steps.iter().any(|step| step.rule == Rule::Absorb));
 }
 
+/// Relevance metadata on imported declarations is recovery input too. A
+/// malformed structural alias growing against a nominal alias must still reach
+/// the growth guard rather than allocating an unbounded sequence of goals.
+#[test]
+fn malformed_mixed_class_cross_alias_growth_is_absorbed() {
+    let parsed = parse::parse(
+        lex(
+            "type A 'a = Nat\n\
+             type B 'a = Nat\n\
+             let f : A Nat -> B Nat = fn x => x",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let mut lowered = ir::build(&mut mint, parsed.stmts);
+    let a = symbol_named(&mint, lowered.program.types.keys().copied(), "A");
+    let b = symbol_named(&mint, lowered.program.types.keys().copied(), "B");
+    lowered.program.types.shift_remove(&a);
+    lowered.program.types.shift_remove(&b);
+
+    let wrapped = Rc::new(Ty::Struct(Row {
+        labels: [("x".into(), RowField::present(Rc::new(Ty::Bound(0))))]
+            .into_iter()
+            .collect(),
+        rest: Rest::Closed,
+    }));
+    lowered.program.external_types.insert(
+        a,
+        ir::ExternalType {
+            params: vec![ParamKind::Type {
+                lacks: Default::default(),
+            }],
+            relevant: vec![false],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Struct(Row {
+                    labels: [(
+                        "next".into(),
+                        RowField::present(semantic_named(a, vec![wrapped])),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                })),
+            ),
+            unresolved: None,
+        },
+    );
+    lowered.program.external_types.insert(
+        b,
+        ir::ExternalType {
+            params: vec![ParamKind::Type {
+                lacks: Default::default(),
+            }],
+            relevant: vec![true],
+            scheme: Scheme::new(
+                1,
+                Rc::new(Ty::Struct(Row {
+                    labels: [(
+                        "next".into(),
+                        RowField::present(semantic_named(b, vec![Rc::new(Ty::Bound(0))])),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    rest: Rest::Closed,
+                })),
+            ),
+            unresolved: None,
+        },
+    );
+
+    let output = inference::infer(&mint, &mut lowered.program);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    assert!(output.steps.iter().any(|step| step.rule == Rule::Absorb));
+}
+
 /// Even malformed imported growth is reflexive. For
 /// `A 'a = { next: A { x: 'a } }`, an identical `A Nat ~ A Nat` goal unfolds
 /// into synchronized growth on both sides. The recovery guard absorbs that

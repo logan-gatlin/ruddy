@@ -1289,7 +1289,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                         if flattened_row(row)
                             .0
                             .iter()
-                            .any(|(name, _)| EffectId::parse_row_key(name).is_some()) =>
+                            .any(|(name, _)| EffectId::parse_canonical_row_key(name).is_some()) =>
                     {
                         work.push(SemanticJob::Cases(row, true));
                     }
@@ -1386,7 +1386,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
             }
             SemanticJob::Case(name, field, strip_interface) => {
                 let name = if strip_interface {
-                    EffectId::parse_row_key(name).map_or(name, |pair| pair.0)
+                    EffectId::parse_canonical_row_key(name).map_or(name, |pair| pair.0)
                 } else {
                     name
                 };
@@ -1458,7 +1458,7 @@ fn write_semantic_mark(
     };
     match presence {
         Presence::Present | Presence::Absent => Ok(()),
-        Presence::Undecided => f.write_str("?"),
+        Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
         Presence::Var(var) => write!(f, "{open}?{var}{close}"),
         Presence::Bound(index) => write!(f, "{open}{}{close}", name_at(*index)),
     }
@@ -1519,7 +1519,7 @@ impl fmt::Display for Presence {
             Presence::Absent => f.write_str("absent"),
             Presence::Var(var) => write!(f, "?{var}"),
             Presence::Bound(index) => f.write_str(&name_at(*index)),
-            Presence::Undecided => f.write_str("?"),
+            Presence::Recovered(_) | Presence::Undecided => f.write_str("?"),
         }
     }
 }

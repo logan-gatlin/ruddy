@@ -2633,6 +2633,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                         // `open_type` bounds-checks malformed positions and
                         // turns them into Undecided before solving.
                         Presence::Bound(index) => Presence::Bound(index),
+                        Presence::Recovered(index) => Presence::Recovered(index),
                         Presence::Var(_) | Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
@@ -2933,10 +2934,10 @@ fn import_type(
                         artifact::Presence::Absent => Presence::Absent,
                         artifact::Presence::Bound(index) => Presence::Bound(index),
                         // Foreign solver variables cannot enter this solver's
-                        // ID space. Keep their correlation in a disjoint
-                        // recovery-bound spelling; opening an out-of-range
-                        // bound recovers to Undecided rather than indexing.
-                        artifact::Presence::Var(index) => Presence::Bound(index ^ 0x8000_0000),
+                        // ID space. Keep their correlation in an out-of-band
+                        // recovery namespace which cannot collide with any
+                        // valid (or malformed) scheme-bound index.
+                        artifact::Presence::Var(index) => Presence::Recovered(index),
                         artifact::Presence::Undecided => Presence::Undecided,
                     };
                     let ty = match presence {
@@ -3320,6 +3321,31 @@ fn canonical_effect_interface(interface: &str) -> String {
     arena.encode(root)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SemanticPresenceKey {
+    Bound { instantiation: usize, index: u32 },
+    Recovered { instantiation: usize, id: u32 },
+}
+
+/// The alpha alphabet of one operation signature. Its input and output share
+/// this scope, while every imported scheme instantiation receives a child
+/// namespace for its bound presences.
+#[derive(Default)]
+struct CanonicalPresenceScope {
+    written: HashMap<String, usize>,
+    semantic: HashMap<SemanticPresenceKey, usize>,
+    next_alpha: usize,
+    next_instantiation: usize,
+}
+
+impl CanonicalPresenceScope {
+    fn instantiation(&mut self) -> usize {
+        let id = self.next_instantiation;
+        self.next_instantiation += 1;
+        id
+    }
+}
+
 /// A finite presentation of a regular type tree. Named declarations are
 /// memoized as graph nodes and then minimized by bisimulation before they are
 /// spelled. This deliberately canonicalizes the *infinite unfolding*, rather
@@ -3390,7 +3416,12 @@ impl RegularType<'_> {
     /// continuation stack. Effect spellings have already been resolved by the
     /// outer dependency work list, so crossing type/effect/type boundaries
     /// never re-enters this walk on the native stack.
-    fn source(&mut self, ty: &Type, args: &[usize]) -> usize {
+    fn source(
+        &mut self,
+        ty: &Type,
+        args: &[usize],
+        presence_scope: &mut CanonicalPresenceScope,
+    ) -> usize {
         enum Work<'a> {
             Type(&'a Type, Vec<usize>),
             CoreTail(&'a Option<Tail>, Vec<usize>),
@@ -3408,8 +3439,6 @@ impl RegularType<'_> {
 
         let mut work = vec![Work::Type(ty, args.to_vec())];
         let mut values = Vec::new();
-        let mut presences = HashMap::new();
-        let mut next_presence = 0usize;
         while let Some(part) = work.pop() {
             match part {
                 Work::Atom(label) => values.push(self.atom(label)),
@@ -3444,11 +3473,9 @@ impl RegularType<'_> {
                             .iter()
                             .map(|(name, field)| {
                                 let presence = match field {
-                                    TypeField::Written { when, .. } => canonical_written_presence(
-                                        when,
-                                        &mut presences,
-                                        &mut next_presence,
-                                    ),
+                                    TypeField::Written { when, .. } => {
+                                        canonical_written_presence(when, presence_scope)
+                                    }
                                     TypeField::Absent { .. } => "\\".into(),
                                 };
                                 (name.clone(), presence)
@@ -3470,11 +3497,9 @@ impl RegularType<'_> {
                             .iter()
                             .map(|(name, case)| {
                                 let presence = match case {
-                                    SumCase::Written { when, .. } => canonical_written_presence(
-                                        when,
-                                        &mut presences,
-                                        &mut next_presence,
-                                    ),
+                                    SumCase::Written { when, .. } => {
+                                        canonical_written_presence(when, presence_scope)
+                                    }
                                     SumCase::Absent { .. } => "\\".into(),
                                 };
                                 format!("label:{name}:{presence}")
@@ -3553,7 +3578,7 @@ impl RegularType<'_> {
                     for label in row.effects.values().rev() {
                         let presence = match label {
                             EffectLabel::Written { when, .. } => {
-                                canonical_written_presence(when, &mut presences, &mut next_presence)
+                                canonical_written_presence(when, presence_scope)
                             }
                             EffectLabel::Absent { .. } => "\\".into(),
                         };
@@ -3586,7 +3611,7 @@ impl RegularType<'_> {
                     } else {
                         // Imported semantic trees have their own iterative
                         // continuation walk and share this graph's named memo.
-                        let id = self.semantic_work(symbol, args);
+                        let id = self.semantic_work(symbol, args, presence_scope);
                         values.push(id);
                     }
                 }
@@ -3628,37 +3653,16 @@ impl RegularType<'_> {
     /// at this level: finite permutations of such roots must reach their exact
     /// memo key instead of being absorbed as growth.
     ///
-    /// Successful reachability only grows while placeholders are filled, so it
-    /// is safe to retain across the whole imported walk. A large finite orbit
-    /// can otherwise ask the same SCC question millions of times.
-    fn grows(
-        nodes: &[RegularNode],
-        known_retained: &mut HashSet<(usize, usize)>,
-        before: &[usize],
-        after: &[usize],
-    ) -> bool {
-        fn retained(
-            nodes: &[RegularNode],
-            known: &mut HashSet<(usize, usize)>,
-            needle: usize,
-            root: usize,
-        ) -> bool {
-            known.contains(&(needle, root))
-                || RegularType::retains(nodes, needle, root) && {
-                    known.insert((needle, root));
-                    true
-                }
-        }
-
+    fn grows(nodes: &[RegularNode], before: &[usize], after: &[usize]) -> bool {
         before.len() == after.len()
             && before
                 .iter()
                 .zip(after)
-                .all(|(before, after)| retained(nodes, known_retained, *before, *after))
+                .all(|(before, after)| RegularType::retains(nodes, *before, *after))
             && before
                 .iter()
                 .zip(after)
-                .any(|(before, after)| !retained(nodes, known_retained, *after, *before))
+                .any(|(before, after)| !RegularType::retains(nodes, *after, *before))
     }
 
     /// Build imported semantic types without borrowing the host stack. The
@@ -3666,12 +3670,17 @@ impl RegularType<'_> {
     /// it may contain a growing recursive application. Hash-consed argument
     /// nodes make finite regular applications meet `named`; structural
     /// embedding rejects only an active constructor-growing application.
-    fn semantic_work(&mut self, symbol: Symbol, args: Vec<usize>) -> usize {
+    fn semantic_work(
+        &mut self,
+        symbol: Symbol,
+        args: Vec<usize>,
+        presence_scope: &mut CanonicalPresenceScope,
+    ) -> usize {
         use crate::types::{Presence, Rest};
 
         enum Work<'a> {
-            Type(&'a Ty, Vec<usize>, bool),
-            Row(&'a crate::types::Row, Vec<usize>, bool, bool),
+            Type(&'a Ty, Vec<usize>, bool, usize),
+            Row(&'a crate::types::Row, Vec<usize>, bool, bool, usize),
             Named(Symbol, Vec<usize>, bool),
             Apply(Symbol, usize, bool),
             FinishNamed(usize, Symbol),
@@ -3685,14 +3694,11 @@ impl RegularType<'_> {
         let mut work = vec![Work::Named(symbol, args, false)];
         let mut values = Vec::new();
         let mut active_instantiations: HashMap<Symbol, Vec<Vec<usize>>> = HashMap::new();
-        let mut known_retained = HashSet::new();
         // A placeholder only has to survive when an in-progress recursive edge
         // actually observed it. Pure forwarding aliases can otherwise publish
         // their body's interned node directly, so a fresh `Id a = a`
         // placeholder does not make `Loop (Id a)` a new instantiation forever.
         let mut referenced_placeholders = HashSet::new();
-        let mut presences = HashMap::new();
-        let mut next_presence = 0usize;
 
         while let Some(part) = work.pop() {
             match part {
@@ -3715,7 +3721,7 @@ impl RegularType<'_> {
                     children.reverse();
                     values.push(self.node(label, edge_labels.into_iter().zip(children).collect()));
                 }
-                Work::Type(ty, args, supplied_as_effects) => match ty {
+                Work::Type(ty, args, supplied_as_effects, instantiation) => match ty {
                     Ty::Nat => values.push(self.atom("Nat")),
                     Ty::Int => values.push(self.atom("Int")),
                     Ty::Real => values.push(self.atom("Real")),
@@ -3728,17 +3734,23 @@ impl RegularType<'_> {
                             "arrow".into(),
                             vec!["from".into(), "to".into(), "effects".into()],
                         ));
-                        work.push(Work::Row(effects, args.clone(), true, false));
-                        work.push(Work::Type(to, args.clone(), false));
-                        work.push(Work::Type(from, args, false));
+                        work.push(Work::Row(effects, args.clone(), true, false, instantiation));
+                        work.push(Work::Type(to, args.clone(), false, instantiation));
+                        work.push(Work::Type(from, args, false, instantiation));
                     }
                     Ty::Struct(row)
                         if row.labels.is_empty() && matches!(row.rest, Rest::Closed) =>
                     {
                         values.push(self.atom("Unit"));
                     }
-                    Ty::Struct(row) => work.push(Work::Row(row, args, false, true)),
-                    Ty::Sum(row) => work.push(Work::Row(row, args, supplied_as_effects, false)),
+                    Ty::Struct(row) => work.push(Work::Row(row, args, false, true, instantiation)),
+                    Ty::Sum(row) => work.push(Work::Row(
+                        row,
+                        args,
+                        supplied_as_effects,
+                        false,
+                        instantiation,
+                    )),
                     Ty::Named {
                         symbol,
                         args: applied,
@@ -3751,7 +3763,7 @@ impl RegularType<'_> {
                                 .get(symbol)
                                 .and_then(|declaration| declaration.params.get(index))
                                 .is_some_and(|kind| matches!(kind, ParamKind::Effects { .. }));
-                            Work::Type(argument, args.clone(), effects)
+                            Work::Type(argument, args.clone(), effects, instantiation)
                         }));
                     }
                 },
@@ -3771,9 +3783,9 @@ impl RegularType<'_> {
                         continue;
                     }
                     if active_instantiations.get(&symbol).is_some_and(|active| {
-                        active.iter().any(|ancestor| {
-                            Self::grows(&self.arena.nodes, &mut known_retained, ancestor, &args)
-                        })
+                        active
+                            .iter()
+                            .any(|ancestor| Self::grows(&self.arena.nodes, ancestor, &args))
                     }) {
                         values.push(self.atom("?"));
                         continue;
@@ -3803,11 +3815,22 @@ impl RegularType<'_> {
                         values.push(id);
                     } else {
                         work.push(Work::FinishNamed(id, symbol));
-                        work.push(Work::Type(decl.scheme.body(), args, supplied_as_effects));
+                        let instantiation = presence_scope.instantiation();
+                        work.push(Work::Type(
+                            decl.scheme.body(),
+                            args,
+                            supplied_as_effects,
+                            instantiation,
+                        ));
                     }
                 }
                 Work::FinishNamed(id, symbol) => {
                     let body = values.pop().expect("named body postorder is balanced");
+                    let completed: Vec<_> = self
+                        .named
+                        .iter()
+                        .filter_map(|(key, node)| (*node == id).then_some(key.clone()))
+                        .collect();
                     let result = if body != id && !referenced_placeholders.contains(&id) {
                         for named in self.named.values_mut() {
                             if *named == id {
@@ -3821,13 +3844,16 @@ impl RegularType<'_> {
                         }
                         id
                     };
+                    for key in completed {
+                        self.named.remove(&key);
+                    }
                     active_instantiations
                         .get_mut(&symbol)
                         .expect("the finished instantiation is active")
                         .pop();
                     values.push(result);
                 }
-                Work::Row(row, args, effects, fields) => {
+                Work::Row(row, args, effects, fields, instantiation) => {
                     let labels = row
                         .labels
                         .iter()
@@ -3837,8 +3863,8 @@ impl RegularType<'_> {
                             } else {
                                 let presence = canonical_semantic_presence(
                                     &field.presence,
-                                    &mut presences,
-                                    &mut next_presence,
+                                    instantiation,
+                                    presence_scope,
                                 );
                                 format!(
                                     "{}:{name}:{presence}",
@@ -3872,29 +3898,38 @@ impl RegularType<'_> {
                         Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
                             work.push(Work::Atom("?".into()))
                         }
-                        Rest::More(more) => {
-                            work.push(Work::Row(more, args.clone(), effects, fields))
-                        }
+                        Rest::More(more) => work.push(Work::Row(
+                            more,
+                            args.clone(),
+                            effects,
+                            fields,
+                            instantiation,
+                        )),
                     }
                     for (name, field) in row.labels.iter().rev() {
                         if effects {
                             let presence = canonical_semantic_presence(
                                 &field.presence,
-                                &mut presences,
-                                &mut next_presence,
+                                instantiation,
+                                presence_scope,
                             );
                             let identity = self.arena.effect_key(name);
                             work.push(Work::EffectCase(presence));
                             if matches!(field.presence, Presence::Absent) {
                                 work.push(Work::Atom("?".into()));
                             } else {
-                                work.push(Work::Type(&field.ty, args.clone(), false));
+                                work.push(Work::Type(
+                                    &field.ty,
+                                    args.clone(),
+                                    false,
+                                    instantiation,
+                                ));
                             }
                             work.push(Work::Canonical(identity));
                         } else if matches!(field.presence, Presence::Absent) {
                             work.push(Work::Atom("?".into()));
                         } else {
-                            work.push(Work::Type(&field.ty, args.clone(), false));
+                            work.push(Work::Type(&field.ty, args.clone(), false, instantiation));
                         }
                     }
                 }
@@ -4148,18 +4183,25 @@ fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
 
 fn canonical_semantic_presence(
     presence: &Presence,
-    presences: &mut HashMap<(u8, u32), usize>,
-    next: &mut usize,
+    instantiation: usize,
+    scope: &mut CanonicalPresenceScope,
 ) -> String {
     let key = match presence {
         Presence::Present => return "+".into(),
         Presence::Absent => return "\\".into(),
         Presence::Undecided => return "?".into(),
-        Presence::Var(id) | Presence::Bound(id) => (0, *id),
+        Presence::Bound(index) => SemanticPresenceKey::Bound {
+            instantiation,
+            index: *index,
+        },
+        Presence::Var(id) | Presence::Recovered(id) => SemanticPresenceKey::Recovered {
+            instantiation,
+            id: *id,
+        },
     };
-    let index = *presences.entry(key).or_insert_with(|| {
-        let index = *next;
-        *next += 1;
+    let index = *scope.semantic.entry(key).or_insert_with(|| {
+        let index = scope.next_alpha;
+        scope.next_alpha += 1;
         index
     });
     format!("?{index}")
@@ -4167,21 +4209,20 @@ fn canonical_semantic_presence(
 
 fn canonical_written_presence(
     when: &Option<Box<When>>,
-    presences: &mut HashMap<String, usize>,
-    next: &mut usize,
+    scope: &mut CanonicalPresenceScope,
 ) -> String {
     let Some(when) = when else {
         return "+".to_string();
     };
     let index = match &when.name {
-        Some(name) => *presences.entry(name.clone()).or_insert_with(|| {
-            let index = *next;
-            *next += 1;
+        Some(name) => *scope.written.entry(name.clone()).or_insert_with(|| {
+            let index = scope.next_alpha;
+            scope.next_alpha += 1;
             index
         }),
         None => {
-            let index = *next;
-            *next += 1;
+            let index = scope.next_alpha;
+            scope.next_alpha += 1;
             index
         }
     };
@@ -4269,6 +4310,8 @@ struct EffectCanonicalizer<'a> {
     active: HashMap<Symbol, usize>,
     cache: HashMap<Symbol, CanonicalValue>,
     arena: CanonicalArena,
+    presence_scopes: HashMap<usize, CanonicalPresenceScope>,
+    next_presence_scope: usize,
 }
 
 impl<'a> EffectCanonicalizer<'a> {
@@ -4288,6 +4331,8 @@ impl<'a> EffectCanonicalizer<'a> {
             active: HashMap::new(),
             cache: HashMap::new(),
             arena: CanonicalArena::default(),
+            presence_scopes: HashMap::new(),
+            next_presence_scope: 0,
         }
     }
 
@@ -4314,10 +4359,15 @@ impl<'a> EffectCanonicalizer<'a> {
                 CanonicalWork::Interface(operations) => {
                     let names = operations.keys().map(|name| name.canonical()).collect();
                     work.push(CanonicalWork::FinishInterface(names));
-                    for operation in operations.values().rev() {
-                        work.push(CanonicalWork::Type(&operation.to));
-                        work.push(CanonicalWork::Type(&operation.from));
-                    }
+                    work.extend(operations.values().rev().map(CanonicalWork::Operation));
+                }
+                CanonicalWork::Operation(operation) => {
+                    let scope = self.next_presence_scope;
+                    self.next_presence_scope += 1;
+                    self.presence_scopes
+                        .insert(scope, CanonicalPresenceScope::default());
+                    work.push(CanonicalWork::Type(&operation.to, scope));
+                    work.push(CanonicalWork::Type(&operation.from, scope));
                 }
                 CanonicalWork::FinishInterface(names) => {
                     let start = values.len() - names.len() * 2;
@@ -4333,12 +4383,12 @@ impl<'a> EffectCanonicalizer<'a> {
                         node: self.arena.node("interface", edges),
                     });
                 }
-                CanonicalWork::Type(ty) => {
+                CanonicalWork::Type(ty, scope) => {
                     let dependencies = type_effect_dependencies(ty, self.types);
-                    work.push(CanonicalWork::FinishType(ty, dependencies.clone()));
+                    work.push(CanonicalWork::FinishType(ty, dependencies.clone(), scope));
                     work.extend(dependencies.into_iter().rev().map(CanonicalWork::Effect));
                 }
-                CanonicalWork::FinishType(ty, dependencies) => {
+                CanonicalWork::FinishType(ty, dependencies, scope) => {
                     let start = values.len() - dependencies.len();
                     let resolved_values = values.split_off(start);
                     let resolved = dependencies
@@ -4355,7 +4405,13 @@ impl<'a> EffectCanonicalizer<'a> {
                         interned: HashMap::new(),
                         named: HashMap::new(),
                     };
-                    let root = graph.source(ty, &[]);
+                    let root = graph.source(
+                        ty,
+                        &[],
+                        self.presence_scopes
+                            .get_mut(&scope)
+                            .expect("an operation presence scope remains live"),
+                    );
                     values.push(CanonicalValue {
                         node: graph.finish(root),
                     });
@@ -4374,10 +4430,9 @@ impl<'a> EffectCanonicalizer<'a> {
                                 let names =
                                     operations.keys().map(|name| name.canonical()).collect();
                                 work.push(CanonicalWork::FinishOperations(symbol, name, names));
-                                for operation in operations.values().rev() {
-                                    work.push(CanonicalWork::Type(&operation.to));
-                                    work.push(CanonicalWork::Type(&operation.from));
-                                }
+                                work.extend(
+                                    operations.values().rev().map(CanonicalWork::Operation),
+                                );
                             }
                             Some(Effect::Alias(named)) => {
                                 work.push(CanonicalWork::FinishAlias(symbol, name, named.len()));
@@ -4462,9 +4517,10 @@ impl<'a> EffectCanonicalizer<'a> {
 enum CanonicalWork<'a> {
     Interface(&'a IndexMap<OperationSelector, Operation>),
     FinishInterface(Vec<String>),
-    Type(&'a Type),
+    Operation(&'a Operation),
+    Type(&'a Type, usize),
     Effect(Symbol),
-    FinishType(&'a Type, Vec<Symbol>),
+    FinishType(&'a Type, Vec<Symbol>, usize),
     FinishOperations(Symbol, String, Vec<String>),
     FinishAlias(Symbol, String, usize),
 }

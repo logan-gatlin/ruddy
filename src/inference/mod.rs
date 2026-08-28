@@ -4416,6 +4416,7 @@ fn substitute_type(
                             .get(*index as usize)
                             .map(Assigned::presence)
                             .unwrap_or(Presence::Undecided),
+                        Presence::Recovered(_) => Presence::Undecided,
                         presence => presence.clone(),
                     };
                     (!matches!(presence, Presence::Absent)).then_some(Work::Ty(&field.ty))
@@ -4462,6 +4463,7 @@ fn substitute_type(
                             .get(*index as usize)
                             .map(Assigned::presence)
                             .unwrap_or(Presence::Undecided),
+                        Presence::Recovered(_) => Presence::Undecided,
                         presence => presence.clone(),
                     };
                     let ty = match presence {

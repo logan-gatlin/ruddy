@@ -2901,7 +2901,10 @@ impl Lower<'_> {
             _ => {
                 let literal = match &col.presence {
                     Presence::Var(_) | Presence::Bound(_) => Some(col.presence.formula()),
-                    Presence::Present | Presence::Absent | Presence::Undecided => None,
+                    Presence::Present
+                    | Presence::Absent
+                    | Presence::Recovered(_)
+                    | Presence::Undecided => None,
                 };
                 let path = tree.allowed.clone().and(matrix.assumed.clone());
                 let can_present = literal.as_ref().is_none_or(|literal| {
