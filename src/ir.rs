@@ -11,7 +11,7 @@ use crate::{
     parse::{self, Expr, ExprKind, Stmt, StmtKind},
     symbol::{Mint, Module, Namespace, Symbol},
     tracking::{Span, Tracked, TrackedString},
-    types::{EffectId, ParamKind, Prim, Rest, Scheme, Sense, Shape, Ty},
+    types::{EffectId, ParamKind, Presence, Prim, Rest, Scheme, Sense, Shape, Ty},
 };
 
 #[derive(Debug, Clone)]
@@ -656,8 +656,8 @@ pub struct Annotation {
     /// What the a variable statements declared, in the order they were
     /// written, each with the sort its uses gave it.
     ///
-    /// FieldSummary rather than left to be read back out of the lowered type,
-    /// because lowering is what worked it out: a variable's sort follows from
+    /// Stored rather than read back out of the lowered type, because lowering
+    /// is what worked it out: a variable's sort follows from
     /// where the type uses it, and inference should not re-derive a fact this
     /// pass already settled. Empty for an annotation that declares nothing,
     /// which is every annotation the language had before this.
@@ -1079,7 +1079,7 @@ pub enum ErrorKind {
     /// A struct's argument is looked at through names as well as at what it
     /// writes out, since a `..` handed a declared type ends up field_summaries whatever
     /// *that* carries: `WithX (WithX Nat)` names `x` twice as much as
-    /// `WithX { x: Nat }` does. See [`field_summaries`].
+    /// `WithX { x: Nat }` does. See [`row_summaries`].
     ///
     /// The argument absorbs, for the reason [`ErrorKind::NotARow`] does: left
     /// standing it would be substituted in all the same, and the reader would be
@@ -1608,11 +1608,20 @@ enum Stands {
     Loop,
 }
 
+enum Selection<'a> {
+    Written(&'a Type),
+    Semantic(&'a Rc<Ty>),
+}
+
 /// Following what every declaration stands for, once, remembering the loops
 /// closed on the way. See [`ErrorKind::Circular`] for what a loop costs and
 /// [`ErrorKind::EndlessFields`] for what the fielded kind costs.
 struct Follow<'a> {
     types: &'a IndexMap<Symbol, Decl<Type>>,
+    /// Imported declarations, whose semantic bodies can forward a local
+    /// recursive occurrence through one of their arguments just as a local
+    /// declaration can.
+    external: &'a IndexMap<Symbol, ExternalType>,
     /// What each declaration was found to stand for. [`Stands::Loop`] is
     /// absorbing — anything that reduces into a loop never reaches a shape
     /// either — so a result reached under an open assumption is still the
@@ -2083,7 +2092,7 @@ fn build_with_dependency_imports_inner(
     // it would cost the solver to be handed one.
     // Read back off the table in declaration order, so the reports come in the
     // order the reader wrote them rather than the order the loops were found.
-    let Loops { looping, endless } = looping(&program.types);
+    let Loops { looping, endless } = looping(&program.types, &program.external_types);
     let circular: Vec<_> = program
         .types
         .keys()
@@ -2466,6 +2475,53 @@ fn import_scheme(
         import_type(mint, &scheme.body, symbols, names),
         import_formula(&scheme.formula),
     )
+}
+
+/// Replace declaration-bound positions a malformed imported type did not
+/// declare with undecided recovery nodes. In particular, an impossible row
+/// rest must not be read as the same numeric slot in a local declaration that
+/// merely mentions the imported bare alias.
+fn clamp_decl_bounds(ty: &Rc<Ty>, arity: usize) -> Rc<Ty> {
+    fn row(value: &crate::types::Row, arity: usize) -> crate::types::Row {
+        let mut labels = IndexMap::with_capacity(value.labels.len());
+        for (name, field) in &value.labels {
+            labels.insert(
+                name.clone(),
+                crate::types::RowField {
+                    presence: field.presence.clone(),
+                    ty: clamp_decl_bounds(&field.ty, arity),
+                },
+            );
+        }
+        crate::types::Row {
+            labels,
+            rest: match &value.rest {
+                Rest::Bound(index) if *index as usize >= arity => Rest::Undecided,
+                Rest::More(more) => Rest::More(Rc::new(row(more, arity))),
+                rest => rest.clone(),
+            },
+        }
+    }
+
+    Rc::new(match &**ty {
+        Ty::Bound(index) if *index as usize >= arity => Ty::Undecided,
+        Ty::Arrow(from, to, effects) => Ty::Arrow(
+            clamp_decl_bounds(from, arity),
+            clamp_decl_bounds(to, arity),
+            row(effects, arity),
+        ),
+        Ty::Struct(fields) => Ty::Struct(row(fields, arity)),
+        Ty::Sum(cases) => Ty::Sum(row(cases, arity)),
+        Ty::Named { symbol, name, args } => Ty::Named {
+            symbol: *symbol,
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| clamp_decl_bounds(arg, arity))
+                .collect(),
+        },
+        ty => ty.clone(),
+    })
 }
 
 fn import_type(
@@ -2912,10 +2968,7 @@ impl RegularType<'_> {
             Ty::Struct(r) => self.semantic_fields(r, args),
             Ty::Sum(r) => self.semantic_row(r, args),
             Ty::Var(v) => self.atom(format!("?{v}")),
-            Ty::Bound(i) => args
-                .get(*i as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'{i}"))),
+            Ty::Bound(i) => args[*i as usize],
             Ty::Rigid { id, .. } => self.atom(format!("'r{id}")),
             Ty::Named {
                 symbol,
@@ -2950,10 +3003,7 @@ impl RegularType<'_> {
         let tail = match &row.rest {
             Rest::Closed => self.atom("Unit"),
             Rest::Var(v) => self.atom(format!("?{v}")),
-            Rest::Bound(i) => args
-                .get(*i as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'#{i}"))),
+            Rest::Bound(i) => args[*i as usize],
             Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
             Rest::Undecided => self.atom("?"),
             Rest::More(m) => self.semantic_fields(m, args),
@@ -2986,10 +3036,7 @@ impl RegularType<'_> {
         let tail = match &row.rest {
             Rest::Closed => self.atom("closed"),
             Rest::Var(id) => self.atom(format!("?{id}")),
-            Rest::Bound(id) => args
-                .get(*id as usize)
-                .copied()
-                .unwrap_or_else(|| self.atom(format!("'#{id}"))),
+            Rest::Bound(id) => args[*id as usize],
             Rest::Rigid { id, .. } => self.atom(format!("'r{id}")),
             Rest::Undecided => self.atom("?"),
             Rest::More(more) => self.semantic_row(more, args),
@@ -3550,9 +3597,13 @@ fn expansions(
 /// terminate: `Id (Id Nat)` never finds `Id` still open, because the first was
 /// finished before the second was reached. Only the declarations *on* a loop
 /// are named — one that merely leads into one has nothing to fix.
-fn looping(types: &IndexMap<Symbol, Decl<Type>>) -> Loops {
+fn looping(
+    types: &IndexMap<Symbol, Decl<Type>>,
+    external: &IndexMap<Symbol, ExternalType>,
+) -> Loops {
     let mut follow = Follow {
         types,
+        external,
         done: HashMap::new(),
         open: Vec::new(),
         marks: Vec::new(),
@@ -3585,15 +3636,18 @@ impl Follow<'_> {
             }
             return Stands::Loop;
         }
-        // Imported declarations live in the semantic interface table rather
-        // than this local syntax table. They are already validated and cannot
-        // participate in a local bare-name recursion cycle.
-        let Some(decl) = self.types.get(&symbol) else {
-            return Stands::Shape;
-        };
         self.open.push(symbol);
         self.marks.push(self.fielded);
-        let stands = self.ty(&decl.value);
+        let stands = match self.types.get(&symbol) {
+            Some(decl) => self.ty(&decl.value),
+            None => {
+                let decl = self
+                    .external
+                    .get(&symbol)
+                    .expect("every resolved imported type has a recovery interface");
+                self.semantic(decl.scheme.body())
+            }
+        };
         self.open.pop();
         self.marks.pop();
         self.done.insert(symbol, stands);
@@ -3619,7 +3673,9 @@ impl Follow<'_> {
                 ..
             } => Stands::Param {
                 index: *index,
-                fields: !fields.is_empty(),
+                fields: fields
+                    .values()
+                    .any(|field| !matches!(field, TypeField::Absent { .. })),
             },
             // A shape one step in, which is all a declaration has to reach.
             // `Error` absorbs, as everywhere else.
@@ -3636,38 +3692,102 @@ impl Follow<'_> {
                 fields: false,
             },
             TypeKind::Ident(symbol) => self.decl(*symbol),
-            TypeKind::Apply { head, args, .. } => match self.decl(*head) {
-                Stands::Shape => Stands::Shape,
-                Stands::Loop => Stands::Loop,
-                // The head hands back one of the arguments written here, so
-                // following it lands on a type still in the current scope and
-                // needs no substitution to do it — which is why a parameter of
-                // the head is not a parameter of anything this walk is in the
-                // middle of.
-                // Indexed rather than looked up: the arity check ran where the
-                // application was written, so a head standing for its own
-                // parameter has an argument in that position.
-                //
-                // Counted here rather than where the struct answered, because a
-                // head already followed answers from the memo without walking
-                // anything: the flag rides on the answer so that the count moves
-                // whether or not this is the first time through.
-                Stands::Param { index, fields } => {
-                    if fields {
-                        self.fielded += 1;
-                    }
-                    match self.ty(&args[index as usize]) {
-                        Stands::Param {
-                            index,
-                            fields: deeper,
-                        } => Stands::Param {
-                            index,
-                            fields: fields || deeper,
-                        },
-                        stands => stands,
+            TypeKind::Apply { head, args, .. } => {
+                let stands = self.decl(*head);
+                self.select(
+                    stands,
+                    args.get(match stands {
+                        Stands::Param { index, .. } => index as usize,
+                        _ => 0,
+                    })
+                    .map(Selection::Written),
+                )
+            }
+        }
+    }
+
+    /// The semantic imported twin of [`Follow::ty`]. Imported aliases are
+    /// already lowered, but a bound type and a bound struct-row rest still mean
+    /// “select this argument”, including through transitive applications.
+    fn semantic(&mut self, ty: &Rc<Ty>) -> Stands {
+        match &**ty {
+            Ty::Bound(index) => Stands::Param {
+                index: *index,
+                fields: false,
+            },
+            Ty::Struct(row) => {
+                let mut row = row;
+                let mut fields = false;
+                loop {
+                    fields |= row
+                        .labels
+                        .values()
+                        .any(|field| !matches!(field.presence, Presence::Absent));
+                    match &row.rest {
+                        Rest::Bound(index) => {
+                            return Stands::Param {
+                                index: *index,
+                                fields,
+                            };
+                        }
+                        Rest::More(more) => row = more,
+                        Rest::Closed | Rest::Var(_) | Rest::Rigid { .. } | Rest::Undecided => {
+                            return Stands::Shape;
+                        }
                     }
                 }
-            },
+            }
+            Ty::Named { symbol, args, .. } => {
+                let stands = self.decl(*symbol);
+                self.select(
+                    stands,
+                    args.get(match stands {
+                        Stands::Param { index, .. } => index as usize,
+                        _ => 0,
+                    })
+                    .map(Selection::Semantic),
+                )
+            }
+            Ty::Nat
+            | Ty::Int
+            | Ty::Real
+            | Ty::String
+            | Ty::Boolean
+            | Ty::Arrow(..)
+            | Ty::Sum(_)
+            | Ty::Var(_)
+            | Ty::Rigid { .. }
+            | Ty::Undecided => Stands::Shape,
+        }
+    }
+
+    /// Apply a declaration's forwarding answer to one supplied argument.
+    /// Missing imported arguments are malformed interface data and absorb.
+    fn select(&mut self, stands: Stands, arg: Option<Selection<'_>>) -> Stands {
+        match stands {
+            Stands::Param { fields, .. } => {
+                if fields {
+                    self.fielded += 1;
+                }
+                let Some(arg) = arg else {
+                    return Stands::Shape;
+                };
+                let deeper = match arg {
+                    Selection::Written(value) => self.ty(value),
+                    Selection::Semantic(value) => self.semantic(value),
+                };
+                match deeper {
+                    Stands::Param {
+                        index,
+                        fields: below,
+                    } => Stands::Param {
+                        index,
+                        fields: fields || below,
+                    },
+                    stands => stands,
+                }
+            }
+            stands => stands,
         }
     }
 }
@@ -4618,7 +4738,11 @@ fn kinds(types: &IndexMap<Symbol, Decl<Type>>, external: &IndexMap<Symbol, Exter
             })
         })
         .collect();
-    let summaries = field_summaries(types, external);
+    let summaries: HashMap<Shape, HashMap<Symbol, RowSummary>> =
+        [Shape::Struct, Shape::Sum, Shape::Effect]
+            .into_iter()
+            .map(|shape| (shape, row_summaries(types, external, shape)))
+            .collect();
     let mut handed: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     let mut tails: IndexMap<Slot, Vec<Slot>> = IndexMap::new();
     for (symbol, decl) in types {
@@ -4766,7 +4890,11 @@ fn senses(
 /// Everything one declaration's body says about its own parameters. See
 /// [`Fact`] for the three, and [`kinds`], which resolves them into a kind
 /// apiece.
-fn constrain(ty: &Type, summaries: &HashMap<Symbol, FieldSummary>, out: &mut impl FnMut(Fact)) {
+fn constrain(
+    ty: &Type,
+    summaries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
+    out: &mut impl FnMut(Fact),
+) {
     match &ty.tracked {
         // A name reached as a type is one: this walk only descends through
         // positions a type goes in, so arriving here at all is the statement.
@@ -4862,27 +4990,18 @@ fn constrain(ty: &Type, summaries: &HashMap<Symbol, FieldSummary>, out: &mut imp
                     // reading, which is why it is a [`Fact::Tails`] rather than
                     // a second [`Fact::Hands`].
                     _ => {
-                        // Every parameter whose fields reach this argument's
-                        // outer row lands where the callee's tail sat. Reading
-                        // a summary rather than only an immediately written
-                        // `{ ..'r }` is what carries the obligation through
-                        // local and imported forwarding aliases alike.
-                        for index in field_summary(arg, summaries).slots {
-                            out(Fact::Tails(index, slot));
-                        }
-                        // Sum rows have their own summaries; retain their
-                        // direct tail edge here until case summaries need the
-                        // same alias normalization as field rows.
-                        if let TypeKind::Sum {
-                            tail:
-                                Some(Tail {
-                                    of: Row::Param { index, .. },
-                                    ..
-                                }),
-                            ..
-                        } = &arg.tracked
-                        {
-                            out(Fact::Tails(*index, slot));
+                        // Every parameter whose row reaches this argument's
+                        // outer row lands where the callee's tail sat. Keep the
+                        // three senses separate: a struct alias carries only
+                        // field obligations, a sum alias only case obligations,
+                        // and an effects row only effect obligations.
+                        for shape in [Shape::Struct, Shape::Sum, Shape::Effect] {
+                            let declarations = summaries
+                                .get(&shape)
+                                .expect("every row sense has summaries");
+                            for index in row_summary(arg, declarations, shape).slots {
+                                out(Fact::Tails(index, slot));
+                            }
                         }
                         constrain(arg, summaries, out);
                     }
@@ -4905,9 +5024,9 @@ fn constrain(ty: &Type, summaries: &HashMap<Symbol, FieldSummary>, out: &mut imp
 /// spliced into a row, so the argument has to be something a row can hold —
 /// [`row_shaped`] — and it has to name none of the cases the declaration already
 /// names, since a `..` covers only what its row leaves out. A
-/// [`ParamKind::Type`] parameter has only the second. A struct's `..` is the
-/// struct-row tail, which requires a struct row; what is left is the labels the argument would bring with it, which
-/// [`field_summary`] reads through a name as readily as off a struct written out.
+/// [`ParamKind::Type`] parameter has only the second. A struct's `..` requires
+/// a struct row. [`row_summary`] reads the labels an argument brings through
+/// local and imported aliases for each row sense independently.
 ///
 /// The kinds themselves are a well-formedness check and nothing more — an
 /// argument lowers to exactly the type it would anywhere else, and substitution
@@ -4923,14 +5042,14 @@ fn constrain(ty: &Type, summaries: &HashMap<Symbol, FieldSummary>, out: &mut imp
 /// [`ErrorKind::Circular`] and [`ErrorKind::OpenDeclaredType`] do — the
 /// argument and not the whole application, because the mistake is the argument
 /// and `WithX { x: Nat } -> Nat` is half correct. [`row_shaped`] already reads
-/// [`TypeKind::Error`] as row-shaped and [`field_summary`] reads it as field_summaries
+/// [`TypeKind::Error`] as row-shaped and [`row_summary`] reads it as naming
 /// nothing, so nothing complains about the erasure, and it lowers to the
 /// undecided type, which row-tail checks already allow.
 fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>) -> Vec<Error> {
     fn walk(
         ty: &mut Type,
         kinds: &HashMap<Symbol, Vec<ParamKind>>,
-        carries: &HashMap<Symbol, FieldSummary>,
+        carries: &HashMap<Shape, HashMap<Symbol, RowSummary>>,
         rows: &HashMap<Symbol, Sense>,
         declarations: &IndexMap<Symbol, Decl<Type>>,
         external: &IndexMap<Symbol, ExternalType>,
@@ -4950,23 +5069,17 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
                         // worded in differs.
                         Some(kind) if kind.row().is_some() => {
                             let (shape, lacks) = kind.row().expect("the arm just asked for one");
-                            match row_shaped(arg, rows, shape, declarations, external) {
+                            let summaries =
+                                carries.get(&shape).expect("every row sense has summaries");
+                            match row_shaped(arg, rows, shape, summaries) {
                                 false => Some(ErrorKind::NotARow {
                                     sense: kind.sense(),
                                 }),
-                                true => {
-                                    let repeated = match shape {
-                                        Shape::Struct => field_summary(arg, carries)
-                                            .labels
-                                            .into_iter()
-                                            .find(|name| lacks.contains(name)),
-                                        Shape::Sum | Shape::Effect => {
-                                            cases_named(arg).find(|name| lacks.contains(name))
-                                        }
-                                    };
-                                    repeated
-                                        .map(|field| ErrorKind::RepeatedRowField { shape, field })
-                                }
+                                true => row_summary(arg, summaries, shape)
+                                    .labels
+                                    .into_iter()
+                                    .find(|name| lacks.contains(name))
+                                    .map(|field| ErrorKind::RepeatedRowField { shape, field }),
                             }
                         }
                         _ => None,
@@ -5022,8 +5135,17 @@ fn row_arguments(program: &mut Program, kinds: &HashMap<Symbol, Vec<ParamKind>>)
     // What each declaration's fields come to, read once over the whole table
     // before anything is walked: an argument written at a struct's `..` carries
     // whatever the declaration it names carries, which is what the repeated
-    // field check is asked against. See [`field_summaries`].
-    let carries = field_summaries(&program.types, &program.external_types);
+    // field check is asked against. See [`row_summaries`].
+    let carries: HashMap<Shape, HashMap<Symbol, RowSummary>> =
+        [Shape::Struct, Shape::Sum, Shape::Effect]
+            .into_iter()
+            .map(|shape| {
+                (
+                    shape,
+                    row_summaries(&program.types, &program.external_types, shape),
+                )
+            })
+            .collect();
     let declarations = program.types.clone();
     let external = program.external_types.clone();
 
@@ -5169,230 +5291,74 @@ fn annotations(term: &mut Term, out: &mut impl FnMut(&mut Type)) {
     }
 }
 
-/// Whether a written type could stand for the cases a sum does not name.
+/// Whether a written type can supply a row of the requested sense.
 ///
-/// A sum can: its cases are spliced in where the tail was. A row parameter can,
-/// by being a sum's already — a struct written there would splice fields into a
-/// row of cases, and nothing downstream could make sense of the result. A
-/// declared name cannot either, though it looks as though it should: a tail
-/// holding a name would have to be unfolded by the two walks that flatten rows,
-/// which neither does, so it is refused rather than silently mishandled.
-///
-/// About cases and nothing else, and so about no shape. A struct's `..` is the
-/// row tail, so a supplied argument must itself be a field row.
+/// Concrete rows answer directly. Parameters answer from their inferred sense,
+/// and declared names/applications answer from the normalized summary that
+/// follows local and imported forwarding aliases without recursion.
 fn row_shaped(
     ty: &Type,
     rows: &HashMap<Symbol, Sense>,
     shape: Shape,
-    declarations: &IndexMap<Symbol, Decl<Type>>,
-    external: &IndexMap<Symbol, ExternalType>,
+    summaries: &HashMap<Symbol, RowSummary>,
 ) -> bool {
-    #[derive(Clone)]
-    enum Argument {
-        Written(Type),
-        Semantic {
-            ty: Rc<Ty>,
-            environment: Rc<[Argument]>,
-        },
-    }
-
-    fn semantic_outer(
-        ty: &Rc<Ty>,
-        rows: &HashMap<Symbol, Sense>,
-        shape: Shape,
-        declarations: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        environment: &Rc<[Argument]>,
-        active: &mut HashSet<Symbol>,
-    ) -> bool {
-        match &**ty {
-            crate::types::Ty::Struct(_) => shape == Shape::Struct,
-            crate::types::Ty::Sum(_) => shape == Shape::Sum,
-            crate::types::Ty::Bound(index) => {
-                environment
-                    .get(*index as usize)
-                    .is_some_and(|argument| match argument {
-                        Argument::Written(arg) => {
-                            outer(arg, rows, shape, declarations, external, None, active)
-                        }
-                        Argument::Semantic { ty, environment } => semantic_outer(
-                            ty,
-                            rows,
-                            shape,
-                            declarations,
-                            external,
-                            environment,
-                            active,
-                        ),
-                    })
-            }
-            crate::types::Ty::Named { symbol, args, .. } => {
-                if !active.insert(*symbol) {
-                    return false;
-                }
-                let found = external.get(symbol).is_some_and(|decl| {
-                    let arguments: Rc<[Argument]> = args
-                        .iter()
-                        .map(|ty| Argument::Semantic {
-                            ty: ty.clone(),
-                            environment: environment.clone(),
-                        })
-                        .collect();
-                    semantic_outer(
-                        decl.scheme.body(),
-                        rows,
-                        shape,
-                        declarations,
-                        external,
-                        &arguments,
-                        active,
-                    )
-                });
-                active.remove(symbol);
-                found
-            }
-            crate::types::Ty::Undecided => true,
-            crate::types::Ty::Nat
-            | crate::types::Ty::Int
-            | crate::types::Ty::Real
-            | crate::types::Ty::String
-            | crate::types::Ty::Boolean
-            | crate::types::Ty::Arrow(..)
-            | crate::types::Ty::Var(_)
-            | crate::types::Ty::Rigid { .. } => false,
-        }
-    }
-
     fn outer(
         ty: &Type,
         rows: &HashMap<Symbol, Sense>,
         shape: Shape,
-        declarations: &IndexMap<Symbol, Decl<Type>>,
-        external: &IndexMap<Symbol, ExternalType>,
-        args: Option<&[Type]>,
-        active: &mut HashSet<Symbol>,
+        summaries: &HashMap<Symbol, RowSummary>,
     ) -> bool {
         match &ty.tracked {
             TypeKind::Error => true,
             TypeKind::Struct { .. } => shape == Shape::Struct,
             TypeKind::Sum { .. } => shape == Shape::Sum,
             TypeKind::Effects(_) => shape == Shape::Effect,
-            TypeKind::Param { symbol, index } => {
-                match args.and_then(|args| args.get(*index as usize)) {
-                    Some(arg) => outer(arg, rows, shape, declarations, external, None, active),
-                    None => rows.get(symbol).copied() == Some(sense(shape)),
-                }
+            TypeKind::Param { symbol, .. } => rows.get(symbol).copied() == Some(sense(shape)),
+            TypeKind::Ident(symbol) => {
+                let summary = summaries.get(symbol).cloned().unwrap_or_default();
+                summary.shaped
             }
-            TypeKind::Ident(symbol) => match declarations.get(symbol) {
-                // Local alias cycles have already been diagnosed and erased.
-                Some(decl) => outer(
-                    &decl.value,
-                    rows,
-                    shape,
-                    declarations,
-                    external,
-                    None,
-                    active,
-                ),
-                None => semantic_outer(
-                    external
-                        .get(symbol)
-                        .expect("every imported type has a recovery declaration")
-                        .scheme
-                        .body(),
-                    rows,
-                    shape,
-                    declarations,
-                    external,
-                    &Rc::from([]),
-                    active,
-                ),
-            },
             TypeKind::Apply {
                 head,
                 args: supplied,
                 ..
-            } => match declarations.get(head) {
-                // Local alias cycles have already been diagnosed and erased.
-                Some(decl) => outer(
-                    &decl.value,
-                    rows,
-                    shape,
-                    declarations,
-                    external,
-                    Some(supplied),
-                    active,
-                ),
-                None => {
-                    let arguments: Rc<[Argument]> =
-                        supplied.iter().cloned().map(Argument::Written).collect();
-                    semantic_outer(
-                        external
-                            .get(head)
-                            .expect("every imported type has a recovery declaration")
-                            .scheme
-                            .body(),
-                        rows,
-                        shape,
-                        declarations,
-                        external,
-                        &arguments,
-                        active,
-                    )
-                }
-            },
+            } => {
+                let summary = summaries.get(head).cloned().unwrap_or_default();
+                summary.shaped
+                    || summary.slots.into_iter().any(|index| {
+                        supplied
+                            .get(index as usize)
+                            .is_some_and(|argument| outer(argument, rows, shape, summaries))
+                    })
+            }
             TypeKind::Arrow { .. } | TypeKind::Prim(_) | TypeKind::Var(_) | TypeKind::Hole => false,
         }
     }
 
-    outer(
-        ty,
-        rows,
-        shape,
-        declarations,
-        external,
-        None,
-        &mut HashSet::new(),
-    )
+    outer(ty, rows, shape, summaries)
 }
 
-/// The cases a written type names outright, in the order it names them.
-///
-/// Only a sum names any. A parameter handed straight on names nothing here —
-/// what it stands for is supplied at every use of *its* declaration, and already
-/// carries this condition — and an erased argument absorbed a complaint already
-/// made.
-fn cases_named(ty: &Type) -> impl Iterator<Item = String> + '_ {
-    let cases: Box<dyn Iterator<Item = String> + '_> = match &ty.tracked {
-        TypeKind::Sum { cases, .. } => Box::new(cases.keys().cloned()),
-        // A row's labels are the effects it names, which is the same question
-        // asked of the row a sum writes.
-        TypeKind::Effects(effects) => Box::new(effects.effects.keys().map(EffectId::row_key)),
-        _ => Box::new(std::iter::empty()),
-    };
-    cases
-}
-
-/// What a written type names at the top level of its struct row: the labels it
-/// names outright, and the parameters used as struct-row tails.
-///
-/// The labels supplied for `..'r` cannot be known until a use site writes the
-/// argument, so the parameter slot is recorded here and read at that use site.
+/// A written type's normalized outer row for one sense: whether it reaches a
+/// concrete row, the labels it names, and the parameters it forwards there.
+/// A separate summary is built for fields, cases, and effects.
 #[derive(Debug, Clone, Default)]
-struct FieldSummary {
+struct RowSummary {
+    /// Whether normalization reaches a concrete row of this sense. A pure
+    /// forwarding parameter has slots but no shape until its argument is read.
+    shaped: bool,
     /// Insertion-ordered, so a complaint about an argument breaking the rule
     /// twice always names the same label first — the one a reader would reach
     /// first reading the argument left to right, which is the rule
     /// [`Table::repeated`](crate::inference) states for the same complaint
     /// reached through a variable.
     labels: IndexSet<String>,
-    /// The parameters used as struct-row tails, whose arguments therefore add
-    /// to this summary.
+    /// The parameters used as row tails, whose arguments therefore add to this
+    /// summary.
     slots: IndexSet<u32>,
 }
 
-/// What each local and imported declaration carries at the outside of its
-/// struct row.
+/// What each local and imported declaration carries at its outer row for one
+/// requested sense.
 ///
 /// Imported declarations are semantic [`Ty`] trees rather than written
 /// [`Type`] trees, but forwarding means the same thing in both: the head's
@@ -5407,10 +5373,11 @@ struct FieldSummary {
 /// recursive. Local unproductive cycles have already been diagnosed and
 /// erased, but the guard keeps this normalization total independently of that
 /// ordering.
-fn field_summaries(
+fn row_summaries(
     types: &IndexMap<Symbol, Decl<Type>>,
     external: &IndexMap<Symbol, ExternalType>,
-) -> HashMap<Symbol, FieldSummary> {
+    shape: Shape,
+) -> HashMap<Symbol, RowSummary> {
     enum Work<'a> {
         Named(Symbol),
         FinishNamed(Symbol),
@@ -5419,15 +5386,19 @@ fn field_summaries(
         SemanticApply(&'a [Rc<Ty>]),
         ArtifactApply(&'a [Type]),
         FinishApply {
+            shaped: bool,
             labels: IndexSet<String>,
             arguments: usize,
             crossed_cycle: bool,
         },
-        Value(FieldSummary),
+        Value(RowSummary),
     }
 
-    fn semantic_row(mut row: &crate::types::Row) -> FieldSummary {
-        let mut out = FieldSummary::default();
+    fn semantic_row(mut row: &crate::types::Row) -> RowSummary {
+        let mut out = RowSummary {
+            shaped: true,
+            ..RowSummary::default()
+        };
         loop {
             out.labels.extend(row.labels.keys().cloned());
             match &row.rest {
@@ -5443,22 +5414,42 @@ fn field_summaries(
         }
     }
 
+    fn written_row_summary(
+        labels: impl IntoIterator<Item = String>,
+        tail: &Option<Tail>,
+    ) -> RowSummary {
+        let mut slots = IndexSet::new();
+        if let Some(Tail {
+            of: Row::Param { index, .. },
+            ..
+        }) = tail
+        {
+            slots.insert(*index);
+        }
+        RowSummary {
+            shaped: true,
+            labels: labels.into_iter().collect(),
+            slots,
+        }
+    }
+
     fn resolve<'a>(
         root: Symbol,
         types: &'a IndexMap<Symbol, Decl<Type>>,
         external: &'a IndexMap<Symbol, ExternalType>,
-        done: &mut HashMap<Symbol, FieldSummary>,
+        shape: Shape,
+        done: &mut HashMap<Symbol, RowSummary>,
     ) {
         let mut active = HashSet::new();
         let mut work = vec![Work::Named(root)];
-        let mut values: Vec<(FieldSummary, bool)> = Vec::new();
+        let mut values: Vec<(RowSummary, bool)> = Vec::new();
         while let Some(next) = work.pop() {
             match next {
                 Work::Named(symbol) => {
                     if let Some(summary) = done.get(&symbol) {
                         values.push((summary.clone(), false));
                     } else if !active.insert(symbol) {
-                        values.push((FieldSummary::default(), true));
+                        values.push((RowSummary::default(), true));
                     } else {
                         work.push(Work::FinishNamed(symbol));
                         match types.get(&symbol) {
@@ -5473,9 +5464,24 @@ fn field_summaries(
                     }
                 }
                 Work::FinishNamed(symbol) => {
-                    let (summary, crossed_cycle) =
+                    let (mut summary, crossed_cycle) =
                         values.pop().expect("a declaration leaves one summary");
                     active.remove(&symbol);
+                    // Summary slots are relative to the declaration whose body
+                    // produced them. Malformed semantic interfaces sometimes
+                    // contain a bound row index beyond their published arity;
+                    // it is not a slot in whichever local declaration happens
+                    // to mention the bare alias.
+                    let arity = types
+                        .get(&symbol)
+                        .map(|declaration| declaration.params.len())
+                        .or_else(|| {
+                            external
+                                .get(&symbol)
+                                .map(|declaration| declaration.params.len())
+                        })
+                        .unwrap_or(0);
+                    summary.slots.retain(|index| (*index as usize) < arity);
                     // A nested result reached under an active-cycle assumption
                     // is valid only for that walk. The root is valid for its
                     // own symbol; caching an intermediate assumption would make
@@ -5486,11 +5492,17 @@ fn field_summaries(
                     values.push((summary, crossed_cycle));
                 }
                 Work::Semantic(ty) => match ty {
-                    Ty::Bound(index) => work.push(Work::Value(FieldSummary {
+                    Ty::Bound(index) => work.push(Work::Value(RowSummary {
+                        shaped: false,
                         labels: IndexSet::new(),
                         slots: std::iter::once(*index).collect(),
                     })),
-                    Ty::Struct(row) => work.push(Work::Value(semantic_row(row))),
+                    Ty::Struct(row) if shape == Shape::Struct => {
+                        work.push(Work::Value(semantic_row(row)))
+                    }
+                    Ty::Sum(row) if shape == Shape::Sum => {
+                        work.push(Work::Value(semantic_row(row)))
+                    }
                     Ty::Named {
                         symbol,
                         args: supplied,
@@ -5505,27 +5517,30 @@ fn field_summaries(
                     | Ty::String
                     | Ty::Boolean
                     | Ty::Arrow(..)
+                    | Ty::Struct(_)
                     | Ty::Sum(_)
                     | Ty::Var(_)
-                    | Ty::Rigid { .. }
-                    | Ty::Undecided => work.push(Work::Value(FieldSummary::default())),
+                    | Ty::Rigid { .. } => work.push(Work::Value(RowSummary::default())),
+                    Ty::Undecided => work.push(Work::Value(RowSummary {
+                        shaped: true,
+                        ..RowSummary::default()
+                    })),
                 },
                 Work::Artifact(ty) => match &ty.tracked {
-                    TypeKind::Struct { fields, tail } => {
-                        let mut slots = IndexSet::new();
-                        if let Some(Tail {
-                            of: Row::Param { index, .. },
-                            ..
-                        }) = tail
-                        {
-                            slots.insert(*index);
-                        }
-                        work.push(Work::Value(FieldSummary {
-                            labels: fields.keys().cloned().collect(),
-                            slots,
-                        }));
+                    TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
+                        work.push(Work::Value(written_row_summary(
+                            fields.keys().cloned(),
+                            tail,
+                        )));
                     }
-                    TypeKind::Param { index, .. } => work.push(Work::Value(FieldSummary {
+                    TypeKind::Sum { cases, tail } if shape == Shape::Sum => {
+                        work.push(Work::Value(written_row_summary(
+                            cases.keys().cloned(),
+                            tail,
+                        )));
+                    }
+                    TypeKind::Param { index, .. } => work.push(Work::Value(RowSummary {
+                        shaped: false,
                         labels: IndexSet::new(),
                         slots: std::iter::once(*index).collect(),
                     })),
@@ -5538,13 +5553,14 @@ fn field_summaries(
                         work.push(Work::ArtifactApply(supplied));
                         work.push(Work::Named(*head));
                     }
-                    TypeKind::Sum { .. }
+                    TypeKind::Struct { .. }
+                    | TypeKind::Sum { .. }
                     | TypeKind::Arrow { .. }
                     | TypeKind::Effects(_)
                     | TypeKind::Prim(_)
                     | TypeKind::Var(_)
                     | TypeKind::Hole
-                    | TypeKind::Error => work.push(Work::Value(FieldSummary::default())),
+                    | TypeKind::Error => work.push(Work::Value(RowSummary::default())),
                 },
                 Work::SemanticApply(supplied) => {
                     let (head, crossed_cycle) = values
@@ -5556,6 +5572,7 @@ fn field_summaries(
                         .filter_map(|index| supplied.get(index as usize))
                         .collect();
                     work.push(Work::FinishApply {
+                        shaped: head.shaped,
                         labels: head.labels,
                         arguments: arguments.len(),
                         crossed_cycle,
@@ -5574,6 +5591,7 @@ fn field_summaries(
                         .filter_map(|index| supplied.get(index as usize))
                         .collect();
                     work.push(Work::FinishApply {
+                        shaped: head.shaped,
                         labels: head.labels,
                         arguments: arguments.len(),
                         crossed_cycle,
@@ -5583,6 +5601,7 @@ fn field_summaries(
                     }
                 }
                 Work::FinishApply {
+                    shaped,
                     labels,
                     arguments,
                     mut crossed_cycle,
@@ -5591,11 +5610,13 @@ fn field_summaries(
                         .len()
                         .checked_sub(arguments)
                         .expect("every selected argument leaves one summary");
-                    let mut out = FieldSummary {
+                    let mut out = RowSummary {
+                        shaped,
                         labels,
                         slots: IndexSet::new(),
                     };
                     for (argument, cycle) in values.drain(at..) {
+                        out.shaped |= argument.shaped;
                         out.labels.extend(argument.labels);
                         out.slots.extend(argument.slots);
                         crossed_cycle |= cycle;
@@ -5616,41 +5637,48 @@ fn field_summaries(
     let mut done = HashMap::new();
     for symbol in types.keys().chain(external.keys()) {
         if !done.contains_key(symbol) {
-            resolve(*symbol, types, external, &mut done);
+            resolve(*symbol, types, external, shape, &mut done);
         }
     }
     done.retain(|symbol, _| types.contains_key(symbol) || external.contains_key(symbol));
     done
 }
 
-/// What one written type carries, given the normalized local and imported
-/// declaration summaries: the read [`row_arguments`] makes of one argument.
-///
-/// A struct writes its own field names, and then whatever its `..` carries. A
-/// name, or an application, carries what the declaration it names carries,
-/// joined with what is field_summary by each argument written at a parameter that
-/// declaration puts in its constructor. Everything else carries nothing — a sum carries
-/// no *fields*, so `WithX (#A | #B)` is fine.
-fn field_summary(ty: &Type, decls: &HashMap<Symbol, FieldSummary>) -> FieldSummary {
+/// One written type's row summary for a requested sense, composing declaration
+/// summaries with whichever arguments their forwarding slots select.
+/// Concrete rows of another sense contribute nothing.
+fn written_summary(labels: impl IntoIterator<Item = String>, tail: &Option<Tail>) -> RowSummary {
+    let mut slots = IndexSet::new();
+    if let Some(Tail {
+        of: Row::Param { index, .. },
+        ..
+    }) = tail
+    {
+        slots.insert(*index);
+    }
+    RowSummary {
+        shaped: true,
+        labels: labels.into_iter().collect(),
+        slots,
+    }
+}
+
+fn row_summary(ty: &Type, decls: &HashMap<Symbol, RowSummary>, shape: Shape) -> RowSummary {
     match &ty.tracked {
-        TypeKind::Struct { fields, tail } => {
-            let mut slots = IndexSet::new();
-            if let Some(Tail {
-                of: Row::Param { index, .. },
-                ..
-            }) = tail
-            {
-                slots.insert(*index);
-            }
-            FieldSummary {
-                labels: fields.keys().cloned().collect(),
-                slots,
-            }
+        TypeKind::Struct { fields, tail } if shape == Shape::Struct => {
+            written_summary(fields.keys().cloned(), tail)
+        }
+        TypeKind::Sum { cases, tail } if shape == Shape::Sum => {
+            written_summary(cases.keys().cloned(), tail)
+        }
+        TypeKind::Effects(effects) if shape == Shape::Effect => {
+            written_summary(effects.effects.keys().map(EffectId::row_key), &effects.tail)
         }
         // The body is the parameter, as in `type Id 'a = 'a`: whatever is written
         // there is the whole of what the declaration stands for, fields
         // included.
-        TypeKind::Param { index, .. } => FieldSummary {
+        TypeKind::Param { index, .. } => RowSummary {
+            shaped: false,
             labels: IndexSet::new(),
             slots: std::iter::once(*index).collect(),
         },
@@ -5659,7 +5687,8 @@ fn field_summary(ty: &Type, decls: &HashMap<Symbol, FieldSummary>) -> FieldSumma
         TypeKind::Ident(symbol) => decls.get(symbol).cloned().unwrap_or_default(),
         TypeKind::Apply { head, args, .. } => {
             let head = decls.get(head).cloned().unwrap_or_default();
-            let mut out = FieldSummary {
+            let mut out = RowSummary {
+                shaped: head.shaped,
                 labels: head.labels,
                 slots: IndexSet::new(),
             };
@@ -5675,20 +5704,22 @@ fn field_summary(ty: &Type, decls: &HashMap<Symbol, FieldSummary>) -> FieldSumma
             for index in head.slots {
                 let inner = args
                     .get(index as usize)
-                    .map(|arg| field_summary(arg, decls))
+                    .map(|arg| row_summary(arg, decls, shape))
                     .unwrap_or_default();
+                out.shaped |= inner.shaped;
                 out.labels.extend(inner.labels);
                 out.slots.extend(inner.slots);
             }
             out
         }
-        TypeKind::Sum { .. }
+        TypeKind::Struct { .. }
+        | TypeKind::Sum { .. }
         | TypeKind::Arrow { .. }
         | TypeKind::Effects(_)
         | TypeKind::Prim(_)
         | TypeKind::Var(_)
         | TypeKind::Hole
-        | TypeKind::Error => FieldSummary::default(),
+        | TypeKind::Error => RowSummary::default(),
     }
 }
 
@@ -6332,7 +6363,7 @@ impl Builder<'_> {
                 else {
                     continue;
                 };
-                let scheme = import_scheme(
+                let imported = import_scheme(
                     self.mint,
                     &declaration.scheme,
                     &mut symbols,
@@ -6351,6 +6382,13 @@ impl Builder<'_> {
                         }
                     })
                     .collect();
+                let body = clamp_decl_bounds(imported.body(), params.len());
+                let scheme = Scheme::constrained(
+                    imported.count(),
+                    imported.presences(),
+                    body,
+                    imported.formula().clone(),
+                );
                 self.arities.insert(symbol, params.len());
                 program.external_types.insert(
                     symbol,

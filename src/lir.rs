@@ -1091,10 +1091,19 @@ impl Lower<'_> {
             Ty::Boolean => Rep::Boolean,
             Ty::Arrow(..) => Rep::Fn,
             Ty::Sum(_) => Rep::Sum,
-            Ty::Struct(row) if row.labels.is_empty() && matches!(row.rest, Rest::Closed) => {
-                Rep::Unit
+            Ty::Struct(row) => {
+                let row = flat(row);
+                if row
+                    .labels
+                    .values()
+                    .all(|field| matches!(field.presence, Presence::Absent))
+                    && matches!(row.rest, Rest::Closed)
+                {
+                    Rep::Unit
+                } else {
+                    Rep::Struct
+                }
             }
-            Ty::Struct(_) => Rep::Struct,
             _ => Rep::Any,
         }
     }

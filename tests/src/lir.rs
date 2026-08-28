@@ -201,6 +201,37 @@ fn a_shadowed_name_is_put_back_afterwards() {
 /// core; the empty struct is `unit` and a struct with fields is `struct`; and
 /// anything a scheme quantified is `any`, since monomorphization is deferred.
 #[test]
+fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
+    let source = "type RowId 'r = { ..'r }\n\
+                  let id : RowId {} -> RowId {} = fn x => x\n\
+                  let called = id {}";
+    let function = section(source, "fn id(");
+    assert!(function.starts_with("fn id(%0: unit):"), "{function}");
+    let call = section(source, "global called");
+    assert!(call.contains(": unit = struct {}"), "{call}");
+    assert!(call.contains(": unit = call id"), "{call}");
+
+    let absent = section(
+        "type NoY 'r = { \\y, ..'r }\nlet value : NoY {} = {}",
+        "global value",
+    );
+    assert!(absent.contains(": unit = struct {}"), "{absent}");
+
+    let open = section(
+        "type RowId 'r = { ..'r }\n\
+         let open : RowId { ..'s } -> RowId { ..'s } = fn x => x",
+        "fn open(",
+    );
+    assert!(open.starts_with("fn open(%0: struct):"), "{open}");
+    let nonempty = section(
+        "type RowId 'r = { ..'r }\n\
+         let point : RowId { x: Nat } = { x: 1n }",
+        "global point",
+    );
+    assert!(nonempty.contains(": struct = struct { x:"), "{nonempty}");
+}
+
+#[test]
 fn every_representation_comes_off_the_solved_type() {
     let source = "let n = 1n\nlet u = {}\nlet s = { x: 1n }\nlet c = #A\nlet i = fn x => x\n\
                   let int : Int -> Int = fn x => x\n\

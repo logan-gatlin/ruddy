@@ -956,6 +956,7 @@ impl Check<'_> {
             },
             Cell::Struct { fields, .. } => {
                 let Ty::Struct(row) = &*ty else { return false };
+                let row = flat(row);
                 fields.iter().all(|(name, sub)| match row.labels.get(name) {
                     Some(field) => match &field.presence {
                         Presence::Absent => true,

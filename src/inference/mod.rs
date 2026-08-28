@@ -3824,12 +3824,41 @@ pub fn unfold(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
             _ => budget.checked_sub(1).expect("declaration loop"),
         };
         let fresh: Vec<_> = args.iter().map(|a| Assigned::Ty(a.clone())).collect();
-        ty = scheme.body().open(&fresh)
+        ty = scheme.body().open_alias(&fresh, aliases)
     }
     ty
 }
 
 impl Ty {
+    /// Open a declared alias body. A bound row rest is allowed to receive a
+    /// named row alias, so look through that argument before converting it to
+    /// the row spliced at [`Rest::More`]. Ordinary bound type positions keep
+    /// the written named type intact.
+    fn open_alias(&self, fresh: &[Assigned], aliases: &IndexMap<Symbol, Scheme>) -> Rc<Ty> {
+        match self {
+            Ty::Bound(i) => fresh
+                .get(*i as usize)
+                .map(Assigned::as_ty)
+                .unwrap_or_else(|| Rc::new(Ty::Undecided)),
+            Ty::Arrow(a, b, r) => Rc::new(Ty::Arrow(
+                a.open_alias(fresh, aliases),
+                b.open_alias(fresh, aliases),
+                r.open_alias(fresh, aliases),
+            )),
+            Ty::Struct(r) => Rc::new(Ty::Struct(r.open_alias(fresh, aliases))),
+            Ty::Sum(r) => Rc::new(Ty::Sum(r.open_alias(fresh, aliases))),
+            Ty::Named { symbol, name, args } => Rc::new(Ty::Named {
+                symbol: *symbol,
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| arg.open_alias(fresh, aliases))
+                    .collect(),
+            }),
+            other => Rc::new(other.clone()),
+        }
+    }
+
     /// Replace each bound variable with what it was opened to.
     ///
     /// Two callers and one rule. Instantiating a definition's scheme hands each
@@ -3854,6 +3883,39 @@ impl Ty {
 }
 
 impl Row {
+    fn open_alias(&self, fresh: &[Assigned], aliases: &IndexMap<Symbol, Scheme>) -> Row {
+        let labels = self
+            .labels
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.clone(),
+                    RowField {
+                        presence: field.presence.open(fresh),
+                        ty: field.ty.open_alias(fresh, aliases),
+                    },
+                )
+            })
+            .collect();
+        let rest = match &self.rest {
+            Rest::Bound(index) => {
+                let row = fresh.get(*index as usize).map(Assigned::as_ty).map_or_else(
+                    || Row::of(Rest::Undecided),
+                    |ty| match &*unfold(aliases, &ty) {
+                        Ty::Struct(row) | Ty::Sum(row) => row.clone(),
+                        Ty::Var(var) => Row::of(Rest::Var(*var)),
+                        Ty::Undecided => Row::of(Rest::Undecided),
+                        _ => Row::of(Rest::Undecided),
+                    },
+                );
+                Rest::More(Rc::new(row))
+            }
+            Rest::More(more) => Rest::More(Rc::new(more.open_alias(fresh, aliases))),
+            rest => rest.clone(),
+        };
+        Row { labels, rest }
+    }
+
     /// [`Ty::open`] over a sum's cases. A row parameter written at this tail
     /// stands for the cases whatever is handed to it allows, which is how an
     /// argument written as a whole type is read for the row it carries. See

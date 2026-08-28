@@ -9,7 +9,7 @@ use ruddy::{
     symbol::{Bundle, Mint, Symbol, Version},
     token::lex,
     tracking::FileID,
-    types::{Formula, Presence, Rest, Sense, Shape, Ty, TyVar},
+    types::{Formula, Presence, Rest, Row, Scheme, Sense, Shape, Ty, TyVar},
 };
 
 fn dummy_mint() -> Mint {
@@ -1408,6 +1408,79 @@ fn a_bad_row_argument_is_absorbed_not_echoed() {
         "inference echoed it: {:#?}",
         output.errors
     );
+}
+
+#[test]
+fn named_sum_row_arguments_are_spliced_before_solving() {
+    let (_, ir, output) = infer_src(
+        "type Cases 'r = #A | ..'r\n\
+         type Alias = #B\n\
+         let good : Cases Alias = #B\n\
+         let bad : Cases Alias = #C",
+    );
+    assert!(ir.errors.is_empty(), "{:#?}", ir.errors);
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+    assert!(output.errors[0].kind.to_string().contains("#C"));
+}
+
+#[test]
+fn alias_row_opening_is_total_for_every_semantic_argument_exit() {
+    let (mint, _, output) = inferred("type RowId 'r = { ..'r }");
+    let symbol = symbol_named(&mint, output.aliases.keys().copied(), "RowId");
+    let named = |arg: Option<Ty>| {
+        Rc::new(Ty::Named {
+            symbol,
+            name: Rc::from("RowId"),
+            args: arg.into_iter().map(Rc::new).collect::<Vec<_>>().into(),
+        })
+    };
+
+    for (arg, expected) in [
+        (Ty::Var(7), Rest::Var(7)),
+        (Ty::Undecided, Rest::Undecided),
+        (Ty::Nat, Rest::Undecided),
+    ] {
+        let opened = inference::unfold(&output.aliases, &named(Some(arg)));
+        let Ty::Struct(row) = &*opened else {
+            panic!("row identity opens to a struct")
+        };
+        let Rest::More(more) = &row.rest else {
+            panic!("the supplied row is composed")
+        };
+        assert!(std::mem::discriminant(&more.rest) == std::mem::discriminant(&expected));
+    }
+
+    // A malformed missing argument and an imported-style nested More both
+    // absorb instead of indexing or leaving a bound slot unopened.
+    let opened = inference::unfold(&output.aliases, &named(None));
+    assert!(matches!(
+        opened.fields().map(|row| &row.rest),
+        Some(Rest::More(more)) if matches!(more.rest, Rest::Undecided)
+    ));
+    let mut aliases = output.aliases.clone();
+    aliases.insert(symbol, Scheme::new(1, Rc::new(Ty::Bound(0))));
+    assert!(matches!(
+        &*inference::unfold(&aliases, &named(None)),
+        Ty::Undecided
+    ));
+    aliases.insert(
+        symbol,
+        Scheme::new(
+            1,
+            Rc::new(Ty::Struct(Row {
+                labels: Default::default(),
+                rest: Rest::More(Rc::new(Row::of(Rest::Bound(0)))),
+            })),
+        ),
+    );
+    let opened = inference::unfold(&aliases, &named(Some(Ty::unit())));
+    let Ty::Struct(row) = &*opened else {
+        panic!("nested row identity opens to a struct")
+    };
+    assert!(matches!(
+        &row.rest,
+        Rest::More(first) if matches!(&first.rest, Rest::More(last) if matches!(last.rest, Rest::Closed))
+    ));
 }
 
 #[test]

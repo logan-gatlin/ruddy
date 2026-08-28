@@ -221,6 +221,18 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
 }
 
 #[test]
+fn struct_pattern_compatibility_flattens_forwarded_rows() {
+    let checks = clean(
+        "type WithX 'r = { x: Nat, ..'r }\n\
+         let f : WithX { y: Nat } -> Nat = fn v =>\n\
+         match v with | { y, .. } => y end",
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable]);
+}
+
+#[test]
 fn a_struct_pattern_with_a_corrupted_non_struct_type_is_skipped_safely() {
     let src = "let f = fn v => match v with | { a } => 1n | _ => 2n end";
     let (mut out, mut inferred, initial) = checked(src);

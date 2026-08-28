@@ -2309,6 +2309,15 @@ fn a_declaration_that_adds_fields_to_itself_is_refused() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert_eq!(out.errors[0].kind.code(), "circular-type");
 
+    // An absent label constrains the tail but adds no field on the way round.
+    // A present or optional label can be there, so each is genuinely endless.
+    let (_, out) = build_src("type NoY 'r = { \\y, ..'r }\ntype T = NoY T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "circular-type");
+    let (_, out) = build_src("type Add 'r = { y: Nat, ..'r }\ntype T = Add T");
+    assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
+    assert_eq!(out.errors[0].kind.code(), "endless-fields");
+
     // And a declaration that names itself inside a *field* is on no core loop
     // at all: its core is unit, and the recursion is in what a field holds.
     let (_, out) = build_src("type List = { next: List }");
@@ -7163,6 +7172,56 @@ fn struct_tails_are_field_rows_and_only_accept_struct_rows() {
     ));
 }
 
+#[test]
+fn sum_row_aliases_are_normalized_for_repetition_and_lacks() {
+    for argument in ["Alias", "Transitive", "(AddB (#C | #A))"] {
+        let source = format!(
+            "type Cases 'r = #A | ..'r\n\
+             type Alias = #B | #A\n\
+             type Transitive = Alias\n\
+             type AddB 'r = #B | ..'r\n\
+             type Bad = Cases {argument}"
+        );
+        let (_, out) = build_src(&source);
+        assert!(
+            matches!(
+                out.errors.as_slice(),
+                [error]
+                    if matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Sum, field } if field == "A")
+            ),
+            "{argument}: {:#?}",
+            out.errors
+        );
+    }
+
+    // `Forward`'s parameter reaches `Cases` through another row constructor;
+    // it inherits A as well as AddB's own B, in source order.
+    let (_, out) = build_src(
+        "type Cases 'r = #A | ..'r\n\
+         type AddB 'r = #B | ..'r\n\
+         type Forward 'r = Cases (AddB 'r)\n\
+         type Bad = Forward (#C | #A | #B)",
+    );
+    assert!(
+        matches!(
+            out.errors.as_slice(),
+            [error]
+                if matches!(&error.kind, ErrorKind::RepeatedRowField { shape: Shape::Sum, field } if field == "A")
+        ),
+        "{:#?}",
+        out.errors
+    );
+
+    // Effect rows use the same normalization machinery without borrowing the
+    // sum or struct sense.
+    let (_, out) = build_src(
+        "effect Log = { write: () -> () }\n\
+         type Eff 'e = Nat -> Nat + ..'e\n\
+         type Forward 'e = Eff (!Log + ..'e)",
+    );
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+}
+
 fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
     let mut dependency = effect_artifact("dep", "forwarding");
     dependency.header.types = vec![
@@ -7180,6 +7239,83 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
                 body: a::Type::Struct(a::Row {
                     labels: Vec::new(),
                     rest: a::Rest::Bound(0),
+                }),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Identity".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Type,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::First".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                },
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Bound(0)),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::MissingSelect".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::Identity".into(),
+                args: Vec::new(),
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::GenericUnknown".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: false,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Undecided),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::Twice".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: Vec::new(),
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::Identity".into(),
+                    args: vec![artifact_type(a::Type::Named {
+                        name: "dep@1.0.0::Identity".into(),
+                        args: vec![artifact_type(a::Type::Bound(0))],
+                    })],
                 }),
             },
         },
@@ -7224,6 +7360,75 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
                 }),
             },
         },
+        a::DeclaredType {
+            name: "dep@1.0.0::WithX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::MaybeX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Undecided,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::AbsentX".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Fields,
+                lacks: vec!["x".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Struct(a::Row {
+                    labels: vec![(
+                        "x".into(),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: artifact_type(a::Type::Undecided),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
     ];
     if include_cycle {
         dependency.header.types.extend([
@@ -7255,6 +7460,184 @@ fn forwarding_rows_artifact(include_cycle: bool) -> a::Artifact {
         ]);
     }
     dependency
+}
+
+fn case_rows_artifact() -> a::Artifact {
+    let mut dependency = forwarding_rows_artifact(false);
+    dependency.header.types.extend([
+        a::DeclaredType {
+            name: "dep@1.0.0::CaseAlias".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Sum(a::Row {
+                labels: ["B", "A"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.into(),
+                            a::RowField {
+                                presence: a::Presence::Present,
+                                ty: artifact_type(a::Type::Nat),
+                            },
+                        )
+                    })
+                    .collect(),
+                rest: a::Rest::Closed,
+            }))),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::CaseTransitive".into(),
+            params: Vec::new(),
+            scheme: artifact_scheme(artifact_type(a::Type::Named {
+                name: "dep@1.0.0::CaseAlias".into(),
+                args: Vec::new(),
+            })),
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::AddB".into(),
+            params: vec![a::Parameter {
+                sense: a::Sense::Cases,
+                lacks: vec!["B".into()],
+                relevant: true,
+            }],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Sum(a::Row {
+                    labels: vec![(
+                        "B".into(),
+                        a::RowField {
+                            presence: a::Presence::Present,
+                            ty: artifact_type(a::Type::Nat),
+                        },
+                    )],
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::SelectSecond".into(),
+            params: vec![
+                a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: false,
+                },
+                a::Parameter {
+                    sense: a::Sense::Cases,
+                    lacks: vec!["B".into()],
+                    relevant: true,
+                },
+            ],
+            scheme: a::Scheme {
+                count: 2,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Named {
+                    name: "dep@1.0.0::AddB".into(),
+                    args: vec![artifact_type(a::Type::Bound(1))],
+                }),
+            },
+        },
+        // No parameters, despite the malformed semantic rest. The importer
+        // must absorb slot zero rather than assigning it to a local parameter.
+        a::DeclaredType {
+            name: "dep@1.0.0::BrokenBare".into(),
+            params: Vec::new(),
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: artifact_type(a::Type::Sum(a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Bound(0),
+                })),
+            },
+        },
+    ]);
+    let a::EffectKind::Operations(operations) = &mut dependency.header.effects[0].kind else {
+        unreachable!()
+    };
+    operations.push(a::Operation {
+        selector: a::OperationSelector::Named("cases".into()),
+        from: artifact_type(a::Type::Named {
+            name: "dep@1.0.0::AddB".into(),
+            args: vec![artifact_type(a::Type::Sum(a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            }))],
+        }),
+        to: artifact_type(a::Type::Nat),
+    });
+    dependency
+}
+
+#[test]
+fn imported_case_rows_are_normalized_and_bad_slots_do_not_escape() {
+    let dependency = case_rows_artifact();
+    let parsed = parse::parse(
+        lex(
+            "type Cases 'r = #A | ..'r\n\
+             type BadDirect = Cases dep::CaseAlias\n\
+             type BadTransitive = Cases dep::CaseTransitive\n\
+             type BadParameterized = Cases (dep::AddB (#C | #A))\n\
+             type BadSelected = Cases (dep::SelectSecond Nat (#C | #A))\n\
+             type CasesB 'r = #B | ..'r\n\
+             type Local 'r = { one: Cases 'r, two: CasesB dep::BrokenBare }\n\
+             type Good = Local (#B)\n\
+             effect UsesImportedCases = { run: dep::AddB (#C) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 4, "{:#?}", out.errors);
+    assert!(out.errors.iter().all(|error| matches!(
+        &error.kind,
+        ErrorKind::RepeatedRowField {
+            shape: Shape::Sum,
+            field,
+        } if field == "A"
+    )));
+}
+
+#[test]
+fn imported_forwarding_aliases_classify_local_recursion() {
+    let dependency = forwarding_rows_artifact(false);
+    let parsed = parse::parse(
+        lex(
+            "type ViaBound = dep::Identity ViaBound\n\
+             type ViaRow = dep::Id ViaRow\n\
+             type ViaSelection = dep::Second Nat ViaSelection\n\
+             type Endless = dep::WithX Endless\n\
+             type Optional = dep::MaybeX Optional\n\
+             type Absent = dep::AbsentX Absent\n\
+             type ValidExit = dep::WithX (dep::Twice { y: Nat })\n\
+             type ValidUnknown = dep::WithX (dep::GenericUnknown {})\n\
+             type ValidMissing = dep::MissingSelect\n\
+             type ValidSelection = dep::First Nat ValidSelection",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert_eq!(out.errors.len(), 6, "{:#?}", out.errors);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        [
+            "circular-type",
+            "circular-type",
+            "circular-type",
+            "endless-fields",
+            "endless-fields",
+            "circular-type",
+        ]
+    );
 }
 
 #[test]
