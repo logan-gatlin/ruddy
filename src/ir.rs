@@ -3062,13 +3062,132 @@ fn structuralize_effects(
 /// rejects effect rows and open tails, but this walk deliberately preserves
 /// them: recovery still gives an erroneous signature a semantic identity, and
 /// a future relaxation of that rule must not silently make effectful arrows
-/// compare as pure ones. Recursive types and effects are represented by their
-/// module-less name at the back edge, so equivalent dependency cycles do not
-/// acquire a module path by accident.
+/// compare as pure ones. Recursive types and effects use graph backreferences,
+/// so equivalent dependency cycles neither acquire a module path nor depend on
+/// a finite unrolling depth.
 #[derive(Clone, Default)]
 struct RegularNode {
     label: String,
     edges: Vec<(String, usize)>,
+}
+
+/// One exact, compact presentation shared by operation interfaces and every
+/// type/effect graph they reach. Node numbers are only construction details;
+/// `encode` bisimulation-minimizes the reachable graph and assigns deterministic
+/// backreference numbers before an identity crosses the artifact boundary.
+type EncodedGraph = Vec<(usize, String, Vec<(String, usize)>)>;
+
+#[derive(Default)]
+struct CanonicalArena {
+    nodes: Vec<RegularNode>,
+}
+
+impl CanonicalArena {
+    fn node(&mut self, label: impl Into<String>, edges: Vec<(String, usize)>) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(RegularNode {
+            label: label.into(),
+            edges,
+        });
+        id
+    }
+
+    fn atom(&mut self, label: impl Into<String>) -> usize {
+        self.node(label, Vec::new())
+    }
+
+    /// Decode an interface emitted by `encode`. Imported generated effect keys
+    /// therefore join the same graph as local interfaces instead of becoming a
+    /// large opaque label. Untrusted or older artifact text remains an exact,
+    /// distinct recovery atom.
+    fn import(&mut self, encoded: &str) -> usize {
+        fn number(bytes: &[u8], at: &mut usize, delimiter: u8) -> Option<usize> {
+            let start = *at;
+            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            if start == *at || bytes.get(*at).copied()? != delimiter {
+                return None;
+            }
+            let value = std::str::from_utf8(&bytes[start..*at]).ok()?.parse().ok()?;
+            *at += 1;
+            Some(value)
+        }
+        fn bare_number(bytes: &[u8], at: &mut usize) -> Option<usize> {
+            let start = *at;
+            while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            (start != *at)
+                .then(|| std::str::from_utf8(&bytes[start..*at]).ok()?.parse().ok())
+                .flatten()
+        }
+        fn parse(encoded: &str) -> Option<EncodedGraph> {
+            let bytes = encoded.as_bytes();
+            let mut at = 0;
+            let mut parsed = Vec::new();
+            while at < bytes.len() {
+                let id = number(bytes, &mut at, b'#')?;
+                let length = number(bytes, &mut at, b':')?;
+                let end = at.checked_add(length)?;
+                let label = std::str::from_utf8(bytes.get(at..end)?).ok()?.to_string();
+                at = end;
+                let mut edges = Vec::new();
+                while bytes.get(at).copied() == Some(b'|') {
+                    at += 1;
+                    let length = number(bytes, &mut at, b':')?;
+                    let end = at.checked_add(length)?;
+                    let edge = std::str::from_utf8(bytes.get(at..end)?).ok()?.to_string();
+                    at = end;
+                    (bytes.get(at).copied() == Some(b'>')).then_some(())?;
+                    at += 1;
+                    edges.push((edge, bare_number(bytes, &mut at)?));
+                }
+                (bytes.get(at).copied() == Some(b';')).then_some(())?;
+                at += 1;
+                parsed.push((id, label, edges));
+            }
+            (!parsed.is_empty()
+                && !parsed.iter().enumerate().any(|(expected, (id, _, edges))| {
+                    *id != expected || edges.iter().any(|(_, child)| *child >= parsed.len())
+                }))
+            .then_some(parsed)
+        }
+
+        let Some(parsed) = parse(encoded) else {
+            return self.atom(format!("opaque-interface:{encoded}"));
+        };
+        let base = self.nodes.len();
+        self.nodes
+            .extend((0..parsed.len()).map(|_| RegularNode::default()));
+        for (id, label, edges) in parsed {
+            self.nodes[base + id] = RegularNode {
+                label,
+                edges: edges
+                    .into_iter()
+                    .map(|(label, child)| (label, base + child))
+                    .collect(),
+            };
+        }
+        base
+    }
+
+    fn effect_key(&mut self, key: &str) -> usize {
+        let (name, interface) = key
+            .split_once('\u{1f}')
+            .map_or((key, None), |(name, interface)| (name, Some(interface)));
+        let interface = interface
+            .map(|interface| self.import(interface))
+            .unwrap_or_else(|| self.atom("unknown-interface"));
+        self.node(
+            format!("effect:{name}"),
+            vec![("interface".into(), interface)],
+        )
+    }
+
+    fn encode(&self, root: usize) -> String {
+        encode_regular_graph(&self.nodes, root)
+    }
 }
 
 /// A finite presentation of a regular type tree. Named declarations are
@@ -3078,8 +3197,9 @@ struct RegularNode {
 struct RegularType<'a> {
     types: &'a IndexMap<Symbol, Decl<Type>>,
     external_types: &'a IndexMap<Symbol, ExternalType>,
-    effect_interfaces: &'a HashMap<Symbol, String>,
-    nodes: Vec<RegularNode>,
+    effect_interfaces: &'a HashMap<Symbol, usize>,
+    arena: &'a mut CanonicalArena,
+    created: Vec<usize>,
     /// Hash-consing makes semantic argument identity independent of the path
     /// which built it. In particular, `T Nat` reached around a recursive
     /// imported declaration meets the same memo entry instead of rebuilding
@@ -3095,8 +3215,8 @@ impl RegularType<'_> {
         if let Some(id) = self.interned.get(&key) {
             return *id;
         }
-        let id = self.nodes.len();
-        self.nodes.push(RegularNode { label, edges });
+        let id = self.arena.node(label, edges);
+        self.created.push(id);
         self.interned.insert(key, id);
         id
     }
@@ -3104,11 +3224,8 @@ impl RegularType<'_> {
     /// A mutable graph back edge. Placeholders are deliberately not interned:
     /// their label is replaced once the declaration body has been visited.
     fn placeholder(&mut self) -> usize {
-        let id = self.nodes.len();
-        self.nodes.push(RegularNode {
-            label: "unproductive-cycle".into(),
-            edges: Vec::new(),
-        });
+        let id = self.arena.atom("unproductive-cycle");
+        self.created.push(id);
         id
     }
 
@@ -3154,6 +3271,8 @@ impl RegularType<'_> {
             FinishNamed(usize),
             Make(String, Vec<String>),
             Fields(Vec<(String, String)>),
+            EffectCase(String),
+            Canonical(usize),
             Atom(String),
         }
 
@@ -3162,6 +3281,15 @@ impl RegularType<'_> {
         while let Some(part) = work.pop() {
             match part {
                 Work::Atom(label) => values.push(self.atom(label)),
+                Work::Canonical(node) => values.push(node),
+                Work::EffectCase(presence) => {
+                    let payload = values.pop().expect("an effect case has a payload");
+                    let identity = values.pop().expect("an effect case has an identity");
+                    values.push(self.node(
+                        format!("effect-case:{presence}"),
+                        vec![("identity".into(), identity), ("payload".into(), payload)],
+                    ));
+                }
                 Work::Make(label, edge_labels) => {
                     let start = values.len() - edge_labels.len();
                     let children = values.split_off(start);
@@ -3266,39 +3394,34 @@ impl RegularType<'_> {
                 },
                 Work::CoreTail(tail, args) => {
                     let value = match tail.as_ref().map(|tail| &tail.of) {
+                        None => self.atom("Unit"),
                         Some(Row::Param { index, .. }) => self.argument(&args, *index),
-                        _ => self.atom("Unit"),
+                        Some(Row::Anything | Row::Named(_)) => self.atom("?"),
                     };
                     values.push(value);
                 }
                 Work::RowTail(tail, args) => {
                     let value = match tail.as_ref().map(|tail| &tail.of) {
-                        Some(Row::Anything) => self.atom("?"),
+                        None => self.atom("closed"),
                         Some(Row::Param { index, .. }) => self.argument(&args, *index),
-                        _ => self.atom("closed"),
+                        Some(Row::Anything | Row::Named(_)) => self.atom("?"),
                     };
                     values.push(value);
                 }
                 Work::EffectRow(row, args) => {
-                    let labels = row
-                        .effects
-                        .values()
-                        .map(|label| {
-                            let effect = &self.effect_interfaces[&label.symbol()];
-                            let presence = match label {
-                                EffectLabel::Written { when, .. } => {
-                                    canonical_written_presence(when)
-                                }
-                                EffectLabel::Absent { .. } => "\\".into(),
-                            };
-                            format!("label:{effect}:{presence}")
-                        })
+                    let labels = std::iter::repeat_n("effect".to_string(), row.effects.len())
                         .chain(std::iter::once("tail".into()))
                         .collect();
-                    work.push(Work::Make("sum".into(), labels));
+                    work.push(Work::Make("effects".into(), labels));
                     work.push(Work::RowTail(&row.tail, args));
-                    for _ in row.effects.values().rev() {
+                    for label in row.effects.values().rev() {
+                        let presence = match label {
+                            EffectLabel::Written { when, .. } => canonical_written_presence(when),
+                            EffectLabel::Absent { .. } => "\\".into(),
+                        };
+                        work.push(Work::EffectCase(presence));
                         work.push(Work::Atom("Unit".into()));
+                        work.push(Work::Canonical(self.effect_interfaces[&label.symbol()]));
                     }
                 }
                 Work::Apply(symbol, count) => {
@@ -3327,7 +3450,7 @@ impl RegularType<'_> {
                     // Bare aliases were rejected during recursion
                     // classification, so a local declaration always reaches a
                     // distinct body node.
-                    self.nodes[id] = self.nodes[body].clone();
+                    self.arena.nodes[id] = self.arena.nodes[body].clone();
                     values.push(id);
                 }
             }
@@ -3353,6 +3476,8 @@ impl RegularType<'_> {
             Apply(Symbol, usize),
             FinishNamed(usize, Symbol),
             Make(String, Vec<String>),
+            EffectCase(String),
+            Canonical(usize),
             Atom(String),
             Argument(Vec<usize>, u32),
         }
@@ -3364,7 +3489,16 @@ impl RegularType<'_> {
         while let Some(part) = work.pop() {
             match part {
                 Work::Atom(label) => values.push(self.atom(label)),
+                Work::Canonical(node) => values.push(node),
                 Work::Argument(args, index) => values.push(self.argument(&args, index)),
+                Work::EffectCase(presence) => {
+                    let payload = values.pop().expect("an effect case has a payload");
+                    let identity = values.pop().expect("an effect case has an identity");
+                    values.push(self.node(
+                        format!("effect-case:{presence}"),
+                        vec![("identity".into(), identity), ("payload".into(), payload)],
+                    ));
+                }
                 Work::Make(label, edge_labels) => {
                     let mut children = Vec::with_capacity(edge_labels.len());
                     for _ in 0..edge_labels.len() {
@@ -3444,7 +3578,7 @@ impl RegularType<'_> {
                             .map(|(index, argument)| (format!("arg:{index}"), argument))
                             .collect();
                         let body = self.node(format!("unresolved:{name}"), edges);
-                        self.nodes[id] = self.nodes[body].clone();
+                        self.arena.nodes[id] = self.arena.nodes[body].clone();
                         *active -= 1;
                         values.push(id);
                     } else {
@@ -3455,33 +3589,43 @@ impl RegularType<'_> {
                 Work::FinishNamed(id, symbol) => {
                     let body = values.pop().expect("named body postorder is balanced");
                     if body != id {
-                        self.nodes[id] = self.nodes[body].clone();
+                        self.arena.nodes[id] = self.arena.nodes[body].clone();
                     }
                     *active_instantiations.entry(symbol).or_default() -= 1;
                     values.push(id);
                 }
                 Work::Row(row, args, effects, fields) => {
-                    let mut labels = Vec::with_capacity(row.labels.len() + 1);
-                    for (name, field) in &row.labels {
-                        let presence = match field.presence {
-                            Presence::Present => "+",
-                            Presence::Absent => "\\",
-                            Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?",
-                        };
-                        let name = if effects {
-                            canonical_effect_key(name)
+                    let labels = row
+                        .labels
+                        .iter()
+                        .map(|(name, field)| {
+                            if effects {
+                                "effect".to_string()
+                            } else {
+                                let presence = match field.presence {
+                                    Presence::Present => "+",
+                                    Presence::Absent => "\\",
+                                    Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => {
+                                        "?"
+                                    }
+                                };
+                                format!(
+                                    "{}:{name}:{presence}",
+                                    if fields { "field" } else { "label" }
+                                )
+                            }
+                        })
+                        .chain(std::iter::once(if fields {
+                            "core".into()
                         } else {
-                            name.clone()
-                        };
-                        labels.push(format!(
-                            "{}:{name}:{presence}",
-                            if fields { "field" } else { "label" }
-                        ));
-                    }
-                    labels.push(if fields { "core".into() } else { "tail".into() });
+                            "tail".into()
+                        }))
+                        .collect();
                     work.push(Work::Make(
                         if fields {
                             "fields".into()
+                        } else if effects {
+                            "effects".into()
                         } else {
                             "sum".into()
                         },
@@ -3501,8 +3645,22 @@ impl RegularType<'_> {
                             work.push(Work::Row(more, args.clone(), effects, fields))
                         }
                     }
-                    for field in row.labels.values().rev() {
-                        if matches!(field.presence, Presence::Absent) {
+                    for (name, field) in row.labels.iter().rev() {
+                        if effects {
+                            let presence = match field.presence {
+                                Presence::Present => "+",
+                                Presence::Absent => "\\",
+                                Presence::Var(_) | Presence::Bound(_) | Presence::Undecided => "?",
+                            };
+                            let identity = self.arena.effect_key(name);
+                            work.push(Work::EffectCase(presence.into()));
+                            if matches!(field.presence, Presence::Absent) {
+                                work.push(Work::Atom("?".into()));
+                            } else {
+                                work.push(Work::Type(&field.ty, args.clone()));
+                            }
+                            work.push(Work::Canonical(identity));
+                        } else if matches!(field.presence, Presence::Absent) {
                             work.push(Work::Atom("?".into()));
                         } else {
                             work.push(Work::Type(&field.ty, args.clone()));
@@ -3520,11 +3678,13 @@ impl RegularType<'_> {
     /// depend on declaration order. Epsilon closure also makes recursive row
     /// graphs finite: each row node contributes its labels at most once.
     fn flatten_rows(&mut self) {
-        let original = self.nodes.clone();
-        for root in 0..original.len() {
+        let original = self.arena.nodes.clone();
+        let mut effect_keys = HashMap::new();
+        for root in self.created.iter().copied() {
             let (kind, join) = match original[root].label.as_str() {
                 "fields" => ("fields", "core"),
                 "sum" => ("sum", "tail"),
+                "effects" => ("effects", "tail"),
                 _ => continue,
             };
             let mut pending = vec![root];
@@ -3545,10 +3705,25 @@ impl RegularType<'_> {
                         // Claiming the semantic label before inspecting it is
                         // the row rule: an outer absent edge masks an inner
                         // present one just as surely as an outer present does.
-                        let key = label
-                            .rsplit_once(':')
-                            .map_or(label.as_str(), |(key, _)| key);
-                        if claimed.insert(key.to_string()) {
+                        let key = if kind == "effects" {
+                            let identity = original[*child]
+                                .edges
+                                .iter()
+                                .find_map(|(edge, identity)| {
+                                    (edge == "identity").then_some(*identity)
+                                })
+                                .expect("effect cases have an identity");
+                            effect_keys
+                                .entry(identity)
+                                .or_insert_with(|| encode_regular_graph(&original, identity))
+                                .clone()
+                        } else {
+                            label
+                                .rsplit_once(':')
+                                .map_or(label.as_str(), |(key, _)| key)
+                                .to_string()
+                        };
+                        if claimed.insert(key) {
                             edges.push((label.clone(), *child));
                         }
                     }
@@ -3557,43 +3732,84 @@ impl RegularType<'_> {
             // Graph encoding is order independent, but stable storage keeps
             // duplicate labels and multiple distinct exits deterministic too.
             edges.sort();
-            self.nodes[root].edges = edges;
+            self.arena.nodes[root].edges = edges;
         }
     }
 
-    fn encode(&mut self, root: usize) -> String {
+    fn finish(&mut self, root: usize) -> usize {
         self.flatten_rows();
-        // Acyclic imported types are by far the common deep case. Classify
-        // those bottom-up in one pass; repeated whole-graph refinement would
-        // take quadratic time on a 30,000-arrow signature. Regular recursive
-        // graphs retain the bisimulation refinement below.
-        let mut remaining: Vec<_> = self.nodes.iter().map(|node| node.edges.len()).collect();
-        let mut parents = vec![Vec::new(); self.nodes.len()];
-        for (parent, node) in self.nodes.iter().enumerate() {
-            for (_, child) in &node.edges {
-                parents[*child].push(parent);
-            }
+        root
+    }
+}
+
+fn encode_regular_graph(nodes: &[RegularNode], root: usize) -> String {
+    let mut reachable = Vec::new();
+    let mut ids = HashMap::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if ids.contains_key(&node) {
+            continue;
         }
-        let mut pending: Vec<_> = remaining
-            .iter()
-            .enumerate()
-            .filter_map(|(node, count)| (*count == 0).then_some(node))
-            .collect();
-        let mut dag_colors = vec![usize::MAX; self.nodes.len()];
-        let mut dag_classes: HashMap<(String, Vec<(String, usize)>), usize> = HashMap::new();
-        let mut classified = 0;
-        while let Some(node) = pending.pop() {
-            let mut edges: Vec<_> = self.nodes[node]
+        ids.insert(node, reachable.len());
+        reachable.push(node);
+        pending.extend(nodes[node].edges.iter().rev().map(|(_, child)| *child));
+    }
+    let dense: Vec<_> = reachable
+        .iter()
+        .map(|node| RegularNode {
+            label: nodes[*node].label.clone(),
+            edges: nodes[*node]
                 .edges
                 .iter()
-                .map(|(label, child)| (label.clone(), dag_colors[*child]))
-                .collect();
-            edges.sort();
-            let next = dag_classes.len();
-            let color = *dag_classes
-                .entry((self.nodes[node].label.clone(), edges))
-                .or_insert(next);
-            dag_colors[node] = color;
+                .map(|(label, child)| (label.clone(), ids[child]))
+                .collect(),
+        })
+        .collect();
+    encode_dense_graph(&dense, ids[&root])
+}
+
+fn encode_dense_graph(nodes: &[RegularNode], root: usize) -> String {
+    // Acyclic imported types are by far the common deep case. Classify
+    // those bottom-up in one pass; repeated whole-graph refinement would
+    // take quadratic time on a 30,000-arrow signature. Regular recursive
+    // graphs retain the bisimulation refinement below.
+    let mut remaining: Vec<_> = nodes.iter().map(|node| node.edges.len()).collect();
+    let mut parents = vec![Vec::new(); nodes.len()];
+    for (parent, node) in nodes.iter().enumerate() {
+        for (_, child) in &node.edges {
+            parents[*child].push(parent);
+        }
+    }
+    let mut pending: Vec<_> = remaining
+        .iter()
+        .enumerate()
+        .filter_map(|(node, count)| (*count == 0).then_some(node))
+        .collect();
+    let mut dag_colors = vec![usize::MAX; nodes.len()];
+    let mut color_base = 0;
+    let mut classified = 0;
+    while !pending.is_empty() {
+        let wave = std::mem::take(&mut pending);
+        let signatures: Vec<_> = wave
+            .iter()
+            .map(|node| {
+                let mut edges: Vec<_> = nodes[*node]
+                    .edges
+                    .iter()
+                    .map(|(label, child)| (label.clone(), dag_colors[*child]))
+                    .collect();
+                edges.sort();
+                (nodes[*node].label.clone(), edges)
+            })
+            .collect();
+        let wave_colors = ranks(signatures);
+        let classes = wave_colors
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |color| color + 1);
+        for (node, color) in wave.into_iter().zip(wave_colors) {
+            dag_colors[node] = color_base + color;
             classified += 1;
             for parent in &parents[node] {
                 remaining[*parent] -= 1;
@@ -3602,84 +3818,85 @@ impl RegularType<'_> {
                 }
             }
         }
-
-        let mut colors = if classified == self.nodes.len() {
-            dag_colors
-        } else {
-            ranks(
-                self.nodes
-                    .iter()
-                    .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
-                    .collect(),
-            )
-        };
-        if classified != self.nodes.len() {
-            loop {
-                let signatures: Vec<_> = self
-                    .nodes
-                    .iter()
-                    .map(|node| {
-                        let mut edges: Vec<_> = node
-                            .edges
-                            .iter()
-                            .map(|(label, to)| (label.clone(), colors[*to]))
-                            .collect();
-                        edges.sort();
-                        (node.label.clone(), edges)
-                    })
-                    .collect();
-                let next = ranks(signatures);
-                let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
-                let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
-                colors = next;
-                if old_classes == new_classes {
-                    break;
-                }
-            }
-        }
-        let mut representatives = vec![0; colors.iter().copied().max().map_or(0, |n| n + 1)];
-        for (node, color) in colors.iter().copied().enumerate() {
-            representatives[color] = node;
-        }
-        let mut ids = HashMap::new();
-        let mut order = Vec::new();
-        let mut pending = vec![colors[root]];
-        while let Some(color) = pending.pop() {
-            if ids.contains_key(&color) {
-                continue;
-            }
-            ids.insert(color, order.len());
-            order.push(color);
-            let mut edges: Vec<_> = self.nodes[representatives[color]]
-                .edges
-                .iter()
-                .map(|(label, to)| (label, colors[*to]))
-                .collect();
-            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            pending.extend(edges.into_iter().rev().map(|(_, child)| child));
-        }
-        let mut out = String::new();
-        for color in order {
-            let node = &self.nodes[representatives[color]];
-            out.push_str(&format!(
-                "{}#{}:{}",
-                ids[&color],
-                node.label.len(),
-                node.label
-            ));
-            let mut edges: Vec<_> = node
-                .edges
-                .iter()
-                .map(|(label, to)| (label, colors[*to]))
-                .collect();
-            edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            for (label, child) in edges {
-                out.push_str(&format!("|{}:{}>{}", label.len(), label, ids[&child]));
-            }
-            out.push(';');
-        }
-        out
+        color_base += classes;
     }
+
+    let mut colors = if classified == nodes.len() {
+        dag_colors
+    } else {
+        ranks(
+            nodes
+                .iter()
+                .map(|node| (node.label.clone(), Vec::<(String, usize)>::new()))
+                .collect(),
+        )
+    };
+    if classified != nodes.len() {
+        loop {
+            let signatures: Vec<_> = nodes
+                .iter()
+                .enumerate()
+                .map(|(id, node)| {
+                    let mut edges: Vec<_> = node
+                        .edges
+                        .iter()
+                        .map(|(label, to)| (label.clone(), colors[*to]))
+                        .collect();
+                    edges.sort();
+                    (colors[id], node.label.clone(), edges)
+                })
+                .collect();
+            let next = ranks(signatures);
+            let old_classes = colors.iter().copied().max().map_or(0, |n| n + 1);
+            let new_classes = next.iter().copied().max().map_or(0, |n| n + 1);
+            colors = next;
+            if old_classes == new_classes {
+                break;
+            }
+        }
+    }
+    let mut representatives = vec![0; colors.iter().copied().max().map_or(0, |n| n + 1)];
+    for (node, color) in colors.iter().copied().enumerate() {
+        representatives[color] = node;
+    }
+    let mut ids = HashMap::new();
+    let mut order = Vec::new();
+    let mut pending = vec![colors[root]];
+    while let Some(color) = pending.pop() {
+        if ids.contains_key(&color) {
+            continue;
+        }
+        ids.insert(color, order.len());
+        order.push(color);
+        let mut edges: Vec<_> = nodes[representatives[color]]
+            .edges
+            .iter()
+            .map(|(label, to)| (label, colors[*to]))
+            .collect();
+        edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        pending.extend(edges.into_iter().rev().map(|(_, child)| child));
+    }
+    let mut out = String::new();
+    for color in order {
+        let node = &nodes[representatives[color]];
+        out.push_str(&format!(
+            "{}#{}:{}",
+            ids[&color],
+            node.label.len(),
+            node.label
+        ));
+        let mut edges: Vec<_> = node
+            .edges
+            .iter()
+            .map(|(label, to)| (label, colors[*to]))
+            .collect();
+        edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        for (label, child) in edges {
+            out.push_str(&format!("|{}:{}>{}", label.len(), label, ids[&child]));
+        }
+        out.push(';');
+    }
+    out
 }
 
 fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
@@ -3690,16 +3907,6 @@ fn ranks<T: Ord + Clone>(values: Vec<T>) -> Vec<usize> {
         .iter()
         .map(|value| sorted.binary_search(value).expect("ranked value"))
         .collect()
-}
-
-/// Imported and source effect labels share this structural spelling.
-fn canonical_effect_key(name: &str) -> String {
-    match name.split_once('\u{1f}') {
-        Some((name, interface)) => format!("!{name}<{interface}>"),
-        // Artifact rows are untrusted. A malformed key is still a distinct
-        // recovery label; it must not panic or silently become purity.
-        None => format!("!{name}<?>"),
-    }
 }
 
 fn canonical_written_presence(when: &Option<Box<When>>) -> String {
@@ -3774,23 +3981,23 @@ fn type_effect_dependencies<'a>(
     dependencies
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct CanonicalValue {
-    spelling: String,
+    node: usize,
 }
 
-/// Canonicalize the complete effect/type/effect dependency graph with an
-/// explicit continuation stack. Completed acyclic effects are memoized across
-/// all local identities. Values containing a recovery back edge remain
-/// path-sensitive and therefore are deliberately not cached.
+/// Canonicalize the complete effect/type/effect dependency graph with one
+/// shared exact graph. Effect placeholders are real graph backreferences, so
+/// recursive identity does not depend on a finite unrolling depth.
 struct EffectCanonicalizer<'a> {
     types: &'a IndexMap<Symbol, Decl<Type>>,
     effects: &'a IndexMap<Symbol, Decl<Effect>>,
     external_types: &'a IndexMap<Symbol, ExternalType>,
     effect_ids: &'a IndexMap<Symbol, EffectId>,
     mint: &'a Mint,
-    active: HashSet<Symbol>,
+    active: HashMap<Symbol, usize>,
     cache: HashMap<Symbol, CanonicalValue>,
+    arena: CanonicalArena,
 }
 
 impl<'a> EffectCanonicalizer<'a> {
@@ -3807,8 +4014,9 @@ impl<'a> EffectCanonicalizer<'a> {
             external_types,
             effect_ids,
             mint,
-            active: HashSet::new(),
+            active: HashMap::new(),
             cache: HashMap::new(),
+            arena: CanonicalArena::default(),
         }
     }
 
@@ -3819,15 +4027,12 @@ impl<'a> EffectCanonicalizer<'a> {
         }
     }
 
-    /// Build a declared operation effect's interface in the same context as
-    /// the original root walk: the root itself is not active until an
-    /// operation row names it. This preserves the one finite unrolling used by
-    /// recursive recovery identities, while nested effects use `Effect` below.
     fn canonical_interface(
         &mut self,
         operations: &'a IndexMap<OperationSelector, Operation>,
     ) -> String {
-        self.run(CanonicalWork::Interface(operations)).spelling
+        let root = self.run(CanonicalWork::Interface(operations)).node;
+        self.arena.encode(root)
     }
 
     fn run(&mut self, root: CanonicalWork<'a>) -> CanonicalValue {
@@ -3846,17 +4051,15 @@ impl<'a> EffectCanonicalizer<'a> {
                 CanonicalWork::FinishInterface(names) => {
                     let start = values.len() - names.len() * 2;
                     let mut types = values.split_off(start).into_iter();
-                    let mut operations: Vec<_> = names
-                        .into_iter()
-                        .map(|name| {
-                            let from = types.next().expect("an operation has an input");
-                            let to = types.next().expect("an operation has an output");
-                            format!("{name}:{}->{}", from.spelling, to.spelling)
-                        })
-                        .collect();
-                    operations.sort();
+                    let mut edges = Vec::with_capacity(names.len() * 2);
+                    for name in names {
+                        let from = types.next().expect("an operation has an input");
+                        let to = types.next().expect("an operation has an output");
+                        edges.push((format!("operation:{name}:from"), from.node));
+                        edges.push((format!("operation:{name}:to"), to.node));
+                    }
                     values.push(CanonicalValue {
-                        spelling: operations.join("|"),
+                        node: self.arena.node("interface", edges),
                     });
                 }
                 CanonicalWork::Type(ty) => {
@@ -3866,34 +4069,35 @@ impl<'a> EffectCanonicalizer<'a> {
                 }
                 CanonicalWork::FinishType(ty, dependencies) => {
                     let start = values.len() - dependencies.len();
+                    let resolved_values = values.split_off(start);
                     let resolved = dependencies
                         .into_iter()
-                        .zip(values.split_off(start))
-                        .map(|(symbol, value)| (symbol, value.spelling))
+                        .zip(resolved_values)
+                        .map(|(symbol, value)| (symbol, value.node))
                         .collect();
                     let mut graph = RegularType {
                         types: self.types,
                         external_types: self.external_types,
                         effect_interfaces: &resolved,
-                        nodes: Vec::new(),
+                        arena: &mut self.arena,
+                        created: Vec::new(),
                         interned: HashMap::new(),
                         named: HashMap::new(),
                     };
                     let root = graph.source(ty, &[]);
                     values.push(CanonicalValue {
-                        spelling: graph.encode(root),
+                        node: graph.finish(root),
                     });
                 }
                 CanonicalWork::Effect(symbol) => {
                     let name = self.name(symbol).to_string();
-                    if self.active.contains(&symbol) {
-                        values.push(CanonicalValue {
-                            spelling: format!("!{name}<rec>"),
-                        });
+                    if let Some(node) = self.active.get(&symbol) {
+                        values.push(CanonicalValue { node: *node });
                     } else if let Some(value) = self.cache.get(&symbol) {
-                        values.push(value.clone());
+                        values.push(*value);
                     } else {
-                        self.active.insert(symbol);
+                        let placeholder = self.arena.atom("pending-effect");
+                        self.active.insert(symbol, placeholder);
                         match self.effects.get(&symbol).map(|decl| &decl.value) {
                             Some(Effect::Operations(operations)) => {
                                 let names =
@@ -3915,12 +4119,16 @@ impl<'a> EffectCanonicalizer<'a> {
                             }
                             None => {
                                 let interface = match self.effect_ids.get(&symbol) {
-                                    Some(EffectId::Structural { interface, .. }) => {
-                                        interface.clone()
-                                    }
-                                    _ => "?".into(),
+                                    Some(EffectId::Structural { interface, .. }) => interface,
+                                    _ => "?",
                                 };
-                                self.finish_effect(symbol, name, interface, &mut values);
+                                let interface = self.arena.import(interface);
+                                self.finish_effect(
+                                    symbol,
+                                    name,
+                                    CanonicalValue { node: interface },
+                                    &mut values,
+                                );
                             }
                         }
                     }
@@ -3928,26 +4136,31 @@ impl<'a> EffectCanonicalizer<'a> {
                 CanonicalWork::FinishOperations(symbol, name, names) => {
                     let start = values.len() - names.len() * 2;
                     let mut types = values.split_off(start).into_iter();
-                    let mut operations: Vec<_> = names
-                        .into_iter()
-                        .map(|name| {
-                            let from = types.next().expect("an operation has an input");
-                            let to = types.next().expect("an operation has an output");
-                            format!("{name}:{}->{}", from.spelling, to.spelling)
-                        })
-                        .collect();
-                    operations.sort();
-                    self.finish_effect(symbol, name, operations.join("|"), &mut values);
+                    let mut edges = Vec::with_capacity(names.len() * 2);
+                    for name in names {
+                        let from = types.next().expect("an operation has an input");
+                        let to = types.next().expect("an operation has an output");
+                        edges.push((format!("operation:{name}:from"), from.node));
+                        edges.push((format!("operation:{name}:to"), to.node));
+                    }
+                    let interface = CanonicalValue {
+                        node: self.arena.node("interface", edges),
+                    };
+                    self.finish_effect(symbol, name, interface, &mut values);
                 }
                 CanonicalWork::FinishAlias(symbol, name, count) => {
                     let start = values.len() - count;
-                    let mut named: Vec<_> = values
-                        .split_off(start)
-                        .into_iter()
-                        .map(|value| value.spelling)
-                        .collect();
-                    named.sort();
-                    self.finish_effect(symbol, name, named.join("+"), &mut values);
+                    let named = values.split_off(start);
+                    let interface = CanonicalValue {
+                        node: self.arena.node(
+                            "alias-interface",
+                            named
+                                .into_iter()
+                                .map(|value| ("effect".into(), value.node))
+                                .collect(),
+                        ),
+                    };
+                    self.finish_effect(symbol, name, interface, &mut values);
                 }
             }
         }
@@ -3958,16 +4171,19 @@ impl<'a> EffectCanonicalizer<'a> {
         &mut self,
         symbol: Symbol,
         name: String,
-        interface: String,
+        interface: CanonicalValue,
         values: &mut Vec<CanonicalValue>,
     ) {
-        self.active.remove(&symbol);
-        let value = CanonicalValue {
-            spelling: format!("!{name}<{interface}>"),
+        let node = self
+            .active
+            .remove(&symbol)
+            .expect("finishing effects have a placeholder");
+        self.arena.nodes[node] = RegularNode {
+            label: format!("effect:{name}"),
+            edges: vec![("interface".into(), interface.node)],
         };
-        if !value.spelling.contains("<rec>") {
-            self.cache.insert(symbol, value.clone());
-        }
+        let value = CanonicalValue { node };
+        self.cache.insert(symbol, value);
         values.push(value);
     }
 }
@@ -7818,8 +8034,10 @@ impl Builder<'_> {
     /// since every one is a label the reader can close — and `tail` is the `..`
     /// the row ended with, which has already reported for itself in
     /// [`row`](Self::row), because only there is it known which of the three a
-    /// tail turned out to be. A row refused here lowers to the error type,
-    /// which absorbs: the `Circular` precedent.
+    /// tail turned out to be. A row refused in a declaration lowers to the
+    /// error type. An operation keeps its invalid row as recovery syntax after
+    /// reporting it, so structural effect identity cannot mistake it for a
+    /// closed row.
     ///
     /// One rule for both shapes, because it is one rule. The two arms of
     /// [`ty`](Self::ty) that call it differ in the nouns they are written about
@@ -7849,7 +8067,7 @@ impl Builder<'_> {
         for span in marks {
             self.error(span, kind.clone());
         }
-        false
+        place == Place::Operation
     }
 
     /// Whether a row's explicit absences have a `..` to speak about. A `\`

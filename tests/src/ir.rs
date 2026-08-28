@@ -5958,6 +5958,228 @@ fn recovery_signatures_keep_every_normalized_source_form_structural() {
 }
 
 #[test]
+fn generated_and_malformed_imported_effect_keys_decode_exactly_and_totally() {
+    let local = "effect IO = { write: Nat -> () }\n\
+                 effect Wrap = { use: (() -> () + !IO) -> () }";
+    let interface = |source: &str, effect: &str| {
+        let (mint, out) = build_src(source);
+        out.program
+            .effect_ids
+            .iter()
+            .find_map(|(symbol, identity)| {
+                (mint.name(*symbol) == effect).then(|| match identity {
+                    ruddy::types::EffectId::Structural { interface, .. } => interface.clone(),
+                    ruddy::types::EffectId::Pending(_) => panic!("pending effect identity"),
+                })
+            })
+            .expect("effect identity")
+    };
+    let expected = interface(local, "Wrap");
+    let io = interface(local, "IO");
+    let dependency = effect_artifact("dep", &io);
+    let parsed = parse::parse(
+        lex(
+            "effect Wrap = { use: (() -> () + dep::!IO) -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    let imported = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| (mint.name(*symbol) == "Wrap").then_some(identity))
+        .expect("wrapper identity");
+    assert!(matches!(
+        imported,
+        ruddy::types::EffectId::Structural { interface, .. } if interface == &expected
+    ));
+
+    // Artifact identity text is untrusted. Exercise every delimiter and bounds
+    // failure in the decoder; all are exact opaque recovery identities.
+    let _ = build_src("effect Open = { get: { x: Nat, .. } -> () }");
+
+    for malformed in [
+        "",
+        "x",
+        "0x",
+        "0#",
+        "0#x",
+        "0#1",
+        "0#999:x",
+        "0#1:é;",
+        "0#1:a|",
+        "0#1:a|1",
+        "0#1:a|9:x",
+        "0#1:a|1:x?",
+        "0#1:a|1:x>",
+        "0#1:a|1:x>0",
+        "0#1:a?",
+        "1#1:a;",
+        "0#1:a|1:x>1;",
+        "0#18446744073709551615:x",
+        "18446744073709551616#1:a;",
+        "0#1:a|1:x>18446744073709551616;",
+    ] {
+        let dependency = effect_artifact("bad", malformed);
+        let parsed = parse::parse(
+            lex(
+                "effect Wrap = { use: (() -> () + bad::!IO) -> () }",
+                FileID::GENERATED,
+            )
+            .tokens,
+        );
+        let mut mint = dummy_mint();
+        let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+        assert!(out.program.effect_ids.values().any(|identity| matches!(
+            identity,
+            ruddy::types::EffectId::Structural { name, .. } if name == "Wrap"
+        )));
+    }
+
+    let mut semantic = effect_artifact("semantic", &io);
+    semantic.header.types.push(a::DeclaredType {
+        name: "semantic@1.0.0::Carrier".into(),
+        params: Vec::new(),
+        scheme: artifact_scheme(a::Type::Arrow(
+            Box::new(artifact_unit()),
+            Box::new(artifact_unit()),
+            a::Row {
+                labels: vec![
+                    (
+                        format!("IO\u{1f}{io}"),
+                        a::RowField {
+                            presence: a::Presence::Absent,
+                            ty: artifact_unit(),
+                        },
+                    ),
+                    (
+                        "Ghost".into(),
+                        a::RowField {
+                            presence: a::Presence::Undecided,
+                            ty: artifact_unit(),
+                        },
+                    ),
+                ],
+                rest: a::Rest::Closed,
+            },
+        )),
+    });
+    let parsed = parse::parse(
+        lex(
+            "effect Probe = { inspect: semantic::Carrier -> () }",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[semantic]);
+    assert!(
+        out.program
+            .effect_ids
+            .keys()
+            .any(|symbol| mint.name(*symbol) == "Probe")
+    );
+}
+
+#[test]
+fn effect_identity_uses_compact_exact_backreferences_for_branching_and_recursion() {
+    let mut source = String::from("effect Branch0 = { op: () -> () }\n");
+    for depth in 1..=30 {
+        let previous = depth - 1;
+        source.push_str(&format!(
+            "effect Branch{depth} = {{ op: (() -> () + !Branch{previous}) -> (() -> () + !Branch{previous}) }}\n"
+        ));
+    }
+    source.push_str(
+        "module A =\n  effect Loop = { op: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module B =\n  effect Loop = { op: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module C =\n  effect Loop = { other: (() -> () + !Loop) -> (() -> () + !Loop) }\nend\n\
+         module D =\n  effect Loop = { op: (() -> () + E::!Loop) -> (() -> () + E::!Loop) }\nend\n\
+         module E =\n  effect Loop = { op: (() -> () + D::!Loop) -> (() -> () + D::!Loop) }\nend",
+    );
+    let (mint, out) = build_src(&source);
+    assert!(
+        out.errors
+            .iter()
+            .all(|error| matches!(error.kind, ErrorKind::ImpureOperation)),
+        "{:#?}",
+        out.errors
+    );
+    let branch = out
+        .program
+        .effect_ids
+        .iter()
+        .find_map(|(symbol, identity)| (mint.name(*symbol) == "Branch30").then_some(identity))
+        .expect("deep branching effect identity");
+    let ruddy::types::EffectId::Structural { interface, .. } = branch else {
+        panic!("effect identity was not finalized")
+    };
+    assert!(
+        interface.len() < 100_000,
+        "shared depth-30 graph was expanded to {} bytes",
+        interface.len()
+    );
+
+    let loops: Vec<_> = out
+        .program
+        .effect_ids
+        .iter()
+        .filter(|(symbol, _)| mint.name(**symbol) == "Loop")
+        .map(|(_, identity)| identity)
+        .collect();
+    assert_eq!(loops.len(), 5);
+    assert_eq!(loops[0], loops[1], "equivalent recursive graphs differ");
+    assert_eq!(loops[0], loops[3], "one- and two-state cycles differ");
+    assert_eq!(loops[0], loops[4], "cycle entry point changed identity");
+    assert_ne!(loops[0], loops[2], "operation names disappeared");
+}
+
+#[test]
+fn recovery_row_tails_remain_unknown_in_every_canonical_shape() {
+    let src = "module Closed =\n\
+                 effect Struct = { get: { x: Nat } -> () }\n\
+                 effect Cases = { get: (#X) -> () }\n\
+                 effect Effects = { get: (() -> ()) -> () }\n\
+               end\n\
+               module Open =\n\
+                 effect Struct = { get: { x: Nat, .. } -> () }\n\
+                 effect Cases = { get: (#X | ..) -> () }\n\
+                 effect Effects = { get: (() -> () + ..) -> () }\n\
+               end\n\
+               effect StructBoth = Closed::!Struct + Open::!Struct\n\
+               effect CasesBoth = Closed::!Cases + Open::!Cases\n\
+               effect EffectsBoth = Closed::!Effects + Open::!Effects";
+    let (mint, out) = build_src(src);
+    assert_eq!(
+        out.errors
+            .iter()
+            .map(|error| error.kind.code())
+            .collect::<Vec<_>>(),
+        [
+            "impure-operation",
+            "impure-operation",
+            "impure-operation",
+            "impure-operation"
+        ],
+        "an unknown recovery tail must not collapse to a closed tail"
+    );
+    for name in ["Struct", "Cases", "Effects"] {
+        let identities: Vec<_> = out
+            .program
+            .effect_ids
+            .iter()
+            .filter(|(symbol, _)| mint.name(**symbol) == name)
+            .map(|(_, identity)| identity)
+            .collect();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1], "{name} tail was closed");
+    }
+}
+
+#[test]
 fn canonicalization_substitutes_struct_sum_and_effect_row_tails() {
     let src = "type Record 'r = { x: Nat, ..'r }\n\
                type Cases 'r = #X | ..'r\n\
