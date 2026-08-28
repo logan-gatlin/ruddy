@@ -831,36 +831,83 @@ impl Formula {
     /// First-appearance order is what decides the printed alphabet, so it is
     /// what the walk preserves.
     pub fn atoms(&self, out: &mut Vec<Atom>) {
-        match self {
-            Formula::True | Formula::False => {}
-            Formula::Atom(atom) => {
-                if !out.contains(atom) {
-                    out.push(*atom);
+        let mut work = vec![self];
+        while let Some(formula) = work.pop() {
+            match formula {
+                Formula::True | Formula::False => {}
+                Formula::Atom(atom) => {
+                    if !out.contains(atom) {
+                        out.push(*atom);
+                    }
                 }
-            }
-            Formula::Not(inner) => inner.atoms(out),
-            Formula::And(left, right)
-            | Formula::Or(left, right)
-            | Formula::Iff(left, right)
-            | Formula::Xor(left, right) => {
-                left.atoms(out);
-                right.atoms(out);
+                Formula::Not(inner) => work.push(inner),
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    work.push(right);
+                    work.push(left);
+                }
             }
         }
     }
 
     /// Whether this formula holds when each atom is read by `assign`.
     pub fn eval(&self, assign: &dyn Fn(Atom) -> bool) -> bool {
-        match self {
-            Formula::True => true,
-            Formula::False => false,
-            Formula::Atom(atom) => assign(*atom),
-            Formula::Not(inner) => !inner.eval(assign),
-            Formula::And(left, right) => left.eval(assign) && right.eval(assign),
-            Formula::Or(left, right) => left.eval(assign) || right.eval(assign),
-            Formula::Iff(left, right) => left.eval(assign) == right.eval(assign),
-            Formula::Xor(left, right) => left.eval(assign) != right.eval(assign),
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Binary(u8),
         }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => values.push(true),
+                Work::Formula(Formula::False) => values.push(false),
+                Work::Formula(Formula::Atom(atom)) => values.push(assign(*atom)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Binary(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Binary(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Binary(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Binary(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let value = values.pop().expect("a visited formula value");
+                    values.push(!value);
+                }
+                Work::Binary(kind) => {
+                    let right = values.pop().expect("a visited right formula value");
+                    let left = values.pop().expect("a visited left formula value");
+                    values.push(match kind {
+                        0 => left && right,
+                        1 => left || right,
+                        2 => left == right,
+                        _ => left != right,
+                    });
+                }
+            }
+        }
+        values.pop().expect("every formula has a value")
     }
 
     /// One formula with each atom replaced by what `of` makes of it, rebuilt
@@ -871,16 +918,60 @@ impl Formula {
     /// one into a scheme — so there is one place for a connective to be handled
     /// and no way for three copies to disagree about `Iff`.
     pub fn substitute(&self, of: &dyn Fn(Atom) -> Formula) -> Self {
-        match self {
-            Formula::True => Formula::True,
-            Formula::False => Formula::False,
-            Formula::Atom(atom) => of(*atom),
-            Formula::Not(inner) => inner.substitute(of).not(),
-            Formula::And(left, right) => left.substitute(of).and(right.substitute(of)),
-            Formula::Or(left, right) => left.substitute(of).or(right.substitute(of)),
-            Formula::Iff(left, right) => left.substitute(of).iff(right.substitute(of)),
-            Formula::Xor(left, right) => left.substitute(of).xor(right.substitute(of)),
+        enum Work<'a> {
+            Formula(&'a Formula),
+            Not,
+            Binary(u8),
         }
+
+        let mut work = vec![Work::Formula(self)];
+        let mut values = Vec::new();
+        while let Some(part) = work.pop() {
+            match part {
+                Work::Formula(Formula::True) => values.push(Formula::True),
+                Work::Formula(Formula::False) => values.push(Formula::False),
+                Work::Formula(Formula::Atom(atom)) => values.push(of(*atom)),
+                Work::Formula(Formula::Not(inner)) => {
+                    work.push(Work::Not);
+                    work.push(Work::Formula(inner));
+                }
+                Work::Formula(Formula::And(left, right)) => {
+                    work.push(Work::Binary(0));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Or(left, right)) => {
+                    work.push(Work::Binary(1));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Iff(left, right)) => {
+                    work.push(Work::Binary(2));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Formula(Formula::Xor(left, right)) => {
+                    work.push(Work::Binary(3));
+                    work.push(Work::Formula(right));
+                    work.push(Work::Formula(left));
+                }
+                Work::Not => {
+                    let inner = values.pop().expect("a visited formula value");
+                    values.push(inner.not());
+                }
+                Work::Binary(kind) => {
+                    let right = values.pop().expect("a visited right formula value");
+                    let left = values.pop().expect("a visited left formula value");
+                    values.push(match kind {
+                        0 => left.and(right),
+                        1 => left.or(right),
+                        2 => left.iff(right),
+                        _ => left.xor(right),
+                    });
+                }
+            }
+        }
+        values.pop().expect("every formula has a substitution")
     }
 
     /// [`substitute`](Self::substitute) over the *solver's* variables alone: a

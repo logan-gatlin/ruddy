@@ -309,6 +309,55 @@ fn opening_a_formula_substitutes_what_was_minted() {
     }
 }
 
+#[test]
+fn deep_formula_opening_and_use_site_walks_are_stack_safe() {
+    std::thread::Builder::new()
+        .name("deep-formula-open".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let mut formula = Formula::bound(0);
+            for depth in 0..30_000 {
+                formula = match depth % 3 {
+                    0 => Formula::Not(Rc::new(formula)),
+                    1 => Formula::And(Rc::new(formula), Rc::new(Formula::bound(1))),
+                    _ => Formula::Or(Rc::new(Formula::bound(1)), Rc::new(formula)),
+                };
+            }
+            let opened = formula.open(&[
+                Assigned::Presence(Presence::Var(7)),
+                Assigned::Presence(Presence::Var(8)),
+            ]);
+
+            let mut work = vec![&opened];
+            let mut nodes = 0;
+            while let Some(at) = work.pop() {
+                nodes += 1;
+                match at {
+                    Formula::Atom(Atom::Var(7 | 8)) => {}
+                    Formula::Not(inner) => work.push(inner),
+                    Formula::And(left, right) | Formula::Or(left, right) => {
+                        work.push(right);
+                        work.push(left);
+                    }
+                    other => panic!("opening preserved an unexpected node: {other:?}"),
+                }
+            }
+            assert!(nodes > 30_000);
+            let mut atoms = Vec::new();
+            opened.atoms(&mut atoms);
+            assert_eq!(atoms, [Atom::Var(8), Atom::Var(7)]);
+            let _ = opened.eval(&|atom| atom == Atom::Var(7));
+
+            // Recursive Rc destruction is not what the bounded-stack walk
+            // measures, and both trees have demonstrably remained valid.
+            std::mem::forget(opened);
+            std::mem::forget(formula);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep formula opening and reads use bounded stack");
+}
+
 /// A third reading of the same machinery, and the only new thing it says is
 /// where it lives: an arrow carries a row beside its two sides, and a bare
 /// `A -> B` is that row closed and empty — which is what pure means, and what

@@ -8008,7 +8008,10 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 },
             });
 
-            let parsed = parse::parse(lex("let answer = 1n", FileID::GENERATED).tokens);
+            // Importing alone only clamps the tree. Naming the value also
+            // instantiates, substitutes, reads, and solves the deep formula.
+            let parsed =
+                parse::parse(lex("let answer = dep::deep_formula", FileID::GENERATED).tokens);
             let mut mint = dummy_mint();
             let dependencies = vec![dependency];
             let out = build_with_dependencies(&mut mint, parsed.stmts, &dependencies);

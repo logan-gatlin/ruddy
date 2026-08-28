@@ -232,6 +232,23 @@ fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
 }
 
 #[test]
+fn sibling_row_substitutions_have_identical_unit_representations() {
+    let source = "type Empty = {}\n\
+                  type Dup 'r = { a: { ..'r }, b: { ..'r } }\n\
+                  type Rev 'r = { b: { ..'r }, a: { ..'r } }\n\
+                  let dup : Dup Empty -> { a: Empty, b: Empty } = fn p => { a: p.a, b: p.b }\n\
+                  let rev : Rev Empty -> { a: Empty, b: Empty } = fn p => { a: p.a, b: p.b }";
+    for name in ["dup", "rev"] {
+        let function = section(source, &format!("fn {name}("));
+        assert_eq!(
+            function.matches(": unit = project").count(),
+            2,
+            "both independent fields must open identically regardless of order:\n{function}"
+        );
+    }
+}
+
+#[test]
 fn imported_forwarding_cycles_recover_before_lir_representation() {
     std::thread::Builder::new()
         .name("forwarding-cycle-lir".into())

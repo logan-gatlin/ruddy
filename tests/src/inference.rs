@@ -1505,7 +1505,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
     };
     let field = |presence, ty| ruddy::types::RowField { presence, ty };
 
-    let nested = Row {
+    let nested = Rc::new(Row {
         labels: [(
             "rigid-rest".into(),
             field(Presence::Present, Rc::new(Ty::Int)),
@@ -1516,7 +1516,7 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             id: 4,
             name: Rc::from("r"),
         },
-    };
+    });
     let sum = Rc::new(Ty::Sum(Row {
         labels: [(
             "bound-rest".into(),
@@ -1573,13 +1573,23 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             ]
             .into_iter()
             .collect(),
-            rest: Rest::More(Rc::new(nested)),
+            rest: Rest::More(nested.clone()),
         })),
         Rc::new(Ty::Struct(Row::closed())),
         Row {
             labels: Default::default(),
-            rest: Rest::Var(8),
+            // Sharing this nested row with the argument row exercises identity
+            // memoization without duplicating its structural descriptor.
+            rest: Rest::More(nested),
         },
+    ));
+
+    let missing = mint
+        .global(None, Namespace::Types, "MissingAlias")
+        .expect("a fresh missing alias symbol");
+    assert!(matches!(
+        &*inference::unfold(&IndexMap::new(), &named(missing, Vec::new())),
+        Ty::Undecided
     ));
 
     let mut aliases = output.aliases.clone();
@@ -1724,6 +1734,34 @@ fn alias_cycle_keys_cover_every_semantic_shape_and_absorb_growth() {
             ..
         }) if matches!(more.rest, Rest::Undecided)
     ));
+}
+
+#[test]
+fn alias_unfolding_is_linear_and_stack_safe_for_deep_forwarding() {
+    std::thread::Builder::new()
+        .name("deep-exact-alias-identity".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let (mint, _, output) = inferred("type Id 'a = 'a");
+            let id = symbol_named(&mint, output.aliases.keys().copied(), "Id");
+            let mut deep = Rc::new(Ty::Nat);
+            for _ in 0..30_000 {
+                deep = Rc::new(Ty::Named {
+                    symbol: id,
+                    name: Rc::from("Id"),
+                    args: vec![deep].into(),
+                });
+            }
+            assert!(matches!(
+                &*inference::unfold(&output.aliases, &deep),
+                Ty::Nat
+            ));
+            // Recursive Rc destruction is unrelated to the bounded-stack walk.
+            std::mem::forget(deep);
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("deep exact alias identity uses bounded stack and linear memory");
 }
 
 #[test]
