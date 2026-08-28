@@ -355,6 +355,57 @@ fn a_lambda_that_closes_over_nothing_captures_nothing() {
     assert!(section(source, "fn k#2").starts_with("fn k#2(%1: any):"));
 }
 
+/// A recursive local function reconstructs its own closure inside the lifted
+/// body. Its name is therefore a local closure read, never a bogus global.
+#[test]
+fn a_local_recursive_function_reconstructs_its_closure() {
+    let source = "let main = let loop = fn n => let again = loop n in loop n in loop";
+    assert_eq!(
+        section(source, "fn main#1"),
+        "fn main#1(%0: any):\n\
+         \x20 %1: fn = closure main#1, []\n\
+         \x20 %2: any = call %1, %0\n\
+         \x20 %3: any = call %1, %0\n\
+         \x20 ret %3"
+    );
+    assert_eq!(
+        section(source, "global main"),
+        "global main:\n  %4: fn = closure main#1, []\n  ret %4"
+    );
+}
+
+/// A reconstructed recursive closure closes over the lifted function's capture
+/// parameters, corresponding exactly to the outer values captured at the site.
+#[test]
+fn a_local_recursive_function_keeps_its_outer_captures() {
+    let source = "let make = fn seed => let loop = fn n => seed + loop n in loop";
+    let outer = section(source, "fn make(");
+    assert!(outer.contains("closure make#2, [%0]"), "{outer}");
+    let recursive = section(source, "fn make#2");
+    assert!(
+        recursive.starts_with("fn make#2(%2: real64, %1: any):"),
+        "{recursive}"
+    );
+    assert!(
+        recursive.contains("%3: fn = closure make#2, [%2]"),
+        "{recursive}"
+    );
+    assert!(recursive.contains("call %3, %1"), "{recursive}");
+}
+
+/// Multi-argument syntax becomes nested lambdas. The inner lambda may still
+/// capture the reconstructed closure of the whole recursively bound function.
+#[test]
+fn a_curried_local_recursive_function_captures_its_outer_self() {
+    let source = "let main = let loop = fn a b => loop a b in loop";
+    let outer = section(source, "fn main#2");
+    assert!(outer.contains("%4: fn = closure main#2, []"), "{outer}");
+    assert!(outer.contains("closure main#1, [%4, %1]"), "{outer}");
+    let inner = section(source, "fn main#1");
+    assert!(inner.contains("call %5, %2, %6"), "{inner}");
+    assert!(inner.contains("call %7, %2, %3"), "{inner}");
+}
+
 /// A top-level definition is not a free variable: naming one is a `global` read
 /// inside the function that names it, so nothing is captured for it.
 #[test]
