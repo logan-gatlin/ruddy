@@ -18,6 +18,7 @@ fn main() -> ExitCode {
             println!("Checked `{}`", path.display());
             ExitCode::SUCCESS
         }
+        Ok(ruddy_cli::Outcome::Ran(_)) => ExitCode::SUCCESS,
         Err(error) if error.is_success() => {
             println!("{error}");
             ExitCode::SUCCESS

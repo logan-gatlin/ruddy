@@ -7,8 +7,16 @@ use std::{
     fs::OpenOptions,
     io::Write as _,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
+use boa_engine::{
+    Context, JsError, Module, Source, builtins::promise::PromiseState, module::SimpleModuleLoader,
+};
+use boa_runtime::{
+    extensions::{ConsoleExtension, FetchExtension},
+    fetch::BlockingReqwestFetcher,
+};
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use ruddy::{
@@ -56,6 +64,8 @@ enum Command {
     Clean,
     /// Type-check a project without writing build artifacts.
     Check,
+    /// Build and execute a JavaScript-targeted project.
+    Run,
 }
 
 /// The successful filesystem action performed by [`run`].
@@ -69,6 +79,8 @@ pub enum Outcome {
     Cleaned(PathBuf),
     /// This project was checked successfully.
     Checked(PathBuf),
+    /// This JavaScript module was built and executed successfully.
+    Ran(PathBuf),
 }
 
 /// A user-facing command-line or filesystem failure.
@@ -148,6 +160,7 @@ where
             check_project(current_directory)?;
             Ok(Outcome::Checked(current_directory.to_path_buf()))
         }
+        Command::Run => run_project(current_directory).map(Outcome::Ran),
     }
 }
 
@@ -298,11 +311,21 @@ pub fn clean_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
     Ok(build)
 }
 
+struct InstalledBuild {
+    artifact: PathBuf,
+    javascript: Option<PathBuf>,
+    target: Target,
+}
+
 /// Compile the complete project graph, then write each local project's canonical
 /// artifact to its own `build/` directory, dependencies first. Immutable Git
 /// cache checkouts are never modified. No artifact is touched unless the entire
-/// graph compiles successfully.
+/// graph compiles and backend generation succeeds.
 pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    install_project(directory.as_ref()).map(|installed| installed.artifact)
+}
+
+fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
     let graph = compile_graph(directory).map_err(|error| CliError {
         rendered: error.to_string(),
         usage: false,
@@ -314,18 +337,21 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
         exit_code: 1,
     })?;
     let last = graph.projects.len().checked_sub(1);
+    let root_project = last
+        .and_then(|index| graph.projects.get(index))
+        .ok_or_else(|| CliError::one("the project graph was empty"))?;
+    let target = root_project.target;
     // Generation is deliberately completed before any build output is touched.
     // The backend consumes the already linked root rather than relinking or
     // reading an artifact back from disk.
-    let javascript = match last.and_then(|index| graph.projects.get(index)) {
-        Some(project) if project.target == Target::Js => {
-            Some(ruddy_js::generate(&linked).map_err(|error| {
-                CliError::one(format!("could not generate JavaScript: {error}"))
-            })?)
-        }
-        _ => None,
-    };
-    let mut root = None;
+    let javascript = (target == Target::Js)
+        .then(|| {
+            ruddy_js::generate(&linked)
+                .map_err(|error| CliError::one(format!("could not generate JavaScript: {error}")))
+        })
+        .transpose()?;
+    let mut root_artifact = None;
+    let mut root_javascript = None;
     for (index, project) in graph.projects.into_iter().enumerate() {
         if project.source == ProjectSource::GitCache {
             continue;
@@ -337,24 +363,86 @@ pub fn build_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
                 build.display()
             ))
         })?;
-        let path = build.join(format!(
+        let artifact_path = build.join(format!(
             "{}.artifact",
             project.artifact.header.identity.name
         ));
-        let artifact = match Some(index) == last {
-            true => &linked,
-            false => &project.artifact,
+        let artifact = if Some(index) == last {
+            &linked
+        } else {
+            &project.artifact
         };
-        replace_file(&path, artifact.print().as_bytes())?;
+        replace_file(&artifact_path, artifact.print().as_bytes())?;
         if Some(index) == last {
             if let Some(javascript) = &javascript {
                 let path = build.join(format!("{}.js", project.artifact.header.identity.name));
                 replace_file(&path, javascript.as_bytes())?;
+                root_javascript = Some(path);
             }
-            root = Some(path);
+            root_artifact = Some(artifact_path);
         }
     }
-    root.ok_or_else(|| CliError::one("the project graph was empty"))
+    Ok(InstalledBuild {
+        artifact: root_artifact.ok_or_else(|| CliError::one("the project graph was empty"))?,
+        javascript: root_javascript,
+        target,
+    })
+}
+
+/// Build and execute the installed root JavaScript module with Boa's standard
+/// runtime extensions. Module initialization is the complete entry point.
+pub fn run_project(directory: impl AsRef<Path>) -> Result<PathBuf, CliError> {
+    let installed = install_project(directory.as_ref())?;
+    if installed.target != Target::Js {
+        return Err(CliError::one(
+            "`ruddy run` requires the root manifest to set `target = \"js\"`",
+        ));
+    }
+    let javascript = installed
+        .javascript
+        .ok_or_else(|| CliError::one("the JavaScript build output was not installed"))?;
+    execute_javascript_module(&javascript)?;
+    Ok(javascript)
+}
+
+fn execute_javascript_module(path: &Path) -> Result<(), CliError> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::one(format!("JavaScript path {} has no parent", path.display()))
+    })?;
+    let loader = Rc::new(SimpleModuleLoader::new(parent).map_err(boa_error)?);
+    let mut context = Context::builder()
+        .module_loader(loader)
+        .build()
+        .map_err(boa_error)?;
+    boa_runtime::register(
+        (
+            ConsoleExtension::default(),
+            FetchExtension(BlockingReqwestFetcher::default()),
+        ),
+        None,
+        &mut context,
+    )
+    .map_err(boa_error)?;
+    let source = Source::from_filepath(path).map_err(|error| {
+        CliError::one(format!(
+            "could not read JavaScript module {}: {error}",
+            path.display()
+        ))
+    })?;
+    let module = Module::parse(source, None, &mut context).map_err(boa_error)?;
+    let evaluation = module.load_link_evaluate(&mut context);
+    context.run_jobs().map_err(boa_error)?;
+    match evaluation.state() {
+        PromiseState::Fulfilled(_) => Ok(()),
+        PromiseState::Rejected(value) => Err(boa_error(JsError::from_opaque(value))),
+        PromiseState::Pending => Err(CliError::one(
+            "JavaScript module evaluation remained pending after the job queue completed",
+        )),
+    }
+}
+
+fn boa_error(error: JsError) -> CliError {
+    CliError::one(format!("JavaScript runtime: {error}"))
 }
 
 /// Write beside the destination first, so a failed write cannot truncate the

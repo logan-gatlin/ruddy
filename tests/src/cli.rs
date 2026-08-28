@@ -9,6 +9,7 @@ use std::{
 use ruddy::artifact::Artifact;
 use ruddy_cli::{
     Lockfile, Outcome, build_project, check_project, clean_project, compile, new_project, run,
+    run_project,
 };
 use tempfile::TempDir;
 
@@ -1389,6 +1390,8 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
         vec!["build", "elsewhere"],
         vec!["clean", "elsewhere"],
         vec!["check", "elsewhere"],
+        vec!["run", "elsewhere"],
+        vec!["r"],
         vec!["compile"],
     ] {
         let error = run(arguments, current.path()).unwrap_err();
@@ -1403,6 +1406,147 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
         assert_eq!(information.exit_code(), 0, "{information}");
         assert!(!information.is_usage(), "{information}");
     }
+}
+
+#[test]
+fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    fs::write(app.join("main.hc"), "let initialized = 1n\n").unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let expected = app.join("build/app.js");
+    assert_eq!(run_project(&app).unwrap(), expected);
+    assert_eq!(run(["run"], &app).unwrap(), Outcome::Ran(expected.clone()));
+    assert!(expected.is_file());
+    assert!(app.join("build/app.artifact").is_file());
+
+    let built_javascript = fs::read_to_string(&expected).unwrap();
+    let built_artifact = fs::read_to_string(app.join("build/app.artifact")).unwrap();
+    clean_project(&app).unwrap();
+    build_project(&app).unwrap();
+    assert_eq!(fs::read_to_string(&expected).unwrap(), built_javascript);
+    assert_eq!(
+        fs::read_to_string(app.join("build/app.artifact")).unwrap(),
+        built_artifact
+    );
+}
+
+#[test]
+fn run_rejects_library_targets_without_executing_stale_javascript() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("app");
+    write_project(&app, "app", "1.0.0", &[]);
+    fs::create_dir(app.join("build")).unwrap();
+    let stale = app.join("build/app.js");
+    fs::write(&stale, "throw new Error('stale JavaScript executed');\n").unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    assert!(error.to_string().contains("target = \"js\""), "{error}");
+    assert!(!error.to_string().contains("stale JavaScript"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&stale).unwrap(),
+        "throw new Error('stale JavaScript executed');\n"
+    );
+    assert!(app.join("build/app.artifact").is_file());
+}
+
+#[test]
+fn run_registers_the_standard_runtime_bundle() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("runtime");
+    write_project(&app, "runtime", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern cwd : {} -> String = process.cwd\n\
+         extern environment : {} = process.env\n\
+         extern console_object : {} = console\n\
+         extern url : {} = URL\n\
+         extern encoder : {} = TextEncoder\n\
+         extern decoder : {} = TextDecoder\n\
+         extern base64 : String -> String = btoa\n\
+         extern clone : {} -> {} = structuredClone\n\
+         extern microtask : ({} -> {}) -> {} = queueMicrotask\n\
+         extern timeout : ({} -> {}) -> Nat = setTimeout\n\
+         extern abort_controller : {} = AbortController\n\
+         extern fetch_value : String -> {} = fetch\n\
+         let initialized = 0n\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    run_project(&app).expect("all documented Boa runtime globals are registered");
+}
+
+#[test]
+fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("queued");
+    write_project(&app, "queued", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern queue : ({} -> {}) -> {} = queueMicrotask\n\
+         extern parse : String -> {} = JSON.parse\n\
+         let queued = queue (fn _ => parse \"{\")\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(!error.is_usage());
+    let rendered = error.to_string().replace('\\', "/");
+    assert!(rendered.contains("JavaScript runtime"), "{rendered}");
+    assert!(rendered.contains("SyntaxError"), "{rendered}");
+    assert!(rendered.contains("build/queued.js"), "{rendered}");
+    assert!(rendered.contains(" at "), "{rendered}");
+    assert!(app.join("build/queued.js").is_file());
+    assert!(app.join("build/queued.artifact").is_file());
+}
+
+#[test]
+fn run_reports_missing_externs_with_javascript_source_locations() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("missing");
+    write_project(&app, "missing", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "extern unavailable : Nat = ruddy_runtime.unavailable\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    let rendered = error.to_string().replace('\\', "/");
+    assert!(rendered.contains("missing Ruddy extern"), "{rendered}");
+    assert!(rendered.contains("ruddy_runtime.unavailable"), "{rendered}");
+    assert!(rendered.contains("build/missing.js"), "{rendered}");
+    assert!(app.join("build/missing.js").is_file());
+    assert!(app.join("build/missing.artifact").is_file());
 }
 
 #[test]
