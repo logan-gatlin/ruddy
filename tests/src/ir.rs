@@ -8850,25 +8850,219 @@ fn deep_equal_imported_types_unify_on_a_bounded_stack() {
 }
 
 #[test]
+fn deep_alias_reentry_shares_one_congruence_transaction() {
+    std::thread::Builder::new()
+        .name("deep-alias-congruence-transaction".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 30_000;
+            let named = |name: String| a::Type::Named {
+                name,
+                args: Vec::new(),
+            };
+            let wrapped = |name: String| a::Type::Named {
+                name: "dep@1.0.0::Wrap".into(),
+                args: vec![named(name)],
+            };
+            let mut dependency = effect_artifact("dep", "deep-alias-transaction");
+            dependency.header.types.push(a::DeclaredType {
+                name: "dep@1.0.0::Wrap".into(),
+                params: vec![a::Parameter {
+                    sense: a::Sense::Type,
+                    lacks: Vec::new(),
+                    relevant: true,
+                }],
+                scheme: a::Scheme {
+                    count: 1,
+                    presences: 0,
+                    formula: a::Formula::True,
+                    body: a::Type::Bound(0),
+                },
+            });
+            for side in ["X", "Y"] {
+                for index in 0..DEPTH {
+                    let body = match index + 1 == DEPTH {
+                        true if side == "X" => a::Type::Nat,
+                        true => a::Type::String,
+                        false => wrapped(format!("dep@1.0.0::{side}{}", index + 1)),
+                    };
+                    dependency.header.types.push(a::DeclaredType {
+                        name: format!("dep@1.0.0::{side}{index}"),
+                        params: Vec::new(),
+                        scheme: artifact_scheme(body),
+                    });
+                }
+            }
+            dependency.header.values.extend([
+                a::Value {
+                    name: "dep@1.0.0::value".into(),
+                    scheme: artifact_scheme(named("dep@1.0.0::Y0".into())),
+                },
+                a::Value {
+                    name: "dep@1.0.0::accept".into(),
+                    scheme: artifact_scheme(a::Type::Arrow(
+                        Box::new(named("dep@1.0.0::X0".into())),
+                        Box::new(a::Type::Nat),
+                        a::Row {
+                            labels: Vec::new(),
+                            rest: a::Rest::Closed,
+                        },
+                    )),
+                },
+                a::Value {
+                    name: "dep@1.0.0::padding".into(),
+                    scheme: a::Scheme {
+                        count: 5_000,
+                        presences: 0,
+                        formula: a::Formula::True,
+                        body: a::Type::Nat,
+                    },
+                },
+            ]);
+            let parsed = parse::parse(
+                lex(
+                    "let padding = dep::padding\nlet mismatch = dep::accept dep::value",
+                    FileID::GENERATED,
+                )
+                .tokens,
+            );
+            let mut mint = dummy_mint();
+            let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+            assert!(out.errors.is_empty(), "{:#?}", out.errors);
+            let inferred = inference::infer(&mint, &mut out.program);
+            assert_eq!(inferred.errors.len(), 1, "{:#?}", inferred.errors);
+            assert!(matches!(
+                inferred.errors[0].kind,
+                inference::ErrorKind::Mismatch { .. }
+            ));
+            assert!(
+                inferred
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.rule, inference::Rule::Unfold))
+            );
+        })
+        .expect("the bounded-stack regression thread starts")
+        .join()
+        .expect("alias unfolding shares the explicit congruence transaction");
+}
+
+#[test]
+fn recursive_imported_alias_reentry_compares_malformed_arities() {
+    let recursive = |name: &str, extra: bool| {
+        let mut args = vec![a::Type::Bound(0)];
+        if extra {
+            args.push(a::Type::Nat);
+        }
+        a::Type::Struct(a::Row {
+            labels: vec![(
+                "next".into(),
+                a::RowField {
+                    presence: a::Presence::Present,
+                    ty: a::Type::Named {
+                        name: name.into(),
+                        args,
+                    },
+                },
+            )],
+            rest: a::Rest::Closed,
+        })
+    };
+    let parameter = || a::Parameter {
+        sense: a::Sense::Type,
+        lacks: Vec::new(),
+        relevant: false,
+    };
+    let mut dependency = effect_artifact("dep", "malformed-recursive-arity");
+    dependency.header.types = vec![
+        a::DeclaredType {
+            name: "dep@1.0.0::A".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: recursive("dep@1.0.0::A", true),
+            },
+        },
+        a::DeclaredType {
+            name: "dep@1.0.0::B".into(),
+            params: vec![parameter()],
+            scheme: a::Scheme {
+                count: 1,
+                presences: 0,
+                formula: a::Formula::True,
+                body: recursive("dep@1.0.0::B", false),
+            },
+        },
+    ];
+    let applied = |name: &str| a::Type::Named {
+        name: name.into(),
+        args: vec![a::Type::String],
+    };
+    dependency.header.values.extend([
+        a::Value {
+            name: "dep@1.0.0::value".into(),
+            scheme: artifact_scheme(applied("dep@1.0.0::A")),
+        },
+        a::Value {
+            name: "dep@1.0.0::accept".into(),
+            scheme: artifact_scheme(a::Type::Arrow(
+                Box::new(applied("dep@1.0.0::B")),
+                Box::new(a::Type::Nat),
+                a::Row {
+                    labels: Vec::new(),
+                    rest: a::Rest::Closed,
+                },
+            )),
+        },
+    ]);
+    let parsed =
+        parse::parse(lex("let compared = dep::accept dep::value", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let mut out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let inferred = inference::infer(&mint, &mut out.program);
+    assert!(inferred.errors.is_empty(), "{:#?}", inferred.errors);
+    assert!(
+        inferred
+            .steps
+            .iter()
+            .any(|step| matches!(step.rule, inference::Rule::Assume))
+    );
+}
+
+#[test]
 fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
     std::thread::Builder::new()
         .name("deep-unequal-imported-rows".into())
         .stack_size(256 * 1024)
         .spawn(|| {
             const DEPTH: usize = 30_000;
-            for (actual_label, actual_presence) in [
-                ("other", a::Presence::Present),
-                ("bottom", a::Presence::Absent),
+            for (actual_label, actual_presence, extra_absent, expected_errors) in [
+                ("other", a::Presence::Present, false, 2),
+                ("bottom", a::Presence::Absent, false, 1),
+                ("bottom", a::Presence::Present, true, 0),
             ] {
-                let nested = |label: &str, presence| {
-                    let mut ty = a::Type::Struct(a::Row {
-                        labels: vec![(
-                            label.into(),
+                let nested = |label: &str, presence, extra_absent| {
+                    let mut labels = vec![(
+                        label.into(),
+                        a::RowField {
+                            presence,
+                            ty: a::Type::Nat,
+                        },
+                    )];
+                    if extra_absent {
+                        labels.push((
+                            "explicitly-absent".into(),
                             a::RowField {
-                                presence,
-                                ty: a::Type::Nat,
+                                presence: a::Presence::Absent,
+                                ty: a::Type::String,
                             },
-                        )],
+                        ));
+                    }
+                    let mut ty = a::Type::Struct(a::Row {
+                        labels,
                         rest: a::Rest::Closed,
                     });
                     for _ in 0..DEPTH {
@@ -8891,12 +9085,16 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                     a::DeclaredType {
                         name: "dep@1.0.0::Expected".into(),
                         params: Vec::new(),
-                        scheme: artifact_scheme(nested("bottom", a::Presence::Present)),
+                        scheme: artifact_scheme(nested("bottom", a::Presence::Present, false)),
                     },
                     a::DeclaredType {
                         name: "dep@1.0.0::Actual".into(),
                         params: Vec::new(),
-                        scheme: artifact_scheme(nested(actual_label, actual_presence)),
+                        scheme: artifact_scheme(nested(
+                            actual_label,
+                            actual_presence,
+                            extra_absent,
+                        )),
                     },
                 ];
                 dependency.header.values.extend([
@@ -8934,7 +9132,6 @@ fn deep_unequal_imported_struct_rows_unify_on_a_bounded_stack() {
                     .iter()
                     .map(|error| error.kind.to_string())
                     .collect();
-                let expected_errors = if actual_label == "other" { 2 } else { 1 };
                 assert_eq!(messages.len(), expected_errors, "{messages:#?}");
                 assert!(
                     messages.iter().all(|message| message.contains("bottom"))

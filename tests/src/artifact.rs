@@ -1524,6 +1524,58 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 }
                 Type::Struct(row)
             };
+            let empty_block = || Block {
+                instrs: Vec::new(),
+                end: End::Ret(0),
+            };
+            let deep_block = || {
+                let mut block = empty_block();
+                for depth in 0..DEPTH {
+                    let op = match depth % 5 {
+                        0 => Op::Catch {
+                            tag: 0,
+                            body: Box::new(block),
+                        },
+                        1 => Op::SwitchTag {
+                            on: 0,
+                            cases: vec![artifact::TagCase {
+                                name: "A".into(),
+                                block,
+                            }],
+                            fallback: Some(Box::new(empty_block())),
+                        },
+                        2 => Op::SwitchPrim {
+                            on: 0,
+                            cases: vec![artifact::PrimCase {
+                                value: Literal::Boolean(true),
+                                block,
+                            }],
+                            fallback: Some(Box::new(empty_block())),
+                        },
+                        3 => Op::SwitchPresence {
+                            on: 0,
+                            field: "x".into(),
+                            present: Box::new(block),
+                            absent: Box::new(empty_block()),
+                        },
+                        _ => Op::SwitchRest {
+                            on: 0,
+                            fields: vec!["x".into()],
+                            none: Box::new(empty_block()),
+                            some: Box::new(block),
+                        },
+                    };
+                    block = Block {
+                        instrs: vec![Instr {
+                            temp: depth as u32,
+                            rep: Rep::Any,
+                            op,
+                        }],
+                        end: End::Ret(depth as u32),
+                    };
+                }
+                block
+            };
 
             let artifact = Artifact {
                 header: artifact::Header {
@@ -1554,7 +1606,11 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                     effects: Vec::new(),
                 },
                 lir: Lir {
-                    functions: Vec::new(),
+                    functions: vec![artifact::Function {
+                        name: "deep".into(),
+                        params: Vec::new(),
+                        body: deep_block(),
+                    }],
                     globals: Vec::new(),
                 },
             };
@@ -1587,6 +1643,42 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
             drop(deep_type());
             drop(deep_row_type());
             drop(deep_formula());
+
+            let block = deep_block();
+            let cloned = block.clone();
+            assert_eq!(cloned, block);
+            assert_ne!(
+                empty_block(),
+                Block {
+                    instrs: Vec::new(),
+                    end: End::Yield(0),
+                }
+            );
+            assert_ne!(Op::Neg(0), Op::Neg(1));
+            drop(cloned);
+            drop(block);
+
+            let instr = Instr {
+                temp: 0,
+                rep: Rep::Any,
+                op: Op::Catch {
+                    tag: 0,
+                    body: Box::new(deep_block()),
+                },
+            };
+            let cloned = instr.clone();
+            assert_eq!(cloned, instr);
+            drop(cloned);
+            drop(instr);
+
+            let op = Op::Catch {
+                tag: 0,
+                body: Box::new(deep_block()),
+            };
+            let cloned = op.clone();
+            assert_eq!(cloned, op);
+            drop(cloned);
+            drop(op);
         })
         .expect("the bounded-stack regression thread starts")
         .join()

@@ -765,7 +765,7 @@ pub struct Global {
 }
 
 /// An ordered instruction list and one terminator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Block {
     pub instrs: Vec<Instr>,
     pub end: End,
@@ -787,7 +787,7 @@ pub enum FieldKey {
 }
 
 /// A span-free LIR operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Op {
     Const(Literal),
     Neg(u32),
@@ -926,6 +926,587 @@ pub enum Rep {
     Sum,
     Fn,
     Any,
+}
+
+// `Block` and `Op` form a mutually recursive ownership tree. They are public
+// artifact values in their own right, so their ordinary ownership operations
+// must not depend on an enclosing `Artifact` to provide a safe traversal.
+enum LirCloneWork<'a> {
+    Block(&'a Block),
+    Op(&'a Op),
+    FinishBlock {
+        instrs: Vec<(u32, Rep)>,
+        end: End,
+    },
+    FinishCatch(u32),
+    FinishSwitchTag {
+        on: u32,
+        names: Vec<String>,
+        fallback: bool,
+    },
+    FinishSwitchPrim {
+        on: u32,
+        values: Vec<Literal>,
+        fallback: bool,
+    },
+    FinishSwitchPresence {
+        on: u32,
+        field: String,
+    },
+    FinishSwitchRest {
+        on: u32,
+        fields: Vec<String>,
+    },
+}
+
+fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
+    let mut work = vec![root];
+    let mut blocks = Vec::new();
+    let mut ops = Vec::new();
+    while let Some(part) = work.pop() {
+        match part {
+            LirCloneWork::Block(block) => {
+                work.push(LirCloneWork::FinishBlock {
+                    instrs: block
+                        .instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect(),
+                    end: block.end.clone(),
+                });
+                work.extend(
+                    block
+                        .instrs
+                        .iter()
+                        .rev()
+                        .map(|instr| LirCloneWork::Op(&instr.op)),
+                );
+            }
+            LirCloneWork::Op(op) => match op {
+                Op::Const(value) => ops.push(Op::Const(value.clone())),
+                Op::Neg(value) => ops.push(Op::Neg(*value)),
+                Op::Not(value) => ops.push(Op::Not(*value)),
+                Op::And { left, right } => ops.push(Op::And {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Or { left, right } => ops.push(Op::Or {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Xor { left, right } => ops.push(Op::Xor {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Add { left, right } => ops.push(Op::Add {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Sub { left, right } => ops.push(Op::Sub {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Mul { left, right } => ops.push(Op::Mul {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Div { left, right } => ops.push(Op::Div {
+                    left: *left,
+                    right: *right,
+                }),
+                Op::Struct(fields) => ops.push(Op::Struct(fields.clone())),
+                Op::Merge(values) => ops.push(Op::Merge(values.clone())),
+                Op::Project { base, field } => ops.push(Op::Project {
+                    base: *base,
+                    field: field.clone(),
+                }),
+                Op::Tag { name, payload } => ops.push(Op::Tag {
+                    name: name.clone(),
+                    payload: *payload,
+                }),
+                Op::Payload(value) => ops.push(Op::Payload(*value)),
+                Op::Closure { func, captures } => ops.push(Op::Closure {
+                    func: *func,
+                    captures: captures.clone(),
+                }),
+                Op::Call { callee, args } => ops.push(Op::Call {
+                    callee: callee.clone(),
+                    args: args.clone(),
+                }),
+                Op::Global { target } => ops.push(Op::Global {
+                    target: target.clone(),
+                }),
+                Op::NewTag => ops.push(Op::NewTag),
+                Op::Catch { tag, body } => {
+                    work.push(LirCloneWork::FinishCatch(*tag));
+                    work.push(LirCloneWork::Block(body));
+                }
+                Op::SwitchTag {
+                    on,
+                    cases,
+                    fallback,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchTag {
+                        on: *on,
+                        names: cases.iter().map(|case| case.name.clone()).collect(),
+                        fallback: fallback.is_some(),
+                    });
+                    if let Some(fallback) = fallback {
+                        work.push(LirCloneWork::Block(fallback));
+                    }
+                    work.extend(
+                        cases
+                            .iter()
+                            .rev()
+                            .map(|case| LirCloneWork::Block(&case.block)),
+                    );
+                }
+                Op::SwitchPrim {
+                    on,
+                    cases,
+                    fallback,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchPrim {
+                        on: *on,
+                        values: cases.iter().map(|case| case.value.clone()).collect(),
+                        fallback: fallback.is_some(),
+                    });
+                    if let Some(fallback) = fallback {
+                        work.push(LirCloneWork::Block(fallback));
+                    }
+                    work.extend(
+                        cases
+                            .iter()
+                            .rev()
+                            .map(|case| LirCloneWork::Block(&case.block)),
+                    );
+                }
+                Op::SwitchPresence {
+                    on,
+                    field,
+                    present,
+                    absent,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchPresence {
+                        on: *on,
+                        field: field.clone(),
+                    });
+                    work.push(LirCloneWork::Block(absent));
+                    work.push(LirCloneWork::Block(present));
+                }
+                Op::SwitchRest {
+                    on,
+                    fields,
+                    none,
+                    some,
+                } => {
+                    work.push(LirCloneWork::FinishSwitchRest {
+                        on: *on,
+                        fields: fields.clone(),
+                    });
+                    work.push(LirCloneWork::Block(some));
+                    work.push(LirCloneWork::Block(none));
+                }
+            },
+            LirCloneWork::FinishBlock { instrs, end } => {
+                let split = ops.len() - instrs.len();
+                let instrs = instrs
+                    .into_iter()
+                    .zip(ops.drain(split..))
+                    .map(|((temp, rep), op)| Instr { temp, rep, op })
+                    .collect();
+                blocks.push(Block { instrs, end });
+            }
+            LirCloneWork::FinishCatch(tag) => {
+                ops.push(Op::Catch {
+                    tag,
+                    body: Box::new(blocks.pop().expect("cloned catch body")),
+                });
+            }
+            LirCloneWork::FinishSwitchTag {
+                on,
+                names,
+                fallback,
+            } => {
+                let fallback =
+                    fallback.then(|| Box::new(blocks.pop().expect("cloned tag fallback")));
+                let split = blocks.len() - names.len();
+                let cases = names
+                    .into_iter()
+                    .zip(blocks.drain(split..))
+                    .map(|(name, block)| TagCase { name, block })
+                    .collect();
+                ops.push(Op::SwitchTag {
+                    on,
+                    cases,
+                    fallback,
+                });
+            }
+            LirCloneWork::FinishSwitchPrim {
+                on,
+                values,
+                fallback,
+            } => {
+                let fallback =
+                    fallback.then(|| Box::new(blocks.pop().expect("cloned primitive fallback")));
+                let split = blocks.len() - values.len();
+                let cases = values
+                    .into_iter()
+                    .zip(blocks.drain(split..))
+                    .map(|(value, block)| PrimCase { value, block })
+                    .collect();
+                ops.push(Op::SwitchPrim {
+                    on,
+                    cases,
+                    fallback,
+                });
+            }
+            LirCloneWork::FinishSwitchPresence { on, field } => {
+                let absent = Box::new(blocks.pop().expect("cloned absent branch"));
+                let present = Box::new(blocks.pop().expect("cloned present branch"));
+                ops.push(Op::SwitchPresence {
+                    on,
+                    field,
+                    present,
+                    absent,
+                });
+            }
+            LirCloneWork::FinishSwitchRest { on, fields } => {
+                let some = Box::new(blocks.pop().expect("cloned nonempty-rest branch"));
+                let none = Box::new(blocks.pop().expect("cloned empty-rest branch"));
+                ops.push(Op::SwitchRest {
+                    on,
+                    fields,
+                    none,
+                    some,
+                });
+            }
+        }
+    }
+    (blocks, ops)
+}
+
+impl Clone for Block {
+    fn clone(&self) -> Self {
+        let (mut blocks, ops) = clone_lir_tree(LirCloneWork::Block(self));
+        debug_assert!(ops.is_empty());
+        blocks.pop().expect("cloned block")
+    }
+}
+
+impl Clone for Op {
+    fn clone(&self) -> Self {
+        let (blocks, mut ops) = clone_lir_tree(LirCloneWork::Op(self));
+        debug_assert!(blocks.is_empty());
+        ops.pop().expect("cloned operation")
+    }
+}
+
+#[derive(PartialEq)]
+enum OpHead<'a> {
+    Const(&'a Literal),
+    Unary(u8, u32),
+    Binary(u8, u32, u32),
+    Struct(&'a [(FieldKey, u32)]),
+    Merge(&'a [u32]),
+    Project(u32, &'a FieldKey),
+    Tag(&'a str, Option<u32>),
+    Closure(u64, &'a [u32]),
+    Call(&'a Callee, &'a [u32]),
+    Global(&'a str),
+    NewTag,
+    Catch(u32),
+    SwitchTag(u32, Vec<&'a str>, bool),
+    SwitchPrim(u32, Vec<&'a Literal>, bool),
+    SwitchPresence(u32, &'a str),
+    SwitchRest(u32, &'a [String]),
+}
+
+impl<'a> From<&'a Op> for OpHead<'a> {
+    fn from(op: &'a Op) -> Self {
+        match op {
+            Op::Const(value) => Self::Const(value),
+            Op::Neg(value) => Self::Unary(0, *value),
+            Op::Not(value) => Self::Unary(1, *value),
+            Op::And { left, right } => Self::Binary(0, *left, *right),
+            Op::Or { left, right } => Self::Binary(1, *left, *right),
+            Op::Xor { left, right } => Self::Binary(2, *left, *right),
+            Op::Add { left, right } => Self::Binary(3, *left, *right),
+            Op::Sub { left, right } => Self::Binary(4, *left, *right),
+            Op::Mul { left, right } => Self::Binary(5, *left, *right),
+            Op::Div { left, right } => Self::Binary(6, *left, *right),
+            Op::Struct(fields) => Self::Struct(fields),
+            Op::Merge(values) => Self::Merge(values),
+            Op::Project { base, field } => Self::Project(*base, field),
+            Op::Tag { name, payload } => Self::Tag(name, *payload),
+            Op::Payload(value) => Self::Unary(2, *value),
+            Op::Closure { func, captures } => Self::Closure(*func, captures),
+            Op::Call { callee, args } => Self::Call(callee, args),
+            Op::Global { target } => Self::Global(target),
+            Op::NewTag => Self::NewTag,
+            Op::Catch { tag, .. } => Self::Catch(*tag),
+            Op::SwitchTag {
+                on,
+                cases,
+                fallback,
+            } => Self::SwitchTag(
+                *on,
+                cases.iter().map(|case| case.name.as_str()).collect(),
+                fallback.is_some(),
+            ),
+            Op::SwitchPrim {
+                on,
+                cases,
+                fallback,
+            } => Self::SwitchPrim(
+                *on,
+                cases.iter().map(|case| &case.value).collect(),
+                fallback.is_some(),
+            ),
+            Op::SwitchPresence { on, field, .. } => Self::SwitchPresence(*on, field),
+            Op::SwitchRest { on, fields, .. } => Self::SwitchRest(*on, fields),
+        }
+    }
+}
+
+enum LirPair<'a> {
+    Block(&'a Block, &'a Block),
+    Op(&'a Op, &'a Op),
+}
+
+fn lir_tree_eq(root: LirPair<'_>) -> bool {
+    let mut work = vec![root];
+    while let Some(part) = work.pop() {
+        match part {
+            LirPair::Block(left, right) => {
+                let left_head = (
+                    &left.end,
+                    left.instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect::<Vec<_>>(),
+                );
+                let right_head = (
+                    &right.end,
+                    right
+                        .instrs
+                        .iter()
+                        .map(|instr| (instr.temp, instr.rep))
+                        .collect::<Vec<_>>(),
+                );
+                if left_head != right_head {
+                    return false;
+                }
+                work.extend(
+                    left.instrs
+                        .iter()
+                        .zip(&right.instrs)
+                        .map(|(left, right)| LirPair::Op(&left.op, &right.op)),
+                );
+            }
+            LirPair::Op(left, right) => {
+                if OpHead::from(left) != OpHead::from(right) {
+                    return false;
+                }
+                match (left, right) {
+                    (Op::Catch { body: left, .. }, Op::Catch { body: right, .. }) => {
+                        work.push(LirPair::Block(left, right));
+                    }
+                    (
+                        Op::SwitchTag {
+                            cases: left_cases,
+                            fallback: left_fallback,
+                            ..
+                        },
+                        Op::SwitchTag {
+                            cases: right_cases,
+                            fallback: right_fallback,
+                            ..
+                        },
+                    ) => {
+                        work.extend(
+                            left_cases
+                                .iter()
+                                .zip(right_cases)
+                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
+                        );
+                        work.extend(
+                            left_fallback
+                                .iter()
+                                .zip(right_fallback)
+                                .map(|(left, right)| LirPair::Block(left, right)),
+                        );
+                    }
+                    (
+                        Op::SwitchPrim {
+                            cases: left_cases,
+                            fallback: left_fallback,
+                            ..
+                        },
+                        Op::SwitchPrim {
+                            cases: right_cases,
+                            fallback: right_fallback,
+                            ..
+                        },
+                    ) => {
+                        work.extend(
+                            left_cases
+                                .iter()
+                                .zip(right_cases)
+                                .map(|(left, right)| LirPair::Block(&left.block, &right.block)),
+                        );
+                        work.extend(
+                            left_fallback
+                                .iter()
+                                .zip(right_fallback)
+                                .map(|(left, right)| LirPair::Block(left, right)),
+                        );
+                    }
+                    (
+                        Op::SwitchPresence {
+                            present: left_present,
+                            absent: left_absent,
+                            ..
+                        },
+                        Op::SwitchPresence {
+                            present: right_present,
+                            absent: right_absent,
+                            ..
+                        },
+                    ) => {
+                        work.push(LirPair::Block(left_absent, right_absent));
+                        work.push(LirPair::Block(left_present, right_present));
+                    }
+                    (
+                        Op::SwitchRest {
+                            none: left_none,
+                            some: left_some,
+                            ..
+                        },
+                        Op::SwitchRest {
+                            none: right_none,
+                            some: right_some,
+                            ..
+                        },
+                    ) => {
+                        work.push(LirPair::Block(left_some, right_some));
+                        work.push(LirPair::Block(left_none, right_none));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    true
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        lir_tree_eq(LirPair::Block(self, other))
+    }
+}
+
+impl Eq for Block {}
+
+impl PartialEq for Op {
+    fn eq(&self, other: &Self) -> bool {
+        lir_tree_eq(LirPair::Op(self, other))
+    }
+}
+
+impl Eq for Op {}
+
+fn empty_block() -> Block {
+    Block {
+        instrs: Vec::new(),
+        end: End::Ret(0),
+    }
+}
+
+fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
+    match op {
+        Op::Catch { body, .. } => pending.push(std::mem::replace(body.as_mut(), empty_block())),
+        Op::SwitchTag {
+            cases, fallback, ..
+        } => {
+            pending.extend(
+                cases
+                    .iter_mut()
+                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
+            );
+            if let Some(block) = fallback.take() {
+                pending.push(*block);
+            }
+        }
+        Op::SwitchPrim {
+            cases, fallback, ..
+        } => {
+            pending.extend(
+                cases
+                    .iter_mut()
+                    .map(|case| std::mem::replace(&mut case.block, empty_block())),
+            );
+            if let Some(block) = fallback.take() {
+                pending.push(*block);
+            }
+        }
+        Op::SwitchPresence {
+            present, absent, ..
+        } => {
+            pending.push(std::mem::replace(present.as_mut(), empty_block()));
+            pending.push(std::mem::replace(absent.as_mut(), empty_block()));
+        }
+        Op::SwitchRest { none, some, .. } => {
+            pending.push(std::mem::replace(none.as_mut(), empty_block()));
+            pending.push(std::mem::replace(some.as_mut(), empty_block()));
+        }
+        Op::Const(_)
+        | Op::Neg(_)
+        | Op::Not(_)
+        | Op::And { .. }
+        | Op::Or { .. }
+        | Op::Xor { .. }
+        | Op::Add { .. }
+        | Op::Sub { .. }
+        | Op::Mul { .. }
+        | Op::Div { .. }
+        | Op::Struct(_)
+        | Op::Merge(_)
+        | Op::Project { .. }
+        | Op::Tag { .. }
+        | Op::Payload(_)
+        | Op::Closure { .. }
+        | Op::Call { .. }
+        | Op::Global { .. }
+        | Op::NewTag => {}
+    }
+}
+
+fn drain_lir_block(block: &mut Block, pending: &mut Vec<Block>) {
+    for instr in &mut block.instrs {
+        drain_lir_op(&mut instr.op, pending);
+    }
+    block.instrs.clear();
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_lir_block(self, &mut pending);
+        while let Some(mut block) = pending.pop() {
+            drain_lir_block(&mut block, &mut pending);
+        }
+    }
+}
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        drain_lir_op(self, &mut pending);
+        while let Some(mut block) = pending.pop() {
+            drain_lir_block(&mut block, &mut pending);
+        }
+    }
 }
 
 /// Build an artifact after inference and LIR lowering succeeded.
@@ -2408,37 +2989,7 @@ pub mod text {
         }
 
         fn discard_block(block: Block) {
-            let mut pending = vec![block];
-            while let Some(Block { instrs, .. }) = pending.pop() {
-                for Instr { op, .. } in instrs {
-                    match op {
-                        Op::Catch { body, .. } => pending.push(*body),
-                        Op::SwitchTag {
-                            cases, fallback, ..
-                        } => {
-                            pending.extend(cases.into_iter().map(|case| case.block));
-                            pending.extend(fallback.map(|block| *block));
-                        }
-                        Op::SwitchPrim {
-                            cases, fallback, ..
-                        } => {
-                            pending.extend(cases.into_iter().map(|case| case.block));
-                            pending.extend(fallback.map(|block| *block));
-                        }
-                        Op::SwitchPresence {
-                            present, absent, ..
-                        } => {
-                            pending.push(*present);
-                            pending.push(*absent);
-                        }
-                        Op::SwitchRest { none, some, .. } => {
-                            pending.push(*none);
-                            pending.push(*some);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            drop(block);
         }
 
         for value in artifact.header.values.drain(..) {

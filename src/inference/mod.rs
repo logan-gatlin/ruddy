@@ -1862,15 +1862,20 @@ impl Table {
                                 args: ys,
                                 ..
                             },
-                        ) => match (a == b, xs.len() == ys.len()) {
-                            (true, true) => work.extend(
+                        ) => {
+                            // Both parts are independent shape facts. Evaluate
+                            // both without short-circuiting so malformed arity
+                            // cannot hide behind a different declaration.
+                            if (a != b) | (xs.len() != ys.len()) {
+                                return false;
+                            }
+                            work.extend(
                                 xs.iter()
                                     .zip(ys.iter())
                                     .rev()
                                     .map(|(x, y)| Work::Ty(x.clone(), y.clone())),
-                            ),
-                            (true, false) | (false, true) | (false, false) => return false,
-                        },
+                            );
+                        }
                         _ => return false,
                     }
                 }
