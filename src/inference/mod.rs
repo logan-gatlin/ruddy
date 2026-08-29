@@ -803,6 +803,9 @@ pub enum ErrorKind {
     NotAllowed { effect: String },
     /// A foreign callback requires evidence the containing host call cannot carry.
     CallbackEffectsNotCovered,
+    /// An ordinary foreign boundary leaf has no fixed runtime representation:
+    /// an annotation variable there could instantiate to a Ruddy closure.
+    PolymorphicExternBoundary,
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -1102,6 +1105,79 @@ pub fn structural_family_for_tests(
     .family_type(types)
 }
 
+/// Find an ordinary boundary leaf whose outer runtime representation remains
+/// polymorphic. Such a leaf cannot be adapted once at declaration lowering:
+/// in particular, an instantiation to an arrow would otherwise send a Ruddy
+/// evidence-taking closure directly to the host.
+fn polymorphic_extern_boundary(
+    aliases: &IndexMap<Symbol, Scheme>,
+    abi: &ir::ExternType,
+    ty: &Rc<Ty>,
+) -> Option<Span> {
+    fn boundary(
+        aliases: &IndexMap<Symbol, Scheme>,
+        abi: &ir::ExternType,
+        ty: &Rc<Ty>,
+        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
+    ) -> Option<Span> {
+        let state = abi as *const ir::ExternType;
+        if seen.iter().any(|(prior_state, prior_ty)| {
+            *prior_state == state && same_finite_syntax(prior_ty, ty)
+        }) {
+            return None;
+        }
+        seen.push((state, ty.clone()));
+        match &abi.tracked {
+            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, seen),
+            ir::ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let mut cursor = ty.clone();
+                for parameter in parameters {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(from, to, _) = &*exposed else {
+                        return None;
+                    };
+                    if let Some(span) = boundary(aliases, parameter, from, seen) {
+                        return Some(span);
+                    }
+                    cursor = to.clone();
+                }
+                // A nullary marked function is represented by the desugared
+                // unit arrow, but its unit input is synthetic rather than a
+                // boundary leaf written by the reader.
+                if parameters.is_empty() {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(_, to, _) = &*exposed else {
+                        return None;
+                    };
+                    cursor = to.clone();
+                }
+                boundary(aliases, result, &cursor, seen)
+            }
+            ir::ExternTypeKind::Ordinary(_) => match &*unfold(aliases, ty) {
+                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => Some(abi.span),
+                Ty::Arrow(from, to, _) => {
+                    boundary(aliases, abi, from, seen).or_else(|| boundary(aliases, abi, to, seen))
+                }
+                // Primitive and structural outer representations are fixed.
+                // Their members do not individually cross the function ABI.
+                Ty::Nat
+                | Ty::Int
+                | Ty::Real
+                | Ty::String
+                | Ty::Boolean
+                | Ty::Struct(_)
+                | Ty::Sum(_)
+                | Ty::Undecided
+                | Ty::Named { .. } => None,
+            },
+        }
+    }
+
+    boundary(aliases, abi, ty, &mut Vec::new())
+}
+
 /// Build callback evidence obligations from the resolved semantic type. The
 /// ABI tree contributes only host grouping; aliases, row tails and conditional
 /// presences all come from the same rows ordinary inference solves.
@@ -1344,15 +1420,24 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             table.require(annotation.ty.span, origin, lowered.formula.clone());
             report_flip(&mut table, &mut errors);
         }
-        let (coverage, conditional) =
-            callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
-        if sat::entails(&lowered.formula, &conditional) {
-            extern_coverage.push((*symbol, coverage));
-        } else {
+        if let Some(span) =
+            polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
+        {
             errors.push(Error {
-                span: decl.value.abi.span,
-                kind: ErrorKind::CallbackEffectsNotCovered,
+                span,
+                kind: ErrorKind::PolymorphicExternBoundary,
             });
+        } else {
+            let (coverage, conditional) =
+                callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
+            if sat::entails(&lowered.formula, &conditional) {
+                extern_coverage.push((*symbol, coverage));
+            } else {
+                errors.push(Error {
+                    span: decl.value.abi.span,
+                    kind: ErrorKind::CallbackEffectsNotCovered,
+                });
+            }
         }
         env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
         externs.insert(*symbol, lowered.scheme);
@@ -3747,6 +3832,7 @@ impl Table {
                 effect: effect.clone(),
             },
             ErrorKind::CallbackEffectsNotCovered => ErrorKind::CallbackEffectsNotCovered,
+            ErrorKind::PolymorphicExternBoundary => ErrorKind::PolymorphicExternBoundary,
         }
     }
 }

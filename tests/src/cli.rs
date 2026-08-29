@@ -2835,6 +2835,47 @@ fn javascript_does_not_reschedule_an_interval_that_clears_itself() {
 }
 
 #[test]
+fn run_rejects_an_effectful_callback_through_a_polymorphic_extern_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = directory.path().join("polymorphic-callback");
+    write_project(&app, "polymorphic-callback", "1.0.0", &[]);
+    fs::write(
+        app.join("main.hc"),
+        "effect Tick = Nat -> Nat\n\
+         extern run : fn('a) -> Nat = host.run\n\
+         let result = handle run (fn n => !Tick n) with\n\
+           | !Tick n => n\n\
+         end\n",
+    )
+    .unwrap();
+    let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
+    fs::write(
+        app.join("Ruddy.toml"),
+        manifest.replace(
+            "root = \"main.hc\"\n[dependencies]",
+            "root = \"main.hc\"\ntarget = \"js\"\n[dependencies]",
+        ),
+    )
+    .unwrap();
+
+    let error = run_project(&app).unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("polymorphic-extern-boundary"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("fixed runtime representation"),
+        "{rendered}"
+    );
+    assert!(
+        !app.join("build/polymorphic-callback.js").exists(),
+        "an unsound module reached execution"
+    );
+}
+
+#[test]
 fn run_reports_missing_externs_with_javascript_source_locations() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("missing");
