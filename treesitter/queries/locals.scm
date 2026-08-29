@@ -29,6 +29,7 @@
 (match_arm pattern: (identifier) @local.definition.var)
 (tag_pattern payload: (identifier) @local.definition.var)
 (parenthesized_pattern (identifier) @local.definition.var)
+(tuple_pattern element: (identifier) @local.definition.var)
 (struct_pattern_field
   name: (identifier) @local.definition.var
   !pattern)

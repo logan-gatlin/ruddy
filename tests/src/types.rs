@@ -351,7 +351,7 @@ fn each_empty_type_has_one_constructor() {
         })
     ));
     assert!(matches!(&unit, Ty::Struct(row) if row.labels.is_empty()));
-    assert_eq!(unit.to_string(), "{}");
+    assert_eq!(unit.to_string(), "()");
     // The default type is the undecided one, which is what a term that has not
     // been inferred yet carries.
     assert!(matches!(Ty::default(), Ty::Undecided));
@@ -370,7 +370,7 @@ fn only_struct_types_carry_fields() {
             .collect(),
         rest: Rest::Var(3),
     });
-    assert_eq!(ty.to_string(), "{ x: {}, ..?3 }");
+    assert_eq!(ty.to_string(), "{ x: (), ..?3 }");
     assert!(ty.fields().is_some());
     assert!(Ty::Nat.fields().is_none());
 }

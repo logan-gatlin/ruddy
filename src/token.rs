@@ -138,6 +138,10 @@ pub enum Kind {
     Natural(u64),
     /// A signed 64-bit integer literal, written with an `i` suffix.
     Integer(i64),
+    /// A canonical numeric field after a projection dot. Kept distinct from a
+    /// suffixless real so `pair.0` names field `"0"` rather than projecting a
+    /// value expression. Leading zeroes are discarded by the numeric value.
+    NumericField(u64),
     /// A 64-bit floating-point literal. The suffixless spelling is real.
     Real(f64),
     /// UTF-8 text between double quotes. Escape sequences are decoded here so
@@ -398,6 +402,29 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 };
                 tokens.push(span.track(kind));
             }
+            // A digit run after a projection dot names a positional field.
+            // The lexer keeps this contextual distinction because ordinary
+            // suffixless numbers are reals. Whitespace is insignificant, so
+            // `pair. 0` has the same tokens as `pair.0`.
+            //
+            // Read the whole number-shaped lexeme before validating it. This
+            // makes `.0n` and `.0.0` one malformed projection field rather
+            // than a valid field followed by surprising extra tokens.
+            c if c.is_ascii_digit()
+                && matches!(
+                    tokens.last(),
+                    Some(tok) if matches!(tok.tracked, Kind::Dot)
+                        && errors.last().is_none_or(|error| error.span.start < tok.span.start)
+                ) =>
+            {
+                let literal = number(&mut chars);
+                let span = file_id.span(start, literal.len());
+                let kind = numeric_field(&literal);
+                match kind {
+                    Ok(kind) => tokens.push(span.track(kind)),
+                    Err(kind) => errors.push(Error { span, kind }),
+                }
+            }
             // A numeric literal is a real by default. An `i` or `n` suffix
             // selects a signed integer or natural respectively. A decimal
             // point belongs to the literal only when a digit follows it, so
@@ -544,6 +571,16 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
         }
     }
     literal
+}
+
+fn numeric_field(literal: &str) -> Result<Kind, ErrorKind> {
+    if !literal.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(ErrorKind::MalformedNatural);
+    }
+    literal
+        .parse()
+        .map(Kind::NumericField)
+        .map_err(|_| ErrorKind::NaturalTooLarge)
 }
 
 fn numeric(literal: &str) -> Result<Kind, ErrorKind> {

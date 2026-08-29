@@ -118,6 +118,7 @@ pub fn label(kind: &Kind) -> &'static str {
         Kind::Underscore => "Underscore",
         Kind::Natural(_) => "Natural",
         Kind::Integer(_) => "Integer",
+        Kind::NumericField(_) => "NumericField",
         Kind::Real(_) => "Real",
         Kind::String(_) => "String",
         Kind::Boolean(_) => "Boolean",

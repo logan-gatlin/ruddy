@@ -21,6 +21,7 @@
 (type_application head: (identifier) @type)
 (type_application argument: (identifier) @type)
 (parenthesized_type (identifier) @type)
+(tuple_type element: (identifier) @type)
 (struct_type_field type: (identifier) @type)
 (sum_case payload: (identifier) @type)
 (effect_operation_field signature: (function_type from: (identifier) @type))
@@ -37,6 +38,7 @@
 (type_application head: (path name: (identifier) @type))
 (type_application argument: (path name: (identifier) @type))
 (parenthesized_type (path name: (identifier) @type))
+(tuple_type element: (path name: (identifier) @type))
 (struct_type_field type: (path name: (identifier) @type))
 (sum_case payload: (path name: (identifier) @type))
 (effect_operation_field signature: (function_type from: (path name: (identifier) @type)))
@@ -104,6 +106,7 @@
 (struct_pattern_field name: (identifier) @property)
 (absent_field name: (identifier) @property)
 (projection field: (identifier) @property)
+(projection field: (numeric_field) @property)
 
 ; ── literals ─────────────────────────────────────────────────────────────────
 

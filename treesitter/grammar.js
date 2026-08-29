@@ -349,7 +349,7 @@ module.exports = grammar({
     _atom_projection: $ => prec.left(PREC.projection, seq(
       field('base', choice($._atom, alias($._atom_projection, $.projection))),
       '.',
-      field('field', choice($.identifier, $.string)),
+      field('field', choice($.identifier, $.string, $.numeric_field)),
     )),
 
     _atom: $ => choice(
@@ -360,6 +360,7 @@ module.exports = grammar({
       $.boolean,
       $.unit,
       $.struct_expression,
+      $.tuple_expression,
       $.tag_expression,
       $.operation,
       $.parenthesized_expression,
@@ -375,7 +376,7 @@ module.exports = grammar({
         $.handle_expression,
       )),
       '.',
-      field('field', choice($.identifier, $.string)),
+      field('field', choice($.identifier, $.string, $.numeric_field)),
     )),
 
     /** `fn <arg>+ => <expr>` — the body runs as far right as it can. */
@@ -494,6 +495,19 @@ module.exports = grammar({
       field('effect', choice($.effect_label, $.effect_path)),
     ),
 
+    /** `(a, b)` — a positional struct; a singleton keeps its comma. */
+    tuple_expression: $ => seq(
+      '(',
+      field('element', $._expression),
+      ',',
+      optional(seq(
+        field('element', $._expression),
+        repeat(seq(',', field('element', $._expression))),
+        optional(','),
+      )),
+      ')',
+    ),
+
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
     // ── Patterns ──────────────────────────────────────────────────────────
@@ -506,6 +520,7 @@ module.exports = grammar({
       $.boolean,
       $.unit,
       $.struct_pattern,
+      $.tuple_pattern,
       $.tag_pattern,
       $.parenthesized_pattern,
     ),
@@ -547,6 +562,19 @@ module.exports = grammar({
       field('name', $.tag),
       optional(field('payload', $._pattern)),
     )),
+
+    /** `(a, b)` — an exact positional struct pattern. */
+    tuple_pattern: $ => seq(
+      '(',
+      field('element', $._pattern),
+      ',',
+      optional(seq(
+        field('element', $._pattern),
+        repeat(seq(',', field('element', $._pattern))),
+        optional(','),
+      )),
+      ')',
+    ),
 
     parenthesized_pattern: $ => seq('(', $._pattern, ')'),
 
@@ -653,6 +681,7 @@ module.exports = grammar({
       $.hole,
       $.unit,
       $.struct_type,
+      $.tuple_type,
       $.parenthesized_type,
     ),
 
@@ -689,6 +718,19 @@ module.exports = grammar({
 
     /** The same clause where there is no colon to end it: `(when 'a)`. */
     parenthesized_when: $ => seq('(', $.when_clause, ')'),
+
+    /** `(A, B)` — a closed positional struct type. */
+    tuple_type: $ => seq(
+      '(',
+      field('element', $._type),
+      ',',
+      optional(seq(
+        field('element', $._type),
+        repeat(seq(',', field('element', $._type))),
+        optional(','),
+      )),
+      ')',
+    ),
 
     parenthesized_type: $ => seq('(', $._type, ')'),
 
@@ -758,6 +800,9 @@ module.exports = grammar({
      * is intentional: the lexer diagnoses `1x` as one malformed literal.
      */
     natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
+
+    /** A decimal positional field following a projection dot. */
+    numeric_field: _ => /[0-9]+/,
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
     string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),
