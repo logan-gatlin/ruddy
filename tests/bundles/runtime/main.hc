@@ -12,6 +12,10 @@ extern tick : fn(Nat) -> Nat + !Tick = host.tick
 extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = host.runTick
 extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = host.runReturnedTick
 
+type Loop = () -> Loop
+extern host_loop : Loop = host.loop
+extern run_loop : fn(Loop) -> Nat = host.runLoop
+
 let answer = Math::answer
 let identity = Math::identity
 let apply = fn f => fn x => f x
@@ -31,6 +35,9 @@ end
 let returned_callback_ticked = handle run_returned_tick (fn a => fn b => !Tick a) 42n 22n with
   | !Tick value => value
 end
+let host_looped = run_loop host_loop
+let ruddy_loop : Loop = fn _ => ruddy_loop
+let ruddy_looped = run_loop ruddy_loop
 let record = { answer: answer, ready: true }
 let tagged = #Ready answer
 let read_tag = fn value => match value with

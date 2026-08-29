@@ -43,6 +43,13 @@ globalThis.host = {
     const [callback, first, second] = args;
     return callback(first)(second);
   },
+  loop() {
+    return this.loop.bind(this);
+  },
+  runLoop(callback) {
+    callback()();
+    return 42;
+  },
 };
 
 const app = await import(pathToFileURL(generated).href);
@@ -82,4 +89,6 @@ test("adapts n-ary, nullary, curried, callback, and returned extern functions", 
   assert.equal(app.ticked, 42);
   assert.equal(app.callback_ticked, 42);
   assert.equal(app.returned_callback_ticked, 42);
+  assert.equal(app.host_looped, 42);
+  assert.equal(app.ruddy_looped, 42);
 });

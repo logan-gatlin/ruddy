@@ -2689,6 +2689,37 @@ fn extern_values_are_imports_not_global_initializers() {
 }
 
 #[test]
+fn recursive_ordinary_extern_adapters_close_cycles_in_both_directions() {
+    let source = "type Loop = () -> Loop\n\
+         extern loop : Loop = host.loop\n\
+         extern install : fn(Loop) -> () = host.install";
+    let printed = listing(source);
+    let adapters: Vec<_> = printed
+        .lines()
+        .filter(|line| line.starts_with("fn "))
+        .collect();
+    assert_eq!(
+        adapters.len(),
+        3,
+        "one marked and two cyclic adapters:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure loop#extern#"))
+            .any(|line| line.matches("loop#extern#").count() == 1),
+        "the host-to-Ruddy result closes over its in-progress adapter:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure install#extern#callback#"))
+            .any(|line| line.matches("install#extern#callback#").count() == 1),
+        "the Ruddy-to-host result closes over its in-progress adapter:\n{printed}"
+    );
+}
+
+#[test]
 fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
@@ -2710,6 +2741,26 @@ fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
             .filter(|line| line.contains("closure install#extern#callback#"))
             .any(|line| line.matches('%').count() == 3),
         "the returned callback retains its closure and Needed evidence:\n{printed}"
+    );
+}
+
+#[test]
+fn conditional_callback_bundles_capture_only_their_named_possibilities() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed + !Spare + ..'effects = host.install";
+    let printed = listing(source);
+    let bundles: Vec<_> = printed
+        .lines()
+        .filter(|line| line.contains(" = struct {") && line.contains("Needed:"))
+        .collect();
+    assert!(
+        !bundles.is_empty(),
+        "the conditional bundle is built:\n{printed}"
+    );
+    assert!(
+        bundles.iter().all(|line| !line.contains("Spare:")),
+        "unrelated definite evidence was captured in a conditional bundle:\n{printed}"
     );
 }
 
