@@ -20,6 +20,31 @@ else
 fi
 
 mkdir -p "$home"
+
+replacement=false
+if [[ -e $home/std || -L $home/std ]]; then
+  replacement=true
+  mv_help=$(mv --help 2>&1 || true)
+  if [[ $(uname -s) != Linux || $mv_help != *--exchange* ]]; then
+    echo 'cannot atomically replace the Ruddy standard library: replacement requires Linux and GNU mv with --exchange support' >&2
+    echo 'remove the existing std directory to perform a portable first install' >&2
+    exit 1
+  fi
+
+  # Diagnose kernel/filesystem support before copying the source tree. The
+  # probe is beside the destination, so it exercises the same filesystem and
+  # the same renameat2(RENAME_EXCHANGE) operation as the eventual commit.
+  probe=$(mktemp -d "$home/.std.exchange.XXXXXX")
+  mkdir "$probe/left" "$probe/right"
+  if ! mv --exchange --no-copy -T -- "$probe/left" "$probe/right"; then
+    rm -rf -- "$probe"
+    echo 'cannot atomically replace the Ruddy standard library: this Linux filesystem does not support directory exchange' >&2
+    echo 'remove the existing std directory to perform a portable first install' >&2
+    exit 1
+  fi
+  rm -rf -- "$probe"
+fi
+
 staging=$(mktemp -d "$home/.std.install.XXXXXX")
 cleanup() {
   status=$?
@@ -51,13 +76,14 @@ if [[ -n ${_RUDDY_INSTALL_STD_TEST_BARRIER:-} ]]; then
   done
 fi
 
-if [[ -e $home/std || -L $home/std ]]; then
-  # GNU mv implements this with renameat2(RENAME_EXCHANGE) on Linux. Unlike
-  # moving std aside and then renaming staging, the namespace therefore always
-  # contains either the complete old tree or the complete new tree. --no-copy
-  # forbids a non-atomic fallback, and -T makes both operands the trees to swap.
+if [[ $replacement == true ]]; then
+  # GNU mv implements this with renameat2(RENAME_EXCHANGE). Unlike moving std
+  # aside and then renaming staging, the namespace therefore always contains
+  # either complete tree. The capability was exercised above before staging.
   mv --exchange --no-copy -T -- "$staging" "$home/std"
 else
-  mv --no-copy -T -- "$staging" "$home/std"
+  # With no destination, ordinary mv is a same-filesystem directory rename.
+  # Avoid GNU-only flags so the first installation remains portable.
+  mv "$staging" "$home/std"
 fi
 printf 'installed Ruddy standard library in %s\n' "$home/std"

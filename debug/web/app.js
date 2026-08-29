@@ -36,6 +36,10 @@ const state = {
   /// Standard library: null uses the installed default, false disables it,
   /// and a dependency specification selects a custom source.
   std: null,
+  /// Last custom standard-library source, retained while std is off so "on"
+  /// restores the user's selection instead of silently switching to default.
+  /// This is debugger UI state, not part of the project manifest.
+  stdPrevious: null,
   /// Dependency project specs keyed by source module alias.
   dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
@@ -270,6 +274,12 @@ async function openDoc(name) {
   state.root = configured?.root ?? ROOT;
   state.run = configured?.run ?? {};
   state.std = configured?.std ?? null;
+  // Older caches have no stdPrevious. A currently configured custom source is
+  // itself the best compatible value; otherwise retain the recovery cache's
+  // UI-only value across a server round trip.
+  state.stdPrevious = state.std !== null && state.std !== false
+    ? state.std
+    : cached?.stdPrevious ?? null;
   state.dependencies = configured?.dependencies ?? {};
   state.snapshot = null;
   state.active = 0;
@@ -347,6 +357,7 @@ function cacheLocally() {
           root: state.root,
           run: state.run,
           std: state.std,
+          stdPrevious: state.stdPrevious,
           dependencies: state.dependencies,
           at,
         }),
@@ -585,13 +596,17 @@ function wireTitlebar() {
         : printDependency("std", state.std)
             .slice("std".length)
             .replace(/^=/, "");
-    const entered = window.prompt("Standard library (default, off, folder, @bundle=folder, or https://url#branch=name)", current);
+    const entered = window.prompt("Standard library (on, default, off, folder, @bundle=folder, or https://url#branch=name)", current);
     if (entered === null) return;
     const value = entered.trim();
     try {
-      if (!value || value === "default") state.std = null;
+      if (value === "on" || value === "true") state.std = state.stdPrevious ?? null;
+      else if (!value || value === "default") state.std = null;
       else if (value === "off" || value === "false") state.std = false;
-      else state.std = parseDependencies(value.startsWith("@") ? `std${value}` : `std=${value}`, true).std;
+      else {
+        state.std = parseDependencies(value.startsWith("@") ? `std${value}` : `std=${value}`, true).std;
+        state.stdPrevious = state.std;
+      }
     } catch (error) {
       window.alert(error.message);
       return;

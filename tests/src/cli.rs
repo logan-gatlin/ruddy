@@ -95,6 +95,64 @@ fn std_manifest_forms_are_strict_and_contextual() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn bundled_std_installer_first_install_does_not_require_gnu_mv_flags() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "").unwrap();
+
+    let real_mv = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v mv"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let fake_mv = bin.join("mv");
+    fs::write(
+        &fake_mv,
+        format!(
+            "#!/bin/sh\ncase ${{1-}} in -*) echo 'nonportable mv option' >&2; exit 97;; esac\nexec {} \"$@\"\n",
+            real_mv.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env("PATH", path)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.join("std/Ruddy.toml").is_file());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn bundled_std_installer_replaces_only_source_files() {
     let root = tempfile::tempdir().unwrap();
@@ -144,6 +202,62 @@ fn bundled_std_installer_replaces_only_source_files() {
         .unwrap();
     assert!(!output.status.success());
     assert!(home.join("std/Nested/module.hc").is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_reports_missing_exchange_capability_before_copying() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+    let fake_mv = bin.join("mv");
+    fs::write(&fake_mv, "#!/bin/sh\necho 'minimal mv'\n").unwrap();
+    fs::set_permissions(&fake_mv, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires Linux and GNU mv with --exchange"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "old"
+    );
+    assert!(!fs::read_dir(&home).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".std.install.")
+    }));
 }
 
 #[cfg(target_os = "linux")]
