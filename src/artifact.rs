@@ -200,6 +200,7 @@ pub enum Type {
     String,
     Boolean,
     Arrow(Box<Type>, Box<Type>, Row),
+    Package(Box<Type>),
     Struct(Row),
     Sum(Row),
     Var(u32),
@@ -309,6 +310,9 @@ fn semantic_eq(root: SemanticPair<'_>) -> bool {
                     pending.push(SemanticPair::Row(left_effects, right_effects));
                     pending.push(SemanticPair::Type(left_to, right_to));
                     pending.push(SemanticPair::Type(left_from, right_from));
+                }
+                (Type::Package(left), Type::Package(right)) => {
+                    pending.push(SemanticPair::Type(left, right));
                 }
                 (Type::Struct(left), Type::Struct(right)) | (Type::Sum(left), Type::Sum(right)) => {
                     pending.push(SemanticPair::Row(left, right));
@@ -424,6 +428,7 @@ impl Eq for Formula {}
 enum CloneWork<'a> {
     Semantic(SemanticRef<'a>),
     Arrow,
+    Package,
     Struct,
     Sum,
     Named {
@@ -453,6 +458,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                     work.push(CloneWork::Semantic(SemanticRef::Row(effects)));
                     work.push(CloneWork::Semantic(SemanticRef::Type(to)));
                     work.push(CloneWork::Semantic(SemanticRef::Type(from)));
+                }
+                Type::Package(body) => {
+                    work.push(CloneWork::Package);
+                    work.push(CloneWork::Semantic(SemanticRef::Type(body)));
                 }
                 Type::Struct(row) => {
                     work.push(CloneWork::Struct);
@@ -515,6 +524,10 @@ fn clone_semantic(root: SemanticRef<'_>) -> (Vec<Type>, Vec<Row>) {
                 let to = types.pop().expect("cloned arrow result");
                 let from = types.pop().expect("cloned arrow parameter");
                 types.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            CloneWork::Package => {
+                let body = types.pop().expect("cloned package body");
+                types.push(Type::Package(Box::new(body)));
             }
             CloneWork::Struct => {
                 types.push(Type::Struct(rows.pop().expect("cloned struct row")));
@@ -583,6 +596,9 @@ fn empty_row() -> Row {
 
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
+        Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
+            body.as_mut(), Type::Undecided,
+        ))),
         Type::Arrow(from, to, effects) => {
             pending.push(SemanticOwned::Type(std::mem::replace(
                 from.as_mut(),
@@ -1759,6 +1775,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
         Ty(&'a types::Ty),
         Row(&'a types::Row),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -1807,6 +1824,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }
+                types::Ty::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body));
+                }
                 types::Ty::Struct(row) => {
                     work.push(Work::Struct);
                     work.push(Work::Row(row));
@@ -1853,6 +1874,10 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
                 let to = tys.pop().expect("artifact arrow result");
                 let from = tys.pop().expect("artifact arrow parameter");
                 tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+            }
+            Work::Package => {
+                let body = tys.pop().expect("artifact package body");
+                tys.push(Type::Package(Box::new(body)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("artifact struct row");
@@ -2406,6 +2431,11 @@ pub mod text {
                             work.push(Work::Ty(to));
                             work.push(Work::Text(" "));
                             work.push(Work::Ty(from));
+                        }
+                        Type::Package(body) => {
+                            out.push_str("(package ");
+                            work.push(Work::Text(")"));
+                            work.push(Work::Ty(body));
                         }
                         Type::Struct(row) | Type::Sum(row) => {
                             out.push('(');
@@ -3401,6 +3431,7 @@ pub mod text {
                 Rest(S),
                 Field(S),
                 BuildArrow,
+                BuildPackage,
                 BuildStruct,
                 BuildSum,
                 BuildNamed { name: String, count: usize },
@@ -3438,6 +3469,11 @@ pub mod text {
                                         tasks.push(Task::Row(effects));
                                         tasks.push(Task::Ty(to));
                                         tasks.push(Task::Ty(from));
+                                    }
+                                    "package" => {
+                                        let body = self.exact(values, 1, "package").remove(0);
+                                        tasks.push(Task::BuildPackage);
+                                        tasks.push(Task::Ty(body));
                                     }
                                     "struct" => {
                                         let row = self.exact(values, 1, "struct").remove(0);
@@ -3541,6 +3577,10 @@ pub mod text {
                         let to = tys.pop().expect("to");
                         let from = tys.pop().expect("from");
                         tys.push(Type::Arrow(Box::new(from), Box::new(to), effects));
+                    }
+                    Task::BuildPackage => {
+                        let body = tys.pop().expect("package body");
+                        tys.push(Type::Package(Box::new(body)));
                     }
                     Task::BuildStruct => {
                         let row = rows.pop().expect("struct row");

@@ -603,6 +603,7 @@ impl Solve<'_> {
         enum FingerprintWork {
             Type(Rc<Ty>),
             Arrow(*const Ty, Rc<Ty>),
+            Package(*const Ty, Rc<Ty>),
             Struct(*const Ty, Rc<Ty>),
             Sum(*const Ty, Rc<Ty>),
             Named(*const Ty, Rc<Ty>, Symbol, usize),
@@ -685,6 +686,11 @@ impl Solve<'_> {
                                     work.push(FingerprintWork::Type(from.clone()));
                                     continue;
                                 }
+                                Ty::Package(body) => {
+                                    work.push(FingerprintWork::Package(key, ty.clone()));
+                                    work.push(FingerprintWork::Type(body.clone()));
+                                    continue;
+                                }
                                 Ty::Struct(row) => {
                                     work.push(FingerprintWork::Struct(key, ty.clone()));
                                     work.push(FingerprintWork::Row(row.clone()));
@@ -716,6 +722,12 @@ impl Solve<'_> {
                         FingerprintWork::Arrow(key, ty) => {
                             let parts = values.split_off(values.len() - 3);
                             let hash = tagged(9, parts);
+                            self.types.insert(key, (ty, hash));
+                            values.push(hash);
+                        }
+                        FingerprintWork::Package(key, ty) => {
+                            let body = values.pop().expect("family package fingerprint body");
+                            let hash = tagged(12, [body]);
                             self.types.insert(key, (ty, hash));
                             values.push(hash);
                         }
@@ -1410,6 +1422,18 @@ impl Solve<'_> {
                         actual: rhs.clone(),
                     };
                     match (&*lhs, &*rhs) {
+                        (Ty::Package(left), Ty::Package(right)) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(left.clone(), right.clone(), depth + 1));
+                        }
+                        (Ty::Package(body), _) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(body.clone(), rhs.clone(), depth + 1));
+                        }
+                        (_, Ty::Package(body)) => {
+                            self.step(span, Rule::Same, goal, Effect::Decomposed);
+                            work.push(SolveWork::Ty(lhs.clone(), body.clone(), depth + 1));
+                        }
                         (Ty::Undecided, _) => {
                             self.step(span, Rule::Absorb, goal, Effect::None);
                             self.recover_ty(span, &rhs);
@@ -1789,6 +1813,7 @@ impl Solve<'_> {
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => {
                             work.push(Work::Row(row.clone()));
                         }
@@ -2911,6 +2936,7 @@ impl Solve<'_> {
                             work.push(Work::Type(to.clone()));
                             work.push(Work::Type(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Type(body.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Type));

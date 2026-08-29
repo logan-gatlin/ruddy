@@ -5119,6 +5119,42 @@ fn conditional_effect_presence_uses_the_carrying_arrows_polarity() {
     );
 }
 
+/// Callback polarity is not approximated from the nearest arrow. The result of
+/// a callback supplied to a callback is positive after two reversals, and its
+/// hidden choice belongs to that innermost result rather than either wrapper.
+#[test]
+fn nested_callback_results_keep_their_own_existential_boundary() {
+    let source = "let nested : ((Nat -> { x when 'p: Nat }) -> Nat) -> Nat = fn use => 0n";
+    let (mint, out) = built(source);
+    let PresenceOwnership::Existential { boundary } =
+        annotation_of(&mint, &out, "nested").variables[0].ownership
+    else {
+        panic!("a twice-reversed callback result should be producer-owned");
+    };
+    assert_eq!(
+        &source[boundary.start..boundary.end()],
+        "{ x when 'p: Nat }"
+    );
+}
+
+/// An arrow's conditional effect is produced at the invocation boundary while
+/// its return field is produced inside that boundary. When one presence links
+/// both, ownership expands to the smallest boundary containing the pair.
+#[test]
+fn result_and_effect_occurrences_share_the_enclosing_call_boundary() {
+    let source = "effect Log = { op: () -> () }\n\
+                  let mixed : Nat -> { x when 'p: Nat } + !Log (when 'p) = fn n => { x: n }";
+    let (mint, out) = built(source);
+    let annotation = annotation_of(&mint, &out, "mixed");
+    let PresenceOwnership::Existential { boundary } = annotation.variables[0].ownership else {
+        panic!("the correlated result and effect should be producer-owned");
+    };
+    assert_eq!(
+        &source[boundary.start..boundary.end()],
+        "Nat -> { x when 'p: Nat } + !Log (when 'p)"
+    );
+}
+
 /// A formula is written about presences, and a presence is what a `when` puts
 /// on a label — so a name no `when` wears is a name the formula has nothing to
 /// say about, whether or not anything declared it.

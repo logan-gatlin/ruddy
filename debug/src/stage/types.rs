@@ -399,6 +399,7 @@ fn relevant_parameters(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<Symbol, Ha
                         work.push(Work::Ty(to));
                         work.push(Work::Ty(from));
                     }
+                    Ty::Package(body) => work.push(Work::Ty(body)),
                     Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                     Ty::Nat
                     | Ty::Int
@@ -473,6 +474,7 @@ fn names_in(ty: &Ty, relevant: &HashMap<Symbol, HashSet<usize>>, out: &mut Vec<S
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
                 }
+                Ty::Package(body) => work.push(Work::Ty(body)),
                 Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row)),
                 Ty::Nat
                 | Ty::Int

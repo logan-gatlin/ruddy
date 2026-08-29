@@ -1748,7 +1748,10 @@ impl Lower<'_> {
     /// that is none of those is a program inference refused — which R2 says
     /// this pass is never handed.
     fn arrow(&self, ty: &Rc<Ty>) -> (Rc<Ty>, Rc<Ty>, Row) {
-        let ty = unfold(&self.inference.aliases, ty);
+        let mut ty = unfold(&self.inference.aliases, ty);
+        while let Ty::Package(body) = &*ty {
+            ty = unfold(&self.inference.aliases, body);
+        }
         let Ty::Arrow(from, to, row) = &*ty else {
             panic!("LIR runs only on programs with no errors");
         };

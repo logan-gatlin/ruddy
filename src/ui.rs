@@ -1228,6 +1228,7 @@ impl fmt::Display for Prim {
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
         match self {
+            Ty::Package(body) => body.prec(),
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
@@ -1286,6 +1287,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     work.push(SemanticJob::Text(")"));
                 }
                 match ty {
+                    Ty::Package(body) => work.push(SemanticJob::Ty(body, false)),
                     Ty::Nat => f.write_str(Prim::Nat.name())?,
                     Ty::Int => f.write_str(Prim::Int.name())?,
                     Ty::Real => f.write_str(Prim::Real.name())?,
