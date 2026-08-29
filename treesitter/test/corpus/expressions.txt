@@ -250,6 +250,34 @@ let c = {}
     (struct_expression)))
 
 ================================================================================
+Tuples are distinguished from grouping by their comma
+================================================================================
+
+let pair = (f x, y)
+let singleton = (x,)
+let projected = pair.001
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (tuple_expression
+      (application
+        (identifier)
+        (identifier))
+      (identifier)))
+  (let_definition
+    (identifier)
+    (tuple_expression
+      (identifier)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (numeric_field))))
+
+================================================================================
 Parentheses group and are then discarded
 ================================================================================
 

@@ -4,7 +4,8 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, ForeignPath, Path, Place, StmtKind, SumCase, Type, TypeField, TypeKind, parse,
+        ErrorKind, ExprKind, ForeignPath, Path, PatternKind, Place, StmtKind, SumCase, Type,
+        TypeField, TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -48,6 +49,61 @@ fn parse_print(src: &str) -> String {
     );
     assert_eq!(out.stmts.len(), 1, "stmts: {:#?}", out.stmts);
     print::ast::stmt(&out.stmts[0].tracked).to_string()
+}
+
+#[test]
+fn parses_expression_pattern_and_type_tuples() {
+    let out = parse(
+        lex(
+            "let (a, b,) : (A, B,) = (f x, y,)\nlet grouped = (x)\nlet one = (x,)",
+            FileID::GENERATED,
+        )
+        .tokens,
+    );
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    assert_eq!(out.stmts.len(), 3);
+
+    let StmtKind::Let {
+        pattern,
+        ty: Some(ty),
+        body,
+    } = &out.stmts[0].tracked
+    else {
+        panic!("expected ascribed tuple let: {:#?}", out.stmts[0]);
+    };
+    assert!(matches!(&pattern.tracked, PatternKind::Tuple(items) if items.len() == 2));
+    assert!(matches!(&ty.ty.tracked, TypeKind::Tuple(items) if items.len() == 2));
+    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 2));
+
+    let StmtKind::Let { body, .. } = &out.stmts[1].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Ident { .. }));
+    let StmtKind::Let { body, .. } = &out.stmts[2].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(&body.tracked.tracked, ExprKind::Tuple(items) if items.len() == 1));
+}
+
+#[test]
+fn parses_numeric_projection_canonically() {
+    let out = parse(lex("let value = pair.001", FileID::GENERATED).tokens);
+    assert!(out.errors.is_empty(), "errors: {:#?}", out.errors);
+    let StmtKind::Let { body, .. } = &out.stmts[0].tracked else {
+        unreachable!()
+    };
+    assert!(matches!(
+        &body.tracked.tracked,
+        ExprKind::Project { field, .. } if field.tracked == "1"
+    ));
+}
+
+#[test]
+fn malformed_tuple_elements_are_reported() {
+    for src in ["let x = (,)", "let x = (a,, b)", "let x = (a,"] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "expected an error for {src:?}");
+    }
 }
 
 #[test]
@@ -1480,7 +1536,7 @@ fn parses_every_kind_of_pattern() {
         ),
         (
             "let a = match x with {} => 1n end",
-            "let a = match x with | {} => 1n end",
+            "let a = match x with | () => 1n end",
         ),
         // A trailing comma among the fields is allowed, as in a struct
         // expression.

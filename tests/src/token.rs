@@ -96,6 +96,44 @@ fn a_literal_too_large_to_hold_is_rejected() {
 }
 
 #[test]
+fn lexes_numeric_projection_fields() {
+    assert!(matches!(
+        kinds("pair.0 pair. 001")[..],
+        [
+            Kind::Identifier(_),
+            Kind::Dot,
+            Kind::NumericField(0),
+            Kind::Identifier(_),
+            Kind::Dot,
+            Kind::NumericField(1),
+        ]
+    ));
+
+    let field = lex("pair.001", FileID::GENERATED).tokens.pop().unwrap();
+    assert_eq!(field.span.start, 5);
+    assert_eq!(field.span.width, 3);
+}
+
+#[test]
+fn numeric_projection_fields_reject_number_forms() {
+    for malformed in ["pair.0n", "pair.0i", "pair.0.0"] {
+        let out = lex(malformed, FileID::GENERATED);
+        assert_eq!(
+            out.errors.len(),
+            1,
+            "errors for {malformed:?}: {:#?}",
+            out.errors
+        );
+        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNatural);
+    }
+
+    let over = format!("pair.{}0", u64::MAX);
+    assert_eq!(errors(&over)[0].kind, ErrorKind::NaturalTooLarge);
+    // Away from a dot the same spelling remains an ordinary real literal.
+    assert!(matches!(kinds("001")[..], [Kind::Real(value)] if value == 1.0));
+}
+
+#[test]
 fn lexes_real_number_operators() {
     assert!(matches!(
         kinds("-1 + 2 * 3 / 4")[..],

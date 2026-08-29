@@ -5751,6 +5751,11 @@ fn pattern_names(pattern: &parse::Pattern, out: &mut Vec<TrackedString>) {
                 }
             }
         }
+        parse::PatternKind::Tuple(elements) => {
+            for element in elements {
+                pattern_names(element, out);
+            }
+        }
     }
 }
 
@@ -8787,6 +8792,26 @@ impl Builder<'_> {
             ExprKind::Struct(fields) => {
                 TermKind::Struct(self.fields(fields, |b, value| b.term(value))).with_span(span)
             }
+            // Tuples are positional structs at the IR boundary. Decimal keys
+            // are canonical and zero-based; the element's own span stands in
+            // for the generated field name, since no label was written.
+            ExprKind::Tuple(elements) => {
+                let fields = elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        let name_span = element.span;
+                        (
+                            index.to_string(),
+                            Field {
+                                name_span,
+                                value: self.term(element),
+                            },
+                        )
+                    })
+                    .collect();
+                TermKind::Struct(fields).with_span(span)
+            }
             ExprKind::Tag { name, payload } => {
                 let payload = payload.map(|payload| Box::new(self.term(*payload)));
                 TermKind::Tag { name, payload }.with_span(span)
@@ -9105,6 +9130,28 @@ impl Builder<'_> {
                 }
             },
             parse::TypeKind::Apply { head, args } => self.apply(span, *head, args, place),
+            // A tuple type is a closed struct with unconditional, zero-based
+            // decimal fields. As with tuple terms, an element's span is the
+            // best source location for its generated label.
+            parse::TypeKind::Tuple(elements) => {
+                let fields = elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        let name_span = element.span;
+                        let value = self.ty(element, place);
+                        (
+                            index.to_string(),
+                            TypeField::Written {
+                                name_span,
+                                when: None,
+                                value,
+                            },
+                        )
+                    })
+                    .collect();
+                span.track(TypeKind::Struct { fields, tail: None })
+            }
             parse::TypeKind::Struct { fields, tail } => {
                 // The values are lowered before openness is judged, so a bad
                 // name inside an open declared type is still reported: the
@@ -9498,6 +9545,21 @@ impl Builder<'_> {
                 let payload =
                     payload.map(|payload| Box::new(self.pattern(*payload, seen, binders, dropped)));
                 span.track(PatternKind::Tag { name, payload })
+            }
+            // Tuple patterns are exact positional struct patterns. Lowering
+            // each element through this same walk preserves binder order and
+            // duplicate-binding diagnostics across arbitrary nesting.
+            parse::PatternKind::Tuple(elements) => {
+                let fields = elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        let name_span = element.span;
+                        let value = self.pattern(element, seen, binders, dropped);
+                        (index.to_string(), Field { name_span, value })
+                    })
+                    .collect();
+                span.track(PatternKind::Struct { fields, rest: None })
             }
             parse::PatternKind::Struct {
                 fields: entries,

@@ -21,6 +21,35 @@ let a : Pair Nat Nat -> Nat -> Nat = f
     (identifier)))
 
 ================================================================================
+Tuple types are closed and may contain full types
+================================================================================
+
+let pair : (A -> B, Pair C D,) = value
+let singleton : (A,) = value
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (annotation
+      (tuple_type
+        (function_type
+          (identifier)
+          (identifier))
+        (type_application
+          (identifier)
+          (identifier)
+          (identifier))))
+    (identifier))
+  (let_definition
+    (identifier)
+    (annotation
+      (tuple_type
+        (identifier)))
+    (identifier)))
+
+================================================================================
 A struct type, with a when clause, an absent field and a tail
 ================================================================================
 

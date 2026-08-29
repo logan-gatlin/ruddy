@@ -35,6 +35,34 @@ let a = match v with
         (natural)))))
 
 ================================================================================
+Tuple patterns keep their positional spelling
+================================================================================
+
+let a = match v with
+  | (x, #Some y,) => x
+  | (only,) => only
+  end
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (match_expression
+      (identifier)
+      (match_arm
+        (tuple_pattern
+          (identifier)
+          (tag_pattern
+            (tag)
+            (identifier)))
+        (identifier))
+      (match_arm
+        (tuple_pattern
+          (identifier))
+        (identifier)))))
+
+================================================================================
 A struct pattern puns a bare field name
 ================================================================================
 

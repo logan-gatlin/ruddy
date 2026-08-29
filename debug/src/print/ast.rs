@@ -18,9 +18,9 @@ use ruddy::{
 };
 
 use crate::print::{
-    Entry, Grouped, Mark, Prec, Shape, label, string, write_applied, write_apply, write_arrow,
-    write_binary, write_let, write_match, write_pipeline, write_project, write_row, write_struct,
-    write_sum, write_tag, write_unary,
+    Entry, Grouped, Mark, Prec, Shape, label, string, tuple_field_order, write_applied,
+    write_apply, write_arrow, write_binary, write_let, write_match, write_pipeline, write_project,
+    write_row, write_struct, write_sum, write_tag, write_tuple, write_unary,
 };
 
 /// A parse node, ready to print. A newtype rather than a bare impl because both
@@ -36,6 +36,7 @@ impl Grouped for Ast<'_, TypeKind> {
             TypeKind::Sum { .. } | TypeKind::Effects(_) => Prec::Sum,
             TypeKind::Apply { .. } => Prec::Apply,
             TypeKind::Struct { .. }
+            | TypeKind::Tuple(_)
             | TypeKind::Ident { .. }
             | TypeKind::Variable { .. }
             | TypeKind::Hole
@@ -95,6 +96,7 @@ impl Grouped for Ast<'_, ExprKind> {
             ExprKind::Project { .. }
             | ExprKind::Operation { .. }
             | ExprKind::Struct(_)
+            | ExprKind::Tuple(_)
             | ExprKind::Ident { .. }
             | ExprKind::Natural(_)
             | ExprKind::Integer(_)
@@ -366,7 +368,29 @@ impl fmt::Display for Ast<'_, ExprKind> {
                 arms.iter()
                     .map(|arm| (&arm.pattern.tracked, Ast(&arm.body.tracked))),
             ),
-            ExprKind::Struct(fields) => write_struct(f, pairs(fields)),
+            ExprKind::Struct(fields) => {
+                if fields.is_empty() {
+                    f.write_str("()")
+                } else if let Some(order) =
+                    tuple_field_order(fields.keys().map(|name| name.tracked.as_str()))
+                {
+                    write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            Ast(&fields
+                                .get_index(insertion)
+                                .expect("tuple field index")
+                                .1
+                                .tracked)
+                        }),
+                    )
+                } else {
+                    write_struct(f, pairs(fields))
+                }
+            }
+            ExprKind::Tuple(elements) => {
+                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
+            }
             ExprKind::Project { base, field } => {
                 write_project(f, &Ast(&base.tracked), &field.tracked)
             }
@@ -421,7 +445,8 @@ impl Grouped for Ast<'_, PatternKind> {
             | PatternKind::String(_)
             | PatternKind::Boolean(_)
             | PatternKind::Unit
-            | PatternKind::Struct { .. } => Prec::Atom,
+            | PatternKind::Struct { .. }
+            | PatternKind::Tuple(_) => Prec::Atom,
         }
     }
 }
@@ -443,7 +468,31 @@ impl fmt::Display for Ast<'_, PatternKind> {
                 None,
                 payload.as_deref().map(|payload| Ast(&payload.tracked)),
             ),
+            PatternKind::Tuple(elements) => {
+                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
+            }
             PatternKind::Struct { fields, rest } => {
+                if rest.is_none() && fields.is_empty() {
+                    return f.write_str("()");
+                }
+                if rest.is_none()
+                    && let Some(order) =
+                        tuple_field_order(fields.keys().map(|name| name.tracked.as_str()))
+                    && fields.values().all(Option::is_some)
+                {
+                    return write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            let pattern = fields
+                                .get_index(insertion)
+                                .expect("tuple field index")
+                                .1
+                                .as_ref()
+                                .expect("tuple fields were checked as explicit");
+                            Ast(&pattern.tracked)
+                        }),
+                    );
+                }
                 f.write_str("{")?;
                 let mut first = true;
                 for (name, pattern) in fields {
@@ -482,6 +531,27 @@ impl fmt::Display for Ast<'_, TypeKind> {
                 )
             }
             TypeKind::Struct { fields, tail } => {
+                if tail.is_none() && fields.is_empty() {
+                    return f.write_str("()");
+                }
+                if tail.is_none()
+                    && fields
+                        .values()
+                        .all(|field| matches!(field, TypeField::Written { when: None, .. }))
+                    && let Some(order) =
+                        tuple_field_order(fields.keys().map(|name| name.tracked.as_str()))
+                {
+                    return write_tuple(
+                        f,
+                        order.into_iter().map(|insertion| {
+                            let field = fields.get_index(insertion).expect("tuple field index").1;
+                            let TypeField::Written { value, .. } = field else {
+                                unreachable!("tuple fields were checked as written")
+                            };
+                            Ast(&value.tracked)
+                        }),
+                    );
+                }
                 let fields = fields.iter().map(|(name, field)| match field {
                     TypeField::Written { when, value } => Entry::Written {
                         name: &name.tracked,
@@ -524,6 +594,9 @@ impl fmt::Display for Ast<'_, TypeKind> {
                     cases,
                     tail.as_ref().map(|tail| tail as &dyn fmt::Display),
                 )
+            }
+            TypeKind::Tuple(elements) => {
+                write_tuple(f, elements.iter().map(|element| Ast(&element.tracked)))
             }
             TypeKind::Apply { head, args } => write_applied(
                 f,

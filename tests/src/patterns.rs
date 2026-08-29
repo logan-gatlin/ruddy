@@ -225,6 +225,25 @@ fn unrelated_same_span_batches_do_not_hide_match_coverage() {
 }
 
 #[test]
+fn tuple_patterns_are_exact_and_split_nested_fields_exhaustively() {
+    let checks = clean(
+        "let choose : (Boolean, Nat) -> Nat = fn value => match value with \
+         | (true, n) => n | (false, n) => n end",
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable; 2]);
+
+    let checks = clean(
+        "let only : (Nat,) -> Nat = fn value => match value with \
+         | (n,) => n end",
+    );
+    let report = sole_report(&checks);
+    assert!(matches!(report.coverage, Coverage::Exhaustive));
+    assert_eq!(verdicts(report), [Verdict::Reachable]);
+}
+
+#[test]
 fn struct_pattern_compatibility_flattens_forwarded_rows() {
     let checks = clean(
         "type WithX 'r = { x: Nat, ..'r }\n\

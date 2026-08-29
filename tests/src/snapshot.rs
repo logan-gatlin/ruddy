@@ -1167,9 +1167,9 @@ fn unit_is_the_empty_struct_in_the_ir() {
     assert_eq!(
         unit_nodes("ir"),
         [
-            ("Struct".into(), "{}".into()),
-            ("Ascribed Struct".into(), "{}".into()),
-            ("Struct".into(), "{}".into()),
+            ("Struct".into(), "()".into()),
+            ("Ascribed Struct".into(), "()".into()),
+            ("Struct".into(), "()".into()),
         ] as [(String, String); 3]
     );
 }
@@ -2840,7 +2840,7 @@ fn every_stage_reports_on_a_source_using_effects() {
     let types = stage_named(&snapshot, "types");
     let meanings: Vec<&str> = nodes(types).iter().map(|node| node.text.as_str()).collect();
     assert!(
-        meanings.contains(&"{} -> Nat + !Log"),
+        meanings.contains(&"() -> Nat + !Log"),
         "the Types tab lost the row: {meanings:?}"
     );
     // An alias does not survive into the type language, so `Runner`'s

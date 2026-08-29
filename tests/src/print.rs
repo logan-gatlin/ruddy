@@ -77,19 +77,87 @@ fn both_trees_render_a_struct_the_same_way() {
     }
 }
 
-/// The empty struct is the one case with no padding, because the padding would
-/// be two spaces around nothing. Both printers have to agree about that too —
-/// and the IR reaches it from `()` as well, which the AST still spells as
-/// written.
 #[test]
-fn the_empty_struct_carries_no_padding() {
+fn tuples_print_canonically_in_both_trees() {
+    for source in [
+        "let pair = (1n, 2n)",
+        "let one = (1n,)",
+        "let nested : ((Nat, Nat), Nat) = ((1n, 2n), 3n)",
+        "let pick = fn p => p.0",
+        "let destruct = match (1n, 2n) with | (x, y) => x end",
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, source, "{source}: AST");
+        assert_eq!(ir, source, "{source}: IR");
+    }
+}
+
+#[test]
+fn canonical_tuple_fields_are_exact_and_insertion_order_independent() {
+    assert_eq!(ruddy::ui::tuple_field_order(["1", "0"]), Some(vec![1, 0]));
+    let reversed = Ty::Struct(Row {
+        labels: IndexMap::from([
+            (
+                "1".to_string(),
+                RowField {
+                    presence: Presence::Present,
+                    ty: Rc::new(Ty::String),
+                },
+            ),
+            (
+                "0".to_string(),
+                RowField {
+                    presence: Presence::Present,
+                    ty: Rc::new(Ty::Nat),
+                },
+            ),
+        ]),
+        rest: Rest::Closed,
+    });
+    assert_eq!(reversed.to_string(), "(Nat, String)");
+
+    assert_eq!(ruddy::ui::tuple_field_order(["0"]), Some(vec![0]));
+    assert_eq!(ruddy::ui::tuple_field_order([]), None);
+    assert_eq!(ruddy::ui::tuple_field_order(["00"]), None);
+    assert_eq!(ruddy::ui::tuple_field_order(["0", "2"]), None);
+    assert_eq!(ruddy::ui::tuple_field_order(["0", "x"]), None);
+}
+
+#[test]
+fn numeric_struct_syntax_canonicalizes_only_when_exact() {
+    for (source, expected) in [
+        ("let p = { \"1\": 2n, \"0\": 1n }", "let p = (1n, 2n)"),
+        (
+            "let p : { \"1\": String, \"0\": Nat } = { \"0\": 1n, \"1\": \"x\" }",
+            "let p : (Nat, String) = (1n, \"x\")",
+        ),
+        (
+            "let first = fn p => match p with | { \"1\": y, \"0\": x } => x end",
+            "let first = fn p => match p with | (x, y) => x end",
+        ),
+        (
+            "let sparse = { \"0\": 1n, \"2\": 3n }",
+            "let sparse = { \"0\": 1n, \"2\": 3n }",
+        ),
+        ("let padded = { \"00\": 1n }", "let padded = { \"00\": 1n }"),
+    ] {
+        let (ast, ir) = printed(source);
+        assert_eq!(ast, expected, "{source}: AST");
+        assert_eq!(ir, expected, "{source}: IR");
+    }
+}
+
+/// Exact empty structs share unit's canonical spelling in every surface
+/// printer, whether they were written with braces or parentheses.
+#[test]
+fn the_empty_struct_canonicalizes_to_unit() {
     let (ast, ir) = printed("let e = {}");
-    assert_eq!(ast, "let e = {}");
-    assert_eq!(ir, "let e = {}");
+    assert_eq!(ast, "let e = ()");
+    assert_eq!(ir, "let e = ()");
 
     let (ast, ir) = printed("let u : () = ()");
     assert_eq!(ast, "let u : () = ()");
-    assert_eq!(ir, "let u : {} = {}");
+    assert_eq!(ir, "let u : () = ()");
 }
 
 /// One source as the parse tree's printer renders it, without lowering it.
@@ -191,7 +259,8 @@ fn a_type_reads_the_same_whichever_printer_reached_it() {
             "let d : { x: Nat, y: Nat -> Nat } = { x: 1n, y: fn n => n }",
             "{ x: Nat, y: Nat -> Nat }",
         ),
-        ("let e : {} = {}", "{}"),
+        ("let e : {} = {}", "()"),
+        ("let tuple : (Nat, String) = (1n, \"x\")", "(Nat, String)"),
         (
             "let g : { p: { q: Nat } } -> Nat = fn r => r.p.q",
             "{ p: { q: Nat } } -> Nat",
@@ -326,9 +395,8 @@ fn a_tag_with_no_payload_is_kept_off_what_follows_it() {
 }
 
 /// A case carrying unit is written with no payload, and prints with none — so
-/// `#None` survives lowering as itself rather than coming back as the
-/// `#None {}` it means. The struct's `()` is the other way round on
-/// purpose: there, two spellings of one written type collapse to one.
+/// `#None` survives lowering as itself rather than acquiring an explicit
+/// unit payload.
 #[test]
 fn a_case_carrying_nothing_keeps_its_missing_payload() {
     let (ast, ir) = printed("type Flag = #On | #Off");
@@ -336,10 +404,10 @@ fn a_case_carrying_nothing_keeps_its_missing_payload() {
     assert_eq!(ir, "type Flag = #On | #Off");
 
     // Written out, the unit stays written out: it is a payload the reader
-    // put on the page, and `{}` is what `()` already prints as.
-    let (ast, ir) = printed("type Flag = #On () | #Off {}");
-    assert_eq!(ast, "type Flag = #On () | #Off {}");
-    assert_eq!(ir, "type Flag = #On {} | #Off {}");
+    // put on the page.
+    let (ast, ir) = printed("type Flag = #On () | #Off ()");
+    assert_eq!(ast, "type Flag = #On () | #Off ()");
+    assert_eq!(ir, "type Flag = #On () | #Off ()");
 }
 
 /// A printed program re-lowers into the one it was printed from, definitions
@@ -368,7 +436,7 @@ fn recursion_and_forward_references_round_trip() {
 /// A match prints back as the surface syntax it was written as — the leading
 /// `|` on every arm, each pattern in the grammar it was read by — and the
 /// printed form re-parses and re-lowers to the same thing. Every kind of
-/// pattern is on the page: names, naturals, `()`, `{}`, struct patterns with
+/// pattern is on the page: names, naturals, unit, struct patterns with
 /// renaming and nesting, tags bare and carrying, and the greedy payload that
 /// needs its parentheses back.
 #[test]
@@ -377,7 +445,6 @@ fn a_match_and_its_patterns_round_trip() {
         "let f = fn v => match v with | #Some x => x | #None => 0n end",
         "let f = fn v => match v with | 0n => 1n | 1n => 2n | k => k end",
         "let f = fn v => match v with | () => 1n end",
-        "let f = fn v => match v with | {} => 1n end",
         "let f = fn v => match v with | { a: #A, b: { c: x } } => x | r => 0n end",
         "let f = fn v => match v with | #A (#X x) => x | #A w => 0n | r => 1n end",
         "let f = fn v => match v with end",
@@ -390,6 +457,10 @@ fn a_match_and_its_patterns_round_trip() {
         let (_, again) = printed(&ir);
         assert_eq!(again, ir, "{source} did not round-trip");
     }
+
+    let (ast, ir) = printed("let f = fn v => match v with | {} => 1n end");
+    assert_eq!(ast, "let f = fn v => match v with | () => 1n end");
+    assert_eq!(ir, ast);
 
     // The one printing the IR spells differently from the AST: a pun is
     // expanded by lowering, so the IR prints the field twice-named while the
@@ -484,12 +555,12 @@ fn both_trees_render_a_pattern_rest() {
     let (ast, ir) = printed("let f = fn v => match v with | { x, .. } => x | {} => 0n end");
     assert_eq!(
         ast,
-        "let f = fn v => match v with | { x, .. } => x | {} => 0n end"
+        "let f = fn v => match v with | { x, .. } => x | () => 0n end"
     );
     // The pun expands in the IR, and the `..` stays put.
     assert_eq!(
         ir,
-        "let f = fn v => match v with | { x: x, .. } => x | {} => 0n end"
+        "let f = fn v => match v with | { x: x, .. } => x | () => 0n end"
     );
 
     // Bare, the open pattern is nothing but its `..`.
@@ -528,7 +599,7 @@ fn a_scheme_prints_the_clause_it_requires() {
     for (source, expected) in [
         (
             "let p = fn a => match a with | {x} => {} | {y} => {} end",
-            "{ x when 'a: 'c, y when 'b: 'd } -> {} where 'a != 'b",
+            "{ x when 'a: 'c, y when 'b: 'd } -> () where 'a != 'b",
         ),
         ("let id = fn x => x", "'a -> 'a"),
     ] {
@@ -561,7 +632,7 @@ fn a_scheme_prints_the_clause_it_requires() {
 /// arrow on re-reading; the round trip is what says so.
 #[test]
 fn an_effect_row_prints_on_the_arrow_it_belongs_to() {
-    let effects = "effect Log = { write: Nat -> {} }\n";
+    let effects = "effect Log = { write: Nat -> () }\n";
     for body in [
         // A row, and a result that is not an arrow: no parentheses.
         "Nat -> Nat + !Log",
@@ -653,18 +724,18 @@ fn an_alias_prints_as_the_effects_it_names() {
 #[test]
 fn both_trees_render_the_effect_forms() {
     for source in [
-        "effect Log = Nat -> {}",
-        "effect Log = { value: Nat } -> {}",
-        "effect Apply = (Nat -> Nat) -> {}",
-        "effect Apply = { run: (Nat -> Nat) -> {} }",
-        "effect Log = { write: Nat -> {} }",
-        "effect Log = { write: Nat -> {}, flush: {} -> {} }",
+        "effect Log = Nat -> ()",
+        "effect Log = { value: Nat } -> ()",
+        "effect Apply = (Nat -> Nat) -> ()",
+        "effect Apply = { run: (Nat -> Nat) -> () }",
+        "effect Log = { write: Nat -> () }",
+        "effect Log = { write: Nat -> (), flush: () -> () }",
         "effect Nil",
         // An effect written absent, and a `when` clause on one: both trees
         // render the marks a row's labels may wear.
-        "effect Log = { write: Nat -> {} }\n\
+        "effect Log = { write: Nat -> () }\n\
          let f : Nat -> Nat + \\!Log + ..'e = fn x => x",
-        "effect Log = { write: Nat -> {} }\n\
+        "effect Log = { write: Nat -> () }\n\
          let f : Nat -> Nat + !Log (when 'a) + ..'e = fn x => x",
     ] {
         let (ast, ir) = printed(source);
@@ -672,8 +743,8 @@ fn both_trees_render_the_effect_forms() {
         assert_eq!(ir, source, "{source}");
     }
 
-    let source = "effect Log = { write: Nat -> {} }\n\
-                  let h = fn n => handle !Log.write n with | !Log.write s => {} | return x => x end";
+    let source = "effect Log = { write: Nat -> () }\n\
+                  let h = fn n => handle !Log.write n with | !Log.write s => () | return x => x end";
     let (ast, ir) = printed(source);
     assert_eq!(ast, source);
     assert_eq!(ir, source);
@@ -807,7 +878,7 @@ fn a_printed_scheme_reads_back_as_source() {
         "let id = fn x => x",
         "let getx = fn p => p.x",
         "let wrap = fn x => #Some x",
-        "let both = fn a => match a with | {x} => {} | {y} => {} end",
+        "let both = fn a => match a with | {x} => () | {y} => () end",
     ] {
         let printed = printed_scheme(source);
         // Pasted back as an annotation over the very same body, which is what
