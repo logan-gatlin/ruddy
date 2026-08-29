@@ -359,7 +359,7 @@ fn install_project(directory: &Path) -> Result<InstalledBuild, CliError> {
     // reading an artifact back from disk.
     let javascript = (target == Target::Js)
         .then(|| {
-            ruddy_js::generate(&linked)
+            ruddy::backend::js::generate(&linked)
                 .map_err(|error| CliError::one(format!("could not generate JavaScript: {error}")))
         })
         .transpose()?;
