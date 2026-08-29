@@ -2071,33 +2071,44 @@ impl Lower<'_> {
         }
         if tail_key(declared).is_some() {
             let key = tail_key(used).unwrap_or(RestKey::Open);
-            // A closed row whose only variable part is conditional labels has
-            // already named every effect the bundle can contain. Do not sweep
-            // unrelated evidence from the surrounding callback boundary into
-            // that bundle. A genuine row tail remains open-ended and keeps the
-            // established all-in-scope behaviour.
-            let conditional: Vec<String> = matches!(declared.rest, Rest::Closed)
-                .then(|| {
-                    declared
-                        .labels
-                        .iter()
-                        .filter(|(_, field)| {
-                            possible(&field.presence) && !definite(&field.presence)
-                        })
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let restricted = (!conditional.is_empty()).then_some(conditional.as_slice());
-            let needs_tails = restricted.is_none_or(|names| {
-                names.iter().any(|name| {
+            // Conditional labels live in the bundle even when a genuine row
+            // tail follows them. A shared tail cannot simply be forwarded in
+            // that case: a use may have promoted one of those labels to a
+            // definite evidence parameter, so overlay its record on the tail.
+            // Conversely, do not rebuild the whole bundle from ambient named
+            // evidence, which would leak unrelated effects into the callback.
+            let conditional: Vec<String> = declared
+                .labels
+                .iter()
+                .filter(|(_, field)| possible(&field.presence) && !definite(&field.presence))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if conditional.is_empty() {
+                args.push(self.bundle(key, None, true, body));
+            } else {
+                let needs_tails = conditional.iter().any(|name| {
                     !used
                         .labels
                         .get(name)
                         .is_some_and(|field| definite(&field.presence))
-                })
-            });
-            args.push(self.bundle(key, restricted, needs_tails, body));
+                });
+                if matches!(declared.rest, Rest::Closed) {
+                    args.push(self.bundle(key, Some(&conditional), needs_tails, body));
+                } else {
+                    // Thread the shared tail first. Building the overlay may
+                    // project from that same capture, and must refer to the
+                    // already-established inner temp rather than introduce a
+                    // later capture before its declaration.
+                    let tail = self.bundle(key, None, true, body);
+                    let named = self.bundle(key, Some(&conditional), needs_tails, body);
+                    args.push(self.emit(
+                        body,
+                        Span::default(),
+                        Rep::Struct,
+                        Op::Merge(vec![tail, named]),
+                    ));
+                }
+            }
         }
         args
     }
@@ -2380,14 +2391,30 @@ impl Lower<'_> {
         // would expose every unrelated effect they happen to contain.
         if let Some(names) = only {
             let held: Vec<(usize, Temp)> = if include_tails {
+                // Prefer the innermost tail, and its matching identity where
+                // that frame holds more than one. In particular, callback
+                // adapters have an explicit bundle parameter in their current
+                // frame; reaching through it to ambient construction-time
+                // frames would create undeclared captures and combine evidence
+                // outside the callback row.
                 self.frames
                     .iter()
                     .enumerate()
-                    .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
-                    .collect()
+                    .rev()
+                    .find_map(|(at, frame)| {
+                        frame
+                            .tails
+                            .iter()
+                            .rev()
+                            .find(|(held, _)| held.forwards(key))
+                            .or_else(|| frame.tails.last())
+                            .map(|(_, temp)| vec![(at, *temp)])
+                    })
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
+            let tail_owner = held.iter().map(|(at, _)| *at).max();
             let mut tails: Vec<Temp> = held
                 .into_iter()
                 .map(|(at, temp)| self.thread(at, temp))
@@ -2405,11 +2432,11 @@ impl Lower<'_> {
             let entries: IndexMap<String, Temp> = names
                 .iter()
                 .map(|name| {
-                    let value = if self
+                    let evidence_owner = self
                         .frames
                         .iter()
-                        .any(|frame| frame.evidence.contains_key(name))
-                    {
+                        .rposition(|frame| frame.evidence.contains_key(name));
+                    let value = if evidence_owner.is_some() && evidence_owner >= tail_owner {
                         self.evidence_of(name)
                     } else {
                         self.emit(

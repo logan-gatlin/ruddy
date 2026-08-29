@@ -2813,6 +2813,33 @@ fn conditional_callback_bundles_capture_only_their_named_possibilities() {
 }
 
 #[test]
+fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = host.install\n\
+         let call = handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
+    let printed = listing(source);
+    let adapter = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert!(
+        adapter
+            .lines()
+            .any(|line| line.contains(" = struct { Needed:")),
+        "definite caller evidence is repacked for the conditional callback label:\n{printed}"
+    );
+    assert!(
+        adapter.lines().any(|line| line.contains(" = merge ")),
+        "the named conditional evidence overlays, rather than replaces, the shared tail:\n{printed}"
+    );
+    assert!(
+        !adapter.lines().any(|line| line.contains("Spare:")),
+        "unrelated named evidence does not leak into the callback bundle:\n{printed}"
+    );
+}
+
+#[test]
 fn restricted_callback_bundles_project_shared_open_tails() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
@@ -2848,12 +2875,14 @@ fn restricted_callback_bundles_drop_unrelated_conditional_tail_effects() {
         .filter(|line| line.contains("project ") && line.contains("Needed"))
         .collect();
     assert!(!projected.is_empty(), "Needed is projected:\n{printed}");
+    let callback = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert!(callback.contains("struct { Needed:"), "{printed}");
     assert!(
-        !printed
-            .lines()
-            .filter(|line| line.contains(" = struct {") && line.contains("Needed:"))
-            .any(|line| line.contains("Spare:")),
-        "the unrelated conditional effect is absent from the restricted bundle:\n{printed}"
+        !callback.contains("Spare"),
+        "the unrelated conditional effect is absent from the restricted callback bundle:\n{printed}"
     );
 }
 
