@@ -166,12 +166,12 @@ fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
     std::fs::write(root.join("demo/main.hc"), "").unwrap();
     std::fs::write(
         root.join("demo/Ruddy.toml"),
-        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nstd = \"../standard\"\n",
+        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nstd = \"../standard\"\n",
     )
     .unwrap();
     let found = read(&root, "demo").unwrap_err();
     assert_eq!(found.kind(), std::io::ErrorKind::InvalidData);
-    assert!(found.to_string().contains("alias `std` is reserved"));
+    assert!(found.to_string().contains("duplicate key"));
 }
 
 #[test]
@@ -278,7 +278,10 @@ fn standard_library_configuration_round_trips_and_defaults_to_installed() {
     }
 
     let source = std::fs::read_to_string(root.join("demo/Ruddy.toml")).unwrap();
-    assert!(source.contains("std = \"../custom-std\""), "{source}");
+    assert!(
+        source.contains("[dependencies]\nstd = \"../custom-std\""),
+        "{source}"
+    );
     std::fs::write(
         root.join("demo/Ruddy.toml"),
         "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\n",

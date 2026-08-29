@@ -38,9 +38,11 @@ Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—R
 
 Every project implicitly receives a dependency named `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. The bundled `std@0.1.0` is initially empty; its source project lives in [`std/`](std/).
 
-A project can disable this dependency or replace it with any normal path or Git dependency using the top-level `std` field:
+A project can disable this dependency or replace it with any normal path or Git dependency using the `std` option under `[dependencies]`:
 
 ```toml
+[dependencies]
+
 # Bootstrap a project without the standard library:
 std = false
 
@@ -49,13 +51,11 @@ std = false
 # std = { path = "../foundation", bundle = "foundation" }
 # std = { git = "https://example.com/my-std.git", tag = "v1.0.0" }
 # std = { git = "https://example.com/foundation.git", rev = "0123456", bundle = "foundation" }
-
-[dependencies]
 ```
 
 The optional `bundle` is the dependency project's actual manifest name when that differs from the source alias: the second example is still referenced as `std::…`, but its artifact identity is `foundation`. Relative paths are resolved from the manifest that declares them. Git overrides use the normal shared cache and selectors, and every transitive resolution is recorded in the root project's lockfile rather than a dependency-local lockfile.
 
-`std = true` is invalid: omit the field to use the installed library. The source alias `std` is reserved and cannot also appear in `[dependencies]`, though another alias may legally target a bundle actually named `std`. `ruddy new` deliberately omits the setting and uses the installed default.
+`std = true` is invalid: omit the key from `[dependencies]` to use the installed library. The `std` key is reserved for this setting rather than a normal declared dependency, though another alias may legally target a bundle actually named `std`. `ruddy new` deliberately omits the setting and uses the installed default.
 
 Each manifest—including transitive path and Git dependencies—resolves its own `std` setting. A custom or bootstrap library should generally declare `std = false` to avoid depending on the installed library itself. Canonical projects are still deduplicated, multiple std bundle identities or versions may coexist, and the usual error applies if the same name and version come from different locations. If the default installation is missing, unreadable, malformed, or names the wrong bundle, Ruddy reports how to run `just install`, configure an override, or set `std = false`.
 
