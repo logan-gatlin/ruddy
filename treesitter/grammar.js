@@ -816,12 +816,13 @@ module.exports = grammar({
 
     /**
      * A number-shaped field that the compiler consumes as one invalid token.
-     * Besides suffixes such as `.0n`, this includes an adjacent decimal tail:
-     * `p.0.0` is one malformed field, while `(p.0).0` is two valid projections.
+     * Besides suffixes such as `.0n` and `.0²`, this includes an adjacent
+     * decimal tail: `p.0.0` is one malformed field, while `(p.0).0` is two
+     * valid projections. The set subtraction keeps another ASCII digit in the
+     * valid field token, so `.001` is not mistaken for a malformed suffix.
      */
-    _malformed_numeric_field: _ => new RegExp(
-      /[0-9]+(?:\.[0-9]+[\p{Alphabetic}\p{N}_]*|[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*)/.source,
-      'u',
+    _malformed_numeric_field: _ => new RustRegex(
+      String.raw`[0-9]+(?:\.[0-9]+[\p{Alphabetic}\p{N}_]*|(?:[\p{Alphabetic}_]|[\p{N}&&[^0-9]])[\p{Alphabetic}\p{N}_]*)`,
     ),
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */

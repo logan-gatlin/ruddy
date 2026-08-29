@@ -353,10 +353,12 @@ let invalid = # "case"
     (string)))
 
 ================================================================================
-A suffixed numeric projection is malformed, not an application
+ASCII and Unicode suffixed numeric projections are one malformed field
 ================================================================================
 
-let invalid = p.0n
+let ascii = p.0n
+let unicode = p.0²
+let valid = p.001
 
 --------------------------------------------------------------------------------
 
@@ -365,7 +367,17 @@ let invalid = p.0n
     (identifier)
     (projection
       (identifier)
-      (ERROR))))
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (numeric_field))))
 
 ================================================================================
 Adjacent numeric projections require grouping or whitespace
