@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use ruddy::tracking::{FileID, Span};
-pub use ruddy_cli::{DependencyDetail, DependencySpec, RunConfig};
+pub use ruddy_cli::{DependencyDetail, DependencySpec, RunConfig, StdConfig};
 use serde::{Deserialize, Serialize};
 
 /// A byte range in one file, `[start, end)`. Always UTF-8 offsets, matching
@@ -27,7 +27,7 @@ pub struct Loc {
     pub range: Range,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompileRequest {
     /// The bundle identity supplied by project configuration in a normal
     /// compilation. Defaults keep cached requests from older debugger pages
@@ -42,6 +42,9 @@ pub struct CompileRequest {
     /// Every file of the active bundle. A request without its configured root
     /// is told so rather than compiled.
     pub files: Vec<FileSpec>,
+    /// Implicit standard-library configuration. Omission uses the installed std.
+    #[serde(default, skip_serializing_if = "StdConfig::is_default")]
+    pub std: StdConfig,
     /// Dependency project specifications keyed by source module alias.
     #[serde(default)]
     pub dependencies: IndexMap<String, DependencySpec>,
@@ -300,6 +303,8 @@ pub struct Doc {
     pub version: String,
     pub root: String,
     pub run: RunConfig,
+    #[serde(default, skip_serializing_if = "StdConfig::is_default")]
+    pub std: StdConfig,
     pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,
     pub modified_ms: u128,
@@ -317,6 +322,8 @@ pub struct DocBody {
     pub root: String,
     #[serde(default)]
     pub run: RunConfig,
+    #[serde(default)]
+    pub std: StdConfig,
     #[serde(default)]
     pub dependencies: IndexMap<String, DependencySpec>,
     pub files: Vec<FileSpec>,

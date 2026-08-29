@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::ROOT,
-    wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig},
+    wire::{DependencySpec, Doc, DocMeta, FileSpec, RunConfig, StdConfig},
 };
 
 const EXTENSION: &str = "hc";
@@ -33,6 +33,8 @@ struct Manifest {
     root: String,
     #[serde(default, skip_serializing_if = "RunConfig::is_default")]
     run: RunConfig,
+    #[serde(default, skip_serializing_if = "StdConfig::is_default")]
+    std: StdConfig,
     dependencies: IndexMap<String, DependencySpec>,
 }
 
@@ -156,6 +158,7 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
         version: manifest.version,
         root: manifest.root,
         run: manifest.run,
+        std: manifest.std,
         dependencies: manifest.dependencies,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
@@ -168,6 +171,10 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
 /// not in it is deleted, so what comes back from [`read`] is what was sent. A
 /// file the page renamed is a write and a delete rather than a move, which is
 /// the same thing from here and one fewer operation to get wrong.
+// The arguments mirror the manifest fields and file payload at the server
+// boundary; keeping them explicit prevents storage identity and bundle identity
+// (both strings named `name` on the wire) from being accidentally interchanged.
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     root: &Path,
     name: &str,
@@ -175,6 +182,7 @@ pub fn write(
     version: &str,
     configured_root: &str,
     run: &RunConfig,
+    std: &StdConfig,
     dependencies: &IndexMap<String, DependencySpec>,
     files: &[FileSpec],
 ) -> io::Result<u128> {
@@ -185,6 +193,7 @@ pub fn write(
         version: version.to_string(),
         root: configured_root.to_string(),
         run: run.clone(),
+        std: std.clone(),
         dependencies: dependencies.clone(),
     };
     let source = toml::to_string(&manifest).map_err(io::Error::other)?;
