@@ -840,84 +840,72 @@ fn presence_polarities(
         }
     }
 
-    fn walk_row(
-        row: &EffectRow,
-        positive: bool,
-        owner: Span,
-        out: &mut HashMap<u32, PresenceOccurrences>,
-    ) {
-        for effect in row.effects.values() {
-            if let EffectLabel::Written { when, .. } = effect {
-                note(out, when, positive, owner);
-            }
-        }
+    enum Work<'a> {
+        Ty(&'a Type, bool, Span),
+        Effects(&'a EffectRow, bool, Span),
     }
 
-    fn walk(
-        ty: &Type,
-        positive: bool,
-        owner: Span,
-        out: &mut HashMap<u32, PresenceOccurrences>,
-        variances: &HashMap<Slot, u8>,
-    ) {
-        match &ty.tracked {
-            TypeKind::Arrow { from, to, effects } => {
-                walk(from, !positive, owner, out, variances);
-                // A result reached positively owns choices made separately by
-                // each invocation. Under negative polarity it is produced by
-                // the annotation's consumer, so no new producer boundary is
-                // introduced relative to the complete type.
-                let result_owner = if positive { to.span } else { owner };
-                walk(to, positive, result_owner, out, variances);
-                // Conditional effects belong to the arrow value itself, not
-                // to its result. The polarity has already been reversed if
-                // this arrow sits in an outer parameter.
-                walk_row(effects, positive, owner, out);
-            }
-            TypeKind::Struct { fields, .. } => {
-                for field in fields.values() {
-                    if let TypeField::Written { when, value, .. } = field {
-                        note(out, when, positive, owner);
-                        walk(value, positive, owner, out, variances);
+    // An explicit worklist is important here: annotations and imported alias
+    // applications are recovery input and may be far deeper than Rust's call
+    // stack. Push in reverse source order so first-occurrence diagnostics stay
+    // deterministic.
+    let mut out = HashMap::new();
+    let mut work = vec![Work::Ty(ty, true, ty.span)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Effects(row, positive, owner) => {
+                for effect in row.effects.values() {
+                    if let EffectLabel::Written { when, .. } = effect {
+                        note(&mut out, when, positive, owner);
                     }
                 }
             }
-            TypeKind::Sum { cases, .. } => {
-                for case in cases.values() {
-                    if let SumCase::Written { when, payload, .. } = case {
-                        note(out, when, positive, owner);
-                        if let Some(payload) = payload {
-                            walk(payload, positive, owner, out, variances);
+            Work::Ty(ty, positive, owner) => match &ty.tracked {
+                TypeKind::Arrow { from, to, effects } => {
+                    work.push(Work::Effects(effects, positive, owner));
+                    let result_owner = if positive { to.span } else { owner };
+                    work.push(Work::Ty(to, positive, result_owner));
+                    work.push(Work::Ty(from, !positive, owner));
+                }
+                TypeKind::Struct { fields, .. } => {
+                    for field in fields.values().rev() {
+                        if let TypeField::Written { when, value, .. } = field {
+                            note(&mut out, when, positive, owner);
+                            work.push(Work::Ty(value, positive, owner));
                         }
                     }
                 }
-            }
-            TypeKind::Effects(effects) => walk_row(effects, positive, owner, out),
-            // Declared aliases are transparent. Their parameter fixpoint says
-            // exactly which polarities survive unfolding, including recursive,
-            // mutually-recursive and imported forwarding aliases.
-            TypeKind::Apply { head, args, .. } => {
-                for (at, arg) in args.iter().enumerate() {
-                    let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
-                    if variance & 1 != 0 {
-                        walk(arg, positive, owner, out, variances);
-                    }
-                    if variance & 2 != 0 {
-                        walk(arg, !positive, owner, out, variances);
+                TypeKind::Sum { cases, .. } => {
+                    for case in cases.values().rev() {
+                        if let SumCase::Written { when, payload, .. } = case {
+                            note(&mut out, when, positive, owner);
+                            if let Some(payload) = payload {
+                                work.push(Work::Ty(payload, positive, owner));
+                            }
+                        }
                     }
                 }
-            }
-            TypeKind::Ident(_)
-            | TypeKind::Param { .. }
-            | TypeKind::Prim(_)
-            | TypeKind::Var(_)
-            | TypeKind::Hole
-            | TypeKind::Error => {}
+                TypeKind::Effects(effects) => work.push(Work::Effects(effects, positive, owner)),
+                TypeKind::Apply { head, args, .. } => {
+                    for (at, arg) in args.iter().enumerate().rev() {
+                        let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
+                        if variance & 2 != 0 {
+                            work.push(Work::Ty(arg, !positive, owner));
+                        }
+                        if variance & 1 != 0 {
+                            work.push(Work::Ty(arg, positive, owner));
+                        }
+                    }
+                }
+                TypeKind::Ident(_)
+                | TypeKind::Param { .. }
+                | TypeKind::Prim(_)
+                | TypeKind::Var(_)
+                | TypeKind::Hole
+                | TypeKind::Error => {}
+            },
         }
     }
-
-    let mut out = HashMap::new();
-    walk(ty, true, ty.span, &mut out, variances);
     out
 }
 

@@ -1422,17 +1422,26 @@ impl Solve<'_> {
                         actual: rhs.clone(),
                     };
                     match (&*lhs, &*rhs) {
-                        (Ty::Package(left), Ty::Package(right)) => {
+                        (Ty::Package(_), Ty::Package(_)) => {
                             self.step(span, Rule::Same, goal, Effect::Decomposed);
-                            work.push(SolveWork::Ty(left.clone(), right.clone(), depth + 1));
+                            if Rc::ptr_eq(&lhs, &rhs) {
+                                let opened = self.table.open_package(span, &lhs);
+                                work.push(SolveWork::Ty(opened.clone(), opened, depth + 1));
+                            } else {
+                                let left = self.table.open_package(span, &lhs);
+                                let right = self.table.open_package(span, &rhs);
+                                work.push(SolveWork::Ty(left, right, depth + 1));
+                            }
                         }
-                        (Ty::Package(body), _) => {
+                        (Ty::Package(_), _) => {
                             self.step(span, Rule::Same, goal, Effect::Decomposed);
-                            work.push(SolveWork::Ty(body.clone(), rhs.clone(), depth + 1));
+                            let body = self.table.open_package(span, &lhs);
+                            work.push(SolveWork::Ty(body, rhs.clone(), depth + 1));
                         }
-                        (_, Ty::Package(body)) => {
+                        (_, Ty::Package(_)) => {
                             self.step(span, Rule::Same, goal, Effect::Decomposed);
-                            work.push(SolveWork::Ty(lhs.clone(), body.clone(), depth + 1));
+                            let body = self.table.open_package(span, &rhs);
+                            work.push(SolveWork::Ty(lhs.clone(), body, depth + 1));
                         }
                         (Ty::Undecided, _) => {
                             self.step(span, Rule::Absorb, goal, Effect::None);
@@ -2669,13 +2678,12 @@ impl Solve<'_> {
                 }
             }
         }
-        if let Assigned::Presence(Presence::Var(other)) = &value {
-            if self.table.abstract_existentials.contains(&var)
-                || self.table.abstract_existentials.contains(other)
-            {
-                self.table.abstract_existentials.insert(var);
-                self.table.abstract_existentials.insert(*other);
-            }
+        if let Assigned::Presence(Presence::Var(other)) = &value
+            && (self.table.abstract_existentials.contains(&var)
+                || self.table.abstract_existentials.contains(other))
+        {
+            self.table.abstract_existentials.insert(var);
+            self.table.abstract_existentials.insert(*other);
         }
         self.table.inherit_lacks(var, &value);
         // And the levels travel the same way the conditions do: what this
