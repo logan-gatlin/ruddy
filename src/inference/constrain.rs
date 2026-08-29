@@ -1176,7 +1176,7 @@ impl Constrain<'_> {
         // fresh variable would hide the day one of those stops holding.
         match self.env[&symbol].clone() {
             Binding::Mono(ty) => ty,
-            Binding::Poly(scheme) => self.table.instantiate(span, &scheme),
+            Binding::Poly(scheme) => self.table.instantiate_local(span, symbol, &scheme),
             // The scheme is not written yet, so the walk says what this use is
             // rather than what it has: a fresh copy of whatever the enclosing
             // [`ConstraintKind::Let`] publishes. Which keeps the invariant this

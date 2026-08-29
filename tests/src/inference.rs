@@ -82,6 +82,35 @@ fn a_consumer_cannot_choose_an_existential_field_presence() {
 }
 
 #[test]
+fn one_existential_package_keeps_shared_label_identity() {
+    inferred(
+        "extern make: Nat -> Boolean ->\n\
+         { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
+         where 'p != 'q = host.make\n\
+         let value = make 1n true\n\
+         let good = match value with\n\
+         | { x, .. } => value.also\n\
+         | { y, .. } => 0n\n\
+         end",
+    );
+}
+
+#[test]
+fn separate_partial_application_calls_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern make: Nat -> Boolean ->\n\
+         { x when 'p: Nat, also when 'p: Nat, y when 'q: Nat }\n\
+         where 'p != 'q = host.make\n\
+         let partial = make 1n\n\
+         let bad = match partial true with\n\
+         | { x, .. } => (partial false).also\n\
+         | { y, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
 fn integer_and_natural_literals_are_function_arguments() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\

@@ -997,6 +997,7 @@ impl Scheme {
     /// [`new`](Self::new) with the presences a definition's generalization
     /// quantified, and what it requires of them.
     pub fn constrained(count: u32, presences: u32, body: Rc<Ty>, formula: Formula) -> Self {
+        debug_assert!(presences <= count);
         Self {
             count,
             presences,
@@ -1014,6 +1015,7 @@ impl Scheme {
         body: Rc<Ty>,
         formula: Formula,
     ) -> Self {
+        debug_assert!(presences <= count);
         debug_assert!(existentials.iter().all(|index| *index < presences));
         Self {
             count,

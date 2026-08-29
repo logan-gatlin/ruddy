@@ -1008,6 +1008,16 @@ struct Table {
     /// witness equation for these while checking the producer, but must not
     /// overwrite their identity: publication has to conceal that equation.
     existential_witnesses: HashSet<TyVar>,
+    /// Sealed producer-owned identities opened from a published scheme. Unlike
+    /// witnesses while their producer is checked, these may only be observed:
+    /// a consumer may use an equation already guaranteed by the package but
+    /// may not add a new equation choosing the hidden presence.
+    abstract_existentials: HashSet<TyVar>,
+    /// A non-function local binding opens its produced package once. Every use
+    /// of that binding must observe the same abstract identity; re-instantiating
+    /// its existential slots would let one match refinement leak or disappear
+    /// between projections of the same value.
+    local_package_instances: HashMap<(Symbol, u32), Presence>,
     /// What the program has required of its presences so far. Grown by
     /// generation (a match's coverage), by instantiation (a constrained
     /// scheme's formula) and by lowering (an annotation's `where` clause), and
@@ -2919,7 +2929,19 @@ impl Table {
     /// one a nested `let` published — which generation could not have opened,
     /// there being nothing to open until the value is solved. One function
     /// because it is one act.
-    fn instantiate(&mut self, span: Span, scheme: &Scheme) -> Rc<Ty> {
+    /// Open a nested value binding. A produced (non-arrow) package is opened
+    /// once per lexical binding, while an arrow retains per-call freshness.
+    fn instantiate_local(&mut self, span: Span, symbol: Symbol, scheme: &Scheme) -> Rc<Ty> {
+        let coherent = !matches!(&**scheme.body(), Ty::Arrow(..));
+        self.instantiate_scoped(span, scheme, coherent.then_some(symbol))
+    }
+
+    fn instantiate_scoped(
+        &mut self,
+        span: Span,
+        scheme: &Scheme,
+        coherent: Option<Symbol>,
+    ) -> Rc<Ty> {
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
         // that is what a scheme records. See [`Assigned::as_row`]. A presence
@@ -2927,11 +2949,23 @@ impl Table {
         let fresh: Vec<Assigned> = (0..scheme.count())
             .map(|at| match at < scheme.presences() {
                 true => {
-                    let presence = self.fresh_presence();
+                    let key = coherent
+                        .filter(|_| scheme.is_existential(at))
+                        .map(|symbol| (symbol, at));
+                    let presence = key
+                        .and_then(|key| self.local_package_instances.get(&key).cloned())
+                        .unwrap_or_else(|| {
+                            let fresh = self.fresh_presence();
+                            if let Some(key) = key {
+                                self.local_package_instances.insert(key, fresh.clone());
+                            }
+                            fresh
+                        });
                     if scheme.is_existential(at)
                         && let Presence::Var(var) = &presence
                     {
                         self.existential_witnesses.insert(*var);
+                        self.abstract_existentials.insert(*var);
                     }
                     Assigned::Presence(presence)
                 }

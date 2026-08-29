@@ -1334,7 +1334,7 @@ impl Solve<'_> {
         // as new as the place it was made, whatever the scheme was generalized
         // at.
         let required = self.table.store.batches.len();
-        let copy = self.table.instantiate(span, &scheme);
+        let copy = self.table.instantiate_local(span, symbol, &scheme);
         let mut batches: Vec<Batch> = self.table.store.batches.drain(required..).collect();
         match batches.pop() {
             Some(mut batch) => {
@@ -2297,6 +2297,18 @@ impl Solve<'_> {
             (Presence::Var(a), Presence::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
+            (Presence::Var(var), Presence::Var(other))
+                if self.table.abstract_existentials.contains(var)
+                    && !self.table.abstract_existentials.contains(other) =>
+            {
+                self.assign(span, goal, *other, Assigned::Presence(Presence::Var(*var)));
+            }
+            (Presence::Var(other), Presence::Var(var))
+                if self.table.abstract_existentials.contains(var)
+                    && !self.table.abstract_existentials.contains(other) =>
+            {
+                self.assign(span, goal, *other, Assigned::Presence(Presence::Var(*var)));
+            }
             (Presence::Var(var), other) if self.table.existential_witnesses.contains(var) => {
                 let formula = lhs.formula().iff(other.formula());
                 self.step(span, Rule::Refine, goal, Effect::None);
@@ -2348,7 +2360,27 @@ impl Solve<'_> {
             (Presence::Absent, other) | (other, Presence::Absent) => other.formula().not(),
             _ => lhs.formula().iff(rhs.formula()),
         };
-        let formula = premise.clone().not().or(obligation.clone());
+        let mut formula = premise.clone().not().or(obligation.clone());
+        let lhs_sealed =
+            matches!(&lhs, Presence::Var(var) if self.table.abstract_existentials.contains(var));
+        let rhs_sealed =
+            matches!(&rhs, Presence::Var(var) if self.table.abstract_existentials.contains(var));
+        // Relating a sealed identity to an ordinary fresh variable opens an
+        // alias which follows the package; it does not choose the witness.
+        // Constants (and a distinct sealed identity) are observations which
+        // must already follow from the package and arm premise.
+        let sealed = (lhs_sealed
+            && !matches!(&rhs, Presence::Var(var) if !self.table.abstract_existentials.contains(var)))
+            || (rhs_sealed
+                && !matches!(&lhs, Presence::Var(var) if !self.table.abstract_existentials.contains(var)));
+        if sealed {
+            let known = self.table.known().and(premise.clone());
+            if !crate::inference::sat::entails(&known, &obligation) {
+                // The arm may refine an opened package only with facts its own
+                // match premise and the package guarantee already establish.
+                formula = Formula::False;
+            }
+        }
         let labels = self
             .active_refinement
             .map(|at| {
@@ -2610,6 +2642,14 @@ impl Solve<'_> {
                 if matches!(presence, Presence::Var(_)) {
                     self.presences(span, &Presence::Absent, presence);
                 }
+            }
+        }
+        if let Assigned::Presence(Presence::Var(other)) = &value {
+            if self.table.abstract_existentials.contains(&var)
+                || self.table.abstract_existentials.contains(other)
+            {
+                self.table.abstract_existentials.insert(var);
+                self.table.abstract_existentials.insert(*other);
             }
         }
         self.table.inherit_lacks(var, &value);
