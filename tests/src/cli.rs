@@ -206,6 +206,76 @@ fn bundled_std_installer_replaces_only_source_files() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn bundled_std_installer_discovery_failure_preserves_existing_installation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(source.join("Nested")).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "new main").unwrap();
+    fs::write(source.join("Nested/module.hc"), "new nested").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+    fs::write(home.join("std/main.hc"), "old main").unwrap();
+
+    let real_find = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v find"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let fake_find = bin.join("find");
+    fs::write(
+        &fake_find,
+        format!("#!/bin/sh\n{} \"$@\"\nexit 73\n", real_find.trim()),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_find, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/main.hc")).unwrap(),
+        "old main"
+    );
+    assert!(fs::read_dir(&home).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".std.install.")
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bundled_std_installer_reports_missing_exchange_capability_before_copying() {
     use std::os::unix::fs::PermissionsExt;
 
