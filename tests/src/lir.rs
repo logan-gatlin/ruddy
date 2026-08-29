@@ -232,6 +232,46 @@ fn forwarded_empty_struct_rows_have_unit_representation_everywhere() {
 }
 
 #[test]
+fn existential_packages_are_transparent_to_container_lowering() {
+    let source = "let build: Nat ->\n\
+                  { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+                  where 'p != 'q = fn n => { left: n, also: n }\n\
+                  extern choose: Nat ->\n\
+                  { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+                  where 'p != 'q = host.choose\n\
+                  let value = choose 7n\n\
+                  let projected = (choose 8n).also\n\
+                  let matched = match value with\n\
+                  | { left, .. } => left\n\
+                  | { right, .. } => right\n\
+                  end";
+
+    let function = section(source, "fn build(");
+    assert!(
+        function.contains(": struct = struct { left:"),
+        "a packaged struct literal keeps its runtime representation:\n{function}"
+    );
+
+    let value = section(source, "global value");
+    assert!(
+        value.contains(": struct = call"),
+        "a packaged call result keeps its runtime representation:\n{value}"
+    );
+
+    let projected = section(source, "global projected");
+    assert!(
+        projected.contains(": nat = project"),
+        "a packaged container still declares its member representation:\n{projected}"
+    );
+
+    let matched = section(source, "global matched");
+    assert!(
+        matched.contains("switch_presence") && matched.contains(": nat = project"),
+        "a packaged struct still widens into presence and field tests:\n{matched}"
+    );
+}
+
+#[test]
 fn sibling_row_substitutions_have_identical_unit_representations() {
     let source = "type Empty = {}\n\
                   type Dup 'r = { a: { ..'r }, b: { ..'r } }\n\
