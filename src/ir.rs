@@ -2730,7 +2730,13 @@ fn import_scheme(
             crate::types::Formula::True
         }
     };
-    Scheme::constrained(count, presences, body, formula)
+    let existentials = scheme
+        .existentials
+        .iter()
+        .copied()
+        .filter(|index| *index < presences)
+        .collect();
+    Scheme::existential(count, presences, existentials, body, formula)
 }
 
 /// Replace bound positions a malformed imported interface did not declare with

@@ -53,6 +53,7 @@ fn scheme() -> a::Scheme {
     a::Scheme {
         count: 0,
         presences: 0,
+        existentials: Vec::new(),
         formula: a::Formula::True,
         body: a::Type::Struct(a::Row {
             labels: vec![],
@@ -165,6 +166,9 @@ fn links_every_item_and_recursively_relocates_function_indices() {
         vec![function("app-f", nested)],
         vec![global("app@1.0.0::main", local_references())],
     );
+    root.header.values[0].scheme.count = 1;
+    root.header.values[0].scheme.presences = 1;
+    root.header.values[0].scheme.existentials = vec![0];
     root.header.types.push(a::DeclaredType {
         name: "app@1.0.0::Public".into(),
         params: vec![],
@@ -174,6 +178,7 @@ fn links_every_item_and_recursively_relocates_function_indices() {
     let linked = link::link(&[dep, root.clone()]).unwrap();
     assert_eq!(linked.header.identity, root.header.identity);
     assert_eq!(linked.header.values, root.header.values);
+    assert_eq!(linked.header.values[0].scheme.existentials, vec![0]);
     assert_eq!(linked.header.types, root.header.types);
     assert!(linked.header.dependencies.is_empty());
     assert_eq!(linked.lir.externs.len(), 2);

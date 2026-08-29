@@ -141,6 +141,7 @@ fn model_artifact() -> Artifact {
             scheme: Scheme {
                 count: 15,
                 presences: 7,
+                existentials: (index == 1).then_some(vec![0, 3]).unwrap_or_default(),
                 formula: formulas[index % formulas.len()].clone(),
                 body,
             },
@@ -277,6 +278,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: Formula::True,
                         body: plain(unit()),
                     },
@@ -291,6 +293,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 1,
                         presences: 0,
+                        existentials: Vec::new(),
                         formula: Formula::True,
                         body: rich(unit()),
                     },
@@ -305,6 +308,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 2,
                         presences: 1,
+                        existentials: Vec::new(),
                         formula: Formula::Var(0),
                         body: plain(Type::Sum(row(Rest::Closed))),
                     },
@@ -319,6 +323,7 @@ fn model_artifact() -> Artifact {
                     scheme: Scheme {
                         count: 3,
                         presences: 2,
+                        existentials: Vec::new(),
                         formula: Formula::Bound(1),
                         body: plain(Type::Arrow(
                             Box::new(plain(Type::Nat)),
@@ -383,6 +388,18 @@ fn model_artifact() -> Artifact {
             }],
         },
     }
+}
+
+#[test]
+fn existential_presence_ownership_round_trips_and_is_validated() {
+    let mut artifact = model_artifact();
+    artifact.header.values[0].scheme.existentials = vec![0, 3];
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(existentials 0 3)"), "{printed}");
+
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 3 0)", 1));
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 0)", 1));
+    assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 7)", 1));
 }
 
 fn assert_round_trip(value: &Artifact) -> String {
@@ -1152,8 +1169,16 @@ fn malformed_text_exercises_every_parser_and_reader_error_shape() {
     assert_malformed(&replace_balanced(&valid, "(named \"other@", "(named)"));
     assert_bad_replacement(&valid, "(ty nat)", "(ty \"wrong\")");
     assert_bad_replacement(&valid, "field present", "field (wrong)");
-    assert_bad_replacement(&valid, " 7 true ", " 7 \"wrong\" ");
-    assert_bad_replacement(&valid, " 7 true ", " 7 wrong ");
+    assert_bad_replacement(
+        &valid,
+        " 7 (existentials) true ",
+        " 7 (existentials) \"wrong\" ",
+    );
+    assert_bad_replacement(
+        &valid,
+        " 7 (existentials) true ",
+        " 7 (existentials) wrong ",
+    );
 
     // Recursive LIR collections distinguish malformed entries, both optional
     // block cardinalities, and a non-list call target.
@@ -1339,6 +1364,7 @@ fn deeply_nested_artifact_semantics_decode_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: Formula::True,
                     body: plain(unit()),
                 },
@@ -1633,6 +1659,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         scheme: Scheme {
                             count: 0,
                             presences: 0,
+                            existentials: Vec::new(),
                             formula: deep_formula(),
                             body: deep_type(),
                         },
@@ -1643,6 +1670,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                         scheme: Scheme {
                             count: 0,
                             presences: 0,
+                            existentials: Vec::new(),
                             formula: Formula::True,
                             body: deep_row_type(),
                         },
@@ -1671,6 +1699,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: deep_formula(),
                     body: deep_type(),
                 },
@@ -1681,6 +1710,7 @@ fn recursive_artifact_ownership_clones_and_drops_on_a_small_stack() {
                 scheme: Scheme {
                     count: 0,
                     presences: 0,
+                    existentials: Vec::new(),
                     formula: Formula::True,
                     body: deep_row_type(),
                 },
@@ -1736,7 +1766,7 @@ fn valid_deep_artifact_parses_and_drops_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let valid = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty nat)))) \
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty nat)))) \
          (types) (effects)) (lir (externs) (functions) (globals)))"
     );
 
@@ -1798,7 +1828,7 @@ fn rejected_deep_semantic_model_is_destroyed_on_a_small_stack() {
     let formula = format!("{}true{}", "(not ".repeat(DEPTH), ")".repeat(DEPTH));
     let malformed = format!(
         "(artifact (header (identity \"deep\" \"1\") (dependencies) \
-         (values (value \"deep@1::value\" (scheme 0 0 {formula} (ty (struct (row (labels) closed)))))) \
+         (values (value \"deep@1::value\" (scheme 0 0 (existentials) {formula} (ty (struct (row (labels) closed)))))) \
          (types) (effects)) (lir (externs) (functions) wrong))"
     );
 
