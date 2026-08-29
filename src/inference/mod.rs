@@ -1170,6 +1170,7 @@ fn polymorphic_extern_boundary(
                 boundary(aliases, result, &cursor, seen)
             }
             ir::ExternTypeKind::Ordinary(_) => match &*unfold(aliases, ty) {
+                Ty::Package(body) => boundary(aliases, abi, body, seen),
                 Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => Some(abi.span),
                 Ty::Arrow(from, to, _) => {
                     boundary(aliases, abi, from, seen).or_else(|| boundary(aliases, abi, to, seen))
@@ -1210,6 +1211,14 @@ fn callback_coverage_constraints(
         }
     }
 
+    fn expose(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+        let mut ty = unfold(aliases, ty);
+        while let Ty::Package(body) = &*ty {
+            ty = unfold(aliases, body);
+        }
+        ty
+    }
+
     fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
         let mut rows = Vec::new();
         let mut cursor = ty.clone();
@@ -1221,7 +1230,7 @@ fn callback_coverage_constraints(
                 }
                 seen.push(cursor.clone());
             }
-            let exposed = unfold(aliases, &cursor);
+            let exposed = expose(aliases, &cursor);
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
             };
@@ -1274,7 +1283,7 @@ fn callback_coverage_constraints(
                 let mut inputs = Vec::new();
                 let mut available = Row::closed();
                 for _ in 0..parameters.len().max(1) {
-                    let exposed = unfold(aliases, &cursor);
+                    let exposed = expose(aliases, &cursor);
                     let Ty::Arrow(from, to, row) = &*exposed else {
                         return;
                     };
@@ -1291,7 +1300,7 @@ fn callback_coverage_constraints(
                 boundary(aliases, result, &cursor, out, seen);
             }
             ir::ExternTypeKind::Ordinary(_) => {
-                let exposed = unfold(aliases, ty);
+                let exposed = expose(aliases, ty);
                 let Ty::Arrow(from, to, available) = &*exposed else {
                     return;
                 };
@@ -1427,12 +1436,17 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             .as_ref()
             .expect("the parser requires every extern annotation");
         let lowered = lower_annotation(mint, &mut table, annotation);
-        if !lowered.formula.is_true() {
-            let origin = Origin::Annotation(Named {
-                labels: lowered.names.clone(),
+        // The clause belongs to each opened package, not to the compiler's
+        // global store. `lowered.scheme` carries its closed copy; validate an
+        // intrinsically impossible contract here without leaking its
+        // assumptions into later declarations.
+        if !sat::satisfiable(&lowered.formula) {
+            errors.push(Error {
+                span: annotation.ty.span,
+                kind: ErrorKind::ClauseImpossible {
+                    formula: crate::ui::in_labels(&lowered.formula, &lowered.names),
+                },
             });
-            table.require(annotation.ty.span, origin, lowered.formula.clone());
-            report_flip(&mut table, &mut errors);
         }
         if let Some(span) =
             polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
@@ -2324,6 +2338,7 @@ impl Table {
                     let ty = self.resolve(&ty);
                     match &*ty {
                         Ty::Var(var) => found.push(*var),
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Ty(to.clone()));
@@ -2425,6 +2440,7 @@ impl Table {
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Struct(row) => work.push(Work::Row(row.clone(), Shape::Struct)),
                         Ty::Sum(row) => work.push(Work::Row(row.clone(), Shape::Sum)),
                         Ty::Named { symbol, args, .. } => {
@@ -2887,6 +2903,7 @@ impl Table {
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
                         }
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
                         Ty::Named { args, .. } => {
                             work.extend(args.iter().rev().cloned().map(Work::Ty));
@@ -2929,18 +2946,58 @@ impl Table {
     /// one a nested `let` published — which generation could not have opened,
     /// there being nothing to open until the value is solved. One function
     /// because it is one act.
-    /// Open a nested value binding. A produced (non-arrow) package is opened
-    /// once per lexical binding, while an arrow retains per-call freshness.
+    /// Open a nested value binding. Only an explicit producer package is
+    /// coherent for the binding; arrow shape is no longer used as a proxy.
+    /// Packages nested in an arrow remain wrapped until result destruction.
     fn instantiate_local(&mut self, span: Span, symbol: Symbol, scheme: &Scheme) -> Rc<Ty> {
-        let coherent = !matches!(&**scheme.body(), Ty::Arrow(..));
-        self.instantiate_scoped(span, scheme, coherent.then_some(symbol))
+        // Only slots occurring directly in the root package are coherent for a
+        // lexical value. Nested package nodes are separate production
+        // boundaries and must remain fresh even when the same scheme also owns
+        // an arrow-value effect at its root.
+        enum Work { Ty(Rc<Ty>), Row(Row) }
+        let mut root_slots = IndexSet::new();
+        let mut work = match &**scheme.body() {
+            Ty::Package(body) => vec![Work::Ty(body.clone())],
+            _ => Vec::new(),
+        };
+        while let Some(next) = work.pop() {
+            match next {
+                Work::Ty(ty) => match &*ty {
+                    Ty::Package(_) => {} // a nested owner
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Work::Row(effects.clone()));
+                        work.push(Work::Ty(to.clone()));
+                        work.push(Work::Ty(from.clone()));
+                    }
+                    Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone())),
+                    Ty::Named { args, .. } => work.extend(args.iter().cloned().map(Work::Ty)),
+                    _ => {}
+                },
+                Work::Row(row) => {
+                    for field in row.labels.values() {
+                        if let Presence::Bound(index) = field.presence
+                            && scheme.is_existential(index)
+                        {
+                            root_slots.insert(index);
+                        }
+                        work.push(Work::Ty(field.ty.clone()));
+                    }
+                }
+            }
+        }
+        let coherent = (!root_slots.is_empty()).then_some((symbol, root_slots));
+        let instantiated = self.instantiate_scoped(span, scheme, coherent);
+        match &*instantiated {
+            Ty::Package(body) => body.clone(),
+            _ => instantiated,
+        }
     }
 
     fn instantiate_scoped(
         &mut self,
         span: Span,
         scheme: &Scheme,
-        coherent: Option<Symbol>,
+        coherent: Option<(Symbol, IndexSet<u32>)>,
     ) -> Rc<Ty> {
         // One fresh variable per position the scheme bound, handed over as a
         // bare type: which sort each one is, is decided where it lands, since
@@ -2950,8 +3007,9 @@ impl Table {
             .map(|at| match at < scheme.presences() {
                 true => {
                     let key = coherent
-                        .filter(|_| scheme.is_existential(at))
-                        .map(|symbol| (symbol, at));
+                        .as_ref()
+                        .filter(|(_, slots)| slots.contains(&at))
+                        .map(|(symbol, _)| (*symbol, at));
                     let presence = key
                         .and_then(|key| self.local_package_instances.get(&key).cloned())
                         .unwrap_or_else(|| {
@@ -3033,6 +3091,7 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Arrow(a, b, effects) => {
                             work.push(Work::Effects(effects.clone()));
                             work.push(Work::Ty(b.clone()));
@@ -3096,7 +3155,10 @@ impl Table {
     /// and both note what they built — at the cost of resolving every variable
     /// and allocating a set per row, on nearly every constraint.
     fn unfolded(&mut self, aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
-        let unfolded = unfold(aliases, ty);
+        let mut unfolded = unfold(aliases, ty);
+        while let Ty::Package(body) = &*unfolded {
+            unfolded = body.clone();
+        }
         if !Rc::ptr_eq(&unfolded, ty) {
             self.note_lacks(&unfolded);
         }
@@ -3145,6 +3207,7 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Rigid { id, name } => {
                             found.entry(*id).or_insert_with(|| name.clone());
                         }
@@ -3308,6 +3371,7 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Arrow(from, to, effects) => {
                             work.push(Work::Row(effects.clone(), true));
                             work.push(Work::Ty(to.clone()));
@@ -3528,6 +3592,7 @@ impl Table {
                 Work::Ty(ty) => {
                     let ty = self.resolve(&ty);
                     match &*ty {
+                        Ty::Package(body) => work.push(Work::Ty(body.clone())),
                         Ty::Var(var) if !presences => self.quantify_var(*var, subst, level),
                         Ty::Rigid { id, .. } if !presences => {
                             let next = subst.next();
@@ -3604,6 +3669,7 @@ impl Table {
         enum Work {
             Ty(Rc<Ty>),
             Arrow,
+            Package,
             Struct,
             Sum,
             Named {
@@ -3638,6 +3704,10 @@ impl Table {
                             work.push(Work::Row(effects.clone()));
                             work.push(Work::Ty(to.clone()));
                             work.push(Work::Ty(from.clone()));
+                        }
+                        Ty::Package(body) => {
+                            work.push(Work::Package);
+                            work.push(Work::Ty(body.clone()));
                         }
                         Ty::Struct(row) => {
                             work.push(Work::Struct);
@@ -3698,6 +3768,10 @@ impl Table {
                     let to = types.pop().expect("zonked arrow result");
                     let from = types.pop().expect("zonked arrow argument");
                     types.push(Rc::new(Ty::Arrow(from, to, effects)));
+                }
+                Work::Package => {
+                    let body = types.pop().expect("zonked package body");
+                    types.push(Rc::new(Ty::Package(body)));
                 }
                 Work::Struct => {
                     let row = rows.pop().expect("zonked struct row");
@@ -3945,6 +4019,7 @@ fn shift(ty: &Rc<Ty>, by: u32) -> Rc<Ty> {
     Rc::new(match &**ty {
         Ty::Bound(at) => Ty::Bound(at + by),
         Ty::Arrow(a, b, r) => Ty::Arrow(shift(a, by), shift(b, by), shift_row(r, by)),
+        Ty::Package(body) => Ty::Package(shift(body, by)),
         Ty::Struct(r) => Ty::Struct(shift_row(r, by)),
         Ty::Sum(r) => Ty::Sum(shift_row(r, by)),
         Ty::Named { symbol, name, args } => Ty::Named {
@@ -4126,18 +4201,66 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             }
         }
     }
-    let ty = lower(mint, table, &mut tails, &annotation.ty);
+    let formula = match &annotation.clause {
+        Some(clause) => clause_formula(&tails, clause),
+        None => Formula::True,
+    };
+    let boundaries: HashSet<Span> = annotation
+        .variables
+        .iter()
+        .filter_map(|variable| match variable.ownership {
+            crate::ir::PresenceOwnership::Existential { boundary } => Some(boundary),
+            crate::ir::PresenceOwnership::Universal => None,
+        })
+        .collect();
+    let ty = lower_scoped(
+        mint,
+        table,
+        &mut tails,
+        &annotation.ty,
+        Some(&boundaries),
+    );
     // A tail stands for the fields its row did not write out, and this is where
     // that is first true of a written one: `{ x: Nat, ..h }` says the hole `h`
     // has no `x`. A rigid needs none of it — nothing can ever be bound to one,
     // so every label demanded of one is refused outright instead. See
     // [`Table::lacks`] and [`ErrorKind::RigidField`].
     table.note_lacks(&ty);
-    let formula = match &annotation.clause {
-        Some(clause) => clause_formula(&tails, clause),
-        None => Formula::True,
+    // Recursive and external uses see a genuinely closed annotation
+    // interface. Presence variables used to remain free here, which made a
+    // recursive call share (and therefore choose) its producer's hidden
+    // witness and made every use of a source extern share one global package.
+    // Close only producer-owned presences and the annotation's rigid type/row
+    // variables. Caller-owned presences and anonymous holes remain the shared
+    // decisions of the surrounding definition.
+    let mut presence_subst = HashMap::new();
+    let mut existential_slots = IndexSet::new();
+    for variable in &annotation.variables {
+        if variable.sense != Sense::Presence
+            || !matches!(variable.ownership, crate::ir::PresenceOwnership::Existential { .. })
+        {
+            continue;
+        }
+        let Presence::Var(var) = tails.presences[&variable.name] else {
+            continue;
+        };
+        let index = presence_subst.len() as u32;
+        presence_subst.insert(var, index);
+        existential_slots.insert(index);
+    }
+    let presences = presence_subst.len() as u32;
+    let subst = Subst {
+        types: HashMap::new(),
+        presences: presence_subst,
+        rigids: at.iter().map(|(id, index)| (*id, presences + index)).collect(),
     };
-    let scheme = Scheme::new(at.len() as u32, close_rigids(&ty, &at));
+    let scheme = Scheme::existential(
+        presences + at.len() as u32,
+        presences,
+        existential_slots,
+        table.zonk(&ty, &subst),
+        quantify_formula(&formula, &subst),
+    );
     // In one fixed order, because they come out of a hash map and the order it
     // hands them over is nobody's: a complaint about the clause names its
     // presences the same way on every run, which alphabetical is enough for.
@@ -4156,57 +4279,6 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         names,
         rigids,
     }
-}
-
-/// A skolemized annotation with its rigids quantified: what a recursive use of
-/// the annotated name is a copy of. See [`Lowered::scheme`].
-///
-/// A structural walk with no resolving in it, because there is nothing yet to
-/// resolve: the type was lowered a moment ago and no constraint has been solved
-/// against it — which is also why no tail here has been spliced to more cases.
-/// The map is indexed rather than looked up for the same reason: it holds every
-/// variable this annotation declared, and a rigid in the type came from this
-/// annotation or from nowhere.
-fn close_rigids(ty: &Rc<Ty>, at: &HashMap<u32, u32>) -> Rc<Ty> {
-    Rc::new(match &**ty {
-        Ty::Rigid { id, .. } => Ty::Bound(at[id]),
-        Ty::Arrow(a, b, r) => Ty::Arrow(
-            close_rigids(a, at),
-            close_rigids(b, at),
-            close_rigids_row(r, at),
-        ),
-        Ty::Struct(r) => Ty::Struct(close_rigids_row(r, at)),
-        Ty::Sum(r) => Ty::Sum(close_rigids_row(r, at)),
-        Ty::Named { symbol, name, args } => Ty::Named {
-            symbol: *symbol,
-            name: name.clone(),
-            args: args.iter().map(|a| close_rigids(a, at)).collect(),
-        },
-        other => other.clone(),
-    })
-}
-
-/// [`close_rigids`] over a sum's cases: its payloads, and the rest it ends with.
-fn close_rigids_row(row: &Row, at: &HashMap<u32, u32>) -> Row {
-    let labels = row
-        .labels
-        .iter()
-        .map(|(name, field)| {
-            let field = RowField {
-                presence: field.presence.clone(),
-                ty: match field.presence {
-                    Presence::Absent => Rc::new(Ty::Undecided),
-                    _ => close_rigids(&field.ty, at),
-                },
-            };
-            (name.clone(), field)
-        })
-        .collect();
-    let rest = match &row.rest {
-        Rest::Rigid { id, .. } => Rest::Bound(at[id]),
-        rest => rest.clone(),
-    };
-    Row { labels, rest }
 }
 
 /// One lowered `where` clause as the formula it denotes, over the presence
@@ -4239,7 +4311,20 @@ fn clause_formula(tails: &Tails, clause: &Clause) -> Formula {
 /// The recursion inside [`lower_type`], carrying the annotation's named-tail
 /// scope.
 fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty> {
-    let ty = match &ty.tracked {
+    lower_scoped(mint, table, tails, ty, None)
+}
+
+/// Lower with producer package boundaries supplied by the IR polarity pass.
+/// Spans identify exact result nodes, so nested arrows need no root-shape
+/// heuristic and sibling production scopes remain distinct.
+fn lower_scoped(
+    mint: &Mint,
+    table: &mut Table,
+    tails: &mut Tails,
+    ty: &Type,
+    boundaries: Option<&HashSet<Span>>,
+) -> Rc<Ty> {
+    let lowered = match &ty.tracked {
         TypeKind::Prim(prim) => (*prim).into(),
         TypeKind::Ident(symbol) => Ty::Named {
             symbol: *symbol,
@@ -4253,15 +4338,15 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
             name: mint.name(*head).into(),
             args: args
                 .iter()
-                .map(|arg| lower(mint, table, tails, arg))
+                .map(|arg| lower_scoped(mint, table, tails, arg, boundaries))
                 .collect(),
         },
         // A parameter is the position it was declared at, which is what
         // unfolding hands an argument to. See [`Ty::Bound`].
         TypeKind::Param { index, .. } => Ty::Bound(*index),
         TypeKind::Arrow { from, to, effects } => Ty::Arrow(
-            lower(mint, table, tails, from),
-            lower(mint, table, tails, to),
+            lower_scoped(mint, table, tails, from, boundaries),
+            lower_scoped(mint, table, tails, to, boundaries),
             effect_row(table, tails, effects),
         ),
         // A row handed to a declaration as an argument, which is the one place
@@ -4282,7 +4367,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
                 let lowered = match field {
                     ir::TypeField::Written { when, value, .. } => RowField {
                         presence: presence(table, tails, when),
-                        ty: lower(mint, table, tails, value),
+                        ty: lower_scoped(mint, table, tails, value, boundaries),
                     },
                     ir::TypeField::Absent { .. } => RowField {
                         presence: Presence::Absent,
@@ -4306,7 +4391,7 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
                     ir::SumCase::Written { when, payload, .. } => {
                         let presence = presence(table, tails, when);
                         let carried = match payload {
-                            Some(payload) => lower(mint, table, tails, payload),
+                            Some(payload) => lower_scoped(mint, table, tails, payload, boundaries),
                             None => Rc::new(Ty::unit()),
                         };
                         RowField {
@@ -4340,7 +4425,11 @@ fn lower(mint: &Mint, table: &mut Table, tails: &mut Tails, ty: &Type) -> Rc<Ty>
         TypeKind::Var(name) => tails.types[name].clone(),
         TypeKind::Error => Ty::Undecided,
     };
-    Rc::new(ty)
+    let body = Rc::new(lowered);
+    match boundaries.is_some_and(|boundaries| boundaries.contains(&ty.span)) {
+        true => Rc::new(Ty::Package(body)),
+        false => body,
+    }
 }
 
 /// Whether one label is there, as its `when` clause says it: no clause means it
@@ -4713,6 +4802,7 @@ fn substitute_type(
         Ty(&'a Ty),
         Row(&'a Row),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -4735,6 +4825,10 @@ fn substitute_type(
                     work.push(Work::Row(effects));
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
+                }
+                Ty::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body));
                 }
                 Ty::Struct(row) => {
                     work.push(Work::Struct);
@@ -4776,6 +4870,10 @@ fn substitute_type(
                 let to = types.pop().expect("result substitution postorder");
                 let from = types.pop().expect("argument substitution postorder");
                 types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package substitution postorder");
+                types.push(Rc::new(Ty::Package(body)));
             }
             Work::Struct => {
                 let row = rows.pop().expect("struct substitution postorder");

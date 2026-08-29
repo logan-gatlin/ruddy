@@ -316,6 +316,10 @@ pub enum Ty {
     /// [`Ty::Sum`] is [`Shape::Sum`]'s: "may perform these effects" is not a
     /// property of every type, so there is nowhere else for the row to live.
     Arrow(Rc<Ty>, Rc<Ty>, Row),
+    /// A producer-owned existential value. The wrapper marks the exact
+    /// annotation result boundary at which hidden presence identities are
+    /// opened; it is otherwise representation-transparent.
+    Package(Rc<Ty>),
     /// A structural record and its true field-row tail.
     Struct(Row),
     /// The cases a value may be: a row of labels, each with a presence, and a
@@ -679,6 +683,9 @@ fn take_ty_children(ty: &mut Ty, types: &mut Vec<Rc<Ty>>, rows: &mut Vec<Rc<Row>
             types.push(std::mem::replace(to, Rc::new(Ty::Undecided)));
             take_row_children(effects, types, rows);
         }
+        Ty::Package(body) => {
+            types.push(std::mem::replace(body, Rc::new(Ty::Undecided)));
+        }
         Ty::Struct(row) | Ty::Sum(row) => take_row_children(row, types, rows),
         Ty::Named { args, .. } => {
             types.extend(std::mem::replace(args, Rc::from([])).iter().cloned());
@@ -792,6 +799,7 @@ pub fn same_finite_syntax(left: &Rc<Ty>, right: &Rc<Ty>) -> bool {
                         pending.push(Pair::Ty(left_to, right_to));
                         pending.push(Pair::Ty(left_from, right_from));
                     }
+                    (Ty::Package(left), Ty::Package(right)) => pending.push(Pair::Ty(left, right)),
                     (Ty::Struct(left), Ty::Struct(right)) | (Ty::Sum(left), Ty::Sum(right)) => {
                         pending.push(Pair::Row(left, right))
                     }
@@ -903,6 +911,7 @@ impl Ty {
     /// The field row inside a struct, if this is one.
     pub fn fields(&self) -> Option<&Row> {
         match self {
+            Ty::Package(body) => body.fields(),
             Ty::Struct(row) => Some(row),
             _ => None,
         }
@@ -917,6 +926,7 @@ impl Ty {
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {
         match self {
+            Ty::Package(body) => body.cases(),
             Ty::Sum(cases) => cases.clone(),
             _ => Row::of(Rest::Undecided),
         }

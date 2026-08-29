@@ -522,6 +522,48 @@ fn compact(text: &str) -> String {
 }
 
 #[test]
+fn nested_existential_result_boundaries_survive_artifact_text() {
+    let artifact = built(
+        "extern nested: ((Nat ->\n\
+         { left when 'p: Nat, right when 'q: Nat }) -> Nat) -> Nat\n\
+         where 'p != 'q = host.nested\n",
+    );
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::nested"))
+        .expect("the nested extern is published");
+    let Type::Arrow(outer_from, _, _) = &value.scheme.body else {
+        panic!(
+            "expected the outer callback arrow: {:#?}",
+            value.scheme.body
+        );
+    };
+    let Type::Arrow(callback_from, _, _) = &**outer_from else {
+        panic!("expected the nested callback arrow: {outer_from:#?}");
+    };
+    let Type::Arrow(_, callback_result, _) = &**callback_from else {
+        panic!("expected the callback-producing arrow: {callback_from:#?}");
+    };
+    assert!(
+        matches!(&**callback_result, Type::Package(body) if matches!(&**body, Type::Struct(_))),
+        "the package must stay at the innermost result: {callback_result:#?}"
+    );
+
+    let printed = assert_round_trip(&artifact);
+    let reparsed = Artifact::parse(&printed);
+    let reparsed = reparsed
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::nested"))
+        .expect("the nested extern survives decoding");
+    assert_eq!(reparsed.scheme.existentials, value.scheme.existentials);
+    assert!(printed.contains("(existentials"), "{printed}");
+}
+
+#[test]
 fn a_compiled_bundle_round_trips_through_canonical_text() {
     let artifact = built(
         "type Box 'a = { value: 'a }\n\

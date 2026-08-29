@@ -2749,6 +2749,7 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
         Ty(&'a Ty),
         Row(&'a crate::types::Row),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -2785,6 +2786,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                     work.push(Work::Row(effects));
                     work.push(Work::Ty(to));
                     work.push(Work::Ty(from));
+                }
+                Ty::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body));
                 }
                 Ty::Struct(fields) => {
                     work.push(Work::Struct);
@@ -2841,6 +2846,10 @@ fn clamp_bounds(ty: Rc<Ty>, count: usize, presences: usize) -> Rc<Ty> {
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
                 types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package postorder stays balanced");
+                types.push(Rc::new(Ty::Package(body)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -2928,6 +2937,7 @@ fn drop_type_iterative(root: Rc<Ty>) {
                         work.push(Work::Ty(to.clone()));
                         row(effects, &mut work);
                     }
+                    Ty::Package(body) => work.push(Work::Ty(body.clone())),
                     Ty::Struct(fields) | Ty::Sum(fields) => row(fields, &mut work),
                     Ty::Named { args, .. } => {
                         work.extend(args.iter().cloned().map(Work::Ty));
@@ -3072,6 +3082,7 @@ fn import_type(
         Ty(&'a artifact::Type, bool),
         Row(&'a artifact::Row, bool),
         Arrow,
+        Package,
         Struct,
         Sum,
         Named {
@@ -3102,6 +3113,10 @@ fn import_type(
                     work.push(Work::Row(effects, true));
                     work.push(Work::Ty(to, false));
                     work.push(Work::Ty(from, false));
+                }
+                artifact::Type::Package(body) => {
+                    work.push(Work::Package);
+                    work.push(Work::Ty(body, is_effect_row));
                 }
                 artifact::Type::Struct(fields) => {
                     work.push(Work::Struct);
@@ -3138,6 +3153,10 @@ fn import_type(
                 let to = types.pop().expect("type postorder stays balanced");
                 let from = types.pop().expect("type postorder stays balanced");
                 types.push(Rc::new(Ty::Arrow(from, to, effects)));
+            }
+            Work::Package => {
+                let body = types.pop().expect("package postorder stays balanced");
+                types.push(Rc::new(Ty::Package(body)));
             }
             Work::Struct => {
                 let fields = rows.pop().expect("row postorder stays balanced");
@@ -3972,6 +3991,9 @@ impl RegularType<'_> {
                     Ty::Boolean => values.push(self.atom("Boolean")),
                     Ty::Bound(index) => values.push(self.argument(&args, *index)),
                     Ty::Var(_) | Ty::Rigid { .. } | Ty::Undecided => values.push(self.atom("?")),
+                    Ty::Package(body) => {
+                        work.push(Work::Type(body, args, supplied_as_effects, instantiation));
+                    }
                     Ty::Arrow(from, to, effects) => {
                         work.push(Work::Make(
                             "arrow".into(),
@@ -5164,6 +5186,7 @@ impl<'a> Follow<'a> {
                     }
                 },
                 FollowWork::Semantic(ty) => match &**ty {
+                    Ty::Package(body) => work.push(FollowWork::Semantic(body)),
                     Ty::Bound(index) => {
                         answer = Some(Stands::Param {
                             index: *index,
@@ -6960,6 +6983,7 @@ fn row_summaries(
                     values.push((summary, crossed_cycle));
                 }
                 Work::Semantic(ty) => match ty {
+                    Ty::Package(body) => work.push(Work::Semantic(body)),
                     Ty::Bound(index) => work.push(Work::Value(RowSummary {
                         shaped: false,
                         labels: IndexSet::new(),

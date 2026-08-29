@@ -110,6 +110,25 @@ fn separate_partial_application_calls_do_not_share_existential_witnesses() {
     assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
 }
 
+/// Fully saturated calls open fresh packages too. In particular, learning the
+/// left side of one XOR result says nothing about a separately called result,
+/// even when both calls name the same generalized producer.
+#[test]
+fn independently_called_xor_results_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern choose: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = host.choose\n\
+         let first = choose 1n\n\
+         let second = choose 2n\n\
+         let bad = match first with\n\
+         | { left, .. } => second.also\n\
+         | { right, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
 #[test]
 fn integer_and_natural_literals_are_function_arguments() {
     let (mint, _, output) = inferred(
@@ -7869,7 +7888,7 @@ fn extern_callback_coverage_uses_where_implications() {
             kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
             ..
         }]
-    ));
+    ), "{:#?}", invalid.errors);
 }
 
 #[test]
