@@ -136,7 +136,9 @@ fn stmt_node(ids: &mut Ids, stmt: &Stmt) -> Node {
             }
             module
         }
-        StmtKind::Extern { name, ty, target } => Node {
+        StmtKind::Extern {
+            name, ty, target, ..
+        } => Node {
             label: "Extern".into(),
             ..node
         }
