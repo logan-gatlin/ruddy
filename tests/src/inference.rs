@@ -172,6 +172,27 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
 }
 
 #[test]
+fn unconstrained_result_packages_still_open_independent_sealed_witnesses() {
+    inferred(
+        "extern choose: Nat -> { left when _: Nat } = host.choose\n\
+         let needs_left: { left: Nat } -> Nat = fn value => value.left\n\
+         let needs_no_left: { \\left, .. } -> Nat = fn _ => 0n\n\
+         let first = needs_left (choose 1n)\n\
+         let second = needs_no_left (choose 2n)",
+    );
+}
+
+#[test]
+fn mixed_input_to_result_guarantees_activate_at_each_call() {
+    inferred(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let good = needs_output (follows { input: 1n })",
+    );
+}
+
+#[test]
 fn negative_and_erased_alias_arguments_do_not_publish_anonymous_existentials() {
     let (mint, _, output) = inferred(
         "type Contra 'a = 'a -> Nat\n\
@@ -5985,6 +6006,61 @@ fn structural_result_families_cover_arrows_sums_names_and_absence() {
         scheme(&mint, &output, "absent"),
         "{ x when 'a: Nat, y when 'b: Nat } -> { ..'c } -> { ..'c } where 'a != 'b"
     );
+}
+
+#[test]
+fn package_rebuilding_places_result_packages_inside_composed_row_tails() {
+    let result = Rc::new(Ty::Struct(Row {
+        labels: [(
+            "hidden".to_string(),
+            RowField {
+                presence: Presence::Bound(0),
+                ty: Rc::new(Ty::Nat),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        rest: Rest::Closed,
+    }));
+    let body = Rc::new(Ty::Struct(Row {
+        labels: IndexMap::new(),
+        rest: Rest::More(Rc::new(Row {
+            labels: [(
+                "producer".to_string(),
+                RowField::present(Rc::new(Ty::Arrow(Rc::new(Ty::Nat), result, Row::closed()))),
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        })),
+    }));
+
+    let (packaged, inferred) =
+        inference::package_positive_presences_for_tests(&body, 1, &Default::default());
+    assert_eq!(inferred.len(), 1);
+    assert!(inferred.contains(&0));
+    let Ty::Struct(row) = &*packaged else {
+        panic!("composed-row root remains a struct")
+    };
+    let Rest::More(more) = &row.rest else {
+        panic!("composed row tail is retained")
+    };
+    let Ty::Arrow(_, result, _) = &*more.labels["producer"].ty else {
+        panic!("composed-row field remains an arrow")
+    };
+    assert!(matches!(&**result, Ty::Package(_)));
+}
+
+#[test]
+fn deeply_nested_invariant_aliases_classify_in_polynomial_time() {
+    const DEPTH: usize = 24;
+    let mut nested = "{ hidden when _: Nat }".to_string();
+    for _ in 0..DEPTH {
+        nested = format!("Invariant ({nested})");
+    }
+    inferred(&format!(
+        "type Invariant 'a = 'a -> 'a\nextern deep: {nested} = host.deep"
+    ));
 }
 
 #[test]

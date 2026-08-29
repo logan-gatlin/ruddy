@@ -1135,6 +1135,17 @@ pub fn structural_family_for_tests(
     .family_type(types)
 }
 
+/// Exercise inferred package placement over semantic rows assembled directly
+/// by integration regressions.
+#[doc(hidden)]
+pub fn package_positive_presences_for_tests(
+    body: &Rc<Ty>,
+    presences: u32,
+    variances: &HashMap<(Symbol, u32), u8>,
+) -> (Rc<Ty>, IndexSet<u32>) {
+    package_positive_presences(body, presences, &IndexSet::new(), variances)
+}
+
 /// Alternately erase transparent packages and unfold transparent names until
 /// neither operation exposes another wrapper.
 fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
@@ -3148,6 +3159,18 @@ impl Table {
             }
         }
 
+        // Opening behavior belongs to the package node even when its scheme has
+        // no nontrivial owned clause. In particular, an unconstrained fresh
+        // result still has to alpha-rename its hidden witnesses on every call.
+        for (key, fresh) in &packages {
+            self.package_guarantees
+                .entry(*key)
+                .or_insert(PackageGuarantee {
+                    formula: Formula::True,
+                    fresh: *fresh,
+                });
+        }
+
         let mut pending = vec![formula];
         let mut immediate = Vec::new();
         while let Some(part) = pending.pop() {
@@ -3188,7 +3211,15 @@ impl Table {
         let mut renames = HashMap::new();
         if guarantee.as_ref().is_some_and(|guarantee| guarantee.fresh) {
             for var in collect_owned_existentials(body, &self.abstract_existentials) {
-                renames.insert(var, self.fresh_presence());
+                let fresh = self.fresh_presence();
+                if let Presence::Var(fresh_var) = fresh {
+                    // The alpha-renamed identity is just as sealed as the
+                    // scheme witness it replaces. Otherwise a consumer could
+                    // choose a fresh result merely because it was opened twice.
+                    self.existential_witnesses.insert(fresh_var);
+                    self.abstract_existentials.insert(fresh_var);
+                    renames.insert(var, Presence::Var(fresh_var));
+                }
             }
         }
         let opened = if renames.is_empty() {
@@ -4380,37 +4411,49 @@ fn semantic_variances(aliases: &IndexMap<Symbol, Scheme>) -> HashMap<(Symbol, u3
     loop {
         let before = out.clone();
         for (owner, scheme) in aliases {
+            // Invariant named parameters enqueue an argument at both
+            // polarities. Join those states at each shared semantic node so a
+            // deep nest is visited at most twice, rather than branching 2^n.
+            let mut seen: HashMap<usize, u8> = HashMap::new();
             let mut work = vec![Work::Ty(scheme.body().clone(), true)];
             while let Some(part) = work.pop() {
                 match part {
-                    Work::Ty(ty, positive) => match &*ty {
-                        Ty::Bound(index) if *index < scheme.count() => {
-                            *out.entry((*owner, *index)).or_default() |=
-                                if positive { 1 } else { 2 };
+                    Work::Ty(ty, positive) => {
+                        let bit = if positive { 1 } else { 2 };
+                        let visited = seen.entry(Rc::as_ptr(&ty) as usize).or_default();
+                        if *visited & bit != 0 {
+                            continue;
                         }
-                        Ty::Arrow(from, to, effects) => {
-                            work.push(Work::Row(effects.clone(), positive));
-                            work.push(Work::Ty(to.clone(), positive));
-                            work.push(Work::Ty(from.clone(), !positive));
-                        }
-                        Ty::Package(body) => work.push(Work::Ty(body.clone(), positive)),
-                        Ty::Struct(row) | Ty::Sum(row) => {
-                            work.push(Work::Row(row.clone(), positive))
-                        }
-                        Ty::Named { symbol, args, .. } => {
-                            for (at, arg) in args.iter().enumerate() {
-                                let variance =
-                                    before.get(&(*symbol, at as u32)).copied().unwrap_or(3);
-                                if variance & 1 != 0 {
-                                    work.push(Work::Ty(arg.clone(), positive));
-                                }
-                                if variance & 2 != 0 {
-                                    work.push(Work::Ty(arg.clone(), !positive));
+                        *visited |= bit;
+                        match &*ty {
+                            Ty::Bound(index) if *index < scheme.count() => {
+                                *out.entry((*owner, *index)).or_default() |=
+                                    if positive { 1 } else { 2 };
+                            }
+                            Ty::Arrow(from, to, effects) => {
+                                work.push(Work::Row(effects.clone(), positive));
+                                work.push(Work::Ty(to.clone(), positive));
+                                work.push(Work::Ty(from.clone(), !positive));
+                            }
+                            Ty::Package(body) => work.push(Work::Ty(body.clone(), positive)),
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                work.push(Work::Row(row.clone(), positive))
+                            }
+                            Ty::Named { symbol, args, .. } => {
+                                for (at, arg) in args.iter().enumerate() {
+                                    let variance =
+                                        before.get(&(*symbol, at as u32)).copied().unwrap_or(3);
+                                    if variance & 1 != 0 {
+                                        work.push(Work::Ty(arg.clone(), positive));
+                                    }
+                                    if variance & 2 != 0 {
+                                        work.push(Work::Ty(arg.clone(), !positive));
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                     Work::Row(row, positive) => {
                         work.extend(
                             row.labels
@@ -4457,37 +4500,50 @@ fn package_positive_presences(
     }
     let root = Rc::as_ptr(body) as usize;
     let mut uses: HashMap<u32, Uses> = HashMap::new();
+    // A named invariant argument is traversed at both polarities. Memoize the
+    // joined polarity state per package owner and semantic allocation so deep
+    // alias nests stay linear in their expanded path rather than exponential.
+    let mut seen: HashMap<(usize, usize), u8> = HashMap::new();
     let mut work = vec![Scan::Ty(body.clone(), true, root)];
     while let Some(item) = work.pop() {
         match item {
-            Scan::Ty(ty, positive, owner) => match &*ty {
-                Ty::Arrow(from, to, effects) => {
-                    work.push(Scan::Ty(from.clone(), !positive, owner));
-                    let result_owner = if positive {
-                        Rc::as_ptr(to) as usize
-                    } else {
-                        owner
-                    };
-                    work.push(Scan::Ty(to.clone(), positive, result_owner));
-                    work.push(Scan::Row(effects.clone(), positive, owner));
+            Scan::Ty(ty, positive, owner) => {
+                let bit = if positive { 1 } else { 2 };
+                let visited = seen.entry((owner, Rc::as_ptr(&ty) as usize)).or_default();
+                if *visited & bit != 0 {
+                    continue;
                 }
-                Ty::Package(inner) => work.push(Scan::Ty(inner.clone(), positive, owner)),
-                Ty::Struct(row) | Ty::Sum(row) => {
-                    work.push(Scan::Row(row.clone(), positive, owner))
-                }
-                Ty::Named { symbol, args, .. } => {
-                    for (at, arg) in args.iter().enumerate() {
-                        let variance = variances.get(&(*symbol, at as u32)).copied().unwrap_or(3);
-                        if variance & 1 != 0 {
-                            work.push(Scan::Ty(arg.clone(), positive, owner));
-                        }
-                        if variance & 2 != 0 {
-                            work.push(Scan::Ty(arg.clone(), !positive, owner));
+                *visited |= bit;
+                match &*ty {
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Scan::Ty(from.clone(), !positive, owner));
+                        let result_owner = if positive {
+                            Rc::as_ptr(to) as usize
+                        } else {
+                            owner
+                        };
+                        work.push(Scan::Ty(to.clone(), positive, result_owner));
+                        work.push(Scan::Row(effects.clone(), positive, owner));
+                    }
+                    Ty::Package(inner) => work.push(Scan::Ty(inner.clone(), positive, owner)),
+                    Ty::Struct(row) | Ty::Sum(row) => {
+                        work.push(Scan::Row(row.clone(), positive, owner))
+                    }
+                    Ty::Named { symbol, args, .. } => {
+                        for (at, arg) in args.iter().enumerate() {
+                            let variance =
+                                variances.get(&(*symbol, at as u32)).copied().unwrap_or(3);
+                            if variance & 1 != 0 {
+                                work.push(Scan::Ty(arg.clone(), positive, owner));
+                            }
+                            if variance & 2 != 0 {
+                                work.push(Scan::Ty(arg.clone(), !positive, owner));
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Scan::Row(row, positive, owner) => {
                 for field in row.labels.values() {
                     if let Presence::Bound(index) = field.presence
@@ -4584,6 +4640,9 @@ fn package_positive_presences(
                     .map(|(name, field)| (name.clone(), field.presence.clone()))
                     .collect();
                 work.push(Build::FinishRow(labels, row.rest.clone()));
+                if let Rest::More(more) = &row.rest {
+                    work.push(Build::Row((**more).clone()));
+                }
                 work.extend(
                     row.labels
                         .values()
@@ -4603,6 +4662,12 @@ fn package_positive_presences(
                     ));
                 }
                 built.reverse();
+                let rest = match rest {
+                    Rest::More(_) => {
+                        Rest::More(Rc::new(rows.pop().expect("packaged composed row tail")))
+                    }
+                    rest => rest,
+                };
                 rows.push(Row {
                     labels: built.into_iter().collect(),
                     rest,
