@@ -214,7 +214,21 @@ pub enum Op {
         callee: Callee,
         args: Vec<Temp>,
     },
-    /// Read a top-level definition's value.
+    /// Invoke a raw target-provided function. Unlike [`Op::Call`], every entry
+    /// in `args` is source-visible at the foreign boundary: effect evidence is
+    /// structurally excluded and must be consumed by an adapter before this
+    /// instruction is emitted.
+    RawCall {
+        callee: Temp,
+        args: Vec<Temp>,
+    },
+    /// Read a raw target-provided value. Raw externs live outside Ruddy's
+    /// global namespace so an adapter may occupy the declaration's public name.
+    Extern {
+        symbol: Symbol,
+        name: String,
+    },
+    /// Read a top-level Ruddy definition or adapted extern value.
     Global {
         symbol: Symbol,
         name: String,
@@ -263,7 +277,7 @@ pub enum Op {
     },
 }
 
-/// What a [`Op::Call`] calls: a function whose identity is known here, or
+/// What an [`Op::Call`] calls: a function whose identity is known here, or
 /// whatever a temp holds.
 #[derive(Debug, Clone, Copy)]
 pub enum Callee {
@@ -682,28 +696,12 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         definition: None,
         assumed: Formula::True,
     };
+    let externs = low.lower_externs();
     let order = low.order();
     low.reserve(&order);
     for symbol in &order {
         low.define(*symbol);
     }
-    let externs = program
-        .externs
-        .iter()
-        .map(|(symbol, decl)| Extern {
-            symbol: *symbol,
-            name: mint.name(*symbol).to_string(),
-            target: decl
-                .value
-                .target
-                .segments
-                .iter()
-                .map(|segment| segment.tracked.clone())
-                .collect(),
-            span: decl.value.target.span(),
-            rep: low.rep(inference.externs[symbol].body()),
-        })
-        .collect();
     Output {
         externs,
         functions: low
@@ -1014,6 +1012,430 @@ impl Body {
 }
 
 impl Lower<'_> {
+    /// Import raw target values and install Ruddy-facing globals in front of
+    /// ordinary definitions. Function imports are always adapters: they accept
+    /// internal evidence parameters but raw calls contain visible arguments
+    /// only. Marked ABI functions accumulate their whole host argument group;
+    /// ordinary arrows retain the legacy unary host-curried convention.
+    fn lower_externs(&mut self) -> Vec<Extern> {
+        let declarations: Vec<_> = self
+            .program
+            .externs
+            .iter()
+            .map(|(symbol, decl)| (*symbol, decl.clone()))
+            .collect();
+        let mut externs = Vec::with_capacity(declarations.len());
+        for (symbol, decl) in declarations {
+            let name = self.mint.name(symbol).to_string();
+            let ty = self.inference.externs[&symbol].body().clone();
+            externs.push(Extern {
+                symbol,
+                name: name.clone(),
+                target: decl
+                    .value
+                    .target
+                    .segments
+                    .iter()
+                    .map(|segment| segment.tracked.clone())
+                    .collect(),
+                span: decl.value.target.span(),
+                rep: self.rep(&ty),
+            });
+
+            self.stem = format!("{name}#extern");
+            self.serial = 0;
+            let mut body = Body::default();
+            let raw = self.emit(
+                &mut body,
+                decl.value.target.span(),
+                self.rep(&ty),
+                Op::Extern {
+                    symbol,
+                    name: name.clone(),
+                },
+            );
+            let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
+            self.globals.push(Global {
+                symbol,
+                name,
+                body: body.seal(Terminator {
+                    span: decl.value.target.span(),
+                    kind: End::Ret(value),
+                }),
+                span: decl.name_span,
+            });
+        }
+        externs
+    }
+
+    fn host_to_ruddy(
+        &mut self,
+        abi: &crate::ir::ExternType,
+        ty: &Rc<Ty>,
+        raw: Temp,
+        body: &mut Body,
+    ) -> Temp {
+        use crate::ir::ExternTypeKind;
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => self.host_to_ruddy(inner, ty, raw, body),
+            ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let arity = parameters.len().max(1);
+                let id = self.marked_extern_level(
+                    raw,
+                    Vec::new(),
+                    ty.clone(),
+                    arity,
+                    parameters.is_empty(),
+                    parameters.clone(),
+                    result.as_ref().clone(),
+                    0,
+                );
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![raw],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+                let id = self.ordinary_extern_level(ty.clone());
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![raw],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) => raw,
+        }
+    }
+
+    /// One legacy host-curried arrow. Evidence is accepted as part of the
+    /// Ruddy closure ABI and intentionally omitted from the raw unary call.
+    fn ordinary_extern_level(&mut self, ty: Rc<Ty>) -> FuncId {
+        let id = self.slot(format!("{}#{}", self.stem, self.serial));
+        self.serial += 1;
+        let raw = self.fresh(Rep::Fn);
+        let (from, to, row) = self.arrow(&ty);
+        let mut params = vec![Param {
+            temp: raw,
+            rep: Rep::Fn,
+        }];
+        for _ in 0..shape(&row).arity() {
+            let temp = self.fresh(Rep::Struct);
+            params.push(Param {
+                temp,
+                rep: Rep::Struct,
+            });
+        }
+        let argument = self.fresh(self.rep(&from));
+        params.push(Param {
+            temp: argument,
+            rep: self.rep(&from),
+        });
+        let mut body = Body::default();
+        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
+            Span::default().track(crate::ir::TypeKind::Error),
+        ));
+        let argument = self.ruddy_to_host(&ordinary, &from, argument, &mut body);
+        let result = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::RawCall {
+                callee: raw,
+                args: vec![argument],
+            },
+        );
+        let result = self.host_to_ruddy(&ordinary, &to, result, &mut body);
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
+    /// Convert a Ruddy closure passed to the host into the ABI written at that
+    /// direct boundary position. These wrappers are called by the host, so
+    /// their parameter list deliberately has no Ruddy evidence slots.
+    fn ruddy_to_host(
+        &mut self,
+        abi: &crate::ir::ExternType,
+        ty: &Rc<Ty>,
+        value: Temp,
+        body: &mut Body,
+    ) -> Temp {
+        use crate::ir::ExternTypeKind;
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, body),
+            ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let id = self.marked_callback(ty.clone(), parameters.clone(), *result.clone());
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![value],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+                let id = self.ordinary_callback(ty.clone());
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![value],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) => value,
+        }
+    }
+
+    fn ordinary_callback(&mut self, ty: Rc<Ty>) -> FuncId {
+        let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
+        self.serial += 1;
+        let closure = self.fresh(Rep::Fn);
+        let (from, to, _) = self.arrow(&ty);
+        let raw_argument = self.fresh(self.rep(&from));
+        let params = vec![
+            Param {
+                temp: closure,
+                rep: Rep::Fn,
+            },
+            Param {
+                temp: raw_argument,
+                rep: self.rep(&from),
+            },
+        ];
+        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
+            Span::default().track(crate::ir::TypeKind::Error),
+        ));
+        let mut body = Body::default();
+        let argument = self.host_to_ruddy(&ordinary, &from, raw_argument, &mut body);
+        let result = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::Call {
+                callee: Callee::Indirect(closure),
+                args: vec![argument],
+            },
+        );
+        let result = self.ruddy_to_host(&ordinary, &to, result, &mut body);
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
+    fn marked_callback(
+        &mut self,
+        ty: Rc<Ty>,
+        parameter_abis: Vec<crate::ir::ExternType>,
+        result_abi: crate::ir::ExternType,
+    ) -> FuncId {
+        let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
+        self.serial += 1;
+        let closure = self.fresh(Rep::Fn);
+        let mut params = vec![Param {
+            temp: closure,
+            rep: Rep::Fn,
+        }];
+        let mut raw_parameters = Vec::new();
+        let mut arrows = Vec::new();
+        let mut cursor = ty;
+        for _ in 0..parameter_abis.len().max(1) {
+            let (from, to, _) = self.arrow(&cursor);
+            if !parameter_abis.is_empty() {
+                let temp = self.fresh(self.rep(&from));
+                params.push(Param {
+                    temp,
+                    rep: self.rep(&from),
+                });
+                raw_parameters.push(temp);
+            }
+            arrows.push((from, to.clone()));
+            cursor = to;
+        }
+
+        let mut body = Body::default();
+        let mut current = closure;
+        if parameter_abis.is_empty() {
+            let unit = self.emit(
+                &mut body,
+                Span::default(),
+                Rep::Unit,
+                Op::Struct(IndexMap::new()),
+            );
+            current = self.emit(
+                &mut body,
+                Span::default(),
+                self.rep(&cursor),
+                Op::Call {
+                    callee: Callee::Indirect(current),
+                    args: vec![unit],
+                },
+            );
+        } else {
+            for ((abi, raw), (from, to)) in
+                parameter_abis.iter().zip(raw_parameters).zip(arrows.iter())
+            {
+                let argument = self.host_to_ruddy(abi, from, raw, &mut body);
+                current = self.emit(
+                    &mut body,
+                    Span::default(),
+                    self.rep(to),
+                    Op::Call {
+                        callee: Callee::Indirect(current),
+                        args: vec![argument],
+                    },
+                );
+            }
+        }
+        let result = self.ruddy_to_host(&result_abi, &cursor, current, &mut body);
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marked_extern_level(
+        &mut self,
+        _outer_raw: Temp,
+        carried: Vec<Rep>,
+        ty: Rc<Ty>,
+        arity: usize,
+        nullary: bool,
+        parameter_abis: Vec<crate::ir::ExternType>,
+        result_abi: crate::ir::ExternType,
+        step: usize,
+    ) -> FuncId {
+        let id = self.slot(format!("{}#{}", self.stem, self.serial));
+        self.serial += 1;
+        let raw = self.fresh(Rep::Fn);
+        let mut params = vec![Param {
+            temp: raw,
+            rep: Rep::Fn,
+        }];
+        let mut gathered = Vec::with_capacity(carried.len());
+        for rep in &carried {
+            let temp = self.fresh(*rep);
+            params.push(Param { temp, rep: *rep });
+            gathered.push(temp);
+        }
+        let (from, to, row) = self.arrow(&ty);
+        for _ in 0..shape(&row).arity() {
+            let temp = self.fresh(Rep::Struct);
+            params.push(Param {
+                temp,
+                rep: Rep::Struct,
+            });
+        }
+        let argument_rep = self.rep(&from);
+        let argument = self.fresh(argument_rep);
+        params.push(Param {
+            temp: argument,
+            rep: argument_rep,
+        });
+        let mut body = Body::default();
+        if !nullary {
+            let argument = self.ruddy_to_host(&parameter_abis[step], &from, argument, &mut body);
+            gathered.push(argument);
+        }
+
+        let value = if step + 1 == arity {
+            let result = self.emit(
+                &mut body,
+                Span::default(),
+                self.rep(&to),
+                Op::RawCall {
+                    callee: raw,
+                    args: gathered,
+                },
+            );
+            self.host_to_ruddy(&result_abi, &to, result, &mut body)
+        } else {
+            let mut next_carried = carried;
+            next_carried.push(argument_rep);
+            let next = self.marked_extern_level(
+                raw,
+                next_carried,
+                to.clone(),
+                arity,
+                false,
+                parameter_abis,
+                result_abi,
+                step + 1,
+            );
+            let mut captures = vec![raw];
+            captures.extend(gathered);
+            self.emit(
+                &mut body,
+                Span::default(),
+                Rep::Fn,
+                Op::Closure {
+                    func: next,
+                    captures,
+                },
+            )
+        };
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(value),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
     /// The definitions in the order a backend initializes them: group order,
     /// earliest first, and source order within a group.
     fn order(&self) -> Vec<Symbol> {

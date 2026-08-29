@@ -63,6 +63,7 @@ pub fn generate(artifact: &Artifact) -> Result<String, Error> {
 struct Generator<'a> {
     artifact: &'a Artifact,
     runtime_names: HashSet<&'a str>,
+    extern_names: HashSet<&'a str>,
     exports: ExportNode,
 }
 
@@ -79,12 +80,29 @@ impl<'a> Generator<'a> {
                     external.name
                 )));
             }
-            if !runtime_names.insert(external.name.as_str()) {
-                return Err(Error::InvalidGlobalReference(external.name.clone()));
-            }
+            runtime_names.insert(external.name.as_str());
         }
+        let extern_names = artifact
+            .lir
+            .externs
+            .iter()
+            .map(|external| external.name.as_str())
+            .collect();
         for global in &artifact.lir.globals {
-            if !runtime_names.insert(global.name.as_str()) {
+            if artifact
+                .lir
+                .globals
+                .iter()
+                .filter(|candidate| candidate.name == global.name)
+                .count()
+                > 1
+                || !runtime_names.insert(global.name.as_str())
+                    && !artifact
+                        .lir
+                        .externs
+                        .iter()
+                        .any(|external| external.name == global.name)
+            {
                 return Err(Error::InvalidGlobalReference(global.name.clone()));
             }
         }
@@ -111,6 +129,7 @@ impl<'a> Generator<'a> {
         let generator = Self {
             artifact,
             runtime_names,
+            extern_names,
             exports,
         };
         generator.validate()?;
@@ -135,6 +154,9 @@ impl<'a> Generator<'a> {
                         ..
                     } if *func >= self.artifact.lir.functions.len() as u64 => {
                         return Err(Error::InvalidFunctionReference(*func));
+                    }
+                    Op::Extern { target } if !self.extern_names.contains(target.as_str()) => {
+                        return Err(Error::InvalidGlobalReference(target.clone()));
                     }
                     Op::Global { target } if !self.runtime_names.contains(target.as_str()) => {
                         return Err(Error::InvalidGlobalReference(target.clone()));
@@ -186,9 +208,9 @@ impl<'a> Generator<'a> {
             self.block(&function.body, &mut out, 2)?;
             out.push_str("; },\n");
         }
-        out.push_str("];\nconst $g = Object.create(null);\n");
+        out.push_str("];\nconst $h = Object.create(null);\nconst $g = Object.create(null);\n");
         for external in &self.artifact.lir.externs {
-            out.push_str("$g[");
+            out.push_str("$h[");
             string(&external.name, &mut out);
             out.push_str("] = $extern([");
             for (i, segment) in external.target.iter().enumerate() {
@@ -197,7 +219,11 @@ impl<'a> Generator<'a> {
                 }
                 string(segment, &mut out);
             }
-            out.push_str("]);\n");
+            out.push_str("]);\n$g[");
+            string(&external.name, &mut out);
+            out.push_str("] = $h[");
+            string(&external.name, &mut out);
+            out.push_str("];\n");
         }
         for global in &self.artifact.lir.globals {
             out.push_str("$g[");
@@ -370,6 +396,17 @@ impl<'a> Generator<'a> {
                 out.push('(');
                 comma_temps(args, out);
                 out.push(')');
+            }
+            Op::RawCall { callee, args } => {
+                out.push_str(&v(*callee));
+                out.push('(');
+                comma_temps(args, out);
+                out.push(')');
+            }
+            Op::Extern { target } => {
+                out.push_str("$h[");
+                string(target, out);
+                out.push(']');
             }
             Op::Global { target } => {
                 out.push_str("$g[");

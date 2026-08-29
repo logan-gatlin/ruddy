@@ -856,6 +856,14 @@ pub enum Op {
         callee: Callee,
         args: Vec<u32>,
     },
+    /// A foreign ABI call containing only host-visible arguments.
+    RawCall {
+        callee: u32,
+        args: Vec<u32>,
+    },
+    Extern {
+        target: QualifiedName,
+    },
     Global {
         target: QualifiedName,
     },
@@ -1049,6 +1057,13 @@ fn clone_lir_tree(root: LirCloneWork<'_>) -> (Vec<Block>, Vec<Op>) {
                     callee: callee.clone(),
                     args: args.clone(),
                 }),
+                Op::RawCall { callee, args } => ops.push(Op::RawCall {
+                    callee: *callee,
+                    args: args.clone(),
+                }),
+                Op::Extern { target } => ops.push(Op::Extern {
+                    target: target.clone(),
+                }),
                 Op::Global { target } => ops.push(Op::Global {
                     target: target.clone(),
                 }),
@@ -1229,6 +1244,8 @@ enum OpHead<'a> {
     Tag(&'a str, Option<u32>),
     Closure(u64, &'a [u32]),
     Call(&'a Callee, &'a [u32]),
+    RawCall(u32, &'a [u32]),
+    Extern(&'a str),
     Global(&'a str),
     NewTag,
     Catch(u32),
@@ -1258,6 +1275,8 @@ impl<'a> From<&'a Op> for OpHead<'a> {
             Op::Payload(value) => Self::Unary(2, *value),
             Op::Closure { func, captures } => Self::Closure(*func, captures),
             Op::Call { callee, args } => Self::Call(callee, args),
+            Op::RawCall { callee, args } => Self::RawCall(*callee, args),
+            Op::Extern { target } => Self::Extern(target),
             Op::Global { target } => Self::Global(target),
             Op::NewTag => Self::NewTag,
             Op::Catch { tag, .. } => Self::Catch(*tag),
@@ -1493,6 +1512,8 @@ fn drain_lir_op(op: &mut Op, pending: &mut Vec<Block>) {
         | Op::Payload(_)
         | Op::Closure { .. }
         | Op::Call { .. }
+        | Op::RawCall { .. }
+        | Op::Extern { .. }
         | Op::Global { .. }
         | Op::NewTag => {}
     }
@@ -2045,6 +2066,13 @@ fn op(mint: &Mint, value: &lir::Op) -> Op {
                 lir::Callee::Indirect(value) => Callee::Indirect(*value),
             },
             args: args.clone(),
+        },
+        Source::RawCall { callee, args } => Op::RawCall {
+            callee: *callee,
+            args: args.clone(),
+        },
+        Source::Extern { symbol, .. } => Op::Extern {
+            target: qualified(mint, *symbol),
         },
         Source::Global { symbol, .. } => Op::Global {
             target: qualified(mint, *symbol),
@@ -2707,6 +2735,14 @@ pub mod text {
                     .chain(args.iter().map(|value| A(value.to_string())))
                     .collect()),
             ]),
+            Op::RawCall { callee, args } => L(vec![
+                A("raw-call".into()),
+                A(callee.to_string()),
+                L(std::iter::once(A("args".into()))
+                    .chain(args.iter().map(|value| A(value.to_string())))
+                    .collect()),
+            ]),
+            Op::Extern { target } => L(vec![A("extern".into()), Q(target.clone())]),
             Op::Global { target } => L(vec![A("global".into()), Q(target.clone())]),
             Op::NewTag => A("new-tag".into()),
             Op::Catch { tag, body } => L(vec![A("catch".into()), A(tag.to_string()), block(body)]),
@@ -4044,6 +4080,19 @@ pub mod text {
                         .collect();
                     Op::Call { callee, args }
                 }
+                "raw-call" => {
+                    let mut values = self.exact(values, 2, "raw-call");
+                    let callee = self.number(self.take(&mut values));
+                    let args = self
+                        .many(self.take(&mut values), "args")
+                        .into_iter()
+                        .map(|value| self.number(value))
+                        .collect();
+                    Op::RawCall { callee, args }
+                }
+                "extern" => Op::Extern {
+                    target: self.string(self.exact(values, 1, "extern").remove(0)),
+                },
                 "global" => Op::Global {
                     target: self.string(self.exact(values, 1, "global").remove(0)),
                 },
