@@ -182,6 +182,10 @@ pub enum OperationSelector {
 pub struct Scheme {
     pub count: u32,
     pub presences: u32,
+    /// Producer-owned presence positions. Each index is in `0..presences`.
+    /// The sorted canonical representation survives import and linking so an
+    /// imported consumer cannot accidentally reopen a witness as universal.
+    pub existentials: Vec<u32>,
     pub formula: Formula,
     pub body: Type,
 }
@@ -1739,9 +1743,12 @@ fn effect_id(id: &types::EffectId) -> EffectIdentity {
 }
 
 fn scheme(mint: &Mint, value: &types::Scheme) -> Scheme {
+    let mut existentials: Vec<_> = value.existentials().iter().copied().collect();
+    existentials.sort_unstable();
     Scheme {
         count: value.count(),
         presences: value.presences(),
+        existentials,
         formula: formula(value.formula()),
         body: ty(mint, value.body()),
     }
@@ -2356,6 +2363,9 @@ pub mod text {
             A("scheme".into()),
             A(value.count.to_string()),
             A(value.presences.to_string()),
+            L(std::iter::once(A("existentials".into()))
+                .chain(value.existentials.iter().map(|index| A(index.to_string())))
+                .collect()),
             formula(&value.formula),
             ty(&value.body),
         ])
@@ -3360,10 +3370,23 @@ pub mod text {
             }
         }
         fn read_scheme(&self, value: S) -> Scheme {
-            let mut value = self.exact(self.list(value, "scheme"), 4, "scheme");
+            let mut value = self.exact(self.list(value, "scheme"), 5, "scheme");
+            let count = self.number(self.take(&mut value));
+            let presences = self.number(self.take(&mut value));
+            let mut encoded = self.list(self.take(&mut value), "existentials");
+            let mut existentials = Vec::new();
+            while !encoded.is_empty() {
+                existentials.push(self.number(self.take(&mut encoded)));
+            }
+            if existentials.iter().any(|index| *index >= presences)
+                || existentials.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                self.fail("invalid existential presence positions");
+            }
             Scheme {
-                count: self.number(self.take(&mut value)),
-                presences: self.number(self.take(&mut value)),
+                count,
+                presences,
+                existentials,
                 formula: self.read_formula(self.take(&mut value)),
                 body: self.read_ty(self.take(&mut value)),
             }

@@ -257,6 +257,7 @@ fn imported_forwarding_cycles_recover_before_lir_representation() {
             let scheme = |count, body| a::Scheme {
                 count,
                 presences: 0,
+                existentials: Vec::new(),
                 formula: a::Formula::True,
                 body,
             };
