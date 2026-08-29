@@ -5106,39 +5106,41 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
     );
 }
 
-/// Ownership is a property of the complete set of positive lifetimes, not the
-/// order fields happen to be walked. Sibling callback results cannot share a
-/// witness by themselves; an occurrence at their enclosing value boundary can
-/// own both, even when that occurrence is visited last.
+/// A source name denotes one witness, while each positive result boundary is
+/// a distinct package lifetime. Neither sibling results nor a containing value
+/// and its nested result can silently widen that witness to scheme scope. The
+/// refusal is independent of field traversal order.
 #[test]
-fn presence_ownership_is_deterministic_across_containment_and_siblings() {
-    let siblings =
-        "let callbacks : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}";
-    let (mint, out) = built(siblings);
-    assert_eq!(
-        annotation_of(&mint, &out, "callbacks").variables[0].ownership,
-        PresenceOwnership::Universal
-    );
-
+fn presence_ownership_rejects_incompatible_production_lifetimes_deterministically() {
     for source in [
-        "let owned : { root when 'p: Nat, one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}",
-        "let owned : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat }, root when 'p: Nat } = {}",
+        "let bad : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}",
+        "let bad : { two: Nat -> { y when 'p: Nat }, one: Nat -> { x when 'p: Nat } } = {}",
+        "let bad : { root when 'p: Nat, nested: Nat -> { x when 'p: Nat } } = {}",
+        "let bad : { nested: Nat -> { x when 'p: Nat }, root when 'p: Nat } = {}",
     ] {
-        let (mint, out) = built(source);
-        let PresenceOwnership::Existential { boundary } =
-            annotation_of(&mint, &out, "owned").variables[0].ownership
-        else {
-            panic!("the enclosing occurrence should own both siblings: {source}");
-        };
-        let expected = source
-            .split_once(": ")
-            .expect("annotation")
-            .1
-            .rsplit_once(" = ")
-            .expect("value")
-            .0;
-        assert_eq!(&source[boundary.start..boundary.end()], expected);
+        let (_, out) = build_src(source);
+        assert_eq!(out.errors.len(), 1, "{source}: {:#?}", out.errors);
+        assert!(
+            matches!(
+                &out.errors[0].kind,
+                ErrorKind::IncompatiblePresenceOwnership { name } if name == "p"
+            ),
+            "{source}: {:#?}",
+            out.errors
+        );
+        assert_eq!(
+            &source[out.errors[0].span.start..out.errors[0].span.end()],
+            "'p"
+        );
     }
+
+    // Repetition within one exact package remains one producer-owned witness.
+    let source = "let good : { x when 'p: Nat, y when 'p: Nat } = { x: 0n, y: 0n }";
+    let (mint, out) = built(source);
+    assert!(matches!(
+        annotation_of(&mint, &out, "good").variables[0].ownership,
+        PresenceOwnership::Existential { .. }
+    ));
 }
 
 /// Conditional effect labels have the polarity of the arrow carrying them;

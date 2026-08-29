@@ -698,6 +698,9 @@ impl ir::ErrorKind {
             // which name it was is the span's to show. The two below say the
             // same about theirs.
             ir::ErrorKind::UnboundPresence { .. } => "unbound-presence",
+            ir::ErrorKind::IncompatiblePresenceOwnership { .. } => {
+                "incompatible-presence-ownership"
+            }
             ir::ErrorKind::Arity { .. } => "wrong-argument-count",
             ir::ErrorKind::NotAConstructor => "not-a-type-constructor",
             ir::ErrorKind::ParameterApplied => "applied-parameter",
@@ -811,6 +814,10 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::UnboundPresence { name } => write!(
                 f,
                 "this clause names `'{name}`, but no `when` in the type beside it gives it a label",
+            ),
+            ir::ErrorKind::IncompatiblePresenceOwnership { name } => write!(
+                f,
+                "presence `'{name}` is produced at more than one lifetime; use a different name at each result boundary",
             ),
             // Counted in words, and said as what the type takes rather than as
             // what the reader failed to supply — the count is the fact, and
