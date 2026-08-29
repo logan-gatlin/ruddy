@@ -60,12 +60,19 @@ trap 'exit 143' TERM
 
 # Copy only the manifest and Ruddy source tree. In particular, build products,
 # repository metadata, and editor files never become part of the installation.
-cp "$source/Ruddy.toml" "$staging/Ruddy.toml"
+# Discover into a regular file first: bash does not propagate a process
+# substitution's status, so `while ... < <(find ...)` could commit the files
+# emitted before a failed find and silently replace a complete installation.
+source_files=$staging/.source-files
+find "$source" -path "$source/build" -prune -o -type f -name '*.hc' -print0 >"$source_files"
+cp -- "$source/Ruddy.toml" "$staging/Ruddy.toml"
 while IFS= read -r -d '' file; do
   relative=${file#"$source"/}
-  mkdir -p "$staging/$(dirname "$relative")"
-  cp "$file" "$staging/$relative"
-done < <(find "$source" -path "$source/build" -prune -o -type f -name '*.hc' -print0)
+  destination=$staging/$relative
+  mkdir -p -- "${destination%/*}"
+  cp -- "$file" "$destination"
+done <"$source_files"
+rm -- "$source_files"
 
 # Tests use this barrier to interrupt a fully staged install before its commit.
 # It is intentionally private and has no effect unless explicitly requested.
