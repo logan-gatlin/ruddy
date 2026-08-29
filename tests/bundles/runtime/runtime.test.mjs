@@ -13,6 +13,21 @@ globalThis.host = {
     next(value) {
       return this.base + value;
     },
+    add(left, right) {
+      return this.base + left + right;
+    },
+    nullary() {
+      return this.base + 2;
+    },
+  },
+  curriedAdd(left) {
+    return (right) => left + right;
+  },
+  applyPair(callback, left, right) {
+    return callback(left, right);
+  },
+  makeAdder(offset) {
+    return (left, right) => offset + left + right;
   },
 };
 
@@ -41,4 +56,13 @@ test("preserves records and pattern matching", () => {
 test("runs effects and binds extern methods to their receiver", () => {
   assert.equal(app.bump(41), 42);
   assert.equal(app.next(2), 42);
+});
+
+test("adapts n-ary, nullary, curried, callback, and returned extern functions", () => {
+  assert.equal(app.added, 62);
+  assert.equal(app.add_twenty(2), 62);
+  assert.equal(app.nullary_answer, 42);
+  assert.equal(app.curried_answer, 42);
+  assert.equal(app.callback_answer, 42);
+  assert.equal(app.nested_result, 42);
 });
