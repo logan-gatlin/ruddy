@@ -2817,25 +2817,23 @@ fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
     let source = "effect Needed = { get: () -> Nat }\n\
          effect Spare = { get: () -> Nat }\n\
          extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = host.install\n\
-         let call = handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
+         let call : () -> () + !Spare = fn _ => handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
     let printed = listing(source);
-    let adapter = printed
+    let marked = printed
         .split("\n\n")
-        .find(|part| part.starts_with("fn install#extern#callback#"))
-        .expect("the callback adapter is emitted");
+        .find(|part| part.starts_with("fn install#extern#0"))
+        .expect("the marked extern adapter is emitted");
     assert!(
-        adapter
-            .lines()
-            .any(|line| line.contains(" = struct { Needed:")),
-        "definite caller evidence is repacked for the conditional callback label:\n{printed}"
+        marked.contains(concat!(
+            "  %5: struct = struct { Needed: %2 }\n",
+            "  %6: struct = merge %3, %5\n",
+            "  %14: fn = closure install#extern#callback#1, [%4, %6]"
+        )),
+        "Needed must overlay the instantiated Spare tail captured by the callback:\n{printed}"
     );
     assert!(
-        adapter.lines().any(|line| line.contains(" = merge ")),
-        "the named conditional evidence overlays, rather than replaces, the shared tail:\n{printed}"
-    );
-    assert!(
-        !adapter.lines().any(|line| line.contains("Spare:")),
-        "unrelated named evidence does not leak into the callback bundle:\n{printed}"
+        !marked.contains("Spare:"),
+        "Spare remains an opaque shared tail instead of becoming named overlay evidence:\n{printed}"
     );
 }
 
@@ -2847,18 +2845,21 @@ fn restricted_callback_bundles_project_shared_open_tails() {
          let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects =
            fn callback => install callback";
     let printed = listing(source);
+    let marked = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#0"))
+        .expect("the marked extern adapter is emitted");
     assert!(
-        printed
-            .lines()
-            .any(|line| line.contains("project ") && line.contains(", \"Needed\"")),
-        "the requested conditional effect is projected from the shared open tail:\n{printed}"
+        marked.contains(concat!(
+            "  %4: struct = project %2, \"Needed\"\n",
+            "  %5: struct = struct { Needed: %4 }\n",
+            "  %12: fn = closure install#extern#callback#1, [%3, %5]"
+        )),
+        "the callback must capture exactly its value and projected Needed record, not ambient %2:\n{printed}"
     );
     assert!(
-        !printed
-            .lines()
-            .filter(|line| line.contains("closure install#extern#callback#"))
-            .any(|line| line.contains("Spare")),
-        "opaque tail contents are not captured wholesale:\n{printed}"
+        !marked.contains("Spare:") && !marked.contains(" = merge "),
+        "opaque ambient tail contents must not be named or merged into the capture:\n{printed}"
     );
 }
 

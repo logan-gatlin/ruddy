@@ -78,14 +78,15 @@ test("preserves records and pattern matching", () => {
   assert.equal(app.read_tag({}), 0);
 });
 
-test("runs effects and binds extern methods to their receiver", () => {
+test("runs effects and binds raw and marked extern adapters to their receiver", () => {
   assert.equal(app.bump(41), 42);
   assert.equal(app.next(2), 42);
+  // `add` has a generated n-ary `#extern` adapter, unlike the raw unary `next`.
+  assert.equal(app.added, 62);
+  assert.equal(app.add_twenty(2), 62);
 });
 
 test("adapts n-ary, nullary, curried, callback, and returned extern functions", () => {
-  assert.equal(app.added, 62);
-  assert.equal(app.add_twenty(2), 62);
   assert.equal(app.nullary_answer, 42);
   assert.equal(app.curried_answer, 42);
   assert.equal(app.callback_answer, 42);
