@@ -1345,6 +1345,10 @@ struct Builder<'a> {
     /// already known to be one, and passing a term where a containing module
     /// goes is what that newtype exists to rule out.
     modules: HashMap<(Option<Module>, String), (Module, Span)>,
+    /// The immediate `prelude` module of the direct dependency imported under
+    /// the source alias `std`. Bare lookup consults its direct members only,
+    /// after every ordinary user scope has failed.
+    std_prelude: Option<Module>,
     /// What each declared effect stands for: itself, for one that declares
     /// operations, and the effects it names — transitively — for an alias.
     ///
@@ -1964,6 +1968,7 @@ fn build_with_dependency_imports_inner(
         terms: Names::default(),
         globals: HashMap::new(),
         modules: HashMap::new(),
+        std_prelude: None,
         expanded: HashMap::new(),
         operations: HashMap::new(),
         answering: Answering::Nowhere,
@@ -7629,6 +7634,12 @@ impl Builder<'_> {
                 let symbol = symbols[&(namespace, qualified.clone())];
                 self.globals.insert(key, (symbol, Span::default()));
             }
+            if import.alias == "std" {
+                self.std_prelude = self
+                    .modules
+                    .get(&(Some(root), "prelude".to_string()))
+                    .map(|&(module, _)| module);
+            }
         }
 
         for dependency in linked
@@ -7906,26 +7917,42 @@ impl Builder<'_> {
 
     /// R9's walk for a global: the module being lowered into, then each
     /// enclosing module in turn, then the bundle root. The first match wins.
+    /// If the user tree has no match, direct members of the configured std
+    /// prelude provide the final fallback.
     fn outward(&self, namespace: Namespace, name: &str) -> Option<Symbol> {
         let mut at = self.module;
         loop {
             if let Some(symbol) = self.global_in(at, namespace, name) {
                 return Some(symbol);
             }
-            at = self.mint.parent(at?.symbol());
+            let Some(module) = at else {
+                break;
+            };
+            at = self.mint.parent(module.symbol());
         }
+        self.std_prelude
+            .and_then(|prelude| self.global_in(Some(prelude), namespace, name))
     }
 
     /// [`outward`](Self::outward) about modules, which is how a path's first
-    /// segment is resolved.
+    /// segment is resolved. A direct child module of the configured std
+    /// prelude is the final fallback.
     fn module_outward(&self, name: &str) -> Option<Module> {
         let mut at = self.module;
         loop {
             if let Some(&(module, _)) = self.modules.get(&(at, name.to_owned())) {
                 return Some(module);
             }
-            at = self.mint.parent(at?.symbol());
+            let Some(module) = at else {
+                break;
+            };
+            at = self.mint.parent(module.symbol());
         }
+        self.std_prelude.and_then(|prelude| {
+            self.modules
+                .get(&(Some(prelude), name.to_owned()))
+                .map(|&(module, _)| module)
+        })
     }
 
     /// Which module a path's segments name: `Some(None)` for a bare name, whose

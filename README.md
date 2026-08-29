@@ -36,7 +36,7 @@ Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—R
 
 ### Standard library
 
-Every project implicitly receives a dependency named `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. The bundled `std@0.1.0` is initially empty; its source project lives in [`std/`](std/).
+Every project implicitly receives a dependency under the source alias `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available through qualified `std::…` names. Direct terms, types, effects, and child modules of its `prelude` module are also available unqualified in every application module. Prelude child modules retain their structure—their own declarations are reached through the child module rather than flattened—and `std::prelude::…` always remains available. Lexical and user-module declarations shadow same-named prelude members; namespaces remain independent. The bundled `std@0.1.0` is initially empty; its source project lives in [`std/`](std/).
 
 A project can disable this dependency or replace it with any normal path or Git dependency using the `std` option under `[dependencies]`:
 
@@ -53,7 +53,7 @@ std = false
 # std = { git = "https://example.com/foundation.git", rev = "0123456", bundle = "foundation" }
 ```
 
-The optional `bundle` is the dependency project's actual manifest name when that differs from the source alias: the second example is still referenced as `std::…`, but its artifact identity is `foundation`. Relative paths are resolved from the manifest that declares them. Git overrides use the normal shared cache and selectors, and every transitive resolution is recorded in the root project's lockfile rather than a dependency-local lockfile.
+The optional `bundle` is the dependency project's actual manifest name when that differs from the source alias: the second example is still referenced as `std::…`, and its `prelude` is still opened implicitly, even though its artifact identity is `foundation`. Disabling std removes the implicit prelude along with the qualified dependency; an unrelated dependency whose artifact happens to be named `std` does not provide one unless its source alias is `std`. Relative paths are resolved from the manifest that declares them. Git overrides use the normal shared cache and selectors, and every transitive resolution is recorded in the root project's lockfile rather than a dependency-local lockfile.
 
 `std = true` is invalid: omit the key from `[dependencies]` to use the installed library. The `std` key is reserved for this setting rather than a normal declared dependency, though another alias may legally target a bundle actually named `std`. `ruddy new` deliberately omits the setting and uses the installed default.
 
