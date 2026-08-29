@@ -850,6 +850,7 @@ fn presence_polarities(
     // stack. Push in reverse source order so first-occurrence diagnostics stay
     // deterministic.
     let mut out = HashMap::new();
+    let mut seen: HashMap<(usize, Span), u8> = HashMap::new();
     let mut work = vec![Work::Ty(ty, true, ty.span)];
     while let Some(part) = work.pop() {
         match part {
@@ -860,50 +861,60 @@ fn presence_polarities(
                     }
                 }
             }
-            Work::Ty(ty, positive, owner) => match &ty.tracked {
-                TypeKind::Arrow { from, to, effects } => {
-                    work.push(Work::Effects(effects, positive, owner));
-                    let result_owner = if positive { to.span } else { owner };
-                    work.push(Work::Ty(to, positive, result_owner));
-                    work.push(Work::Ty(from, !positive, owner));
+            Work::Ty(ty, positive, owner) => {
+                let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                let visited = seen.entry((ty as *const Type as usize, owner)).or_default();
+                if *visited & bit != 0 {
+                    continue;
                 }
-                TypeKind::Struct { fields, .. } => {
-                    for field in fields.values().rev() {
-                        if let TypeField::Written { when, value, .. } = field {
-                            note(&mut out, when, positive, owner);
-                            work.push(Work::Ty(value, positive, owner));
-                        }
+                *visited |= bit;
+                match &ty.tracked {
+                    TypeKind::Arrow { from, to, effects } => {
+                        work.push(Work::Effects(effects, positive, owner));
+                        let result_owner = if positive { to.span } else { owner };
+                        work.push(Work::Ty(to, positive, result_owner));
+                        work.push(Work::Ty(from, !positive, owner));
                     }
-                }
-                TypeKind::Sum { cases, .. } => {
-                    for case in cases.values().rev() {
-                        if let SumCase::Written { when, payload, .. } = case {
-                            note(&mut out, when, positive, owner);
-                            if let Some(payload) = payload {
-                                work.push(Work::Ty(payload, positive, owner));
+                    TypeKind::Struct { fields, .. } => {
+                        for field in fields.values().rev() {
+                            if let TypeField::Written { when, value, .. } = field {
+                                note(&mut out, when, positive, owner);
+                                work.push(Work::Ty(value, positive, owner));
                             }
                         }
                     }
-                }
-                TypeKind::Effects(effects) => work.push(Work::Effects(effects, positive, owner)),
-                TypeKind::Apply { head, args, .. } => {
-                    for (at, arg) in args.iter().enumerate().rev() {
-                        let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
-                        if variance & 2 != 0 {
-                            work.push(Work::Ty(arg, !positive, owner));
-                        }
-                        if variance & 1 != 0 {
-                            work.push(Work::Ty(arg, positive, owner));
+                    TypeKind::Sum { cases, .. } => {
+                        for case in cases.values().rev() {
+                            if let SumCase::Written { when, payload, .. } = case {
+                                note(&mut out, when, positive, owner);
+                                if let Some(payload) = payload {
+                                    work.push(Work::Ty(payload, positive, owner));
+                                }
+                            }
                         }
                     }
+                    TypeKind::Effects(effects) => {
+                        work.push(Work::Effects(effects, positive, owner))
+                    }
+                    TypeKind::Apply { head, args, .. } => {
+                        for (at, arg) in args.iter().enumerate().rev() {
+                            let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
+                            if variance & 2 != 0 {
+                                work.push(Work::Ty(arg, !positive, owner));
+                            }
+                            if variance & 1 != 0 {
+                                work.push(Work::Ty(arg, positive, owner));
+                            }
+                        }
+                    }
+                    TypeKind::Ident(_)
+                    | TypeKind::Param { .. }
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => {}
                 }
-                TypeKind::Ident(_)
-                | TypeKind::Param { .. }
-                | TypeKind::Prim(_)
-                | TypeKind::Var(_)
-                | TypeKind::Hole
-                | TypeKind::Error => {}
-            },
+            }
         }
     }
     out
@@ -936,9 +947,15 @@ fn declaration_variances(
     loop {
         let before = out.clone();
         for (owner, decl) in local {
+            let mut seen: HashMap<usize, u8> = HashMap::new();
             let mut work = vec![(&decl.value, true)];
             while let Some((ty, positive)) = work.pop() {
                 let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                let visited = seen.entry(ty as *const Type as usize).or_default();
+                if *visited & bit != 0 {
+                    continue;
+                }
+                *visited |= bit;
                 match &ty.tracked {
                     TypeKind::Param { index, .. } => {
                         *out.entry((*owner, *index)).or_default() |= bit;
@@ -1017,11 +1034,17 @@ fn declaration_variances(
             Row(&'a crate::types::Row, bool),
         }
         for (owner, decl) in imported {
+            let mut seen: HashMap<usize, u8> = HashMap::new();
             let mut work = vec![Semantic::Ty(decl.scheme.body(), true)];
             while let Some(item) = work.pop() {
                 match item {
                     Semantic::Ty(ty, positive) => {
                         let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        let visited = seen.entry(ty as *const Ty as usize).or_default();
+                        if *visited & bit != 0 {
+                            continue;
+                        }
+                        *visited |= bit;
                         match ty {
                             Ty::Bound(index) if (*index as usize) < decl.params.len() => {
                                 *out.entry((*owner, *index)).or_default() |= bit;

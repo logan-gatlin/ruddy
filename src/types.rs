@@ -1198,8 +1198,12 @@ fn partition_package_formula(
             let Atom::Bound(index) = atom else {
                 return part;
             };
+            // A conjunct that relates a caller-owned input to a hidden result
+            // is still a guarantee of that result package. Keep the universal
+            // atom in the clause, but select ownership from its existential
+            // atoms so opening the package can rename only the fresh witness.
             if !existentials.contains(&index) {
-                return part;
+                continue;
             }
             let Some(owner) = owners.get(&index).copied() else {
                 return part;
