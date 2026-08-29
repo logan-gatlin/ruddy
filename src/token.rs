@@ -138,9 +138,10 @@ pub enum Kind {
     Natural(u64),
     /// A signed 64-bit integer literal, written with an `i` suffix.
     Integer(i64),
-    /// A canonical numeric field after a projection dot. Kept distinct from a
-    /// suffixless real so `pair.0` names field `"0"` rather than projecting a
-    /// value expression. Leading zeroes are discarded by the numeric value.
+    /// A canonical numeric field after a projection dot or in a structural
+    /// field-label position. Kept distinct from a suffixless real so `pair.0`
+    /// and `{0: value}` name field `"0"` without changing ordinary numeric
+    /// expressions. Leading zeroes are discarded by the numeric value.
     NumericField(u64),
     /// A 64-bit floating-point literal. The suffixless spelling is real.
     Real(f64),
@@ -176,9 +177,16 @@ pub struct Output {
     pub errors: Vec<Error>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    Brace,
+    Paren,
+}
+
 pub fn lex(input: &str, file_id: FileID) -> Output {
     let mut tokens = Vec::new();
     let mut errors = Vec::new();
+    let mut delimiters = Vec::new();
 
     let mut chars = input.char_indices().peekable();
     while let Some(&(start, c)) = chars.peek() {
@@ -350,18 +358,26 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
             }
             '{' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftBrace));
+                delimiters.push(Delimiter::Brace);
                 chars.next();
             }
             '}' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::RightBrace));
+                if delimiters.last() == Some(&Delimiter::Brace) {
+                    delimiters.pop();
+                }
                 chars.next();
             }
             '(' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::LeftParen));
+                delimiters.push(Delimiter::Paren);
                 chars.next();
             }
             ')' => {
                 tokens.push(file_id.span(start, c.len_utf8()).track(Kind::RightParen));
+                if delimiters.last() == Some(&Delimiter::Paren) {
+                    delimiters.pop();
+                }
                 chars.next();
             }
             // Identifiers and keywords: start with a letter or underscore,
@@ -402,20 +418,21 @@ pub fn lex(input: &str, file_id: FileID) -> Output {
                 };
                 tokens.push(span.track(kind));
             }
-            // A digit run after a projection dot names a positional field.
-            // The lexer keeps this contextual distinction because ordinary
-            // suffixless numbers are reals. Whitespace is insignificant, so
-            // `pair. 0` has the same tokens as `pair.0`.
+            // A digit run after a projection dot or at the start of a field
+            // entry names a positional field. The lexer keeps this contextual
+            // distinction because ordinary suffixless numbers are reals.
+            // Whitespace is insignificant in both positions.
             //
             // Read the whole number-shaped lexeme before validating it. This
-            // makes `.0n` and `.0.0` one malformed projection field rather
+            // makes `.0n`, `.0.0`, and `{0n: x}` one malformed field rather
             // than a valid field followed by surprising extra tokens.
             c if c.is_ascii_digit()
-                && matches!(
-                    tokens.last(),
-                    Some(tok) if matches!(tok.tracked, Kind::Dot)
-                        && errors.last().is_none_or(|error| error.span.start < tok.span.start)
-                ) =>
+                && numeric_field_position(&tokens, &delimiters)
+                && tokens.last().is_some_and(|tok| {
+                    errors
+                        .last()
+                        .is_none_or(|error| error.span.start < tok.span.start)
+                }) =>
             {
                 let literal = number(&mut chars);
                 let span = file_id.span(start, literal.len());
@@ -571,6 +588,22 @@ fn number(chars: &mut Peekable<CharIndices<'_>>) -> String {
         }
     }
     literal
+}
+
+/// Whether the next token occupies a structural numeric-label position.
+///
+/// Braces are structural throughout Ruddy, but values inside them may contain
+/// arbitrary nested expressions. The innermost unmatched delimiter keeps
+/// `(1, 2)` and `{ x: (1, 2) }` as ordinary real expressions, while recognizing
+/// the first field and every brace-level field after a comma. A backslash is
+/// included for an absent struct-type field.
+fn numeric_field_position(tokens: &[Token], delimiters: &[Delimiter]) -> bool {
+    let Some(previous) = tokens.last() else {
+        return false;
+    };
+    matches!(previous.tracked, Kind::Dot | Kind::LeftBrace)
+        || (matches!(previous.tracked, Kind::Comma | Kind::Backslash)
+            && delimiters.last() == Some(&Delimiter::Brace))
 }
 
 fn numeric_field(literal: &str) -> Result<Kind, ErrorKind> {

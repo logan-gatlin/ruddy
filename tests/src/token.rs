@@ -115,6 +115,79 @@ fn lexes_numeric_projection_fields() {
 }
 
 #[test]
+fn lexes_numeric_struct_fields_without_changing_real_expressions() {
+    assert!(matches!(
+        kinds("{ 001: 2, x: (3, 4), inner: { \\05, 6: 7 } }")[..],
+        [
+            Kind::LeftBrace,
+            Kind::NumericField(1),
+            Kind::Colon,
+            Kind::Real(_),
+            Kind::Comma,
+            Kind::Identifier(_),
+            Kind::Colon,
+            Kind::LeftParen,
+            Kind::Real(_),
+            Kind::Comma,
+            Kind::Real(_),
+            Kind::RightParen,
+            Kind::Comma,
+            Kind::Identifier(_),
+            Kind::Colon,
+            Kind::LeftBrace,
+            Kind::Backslash,
+            Kind::NumericField(5),
+            Kind::Comma,
+            Kind::NumericField(6),
+            Kind::Colon,
+            Kind::Real(_),
+            Kind::RightBrace,
+            Kind::RightBrace,
+        ]
+    ));
+
+    // Numeric expressions in field values and tuples retain suffixless-real
+    // semantics; only the label position is contextual.
+    assert!(matches!(
+        kinds("{ 0: 1 + 2, x: (3, 4) }")[..],
+        [
+            Kind::LeftBrace,
+            Kind::NumericField(0),
+            Kind::Colon,
+            Kind::Real(_),
+            Kind::Plus,
+            Kind::Real(_),
+            Kind::Comma,
+            Kind::Identifier(_),
+            Kind::Colon,
+            Kind::LeftParen,
+            Kind::Real(_),
+            Kind::Comma,
+            Kind::Real(_),
+            Kind::RightParen,
+            Kind::RightBrace,
+        ]
+    ));
+}
+
+#[test]
+fn numeric_struct_fields_reject_number_forms_and_overflow() {
+    for malformed in ["{0n: x}", "{0i: x}", "{0.0: x}", "{0²: x}"] {
+        let out = lex(malformed, FileID::GENERATED);
+        assert_eq!(
+            out.errors.len(),
+            1,
+            "errors for {malformed:?}: {:#?}",
+            out.errors
+        );
+        assert_eq!(out.errors[0].kind, ErrorKind::MalformedNatural);
+    }
+
+    let over = format!("{{{}0: x}}", u64::MAX);
+    assert_eq!(errors(&over)[0].kind, ErrorKind::NaturalTooLarge);
+}
+
+#[test]
 fn numeric_projection_fields_reject_number_forms() {
     for malformed in ["pair.0n", "pair.0i", "pair.0.0", "pair.0²"] {
         let out = lex(malformed, FileID::GENERATED);

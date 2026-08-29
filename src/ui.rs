@@ -314,7 +314,10 @@ pub fn write_string(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 
 /// Write a field label in its shortest unambiguous source spelling.
 pub fn write_field_label(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
-    if bare_identifier(name) {
+    let canonical_numeric = name
+        .parse::<u64>()
+        .is_ok_and(|value| value.to_string() == name);
+    if bare_identifier(name) || canonical_numeric {
         f.write_str(name)
     } else {
         write_string(f, name)
