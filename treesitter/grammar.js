@@ -349,7 +349,12 @@ module.exports = grammar({
     _atom_projection: $ => prec.left(PREC.projection, seq(
       field('base', choice($._atom, alias($._atom_projection, $.projection))),
       '.',
-      field('field', choice($.identifier, $.string, $.numeric_field)),
+      field('field', choice(
+        $.identifier,
+        $.string,
+        $.numeric_field,
+        alias($._malformed_numeric_field, $.ERROR),
+      )),
     )),
 
     _atom: $ => choice(
@@ -376,7 +381,12 @@ module.exports = grammar({
         $.handle_expression,
       )),
       '.',
-      field('field', choice($.identifier, $.string, $.numeric_field)),
+      field('field', choice(
+        $.identifier,
+        $.string,
+        $.numeric_field,
+        alias($._malformed_numeric_field, $.ERROR),
+      )),
     )),
 
     /** `fn <arg>+ => <expr>` — the body runs as far right as it can. */
@@ -803,6 +813,12 @@ module.exports = grammar({
 
     /** A decimal positional field following a projection dot. */
     numeric_field: _ => /[0-9]+/,
+
+    /** A numeric field with a suffix, rejected like the compiler's literal. */
+    _malformed_numeric_field: _ => new RegExp(
+      /[0-9]+[\p{Alphabetic}\p{N}_]+/.source,
+      'u',
+    ),
 
     /** A double-quoted UTF-8 string with the escapes token::lex accepts. */
     string: _ => token(seq('"', repeat(choice(/[^"\\\n]/, /\\["\\nrt]/)), '"')),

@@ -106,6 +106,14 @@ impl Grouped for Ast<'_, ExprKind> {
             | ExprKind::Unit => Prec::Atom,
         }
     }
+
+    fn ends_in_numeric_projection(&self) -> bool {
+        matches!(
+            self.0,
+            ExprKind::Project { field, .. }
+                if ruddy::ui::canonical_tuple_index(&field.tracked).is_some()
+        )
+    }
 }
 
 impl fmt::Display for Ast<'_, StmtKind> {

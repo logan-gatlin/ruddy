@@ -91,6 +91,13 @@ pub const DECLARED_HERE: &str = "declared here";
 /// directly.
 pub trait Grouped: fmt::Display {
     fn prec(&self) -> Prec;
+
+    /// Whether this node's surface spelling ends in a numeric projection.
+    /// Another numeric projection must parenthesize such a base: `.0.0` is
+    /// deliberately lexed as one malformed decimal-like field.
+    fn ends_in_numeric_projection(&self) -> bool {
+        false
+    }
 }
 
 /// A reference groups as what it points at, so a printer can hand out borrowed
@@ -98,6 +105,10 @@ pub trait Grouped: fmt::Display {
 impl<T: Grouped + ?Sized> Grouped for &T {
     fn prec(&self) -> Prec {
         (**self).prec()
+    }
+
+    fn ends_in_numeric_projection(&self) -> bool {
+        (**self).ends_in_numeric_projection()
     }
 }
 
@@ -2634,11 +2645,18 @@ pub fn write_match<P: fmt::Display, B: fmt::Display>(
 }
 
 /// Render `base.field`. Projection binds tighter than everything that follows a
-/// space, so only the forms that extend rightward need grouping.
+/// space, so only the forms that extend rightward need grouping. Consecutive
+/// numeric projections are the exception: the lexer deliberately rejects
+/// `.0.0` as decimal-like malformed syntax, so the base is parenthesized.
 pub fn write_project(f: &mut fmt::Formatter<'_>, base: &impl Grouped, field: &str) -> fmt::Result {
-    write_grouped(f, base.prec() < Prec::Atom, base)?;
+    let index = canonical_tuple_index(field);
+    write_grouped(
+        f,
+        base.prec() < Prec::Atom || (index.is_some() && base.ends_in_numeric_projection()),
+        base,
+    )?;
     f.write_str(".")?;
-    match canonical_tuple_index(field) {
+    match index {
         Some(index) => write!(f, "{index}"),
         None => write_field_label(f, field),
     }

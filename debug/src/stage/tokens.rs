@@ -137,7 +137,7 @@ pub fn label(kind: &Kind) -> &'static str {
 pub fn class(kind: &Kind) -> &'static str {
     match kind {
         Kind::Identifier(_) => "ident",
-        Kind::Natural(_) | Kind::Integer(_) | Kind::Real(_) => "number",
+        Kind::Natural(_) | Kind::Integer(_) | Kind::NumericField(_) | Kind::Real(_) => "number",
         Kind::String(_) => "string",
         Kind::Boolean(_) => "boolean",
         Kind::Tag(_) => "tag",

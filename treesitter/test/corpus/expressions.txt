@@ -351,3 +351,18 @@ let invalid = # "case"
     (ERROR
       (UNEXPECTED ' '))
     (string)))
+
+================================================================================
+A suffixed numeric projection is malformed, not an application
+================================================================================
+
+let invalid = p.0n
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR))))
