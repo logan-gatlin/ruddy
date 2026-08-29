@@ -103,6 +103,26 @@ fn one_existential_package_keeps_shared_label_identity() {
     );
 }
 
+/// R16 deliberately gives aliases fresh views of a hidden package. Learning a
+/// field through one alias must not correlate a separately bound alias, even
+/// when both came from the same source expression.
+#[test]
+fn separate_alias_views_do_not_share_existential_witnesses() {
+    let (_, _, output) = infer_src(
+        "extern choose: Nat ->\n\
+         { left when 'p: Nat, also when 'p: Nat, right when 'q: Nat }\n\
+         where 'p != 'q = host.choose\n\
+         let source = choose 1n\n\
+         let first = source\n\
+         let second = source\n\
+         let bad = match first with\n\
+         | { left, .. } => second.also\n\
+         | { right, .. } => 0n\n\
+         end",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
 #[test]
 fn separate_partial_application_calls_do_not_share_existential_witnesses() {
     let (_, _, output) = infer_src(

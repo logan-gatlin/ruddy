@@ -3467,77 +3467,140 @@ pub mod text {
             // shape or from which existential slots happen to occur nearby.
             let mut package_count = 0u32;
             let mut slot_owners = HashMap::new();
-            let mut tys = vec![(&body, None)];
-            while let Some((ty, owner)) = tys.pop() {
-                match ty {
-                    Type::Package(inner) => {
-                        let here = package_count;
-                        package_count += 1;
-                        tys.push((inner, Some(here)));
-                    }
-                    Type::Arrow(from, to, row) => {
-                        for (_, field) in row.labels.iter().rev() {
-                            if let Presence::Bound(index) = field.presence
-                                && existentials.contains(&index)
-                                && let Some(owner) = owner
-                                && slot_owners
-                                    .insert(index, owner)
-                                    .is_some_and(|before| before != owner)
-                            {
-                                self.fail("existential presence crosses package owners");
+            enum Part<'a> {
+                Ty(&'a Type, Option<u32>),
+                Row(&'a Row, Option<u32>),
+            }
+            let mut parts = vec![Part::Ty(&body, None)];
+            while let Some(part) = parts.pop() {
+                match part {
+                    Part::Ty(ty, owner) => match ty {
+                        Type::Bound(index) => {
+                            if *index < presences || *index >= count {
+                                self.fail("type bound is outside the type quantifier space");
                             }
-                            tys.push((&field.ty, owner));
                         }
-                        tys.push((to, owner));
-                        tys.push((from, owner));
-                    }
-                    Type::Struct(row) | Type::Sum(row) => {
+                        Type::Package(inner) => {
+                            let here = package_count;
+                            package_count += 1;
+                            parts.push(Part::Ty(inner, Some(here)));
+                        }
+                        Type::Arrow(from, to, row) => {
+                            parts.push(Part::Row(row, owner));
+                            parts.push(Part::Ty(to, owner));
+                            parts.push(Part::Ty(from, owner));
+                        }
+                        Type::Struct(row) | Type::Sum(row) => {
+                            parts.push(Part::Row(row, owner));
+                        }
+                        Type::Named { args, .. } => {
+                            parts.extend(args.iter().rev().map(|ty| Part::Ty(ty, owner)))
+                        }
+                        _ => {}
+                    },
+                    Part::Row(row, owner) => {
+                        if let Rest::Bound(index) = row.rest
+                            && (index < presences || index >= count)
+                        {
+                            self.fail("row bound is outside the row quantifier space");
+                        }
+                        if let Rest::More(more) = &row.rest {
+                            parts.push(Part::Row(more, owner));
+                        }
                         for (_, field) in row.labels.iter().rev() {
-                            if let Presence::Bound(index) = field.presence
-                                && existentials.contains(&index)
-                                && let Some(owner) = owner
-                                && slot_owners
-                                    .insert(index, owner)
-                                    .is_some_and(|before| before != owner)
-                            {
-                                self.fail("existential presence crosses package owners");
+                            if let Presence::Bound(index) = field.presence {
+                                if index >= presences {
+                                    self.fail(
+                                        "presence bound is outside the presence quantifier space",
+                                    );
+                                }
+                                if existentials.contains(&index) {
+                                    let Some(owner) = owner else {
+                                        self.fail("existential presence occurs outside a package");
+                                        continue;
+                                    };
+                                    if slot_owners
+                                        .insert(index, owner)
+                                        .is_some_and(|before| before != owner)
+                                    {
+                                        self.fail("existential presence crosses package owners");
+                                    }
+                                }
                             }
-                            tys.push((&field.ty, owner));
+                            parts.push(Part::Ty(&field.ty, owner));
                         }
                     }
-                    Type::Named { args, .. } => tys.extend(args.iter().rev().map(|ty| (ty, owner))),
-                    _ => {}
                 }
             }
-            let mut formulas = vec![(&formula, None)];
-            while let Some((part, claimed)) = formulas.pop() {
-                match part {
+            if existentials
+                .iter()
+                .any(|index| !slot_owners.contains_key(index))
+            {
+                self.fail("existential presence has no package-owned occurrence");
+            }
+
+            // `Owned` is a canonical wrapper around one top-level conjunct.
+            // An independently package-owned conjunct must have the wrapper;
+            // mixed/universal conjuncts must not. This rejects metadata that is
+            // locally plausible but incomplete, which would otherwise change
+            // meaning when the scheme is opened one package at a time.
+            let mut conjuncts = vec![&formula];
+            while let Some(part) = conjuncts.pop() {
+                if let Formula::And(left, right) = part {
+                    conjuncts.push(right);
+                    conjuncts.push(left);
+                    continue;
+                }
+                let (claimed, inner) = match part {
                     Formula::Owned(owner, inner) => {
                         if *owner >= package_count {
                             self.fail("formula package owner is outside scheme body");
                         }
-                        if claimed.is_some() {
+                        (Some(*owner), &**inner)
+                    }
+                    _ => (None, part),
+                };
+                let mut atoms = Vec::new();
+                let mut formulas = vec![inner];
+                while let Some(formula) = formulas.pop() {
+                    match formula {
+                        Formula::Bound(index) => {
+                            if *index >= presences {
+                                self.fail("formula bound is outside the presence quantifier space");
+                            }
+                            atoms.push(*index);
+                        }
+                        Formula::Var(_) if claimed.is_some() => {
+                            self.fail("formula package owner contains an open atom");
+                        }
+                        Formula::Owned(_, _) => {
                             self.fail("nested formula package owners are not canonical");
                         }
-                        formulas.push((inner, Some(*owner)));
-                    }
-                    Formula::Bound(index) if claimed.is_some() => {
-                        if slot_owners.get(index) != claimed.as_ref() {
-                            self.fail("formula atom does not belong to its package owner");
+                        Formula::Not(inner) => formulas.push(inner),
+                        Formula::And(_, _) if claimed.is_some() => {
+                            self.fail("owned conjunction is not canonical");
                         }
+                        Formula::And(left, right)
+                        | Formula::Or(left, right)
+                        | Formula::Iff(left, right)
+                        | Formula::Xor(left, right) => {
+                            formulas.push(right);
+                            formulas.push(left);
+                        }
+                        Formula::True | Formula::False | Formula::Var(_) => {}
                     }
-                    Formula::Var(_) if claimed.is_some() => {
-                        self.fail("formula package owner contains an open atom");
-                    }
-                    Formula::Not(inner) => formulas.push((inner, claimed)),
-                    Formula::And(left, right)
-                    | Formula::Or(left, right)
-                    | Formula::Iff(left, right)
-                    | Formula::Xor(left, right) => {
-                        formulas.push((right, claimed));
-                        formulas.push((left, claimed));
-                    }
-                    _ => {}
+                }
+                let inferred = atoms.first().and_then(|first| {
+                    let owner = slot_owners.get(first).copied()?;
+                    atoms
+                        .iter()
+                        .all(|index| {
+                            existentials.contains(index) && slot_owners.get(index) == Some(&owner)
+                        })
+                        .then_some(owner)
+                });
+                if claimed != inferred {
+                    self.fail("formula package ownership is incomplete or non-canonical");
                 }
             }
             Scheme {
