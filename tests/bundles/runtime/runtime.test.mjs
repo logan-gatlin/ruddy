@@ -43,6 +43,10 @@ globalThis.host = {
     const [callback, first, second] = args;
     return callback(first)(second);
   },
+  invokeConditionalShared(...args) {
+    assert.equal(args.length, 1, "conditional/shared-tail evidence crossed the foreign boundary");
+    return args[0]();
+  },
   loop() {
     return this.loop.bind(this);
   },
@@ -89,6 +93,7 @@ test("adapts n-ary, nullary, curried, callback, and returned extern functions", 
   assert.equal(app.ticked, 42);
   assert.equal(app.callback_ticked, 42);
   assert.equal(app.returned_callback_ticked, 42);
+  assert.equal(app.conditional_shared_result, 42);
   assert.equal(app.host_looped, 42);
   assert.equal(app.ruddy_looped, 42);
 });
