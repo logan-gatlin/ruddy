@@ -560,7 +560,20 @@ fn nested_existential_result_boundaries_survive_artifact_text() {
         .find(|value| value.name.ends_with("::nested"))
         .expect("the nested extern survives decoding");
     assert_eq!(reparsed.scheme.existentials, value.scheme.existentials);
+    assert!(
+        matches!(reparsed.scheme.formula, Formula::Owned(0, _)),
+        "the guarantee belongs to the exact nested result package: {:#?}",
+        reparsed.scheme.formula
+    );
     assert!(printed.contains("(existentials"), "{printed}");
+    assert!(printed.contains("(owned 0 (xor"), "{printed}");
+
+    let invalid = printed.replacen("(owned 0", "(owned 1", 1);
+    let error = Artifact::try_parse(&invalid).expect_err("owner 1 names no package");
+    assert_eq!(
+        error.message(),
+        "formula package owner is outside scheme body"
+    );
 }
 
 #[test]

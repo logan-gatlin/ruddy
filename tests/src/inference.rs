@@ -69,6 +69,14 @@ fn positive_result_presences_can_forget_input_correlations() {
         scheme(&mint, &output, "forget"),
         "{ left when 'a: 'e, right when 'b: 'e } -> { left when 'c: 'e, right when 'd: 'e } where ('a != 'b) and ('c != 'd)"
     );
+    let symbol = symbol_named(&mint, output.schemes.keys().copied(), "forget");
+    let Formula::And(input, output_formula) = output.schemes[&symbol].formula() else {
+        panic!("independent input/output guarantees must remain partitionable");
+    };
+    assert!(matches!(&**input, Formula::Xor(..)));
+    assert!(
+        matches!(&**output_formula, Formula::Owned(0, inner) if matches!(&**inner, Formula::Xor(..)))
+    );
 }
 
 #[test]

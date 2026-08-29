@@ -2975,7 +2975,7 @@ fn drop_formula_iterative(root: crate::types::Formula) {
 
     fn children(formula: &Formula, work: &mut Vec<Rc<Formula>>) {
         match formula {
-            Formula::Not(inner) => work.push(inner.clone()),
+            Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner.clone()),
             Formula::And(left, right)
             | Formula::Or(left, right)
             | Formula::Iff(left, right)
@@ -3004,7 +3004,7 @@ fn formula_bounds_valid(formula: &crate::types::Formula, presences: u32) -> bool
             Formula::True | Formula::False => {}
             Formula::Atom(Atom::Bound(index)) if *index < presences => {}
             Formula::Atom(_) => return false,
-            Formula::Not(inner) => work.push(inner),
+            Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner),
             Formula::And(left, right)
             | Formula::Or(left, right)
             | Formula::Iff(left, right)
@@ -3246,6 +3246,7 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
     }
     enum Work<'a> {
         Formula(&'a artifact::Formula),
+        Owned(u32),
         Not,
         Binary(Binary),
     }
@@ -3262,6 +3263,10 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
                 artifact::Formula::Var(_) => {
                     valid = false;
                     values.push(Formula::True);
+                }
+                artifact::Formula::Owned(owner, inner) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
                 }
                 artifact::Formula::Not(inner) => {
                     work.push(Work::Not);
@@ -3288,6 +3293,10 @@ fn import_formula(value: &artifact::Formula) -> (crate::types::Formula, bool) {
                     work.push(Work::Formula(left));
                 }
             },
+            Work::Owned(owner) => {
+                let inner = values.pop().expect("owned visits one operand");
+                values.push(Formula::owned(owner, inner));
+            }
             Work::Not => {
                 let inner = values.pop().expect("not visits one operand");
                 values.push(Formula::Not(Rc::new(inner)));

@@ -224,6 +224,7 @@ fn justify(
             // A constant is what it is with nothing to hold it there.
             Formula::True | Formula::False => {}
             Formula::Atom(atom) => out.push((*atom, want)),
+            Formula::Owned(_, inner) => work.push((inner, want)),
             Formula::Not(inner) => work.push((inner, !want)),
             Formula::And(left, right) => match want {
                 true => {
@@ -528,6 +529,9 @@ impl Encoding {
                         Var::from_index(next)
                     });
                     values.push(Lit::from_var(var, true));
+                }
+                Work::Formula(Formula::Owned(_, inner)) => {
+                    work.push(Work::Formula(inner));
                 }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
