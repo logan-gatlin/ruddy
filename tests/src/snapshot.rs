@@ -2143,6 +2143,20 @@ fn a_raw_dump_carries_only_its_own_tab() {
     );
 }
 
+#[test]
+fn the_types_raw_dump_asserts_package_and_owned_metadata() {
+    let snapshot = snapshot(
+        "extern choose: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choose\n",
+    );
+    let types = snapshot
+        .stages
+        .iter()
+        .find(|stage| stage.id == "types")
+        .unwrap();
+    assert!(types.debug.contains("packages=1"), "{}", types.debug);
+    assert!(types.debug.contains("owned=[0]"), "{}", types.debug);
+}
+
 /// Summaries sit in the pane bar as a phrase somebody reads, so the count and
 /// its noun agree. Three stages had spelled that out for themselves and the
 /// rest had not, which is how `1 schemes` reached the bar of a tool whose whole
