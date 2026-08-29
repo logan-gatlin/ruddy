@@ -214,7 +214,21 @@ pub enum Op {
         callee: Callee,
         args: Vec<Temp>,
     },
-    /// Read a top-level definition's value.
+    /// Invoke a raw target-provided function. Unlike [`Op::Call`], every entry
+    /// in `args` is source-visible at the foreign boundary: effect evidence is
+    /// structurally excluded and must be consumed by an adapter before this
+    /// instruction is emitted.
+    RawCall {
+        callee: Temp,
+        args: Vec<Temp>,
+    },
+    /// Read a raw target-provided value. Raw externs live outside Ruddy's
+    /// global namespace so an adapter may occupy the declaration's public name.
+    Extern {
+        symbol: Symbol,
+        name: String,
+    },
+    /// Read a top-level Ruddy definition or adapted extern value.
     Global {
         symbol: Symbol,
         name: String,
@@ -263,7 +277,7 @@ pub enum Op {
     },
 }
 
-/// What a [`Op::Call`] calls: a function whose identity is known here, or
+/// What an [`Op::Call`] calls: a function whose identity is known here, or
 /// whatever a temp holds.
 #[derive(Debug, Clone, Copy)]
 pub enum Callee {
@@ -584,10 +598,29 @@ fn same_alias_pair(
     same_finite_syntax(left_want, right_want) && same_finite_syntax(left_have, right_have)
 }
 
+fn same_row_syntax(left: &Row, right: &Row) -> bool {
+    let unit = Rc::new(Ty::unit());
+    same_finite_syntax(
+        &Rc::new(Ty::Arrow(unit.clone(), unit.clone(), left.clone())),
+        &Rc::new(Ty::Arrow(unit.clone(), unit, right.clone())),
+    )
+}
+
 type TypePair = (Rc<Ty>, Rc<Ty>);
 type AliasPairs = HashMap<(Symbol, Symbol), Vec<TypePair>>;
 type AdapterAliases = HashMap<(Symbol, Symbol), Vec<(Rc<Ty>, Rc<Ty>, FuncId)>>;
 type CachedFit = (Rc<Ty>, Rc<Ty>, bool);
+
+struct OrdinaryExternAdapter {
+    ty: Rc<Ty>,
+    id: FuncId,
+}
+
+struct OrdinaryCallbackAdapter {
+    ty: Rc<Ty>,
+    available: Row,
+    id: FuncId,
+}
 
 #[derive(Default)]
 struct FitsCache {
@@ -652,6 +685,11 @@ struct Lower<'a> {
     stem: String,
     serial: u32,
     globals: Vec<Global>,
+    /// Ordinary foreign adapters currently being generated. Recursive aliases
+    /// can return (or accept contravariantly) their own function shape, so the
+    /// function slot must be reusable before its body has finished lowering.
+    extern_adapters: Vec<OrdinaryExternAdapter>,
+    callback_adapters: Vec<OrdinaryCallbackAdapter>,
     /// The top-level definition currently being lowered, whose quantified
     /// presence promise governs every nested match decision tree.
     definition: Option<Symbol>,
@@ -679,31 +717,17 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         stem: String::new(),
         serial: 0,
         globals: Vec::new(),
+        extern_adapters: Vec::new(),
+        callback_adapters: Vec::new(),
         definition: None,
         assumed: Formula::True,
     };
+    let externs = low.lower_externs();
     let order = low.order();
     low.reserve(&order);
     for symbol in &order {
         low.define(*symbol);
     }
-    let externs = program
-        .externs
-        .iter()
-        .map(|(symbol, decl)| Extern {
-            symbol: *symbol,
-            name: mint.name(*symbol).to_string(),
-            target: decl
-                .value
-                .target
-                .segments
-                .iter()
-                .map(|segment| segment.tracked.clone())
-                .collect(),
-            span: decl.value.target.span(),
-            rep: low.rep(inference.externs[symbol].body()),
-        })
-        .collect();
     Output {
         externs,
         functions: low
@@ -1014,6 +1038,541 @@ impl Body {
 }
 
 impl Lower<'_> {
+    /// Import raw target values and install Ruddy-facing globals in front of
+    /// ordinary definitions. Function imports are always adapters: they accept
+    /// internal evidence parameters but raw calls contain visible arguments
+    /// only. Marked ABI functions accumulate their whole host argument group;
+    /// ordinary arrows retain the legacy unary host-curried convention.
+    fn lower_externs(&mut self) -> Vec<Extern> {
+        let declarations: Vec<_> = self
+            .program
+            .externs
+            .iter()
+            .map(|(symbol, decl)| (*symbol, decl.clone()))
+            .collect();
+        let mut externs = Vec::with_capacity(declarations.len());
+        for (symbol, decl) in declarations {
+            let name = self.mint.name(symbol).to_string();
+            let ty = self.inference.externs[&symbol].body().clone();
+            externs.push(Extern {
+                symbol,
+                name: name.clone(),
+                target: decl
+                    .value
+                    .target
+                    .segments
+                    .iter()
+                    .map(|segment| segment.tracked.clone())
+                    .collect(),
+                span: decl.value.target.span(),
+                rep: self.rep(&ty),
+            });
+
+            // Non-function imports already have the Ruddy representation and
+            // remain direct globals. Only functions need an initialized
+            // adapter in front of the raw host value.
+            if self.rep(&ty) == Rep::Fn {
+                self.stem = format!("{name}#extern");
+                self.serial = 0;
+                let mut body = Body::default();
+                let raw = self.emit(
+                    &mut body,
+                    decl.value.target.span(),
+                    self.rep(&ty),
+                    Op::Extern {
+                        symbol,
+                        name: name.clone(),
+                    },
+                );
+                let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
+                self.globals.push(Global {
+                    symbol,
+                    name,
+                    body: body.seal(Terminator {
+                        span: decl.value.target.span(),
+                        kind: End::Ret(value),
+                    }),
+                    span: decl.name_span,
+                });
+            }
+        }
+        externs
+    }
+
+    fn host_to_ruddy(
+        &mut self,
+        abi: &crate::ir::ExternType,
+        ty: &Rc<Ty>,
+        raw: Temp,
+        body: &mut Body,
+    ) -> Temp {
+        use crate::ir::ExternTypeKind;
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => self.host_to_ruddy(inner, ty, raw, body),
+            ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let arity = parameters.len().max(1);
+                let id = self.marked_extern_level(
+                    raw,
+                    Vec::new(),
+                    Vec::new(),
+                    ty.clone(),
+                    arity,
+                    parameters.is_empty(),
+                    parameters.clone(),
+                    result.as_ref().clone(),
+                    0,
+                );
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![raw],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+                let id = self.ordinary_extern_level(ty.clone());
+                self.emit(
+                    body,
+                    abi.span,
+                    Rep::Fn,
+                    Op::Closure {
+                        func: id,
+                        captures: vec![raw],
+                    },
+                )
+            }
+            ExternTypeKind::Ordinary(_) => raw,
+        }
+    }
+
+    /// One legacy host-curried arrow. Evidence is accepted as part of the
+    /// Ruddy closure ABI and intentionally omitted from the raw unary call.
+    fn ordinary_extern_level(&mut self, ty: Rc<Ty>) -> FuncId {
+        if matches!(&*ty, Ty::Named { .. })
+            && let Some(adapter) = self
+                .extern_adapters
+                .iter()
+                .rev()
+                .find(|adapter| same_finite_syntax(&adapter.ty, &ty))
+        {
+            return adapter.id;
+        }
+        let id = self.slot(format!("{}#{}", self.stem, self.serial));
+        self.serial += 1;
+        let recursive = matches!(&*ty, Ty::Named { .. });
+        if recursive {
+            self.extern_adapters
+                .push(OrdinaryExternAdapter { ty: ty.clone(), id });
+        }
+        let raw = self.fresh(Rep::Fn);
+        let (from, to, row) = self.arrow(&ty);
+        let mut params = vec![Param {
+            temp: raw,
+            rep: Rep::Fn,
+        }];
+        self.frames.push(Frame::default());
+        self.evidence_params(&row, &mut params);
+        let argument = self.fresh(self.rep(&from));
+        params.push(Param {
+            temp: argument,
+            rep: self.rep(&from),
+        });
+        let mut body = Body::default();
+        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
+            Span::default().track(crate::ir::TypeKind::Error),
+        ));
+        let argument = self.ruddy_to_host(&ordinary, &from, argument, &row, &mut body);
+        let result = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::RawCall {
+                callee: raw,
+                args: vec![argument],
+            },
+        );
+        let result = self.host_to_ruddy(&ordinary, &to, result, &mut body);
+        self.frames.pop().expect("the extern frame just pushed");
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        if recursive {
+            self.extern_adapters
+                .pop()
+                .expect("the ordinary extern adapter just completed");
+        }
+        id
+    }
+
+    /// The least evidence a host-facing callback and the callbacks it returns
+    /// can ask for. Walking the semantic result spine (rather than the written
+    /// ABI leaves) sees through aliases; remembering alias applications keeps
+    /// regular recursive callback types finite.
+    fn callback_evidence(&self, ty: &Rc<Ty>, available: &Row) -> Row {
+        let mut required = Row::closed();
+        let mut cursor = ty.clone();
+        let mut seen = Vec::new();
+        let mut variable = false;
+        loop {
+            if matches!(&*cursor, Ty::Named { .. }) {
+                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                    break;
+                }
+                seen.push(cursor.clone());
+            }
+            let exposed = unfold(&self.inference.aliases, &cursor);
+            let Ty::Arrow(_, to, row) = &*exposed else {
+                break;
+            };
+            let row = flat(row);
+            for (name, field) in &row.labels {
+                if !possible(&field.presence) {
+                    continue;
+                }
+                match required.labels.entry(name.clone()) {
+                    indexmap::map::Entry::Vacant(entry) => {
+                        entry.insert(field.clone());
+                    }
+                    indexmap::map::Entry::Occupied(mut entry) => {
+                        // The callback may perform the same effect at several
+                        // returned arrows. Its requirement is their union: a
+                        // definite occurrence dominates either traversal
+                        // order, while conditional occurrences remain one
+                        // possible bundle entry (their particular formula is
+                        // immaterial to the evidence representation).
+                        if definite(&field.presence) {
+                            entry.get_mut().presence = Presence::Present;
+                        }
+                    }
+                }
+            }
+            // Conditional labels need a bundle, but they do not make the
+            // callback effect-polymorphic. Only a semantic row tail may inherit
+            // the containing arrow's tail identity.
+            variable |= !matches!(row.rest, Rest::Closed);
+            cursor = to.clone();
+        }
+        if variable {
+            // Preserve the containing row's tail identity when it has one. A
+            // callback with conditional labels already gives `required` an
+            // anonymous variable part of its own.
+            if tail_key(available).is_some() {
+                required.rest = available.rest.clone();
+            }
+        }
+        required
+    }
+
+    /// Convert a Ruddy closure passed to the host into the ABI written at that
+    /// direct boundary position. These wrappers are called by the host, so
+    /// their parameter list deliberately has no Ruddy evidence slots.
+    fn ruddy_to_host(
+        &mut self,
+        abi: &crate::ir::ExternType,
+        ty: &Rc<Ty>,
+        value: Temp,
+        available: &Row,
+        body: &mut Body,
+    ) -> Temp {
+        use crate::ir::ExternTypeKind;
+        match &abi.tracked {
+            ExternTypeKind::Group(inner) => self.ruddy_to_host(inner, ty, value, available, body),
+            ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let required = self.callback_evidence(ty, available);
+                let evidence = self.evidence_args(&required, available, body);
+                let id =
+                    self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
+                let mut captures = vec![value];
+                captures.extend(evidence);
+                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+            }
+            ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
+                let required = self.callback_evidence(ty, available);
+                let evidence = self.evidence_args(&required, available, body);
+                let id = self.ordinary_callback(ty.clone(), required);
+                let mut captures = vec![value];
+                captures.extend(evidence);
+                self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
+            }
+            ExternTypeKind::Ordinary(_) => value,
+        }
+    }
+
+    fn ordinary_callback(&mut self, ty: Rc<Ty>, available: Row) -> FuncId {
+        if matches!(&*ty, Ty::Named { .. })
+            && let Some(adapter) = self.callback_adapters.iter().rev().find(|adapter| {
+                same_finite_syntax(&adapter.ty, &ty)
+                    && same_row_syntax(&adapter.available, &available)
+            })
+        {
+            return adapter.id;
+        }
+        let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
+        self.serial += 1;
+        let recursive = matches!(&*ty, Ty::Named { .. });
+        if recursive {
+            self.callback_adapters.push(OrdinaryCallbackAdapter {
+                ty: ty.clone(),
+                available: available.clone(),
+                id,
+            });
+        }
+        let closure = self.fresh(Rep::Fn);
+        let (from, to, row) = self.arrow(&ty);
+        let raw_argument = self.fresh(self.rep(&from));
+        let mut params = vec![Param {
+            temp: closure,
+            rep: Rep::Fn,
+        }];
+        self.frames.push(Frame::default());
+        self.evidence_params(&available, &mut params);
+        params.push(Param {
+            temp: raw_argument,
+            rep: self.rep(&from),
+        });
+        let ordinary = Span::default().track(crate::ir::ExternTypeKind::Ordinary(
+            Span::default().track(crate::ir::TypeKind::Error),
+        ));
+        let mut body = Body::default();
+        let argument = self.host_to_ruddy(&ordinary, &from, raw_argument, &mut body);
+        let mut args = self.evidence_args(&row, &row, &mut body);
+        args.push(argument);
+        let result = self.emit(
+            &mut body,
+            Span::default(),
+            self.rep(&to),
+            Op::Call {
+                callee: Callee::Indirect(closure),
+                args,
+            },
+        );
+        let result = self.ruddy_to_host(&ordinary, &to, result, &available, &mut body);
+        self.frames.pop().expect("the callback frame just pushed");
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        if recursive {
+            self.callback_adapters
+                .pop()
+                .expect("the ordinary callback adapter just completed");
+        }
+        id
+    }
+
+    fn marked_callback(
+        &mut self,
+        ty: Rc<Ty>,
+        parameter_abis: Vec<crate::ir::ExternType>,
+        result_abi: crate::ir::ExternType,
+        available: Row,
+    ) -> FuncId {
+        let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
+        self.serial += 1;
+        let closure = self.fresh(Rep::Fn);
+        let mut params = vec![Param {
+            temp: closure,
+            rep: Rep::Fn,
+        }];
+        self.frames.push(Frame::default());
+        self.evidence_params(&available, &mut params);
+        let mut raw_parameters = Vec::new();
+        let mut arrows = Vec::new();
+        let mut cursor = ty;
+        for _ in 0..parameter_abis.len().max(1) {
+            let (from, to, row) = self.arrow(&cursor);
+            if !parameter_abis.is_empty() {
+                let temp = self.fresh(self.rep(&from));
+                params.push(Param {
+                    temp,
+                    rep: self.rep(&from),
+                });
+                raw_parameters.push(temp);
+            }
+            arrows.push((from, to.clone(), row));
+            cursor = to;
+        }
+
+        let mut body = Body::default();
+        let mut current = closure;
+        if parameter_abis.is_empty() {
+            let unit = self.emit(
+                &mut body,
+                Span::default(),
+                Rep::Unit,
+                Op::Struct(IndexMap::new()),
+            );
+            let mut args = self.evidence_args(&arrows[0].2, &arrows[0].2, &mut body);
+            args.push(unit);
+            current = self.emit(
+                &mut body,
+                Span::default(),
+                self.rep(&cursor),
+                Op::Call {
+                    callee: Callee::Indirect(current),
+                    args,
+                },
+            );
+        } else {
+            for ((abi, raw), (from, to, row)) in
+                parameter_abis.iter().zip(raw_parameters).zip(arrows.iter())
+            {
+                let argument = self.host_to_ruddy(abi, from, raw, &mut body);
+                let mut args = self.evidence_args(row, row, &mut body);
+                args.push(argument);
+                current = self.emit(
+                    &mut body,
+                    Span::default(),
+                    self.rep(to),
+                    Op::Call {
+                        callee: Callee::Indirect(current),
+                        args,
+                    },
+                );
+            }
+        }
+        let result = self.ruddy_to_host(&result_abi, &cursor, current, &available, &mut body);
+        self.frames.pop().expect("the callback frame just pushed");
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(result),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marked_extern_level(
+        &mut self,
+        _outer_raw: Temp,
+        carried: Vec<Rep>,
+        carried_types: Vec<Rc<Ty>>,
+        ty: Rc<Ty>,
+        arity: usize,
+        nullary: bool,
+        parameter_abis: Vec<crate::ir::ExternType>,
+        result_abi: crate::ir::ExternType,
+        step: usize,
+    ) -> FuncId {
+        let id = self.slot(format!("{}#{}", self.stem, self.serial));
+        self.serial += 1;
+        let raw = self.fresh(Rep::Fn);
+        let mut params = vec![Param {
+            temp: raw,
+            rep: Rep::Fn,
+        }];
+        let mut gathered = Vec::with_capacity(carried.len());
+        for rep in &carried {
+            let temp = self.fresh(*rep);
+            params.push(Param { temp, rep: *rep });
+            gathered.push(temp);
+        }
+        let (from, to, row) = self.arrow(&ty);
+        self.frames.push(Frame::default());
+        self.evidence_params(&row, &mut params);
+        let argument_rep = self.rep(&from);
+        let argument = self.fresh(argument_rep);
+        params.push(Param {
+            temp: argument,
+            rep: argument_rep,
+        });
+        let mut body = Body::default();
+        if !nullary {
+            gathered.push(argument);
+        }
+
+        let value = if step + 1 == arity {
+            let gathered = gathered
+                .into_iter()
+                .zip(carried_types.iter().chain(std::iter::once(&from)))
+                .zip(parameter_abis.iter())
+                .map(|((argument, ty), abi)| self.ruddy_to_host(abi, ty, argument, &row, &mut body))
+                .collect();
+            let result = self.emit(
+                &mut body,
+                Span::default(),
+                self.rep(&to),
+                Op::RawCall {
+                    callee: raw,
+                    args: gathered,
+                },
+            );
+            self.host_to_ruddy(&result_abi, &to, result, &mut body)
+        } else {
+            let mut next_carried = carried;
+            next_carried.push(argument_rep);
+            let mut next_types = carried_types;
+            next_types.push(from);
+            let next = self.marked_extern_level(
+                raw,
+                next_carried,
+                next_types,
+                to.clone(),
+                arity,
+                false,
+                parameter_abis,
+                result_abi,
+                step + 1,
+            );
+            let mut captures = vec![raw];
+            captures.extend(gathered);
+            self.emit(
+                &mut body,
+                Span::default(),
+                Rep::Fn,
+                Op::Closure {
+                    func: next,
+                    captures,
+                },
+            )
+        };
+        self.frames.pop().expect("the extern frame just pushed");
+        self.fill(
+            id,
+            Function {
+                name: self.labels[id].clone(),
+                params,
+                body: body.seal(Terminator {
+                    span: Span::default(),
+                    kind: End::Ret(value),
+                }),
+                span: Span::default(),
+            },
+        );
+        id
+    }
+
     /// The definitions in the order a backend initializes them: group order,
     /// earliest first, and source order within a group.
     fn order(&self) -> Vec<Symbol> {
@@ -1512,7 +2071,44 @@ impl Lower<'_> {
         }
         if tail_key(declared).is_some() {
             let key = tail_key(used).unwrap_or(RestKey::Open);
-            args.push(self.bundle(key, body));
+            // Conditional labels live in the bundle even when a genuine row
+            // tail follows them. A shared tail cannot simply be forwarded in
+            // that case: a use may have promoted one of those labels to a
+            // definite evidence parameter, so overlay its record on the tail.
+            // Conversely, do not rebuild the whole bundle from ambient named
+            // evidence, which would leak unrelated effects into the callback.
+            let conditional: Vec<String> = declared
+                .labels
+                .iter()
+                .filter(|(_, field)| possible(&field.presence) && !definite(&field.presence))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if conditional.is_empty() {
+                args.push(self.bundle(key, None, true, body));
+            } else {
+                let needs_tails = conditional.iter().any(|name| {
+                    !used
+                        .labels
+                        .get(name)
+                        .is_some_and(|field| definite(&field.presence))
+                });
+                if matches!(declared.rest, Rest::Closed) {
+                    args.push(self.bundle(key, Some(&conditional), needs_tails, body));
+                } else {
+                    // Thread the shared tail first. Building the overlay may
+                    // project from that same capture, and must refer to the
+                    // already-established inner temp rather than introduce a
+                    // later capture before its declaration.
+                    let tail = self.bundle(key, None, true, body);
+                    let named = self.bundle(key, Some(&conditional), needs_tails, body);
+                    args.push(self.emit(
+                        body,
+                        Span::default(),
+                        Rep::Struct,
+                        Op::Merge(vec![tail, named]),
+                    ));
+                }
+            }
         }
         args
     }
@@ -1781,19 +2377,106 @@ impl Lower<'_> {
     ///
     /// A record built here is evidence plumbing rather than anything the reader
     /// wrote, so it carries no span and the debugger marks it generated.
-    fn bundle(&mut self, key: RestKey, body: &mut Body) -> Temp {
-        let found = self
-            .frames
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(at, frame)| {
-                frame
-                    .tails
+    fn bundle(
+        &mut self,
+        key: RestKey,
+        only: Option<&[String]>,
+        include_tails: bool,
+        body: &mut Body,
+    ) -> Temp {
+        // A restricted conditional bundle is a projection, never a forwarded
+        // ambient tail. Rebuild exactly the requested keys: named evidence wins
+        // as usual, and a key known only through an opaque tail is projected
+        // from the layered tails. Forwarding or merging those tails themselves
+        // would expose every unrelated effect they happen to contain.
+        if let Some(names) = only {
+            let held: Vec<(usize, Temp)> = if include_tails {
+                // Prefer the innermost tail, and its matching identity where
+                // that frame holds more than one. In particular, callback
+                // adapters have an explicit bundle parameter in their current
+                // frame; reaching through it to ambient construction-time
+                // frames would create undeclared captures and combine evidence
+                // outside the callback row.
+                self.frames
                     .iter()
-                    .find(|(held, _)| held.forwards(key))
-                    .map(|(_, temp)| (at, *temp))
-            });
+                    .enumerate()
+                    .rev()
+                    .find_map(|(at, frame)| {
+                        frame
+                            .tails
+                            .iter()
+                            .rev()
+                            .find(|(held, _)| held.forwards(key))
+                            .or_else(|| frame.tails.last())
+                            .map(|(_, temp)| vec![(at, *temp)])
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let tail_owner = held.iter().map(|(at, _)| *at).max();
+            let mut tails: Vec<Temp> = held
+                .into_iter()
+                .map(|(at, temp)| self.thread(at, temp))
+                .collect();
+            let tail = match tails.as_slice() {
+                [] => None,
+                [tail] => Some(*tail),
+                _ => Some(self.emit(
+                    body,
+                    Span::default(),
+                    Rep::Struct,
+                    Op::Merge(std::mem::take(&mut tails)),
+                )),
+            };
+            let entries: IndexMap<String, Temp> = names
+                .iter()
+                .map(|name| {
+                    let evidence_owner = self
+                        .frames
+                        .iter()
+                        .rposition(|frame| frame.evidence.contains_key(name));
+                    let value = if evidence_owner.is_some() && evidence_owner >= tail_owner {
+                        self.evidence_of(name)
+                    } else {
+                        self.emit(
+                            body,
+                            Span::default(),
+                            Rep::Struct,
+                            Op::Project {
+                                base: tail.expect(
+                                    "accepted conditional evidence is named or supplied by a tail",
+                                ),
+                                field: FieldKey::named(name.clone()),
+                            },
+                        )
+                    };
+                    (name.clone(), value)
+                })
+                .collect();
+            return self.emit(
+                body,
+                Span::default(),
+                Rep::Struct,
+                Op::Struct(named_fields(entries)),
+            );
+        }
+
+        let found = include_tails
+            .then(|| {
+                self.frames
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(at, frame)| {
+                        frame
+                            .tails
+                            .iter()
+                            .find(|(held, _)| held.forwards(key))
+                            .map(|(_, temp)| (at, *temp))
+                    })
+            })
+            .flatten();
         if let Some((at, temp)) = found {
             return self.thread(at, temp);
         }
@@ -1802,12 +2485,15 @@ impl Lower<'_> {
         // what `evidence_of` answers with. The bundles go in the same order and
         // for the same reason, and under the record: a name the scope has
         // outright is the one to hand over where a bundle holds it too.
-        let held: Vec<(usize, Temp)> = self
-            .frames
-            .iter()
-            .enumerate()
-            .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
-            .collect();
+        let held: Vec<(usize, Temp)> = if include_tails {
+            self.frames
+                .iter()
+                .enumerate()
+                .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut layers: Vec<Temp> = held
             .into_iter()
             .map(|(at, temp)| self.thread(at, temp))

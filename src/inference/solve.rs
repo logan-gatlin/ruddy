@@ -385,6 +385,16 @@ impl Solve<'_> {
                     ambient,
                     inside,
                 } => self.performs(span, performed, ambient, *inside),
+                ConstraintKind::CallbackCoverage {
+                    required,
+                    available,
+                } => {
+                    let reported = self.errors.len();
+                    self.performs(span, required, available, true);
+                    for error in &mut self.errors[reported..] {
+                        error.kind = ErrorKind::CallbackEffectsNotCovered;
+                    }
+                }
             }
         }
     }

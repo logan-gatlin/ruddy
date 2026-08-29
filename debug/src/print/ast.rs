@@ -119,7 +119,9 @@ impl Grouped for Ast<'_, ExprKind> {
 impl fmt::Display for Ast<'_, StmtKind> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            StmtKind::Extern { name, ty, target } => {
+            StmtKind::Extern {
+                name, ty, target, ..
+            } => {
                 write!(f, "extern {} : {} = {target}", name.tracked, annotation(ty))
             }
             // `body` is a `Tracked<Expr>` and `Expr` is itself `Tracked`, hence

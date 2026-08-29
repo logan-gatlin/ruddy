@@ -7695,6 +7695,192 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 }
 
 #[test]
+fn polymorphic_extern_boundary_leaves_are_rejected_before_callback_instantiation() {
+    let source = "effect Tick = Nat -> Nat\n\
+                  extern run : fn('a) -> Nat = host.run\n\
+                  let called = handle run (fn n => !Tick n) with\n\
+                    | !Tick n => n\n\
+                  end";
+    let (_, lowered, output) = infer_src(source);
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        output.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            ..
+        }]
+    ));
+    assert_eq!(output.errors[0].kind.code(), "polymorphic-extern-boundary");
+    assert!(
+        output.errors[0]
+            .kind
+            .to_string()
+            .contains("fixed runtime representation")
+    );
+
+    // A forwarding alias does not make the representation any less
+    // polymorphic, including when the unsafe leaf is a host result.
+    let (_, lowered, output) = infer_src(
+        "type Identity 'a = 'a\n\
+         extern make : fn(Nat) -> Identity 'a = host.make",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        output.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::PolymorphicExternBoundary,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn fixed_representation_polymorphism_remains_valid_at_extern_boundaries() {
+    let (_, lowered, output) = infer_src(
+        "extern echo : fn({ value: 'a }) -> { value: 'a } = host.echo\n\
+         let answer = (echo { value: 42n }).value",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
+fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
+    let (_, lowered, invalid) = infer_src(
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : fn(Callback) -> () = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        invalid.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            ..
+        }]
+    ));
+
+    let (_, lowered, valid) = infer_src(
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : fn(Callback) -> () + !Fail = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
+}
+
+#[test]
+fn extern_callback_coverage_terminates_on_recursive_ordinary_aliases() {
+    let (_, lowered, output) = infer_src(
+        "type Loop = () -> Loop\n\
+         extern loop : Loop = host.loop",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
+fn extern_callback_coverage_preserves_conditional_presence() {
+    let (mint, lowered, output) = inferred(
+        "effect Fail = { abort: () -> () }\n\
+         extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    let (_, declared) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "install")
+        .expect("the extern scheme is published");
+    assert!(
+        declared.to_string().contains("(when"),
+        "coverage decided the callback condition: {declared}"
+    );
+}
+
+#[test]
+fn extern_callback_coverage_uses_where_implications() {
+    let source = |clause: &str| {
+        format!(
+            "effect Fail = {{ abort: () -> () }}\n\
+             extern install : fn(fn(()) -> () + !Fail (when 'needed)) -> () + !Fail (when 'carried){clause} = host.install"
+        )
+    };
+    let (_, lowered, valid) = infer_src(&source(" where not 'needed or 'carried"));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
+
+    let (_, lowered, invalid) = infer_src(&source(""));
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        invalid.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn extern_callback_coverage_respects_shared_open_effect_tails() {
+    let (_, lowered, valid) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'e = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(valid.errors.is_empty(), "{:#?}", valid.errors);
+
+    let (_, lowered, invalid) = infer_src(
+        "type Callback 'e = () -> () + ..'e\n\
+         extern install : fn(Callback (..'e)) -> () + ..'f = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        invalid.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn legacy_outer_extern_arrows_check_callback_coverage() {
+    let (_, lowered, output) = infer_src(
+        "effect Fail = { abort: () -> () }\n\
+         type Callback = () -> () + !Fail\n\
+         extern install : Callback -> () = host.install",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(matches!(
+        output.errors.as_slice(),
+        [ruddy::inference::Error {
+            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
+    let (mint, _, output) = inferred(
+        "effect Fail = { abort: () -> () }\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () + !Fail = host.install\n\
+         let callback = fn unit => !Fail.abort unit\n\
+         let installed = handle install callback with\n\
+           | !Fail.abort unit => ()\n\
+         end",
+    );
+    assert_eq!(scheme(&mint, &output, "callback"), "() -> () + !Fail");
+    assert_eq!(scheme(&mint, &output, "installed"), "()");
+    let (_, declared) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "install")
+        .expect("the marked extern scheme is published");
+    assert_eq!(declared.to_string(), "(() -> () + !Fail) -> () + !Fail");
+}
+
+#[test]
 fn an_impossible_extern_clause_is_refused_at_the_declaration() {
     let src = "extern impossible : { x when 'x: Nat } where 'x and not 'x = host.impossible";
     let (_, out, output) = infer_src(src);

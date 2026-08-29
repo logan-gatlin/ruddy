@@ -88,7 +88,7 @@ use crate::{
     tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar,
+        Shape, Ty, TyVar, same_finite_syntax,
     },
 };
 use constrain::Constrain;
@@ -620,6 +620,9 @@ pub enum ConstraintKind {
         /// See R11.
         inside: bool,
     },
+    /// An effectful callback crossing a foreign boundary must be callable with
+    /// the evidence carried by that boundary.
+    CallbackCoverage { required: Row, available: Row },
 }
 
 #[derive(Debug, Clone)]
@@ -798,6 +801,11 @@ pub enum ErrorKind {
     /// The ordinary refusal, and the reason an effect row is worth having: the
     /// function says what calling it may do, and this would do more.
     NotAllowed { effect: String },
+    /// A foreign callback requires evidence the containing host call cannot carry.
+    CallbackEffectsNotCovered,
+    /// An ordinary foreign boundary leaf has no fixed runtime representation:
+    /// an annotation variable there could instantiate to a Ruddy closure.
+    PolymorphicExternBoundary,
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -1097,6 +1105,222 @@ pub fn structural_family_for_tests(
     .family_type(types)
 }
 
+/// Find an ordinary boundary leaf whose outer runtime representation remains
+/// polymorphic. Such a leaf cannot be adapted once at declaration lowering:
+/// in particular, an instantiation to an arrow would otherwise send a Ruddy
+/// evidence-taking closure directly to the host.
+fn polymorphic_extern_boundary(
+    aliases: &IndexMap<Symbol, Scheme>,
+    abi: &ir::ExternType,
+    ty: &Rc<Ty>,
+) -> Option<Span> {
+    fn boundary(
+        aliases: &IndexMap<Symbol, Scheme>,
+        abi: &ir::ExternType,
+        ty: &Rc<Ty>,
+        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
+    ) -> Option<Span> {
+        let state = abi as *const ir::ExternType;
+        if seen.iter().any(|(prior_state, prior_ty)| {
+            *prior_state == state && same_finite_syntax(prior_ty, ty)
+        }) {
+            return None;
+        }
+        seen.push((state, ty.clone()));
+        match &abi.tracked {
+            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, seen),
+            ir::ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let mut cursor = ty.clone();
+                for parameter in parameters {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(from, to, _) = &*exposed else {
+                        return None;
+                    };
+                    if let Some(span) = boundary(aliases, parameter, from, seen) {
+                        return Some(span);
+                    }
+                    cursor = to.clone();
+                }
+                // A nullary marked function is represented by the desugared
+                // unit arrow, but its unit input is synthetic rather than a
+                // boundary leaf written by the reader.
+                if parameters.is_empty() {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(_, to, _) = &*exposed else {
+                        return None;
+                    };
+                    cursor = to.clone();
+                }
+                boundary(aliases, result, &cursor, seen)
+            }
+            ir::ExternTypeKind::Ordinary(_) => match &*unfold(aliases, ty) {
+                Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => Some(abi.span),
+                Ty::Arrow(from, to, _) => {
+                    boundary(aliases, abi, from, seen).or_else(|| boundary(aliases, abi, to, seen))
+                }
+                // Primitive and structural outer representations are fixed.
+                // Their members do not individually cross the function ABI.
+                Ty::Nat
+                | Ty::Int
+                | Ty::Real
+                | Ty::String
+                | Ty::Boolean
+                | Ty::Struct(_)
+                | Ty::Sum(_)
+                | Ty::Undecided
+                | Ty::Named { .. } => None,
+            },
+        }
+    }
+
+    boundary(aliases, abi, ty, &mut Vec::new())
+}
+
+/// Build callback evidence obligations from the resolved semantic type. The
+/// ABI tree contributes only host grouping; aliases, row tails and conditional
+/// presences all come from the same rows ordinary inference solves.
+fn callback_coverage_constraints(
+    aliases: &IndexMap<Symbol, Scheme>,
+    abi: &ir::ExternType,
+    ty: &Rc<Ty>,
+) -> (Vec<Constraint>, Formula) {
+    fn presence_formula(presence: &Presence) -> Option<Formula> {
+        match presence {
+            Presence::Present => Some(Formula::True),
+            Presence::Absent => Some(Formula::False),
+            Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
+            Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
+            Presence::Recovered(_) | Presence::Undecided => None,
+        }
+    }
+
+    fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut cursor = ty.clone();
+        let mut seen = Vec::new();
+        loop {
+            if matches!(&*cursor, Ty::Named { .. }) {
+                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                    break;
+                }
+                seen.push(cursor.clone());
+            }
+            let exposed = unfold(aliases, &cursor);
+            let Ty::Arrow(_, to, row) = &*exposed else {
+                break;
+            };
+            rows.push(row.clone());
+            cursor = to.clone();
+        }
+        rows
+    }
+
+    fn cover(
+        aliases: &IndexMap<Symbol, Scheme>,
+        span: Span,
+        callback: &Rc<Ty>,
+        available: &Row,
+        out: &mut Vec<Constraint>,
+    ) {
+        out.extend(
+            callback_rows(aliases, callback)
+                .into_iter()
+                .map(|required| Constraint {
+                    span,
+                    kind: ConstraintKind::CallbackCoverage {
+                        required,
+                        available: available.clone(),
+                    },
+                }),
+        );
+    }
+
+    fn boundary(
+        aliases: &IndexMap<Symbol, Scheme>,
+        abi: &ir::ExternType,
+        ty: &Rc<Ty>,
+        out: &mut Vec<Constraint>,
+        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
+    ) {
+        let state = abi as *const ir::ExternType;
+        if seen.iter().any(|(prior_state, prior_ty)| {
+            *prior_state == state && same_finite_syntax(prior_ty, ty)
+        }) {
+            return;
+        }
+        seen.push((state, ty.clone()));
+        match &abi.tracked {
+            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, out, seen),
+            ir::ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let mut cursor = ty.clone();
+                let mut inputs = Vec::new();
+                let mut available = Row::closed();
+                for _ in 0..parameters.len().max(1) {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(from, to, row) = &*exposed else {
+                        return;
+                    };
+                    if !parameters.is_empty() {
+                        inputs.push(from.clone());
+                    }
+                    available = row.clone();
+                    cursor = to.clone();
+                }
+                for (parameter, input) in parameters.iter().zip(inputs) {
+                    cover(aliases, parameter.span, &input, &available, out);
+                    boundary(aliases, parameter, &input, out, seen);
+                }
+                boundary(aliases, result, &cursor, out, seen);
+            }
+            ir::ExternTypeKind::Ordinary(_) => {
+                let exposed = unfold(aliases, ty);
+                let Ty::Arrow(from, to, available) = &*exposed else {
+                    return;
+                };
+                cover(aliases, abi.span, from, available, out);
+                // An ordinary leaf may conceal arbitrarily much foreign shape
+                // behind aliases. Every arrow remains a unary host boundary.
+                boundary(aliases, abi, from, out, seen);
+                boundary(aliases, abi, to, out, seen);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    boundary(aliases, abi, ty, &mut out, &mut Vec::new());
+    let conditional = Formula::all(out.iter().flat_map(|constraint| {
+        let ConstraintKind::CallbackCoverage {
+            required,
+            available,
+        } = &constraint.kind
+        else {
+            return None;
+        };
+        Some(Formula::all(required.labels.iter().filter_map(
+            |(name, required)| {
+                let required = presence_formula(&required.presence)?;
+                let available = match available.labels.get(name) {
+                    Some(field) => presence_formula(&field.presence)?,
+                    None if matches!(
+                        available.rest,
+                        Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
+                    ) =>
+                    {
+                        Formula::False
+                    }
+                    None => return None,
+                };
+                Some(required.not().or(available))
+            },
+        )))
+    }));
+    (out, conditional)
+}
+
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
@@ -1182,6 +1406,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // use. The annotation is authoritative, including any effect row it
     // declares for calls through the imported value.
     let mut externs = IndexMap::new();
+    let mut extern_coverage = Vec::new();
     for (symbol, decl) in &program.externs {
         let annotation = decl
             .annotation
@@ -1194,6 +1419,25 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             });
             table.require(annotation.ty.span, origin, lowered.formula.clone());
             report_flip(&mut table, &mut errors);
+        }
+        if let Some(span) =
+            polymorphic_extern_boundary(&aliases, &decl.value.abi, lowered.scheme.body())
+        {
+            errors.push(Error {
+                span,
+                kind: ErrorKind::PolymorphicExternBoundary,
+            });
+        } else {
+            let (coverage, conditional) =
+                callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
+            if sat::entails(&lowered.formula, &conditional) {
+                extern_coverage.push((*symbol, coverage));
+            } else {
+                errors.push(Error {
+                    span: decl.value.abi.span,
+                    kind: ErrorKind::CallbackEffectsNotCovered,
+                });
+            }
         }
         env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
         externs.insert(*symbol, lowered.scheme);
@@ -1211,6 +1455,26 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut promises = IndexMap::new();
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
+    for (symbol, coverage) in extern_coverage {
+        Solve {
+            table: &mut table,
+            errors: &mut errors,
+            steps: &mut steps,
+            aliases: &aliases,
+            nominal: &nominal,
+            definition: symbol,
+            depth: 0,
+            assumed: Vec::new(),
+            schemes: HashMap::new(),
+            locals: &mut locals,
+            guard: None,
+            active_refinement: None,
+            refinements: &mut refinements,
+            generated_end: 0,
+        }
+        .run(&coverage);
+        report_flip(&mut table, &mut errors);
+    }
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
     // a fact about the lowered program that nothing here changes.
@@ -3567,6 +3831,8 @@ impl Table {
             ErrorKind::NotAllowed { effect } => ErrorKind::NotAllowed {
                 effect: effect.clone(),
             },
+            ErrorKind::CallbackEffectsNotCovered => ErrorKind::CallbackEffectsNotCovered,
+            ErrorKind::PolymorphicExternBoundary => ErrorKind::PolymorphicExternBoundary,
         }
     }
 }

@@ -72,7 +72,11 @@ pub enum StmtKind {
     /// and it binds one ordinary term name for the module just as `let` does.
     Extern {
         name: TrackedString,
+        /// The ordinary, curried Ruddy type used by name resolution and
+        /// inference. A marked ABI function is desugared into arrows here.
         ty: Annotation,
+        /// The extern-only ABI spelling, retaining every marked `fn` boundary.
+        abi: ExternType,
         target: ForeignPath,
     },
     Let {
@@ -412,6 +416,23 @@ pub enum PatternKind {
 }
 
 pub type Type = Tracked<TypeKind>;
+
+/// An extern's boundary type. Ordinary Ruddy types are leaves; `fn(...) -> ...`
+/// nodes record the foreign function's call arity independently of the curried
+/// [`Type`] exposed to Ruddy code. Parentheses around a marked function remain
+/// visible for source tooling even though they are semantically transparent.
+pub type ExternType = Tracked<ExternTypeKind>;
+
+#[derive(Debug, Clone)]
+pub enum ExternTypeKind {
+    Ordinary(Type),
+    Function {
+        parameters: Vec<ExternType>,
+        result: Box<ExternType>,
+        effects: Option<Box<EffectRow>>,
+    },
+    Group(Box<ExternType>),
+}
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
@@ -1226,19 +1247,131 @@ impl Parser {
         false
     }
 
-    /// `extern <name> : <annotation> = <target>` — a target-supplied value.
-    /// Unlike a `let`, every piece is mandatory: an extern has no Ruddy body
-    /// to infer from, and its target is a dotted foreign name rather than an
-    /// expression that could otherwise consume the following statement.
+    /// `extern <name> : <extern-annotation> = <target>` — a target-supplied
+    /// value. `fn(A, B) -> R` is available only in this annotation and records
+    /// an n-ary foreign ABI while desugaring to the curried type `A -> B -> R`.
     fn extern_stmt(&mut self) -> Option<Stmt> {
         let kw = self.advance().expect("the caller peeked `extern`");
         let name = self.ident()?;
         self.eat(&Kind::Colon)?;
-        let ty = self.annotation(true)?;
+        let (ty, abi) = self.extern_annotation()?;
         self.eat(&Kind::Equal)?;
         let target = self.foreign_path()?;
         let span = kw.span.merge(target.span());
-        Some(span.track(StmtKind::Extern { name, ty, target }))
+        Some(span.track(StmtKind::Extern {
+            name,
+            ty,
+            abi,
+            target,
+        }))
+    }
+
+    /// `<extern-type> [where <clause>]`. The clause still belongs to the one
+    /// desugared ordinary annotation; ABI nodes never introduce rank of their
+    /// own.
+    fn extern_annotation(&mut self) -> Option<(Annotation, ExternType)> {
+        let (ty, abi) = self.extern_type(true)?;
+        let clause = match self.eat_keyword("where") {
+            Some(kw) => Some(self.where_clause(kw.span, true)?),
+            None => None,
+        };
+        Some((Annotation { ty, clause }, abi))
+    }
+
+    /// A marked ABI function, a transparent group around one, or an ordinary
+    /// Ruddy type leaf. `ordinary_outermost` retains the ordinary annotation's
+    /// useful error for a `+` with no arrow at the declaration's top level.
+    fn extern_type(&mut self, ordinary_outermost: bool) -> Option<(Type, ExternType)> {
+        if self.at(&Kind::Fn) {
+            return self.extern_function_type();
+        }
+        if self.at_grouped_extern_function() {
+            let open = self.eat(&Kind::LeftParen).expect("just peeked `(`");
+            let (mut ty, inner) = self.extern_type(false)?;
+            let close = self.eat(&Kind::RightParen)?;
+            let span = open.span.merge(close.span);
+            ty.span = span;
+            return Some((ty, span.track(ExternTypeKind::Group(Box::new(inner)))));
+        }
+        let ty = self.arrow(ordinary_outermost)?;
+        let abi = ty.span.track(ExternTypeKind::Ordinary(ty.clone()));
+        Some((ty, abi))
+    }
+
+    /// Whether consecutive transparent parentheses lead directly to `fn`.
+    /// Ordinary parenthesized and tuple types remain wholly ordinary leaves.
+    fn at_grouped_extern_function(&self) -> bool {
+        let mut at = self.pos;
+        let mut opens = 0usize;
+        while matches!(
+            self.toks.get(at).map(|token| &token.tracked),
+            Some(Kind::LeftParen)
+        ) {
+            opens += 1;
+            at += 1;
+        }
+        opens > 0
+            && matches!(
+                self.toks.get(at).map(|token| &token.tracked),
+                Some(Kind::Fn)
+            )
+    }
+
+    /// `fn(<extern-type>, ...) -> <extern-type> [+ <effects>]`.
+    fn extern_function_type(&mut self) -> Option<(Type, ExternType)> {
+        let keyword = self.eat(&Kind::Fn).expect("the caller peeked `fn`");
+        let open = self.eat(&Kind::LeftParen)?;
+        let mut parameters = Vec::new();
+        if !self.at(&Kind::RightParen) {
+            loop {
+                parameters.push(self.extern_type(false)?);
+                if self.eat_if(&Kind::Comma).is_none() {
+                    break;
+                }
+                if self.at(&Kind::RightParen) {
+                    break;
+                }
+            }
+        }
+        let close = self.eat(&Kind::RightParen)?;
+        self.eat(&Kind::Arrow)?;
+        let (result_ty, result) = self.extern_type(false)?;
+        let effects = match self.at_plus() {
+            true => Some(Box::new(self.effect_row()?)),
+            false => None,
+        };
+        let span = effects.as_ref().map_or_else(
+            || keyword.span.merge(result_ty.span),
+            |row| keyword.span.merge(row.span),
+        );
+
+        // Marked effects belong only to the final curried arrow. A nullary ABI
+        // receives Ruddy unit but passes no argument across the boundary.
+        let mut parameter_types: Vec<Type> = parameters.iter().map(|(ty, _)| ty.clone()).collect();
+        if parameter_types.is_empty() {
+            parameter_types.push(open.span.merge(close.span).track(TypeKind::Unit));
+        }
+        let mut ty = result_ty;
+        let final_at = parameter_types.len() - 1;
+        for (at, parameter) in parameter_types.into_iter().enumerate().rev() {
+            let arrow_effects = (at == final_at).then(|| effects.clone()).flatten();
+            let arrow_span = arrow_effects.as_ref().map_or_else(
+                || parameter.span.merge(ty.span),
+                |row| parameter.span.merge(row.span),
+            );
+            ty = arrow_span.track(TypeKind::Arrow {
+                from: Box::new(parameter),
+                to: Box::new(ty),
+                effects: arrow_effects,
+            });
+        }
+        ty.span = span;
+        let abi = span.track(ExternTypeKind::Function {
+            parameters: parameters.into_iter().map(|(_, abi)| abi).collect(),
+            result: Box::new(result),
+            effects,
+        });
+        Some((ty, abi))
     }
 
     /// `<name> ('.' <name>)*` — the target side of an extern declaration.
@@ -2803,7 +2936,7 @@ impl Parser {
         while let Some(tok) = self.peek() {
             if matches!(
                 tok.tracked,
-                Kind::Let | Kind::Type | Kind::Effect | Kind::Module | Kind::End
+                Kind::Let | Kind::Extern | Kind::Type | Kind::Effect | Kind::Module | Kind::End
             ) {
                 break;
             }

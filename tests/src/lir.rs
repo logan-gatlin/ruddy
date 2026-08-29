@@ -2689,6 +2689,205 @@ fn extern_values_are_imports_not_global_initializers() {
 }
 
 #[test]
+fn recursive_ordinary_extern_adapters_close_cycles_in_both_directions() {
+    let source = "type Loop = () -> Loop\n\
+         extern loop : Loop = host.loop\n\
+         extern install : fn(Loop) -> () = host.install";
+    let printed = listing(source);
+    let adapters: Vec<_> = printed
+        .lines()
+        .filter(|line| line.starts_with("fn "))
+        .collect();
+    assert_eq!(
+        adapters.len(),
+        3,
+        "one marked and two cyclic adapters:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure loop#extern#"))
+            .any(|line| line.matches("loop#extern#").count() == 1),
+        "the host-to-Ruddy result closes over its in-progress adapter:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure install#extern#callback#"))
+            .any(|line| line.matches("install#extern#callback#").count() == 1),
+        "the Ruddy-to-host result closes over its in-progress adapter:\n{printed}"
+    );
+}
+
+#[test]
+fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         type Callback = () -> (() -> Nat + !Needed)\n\
+         extern install : fn(Callback) -> () + !Needed + !Spare = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "only Needed crosses into the callback adapter:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure install#extern#callback#"))
+            .any(|line| line.matches('%').count() == 3),
+        "the returned callback retains its closure and Needed evidence:\n{printed}"
+    );
+}
+
+#[test]
+fn callback_evidence_joins_conditional_then_definite_occurrences() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> (() -> () + !Needed) + !Needed (when 'needed)) -> () + !Needed = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "the definite occurrence promotes the repeated requirement:\n{printed}"
+    );
+    let first_adapter = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#1"))
+        .expect("the first callback adapter is printed");
+    assert!(
+        first_adapter.find("struct { Needed:") < first_adapter.find(" = call "),
+        "the promoted evidence is repacked for the outer conditional arrow before its call:\n{printed}"
+    );
+}
+
+#[test]
+fn callback_evidence_joins_definite_then_conditional_occurrences() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> (() -> () + !Needed (when 'needed)) + !Needed) -> () + !Needed = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "the definite occurrence stays dominant:\n{printed}"
+    );
+    let first_adapter = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#1"))
+        .expect("the first callback adapter is printed");
+    assert!(
+        first_adapter.find(" = call ") < first_adapter.find("struct { Needed:"),
+        "the first definite occurrence remains direct evidence at its call:\n{printed}"
+    );
+}
+
+#[test]
+fn conditional_callback_bundles_capture_only_their_named_possibilities() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed + !Spare + ..'effects = host.install";
+    let printed = listing(source);
+    let bundles: Vec<_> = printed
+        .lines()
+        .filter(|line| line.contains(" = struct {") && line.contains("Needed:"))
+        .collect();
+    assert!(
+        !bundles.is_empty(),
+        "the conditional bundle is built:\n{printed}"
+    );
+    assert!(
+        bundles.iter().all(|line| !line.contains("Spare:")),
+        "unrelated definite evidence was captured in a conditional bundle:\n{printed}"
+    );
+}
+
+#[test]
+fn conditional_named_evidence_overlays_the_same_shared_open_tail() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed) + ..'effects) -> () + !Needed + ..'effects = host.install\n\
+         let call : () -> () + !Spare = fn _ => handle install (fn _ => let n = !Needed.get () in {}) with | !Needed.get _ => 0n end";
+    let printed = listing(source);
+    let marked = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#0"))
+        .expect("the marked extern adapter is emitted");
+    assert!(
+        marked.contains(concat!(
+            "  %5: struct = struct { Needed: %2 }\n",
+            "  %6: struct = merge %3, %5\n",
+            "  %14: fn = closure install#extern#callback#1, [%4, %6]"
+        )),
+        "Needed must overlay the instantiated Spare tail captured by the callback:\n{printed}"
+    );
+    assert!(
+        !marked.contains("Spare:"),
+        "Spare remains an opaque shared tail instead of becoming named overlay evidence:\n{printed}"
+    );
+}
+
+#[test]
+fn restricted_callback_bundles_project_shared_open_tails() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects =
+           fn callback => install callback";
+    let printed = listing(source);
+    let marked = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#0"))
+        .expect("the marked extern adapter is emitted");
+    assert!(
+        marked.contains(concat!(
+            "  %4: struct = project %2, \"Needed\"\n",
+            "  %5: struct = struct { Needed: %4 }\n",
+            "  %12: fn = closure install#extern#callback#1, [%3, %5]"
+        )),
+        "the callback must capture exactly its value and projected Needed record, not ambient %2:\n{printed}"
+    );
+    assert!(
+        !marked.contains("Spare:") && !marked.contains(" = merge "),
+        "opaque ambient tail contents must not be named or merged into the capture:\n{printed}"
+    );
+}
+
+#[test]
+fn restricted_callback_bundles_drop_unrelated_conditional_tail_effects() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         extern install : fn(fn(()) -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + ..'effects = host.install\n\
+         let pass : (() -> () + !Needed (when 'needed)) -> () + !Needed (when 'needed) + !Spare (when 'spare) + ..'effects =
+           fn callback => install callback";
+    let printed = listing(source);
+    let projected: Vec<_> = printed
+        .lines()
+        .filter(|line| line.contains("project ") && line.contains("Needed"))
+        .collect();
+    assert!(!projected.is_empty(), "Needed is projected:\n{printed}");
+    let callback = printed
+        .split("\n\n")
+        .find(|part| part.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert!(callback.contains("struct { Needed:"), "{printed}");
+    assert!(
+        !callback.contains("Spare"),
+        "the unrelated conditional effect is absent from the restricted callback bundle:\n{printed}"
+    );
+}
+
+#[test]
 fn struct_and_project_instructions_preserve_quoted_field_names() {
     let source = r###"let pick = fn ignored => let record = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n } in record."line\n\"quote\"\\tail""###;
     let printed = section(source, "fn pick(");

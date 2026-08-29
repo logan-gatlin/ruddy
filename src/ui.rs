@@ -1916,6 +1916,7 @@ impl ConstraintKind {
             ConstraintKind::Instance { .. } => "instance",
             ConstraintKind::Match { .. } => "match",
             ConstraintKind::Performs { .. } => "performs",
+            ConstraintKind::CallbackCoverage { .. } => "callback-coverage",
         }
     }
 }
@@ -1992,6 +1993,15 @@ impl fmt::Display for ConstraintKind {
                 effects_shown(performed),
                 effects_shown(ambient),
             ),
+            ConstraintKind::CallbackCoverage {
+                required,
+                available,
+            } => write!(
+                f,
+                "callback {} covered by {}",
+                effects_shown(required),
+                effects_shown(available),
+            ),
         }
     }
 }
@@ -2047,6 +2057,8 @@ impl inference::ErrorKind {
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
             inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
             inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
+            inference::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
+            inference::ErrorKind::PolymorphicExternBoundary => "polymorphic-extern-boundary",
         }
     }
 }
@@ -2165,6 +2177,14 @@ impl fmt::Display for inference::ErrorKind {
                 f,
                 "this function performs `{}`, which its type does not allow",
                 label(Shape::Effect, effect),
+            ),
+            inference::ErrorKind::CallbackEffectsNotCovered => write!(
+                f,
+                "callback effects are not covered by the containing extern call",
+            ),
+            inference::ErrorKind::PolymorphicExternBoundary => write!(
+                f,
+                "an extern boundary leaf must have a fixed runtime representation",
             ),
         }
     }

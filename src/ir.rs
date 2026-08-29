@@ -202,6 +202,90 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Extern {
     pub target: ForeignPath,
+    /// The resolved foreign boundary spelling. This is kept separately from
+    /// the annotation's ordinary curried type so lowering can distinguish one
+    /// n-ary host call from a chain of Ruddy calls without resolving names (or
+    /// annotation variables) a second time.
+    pub abi: ExternType,
+}
+
+/// A resolved extern boundary type. Every leaf contains the corresponding
+/// part of the already-resolved annotation, while marked functions retain
+/// their host arity and callback nesting.
+pub type ExternType = Tracked<ExternTypeKind>;
+
+#[derive(Debug, Clone)]
+pub enum ExternTypeKind {
+    Ordinary(Type),
+    Function {
+        parameters: Vec<ExternType>,
+        result: Box<ExternType>,
+        /// Effects on the final arrow of the desugared marked function.
+        effects: Box<EffectRow>,
+    },
+    Group(Box<ExternType>),
+}
+
+/// Attach resolved annotation nodes to the parser's ABI skeleton. The parser
+/// constructs the ordinary annotation and ABI tree together, so a marked
+/// function corresponds to one arrow per parameter (or one unit arrow when it
+/// is nullary). Invalid annotation pieces are deliberately retained as error
+/// leaves rather than making ABI retention depend on successful resolution.
+fn resolved_extern_type(written: parse::ExternType, resolved: &Type) -> ExternType {
+    let span = written.span;
+    match written.tracked {
+        parse::ExternTypeKind::Ordinary(_) => {
+            span.track(ExternTypeKind::Ordinary(resolved.clone()))
+        }
+        parse::ExternTypeKind::Group(inner) => span.track(ExternTypeKind::Group(Box::new(
+            resolved_extern_type(*inner, resolved),
+        ))),
+        parse::ExternTypeKind::Function {
+            parameters, result, ..
+        } => {
+            let mut cursor = resolved.clone();
+            let mut resolved_parameters = Vec::with_capacity(parameters.len());
+            let arrow_count = parameters.len().max(1);
+            let mut effects = Box::new(EffectRow::default());
+            for at in 0..arrow_count {
+                match cursor.tracked.clone() {
+                    TypeKind::Arrow {
+                        from,
+                        to,
+                        effects: arrow_effects,
+                    } => {
+                        if at < parameters.len() {
+                            resolved_parameters.push(*from);
+                        }
+                        cursor = *to;
+                        if at + 1 == arrow_count {
+                            effects = arrow_effects;
+                        }
+                    }
+                    _ => {
+                        // Resolution can absorb a bad arrow into Error. Keep
+                        // the ABI tree total so diagnostics remain the only
+                        // observable consequence of the malformed annotation.
+                        if at < parameters.len() {
+                            resolved_parameters.push(span.track(TypeKind::Error));
+                        }
+                        cursor = span.track(TypeKind::Error);
+                    }
+                }
+            }
+            let parameters = parameters
+                .into_iter()
+                .zip(resolved_parameters.iter())
+                .map(|(parameter, resolved)| resolved_extern_type(parameter, resolved))
+                .collect();
+            let result = Box::new(resolved_extern_type(*result, &cursor));
+            span.track(ExternTypeKind::Function {
+                parameters,
+                result,
+                effects,
+            })
+        }
+    }
 }
 
 /// A target path is neither a Ruddy module path nor a projection expression.
@@ -1429,7 +1513,13 @@ enum FlatValue {
 type Defined = (Option<Module>, Box<parse::Pattern>, Option<Annotated>, Body);
 
 /// One extern declaration, paired with the module it belongs to.
-type External = (Option<Module>, TrackedString, Annotated, parse::ForeignPath);
+type External = (
+    Option<Module>,
+    TrackedString,
+    Annotated,
+    parse::ExternType,
+    parse::ForeignPath,
+);
 
 enum DeclaredValue {
     Term {
@@ -2211,7 +2301,7 @@ fn build_with_dependency_imports_inner(
                 }
             }
             FlatValue::Extern(at) => {
-                let (module, name, _, _) = &flat.externs[*at];
+                let (module, name, _, _, _) = &flat.externs[*at];
                 b.module = *module;
                 DeclaredValue::Extern {
                     at: *at,
@@ -2223,9 +2313,14 @@ fn build_with_dependency_imports_inner(
     for value in declared {
         match value {
             DeclaredValue::Extern { at, symbol } => {
-                let (module, name, annotation, target) = flat.externs[at].clone();
+                let (module, name, annotation, abi, target) = flat.externs[at].clone();
                 b.module = module;
                 let annotation = b.written(annotation, Place::Annotation);
+                // Resolve the ABI against the annotation we just lowered. Its
+                // leaves are clones of the same parsed types, so lowering them
+                // independently would duplicate diagnostics and, more subtly,
+                // mint different annotation-variable identities.
+                let abi = resolved_extern_type(abi, &annotation.ty);
                 if let Some(symbol) = symbol {
                     program.externs.insert(
                         symbol,
@@ -2237,6 +2332,7 @@ fn build_with_dependency_imports_inner(
                                 target: ForeignPath {
                                     segments: target.segments,
                                 },
+                                abi,
                             },
                         },
                     );
@@ -7374,9 +7470,14 @@ impl Builder<'_> {
                     flat.terms.push((outer, pattern, ty, body));
                     flat.values.push(FlatValue::Term(at));
                 }
-                StmtKind::Extern { name, ty, target } => {
+                StmtKind::Extern {
+                    name,
+                    ty,
+                    abi,
+                    target,
+                } => {
                     let at = flat.externs.len();
-                    flat.externs.push((outer, name, ty, target));
+                    flat.externs.push((outer, name, ty, abi, target));
                     flat.values.push(FlatValue::Extern(at));
                 }
                 StmtKind::Module { name, body } => {
