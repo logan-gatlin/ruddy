@@ -944,7 +944,11 @@ struct Solved {
 /// generalization reads it. It is the only state that outlives a pass.
 #[derive(Clone)]
 struct PackageGuarantee {
-    formula: Formula,
+    /// Distinct owned conjuncts in stable registration order. A coherent local
+    /// package can be instantiated thousands of times; set insertion makes
+    /// repeating its identical guarantee idempotent instead of growing an
+    /// ever-deeper conjunction (and cloning that conjunction on every use).
+    clauses: IndexSet<Formula>,
     /// Nested arrow results are production events and open freshly each time;
     /// a root package denotes one lexical value and keeps one coherent view.
     fresh: bool,
@@ -3172,7 +3176,7 @@ impl Table {
             self.package_guarantees
                 .entry(key.clone())
                 .or_insert(PackageGuarantee {
-                    formula: Formula::True,
+                    clauses: IndexSet::new(),
                     fresh: *fresh,
                 });
         }
@@ -3190,10 +3194,10 @@ impl Table {
                         self.package_guarantees
                             .entry(key.clone())
                             .and_modify(|before| {
-                                before.formula = before.formula.clone().and((**inner).clone())
+                                before.clauses.insert((**inner).clone());
                             })
-                            .or_insert(PackageGuarantee {
-                                formula: (**inner).clone(),
+                            .or_insert_with(|| PackageGuarantee {
+                                clauses: std::iter::once((**inner).clone()).collect(),
                                 fresh: *fresh,
                             });
                     }
@@ -3236,7 +3240,7 @@ impl Table {
             substitute_presence_vars(body, &renames)
         };
         if let Some(guarantee) = guarantee {
-            let formula = guarantee.formula.rename(&|var| {
+            let formula = Formula::all(guarantee.clauses.iter().cloned()).rename(&|var| {
                 renames
                     .get(&var)
                     .cloned()
@@ -5791,6 +5795,46 @@ fn same_field_set<A, B>(want: &IndexMap<String, A>, have: &IndexMap<String, B>) 
 #[cfg(test)]
 mod existential_regressions {
     use super::*;
+
+    #[test]
+    fn coherent_package_guarantees_are_registered_idempotently() {
+        let mut table = Table::default();
+        let Presence::Var(hidden) = table.fresh_presence() else {
+            unreachable!()
+        };
+        table.abstract_existentials.insert(hidden);
+        let body = Rc::new(Ty::Struct(Row {
+            labels: [(
+                "hidden".into(),
+                RowField {
+                    presence: Presence::Var(hidden),
+                    ty: Rc::new(Ty::Nat),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            rest: Rest::Closed,
+        }));
+        let package = Rc::new(Ty::Package(body));
+        let clause = Formula::owned(0, Formula::var(hidden));
+
+        for _ in 0..5_000 {
+            assert!(
+                table
+                    .register_package_guarantees(&package, clause.clone())
+                    .is_true()
+            );
+        }
+
+        let guarantee = table.package_guarantees.values().next().unwrap();
+        assert_eq!(guarantee.clauses.len(), 1);
+
+        // Idempotence must not collapse a genuinely different proposition for
+        // the same package allocation.
+        table.register_package_guarantees(&package, Formula::owned(0, Formula::var(hidden).not()));
+        let guarantee = table.package_guarantees.values().next().unwrap();
+        assert_eq!(guarantee.clauses.len(), 2);
+    }
 
     #[test]
     fn publication_shift_captures_deep_composed_rows_without_recursing() {

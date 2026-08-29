@@ -427,6 +427,50 @@ fn existential_presence_ownership_round_trips_and_is_validated() {
     assert_malformed(&printed.replacen("(scheme 15 7", "(scheme 6 7", 1));
 }
 
+#[test]
+fn broad_existential_package_validation_scales() {
+    const WIDTH: u32 = 4_096;
+    let mut artifact = model_artifact();
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.count = WIDTH + 1;
+    scheme.presences = WIDTH + 1;
+    scheme.existentials = (0..WIDTH).collect();
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: (0..WIDTH)
+            .map(|index| {
+                (
+                    format!("slot{index}"),
+                    field(Presence::Bound(index), Type::Nat),
+                )
+            })
+            .collect(),
+        rest: Rest::Closed,
+    })));
+
+    // Include every existential and one universal in an indivisible owned
+    // proposition. This exercises both broad body-owner membership checks and
+    // the mixed formula scan without creating a recursively deep formula.
+    let mut formulas: Vec<_> = (0..=WIDTH).map(Formula::Bound).collect();
+    while formulas.len() > 1 {
+        formulas = formulas
+            .chunks(2)
+            .map(|pair| match pair {
+                [left, right] => Formula::Or(Box::new(left.clone()), Box::new(right.clone())),
+                [only] => only.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+    }
+    scheme.formula = Formula::Owned(0, Box::new(formulas.pop().unwrap()));
+
+    let printed = artifact.print();
+    let parsed = Artifact::try_parse(&printed).expect("broad package remains valid");
+    assert_eq!(
+        parsed.header.values[0].scheme.existentials.len(),
+        WIDTH as usize
+    );
+}
+
 fn assert_round_trip(value: &Artifact) -> String {
     let printed = value.print();
     let parsed = Artifact::parse(&printed);

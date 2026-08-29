@@ -3514,7 +3514,7 @@ pub mod text {
                                         "presence bound is outside the presence quantifier space",
                                     );
                                 }
-                                if existentials.contains(&index) {
+                                if existentials.binary_search(&index).is_ok() {
                                     let Some(owner) = owner else {
                                         self.fail("existential presence occurs outside a package");
                                         continue;
@@ -3595,7 +3595,7 @@ pub mod text {
                 for index in atoms
                     .iter()
                     .copied()
-                    .filter(|index| existentials.contains(index))
+                    .filter(|index| existentials.binary_search(index).is_ok())
                 {
                     let owner = slot_owners.get(&index).copied();
                     match (inferred, owner) {
