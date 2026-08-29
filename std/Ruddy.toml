@@ -1,6 +1,6 @@
 name = "std"
 version = "0.1.0"
-root = "main.hc"
+root = "lib.hc"
 
 [dependencies]
 std = false
