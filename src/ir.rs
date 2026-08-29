@@ -752,6 +752,12 @@ pub struct Annotation {
 /// One variable a variable statement declared.
 #[derive(Debug, Clone)]
 pub struct Variable {
+    /// Whether this presence is selected by callers or hidden by the value
+    /// which produces it. Non-presence variables are always `Universal`.
+    ///
+    /// This is computed from the complete lowered annotation rather than at a
+    /// `when` occurrence, because arrows can reverse polarity more than once.
+    pub ownership: PresenceOwnership,
     /// Where the name was written, so a complaint about what the body did with
     /// it can point back at the promise it broke.
     pub span: Span,
@@ -765,6 +771,136 @@ pub struct Variable {
     /// each write `a` declare two variables, and this is what keeps them apart
     /// wherever both are in hand at once.
     pub id: u32,
+}
+
+/// Ownership inferred for an annotation variable from its type polarity.
+///
+/// Existential ownership is semantic metadata only: it adds no source syntax
+/// and has no runtime representation. `boundary` identifies the result/value
+/// node which owns the hidden choice, allowing later lowering to preserve
+/// nested result scopes instead of prenexing every presence into the scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceOwnership {
+    Universal,
+    Existential { boundary: Span },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PresenceOccurrences {
+    positive: u32,
+    negative: u32,
+    owner: Option<Span>,
+}
+
+/// Compute presence polarity and the smallest positive production boundary
+/// shared by a name. Formula uses are deliberately absent: a formula relates
+/// presences established by labels but does not decide their ownership.
+fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
+    fn contains(outer: Span, inner: Span) -> bool {
+        outer.file_id == inner.file_id && outer.start <= inner.start && outer.end() >= inner.end()
+    }
+
+    fn note(
+        out: &mut HashMap<String, PresenceOccurrences>,
+        when: &Option<Box<When>>,
+        positive: bool,
+        owner: Span,
+    ) {
+        let Some(name) = when.as_ref().and_then(|when| when.name.as_ref()) else {
+            return;
+        };
+        let occurrence = out.entry(name.clone()).or_default();
+        if positive {
+            occurrence.positive += 1;
+            occurrence.owner = match occurrence.owner {
+                None if occurrence.positive == 1 => Some(owner),
+                Some(before) if contains(before, owner) => Some(before),
+                Some(before) if contains(owner, before) => Some(owner),
+                // Two sibling production boundaries cannot soundly share one
+                // hidden witness. Keeping no owner makes classification fall
+                // back to universal until lowering emits the dedicated R8
+                // ownership diagnostic.
+                _ => None,
+            };
+        } else {
+            occurrence.negative += 1;
+        }
+    }
+
+    fn walk_row(
+        row: &EffectRow,
+        positive: bool,
+        owner: Span,
+        out: &mut HashMap<String, PresenceOccurrences>,
+    ) {
+        for effect in row.effects.values() {
+            if let EffectLabel::Written { when, .. } = effect {
+                note(out, when, positive, owner);
+            }
+        }
+    }
+
+    fn walk(
+        ty: &Type,
+        positive: bool,
+        owner: Span,
+        out: &mut HashMap<String, PresenceOccurrences>,
+    ) {
+        match &ty.tracked {
+            TypeKind::Arrow { from, to, effects } => {
+                walk(from, !positive, owner, out);
+                // A result reached positively owns choices made separately by
+                // each invocation. Under negative polarity it is produced by
+                // the annotation's consumer, so no new producer boundary is
+                // introduced relative to the complete type.
+                let result_owner = if positive { to.span } else { owner };
+                walk(to, positive, result_owner, out);
+                // Conditional effects belong to the arrow value itself, not
+                // to its result. The polarity has already been reversed if
+                // this arrow sits in an outer parameter.
+                walk_row(effects, positive, owner, out);
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields.values() {
+                    if let TypeField::Written { when, value, .. } = field {
+                        note(out, when, positive, owner);
+                        walk(value, positive, owner, out);
+                    }
+                }
+            }
+            TypeKind::Sum { cases, .. } => {
+                for case in cases.values() {
+                    if let SumCase::Written { when, payload, .. } = case {
+                        note(out, when, positive, owner);
+                        if let Some(payload) = payload {
+                            walk(payload, positive, owner, out);
+                        }
+                    }
+                }
+            }
+            TypeKind::Effects(effects) => walk_row(effects, positive, owner, out),
+            // Declared types are transparent semantically. Until declaration
+            // parameter variance is available here, invariant treatment is the
+            // only sound choice: preserving polarity through every argument
+            // would incorrectly hide a presence forwarded to a negative use.
+            TypeKind::Apply { args, .. } => {
+                for arg in args {
+                    walk(arg, true, owner, out);
+                    walk(arg, false, owner, out);
+                }
+            }
+            TypeKind::Ident(_)
+            | TypeKind::Param { .. }
+            | TypeKind::Prim(_)
+            | TypeKind::Var(_)
+            | TypeKind::Hole
+            | TypeKind::Error => {}
+        }
+    }
+
+    let mut out = HashMap::new();
+    walk(ty, true, ty.span, &mut out);
+    out
 }
 
 /// One case of a sum type: the [`Field`] split of spans, the `when` clause it
@@ -8414,17 +8550,34 @@ impl Builder<'_> {
                 }
             });
         }
+        let polarity = presence_polarities(&ty);
         let variables = self
             .vars
             .iter()
-            .map(|(name, declared)| Variable {
-                span: declared.span,
-                name: name.clone(),
-                sense: declared
+            .map(|(name, declared)| {
+                let sense = declared
                     .sense
                     .expect("an annotation variable was minted by a typed use")
-                    .0,
-                id: declared.id,
+                    .0;
+                let ownership = match (sense, polarity.get(name)) {
+                    (Sense::Presence, Some(occurrences))
+                        if occurrences.negative == 0
+                            && occurrences.positive > 0
+                            && occurrences.owner.is_some() =>
+                    {
+                        PresenceOwnership::Existential {
+                            boundary: occurrences.owner.expect("checked above"),
+                        }
+                    }
+                    _ => PresenceOwnership::Universal,
+                };
+                Variable {
+                    ownership,
+                    span: declared.span,
+                    name: name.clone(),
+                    sense,
+                    id: declared.id,
+                }
             })
             .collect();
         Annotation {

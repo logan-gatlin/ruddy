@@ -2297,6 +2297,24 @@ impl Solve<'_> {
             (Presence::Var(a), Presence::Var(b)) if a == b => {
                 self.step(span, Rule::Same, goal, Effect::None)
             }
+            (Presence::Var(var), other) if self.table.existential_witnesses.contains(var) => {
+                let formula = lhs.formula().iff(other.formula());
+                self.step(span, Rule::Refine, goal, Effect::None);
+                self.table.require(
+                    span,
+                    Origin::Instance(Named { labels: Vec::new() }),
+                    formula,
+                );
+            }
+            (other, Presence::Var(var)) if self.table.existential_witnesses.contains(var) => {
+                let formula = other.formula().iff(rhs.formula());
+                self.step(span, Rule::Refine, goal, Effect::None);
+                self.table.require(
+                    span,
+                    Origin::Instance(Named { labels: Vec::new() }),
+                    formula,
+                );
+            }
             (Presence::Var(var), other) => {
                 let (var, other) = (*var, other.clone());
                 self.assign(span, goal, var, Assigned::Presence(other));
