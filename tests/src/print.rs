@@ -157,9 +157,13 @@ fn numeric_struct_syntax_canonicalizes_only_when_exact() {
         ),
         (
             "let sparse = { \"0\": 1n, \"2\": 3n }",
-            "let sparse = { \"0\": 1n, \"2\": 3n }",
+            "let sparse = { 0: 1n, 2: 3n }",
         ),
         ("let padded = { \"00\": 1n }", "let padded = { \"00\": 1n }"),
+        (
+            "let huge = { \"18446744073709551616\": 1n }",
+            "let huge = { \"18446744073709551616\": 1n }",
+        ),
     ] {
         let (ast, ir) = printed(source);
         assert_eq!(ast, expected, "{source}: AST");

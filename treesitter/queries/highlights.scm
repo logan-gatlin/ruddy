@@ -107,6 +107,10 @@
 (absent_field name: (identifier) @property)
 (projection field: (identifier) @property)
 (projection field: (numeric_field) @property)
+(struct_field name: (numeric_field) @property)
+(struct_type_field name: (numeric_field) @property)
+(struct_pattern_field name: (numeric_field) @property)
+(absent_field name: (numeric_field) @property)
 
 ; ── literals ─────────────────────────────────────────────────────────────────
 

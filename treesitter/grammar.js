@@ -52,6 +52,16 @@ function sepBy1(sep, rule) {
   return seq(rule, repeat(seq(sep, rule)));
 }
 
+/** A structural field label, including compiler-invalid numeric forms. */
+function fieldLabel($) {
+  return choice(
+    $.identifier,
+    $.string,
+    $.numeric_field,
+    alias($._malformed_numeric_field, $.ERROR),
+  );
+}
+
 module.exports = grammar({
   name: 'ruddy',
 
@@ -484,7 +494,7 @@ module.exports = grammar({
     ),
 
     struct_field: $ => seq(
-      field('name', choice($.identifier, $.string)),
+      field('name', fieldLabel($)),
       ':',
       field('value', $._expression),
     ),
@@ -549,8 +559,9 @@ module.exports = grammar({
     ),
 
     /**
-     * A field, or a bare identifier punning one to itself. Quoted labels never
-     * pun: `{"field name": p}` must say which pattern receives the field.
+     * A field, or a bare identifier punning one to itself. Quoted and numeric
+     * labels never pun: `{"field name": p}` and `{0: p}` must say which
+     * pattern receives the field.
      */
     struct_pattern_field: $ => choice(
       seq(
@@ -558,7 +569,11 @@ module.exports = grammar({
         optional(seq(':', field('pattern', $._pattern))),
       ),
       seq(
-        field('name', $.string),
+        field('name', choice(
+          $.string,
+          $.numeric_field,
+          alias($._malformed_numeric_field, $.ERROR),
+        )),
         ':',
         field('pattern', $._pattern),
       ),
@@ -707,14 +722,14 @@ module.exports = grammar({
     ),
 
     struct_type_field: $ => seq(
-      field('name', choice($.identifier, $.string)),
+      field('name', fieldLabel($)),
       optional(field('when', $.when_clause)),
       ':',
       field('type', $._type),
     ),
 
     /** `\name` — the label is definitely not there. */
-    absent_field: $ => seq('\\', field('name', choice($.identifier, $.string))),
+    absent_field: $ => seq('\\', field('name', fieldLabel($))),
 
     /**
      * `..` or `..'r` — what is known about the labels not written out. Bare it
@@ -811,7 +826,7 @@ module.exports = grammar({
      */
     natural: _ => new RegExp(/[0-9]+(?:\.[0-9]+)?[\p{Alphabetic}\p{N}_]*/.source, 'u'),
 
-    /** A decimal positional field following a projection dot. */
+    /** A decimal positional field in a projection or structural label. */
     numeric_field: _ => /[0-9]+/,
 
     /**

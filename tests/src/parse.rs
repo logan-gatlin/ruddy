@@ -682,6 +682,43 @@ fn quoted_field_labels_parse_everywhere_and_print_canonically() {
     }
 }
 
+#[test]
+fn bare_numeric_field_labels_parse_canonically_everywhere() {
+    for (src, printed) in [
+        ("let v = { 001: x, 3: 4 }", "let v = { 1: x, 3: 4 }"),
+        (
+            "let v = match x with | { 001: y, 2: z } => y end",
+            "let v = match x with | { 1: y, 2: z } => y end",
+        ),
+        (
+            "let x : { 001 when 'p: Nat, \\02, 3: Nat } = y",
+            "let x : { 1 when 'p: Nat, \\2, 3: Nat } = y",
+        ),
+        // A quoted canonical numeric label now has a shorter bare spelling,
+        // but a leading-zero string cannot be printed bare without changing
+        // its identity through numeric canonicalization.
+        (
+            "let v = { \"1\": x, \"001\": y }",
+            "let v = { 1: x, \"001\": y }",
+        ),
+    ] {
+        assert_eq!(parse_one(src), printed, "{src:?}");
+    }
+}
+
+#[test]
+fn a_numeric_pattern_field_requires_a_colon() {
+    for src in [
+        "let v = match x with | { 0 } => x end",
+        "let v = match x with | { 0, rest: y } => y end",
+        "let v = match x with | { 0: } => x end",
+    ] {
+        let out = parse(lex(src, FileID::GENERATED).tokens);
+        assert!(!out.errors.is_empty(), "{src:?} parsed without complaint");
+        assert!(out.stmts.is_empty(), "{src:?}: {:#?}", out.stmts);
+    }
+}
+
 /// Unlike an identifier field, a quoted pattern label cannot pun: no source
 /// binding can have the arbitrary decoded spelling, so `:` and a subpattern
 /// are required. Identifier puns remain unchanged.
@@ -1157,7 +1194,7 @@ fn every_position_that_can_fail_reports_before_it_does() {
         "let v = #A {",
         // Pattern atoms, nested pattern payloads, and delimiters.
         "let #A ( = value",
-        "let { 1n } = value",
+        "let { 1 } = value",
         "let { field: } = value",
         "let ( = value",
         "let (name = value",

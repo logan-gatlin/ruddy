@@ -1632,6 +1632,19 @@
               {
                 "type": "SYMBOL",
                 "name": "string"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "numeric_field"
+              },
+              {
+                "type": "ALIAS",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_malformed_numeric_field"
+                },
+                "named": true,
+                "value": "ERROR"
               }
             ]
           }
@@ -2003,8 +2016,26 @@
               "type": "FIELD",
               "name": "name",
               "content": {
-                "type": "SYMBOL",
-                "name": "string"
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "SYMBOL",
+                    "name": "string"
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "numeric_field"
+                  },
+                  {
+                    "type": "ALIAS",
+                    "content": {
+                      "type": "SYMBOL",
+                      "name": "_malformed_numeric_field"
+                    },
+                    "named": true,
+                    "value": "ERROR"
+                  }
+                ]
               }
             },
             {
@@ -2728,6 +2759,19 @@
               {
                 "type": "SYMBOL",
                 "name": "string"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "numeric_field"
+              },
+              {
+                "type": "ALIAS",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_malformed_numeric_field"
+                },
+                "named": true,
+                "value": "ERROR"
               }
             ]
           }
@@ -2782,6 +2826,19 @@
               {
                 "type": "SYMBOL",
                 "name": "string"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "numeric_field"
+              },
+              {
+                "type": "ALIAS",
+                "content": {
+                  "type": "SYMBOL",
+                  "name": "_malformed_numeric_field"
+                },
+                "named": true,
+                "value": "ERROR"
               }
             ]
           }

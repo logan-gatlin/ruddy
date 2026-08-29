@@ -279,3 +279,27 @@ type Cases 'r = #"some case" Nat | \#"gone case" | ..'r
           (tag))
         (rest
           (type_variable))))))
+
+================================================================================
+Bare numeric labels work in struct types and absences
+================================================================================
+
+type Record = { 001 when 'p: Nat, \02, 3: String }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_definition
+    (identifier)
+    (annotation
+      (struct_type
+        (struct_type_field
+          (numeric_field)
+          (when_clause
+            (type_variable))
+          (identifier))
+        (absent_field
+          (numeric_field))
+        (struct_type_field
+          (numeric_field)
+          (identifier))))))

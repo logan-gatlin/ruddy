@@ -176,12 +176,12 @@ fn generated_module_executes_tuple_values_projections_and_patterns() {
         return;
     }
     let artifact = compiled(
-        "let pair : (Nat, String) = (42n, \"answer\")\n\
+        "let pair : { 0: Nat, 1: String } = { 000: 42n, 1: \"answer\" }\n\
          let singleton = (true,)\n\
          let first = pair.0\n\
          let second = pair.1\n\
          let swap : (Nat, String) -> (String, Nat) = fn value => match value with \
-         | (number, text) => (text, number) end\n",
+         | { 0: number, 1: text } => (text, number) end\n",
     );
     let module = js::generate(&artifact).unwrap();
     let directory = tempfile::tempdir().unwrap();

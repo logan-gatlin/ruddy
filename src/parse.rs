@@ -945,13 +945,14 @@ impl Parser {
     }
 
     /// Read a structural field label. Unlike bindings and paths, field labels
-    /// may be arbitrary decoded strings; both spellings share the same map-key
-    /// representation so duplicate detection naturally equates `foo` and
-    /// `"foo"`.
+    /// may be arbitrary decoded strings or canonical numeric labels; every
+    /// spelling shares the same map-key representation so duplicate detection
+    /// naturally equates `foo` with `"foo"` and `001` with `"1"`.
     fn field_label(&mut self) -> Option<TrackedString> {
         let name = match self.peek() {
             Some(tok) => match &tok.tracked {
                 Kind::Identifier(name) | Kind::String(name) => Some(tok.span.track(name.clone())),
+                Kind::NumericField(value) => Some(tok.span.track(value.to_string())),
                 _ => None,
             },
             None => None,
@@ -1973,12 +1974,15 @@ impl Parser {
                 };
                 return self.wildcard(place);
             }
-            let quoted = matches!(self.peek(), Some(tok) if matches!(tok.tracked, Kind::String(_)));
+            let requires_colon = matches!(
+                self.peek(),
+                Some(tok) if matches!(tok.tracked, Kind::String(_) | Kind::NumericField(_))
+            );
             let name = self.field_label()?;
-            // Only identifiers may pun. A quoted label always introduces an
-            // explicit sub-pattern, even when its decoded value is identifier-
-            // shaped, so quote provenance need not survive this point.
-            let value = if quoted {
+            // Only identifiers may pun. Quoted and numeric labels always
+            // introduce an explicit sub-pattern, since neither can name the
+            // source binder a pun would create.
+            let value = if requires_colon {
                 self.eat(&Kind::Colon)?;
                 Some(self.pattern()?)
             } else {

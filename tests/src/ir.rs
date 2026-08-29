@@ -772,6 +772,22 @@ fn duplicate_term_fields_are_rejected() {
     assert!(matches!(fields["x"].value.kind, TermKind::Ident(s) if mint.name(s) == "a"));
 }
 
+#[test]
+fn bare_numeric_and_quoted_canonical_labels_are_duplicates() {
+    for src in [
+        "let p = fn a b => { 001: a, \"1\": b }",
+        "type T = { 001: Nat, \"1\": Nat }",
+    ] {
+        let (_, out) = build_src(src);
+        assert_eq!(out.errors.len(), 1, "errors for {src:?}: {:#?}", out.errors);
+        assert!(matches!(out.errors[0].kind, ErrorKind::DuplicateField));
+        assert_eq!(
+            out.errors[0].span.start,
+            src.rfind("\"1\"").expect("the duplicate")
+        );
+    }
+}
+
 /// A repeat in a struct *type* is the same complaint, in the same place, as a
 /// repeat in a struct literal: the two are re-keyed by one piece of code, and a
 /// reader who has learned what the message means about a value should not have
