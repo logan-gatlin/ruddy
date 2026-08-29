@@ -10,6 +10,7 @@ extern make_adder : fn(Nat) -> fn(Nat, Nat) -> Nat = host.makeAdder
 effect Tick = Nat -> Nat
 extern tick : fn(Nat) -> Nat + !Tick = host.tick
 extern run_tick : fn(fn(Nat) -> Nat + !Tick, Nat) -> Nat + !Tick = host.runTick
+extern run_returned_tick : fn(fn(Nat) -> (Nat -> Nat + !Tick), Nat, Nat) -> Nat + !Tick = host.runReturnedTick
 
 let answer = Math::answer
 let identity = Math::identity
@@ -25,6 +26,9 @@ let ticked = handle tick 42n with
   | !Tick value => value
 end
 let callback_ticked = handle run_tick (fn value => !Tick value) 42n with
+  | !Tick value => value
+end
+let returned_callback_ticked = handle run_returned_tick (fn a => fn b => !Tick a) 42n 22n with
   | !Tick value => value
 end
 let record = { answer: answer, ready: true }

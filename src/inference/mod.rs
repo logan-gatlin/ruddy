@@ -88,7 +88,7 @@ use crate::{
     tracking::Span,
     types::{
         Assigned, Atom, EffectId, Formula, ParamKind, Presence, Rest, Row, RowField, Scheme, Sense,
-        Shape, Ty, TyVar,
+        Shape, Ty, TyVar, same_finite_syntax,
     },
 };
 use constrain::Constrain;
@@ -1123,12 +1123,13 @@ fn callback_coverage_constraints(
     fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
         let mut rows = Vec::new();
         let mut cursor = ty.clone();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         loop {
-            if let Ty::Named { symbol, .. } = &*cursor
-                && !seen.insert(*symbol)
-            {
-                break;
+            if matches!(&*cursor, Ty::Named { .. }) {
+                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                    break;
+                }
+                seen.push(cursor.clone());
             }
             let exposed = unfold(aliases, &cursor);
             let Ty::Arrow(_, to, row) = &*exposed else {
@@ -1165,9 +1166,17 @@ fn callback_coverage_constraints(
         abi: &ir::ExternType,
         ty: &Rc<Ty>,
         out: &mut Vec<Constraint>,
+        seen: &mut Vec<(*const ir::ExternType, Rc<Ty>)>,
     ) {
+        let state = abi as *const ir::ExternType;
+        if seen.iter().any(|(prior_state, prior_ty)| {
+            *prior_state == state && same_finite_syntax(prior_ty, ty)
+        }) {
+            return;
+        }
+        seen.push((state, ty.clone()));
         match &abi.tracked {
-            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, out),
+            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, out, seen),
             ir::ExternTypeKind::Function {
                 parameters, result, ..
             } => {
@@ -1187,9 +1196,9 @@ fn callback_coverage_constraints(
                 }
                 for (parameter, input) in parameters.iter().zip(inputs) {
                     cover(aliases, parameter.span, &input, &available, out);
-                    boundary(aliases, parameter, &input, out);
+                    boundary(aliases, parameter, &input, out, seen);
                 }
-                boundary(aliases, result, &cursor, out);
+                boundary(aliases, result, &cursor, out, seen);
             }
             ir::ExternTypeKind::Ordinary(_) => {
                 let exposed = unfold(aliases, ty);
@@ -1199,14 +1208,14 @@ fn callback_coverage_constraints(
                 cover(aliases, abi.span, from, available, out);
                 // An ordinary leaf may conceal arbitrarily much foreign shape
                 // behind aliases. Every arrow remains a unary host boundary.
-                boundary(aliases, abi, from, out);
-                boundary(aliases, abi, to, out);
+                boundary(aliases, abi, from, out, seen);
+                boundary(aliases, abi, to, out, seen);
             }
         }
     }
 
     let mut out = Vec::new();
-    boundary(aliases, abi, ty, &mut out);
+    boundary(aliases, abi, ty, &mut out, &mut Vec::new());
     let conditional = Formula::all(out.iter().flat_map(|constraint| {
         let ConstraintKind::CallbackCoverage {
             required,
