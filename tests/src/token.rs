@@ -116,7 +116,7 @@ fn lexes_numeric_projection_fields() {
 
 #[test]
 fn numeric_projection_fields_reject_number_forms() {
-    for malformed in ["pair.0n", "pair.0i", "pair.0.0"] {
+    for malformed in ["pair.0n", "pair.0i", "pair.0.0", "pair.0²"] {
         let out = lex(malformed, FileID::GENERATED);
         assert_eq!(
             out.errors.len(),
@@ -125,6 +125,11 @@ fn numeric_projection_fields_reject_number_forms() {
             out.errors
         );
         assert_eq!(out.errors[0].kind, ErrorKind::MalformedNatural);
+        assert_eq!(
+            out.errors[0].span.width,
+            malformed.len() - "pair.".len(),
+            "the malformed field must consume its whole Unicode suffix"
+        );
     }
 
     let over = format!("pair.{}0", u64::MAX);
