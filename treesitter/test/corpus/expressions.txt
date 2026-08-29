@@ -366,3 +366,35 @@ let invalid = p.0n
     (projection
       (identifier)
       (ERROR))))
+
+================================================================================
+Adjacent numeric projections require grouping or whitespace
+================================================================================
+
+let invalid = p.0.0
+let printed = (p.0).0
+let spaced = p.0 .0
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (let_definition
+    (identifier)
+    (projection
+      (identifier)
+      (ERROR)))
+  (let_definition
+    (identifier)
+    (projection
+      (parenthesized_expression
+        (projection
+          (identifier)
+          (numeric_field)))
+      (numeric_field)))
+  (let_definition
+    (identifier)
+    (projection
+      (projection
+        (identifier)
+        (numeric_field))
+      (numeric_field))))
