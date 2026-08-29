@@ -910,8 +910,11 @@ impl Ty {
 
     /// The field row inside a struct, if this is one.
     pub fn fields(&self) -> Option<&Row> {
-        match self {
-            Ty::Package(body) => body.fields(),
+        let mut ty = self;
+        while let Ty::Package(body) = ty {
+            ty = body;
+        }
+        match ty {
             Ty::Struct(row) => Some(row),
             _ => None,
         }
@@ -925,8 +928,11 @@ impl Ty {
     /// only way to reach it — so the tail it leaves behind is undecided rather
     /// than closed, which is what an erased argument has always been.
     pub fn cases(&self) -> Row {
-        match self {
-            Ty::Package(body) => body.cases(),
+        let mut ty = self;
+        while let Ty::Package(body) = ty {
+            ty = body;
+        }
+        match ty {
             Ty::Sum(cases) => cases.clone(),
             _ => Row::of(Rest::Undecided),
         }

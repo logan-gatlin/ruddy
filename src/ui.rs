@@ -1225,10 +1225,16 @@ impl fmt::Display for Prim {
 /// comparing against the position a type is being written into, and that
 /// comparison is the surface grammar's whether or not this particular tree can
 /// reach every level of it.
+fn unpackaged(mut ty: &Ty) -> &Ty {
+    while let Ty::Package(body) = ty {
+        ty = body;
+    }
+    ty
+}
+
 impl Grouped for Ty {
     fn prec(&self) -> Prec {
-        match self {
-            Ty::Package(body) => body.prec(),
+        match unpackaged(self) {
             Ty::Arrow(..) => Prec::Arrow,
             Ty::Sum(_) => Prec::Sum,
             Ty::Named { args, .. } if !args.is_empty() => Prec::Apply,
@@ -1299,7 +1305,10 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                             work.push(SemanticJob::Effects(effects));
                             work.push(SemanticJob::Text(" + "));
                         }
-                        work.push(SemanticJob::Ty(to, shown && matches!(&**to, Ty::Arrow(..))));
+                        work.push(SemanticJob::Ty(
+                            to,
+                            shown && matches!(unpackaged(to), Ty::Arrow(..)),
+                        ));
                         work.push(SemanticJob::Text(" -> "));
                         work.push(SemanticJob::Ty(from, from.prec() < Prec::Sum));
                     }
@@ -1324,7 +1333,7 @@ fn format_semantic(f: &mut fmt::Formatter<'_>, root: SemanticRoot<'_>) -> fmt::R
                     f.write_str("(")?;
                     work.push(SemanticJob::Text(")"));
                 }
-                match ty {
+                match unpackaged(ty) {
                     Ty::Sum(row)
                         if flattened_row(row)
                             .0
