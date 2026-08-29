@@ -5106,6 +5106,41 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
     );
 }
 
+/// Ownership is a property of the complete set of positive lifetimes, not the
+/// order fields happen to be walked. Sibling callback results cannot share a
+/// witness by themselves; an occurrence at their enclosing value boundary can
+/// own both, even when that occurrence is visited last.
+#[test]
+fn presence_ownership_is_deterministic_across_containment_and_siblings() {
+    let siblings =
+        "let callbacks : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}";
+    let (mint, out) = built(siblings);
+    assert_eq!(
+        annotation_of(&mint, &out, "callbacks").variables[0].ownership,
+        PresenceOwnership::Universal
+    );
+
+    for source in [
+        "let owned : { root when 'p: Nat, one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat } } = {}",
+        "let owned : { one: Nat -> { x when 'p: Nat }, two: Nat -> { y when 'p: Nat }, root when 'p: Nat } = {}",
+    ] {
+        let (mint, out) = built(source);
+        let PresenceOwnership::Existential { boundary } =
+            annotation_of(&mint, &out, "owned").variables[0].ownership
+        else {
+            panic!("the enclosing occurrence should own both siblings: {source}");
+        };
+        let expected = source
+            .split_once(": ")
+            .expect("annotation")
+            .1
+            .rsplit_once(" = ")
+            .expect("value")
+            .0;
+        assert_eq!(&source[boundary.start..boundary.end()], expected);
+    }
+}
+
 /// Conditional effect labels have the polarity of the arrow carrying them;
 /// entering an outer parameter has already reversed that polarity.
 #[test]

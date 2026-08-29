@@ -785,21 +785,39 @@ pub enum PresenceOwnership {
     Existential { boundary: Span },
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct PresenceOccurrences {
     positive: u32,
     negative: u32,
-    owner: Option<Span>,
+    owners: Vec<Span>,
+}
+
+impl PresenceOccurrences {
+    /// The narrowest written production boundary that contains every positive
+    /// occurrence. Looking at the complete set makes ownership independent of
+    /// traversal order: two siblings stay incompatible, but an occurrence at
+    /// their enclosing boundary gives both a coherent lifetime.
+    fn owner(&self) -> Option<Span> {
+        let candidate = self
+            .owners
+            .iter()
+            .copied()
+            .max_by_key(|span| span.end() - span.start)?;
+        self.owners
+            .iter()
+            .all(|owner| contains_span(candidate, *owner))
+            .then_some(candidate)
+    }
+}
+
+fn contains_span(outer: Span, inner: Span) -> bool {
+    outer.file_id == inner.file_id && outer.start <= inner.start && outer.end() >= inner.end()
 }
 
 /// Compute presence polarity and the smallest positive production boundary
 /// shared by a name. Formula uses are deliberately absent: a formula relates
 /// presences established by labels but does not decide their ownership.
 fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
-    fn contains(outer: Span, inner: Span) -> bool {
-        outer.file_id == inner.file_id && outer.start <= inner.start && outer.end() >= inner.end()
-    }
-
     fn note(
         out: &mut HashMap<String, PresenceOccurrences>,
         when: &Option<Box<When>>,
@@ -812,16 +830,7 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
         let occurrence = out.entry(name.clone()).or_default();
         if positive {
             occurrence.positive += 1;
-            occurrence.owner = match occurrence.owner {
-                None if occurrence.positive == 1 => Some(owner),
-                Some(before) if contains(before, owner) => Some(before),
-                Some(before) if contains(owner, before) => Some(owner),
-                // Two sibling production boundaries cannot soundly share one
-                // hidden witness. Keeping no owner makes classification fall
-                // back to universal until lowering emits the dedicated R8
-                // ownership diagnostic.
-                _ => None,
-            };
+            occurrence.owners.push(owner);
         } else {
             occurrence.negative += 1;
         }
@@ -8593,10 +8602,10 @@ impl Builder<'_> {
                     (Sense::Presence, Some(occurrences))
                         if occurrences.negative == 0
                             && occurrences.positive > 0
-                            && occurrences.owner.is_some() =>
+                            && occurrences.owner().is_some() =>
                     {
                         PresenceOwnership::Existential {
-                            boundary: occurrences.owner.expect("checked above"),
+                            boundary: occurrences.owner().expect("checked above"),
                         }
                     }
                     _ => PresenceOwnership::Universal,

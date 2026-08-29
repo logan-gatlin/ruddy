@@ -4241,18 +4241,16 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
     // [`Table::lacks`] and [`ErrorKind::RigidField`].
     table.note_lacks(&ty);
     // Recursive and external uses see a genuinely closed annotation
-    // interface. Presence variables used to remain free here, which made a
-    // recursive call share (and therefore choose) its producer's hidden
-    // witness and made every use of a source extern share one global package.
-    // Close only producer-owned presences and the annotation's rigid type/row
-    // variables. Caller-owned presences and anonymous holes remain the shared
-    // decisions of the surrounding definition.
+    // interface. Every named presence belongs to that published interface:
+    // producer-owned slots open as fresh hidden witnesses, while universal
+    // slots open as fresh caller choices. Leaving the latter free made all
+    // recursive invocations share one solver variable and let one invocation
+    // choose the supposedly universal presence for its siblings. Anonymous
+    // holes remain the shared decisions of the surrounding definition.
     let mut presence_subst = HashMap::new();
     let mut existential_slots = IndexSet::new();
     for variable in &annotation.variables {
-        if variable.sense != Sense::Presence
-            || !matches!(variable.ownership, crate::ir::PresenceOwnership::Existential { .. })
-        {
+        if variable.sense != Sense::Presence {
             continue;
         }
         let Presence::Var(var) = tails.presences[&variable.name] else {
@@ -4260,7 +4258,12 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         };
         let index = presence_subst.len() as u32;
         presence_subst.insert(var, index);
-        existential_slots.insert(index);
+        if matches!(
+            variable.ownership,
+            crate::ir::PresenceOwnership::Existential { .. }
+        ) {
+            existential_slots.insert(index);
+        }
     }
     let presences = presence_subst.len() as u32;
     let subst = Subst {

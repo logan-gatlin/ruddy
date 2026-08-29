@@ -3640,9 +3640,10 @@ fn an_abandoned_presence_and_an_abandoned_tail_absorb_what_meets_them() {
 /// is the presence sort's version of what a tail and a type each get.
 #[test]
 fn a_presence_against_itself_is_already_the_same_presence() {
-    // A recursive call is monomorphic, so the parameter's row meets itself:
-    // one `when` on both sides, and one tail on both sides.
-    let (mint, _, output) = inferred("let f : { x when 'a: Nat, .. } -> Nat = fn p => f p");
+    // An anonymous annotation hole is monomorphic, so the parameter's row
+    // meets itself: one `when` on both sides, and one tail on both sides.
+    // Named presences are declared interface variables and instantiate freshly.
+    let (mint, _, output) = inferred("let f : { x when _: Nat, .. } -> Nat = fn p => f p");
     assert_eq!(
         scheme(&mint, &output, "f"),
         "{ x when 'a: Nat, ..'b } -> Nat"
@@ -4362,7 +4363,7 @@ fn a_sums_tail_is_decided_as_a_row() {
 fn an_abandoned_presence_absorbs_from_either_side() {
     let (mint, out, output) = infer_src(
         "let mk : Nat -> (#A Nat) = fn n => #A n\n\
-         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => f (mk (nope p))",
+         let f : (#A (when _) Nat | ..'r) -> Nat = fn p => f (mk (nope p))",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -4375,7 +4376,7 @@ fn an_abandoned_presence_absorbs_from_either_side() {
 
     let (mint, out, output) = infer_src(
         "let g : Nat -> (#A Nat) -> Nat = fn a => fn b => 1n\n\
-         let f : (#A (when 'a) Nat | ..'r) -> Nat = fn p => g (nope p) p",
+         let f : (#A (when _) Nat | ..'r) -> Nat = fn p => g (nope p) p",
     );
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     let taken = steps(&mint, &output, "f");
@@ -7628,6 +7629,17 @@ fn a_recursive_use_instantiates_what_was_declared() {
     assert_eq!(
         scheme(&mint, &output, "depth"),
         "{ kids: Nest, ..'a } -> Nat"
+    );
+
+    // A declared presence is part of the recursive interface too. Each call
+    // chooses its own universal instance, so calling recursively with a
+    // definitely-present field does not settle the caller's conditional one.
+    let (mint, _, output) = inferred(
+        "let inspect : { x when 'p: Nat } -> Nat = fn value => inspect { x: 1n }",
+    );
+    assert_eq!(
+        scheme(&mint, &output, "inspect"),
+        "{ x when 'a: Nat } -> Nat"
     );
 
     // Monomorphic in what was left to inference: one hole, shared across every
