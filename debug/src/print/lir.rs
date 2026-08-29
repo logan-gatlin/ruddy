@@ -157,6 +157,8 @@ pub fn opcode(op: &Op) -> &'static str {
         Op::Payload(_) => "payload",
         Op::Closure { .. } => "closure",
         Op::Call { .. } => "call",
+        Op::RawCall { .. } => "raw_call",
+        Op::Extern { .. } => "extern",
         Op::Global { .. } => "global",
         Op::NewTag => "new_tag",
         Op::Catch { .. } => "catch",
@@ -354,6 +356,12 @@ fn operation(output: &Output, labels: &Labels, generated: bool, op: &Op) -> Stri
             written.extend(args.iter().map(|temp| format!("%{temp}")));
             format!("call {}", written.join(", "))
         }
+        Op::RawCall { callee, args } => {
+            let mut written = vec![format!("%{callee}")];
+            written.extend(args.iter().map(|temp| format!("%{temp}")));
+            format!("raw_call {}", written.join(", "))
+        }
+        Op::Extern { name, .. } => format!("extern {name}"),
         Op::Global { name, .. } => format!("global {name}"),
         Op::NewTag => "new_tag".to_string(),
         Op::Catch { tag, .. } => format!("catch %{tag}:"),
