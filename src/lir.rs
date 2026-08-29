@@ -598,10 +598,29 @@ fn same_alias_pair(
     same_finite_syntax(left_want, right_want) && same_finite_syntax(left_have, right_have)
 }
 
+fn same_row_syntax(left: &Row, right: &Row) -> bool {
+    let unit = Rc::new(Ty::unit());
+    same_finite_syntax(
+        &Rc::new(Ty::Arrow(unit.clone(), unit.clone(), left.clone())),
+        &Rc::new(Ty::Arrow(unit.clone(), unit, right.clone())),
+    )
+}
+
 type TypePair = (Rc<Ty>, Rc<Ty>);
 type AliasPairs = HashMap<(Symbol, Symbol), Vec<TypePair>>;
 type AdapterAliases = HashMap<(Symbol, Symbol), Vec<(Rc<Ty>, Rc<Ty>, FuncId)>>;
 type CachedFit = (Rc<Ty>, Rc<Ty>, bool);
+
+struct OrdinaryExternAdapter {
+    ty: Rc<Ty>,
+    id: FuncId,
+}
+
+struct OrdinaryCallbackAdapter {
+    ty: Rc<Ty>,
+    available: Row,
+    id: FuncId,
+}
 
 #[derive(Default)]
 struct FitsCache {
@@ -666,6 +685,11 @@ struct Lower<'a> {
     stem: String,
     serial: u32,
     globals: Vec<Global>,
+    /// Ordinary foreign adapters currently being generated. Recursive aliases
+    /// can return (or accept contravariantly) their own function shape, so the
+    /// function slot must be reusable before its body has finished lowering.
+    extern_adapters: Vec<OrdinaryExternAdapter>,
+    callback_adapters: Vec<OrdinaryCallbackAdapter>,
     /// The top-level definition currently being lowered, whose quantified
     /// presence promise governs every nested match decision tree.
     definition: Option<Symbol>,
@@ -693,6 +717,8 @@ pub fn lower(mint: &Mint, program: &Program, inference: &inference::Output) -> O
         stem: String::new(),
         serial: 0,
         globals: Vec::new(),
+        extern_adapters: Vec::new(),
+        callback_adapters: Vec::new(),
         definition: None,
         assumed: Formula::True,
     };
@@ -1127,8 +1153,22 @@ impl Lower<'_> {
     /// One legacy host-curried arrow. Evidence is accepted as part of the
     /// Ruddy closure ABI and intentionally omitted from the raw unary call.
     fn ordinary_extern_level(&mut self, ty: Rc<Ty>) -> FuncId {
+        if matches!(&*ty, Ty::Named { .. })
+            && let Some(adapter) = self
+                .extern_adapters
+                .iter()
+                .rev()
+                .find(|adapter| same_finite_syntax(&adapter.ty, &ty))
+        {
+            return adapter.id;
+        }
         let id = self.slot(format!("{}#{}", self.stem, self.serial));
         self.serial += 1;
+        let recursive = matches!(&*ty, Ty::Named { .. });
+        if recursive {
+            self.extern_adapters
+                .push(OrdinaryExternAdapter { ty: ty.clone(), id });
+        }
         let raw = self.fresh(Rep::Fn);
         let (from, to, row) = self.arrow(&ty);
         let mut params = vec![Param {
@@ -1170,6 +1210,11 @@ impl Lower<'_> {
                 span: Span::default(),
             },
         );
+        if recursive {
+            self.extern_adapters
+                .pop()
+                .expect("the ordinary extern adapter just completed");
+        }
         id
     }
 
@@ -1193,6 +1238,7 @@ impl Lower<'_> {
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
             };
+            let row = flat(row);
             for (name, field) in &row.labels {
                 if possible(&field.presence) {
                     required
@@ -1201,7 +1247,10 @@ impl Lower<'_> {
                         .or_insert_with(|| field.clone());
                 }
             }
-            variable |= tail_key(row).is_some();
+            // Conditional labels need a bundle, but they do not make the
+            // callback effect-polymorphic. Only a semantic row tail may inherit
+            // the containing arrow's tail identity.
+            variable |= !matches!(row.rest, Rest::Closed);
             cursor = to.clone();
         }
         if variable {
@@ -1253,8 +1302,24 @@ impl Lower<'_> {
     }
 
     fn ordinary_callback(&mut self, ty: Rc<Ty>, available: Row) -> FuncId {
+        if matches!(&*ty, Ty::Named { .. })
+            && let Some(adapter) = self.callback_adapters.iter().rev().find(|adapter| {
+                same_finite_syntax(&adapter.ty, &ty)
+                    && same_row_syntax(&adapter.available, &available)
+            })
+        {
+            return adapter.id;
+        }
         let id = self.slot(format!("{}#callback#{}", self.stem, self.serial));
         self.serial += 1;
+        let recursive = matches!(&*ty, Ty::Named { .. });
+        if recursive {
+            self.callback_adapters.push(OrdinaryCallbackAdapter {
+                ty: ty.clone(),
+                available: available.clone(),
+                id,
+            });
+        }
         let closure = self.fresh(Rep::Fn);
         let (from, to, row) = self.arrow(&ty);
         let raw_argument = self.fresh(self.rep(&from));
@@ -1298,6 +1363,11 @@ impl Lower<'_> {
                 span: Span::default(),
             },
         );
+        if recursive {
+            self.callback_adapters
+                .pop()
+                .expect("the ordinary callback adapter just completed");
+        }
         id
     }
 
@@ -1988,7 +2058,33 @@ impl Lower<'_> {
         }
         if tail_key(declared).is_some() {
             let key = tail_key(used).unwrap_or(RestKey::Open);
-            args.push(self.bundle(key, body));
+            // A closed row whose only variable part is conditional labels has
+            // already named every effect the bundle can contain. Do not sweep
+            // unrelated evidence from the surrounding callback boundary into
+            // that bundle. A genuine row tail remains open-ended and keeps the
+            // established all-in-scope behaviour.
+            let conditional: Vec<String> = matches!(declared.rest, Rest::Closed)
+                .then(|| {
+                    declared
+                        .labels
+                        .iter()
+                        .filter(|(_, field)| {
+                            possible(&field.presence) && !definite(&field.presence)
+                        })
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let restricted = (!conditional.is_empty()).then_some(conditional.as_slice());
+            let needs_tails = restricted.is_none_or(|names| {
+                names.iter().any(|name| {
+                    !used
+                        .labels
+                        .get(name)
+                        .is_some_and(|field| definite(&field.presence))
+                })
+            });
+            args.push(self.bundle(key, restricted, needs_tails, body));
         }
         args
     }
@@ -2257,19 +2353,28 @@ impl Lower<'_> {
     ///
     /// A record built here is evidence plumbing rather than anything the reader
     /// wrote, so it carries no span and the debugger marks it generated.
-    fn bundle(&mut self, key: RestKey, body: &mut Body) -> Temp {
-        let found = self
-            .frames
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(at, frame)| {
-                frame
-                    .tails
+    fn bundle(
+        &mut self,
+        key: RestKey,
+        only: Option<&[String]>,
+        include_tails: bool,
+        body: &mut Body,
+    ) -> Temp {
+        let found = include_tails
+            .then(|| {
+                self.frames
                     .iter()
-                    .find(|(held, _)| held.forwards(key))
-                    .map(|(_, temp)| (at, *temp))
-            });
+                    .enumerate()
+                    .rev()
+                    .find_map(|(at, frame)| {
+                        frame
+                            .tails
+                            .iter()
+                            .find(|(held, _)| held.forwards(key))
+                            .map(|(_, temp)| (at, *temp))
+                    })
+            })
+            .flatten();
         if let Some((at, temp)) = found {
             return self.thread(at, temp);
         }
@@ -2278,12 +2383,15 @@ impl Lower<'_> {
         // what `evidence_of` answers with. The bundles go in the same order and
         // for the same reason, and under the record: a name the scope has
         // outright is the one to hand over where a bundle holds it too.
-        let held: Vec<(usize, Temp)> = self
-            .frames
-            .iter()
-            .enumerate()
-            .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
-            .collect();
+        let held: Vec<(usize, Temp)> = if include_tails {
+            self.frames
+                .iter()
+                .enumerate()
+                .flat_map(|(at, frame)| frame.tails.iter().map(move |(_, temp)| (at, *temp)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut layers: Vec<Temp> = held
             .into_iter()
             .map(|(at, temp)| self.thread(at, temp))
@@ -2291,7 +2399,7 @@ impl Lower<'_> {
         let mut names: Vec<String> = Vec::new();
         for frame in &self.frames {
             for name in frame.evidence.keys() {
-                if !names.contains(name) {
+                if only.is_none_or(|allowed| allowed.contains(name)) && !names.contains(name) {
                     names.push(name.clone());
                 }
             }
