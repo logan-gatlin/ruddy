@@ -254,7 +254,7 @@ pub enum Atom {
 /// The constructors below simplify as they build — `and` with [`Formula::True`]
 /// is the other side — so the common case of a formula that says nothing is the
 /// value `True` rather than a tree of trues to be recognized later.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Formula {
     /// The constraint that says nothing. A scheme carrying this prints with no
     /// `where` clause at all.
@@ -273,6 +273,72 @@ pub enum Formula {
     Iff(Rc<Formula>, Rc<Formula>),
     /// `a != b` — exactly one of them there.
     Xor(Rc<Formula>, Rc<Formula>),
+}
+
+impl PartialEq for Formula {
+    fn eq(&self, other: &Self) -> bool {
+        let mut work = vec![(self, other)];
+        while let Some((left, right)) = work.pop() {
+            match (left, right) {
+                (Formula::True, Formula::True) | (Formula::False, Formula::False) => {}
+                (Formula::Atom(left), Formula::Atom(right)) if left == right => {}
+                (Formula::Owned(lo, left), Formula::Owned(ro, right)) if lo == ro => {
+                    work.push((left, right));
+                }
+                (Formula::Not(left), Formula::Not(right)) => work.push((left, right)),
+                (Formula::And(ll, lr), Formula::And(rl, rr))
+                | (Formula::Or(ll, lr), Formula::Or(rl, rr))
+                | (Formula::Iff(ll, lr), Formula::Iff(rl, rr))
+                | (Formula::Xor(ll, lr), Formula::Xor(rl, rr)) => {
+                    work.push((lr, rr));
+                    work.push((ll, rl));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for Formula {}
+
+impl std::hash::Hash for Formula {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut work = vec![self];
+        while let Some(formula) = work.pop() {
+            match formula {
+                Formula::True => 0u8.hash(state),
+                Formula::False => 1u8.hash(state),
+                Formula::Atom(atom) => {
+                    2u8.hash(state);
+                    atom.hash(state);
+                }
+                Formula::Owned(owner, inner) => {
+                    3u8.hash(state);
+                    owner.hash(state);
+                    work.push(inner);
+                }
+                Formula::Not(inner) => {
+                    4u8.hash(state);
+                    work.push(inner);
+                }
+                Formula::And(left, right)
+                | Formula::Or(left, right)
+                | Formula::Iff(left, right)
+                | Formula::Xor(left, right) => {
+                    let tag = match formula {
+                        Formula::And(_, _) => 5u8,
+                        Formula::Or(_, _) => 6,
+                        Formula::Iff(_, _) => 7,
+                        _ => 8,
+                    };
+                    tag.hash(state);
+                    work.push(right);
+                    work.push(left);
+                }
+            }
+        }
+    }
 }
 
 /// A type closed over the variables it binds, and what it requires of the
