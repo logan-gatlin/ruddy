@@ -451,6 +451,203 @@ fn bundled_std_installer_interruption_preserves_existing_installation() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn bundled_std_installer_resolves_symlinked_metacharacter_source_roots() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source[odd]*?");
+    let source_link = root.path().join("source-link");
+    let home = root.path().join("home");
+    fs::create_dir_all(source.join("Nested")).unwrap();
+    fs::create_dir_all(source.join("build")).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(source.join("Nested/module.hc"), "nested").unwrap();
+    fs::write(source.join("build/generated.hc"), "generated").unwrap();
+    symlink(&source, &source_link).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(source_link)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/main.hc")).unwrap(),
+        "main"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/Nested/module.hc")).unwrap(),
+        "nested"
+    );
+    assert!(!home.join("std/build").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_serializes_concurrent_first_installs() {
+    use std::{thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let home = root.path().join("home");
+    let barrier = root.path().join("first-barrier");
+    for (source, contents) in [(&first, "first"), (&second, "second")] {
+        fs::create_dir_all(source).unwrap();
+        fs::write(source.join("Ruddy.toml"), contents).unwrap();
+        fs::write(source.join("main.hc"), contents).unwrap();
+    }
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let mut first_child = Command::new(&script)
+        .arg(&first)
+        .env("RUDDY_HOME", &home)
+        .env("_RUDDY_INSTALL_STD_TEST_BARRIER", &barrier)
+        .env_remove("HOME")
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if barrier.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(barrier.exists(), "first installer did not finish staging");
+
+    let mut second_child = Command::new(&script)
+        .arg(&second)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(second_child.try_wait().unwrap().is_none());
+    assert!(!home.join("std").exists());
+
+    fs::remove_file(&barrier).unwrap();
+    assert!(first_child.wait().unwrap().success());
+    assert!(second_child.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "second"
+    );
+    assert!(!home.join("std/.std.install.lock").exists());
+    assert!(fs::read_dir(&home).unwrap().all(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        !name.starts_with(".std.install.") && !name.starts_with(".std.exchange.")
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_reclaims_a_stale_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join(".std.install.lock")).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(home.join(".std.install.lock/owner"), "999999999\n").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(home.join("std/main.hc").is_file());
+    assert!(!home.join(".std.install.lock").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bundled_std_installer_cleans_a_probe_interrupted_during_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(home.join("std")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(source.join("Ruddy.toml"), "new").unwrap();
+    fs::write(source.join("main.hc"), "new").unwrap();
+    fs::write(home.join("std/Ruddy.toml"), "old").unwrap();
+    let real_mktemp = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v mktemp"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let fake_mktemp = bin.join("mktemp");
+    fs::write(
+        &fake_mktemp,
+        format!(
+            "#!/bin/sh\nresult=$({} \"$@\") || exit\nprintf '%s\\n' \"$result\"\nkill -TERM \"$PPID\"\n",
+            real_mktemp.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_mktemp, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(home.join("std/Ruddy.toml")).unwrap(),
+        "old"
+    );
+    assert!(fs::read_dir(&home).unwrap().all(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        !name.starts_with(".std.exchange.") && !name.starts_with(".std.install.")
+    }));
+}
+
 #[test]
 fn automatic_std_environment_behavior_is_isolated() {
     let parent = tempfile::tempdir().unwrap();
