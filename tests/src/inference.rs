@@ -172,6 +172,25 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
 }
 
 #[test]
+fn negative_and_erased_alias_arguments_do_not_publish_anonymous_existentials() {
+    let (mint, _, output) = inferred(
+        "type Contra 'a = 'a -> Nat\n\
+         type Erased 'a = Nat\n\
+         let negative: Contra { x when _: Nat } = fn value => 0n\n\
+         let erased: Erased { x when _: Nat } = 0n",
+    );
+    for name in ["negative", "erased"] {
+        let symbol = symbol_named(&mint, output.schemes.keys().copied(), name);
+        let scheme = &output.schemes[&symbol];
+        assert!(scheme.existentials().is_empty(), "{name}: {scheme:#?}");
+        assert!(
+            !matches!(&**scheme.body(), Ty::Package(_)),
+            "{name}: {scheme:#?}"
+        );
+    }
+}
+
+#[test]
 fn producer_guarantees_hold_for_every_admitted_universal_input() {
     inferred(
         "let follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\

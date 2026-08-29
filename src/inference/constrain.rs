@@ -328,8 +328,11 @@ impl Constrain<'_> {
                             let origin = Origin::Annotation(Named {
                                 labels: lowered.names.clone(),
                             });
-                            self.table
-                                .require(annotation.ty.span, origin, lowered.formula.clone());
+                            self.table.require(
+                                annotation.ty.span,
+                                origin,
+                                lowered.assumptions.clone(),
+                            );
                         }
                         self.annotated.push(Annotated {
                             span: annotation.ty.span,
@@ -416,9 +419,17 @@ impl Constrain<'_> {
                     // parameter is what the context asked for, and the
                     // argument is the term the reader can change.
                     Ty::Arrow(from, to, does) => {
-                        let (from, to, does) = (from.clone(), to.clone(), does.clone());
+                        let (from, mut to, does) = (from.clone(), to.clone(), does.clone());
                         let actual = arg.ty.clone();
                         self.checks(arg.span, &actual, &from);
+                        // Application is the semantic destruction point of a
+                        // packaged result. Open it during generation so its
+                        // invocation-fresh guarantee occupies the call's
+                        // source-order store position (rather than leaking in
+                        // later when equality happens to solve).
+                        if matches!(&*to, Ty::Package(_)) {
+                            to = self.table.open_package(arg.span, &to);
+                        }
                         (to, does)
                     }
                     // Nothing is known about the function yet, so what the
