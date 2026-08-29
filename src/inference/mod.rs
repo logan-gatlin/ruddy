@@ -620,6 +620,9 @@ pub enum ConstraintKind {
         /// See R11.
         inside: bool,
     },
+    /// An effectful callback crossing a foreign boundary must be callable with
+    /// the evidence carried by that boundary.
+    CallbackCoverage { required: Row, available: Row },
 }
 
 #[derive(Debug, Clone)]
@@ -798,6 +801,8 @@ pub enum ErrorKind {
     /// The ordinary refusal, and the reason an effect row is worth having: the
     /// function says what calling it may do, and this would do more.
     NotAllowed { effect: String },
+    /// A foreign callback requires evidence the containing host call cannot carry.
+    CallbackEffectsNotCovered,
 }
 
 /// What one type variable is known to be. Private to inference, and rightly so:
@@ -1097,6 +1102,140 @@ pub fn structural_family_for_tests(
     .family_type(types)
 }
 
+/// Build callback evidence obligations from the resolved semantic type. The
+/// ABI tree contributes only host grouping; aliases, row tails and conditional
+/// presences all come from the same rows ordinary inference solves.
+fn callback_coverage_constraints(
+    aliases: &IndexMap<Symbol, Scheme>,
+    abi: &ir::ExternType,
+    ty: &Rc<Ty>,
+) -> (Vec<Constraint>, Formula) {
+    fn presence_formula(presence: &Presence) -> Option<Formula> {
+        match presence {
+            Presence::Present => Some(Formula::True),
+            Presence::Absent => Some(Formula::False),
+            Presence::Var(var) => Some(Formula::Atom(Atom::Var(*var))),
+            Presence::Bound(bound) => Some(Formula::Atom(Atom::Bound(*bound))),
+            Presence::Recovered(_) | Presence::Undecided => None,
+        }
+    }
+
+    fn callback_rows(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut cursor = ty.clone();
+        let mut seen = HashSet::new();
+        loop {
+            if let Ty::Named { symbol, .. } = &*cursor
+                && !seen.insert(*symbol)
+            {
+                break;
+            }
+            let exposed = unfold(aliases, &cursor);
+            let Ty::Arrow(_, to, row) = &*exposed else {
+                break;
+            };
+            rows.push(row.clone());
+            cursor = to.clone();
+        }
+        rows
+    }
+
+    fn cover(
+        aliases: &IndexMap<Symbol, Scheme>,
+        span: Span,
+        callback: &Rc<Ty>,
+        available: &Row,
+        out: &mut Vec<Constraint>,
+    ) {
+        out.extend(
+            callback_rows(aliases, callback)
+                .into_iter()
+                .map(|required| Constraint {
+                    span,
+                    kind: ConstraintKind::CallbackCoverage {
+                        required,
+                        available: available.clone(),
+                    },
+                }),
+        );
+    }
+
+    fn boundary(
+        aliases: &IndexMap<Symbol, Scheme>,
+        abi: &ir::ExternType,
+        ty: &Rc<Ty>,
+        out: &mut Vec<Constraint>,
+    ) {
+        match &abi.tracked {
+            ir::ExternTypeKind::Group(inner) => boundary(aliases, inner, ty, out),
+            ir::ExternTypeKind::Function {
+                parameters, result, ..
+            } => {
+                let mut cursor = ty.clone();
+                let mut inputs = Vec::new();
+                let mut available = Row::closed();
+                for _ in 0..parameters.len().max(1) {
+                    let exposed = unfold(aliases, &cursor);
+                    let Ty::Arrow(from, to, row) = &*exposed else {
+                        return;
+                    };
+                    if !parameters.is_empty() {
+                        inputs.push(from.clone());
+                    }
+                    available = row.clone();
+                    cursor = to.clone();
+                }
+                for (parameter, input) in parameters.iter().zip(inputs) {
+                    cover(aliases, parameter.span, &input, &available, out);
+                    boundary(aliases, parameter, &input, out);
+                }
+                boundary(aliases, result, &cursor, out);
+            }
+            ir::ExternTypeKind::Ordinary(_) => {
+                let exposed = unfold(aliases, ty);
+                let Ty::Arrow(from, to, available) = &*exposed else {
+                    return;
+                };
+                cover(aliases, abi.span, from, available, out);
+                // An ordinary leaf may conceal arbitrarily much foreign shape
+                // behind aliases. Every arrow remains a unary host boundary.
+                boundary(aliases, abi, from, out);
+                boundary(aliases, abi, to, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    boundary(aliases, abi, ty, &mut out);
+    let conditional = Formula::all(out.iter().flat_map(|constraint| {
+        let ConstraintKind::CallbackCoverage {
+            required,
+            available,
+        } = &constraint.kind
+        else {
+            return None;
+        };
+        Some(Formula::all(required.labels.iter().filter_map(
+            |(name, required)| {
+                let required = presence_formula(&required.presence)?;
+                let available = match available.labels.get(name) {
+                    Some(field) => presence_formula(&field.presence)?,
+                    None if matches!(
+                        available.rest,
+                        Rest::Closed | Rest::Bound(_) | Rest::Rigid { .. }
+                    ) =>
+                    {
+                        Formula::False
+                    }
+                    None => return None,
+                };
+                Some(required.not().or(available))
+            },
+        )))
+    }));
+    (out, conditional)
+}
+
 /// Assign a type to every term in the program, in place, and return the
 /// schemes of its top-level definitions.
 pub fn infer(mint: &Mint, program: &mut Program) -> Output {
@@ -1182,6 +1321,7 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     // use. The annotation is authoritative, including any effect row it
     // declares for calls through the imported value.
     let mut externs = IndexMap::new();
+    let mut extern_coverage = Vec::new();
     for (symbol, decl) in &program.externs {
         let annotation = decl
             .annotation
@@ -1194,6 +1334,16 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
             });
             table.require(annotation.ty.span, origin, lowered.formula.clone());
             report_flip(&mut table, &mut errors);
+        }
+        let (coverage, conditional) =
+            callback_coverage_constraints(&aliases, &decl.value.abi, &lowered.ty);
+        if sat::entails(&lowered.formula, &conditional) {
+            extern_coverage.push((*symbol, coverage));
+        } else {
+            errors.push(Error {
+                span: decl.value.abi.span,
+                kind: ErrorKind::CallbackEffectsNotCovered,
+            });
         }
         env.insert(*symbol, Binding::Poly(lowered.scheme.clone()));
         externs.insert(*symbol, lowered.scheme);
@@ -1211,6 +1361,26 @@ pub fn infer(mint: &Mint, program: &mut Program) -> Output {
     let mut promises = IndexMap::new();
     let mut steps = Vec::new();
     let mut refinements = Vec::new();
+    for (symbol, coverage) in extern_coverage {
+        Solve {
+            table: &mut table,
+            errors: &mut errors,
+            steps: &mut steps,
+            aliases: &aliases,
+            nominal: &nominal,
+            definition: symbol,
+            depth: 0,
+            assumed: Vec::new(),
+            schemes: HashMap::new(),
+            locals: &mut locals,
+            guard: None,
+            active_refinement: None,
+            refinements: &mut refinements,
+            generated_end: 0,
+        }
+        .run(&coverage);
+        report_flip(&mut table, &mut errors);
+    }
     // The groups are read out before anything is solved: solving mutates the
     // definitions they name, and which definitions have to be typed together is
     // a fact about the lowered program that nothing here changes.
@@ -3567,6 +3737,7 @@ impl Table {
             ErrorKind::NotAllowed { effect } => ErrorKind::NotAllowed {
                 effect: effect.clone(),
             },
+            ErrorKind::CallbackEffectsNotCovered => ErrorKind::CallbackEffectsNotCovered,
         }
     }
 }

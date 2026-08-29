@@ -731,7 +731,6 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
             ir::ErrorKind::RaiseOutsideArm => "raise-outside-arm",
             ir::ErrorKind::RaiseInFunction => "raise-in-function",
-            ir::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
         }
     }
 }
@@ -954,9 +953,6 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::RaiseOutsideArm => f.write_str("raise belongs in a handler arm"),
             ir::ErrorKind::RaiseInFunction => f.write_str(
                 "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
-            ),
-            ir::ErrorKind::CallbackEffectsNotCovered => f.write_str(
-                "callback effects are not covered by the containing extern call",
             ),
         }
     }
@@ -1920,6 +1916,7 @@ impl ConstraintKind {
             ConstraintKind::Instance { .. } => "instance",
             ConstraintKind::Match { .. } => "match",
             ConstraintKind::Performs { .. } => "performs",
+            ConstraintKind::CallbackCoverage { .. } => "callback-coverage",
         }
     }
 }
@@ -1996,6 +1993,15 @@ impl fmt::Display for ConstraintKind {
                 effects_shown(performed),
                 effects_shown(ambient),
             ),
+            ConstraintKind::CallbackCoverage {
+                required,
+                available,
+            } => write!(
+                f,
+                "callback {} covered by {}",
+                effects_shown(required),
+                effects_shown(available),
+            ),
         }
     }
 }
@@ -2051,6 +2057,7 @@ impl inference::ErrorKind {
             inference::ErrorKind::AnnotationAllows { .. } => "annotation-allows-more",
             inference::ErrorKind::Unhandled { .. } => "unhandled-effect",
             inference::ErrorKind::NotAllowed { .. } => "effect-not-allowed",
+            inference::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
         }
     }
 }
@@ -2169,6 +2176,10 @@ impl fmt::Display for inference::ErrorKind {
                 f,
                 "this function performs `{}`, which its type does not allow",
                 label(Shape::Effect, effect),
+            ),
+            inference::ErrorKind::CallbackEffectsNotCovered => write!(
+                f,
+                "callback effects are not covered by the containing extern call",
             ),
         }
     }

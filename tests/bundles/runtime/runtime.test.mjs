@@ -33,6 +33,11 @@ globalThis.host = {
     assert.equal(args.length, 1, "effect evidence crossed the foreign boundary");
     return args[0];
   },
+  runTick(...args) {
+    assert.equal(args.length, 2, "effect evidence crossed the foreign boundary");
+    const [callback, value] = args;
+    return callback(value);
+  },
 };
 
 const app = await import(pathToFileURL(generated).href);
@@ -70,4 +75,5 @@ test("adapts n-ary, nullary, curried, callback, and returned extern functions", 
   assert.equal(app.callback_answer, 42);
   assert.equal(app.nested_result, 42);
   assert.equal(app.ticked, 42);
+  assert.equal(app.callback_ticked, 42);
 });
