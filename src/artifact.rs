@@ -3378,6 +3378,9 @@ pub mod text {
             while !encoded.is_empty() {
                 existentials.push(self.number(self.take(&mut encoded)));
             }
+            if presences > count {
+                self.fail("scheme presence count exceeds quantifier count");
+            }
             if existentials.iter().any(|index| *index >= presences)
                 || existentials.windows(2).any(|pair| pair[0] >= pair[1])
             {

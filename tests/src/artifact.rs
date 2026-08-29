@@ -400,6 +400,10 @@ fn existential_presence_ownership_round_trips_and_is_validated() {
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 3 0)", 1));
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 0)", 1));
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 7)", 1));
+    // Presence positions share the scheme's quantifier space; accepting more
+    // presence slots than total slots would let malformed bounds pass all
+    // subsequent per-presence checks.
+    assert_malformed(&printed.replacen("(scheme 15 7", "(scheme 6 7", 1));
 }
 
 fn assert_round_trip(value: &Artifact) -> String {
