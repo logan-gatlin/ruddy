@@ -7,6 +7,9 @@ extern curried_add : Nat -> Nat -> Nat = host.curriedAdd
 extern apply_pair : fn(fn(Nat, Nat) -> Nat, Nat, Nat) -> Nat = host.applyPair
 extern make_adder : fn(Nat) -> fn(Nat, Nat) -> Nat = host.makeAdder
 
+effect Tick = Nat -> Nat
+extern tick : fn(Nat) -> Nat + !Tick = host.tick
+
 let answer = Math::answer
 let identity = Math::identity
 let apply = fn f => fn x => f x
@@ -17,6 +20,9 @@ let nullary_answer = nullary ()
 let curried_answer = curried_add 20n 22n
 let callback_answer = apply_pair (fn x => fn _ => x) 42n 0n
 let nested_result = make_adder 2n 20n 20n
+let ticked = handle tick 42n with
+  | !Tick value => value
+end
 let record = { answer: answer, ready: true }
 let tagged = #Ready answer
 let read_tag = fn value => match value with

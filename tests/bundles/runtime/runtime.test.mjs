@@ -29,6 +29,10 @@ globalThis.host = {
   makeAdder(offset) {
     return (left, right) => offset + left + right;
   },
+  tick(...args) {
+    assert.equal(args.length, 1, "effect evidence crossed the foreign boundary");
+    return args[0];
+  },
 };
 
 const app = await import(pathToFileURL(generated).href);
@@ -65,4 +69,5 @@ test("adapts n-ary, nullary, curried, callback, and returned extern functions", 
   assert.equal(app.curried_answer, 42);
   assert.equal(app.callback_answer, 42);
   assert.equal(app.nested_result, 42);
+  assert.equal(app.ticked, 42);
 });
