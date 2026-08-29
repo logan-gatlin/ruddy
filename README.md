@@ -1,5 +1,21 @@
 # Ruddy
 
+Ruddy is a structurally typed functional language and compiler with a JavaScript backend and a browser-based phase debugger.
+
+## Installation
+
+A source checkout and a Rust toolchain are currently required. [`just`](https://just.systems/) provides the installation task:
+
+```sh
+git clone https://github.com/logan-gatlin/ruddy.git
+cd ruddy
+just install
+```
+
+This installs the `ruddy` executable into Cargo's binary directory and installs the standard-library project at `$RUDDY_HOME/std`. A non-empty `RUDDY_HOME` selects the Ruddy data directory; otherwise it is `$HOME/.ruddy`. Re-running `just install` replaces the installed standard library from this checkout without exposing a partially copied project. Ensure Cargo's binary directory (usually `$HOME/.cargo/bin`) is on `PATH`.
+
+## Projects and dependencies
+
 Ruddy projects are configured by `Ruddy.toml`. Dependencies can be local paths or HTTPS Git repositories:
 
 ```toml
@@ -17,6 +33,25 @@ A Git dependency accepts at most one of `branch`, `tag`, or `rev`; without one, 
 Git repositories are fetched and checked out with pure-Rust `gix` and Rustls—Ruddy never invokes a Git executable. `RUDDY_HOME` uses a non-empty explicit override when set and otherwise defaults to `$HOME/.ruddy` (independent of `XDG_CACHE_HOME`). All global Git cache data lives beneath `$RUDDY_HOME/cache/git`: checkouts are in `$RUDDY_HOME/cache/git/checkouts`, with temporary clones and the advisory lock alongside them under that cache directory. The project-local `Ruddy.lock` is not part of this cache. Resolution can populate the cache even if compilation later fails. Cached trees are restored to their locked commit under a cross-process lock before every compilation. `compile` and `compile_graph` write no artifacts, but may fetch dependencies and update `Ruddy.lock`; `build` writes local artifacts only after the entire graph compiles and never writes into Git cache checkouts.
 
 `ruddy new NAME` (or `ruddy n NAME`) creates a project and initializes its repository. `ruddy build` (`ruddy b`) compiles and writes artifacts, `ruddy run` builds and executes a JavaScript target, `ruddy check` compiles without writing artifacts, and `ruddy clean` removes project build output. `Ruddy.lock` is generated on the first dependency resolution and is intentionally not ignored; only `/build/` is listed in a new project's `.gitignore`.
+
+### Standard library
+
+Every project implicitly receives a dependency named `std`, resolved from `$RUDDY_HOME/std`. The dependency is injected before declared dependencies and is available with qualified names such as `std::identity` and `std::Option`. The installed library currently provides `Option`, `Result`, and small function combinators; its source project lives in [`std/`](std/).
+
+A project can disable this dependency or replace it with any normal path or Git dependency using the top-level `std` field:
+
+```toml
+# Bootstrap a project without the standard library:
+std = false
+
+# Or select another std project (instead of `false`):
+# std = "../my-std"
+# std = { git = "https://example.com/my-std.git", tag = "v1.0.0" }
+
+[dependencies]
+```
+
+`std = true` is invalid: omit the field to use the installed library. The alias `std` is reserved and cannot also appear in `[dependencies]`. Each dependency project resolves its own `std` setting, so a custom or bootstrap library should generally declare `std = false` to avoid depending on the installed library itself. If the default installation is missing or invalid, Ruddy reports how to install, override, or disable it.
 
 ## JavaScript target
 
