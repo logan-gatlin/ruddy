@@ -5645,6 +5645,20 @@ fn configured_std_prelude_opens_only_direct_members_in_every_namespace() {
 }
 
 #[test]
+fn a_bundle_does_not_open_its_own_prelude_without_configured_std() {
+    let (_, out) = build_src("module prelude =\n  let shared = 1n\nend\nlet bare = shared");
+    assert!(matches!(
+        out.errors.as_slice(),
+        [ruddy::ir::Error {
+            kind: ErrorKind::Undefined {
+                namespace: Namespace::Terms
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
 fn std_prelude_does_not_flatten_descendants_and_requires_the_source_alias() {
     let dependency = prelude_artifact("std");
     let (_, out) = build_imported("let bad = inside", "other", &dependency);
@@ -5697,6 +5711,7 @@ fn user_and_lexical_declarations_shadow_std_prelude_without_duplicates() {
     let dependency = prelude_artifact("foundation");
     let src = "let shared = 1n\n\
                let root = shared\n\
+               let qualified = std::prelude::shared\n\
                module M =\n  let shared = 2n\n  let nested = shared\nend\n\
                let lexical = fn shared => shared";
     let (mint, out) = build_imported(src, "std", &dependency);
@@ -5705,6 +5720,12 @@ fn user_and_lexical_declarations_shadow_std_prelude_without_duplicates() {
     assert!(
         matches!(term_value(&mint, &out, "root"), TermKind::Ident(symbol) if *symbol == root_shared)
     );
+    assert!(matches!(
+        term_value(&mint, &out, "qualified"),
+        TermKind::Ident(symbol)
+            if out.program.external_names.get(symbol).map(String::as_str)
+                == Some("foundation@1.0.0::prelude::shared")
+    ));
     let nested = out
         .program
         .terms
@@ -5727,6 +5748,59 @@ fn user_and_lexical_declarations_shadow_std_prelude_without_duplicates() {
         panic!("lexical test is a lambda")
     };
     assert!(matches!(body.kind, TermKind::Ident(symbol) if symbol == arg.tracked));
+}
+
+#[test]
+fn user_types_effects_and_child_modules_shadow_prelude_names_independently() {
+    let dependency = prelude_artifact("foundation");
+    let src = "type Shared = String\n\
+               type Alias = Shared\n\
+               effect Shared\n\
+               effect Alias = !Shared\n\
+               module Tools =\n  let inside = 2n\nend\n\
+               let Tools = 3n\n\
+               let child = Tools::inside\n\
+               let term = Tools";
+    let (mint, out) = build_imported(src, "std", &dependency);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+
+    let local_type = type_symbol(&mint, &out, "Shared");
+    assert!(matches!(
+        out.program.types[&type_symbol(&mint, &out, "Alias")].value.tracked,
+        TypeKind::Ident(symbol) if symbol == local_type
+    ));
+
+    let local_effect = *out
+        .program
+        .effects
+        .keys()
+        .find(|symbol| mint.name(**symbol) == "Shared")
+        .expect("local Shared effect");
+    assert!(matches!(
+        effect_of(&mint, &out, "Alias"),
+        Effect::Alias(names)
+            if names.values().any(|named| named.symbol == local_effect)
+    ));
+
+    let local_inside = out
+        .program
+        .terms
+        .iter()
+        .find(|(symbol, declaration)| {
+            mint.name(**symbol) == "inside"
+                && matches!(declaration.value.kind, TermKind::Natural(2))
+        })
+        .map(|(symbol, _)| *symbol)
+        .expect("local Tools::inside");
+    assert!(matches!(
+        term_value(&mint, &out, "child"),
+        TermKind::Ident(symbol) if *symbol == local_inside
+    ));
+    let local_tools_term = term_symbol(&mint, &out, "Tools");
+    assert!(matches!(
+        term_value(&mint, &out, "term"),
+        TermKind::Ident(symbol) if *symbol == local_tools_term
+    ));
 }
 
 #[test]
