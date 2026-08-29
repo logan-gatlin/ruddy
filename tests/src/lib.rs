@@ -21,6 +21,7 @@ mod lir;
 mod parse;
 mod patterns;
 mod print;
+mod runtime;
 mod sat;
 mod snapshot;
 mod stage;

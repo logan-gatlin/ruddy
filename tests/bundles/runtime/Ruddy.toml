@@ -1,0 +1,9 @@
+name = "runtime-tests"
+version = "1.0.0"
+root = "main.hc"
+target = "js"
+
+[run]
+js = "node runtime.test.mjs"
+
+[dependencies]
