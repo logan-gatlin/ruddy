@@ -975,18 +975,24 @@ struct Manifest {
     target: Target,
     #[serde(default)]
     run: RunConfig,
+    dependencies: ManifestDependencies,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ManifestDependencies {
     /// The implicit dependency available under the reserved source alias `std`.
     #[serde(default)]
     std: StdConfig,
-    dependencies: IndexMap<String, ManifestDependency>,
+    #[serde(flatten)]
+    declared: IndexMap<String, ManifestDependency>,
 }
 
 pub type ManifestDependency = DependencySpec;
 
 /// Configuration for the implicit `std` dependency in a Ruddy manifest.
 ///
-/// An omitted field uses [`StdConfig::Default`], `false` disables standard
-/// library injection, and dependency path/table syntax selects an override.
+/// An omitted `[dependencies].std` entry uses [`StdConfig::Default`], `false`
+/// disables standard library injection, and dependency syntax selects an override.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StdConfig {
     /// Resolve `std` from `$RUDDY_HOME/std` (or `$HOME/.ruddy/std`).
@@ -1031,7 +1037,7 @@ impl<'de> Deserialize<'de> for StdConfig {
             fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
                 if value {
                     Err(E::custom(
-                        "`std = true` is invalid; omit `std` to use the default standard library",
+                        "`std = true` is invalid; omit `std` from `[dependencies]` to use the default standard library",
                     ))
                 } else {
                     Ok(StdConfig::Disabled)
@@ -1432,7 +1438,7 @@ where
         let alias = alias.into();
         if alias == "std" {
             return Err(CompileError::one(
-                "dependency alias `std` is reserved; configure the top-level `std` field instead",
+                "dependency alias `std` is reserved for the standard-library setting under `[dependencies]`",
             ));
         }
         specifications.push((alias, specification, false));
@@ -1700,8 +1706,8 @@ impl GraphCompiler {
         // Synthesize std before declared dependencies for deterministic graph,
         // header, and source-import order. Each visited manifest makes this
         // decision independently, including path and Git dependencies.
-        let mut dependencies = Vec::with_capacity(manifest.dependencies.len() + 1);
-        match &manifest.std {
+        let mut dependencies = Vec::with_capacity(manifest.dependencies.declared.len() + 1);
+        match &manifest.dependencies.std {
             StdConfig::Default => {
                 let specification = ruddy_home()
                     .map(|home| DependencySpec::Path(home.join("std")))
@@ -1716,6 +1722,7 @@ impl GraphCompiler {
         dependencies.extend(
             manifest
                 .dependencies
+                .declared
                 .iter()
                 .map(|(alias, specification)| (alias.clone(), specification.clone(), false)),
         );
@@ -1920,7 +1927,7 @@ fn default_std_error(error: CompileError) -> CompileError {
             .into_iter()
             .map(|message| {
                 format!(
-                    "{message}\nhelp: install the Ruddy standard library in $RUDDY_HOME/std, configure `std` to another dependency, or set `std = false`"
+                    "{message}\nhelp: install the Ruddy standard library in $RUDDY_HOME/std, configure `[dependencies].std` to another dependency, or set it to `false`"
                 )
             })
             .collect(),
@@ -2180,12 +2187,6 @@ fn load_manifest(directory: &Path, sandbox: Option<&Path>) -> Result<Manifest, C
             path.display()
         ))
     })?;
-    if manifest.dependencies.contains_key("std") {
-        return Err(CompileError::one(format!(
-            "manifest {} declares reserved dependency alias `std`; configure the top-level `std` field instead",
-            path.display()
-        )));
-    }
     Ok(manifest)
 }
 

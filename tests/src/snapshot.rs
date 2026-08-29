@@ -184,7 +184,7 @@ fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
     fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
@@ -261,7 +261,7 @@ fn installed_standard_library_child() {
     fs::write(standard.join("main.hc"), "let installed = 1n\n").unwrap();
     fs::write(
         standard.join("Ruddy.toml"),
-        "name = \"std\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"std\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let request = CompileRequest {
@@ -316,7 +316,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
     fs::write(
         base.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
@@ -412,7 +412,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         fs::write(
             path.join("Ruddy.toml"),
             format!(
-                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n"
+                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n"
             ),
         )
         .unwrap();
@@ -483,13 +483,13 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     }
     fs::write(
         scratch.path().join("shared/Ruddy.toml"),
-        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(
@@ -530,7 +530,7 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     fs::create_dir_all(scratch.path().join("base")).unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nmissing = \"../../outside\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\nmissing = \"../../outside\"\n",
     )
     .unwrap();
     fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
@@ -565,7 +565,7 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
     ] {
         fs::write(
             scratch.join("base/Ruddy.toml"),
-            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\nstd = false\n[dependencies]\n"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\nstd = false\n"),
         )
         .unwrap();
         let snapshot = compile_at(
@@ -594,7 +594,7 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
     let manifest =
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n";
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n";
     let outside = outer.path().join("outside.toml");
     fs::write(&outside, manifest).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
@@ -639,7 +639,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     fs::create_dir_all(scratch.join("base")).unwrap();
     fs::write(
         scratch.join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
     )
     .unwrap();
     fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
@@ -674,7 +674,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
             fs::create_dir_all(scratch.path().join("dep")).unwrap();
             fs::write(
                 scratch.path().join("dep/Ruddy.toml"),
-                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = false\n",
             )
             .unwrap();
             let mut source = String::new();

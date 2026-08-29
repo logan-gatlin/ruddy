@@ -33,16 +33,22 @@ struct Manifest {
     root: String,
     #[serde(default, skip_serializing_if = "RunConfig::is_default")]
     run: RunConfig,
+    dependencies: ManifestDependencies,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ManifestDependencies {
     #[serde(default, skip_serializing_if = "StdConfig::is_default")]
     std: StdConfig,
-    dependencies: IndexMap<String, DependencySpec>,
+    #[serde(flatten)]
+    declared: IndexMap<String, DependencySpec>,
 }
 
 fn validate_dependencies(dependencies: &IndexMap<String, DependencySpec>) -> io::Result<()> {
     if dependencies.contains_key("std") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "dependency alias `std` is reserved; configure the top-level `std` field instead",
+            "dependency alias `std` is reserved for the standard-library setting",
         ));
     }
     Ok(())
@@ -168,8 +174,8 @@ pub fn read(root: &Path, name: &str) -> io::Result<Doc> {
         version: manifest.version,
         root: manifest.root,
         run: manifest.run,
-        std: manifest.std,
-        dependencies: manifest.dependencies,
+        std: manifest.dependencies.std,
+        dependencies: manifest.dependencies.declared,
         files,
         modified_ms: modified_ms(&fs::metadata(&dir)?),
     })
@@ -204,8 +210,10 @@ pub fn write(
         version: version.to_string(),
         root: configured_root.to_string(),
         run: run.clone(),
-        std: std.clone(),
-        dependencies: dependencies.clone(),
+        dependencies: ManifestDependencies {
+            std: std.clone(),
+            declared: dependencies.clone(),
+        },
     };
     let source = toml::to_string(&manifest).map_err(io::Error::other)?;
     fs::write(dir.join(MANIFEST), source)?;
@@ -237,7 +245,7 @@ fn read_manifest(dir: &Path) -> io::Result<Manifest> {
             format!("could not parse manifest {}: {error}", path.display()),
         )
     })?;
-    validate_dependencies(&manifest.dependencies)
+    validate_dependencies(&manifest.dependencies.declared)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(manifest)
 }
