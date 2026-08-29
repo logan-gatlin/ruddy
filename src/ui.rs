@@ -66,6 +66,8 @@ pub const FIRST_DEFINITION: &str = "first defined here";
 /// counterpart for the complaints about a name that was used rather than
 /// defined twice — see [`ir::ErrorKind::MixedTail`].
 pub const FIRST_USE: &str = "first used here";
+/// The other result boundary participating in an existential lifetime clash.
+pub const FIRST_PRODUCTION_LIFETIME: &str = "the conflicting production lifetime begins here";
 
 /// The note a repeated variable points back with, printed against the
 /// span of the declaration that stands.
@@ -815,7 +817,7 @@ impl fmt::Display for ir::ErrorKind {
                 f,
                 "this clause names `'{name}`, but no `when` in the type beside it gives it a label",
             ),
-            ir::ErrorKind::IncompatiblePresenceOwnership { name } => write!(
+            ir::ErrorKind::IncompatiblePresenceOwnership { name, .. } => write!(
                 f,
                 "presence `'{name}` is produced at more than one lifetime; use a different name at each result boundary",
             ),

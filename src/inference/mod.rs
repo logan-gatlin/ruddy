@@ -1119,6 +1119,22 @@ pub fn structural_family_for_tests(
     .family_type(types)
 }
 
+/// Alternately erase transparent packages and unfold transparent names until
+/// neither operation exposes another wrapper.
+fn expose_packages(aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
+    let mut exposed = ty.clone();
+    loop {
+        while let Ty::Package(body) = &*exposed {
+            exposed = body.clone();
+        }
+        let next = unfold(aliases, &exposed);
+        if Rc::ptr_eq(&next, &exposed) {
+            return exposed;
+        }
+        exposed = next;
+    }
+}
+
 /// Find an ordinary boundary leaf whose outer runtime representation remains
 /// polymorphic. Such a leaf cannot be adapted once at declaration lowering:
 /// in particular, an instantiation to an arrow would otherwise send a Ruddy
@@ -1148,7 +1164,7 @@ fn polymorphic_extern_boundary(
             } => {
                 let mut cursor = ty.clone();
                 for parameter in parameters {
-                    let exposed = unfold(aliases, &cursor);
+                    let exposed = expose_packages(aliases, &cursor);
                     let Ty::Arrow(from, to, _) = &*exposed else {
                         return None;
                     };
@@ -1161,7 +1177,7 @@ fn polymorphic_extern_boundary(
                 // unit arrow, but its unit input is synthetic rather than a
                 // boundary leaf written by the reader.
                 if parameters.is_empty() {
-                    let exposed = unfold(aliases, &cursor);
+                    let exposed = expose_packages(aliases, &cursor);
                     let Ty::Arrow(_, to, _) = &*exposed else {
                         return None;
                     };
@@ -1169,8 +1185,8 @@ fn polymorphic_extern_boundary(
                 }
                 boundary(aliases, result, &cursor, seen)
             }
-            ir::ExternTypeKind::Ordinary(_) => match &*unfold(aliases, ty) {
-                Ty::Package(body) => boundary(aliases, abi, body, seen),
+            ir::ExternTypeKind::Ordinary(_) => match &*expose_packages(aliases, ty) {
+                Ty::Package(_) => unreachable!("package exposure reaches a fixed point"),
                 Ty::Bound(_) | Ty::Var(_) | Ty::Rigid { .. } => Some(abi.span),
                 Ty::Arrow(from, to, _) => {
                     boundary(aliases, abi, from, seen).or_else(|| boundary(aliases, abi, to, seen))
@@ -2999,6 +3015,9 @@ impl Table {
                         }
                         work.push(Work::Ty(field.ty.clone()));
                     }
+                    if let Rest::More(more) = &row.rest {
+                        work.push(Work::Row((**more).clone()));
+                    }
                 }
             }
         }
@@ -3172,14 +3191,25 @@ impl Table {
     /// and both note what they built — at the cost of resolving every variable
     /// and allocating a set per row, on nearly every constraint.
     fn unfolded(&mut self, aliases: &IndexMap<Symbol, Scheme>, ty: &Rc<Ty>) -> Rc<Ty> {
-        let mut unfolded = unfold(aliases, ty);
-        while let Ty::Package(body) = &*unfolded {
-            unfolded = body.clone();
+        // A package may conceal a name and an alias may unfold to another
+        // package. Alternate the two transparent operations until a real shape
+        // is exposed; doing either only once leaves `Package (Alias
+        // (Package ...))` opaque to callers such as ABI validation.
+        let mut exposed = ty.clone();
+        loop {
+            while let Ty::Package(body) = &*exposed {
+                exposed = body.clone();
+            }
+            let next = unfold(aliases, &exposed);
+            if Rc::ptr_eq(&next, &exposed) {
+                break;
+            }
+            exposed = next;
         }
-        if !Rc::ptr_eq(&unfolded, ty) {
-            self.note_lacks(&unfolded);
+        if !Rc::ptr_eq(&exposed, ty) {
+            self.note_lacks(&exposed);
         }
-        unfolded
+        exposed
     }
 
     /// Every a variable variable a type still mentions that the scheme being
@@ -3438,11 +3468,14 @@ impl Table {
         self.quantify(ty, &mut subst, level);
         let body = self.zonk(ty, &subst);
         let formula = quantify_formula(&formula, &subst);
-        let existentials = subst
+        let mut existentials: IndexSet<u32> = subst
             .presences
             .iter()
             .filter_map(|(var, index)| self.existential_witnesses.contains(var).then_some(*index))
             .collect();
+        let (body, inferred) =
+            package_positive_presences(&body, subst.presences.len() as u32, &existentials);
+        existentials.extend(inferred);
         (
             Scheme::existential(
                 subst.next(),
@@ -4019,6 +4052,229 @@ fn quantify_formula(formula: &Formula, subst: &Subst) -> Formula {
     })
 }
 
+/// Classify solver-inferred presence quantifiers by polarity and seal every
+/// positive-only class at its exact semantic production node. Explicit
+/// annotation variables are rigids rather than these low presence positions,
+/// so this cannot turn a caller-chosen annotation variable existential.
+fn package_positive_presences(
+    body: &Rc<Ty>,
+    presences: u32,
+    already: &IndexSet<u32>,
+) -> (Rc<Ty>, IndexSet<u32>) {
+    #[derive(Default)]
+    struct Uses {
+        positive: u32,
+        negative: u32,
+        owners: IndexSet<usize>,
+    }
+    enum Scan {
+        Ty(Rc<Ty>, bool, usize),
+        Row(Row, bool, usize),
+    }
+    let root = Rc::as_ptr(body) as usize;
+    let mut uses: HashMap<u32, Uses> = HashMap::new();
+    let mut work = vec![Scan::Ty(body.clone(), true, root)];
+    while let Some(item) = work.pop() {
+        match item {
+            Scan::Ty(ty, positive, owner) => match &*ty {
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Scan::Ty(from.clone(), !positive, owner));
+                    let result_owner = if positive {
+                        Rc::as_ptr(to) as usize
+                    } else {
+                        owner
+                    };
+                    work.push(Scan::Ty(to.clone(), positive, result_owner));
+                    work.push(Scan::Row(effects.clone(), positive, owner));
+                }
+                Ty::Package(inner) => work.push(Scan::Ty(inner.clone(), positive, owner)),
+                Ty::Struct(row) | Ty::Sum(row) => {
+                    work.push(Scan::Row(row.clone(), positive, owner))
+                }
+                Ty::Named { args, .. } => work.extend(
+                    args.iter()
+                        .cloned()
+                        .map(|arg| Scan::Ty(arg, positive, owner)),
+                ),
+                _ => {}
+            },
+            Scan::Row(row, positive, owner) => {
+                for field in row.labels.values() {
+                    if let Presence::Bound(index) = field.presence
+                        && index < presences
+                        && !already.contains(&index)
+                    {
+                        let use_ = uses.entry(index).or_default();
+                        if positive {
+                            use_.positive += 1
+                        } else {
+                            use_.negative += 1
+                        }
+                        if positive {
+                            use_.owners.insert(owner);
+                        }
+                    }
+                    work.push(Scan::Ty(field.ty.clone(), positive, owner));
+                }
+                if let Rest::More(more) = &row.rest {
+                    work.push(Scan::Row((**more).clone(), positive, owner));
+                }
+            }
+        }
+    }
+    let inferred: IndexSet<u32> = uses
+        .iter()
+        .filter_map(|(index, use_)| {
+            (use_.positive > 0 && use_.negative == 0 && use_.owners.len() == 1).then_some(*index)
+        })
+        .collect();
+    let owners: HashSet<usize> = uses
+        .iter()
+        .filter(|(index, _)| inferred.contains(*index))
+        .map(|(_, use_)| *use_.owners.first().expect("positive presence has owner"))
+        .collect();
+    if owners.is_empty() {
+        return (body.clone(), inferred);
+    }
+
+    enum Build {
+        Ty(Rc<Ty>),
+        Arrow(bool),
+        Package(bool),
+        Struct(bool),
+        Sum(bool),
+        Named(bool, Symbol, Rc<str>, usize),
+        Row(Row),
+        FinishRow(Vec<(String, Presence)>, Rest),
+    }
+    let mut work = vec![Build::Ty(body.clone())];
+    let mut types = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Build::Ty(ty) => {
+                let wrap = owners.contains(&(Rc::as_ptr(&ty) as usize));
+                match &*ty {
+                    Ty::Arrow(from, to, effects) => {
+                        work.push(Build::Arrow(wrap));
+                        work.push(Build::Row(effects.clone()));
+                        work.push(Build::Ty(to.clone()));
+                        work.push(Build::Ty(from.clone()));
+                    }
+                    Ty::Package(inner) => {
+                        work.push(Build::Package(wrap));
+                        work.push(Build::Ty(inner.clone()));
+                    }
+                    Ty::Struct(row) => {
+                        work.push(Build::Struct(wrap));
+                        work.push(Build::Row(row.clone()));
+                    }
+                    Ty::Sum(row) => {
+                        work.push(Build::Sum(wrap));
+                        work.push(Build::Row(row.clone()));
+                    }
+                    Ty::Named { symbol, name, args } => {
+                        work.push(Build::Named(wrap, *symbol, name.clone(), args.len()));
+                        work.extend(args.iter().rev().cloned().map(Build::Ty));
+                    }
+                    other => {
+                        let value = Rc::new(other.clone());
+                        types.push(if wrap {
+                            Rc::new(Ty::Package(value))
+                        } else {
+                            value
+                        });
+                    }
+                }
+            }
+            Build::Row(row) => {
+                let labels: Vec<_> = row
+                    .labels
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.presence.clone()))
+                    .collect();
+                work.push(Build::FinishRow(labels, row.rest.clone()));
+                work.extend(
+                    row.labels
+                        .values()
+                        .rev()
+                        .map(|field| Build::Ty(field.ty.clone())),
+                );
+            }
+            Build::FinishRow(labels, rest) => {
+                let mut built = Vec::with_capacity(labels.len());
+                for (name, presence) in labels.into_iter().rev() {
+                    built.push((
+                        name,
+                        RowField {
+                            presence,
+                            ty: types.pop().expect("packaged row payload"),
+                        },
+                    ));
+                }
+                built.reverse();
+                rows.push(Row {
+                    labels: built.into_iter().collect(),
+                    rest,
+                });
+            }
+            Build::Arrow(wrap) => {
+                let effects = rows.pop().unwrap();
+                let to = types.pop().unwrap();
+                let from = types.pop().unwrap();
+                let value = Rc::new(Ty::Arrow(from, to, effects));
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
+            Build::Package(wrap) => {
+                let value = Rc::new(Ty::Package(types.pop().unwrap()));
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
+            Build::Struct(wrap) => {
+                let value = Rc::new(Ty::Struct(rows.pop().unwrap()));
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
+            Build::Sum(wrap) => {
+                let value = Rc::new(Ty::Sum(rows.pop().unwrap()));
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
+            Build::Named(wrap, symbol, name, count) => {
+                let mut args = Vec::with_capacity(count);
+                for _ in 0..count {
+                    args.push(types.pop().unwrap());
+                }
+                args.reverse();
+                let value = Rc::new(Ty::Named {
+                    symbol,
+                    name,
+                    args: args.into(),
+                });
+                types.push(if wrap {
+                    Rc::new(Ty::Package(value))
+                } else {
+                    value
+                });
+            }
+        }
+    }
+    (types.pop().expect("packaged type"), inferred)
+}
+
 /// One scheme body with every type and row position it quantifies moved up by
 /// `by`, to make room below them for that many more presences.
 ///
@@ -4131,6 +4387,7 @@ struct Tails {
     /// name share one variable, which is how a type says two fields are there
     /// together, and what the `where` clause beside them resolves against.
     presences: HashMap<String, Presence>,
+    anonymous: HashMap<u32, Presence>,
 }
 
 /// Everything one lowered annotation says: the type its body is checked
@@ -4229,8 +4486,19 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
             crate::ir::PresenceOwnership::Existential { boundary } => Some(boundary),
             crate::ir::PresenceOwnership::Universal => None,
         })
+        .chain(
+            annotation
+                .anonymous_existentials
+                .iter()
+                .map(|(_, boundary)| *boundary),
+        )
         .collect();
     let ty = lower_scoped(mint, table, &mut tails, &annotation.ty, Some(&boundaries));
+    for (id, _) in &annotation.anonymous_existentials {
+        if let Some(Presence::Var(var)) = tails.anonymous.get(id) {
+            table.existential_witnesses.insert(*var);
+        }
+    }
     // A tail stands for the fields its row did not write out, and this is where
     // that is first true of a written one: `{ x: Nat, ..h }` says the hole `h`
     // has no `x`. A rigid needs none of it — nothing can ever be bound to one,
@@ -4261,6 +4529,14 @@ fn lower_annotation(mint: &Mint, table: &mut Table, annotation: &Annotation) -> 
         ) {
             existential_slots.insert(index);
         }
+    }
+    for (id, _) in &annotation.anonymous_existentials {
+        let Some(Presence::Var(var)) = tails.anonymous.get(id) else {
+            continue;
+        };
+        let index = presence_subst.len() as u32;
+        presence_subst.insert(*var, index);
+        existential_slots.insert(index);
     }
     let presences = presence_subst.len() as u32;
     let subst = Subst {
@@ -4457,12 +4733,16 @@ fn lower_scoped(
 /// Indexed rather than looked up: a named `when` is a *use*, so lowering has
 /// already refused a name nothing declared and erased one read at another sort,
 /// and [`lower_annotation`] minted a variable for every name that survived.
-fn presence(table: &mut Table, tails: &Tails, when: &Option<Box<ir::When>>) -> Presence {
+fn presence(table: &mut Table, tails: &mut Tails, when: &Option<Box<ir::When>>) -> Presence {
     let Some(when) = when else {
         return Presence::Present;
     };
     let Some(name) = &when.name else {
-        return table.fresh_presence();
+        return tails
+            .anonymous
+            .entry(when.id)
+            .or_insert_with(|| table.fresh_presence())
+            .clone();
     };
     tails.presences[name].clone()
 }

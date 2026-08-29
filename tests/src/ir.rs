@@ -5106,6 +5106,68 @@ fn presence_ownership_is_inferred_from_polarity_and_result_boundaries() {
     );
 }
 
+#[test]
+fn anonymous_presences_have_distinct_positive_package_owners() {
+    let source = "let choose : { x when _: Nat, y when _: Nat } = { x: 0n, y: 0n }";
+    let (mint, out) = built(source);
+    let annotation = annotation_of(&mint, &out, "choose");
+    assert_eq!(annotation.anonymous_existentials.len(), 2);
+    assert_ne!(
+        annotation.anonymous_existentials[0].0,
+        annotation.anonymous_existentials[1].0
+    );
+    assert_eq!(
+        annotation.anonymous_existentials[0].1,
+        annotation.anonymous_existentials[1].1
+    );
+
+    let source = "let take : { x when _: Nat } -> Nat = fn x => 0n";
+    let (mint, out) = built(source);
+    assert!(
+        annotation_of(&mint, &out, "take")
+            .anonymous_existentials
+            .is_empty()
+    );
+}
+
+#[test]
+fn alias_parameter_variance_reaches_annotation_ownership_fixpoint() {
+    for (declarations, use_ty, existential) in [
+        (
+            "type Cov 'a = { value: 'a }",
+            "Cov { x when 'p: Nat }",
+            true,
+        ),
+        (
+            "type Contra 'a = 'a -> Nat",
+            "Contra { x when 'p: Nat }",
+            false,
+        ),
+        (
+            "type Inv 'a = { value: 'a -> 'a }",
+            "Inv { x when 'p: Nat }",
+            false,
+        ),
+        ("type Erased 'a = Nat", "Erased { x when 'p: Nat }", false),
+        (
+            "type A 'a = { next: B 'a }\ntype B 'b = { next: A 'b, value: 'b }",
+            "A { x when 'p: Nat }",
+            true,
+        ),
+    ] {
+        let source = format!("{declarations}\nlet value : {use_ty} = 0n");
+        let (mint, out) = build_src(&source);
+        assert!(out.errors.is_empty(), "{source}: {:#?}", out.errors);
+        let variable = &annotation_of(&mint, &out, "value").variables[0];
+        assert_eq!(
+            matches!(variable.ownership, PresenceOwnership::Existential { .. }),
+            existential,
+            "{source}: {:?}",
+            variable.ownership
+        );
+    }
+}
+
 /// A source name denotes one witness, while each positive result boundary is
 /// a distinct package lifetime. Neither sibling results nor a containing value
 /// and its nested result can silently widen that witness to scheme scope. The
@@ -5123,15 +5185,17 @@ fn presence_ownership_rejects_incompatible_production_lifetimes_deterministicall
         assert!(
             matches!(
                 &out.errors[0].kind,
-                ErrorKind::IncompatiblePresenceOwnership { name } if name == "p"
+                ErrorKind::IncompatiblePresenceOwnership { name, .. } if name == "p"
             ),
             "{source}: {:#?}",
             out.errors
         );
-        assert_eq!(
-            &source[out.errors[0].span.start..out.errors[0].span.end()],
-            "'p"
-        );
+        let ErrorKind::IncompatiblePresenceOwnership { previous, .. } = out.errors[0].kind else {
+            unreachable!()
+        };
+        assert_ne!(previous, out.errors[0].span);
+        assert!(source[out.errors[0].span.start..out.errors[0].span.end()].contains('{'));
+        assert!(source[previous.start..previous.end()].contains('{'));
     }
 
     // Repetition within one exact package remains one producer-owned witness.
@@ -5186,7 +5250,7 @@ fn result_and_effect_occurrences_do_not_merge_package_boundaries() {
     assert_eq!(out.errors.len(), 1, "{:#?}", out.errors);
     assert!(matches!(
         out.errors[0].kind,
-        ErrorKind::IncompatiblePresenceOwnership { ref name } if name == "p"
+        ErrorKind::IncompatiblePresenceOwnership { ref name, .. } if name == "p"
     ));
 }
 

@@ -80,6 +80,20 @@ fn positive_result_presences_can_forget_input_correlations() {
 }
 
 #[test]
+fn anonymous_positive_annotation_presences_publish_distinct_existential_slots() {
+    let (mint, _, output) =
+        inferred("extern choice: { left when _: Nat, right when _: Nat } = host.choice");
+    let (_, scheme) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "choice")
+        .expect("the extern scheme is published");
+    assert_eq!(scheme.presences(), 2);
+    assert!(scheme.is_existential(0) && scheme.is_existential(1));
+    assert!(matches!(&**scheme.body(), Ty::Package(_)));
+}
+
+#[test]
 fn a_consumer_cannot_choose_an_existential_field_presence() {
     let (_, _, output) = infer_src(
         "extern choice: { left when 'a: Nat, right when 'b: Nat } where 'a != 'b = host.choice\n\

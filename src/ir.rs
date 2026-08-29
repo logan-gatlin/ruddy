@@ -704,6 +704,9 @@ pub enum TypeField {
 pub struct When {
     pub span: Span,
     pub name: Option<String>,
+    /// Program-unique even for `when _`; anonymous occurrences must never
+    /// accidentally share an inferred package slot.
+    pub id: u32,
 }
 
 /// A `where` clause, lowered: a formula over the names the written type's
@@ -746,6 +749,9 @@ pub struct Annotation {
     /// pass already settled. Empty for an annotation that declares nothing,
     /// which is every annotation the language had before this.
     pub variables: Vec<Variable>,
+    /// Anonymous positive-only occurrences and their exact producer boundary.
+    /// Each `when _` has its own id even when several share a boundary.
+    pub anonymous_existentials: Vec<(u32, Span)>,
     pub clause: Option<Clause>,
 }
 
@@ -797,30 +803,35 @@ impl PresenceOccurrences {
     /// occurrence. Containing boundaries are deliberately not unified: an
     /// invocation result makes a fresh choice, so its witness cannot also be
     /// the witness of the enclosing value (or of a sibling invocation).
-    fn owner(&self) -> Result<Span, ()> {
-        let owner = self.owners.first().copied().ok_or(())?;
+    fn owner(&self) -> Result<Span, (Span, Span)> {
+        let owner = self
+            .owners
+            .first()
+            .copied()
+            .expect("a positive presence occurrence has an owner");
         self.owners
             .iter()
-            .all(|candidate| *candidate == owner)
-            .then_some(owner)
-            .ok_or(())
+            .copied()
+            .find(|candidate| *candidate != owner)
+            .map_or(Ok(owner), |second| Err((owner, second)))
     }
 }
 
 /// Compute presence polarity and every positive production boundary used by a
 /// name. Formula uses are deliberately absent: a formula relates
 /// presences established by labels but does not decide their ownership.
-fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
+fn presence_polarities(
+    ty: &Type,
+    variances: &HashMap<Slot, u8>,
+) -> HashMap<u32, PresenceOccurrences> {
     fn note(
-        out: &mut HashMap<String, PresenceOccurrences>,
+        out: &mut HashMap<u32, PresenceOccurrences>,
         when: &Option<Box<When>>,
         positive: bool,
         owner: Span,
     ) {
-        let Some(name) = when.as_ref().and_then(|when| when.name.as_ref()) else {
-            return;
-        };
-        let occurrence = out.entry(name.clone()).or_default();
+        let Some(when) = when.as_ref() else { return };
+        let occurrence = out.entry(when.id).or_default();
         if positive {
             occurrence.positive += 1;
             occurrence.owners.push(owner);
@@ -833,7 +844,7 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
         row: &EffectRow,
         positive: bool,
         owner: Span,
-        out: &mut HashMap<String, PresenceOccurrences>,
+        out: &mut HashMap<u32, PresenceOccurrences>,
     ) {
         for effect in row.effects.values() {
             if let EffectLabel::Written { when, .. } = effect {
@@ -846,17 +857,18 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
         ty: &Type,
         positive: bool,
         owner: Span,
-        out: &mut HashMap<String, PresenceOccurrences>,
+        out: &mut HashMap<u32, PresenceOccurrences>,
+        variances: &HashMap<Slot, u8>,
     ) {
         match &ty.tracked {
             TypeKind::Arrow { from, to, effects } => {
-                walk(from, !positive, owner, out);
+                walk(from, !positive, owner, out, variances);
                 // A result reached positively owns choices made separately by
                 // each invocation. Under negative polarity it is produced by
                 // the annotation's consumer, so no new producer boundary is
                 // introduced relative to the complete type.
                 let result_owner = if positive { to.span } else { owner };
-                walk(to, positive, result_owner, out);
+                walk(to, positive, result_owner, out, variances);
                 // Conditional effects belong to the arrow value itself, not
                 // to its result. The polarity has already been reversed if
                 // this arrow sits in an outer parameter.
@@ -866,7 +878,7 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
                 for field in fields.values() {
                     if let TypeField::Written { when, value, .. } = field {
                         note(out, when, positive, owner);
-                        walk(value, positive, owner, out);
+                        walk(value, positive, owner, out, variances);
                     }
                 }
             }
@@ -875,20 +887,24 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
                     if let SumCase::Written { when, payload, .. } = case {
                         note(out, when, positive, owner);
                         if let Some(payload) = payload {
-                            walk(payload, positive, owner, out);
+                            walk(payload, positive, owner, out, variances);
                         }
                     }
                 }
             }
             TypeKind::Effects(effects) => walk_row(effects, positive, owner, out),
-            // Declared types are transparent semantically. Until declaration
-            // parameter variance is available here, invariant treatment is the
-            // only sound choice: preserving polarity through every argument
-            // would incorrectly hide a presence forwarded to a negative use.
-            TypeKind::Apply { args, .. } => {
-                for arg in args {
-                    walk(arg, true, owner, out);
-                    walk(arg, false, owner, out);
+            // Declared aliases are transparent. Their parameter fixpoint says
+            // exactly which polarities survive unfolding, including recursive,
+            // mutually-recursive and imported forwarding aliases.
+            TypeKind::Apply { head, args, .. } => {
+                for (at, arg) in args.iter().enumerate() {
+                    let variance = variances.get(&(*head, at as u32)).copied().unwrap_or(3);
+                    if variance & 1 != 0 {
+                        walk(arg, positive, owner, out, variances);
+                    }
+                    if variance & 2 != 0 {
+                        walk(arg, !positive, owner, out, variances);
+                    }
                 }
             }
             TypeKind::Ident(_)
@@ -901,7 +917,182 @@ fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
     }
 
     let mut out = HashMap::new();
-    walk(ty, true, ty.span, &mut out);
+    walk(ty, true, ty.span, &mut out, variances);
+    out
+}
+
+const COVARIANT: u8 = 1;
+const CONTRAVARIANT: u8 = 2;
+
+/// Declared aliases are representation-transparent, so their parameter
+/// variance is the least solution of the uses in every local and imported body.
+/// The finite two-bit lattice makes recursive and mutually-recursive forwarding
+/// terminate without a depth cap; a parameter may be covariant,
+/// contravariant, invariant (both bits), or erased (no bits).
+fn declaration_variances(
+    local: &IndexMap<Symbol, Decl<Type>>,
+    imported: &IndexMap<Symbol, ExternalType>,
+) -> HashMap<Slot, u8> {
+    let mut out = HashMap::new();
+    for (symbol, decl) in local {
+        for at in 0..decl.params.len() {
+            out.insert((*symbol, at as u32), 0);
+        }
+    }
+    for (symbol, decl) in imported {
+        for at in 0..decl.params.len() {
+            out.insert((*symbol, at as u32), 0);
+        }
+    }
+
+    loop {
+        let before = out.clone();
+        for (owner, decl) in local {
+            let mut work = vec![(&decl.value, true)];
+            while let Some((ty, positive)) = work.pop() {
+                let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                match &ty.tracked {
+                    TypeKind::Param { index, .. } => {
+                        *out.entry((*owner, *index)).or_default() |= bit;
+                    }
+                    TypeKind::Arrow { from, to, effects } => {
+                        work.push((from, !positive));
+                        work.push((to, positive));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = &effects.tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Struct { fields, tail } => {
+                        work.extend(fields.values().filter_map(|field| match field {
+                            TypeField::Written { value, .. } => Some((value, positive)),
+                            TypeField::Absent { .. } => None,
+                        }));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Sum { cases, tail } => {
+                        work.extend(cases.values().filter_map(|case| match case {
+                            SumCase::Written {
+                                payload: Some(value),
+                                ..
+                            } => Some((value, positive)),
+                            _ => None,
+                        }));
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Effects(effects) => {
+                        if let Some(Tail {
+                            of: Row::Param { index, .. },
+                            ..
+                        }) = &effects.tail
+                        {
+                            *out.entry((*owner, *index)).or_default() |= bit;
+                        }
+                    }
+                    TypeKind::Apply { head, args, .. } => {
+                        for (at, arg) in args.iter().enumerate() {
+                            let variance = before.get(&(*head, at as u32)).copied().unwrap_or(3);
+                            if variance & COVARIANT != 0 {
+                                work.push((arg, positive));
+                            }
+                            if variance & CONTRAVARIANT != 0 {
+                                work.push((arg, !positive));
+                            }
+                        }
+                    }
+                    TypeKind::Ident(_)
+                    | TypeKind::Prim(_)
+                    | TypeKind::Var(_)
+                    | TypeKind::Hole
+                    | TypeKind::Error => {}
+                }
+            }
+        }
+
+        enum Semantic<'a> {
+            Ty(&'a Ty, bool),
+            Row(&'a crate::types::Row, bool),
+        }
+        for (owner, decl) in imported {
+            let mut work = vec![Semantic::Ty(decl.scheme.body(), true)];
+            while let Some(item) = work.pop() {
+                match item {
+                    Semantic::Ty(ty, positive) => {
+                        let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        match ty {
+                            Ty::Bound(index) if (*index as usize) < decl.params.len() => {
+                                *out.entry((*owner, *index)).or_default() |= bit;
+                            }
+                            Ty::Arrow(from, to, effects) => {
+                                work.push(Semantic::Ty(from, !positive));
+                                work.push(Semantic::Ty(to, positive));
+                                work.push(Semantic::Row(effects, positive));
+                            }
+                            Ty::Package(body) => work.push(Semantic::Ty(body, positive)),
+                            Ty::Struct(row) | Ty::Sum(row) => {
+                                work.push(Semantic::Row(row, positive))
+                            }
+                            Ty::Named { symbol, args, .. } => {
+                                for (at, arg) in args.iter().enumerate() {
+                                    let variance =
+                                        before.get(&(*symbol, at as u32)).copied().unwrap_or(3);
+                                    if variance & COVARIANT != 0 {
+                                        work.push(Semantic::Ty(arg, positive));
+                                    }
+                                    if variance & CONTRAVARIANT != 0 {
+                                        work.push(Semantic::Ty(arg, !positive));
+                                    }
+                                }
+                            }
+                            Ty::Var(_)
+                            | Ty::Rigid { .. }
+                            | Ty::Bound(_)
+                            | Ty::Undecided
+                            | Ty::Nat
+                            | Ty::Int
+                            | Ty::Real
+                            | Ty::String
+                            | Ty::Boolean => {}
+                        }
+                    }
+                    Semantic::Row(row, positive) => {
+                        let bit = if positive { COVARIANT } else { CONTRAVARIANT };
+                        work.extend(
+                            row.labels
+                                .values()
+                                .map(|field| Semantic::Ty(&field.ty, positive)),
+                        );
+                        if let Rest::Bound(index) = row.rest
+                            && (index as usize) < decl.params.len()
+                        {
+                            *out.entry((*owner, index)).or_default() |= bit;
+                        }
+                        if let Rest::More(more) = &row.rest {
+                            work.push(Semantic::Row(more, positive));
+                        }
+                    }
+                }
+            }
+        }
+        if out == before {
+            break;
+        }
+    }
     out
 }
 
@@ -1168,6 +1359,8 @@ pub enum ErrorKind {
     /// hidden choice, so one source variable cannot identify their witnesses.
     IncompatiblePresenceOwnership {
         name: String,
+        /// The other actionable production boundary.
+        previous: Span,
     },
     /// A type given a different number of arguments than it takes, including a
     /// name written bare that takes some.
@@ -1627,6 +1820,10 @@ struct Builder<'a> {
     /// that each write `a` never collide however alike they look — see
     /// [`Variable::id`].
     rigids: u32,
+    /// Positive/negative uses of every declared-type parameter after the
+    /// transparent alias graph reaches its least fixpoint. Bit 0 is covariant,
+    /// bit 1 contravariant; both is invariant and neither is erased.
+    variances: HashMap<Slot, u8>,
 }
 
 /// Every declaration in the bundle, split by what it declares and paired with
@@ -2210,6 +2407,7 @@ fn build_with_dependency_imports_inner(
         params: HashMap::new(),
         vars: IndexMap::new(),
         rigids: 0,
+        variances: HashMap::new(),
     };
     let mut program = Program {
         externs: IndexMap::new(),
@@ -2374,6 +2572,11 @@ fn build_with_dependency_imports_inner(
     // by normalized operation interfaces before parameter-kind analysis reads
     // their lacks sets. Terms are re-keyed after they are lowered below.
     structuralize_effects(&mut program, b.mint, &b.expanded, &mut b.errors);
+    // Alias applications are transparent for annotation polarity. Compute the
+    // least variance fixpoint only after every local/imported body is available;
+    // this terminates for recursive and mutually-recursive aliases because each
+    // slot can gain only the positive and negative bits.
+    b.variances = declaration_variances(&program.types, &program.external_types);
     // What each parameter stands for, which only the finished bodies can say: a
     // parameter handed straight on to another declaration takes its kind from
     // there, so no one body decides its own.
@@ -5695,6 +5898,7 @@ fn demand(ty: Type) -> Annotation {
     Annotation {
         ty,
         variables: Vec::new(),
+        anonymous_existentials: Vec::new(),
         clause: None,
     }
 }
@@ -8597,7 +8801,15 @@ impl Builder<'_> {
                 }
             });
         }
-        let polarity = presence_polarities(&ty);
+        let polarity = presence_polarities(&ty, &self.variances);
+        let named_ids: HashSet<u32> = self.vars.values().map(|declared| declared.id).collect();
+        let anonymous_existentials = polarity
+            .iter()
+            .filter(|(id, occurrences)| {
+                !named_ids.contains(id) && occurrences.negative == 0 && occurrences.positive > 0
+            })
+            .filter_map(|(id, occurrences)| occurrences.owner().ok().map(|owner| (*id, owner)))
+            .collect();
         let mut ownership_errors = Vec::new();
         let variables = self
             .vars
@@ -8607,17 +8819,18 @@ impl Builder<'_> {
                     .sense
                     .expect("an annotation variable was minted by a typed use")
                     .0;
-                let ownership = match (sense, polarity.get(name)) {
+                let ownership = match (sense, polarity.get(&declared.id)) {
                     (Sense::Presence, Some(occurrences))
                         if occurrences.negative == 0 && occurrences.positive > 0 =>
                     {
                         match occurrences.owner() {
                             Ok(boundary) => PresenceOwnership::Existential { boundary },
-                            Err(()) => {
+                            Err((previous, second)) => {
                                 ownership_errors.push(Error {
-                                    span: declared.span,
+                                    span: second,
                                     kind: ErrorKind::IncompatiblePresenceOwnership {
                                         name: name.clone(),
+                                        previous,
                                     },
                                 });
                                 // Lowering continues only to accumulate independent errors;
@@ -8641,6 +8854,7 @@ impl Builder<'_> {
         Annotation {
             ty,
             variables,
+            anonymous_existentials,
             // The clause absorbs whole rather than keeping the statements that
             // resolved, for the reason one bad name absorbs a formula: a
             // contract missing one of its conjuncts is a contract nobody wrote.
@@ -8719,26 +8933,38 @@ impl Builder<'_> {
     fn when(&mut self, when: Option<Box<parse::When>>, place: Place) -> Option<Box<When>> {
         let when = when?;
         if place != Place::Annotation {
+            let id = self.rigids;
+            self.rigids += 1;
             return Some(Box::new(When {
                 span: when.span,
                 name: when.name.map(|name| name.tracked),
+                id,
             }));
         }
+        let mut id = None;
         let name = when.name.and_then(|name| {
             if !self.variable(&name, Sense::Presence) {
                 return None;
             }
             // Worn by a label, which is what a formula needs of a name before
             // it can say anything about it.
-            self.vars
+            let declared = self
+                .vars
                 .get_mut(&name.tracked)
-                .expect("the variable was just minted")
-                .labelled = true;
+                .expect("the variable was just minted");
+            declared.labelled = true;
+            id = Some(declared.id);
             Some(name.tracked)
+        });
+        let id = id.unwrap_or_else(|| {
+            let id = self.rigids;
+            self.rigids += 1;
+            id
         });
         Some(Box::new(When {
             span: when.span,
             name,
+            id,
         }))
     }
 
