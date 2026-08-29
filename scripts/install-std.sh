@@ -27,6 +27,8 @@ mkdir -p "$home"
 lock=$home/.std.install.lock
 lock_owned=false
 temp_tag=$$.$RANDOM.$RANDOM
+candidate=$lock/candidate.$temp_tag
+quarantine=$lock/reaping.$temp_tag
 probe=
 staging=
 cleanup() {
@@ -40,8 +42,9 @@ cleanup() {
   rm -rf -- "$home/.std.exchange.$temp_tag".* "$home/.std.install.$temp_tag".*
   if [[ $lock_owned == true ]]; then
     rm -f -- "$lock/owner"
-    rmdir -- "$lock" 2>/dev/null || true
   fi
+  rm -f -- "$candidate" "$quarantine"
+  rmdir -- "$lock" 2>/dev/null || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -51,25 +54,36 @@ trap 'exit 143' TERM
 
 # A first install and a concurrent first install must not both decide that std
 # is absent: the second `mv staging std` would otherwise put staging *inside*
-# std. mkdir is the portable atomic lock primitive. Dead owners are reclaimed
-# under a marker inside the old lock; the owner is checked again after claiming
-# that marker so a contender cannot remove a newly acquired lock.
-while ! mkdir -- "$lock" 2>/dev/null; do
+# std. Publish a completely written, uniquely named candidate as `owner` with
+# an atomic hard link. A crash can therefore leave either no owner or a complete
+# one, never the empty owner that create-then-write would expose.
+while true; do
+  mkdir -p -- "$lock"
+  if ! printf '%s %s\n' "$$" "$temp_tag" >"$candidate" 2>/dev/null; then
+    sleep 0.01
+    continue
+  fi
+  if ln -- "$candidate" "$lock/owner" 2>/dev/null; then
+    lock_owned=true
+    # These can only be abandoned attempts: a current contender recreates its
+    # candidate if cleanup races its link. The owner link itself remains valid.
+    rm -f -- "$lock"/candidate.* "$lock"/reaping.*
+    break
+  fi
+
   owner=$(cat "$lock/owner" 2>/dev/null || true)
-  if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-    if mkdir -- "$lock/reaping" 2>/dev/null; then
-      current=$(cat "$lock/owner" 2>/dev/null || true)
-      if [[ $current == "$owner" ]] && ! kill -0 "$current" 2>/dev/null; then
-        rm -rf -- "$lock"
-      else
-        rmdir -- "$lock/reaping" 2>/dev/null || true
-      fi
+  owner_pid=${owner%% *}
+  if [[ ! $owner =~ ^[0-9]+\ [^[:space:]]+$ ]] || ! kill -0 "$owner_pid" 2>/dev/null; then
+    # Renaming claims exactly the owner we inspected and makes room for a new
+    # claimant in one operation. If another reaper wins, this simply fails;
+    # unlike deleting by pathname, it can never delete a newly published owner.
+    if mv -- "$lock/owner" "$quarantine" 2>/dev/null; then
+      rm -f -- "$quarantine"
     fi
   fi
+  rm -f -- "$candidate"
   sleep 0.01
 done
-lock_owned=true
-printf '%s\n' "$$" >"$lock/owner"
 
 replacement=false
 if [[ -e $home/std || -L $home/std ]]; then

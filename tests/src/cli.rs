@@ -586,6 +586,42 @@ fn bundled_std_installer_reclaims_a_stale_lock() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn bundled_std_installer_recovers_an_empty_unpublished_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let home = root.path().join("home");
+    let lock = home.join(".std.install.lock");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(source.join("Ruddy.toml"), "manifest").unwrap();
+    fs::write(source.join("main.hc"), "main").unwrap();
+    fs::write(lock.join("owner"), "").unwrap();
+    fs::write(lock.join("candidate.abandoned"), "999999 abandoned\n").unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/install-std.sh");
+    let output = Command::new(script)
+        .arg(&source)
+        .env("RUDDY_HOME", &home)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("std/main.hc")).unwrap(),
+        "main"
+    );
+    assert!(!lock.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bundled_std_installer_cleans_a_probe_interrupted_during_creation() {
     use std::os::unix::fs::PermissionsExt;
 
