@@ -7720,6 +7720,16 @@ fn extern_callback_coverage_uses_semantic_rows_and_aliases() {
 }
 
 #[test]
+fn extern_callback_coverage_terminates_on_recursive_ordinary_aliases() {
+    let (_, lowered, output) = infer_src(
+        "type Loop = () -> Loop\n\
+         extern loop : Loop = host.loop",
+    );
+    assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+}
+
+#[test]
 fn extern_callback_coverage_preserves_conditional_presence() {
     let (mint, lowered, output) = inferred(
         "effect Fail = { abort: () -> () }\n\

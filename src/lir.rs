@@ -1173,6 +1173,48 @@ impl Lower<'_> {
         id
     }
 
+    /// The least evidence a host-facing callback and the callbacks it returns
+    /// can ask for. Walking the semantic result spine (rather than the written
+    /// ABI leaves) sees through aliases; remembering alias applications keeps
+    /// regular recursive callback types finite.
+    fn callback_evidence(&self, ty: &Rc<Ty>, available: &Row) -> Row {
+        let mut required = Row::closed();
+        let mut cursor = ty.clone();
+        let mut seen = Vec::new();
+        let mut variable = false;
+        loop {
+            if matches!(&*cursor, Ty::Named { .. }) {
+                if seen.iter().any(|prior| same_finite_syntax(prior, &cursor)) {
+                    break;
+                }
+                seen.push(cursor.clone());
+            }
+            let exposed = unfold(&self.inference.aliases, &cursor);
+            let Ty::Arrow(_, to, row) = &*exposed else {
+                break;
+            };
+            for (name, field) in &row.labels {
+                if possible(&field.presence) {
+                    required
+                        .labels
+                        .entry(name.clone())
+                        .or_insert_with(|| field.clone());
+                }
+            }
+            variable |= tail_key(row).is_some();
+            cursor = to.clone();
+        }
+        if variable {
+            // Preserve the containing row's tail identity when it has one. A
+            // callback with conditional labels already gives `required` an
+            // anonymous variable part of its own.
+            if tail_key(available).is_some() {
+                required.rest = available.rest.clone();
+            }
+        }
+        required
+    }
+
     /// Convert a Ruddy closure passed to the host into the ABI written at that
     /// direct boundary position. These wrappers are called by the host, so
     /// their parameter list deliberately has no Ruddy evidence slots.
@@ -1190,20 +1232,18 @@ impl Lower<'_> {
             ExternTypeKind::Function {
                 parameters, result, ..
             } => {
-                let evidence = self.evidence_args(available, available, body);
-                let id = self.marked_callback(
-                    ty.clone(),
-                    parameters.clone(),
-                    *result.clone(),
-                    available.clone(),
-                );
+                let required = self.callback_evidence(ty, available);
+                let evidence = self.evidence_args(&required, available, body);
+                let id =
+                    self.marked_callback(ty.clone(), parameters.clone(), *result.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
                 self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
             }
             ExternTypeKind::Ordinary(_) if self.rep(ty) == Rep::Fn => {
-                let evidence = self.evidence_args(available, available, body);
-                let id = self.ordinary_callback(ty.clone(), available.clone());
+                let required = self.callback_evidence(ty, available);
+                let evidence = self.evidence_args(&required, available, body);
+                let id = self.ordinary_callback(ty.clone(), required);
                 let mut captures = vec![value];
                 captures.extend(evidence);
                 self.emit(body, abi.span, Rep::Fn, Op::Closure { func: id, captures })
@@ -1244,7 +1284,7 @@ impl Lower<'_> {
                 args,
             },
         );
-        let result = self.ruddy_to_host(&ordinary, &to, result, &row, &mut body);
+        let result = self.ruddy_to_host(&ordinary, &to, result, &available, &mut body);
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,
@@ -1332,8 +1372,7 @@ impl Lower<'_> {
                 );
             }
         }
-        let result_row = &arrows.last().expect("a marked callback has an arrow").2;
-        let result = self.ruddy_to_host(&result_abi, &cursor, current, result_row, &mut body);
+        let result = self.ruddy_to_host(&result_abi, &cursor, current, &available, &mut body);
         self.frames.pop().expect("the callback frame just pushed");
         self.fill(
             id,

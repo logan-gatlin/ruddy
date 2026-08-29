@@ -2689,6 +2689,31 @@ fn extern_values_are_imports_not_global_initializers() {
 }
 
 #[test]
+fn extern_callbacks_capture_only_the_evidence_their_result_spine_requires() {
+    let source = "effect Needed = { get: () -> Nat }\n\
+         effect Spare = { get: () -> Nat }\n\
+         type Callback = () -> (() -> Nat + !Needed)\n\
+         extern install : fn(Callback) -> () + !Needed + !Spare = host.install";
+    let printed = listing(source);
+    let callback = printed
+        .lines()
+        .find(|line| line.starts_with("fn install#extern#callback#"))
+        .expect("the callback adapter is emitted");
+    assert_eq!(
+        callback.matches(": struct").count(),
+        1,
+        "only Needed crosses into the callback adapter:\n{printed}"
+    );
+    assert!(
+        printed
+            .lines()
+            .filter(|line| line.contains("closure install#extern#callback#"))
+            .any(|line| line.matches('%').count() == 3),
+        "the returned callback retains its closure and Needed evidence:\n{printed}"
+    );
+}
+
+#[test]
 fn struct_and_project_instructions_preserve_quoted_field_names() {
     let source = r###"let pick = fn ignored => let record = { "field name": 1n, "let": 2n, "line\n\"quote\"\\tail": 3n } in record."line\n\"quote\"\\tail""###;
     let printed = section(source, "fn pick(");
