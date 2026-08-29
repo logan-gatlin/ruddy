@@ -3257,7 +3257,7 @@
     },
     "_malformed_numeric_field": {
       "type": "PATTERN",
-      "value": "[0-9]+[\\p{Alphabetic}\\p{N}_]+",
+      "value": "[0-9]+(?:\\.[0-9]+[\\p{Alphabetic}\\p{N}_]*|[\\p{Alphabetic}_][\\p{Alphabetic}\\p{N}_]*)",
       "flags": "u"
     },
     "string": {

@@ -814,9 +814,13 @@ module.exports = grammar({
     /** A decimal positional field following a projection dot. */
     numeric_field: _ => /[0-9]+/,
 
-    /** A numeric field with a suffix, rejected like the compiler's literal. */
+    /**
+     * A number-shaped field that the compiler consumes as one invalid token.
+     * Besides suffixes such as `.0n`, this includes an adjacent decimal tail:
+     * `p.0.0` is one malformed field, while `(p.0).0` is two valid projections.
+     */
     _malformed_numeric_field: _ => new RegExp(
-      /[0-9]+[\p{Alphabetic}\p{N}_]+/.source,
+      /[0-9]+(?:\.[0-9]+[\p{Alphabetic}\p{N}_]*|[\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*)/.source,
       'u',
     ),
 
