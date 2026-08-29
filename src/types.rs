@@ -1036,6 +1036,14 @@ impl Scheme {
     ) -> Self {
         debug_assert!(presences <= count);
         debug_assert!(existentials.iter().all(|index| *index < presences));
+        // Opening a package for a lexical alias deliberately gives that alias
+        // a fresh, unrelated view (R16). Generalizing the opened view can leave
+        // its existential slots structurally bare; reseal those slots at the
+        // alias boundary rather than retaining the source package's identity.
+        let body = match existential_outside_package(&body, &existentials) {
+            true => Rc::new(Ty::Package(body)),
+            false => body,
+        };
         let formula = partition_package_formula(&body, &existentials, formula);
         Self {
             count,
@@ -1077,6 +1085,48 @@ impl Scheme {
     }
 }
 
+/// Whether an existential bound occurrence has not yet been resealed by a
+/// package. The walk includes composed row tails because imported and inferred
+/// rows may retain their finite shape in `Rest::More`.
+fn existential_outside_package(body: &Rc<Ty>, existentials: &IndexSet<u32>) -> bool {
+    enum Work {
+        Ty(Rc<Ty>, bool),
+        Row(Row, bool),
+    }
+    let mut work = vec![Work::Ty(body.clone(), false)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty, packaged) => match &*ty {
+                Ty::Package(inner) => work.push(Work::Ty(inner.clone(), true)),
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Row(effects.clone(), packaged));
+                    work.push(Work::Ty(to.clone(), packaged));
+                    work.push(Work::Ty(from.clone(), packaged));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), packaged)),
+                Ty::Named { args, .. } => {
+                    work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, packaged)))
+                }
+                _ => {}
+            },
+            Work::Row(row, packaged) => {
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::Row((**more).clone(), packaged));
+                }
+                for field in row.labels.values().rev() {
+                    if !packaged
+                        && matches!(field.presence, Presence::Bound(index) if existentials.contains(&index))
+                    {
+                        return true;
+                    }
+                    work.push(Work::Ty(field.ty.clone(), packaged));
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Partition independent conjuncts by the exact package which owns all their
 /// existential atoms. Package numbers are stable structural preorder; a
 /// conjunct involving a universal or multiple owners stays scheme-wide.
@@ -1112,6 +1162,9 @@ fn partition_package_formula(
                 _ => {}
             },
             Work::Row(row, owner) => {
+                if let Rest::More(more) = &row.rest {
+                    work.push(Work::Row((**more).clone(), owner));
+                }
                 for field in row.labels.values().rev() {
                     if let Presence::Bound(index) = field.presence
                         && existentials.contains(&index)

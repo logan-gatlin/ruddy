@@ -1234,7 +1234,14 @@ impl Lower<'_> {
                 }
                 seen.push(cursor.clone());
             }
-            let exposed = unfold(&self.inference.aliases, &cursor);
+            // Package erasure and alias unfolding alternate: an alias may
+            // reveal a package whose body is another alias (including an
+            // imported or recursive one), and either operation alone would
+            // stop before the callback arrow.
+            let mut exposed = unfold(&self.inference.aliases, &cursor);
+            while let Ty::Package(body) = &*exposed {
+                exposed = unfold(&self.inference.aliases, body);
+            }
             let Ty::Arrow(_, to, row) = &*exposed else {
                 break;
             };

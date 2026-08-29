@@ -141,7 +141,7 @@ fn model_artifact() -> Artifact {
             scheme: Scheme {
                 count: 15,
                 presences: 7,
-                existentials: (index == 1).then_some(vec![0, 3]).unwrap_or_default(),
+                existentials: Vec::new(),
                 formula: formulas[index % formulas.len()].clone(),
                 body,
             },
@@ -393,13 +393,30 @@ fn model_artifact() -> Artifact {
 #[test]
 fn existential_presence_ownership_round_trips_and_is_validated() {
     let mut artifact = model_artifact();
-    artifact.header.values[0].scheme.existentials = vec![0, 3];
+    let scheme = &mut artifact.header.values[0].scheme;
+    scheme.existentials = vec![0, 3];
+    scheme.body = Type::Package(Box::new(Type::Struct(Row {
+        labels: vec![("a".into(), field(Presence::Bound(0), Type::Nat))],
+        rest: Rest::More(Box::new(Row {
+            labels: vec![("b".into(), field(Presence::Bound(3), Type::Nat))],
+            rest: Rest::Closed,
+        })),
+    })));
+    scheme.formula = Formula::Owned(
+        0,
+        Box::new(Formula::Or(
+            Box::new(Formula::Bound(0)),
+            Box::new(Formula::Bound(3)),
+        )),
+    );
     let printed = assert_round_trip(&artifact);
     assert!(printed.contains("(existentials 0 3)"), "{printed}");
 
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 3 0)", 1));
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 0)", 1));
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 7)", 1));
+    assert_malformed(&printed.replacen("(owned 0", "(owned 1", 1));
+    assert_malformed(&printed.replacen("(owned 0", "", 1).replacen(")", "", 1));
     // Presence positions share the scheme's quantifier space; accepting more
     // presence slots than total slots would let malformed bounds pass all
     // subsequent per-presence checks.
@@ -851,7 +868,7 @@ fn building_translates_every_compiler_semantic_and_lir_variant() {
     );
     inferred
         .schemes
-        .insert(symbol, types::Scheme::constrained(7, 1, body, formula));
+        .insert(symbol, types::Scheme::constrained(7, 3, body, formula));
 
     let span = Span::default();
     let nested = |kind| lir::Block {
