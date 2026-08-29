@@ -130,6 +130,23 @@ fn independently_called_xor_results_do_not_share_existential_witnesses() {
 }
 
 #[test]
+fn producer_guarantees_hold_for_every_admitted_universal_input() {
+    inferred(
+        "let follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = fn value => match value with\n\
+         | { input, .. } => { output: input }\n\
+         | { .. } => {}\n\
+         end",
+    );
+
+    let (_, _, output) = infer_src(
+        "let bad: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = fn input => {}",
+    );
+    assert_eq!(output.errors.len(), 1, "{:#?}", output.errors);
+}
+
+#[test]
 fn integer_and_natural_literals_are_function_arguments() {
     let (mint, _, output) = inferred(
         "let nat : Nat -> Nat = fn x => x\n\

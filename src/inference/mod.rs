@@ -2829,11 +2829,25 @@ impl Table {
         // A local annotation mints its own presences, disjoint from the
         // enclosing arm's. Both sets stay in the entailment alphabet.
         check_atoms.extend(guard_atoms);
-        let needed = sat::project(&body, &check_atoms);
-        if sat::entails(&allowed, &needed) {
+        // The clause has two quantifier polarities. Caller-owned presences are
+        // inputs, while producer-owned presences are witnesses selected by the
+        // body. Consequently a mixed contract is not the ordinary implication
+        // `promised -> project(body)`: that loses the correlation between an
+        // input and its witness. For every admitted caller assignment, some
+        // witness must satisfy both the advertised guarantee and what the body
+        // actually produces.
+        //
+        //     (exists E. promised(U, E))
+        //       -> (exists E, locals. promised(U, E) and body(U, E, locals))
+        //
+        // Projection supplies those existential quantifiers. With no producer
+        // witnesses this reduces to the old universal contract check.
+        let admitted = sat::project(&allowed, &check_atoms);
+        let realized = sat::project(&allowed.clone().and(body.clone()), &check_atoms);
+        if sat::entails(&admitted, &realized) {
             return None;
         }
-        let required = sat::project(&guard.and(needed), &promised_atoms);
+        let required = sat::project(&guard.and(body), &promised_atoms);
         // Both halves are quoted in the names the reader wrote, which means
         // looking each one up by the presence it decides — as the solve now has
         // it, not as the annotation minted it. A variable unified with another
