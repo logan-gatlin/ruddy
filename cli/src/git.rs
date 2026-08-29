@@ -260,13 +260,24 @@ pub(crate) fn canonical_checkouts_root() -> Option<PathBuf> {
 }
 
 pub fn ruddy_home() -> Result<PathBuf, CompileError> {
-    if let Some(path) = env::var_os("RUDDY_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
+    let configured = if let Some(path) = env::var_os("RUDDY_HOME").filter(|value| !value.is_empty())
+    {
+        PathBuf::from(path)
+    } else {
+        env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(|home| PathBuf::from(home).join(".ruddy"))
+            .ok_or_else(|| CompileError::one("could not determine Ruddy home; set RUDDY_HOME"))?
+    };
+    if configured.is_absolute() {
+        Ok(configured)
+    } else {
+        env::current_dir()
+            .map(|current| current.join(configured))
+            .map_err(|error| {
+                CompileError::one(format!("could not resolve relative Ruddy home: {error}"))
+            })
     }
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).join(".ruddy"))
-        .ok_or_else(|| CompileError::one("could not determine Ruddy home; set RUDDY_HOME"))
 }
 
 fn git_cache(home: &Path) -> PathBuf {

@@ -143,6 +143,38 @@ fn a_document_round_trips_through_the_disk() {
 }
 
 #[test]
+fn the_reserved_std_alias_is_never_persisted_as_a_declared_dependency() {
+    let root = scratch("reserved-std");
+    let dependencies = IndexMap::from([("std".into(), DependencySpec::from("../standard"))]);
+    let found = write(
+        &root,
+        "demo",
+        "demo",
+        "0.1.0",
+        "main.hc",
+        &RunConfig::default(),
+        &StdConfig::default(),
+        &dependencies,
+        &[file("main.hc", "")],
+    )
+    .unwrap_err();
+    assert_eq!(found.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(found.to_string().contains("alias `std` is reserved"));
+    assert!(!root.join("demo").exists());
+
+    std::fs::create_dir_all(root.join("demo")).unwrap();
+    std::fs::write(root.join("demo/main.hc"), "").unwrap();
+    std::fs::write(
+        root.join("demo/Ruddy.toml"),
+        "name = \"demo\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nstd = \"../standard\"\n",
+    )
+    .unwrap();
+    let found = read(&root, "demo").unwrap_err();
+    assert_eq!(found.kind(), std::io::ErrorKind::InvalidData);
+    assert!(found.to_string().contains("alias `std` is reserved"));
+}
+
+#[test]
 fn the_configured_root_is_ordered_before_other_files() {
     let root = scratch("configured-root-order");
     write(
