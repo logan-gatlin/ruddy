@@ -19,11 +19,22 @@ fn project() -> TempDir {
     directory
 }
 
+fn disable_std(directory: &Path) {
+    let path = directory.join("Ruddy.toml");
+    let manifest = fs::read_to_string(&path).unwrap();
+    fs::write(
+        path,
+        manifest.replace("\n[dependencies]", "\nstd = false\n[dependencies]"),
+    )
+    .unwrap();
+}
+
 fn write_project(directory: &Path, name: &str, version: &str, dependencies: &[(&str, &str)]) {
     fs::create_dir_all(directory).unwrap();
     fs::write(directory.join("main.hc"), "let value = 0n\n").unwrap();
-    let mut manifest =
-        format!("name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\n[dependencies]\n");
+    let mut manifest = format!(
+        "name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\nstd = false\n[dependencies]\n"
+    );
     for (dependency, path) in dependencies {
         manifest.push_str(&format!("{dependency} = {path:?}\n"));
     }
@@ -34,6 +45,78 @@ fn error(directory: &TempDir) -> String {
     compile(directory.path())
         .expect_err("compilation fails")
         .to_string()
+}
+
+#[test]
+fn shared_std_configuration_accepts_only_false_or_dependency_syntax() {
+    let disabled: ruddy_cli::StdConfig = toml::Value::Boolean(false).try_into().unwrap();
+    assert!(disabled.is_disabled());
+
+    let path: ruddy_cli::StdConfig = toml::Value::String("vendor/std".into()).try_into().unwrap();
+    assert_eq!(
+        path.dependency().and_then(ruddy_cli::DependencySpec::path),
+        Some(Path::new("vendor/std"))
+    );
+
+    let enabled = toml::Value::Boolean(true)
+        .try_into::<ruddy_cli::StdConfig>()
+        .unwrap_err()
+        .to_string();
+    assert!(enabled.contains("`std = true` is invalid"), "{enabled}");
+}
+
+#[test]
+fn configured_std_is_injected_first_and_is_source_visible() {
+    let directory = project();
+    write_project(
+        &directory.path().join("standard"),
+        "foundation",
+        "2.1.0",
+        &[],
+    );
+    fs::write(
+        directory.path().join("standard/main.hc"),
+        "let answer = 42n\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("main.hc"), "let main = std::answer\n").unwrap();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = { path = \"standard\", bundle = \"foundation\" }\n[dependencies]\n",
+    )
+    .unwrap();
+
+    let graph = ruddy_cli::compile_graph(directory.path()).unwrap();
+    assert_eq!(
+        graph
+            .projects
+            .iter()
+            .map(|project| project.artifact.header.identity.name.as_str())
+            .collect::<Vec<_>>(),
+        ["foundation", "app"]
+    );
+    assert_eq!(
+        graph.projects[1].artifact.header.dependencies[0].name,
+        "foundation"
+    );
+    assert!(
+        compile(directory.path())
+            .unwrap()
+            .print()
+            .contains("foundation@2.1.0::answer")
+    );
+}
+
+#[test]
+fn reserved_explicit_std_alias_has_a_focused_error() {
+    let directory = project();
+    fs::write(
+        directory.path().join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nstd = \"vendor/std\"\n",
+    )
+    .unwrap();
+    let error = error(&directory);
+    assert!(error.contains("reserved dependency alias `std`"), "{error}");
 }
 
 #[test]
@@ -48,7 +131,7 @@ fn manifest_dependencies_reach_the_artifact_in_declaration_order() {
     );
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nzeta = \"zeta\"\nalpha = \"alpha\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nzeta = \"zeta\"\nalpha = \"alpha\"\n",
     )
     .expect("write the manifest");
 
@@ -88,7 +171,7 @@ fn direct_dependency_exports_resolve_and_keep_their_artifact_owner() {
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"std\"\n[dependencies]\n",
     )
     .unwrap();
 
@@ -117,7 +200,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { bundle = \"http-core\", path = \"http-core\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nhttp_core = { bundle = \"http-core\", path = \"http-core\" }\n",
     )
     .unwrap();
 
@@ -136,7 +219,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nhttp_core = { package = \"http-core\", path = \"http-core\" }\n",
     )
     .unwrap();
     let old_field_error = error(&directory);
@@ -147,7 +230,7 @@ fn detailed_dependencies_alias_hyphenated_bundle_identities() {
 
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nhttp-core = \"http-core\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nhttp-core = \"http-core\"\n",
     )
     .unwrap();
     let error = error(&directory);
@@ -179,7 +262,7 @@ fn transitive_dependencies_are_linkable_but_not_source_visible() {
     .unwrap();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"std\"\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -201,7 +284,7 @@ fn missing_dependency_paths_report_the_requested_namespace() {
     write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"std\"\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -222,7 +305,7 @@ fn a_local_module_cannot_shadow_a_direct_dependency_root() {
     write_project(&directory.path().join("std"), "std", "1.0.0", &[]);
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nstd = \"std\"\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"std\"\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -245,7 +328,7 @@ fn the_configured_root_is_resolved_relative_to_the_manifest() {
     .expect("move the root");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\nstd = false\n[dependencies]\n",
     )
     .expect("write the manifest");
 
@@ -260,7 +343,7 @@ fn nested_root_diagnostics_preserve_root_and_module_paths() {
     fs::create_dir(directory.path().join("src")).expect("create source directory");
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"src/app.hc\"\nstd = false\n[dependencies]\n",
     )
     .expect("write the manifest");
     fs::write(
@@ -320,11 +403,11 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
             "missing field `root`",
         ),
         (
-            "name = 1\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+            "name = 1\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
             "invalid type",
         ),
         (
-            "name = \"app\"\nversion = 1\nroot = \"main.hc\"\n[dependencies]\n",
+            "name = \"app\"\nversion = 1\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
             "invalid type",
         ),
         (
@@ -333,36 +416,36 @@ fn the_manifest_is_required_and_must_be_valid_and_supported() {
         ),
         ("[dependencies", "could not parse manifest"),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntitle = \"app\"\n[dependencies]\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\ntitle = \"app\"\n[dependencies]\n",
             "unknown field `title`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = 1\n[dependencies]\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[run]\njs = 1\n[dependencies]\n",
             "invalid type",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[run]\njs = \"node\"\nnative = \"app\"\n[dependencies]\n",
             "unknown field `native`",
         ),
         ("title = \"app\"\n", "unknown field `title`"),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { source = \"base.artifact\" }\n",
             "unknown field `source`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { version = \"1.0.0\" }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { version = 1, source = \"base.artifact\" }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { version = \"1.0.0\", source = 1 }\n",
             "unknown field `version`",
         ),
         (
-            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
+            "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { version = \"1.0.0\", source = \"base.artifact\", registry = \"x\" }\n",
             "unknown field `version`",
         ),
     ] {
@@ -404,7 +487,7 @@ fn git_dependency_manifest_validation_is_strict_and_contextual() {
             "unknown field `unknown`",
         ),
     ] {
-        fs::write(directory.path().join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {specification}\n")).unwrap();
+        fs::write(directory.path().join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = {specification}\n")).unwrap();
         let found = error(&directory);
         assert!(found.contains(expected), "`{expected}` in:\n{found}");
         if !expected.starts_with("unknown field") {
@@ -422,7 +505,7 @@ fn ambient_git_configuration_cannot_rewrite_https_to_an_unsafe_transport() {
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&home).unwrap();
     fs::write(app.join("main.hc"), "let main = 0n\n").unwrap();
-    fs::write(app.join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://example.invalid/repository\" }\n").unwrap();
+    fs::write(app.join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { git = \"https://example.invalid/repository\" }\n").unwrap();
     let config = home.join("hostile.gitconfig");
     fs::write(
         &config,
@@ -527,7 +610,7 @@ fn ruddy_home_layout_child() {
 #[test]
 fn https_fetch_failures_are_contextual_and_do_not_create_a_lockfile() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", branch = \"main\" }\n").unwrap();
     let found = error(&directory);
     assert!(found.contains("dependency `base`"), "{found}");
     assert!(
@@ -570,7 +653,7 @@ fn locked_cached_git_dependency_child() {
     fs::create_dir_all(&seed).unwrap();
     let repository = gix::init(&seed).unwrap();
     let manifest = repository
-        .write_blob(b"name = \"base\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\n[dependencies]\n")
+        .write_blob(b"name = \"base\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n")
         .unwrap()
         .detach();
     let source = repository.write_blob(b"let value = 2n\n").unwrap().detach();
@@ -630,7 +713,7 @@ fn locked_cached_git_dependency_child() {
     fs::rename(seed, &checkout).unwrap();
     fs::create_dir_all(&app).unwrap();
     fs::write(app.join("main.hc"), "let main = base::value\n").unwrap();
-    fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
+    fs::write(app.join("Ruddy.toml"), format!("name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = {{ git = {url:?}, branch = \"main\" }}\n")).unwrap();
     let uppercase = commit.to_ascii_uppercase();
     let lock = format!(
         "version = 1\n\n[[git]]\nurl = {url:?}\nbranch = \"main\"\ncommit = {uppercase:?}\n"
@@ -650,7 +733,7 @@ fn locked_cached_git_dependency_child() {
     // cross-process cache lock remains held for compilation.
     fs::write(
         checkout.join("Ruddy.toml"),
-        "name = \"poison\"\nversion = \"9.9.9\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"poison\"\nversion = \"9.9.9\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -708,7 +791,7 @@ fn locked_cached_git_dependency_child() {
     fs::write(
         path_app.join("Ruddy.toml"),
         format!(
-            "name = \"path-app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = {{ path = {:?} }}\n",
+            "name = \"path-app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = {{ path = {:?} }}\n",
             checkout
         ),
     )
@@ -729,7 +812,7 @@ fn locked_cached_git_dependency_child() {
 #[test]
 fn exact_revisions_require_unambiguous_hex_prefixes_before_network_access() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = { git = \"https://127.0.0.1:9/repository\", rev = \"abc123\" }\n").unwrap();
     let found = error(&directory);
     assert!(found.contains("7 to 40 hexadecimal digits"), "{found}");
     assert!(!directory.path().join("Ruddy.lock").exists());
@@ -740,7 +823,7 @@ fn a_successful_build_removes_stale_git_entries_from_an_existing_lockfile() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -760,7 +843,7 @@ fn abbreviated_revision_lock_entries_accept_the_matching_full_commit() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -776,7 +859,7 @@ fn malformed_and_unsupported_lockfiles_are_diagnosed_without_replacement() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     for source in [
@@ -817,7 +900,7 @@ fn manifest_bundle_identity_must_be_valid() {
     ] {
         fs::write(
             directory.path().join("Ruddy.toml"),
-            format!("name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\n[dependencies]\n"),
+            format!("name = {name:?}\nversion = {version:?}\nroot = \"main.hc\"\nstd = false\n[dependencies]\n"),
         )
         .expect("replace the manifest");
         let found = error(&directory);
@@ -828,11 +911,11 @@ fn manifest_bundle_identity_must_be_valid() {
 #[test]
 fn dependency_projects_must_exist_compile_and_match_the_table_key() {
     let directory = project();
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = \"missing\"\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = \"missing\"\n").unwrap();
     assert!(error(&directory).contains("dependency `base`"));
 
     write_project(&directory.path().join("child"), "other", "1.0.0", &[]);
-    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nbase = \"child\"\n").unwrap();
+    fs::write(directory.path().join("Ruddy.toml"), "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nbase = \"child\"\n").unwrap();
     assert!(error(&directory).contains("contains project `other` instead"));
 
     write_project(&directory.path().join("child"), "base", "1.0.0", &[]);
@@ -1053,7 +1136,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     let missing = tempfile::tempdir().unwrap();
     fs::write(
         missing.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"missing.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"missing.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     let root_error = compile(missing.path())
@@ -1067,7 +1150,7 @@ fn bundle_and_compiler_failures_are_returned_as_cli_diagnostics() {
     let directory = project();
     fs::write(
         directory.path().join("Ruddy.toml"),
-        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(
@@ -1089,7 +1172,7 @@ fn the_configured_root_must_name_a_file() {
     for root in ["", ".", "..", "src/", "src/.", "/"] {
         fs::write(
             directory.path().join("Ruddy.toml"),
-            format!("name = \"app\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\n"),
+            format!("name = \"app\"\nversion = \"1.0.0\"\nroot = {root:?}\nstd = false\n[dependencies]\n"),
         )
         .unwrap();
         let error = compile(directory.path())
@@ -1129,6 +1212,7 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
         fs::canonicalize(repository.git_dir()).unwrap(),
         fs::canonicalize(destination.join(".git")).unwrap()
     );
+    disable_std(&destination);
     assert_eq!(
         compile(&destination).unwrap().header.identity,
         ruddy::artifact::Identity {
@@ -1221,6 +1305,7 @@ fn build_writes_and_replaces_the_named_canonical_artifact() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("sample");
     new_project(&project).unwrap();
+    disable_std(&project);
 
     let path = build_project(&project).expect("build project");
     assert_eq!(path, project.join("build/sample.artifact"));
@@ -1242,6 +1327,7 @@ fn manifest_targets_select_root_javascript_output() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("app");
     new_project(&app).unwrap();
+    disable_std(&app);
 
     // Omission and an explicit library target retain artifact-only behavior.
     let artifact = build_project(&app).unwrap();
@@ -1250,7 +1336,10 @@ fn manifest_targets_select_root_javascript_output() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"lib\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"lib\"",
+        ),
     )
     .unwrap();
     build_project(&app).unwrap();
@@ -1292,7 +1381,10 @@ fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
     let manifest = fs::read_to_string(dependency.join("Ruddy.toml")).unwrap();
     fs::write(
         dependency.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
 
@@ -1307,7 +1399,10 @@ fn dependency_targets_do_not_select_backend_output_for_a_parent_build() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
     build_project(&app).unwrap();
@@ -1322,7 +1417,7 @@ fn unsupported_manifest_targets_use_manifest_parse_diagnostics() {
         fs::write(
             directory.path().join("Ruddy.toml"),
             format!(
-                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\ntarget = {target}\n[dependencies]\n"
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\ntarget = {target}\n[dependencies]\n"
             ),
         )
         .unwrap();
@@ -1345,6 +1440,7 @@ fn build_surfaces_compile_directory_and_artifact_write_failures() {
     let blocked_build = tempfile::tempdir().unwrap();
     new_project(blocked_build.path().join("app")).unwrap();
     let project = blocked_build.path().join("app");
+    disable_std(&project);
     fs::write(project.join("build"), "not a directory").unwrap();
     let error = build_project(&project).unwrap_err().to_string();
     assert!(
@@ -1355,6 +1451,7 @@ fn build_surfaces_compile_directory_and_artifact_write_failures() {
     let blocked_artifact = tempfile::tempdir().unwrap();
     new_project(blocked_artifact.path().join("app")).unwrap();
     let project = blocked_artifact.path().join("app");
+    disable_std(&project);
     fs::create_dir(project.join("build")).unwrap();
     fs::create_dir(project.join("build/app.artifact")).unwrap();
     let error = build_project(&project).unwrap_err().to_string();
@@ -1373,6 +1470,7 @@ fn clap_commands_support_aliases_help_and_strict_arguments() {
         run(["n", "app"], current.path()).unwrap(),
         Outcome::Created(current.path().join("app"))
     );
+    disable_std(&current.path().join("app"));
     assert_eq!(
         run(["b"], current.path().join("app")).unwrap(),
         Outcome::Built(current.path().join("app/build/app.artifact"))
@@ -1425,7 +1523,10 @@ fn run_builds_and_evaluates_a_javascript_module_without_a_main_entrypoint() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
 
@@ -1456,8 +1557,8 @@ fn run_uses_the_configured_javascript_shell_runner() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"",
-            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"",
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"\n\n[run]\njs = \"sh runner.sh marker.txt\"",
         ),
     )
     .unwrap();
@@ -1489,8 +1590,8 @@ fn configured_javascript_runner_failures_preserve_build_output() {
     fs::write(
         app.join("Ruddy.toml"),
         manifest.replace(
-            "root = \"main.hc\"",
-            "root = \"main.hc\"\ntarget = \"js\"\n\n[run]\njs = \"false\"",
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"\n\n[run]\njs = \"false\"",
         ),
     )
     .unwrap();
@@ -1550,7 +1651,10 @@ fn run_registers_the_standard_runtime_bundle() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
 
@@ -1572,7 +1676,10 @@ fn run_drains_queued_jobs_and_preserves_installed_files_on_runtime_failure() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
 
@@ -1743,7 +1850,10 @@ fn run_reports_missing_externs_with_javascript_source_locations() {
     let manifest = fs::read_to_string(app.join("Ruddy.toml")).unwrap();
     fs::write(
         app.join("Ruddy.toml"),
-        manifest.replace("root = \"main.hc\"", "root = \"main.hc\"\ntarget = \"js\""),
+        manifest.replace(
+            "root = \"main.hc\"\nstd = false",
+            "root = \"main.hc\"\nstd = false\ntarget = \"js\"",
+        ),
     )
     .unwrap();
 
@@ -1762,6 +1872,7 @@ fn check_compiles_without_build_output_and_reports_failures() {
     let directory = tempfile::tempdir().unwrap();
     let app = directory.path().join("app");
     new_project(&app).unwrap();
+    disable_std(&app);
 
     check_project(&app).unwrap();
     assert!(!app.join("build").exists());
