@@ -7642,9 +7642,8 @@ fn a_recursive_use_instantiates_what_was_declared() {
     // A declared presence is part of the recursive interface too. Each call
     // chooses its own universal instance, so calling recursively with a
     // definitely-present field does not settle the caller's conditional one.
-    let (mint, _, output) = inferred(
-        "let inspect : { x when 'p: Nat } -> Nat = fn value => inspect { x: 1n }",
-    );
+    let (mint, _, output) =
+        inferred("let inspect : { x when 'p: Nat } -> Nat = fn value => inspect { x: 1n }");
     assert_eq!(
         scheme(&mint, &output, "inspect"),
         "{ x when 'a: Nat } -> Nat"
@@ -7919,13 +7918,17 @@ fn extern_callback_coverage_uses_where_implications() {
 
     let (_, lowered, invalid) = infer_src(&source(""));
     assert!(lowered.errors.is_empty(), "{:#?}", lowered.errors);
-    assert!(matches!(
-        invalid.errors.as_slice(),
-        [ruddy::inference::Error {
-            kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
-            ..
-        }]
-    ), "{:#?}", invalid.errors);
+    assert!(
+        matches!(
+            invalid.errors.as_slice(),
+            [ruddy::inference::Error {
+                kind: ruddy::inference::ErrorKind::CallbackEffectsNotCovered,
+                ..
+            }]
+        ),
+        "{:#?}",
+        invalid.errors
+    );
 }
 
 #[test]
