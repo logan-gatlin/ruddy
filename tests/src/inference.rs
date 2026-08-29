@@ -7698,9 +7698,11 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
     let (mint, _, output) = inferred(
         "effect Fail = { abort: () -> () }\n\
-         extern install : fn(fn(()) -> () + !Fail) -> () = host.install\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () + !Fail = host.install\n\
          let callback = fn unit => !Fail.abort unit\n\
-         let installed = install callback",
+         let installed = handle install callback with\n\
+           | !Fail.abort unit => ()\n\
+         end",
     );
     assert_eq!(scheme(&mint, &output, "callback"), "() -> () + !Fail");
     assert_eq!(scheme(&mint, &output, "installed"), "()");
@@ -7709,7 +7711,7 @@ fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
         .iter()
         .find(|(symbol, _)| mint.name(**symbol) == "install")
         .expect("the marked extern scheme is published");
-    assert_eq!(declared.to_string(), "(() -> () + !Fail) -> ()");
+    assert_eq!(declared.to_string(), "(() -> () + !Fail) -> () + !Fail");
 }
 
 #[test]

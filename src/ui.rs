@@ -731,6 +731,7 @@ impl ir::ErrorKind {
             ir::ErrorKind::DuplicateReturn { .. } => "duplicate-return-arm",
             ir::ErrorKind::RaiseOutsideArm => "raise-outside-arm",
             ir::ErrorKind::RaiseInFunction => "raise-in-function",
+            ir::ErrorKind::CallbackEffectsNotCovered => "callback-effects-not-covered",
         }
     }
 }
@@ -953,6 +954,9 @@ impl fmt::Display for ir::ErrorKind {
             ir::ErrorKind::RaiseOutsideArm => f.write_str("raise belongs in a handler arm"),
             ir::ErrorKind::RaiseInFunction => f.write_str(
                 "raise may not be written inside a function: it answers the handler around it, and a function can outlive one",
+            ),
+            ir::ErrorKind::CallbackEffectsNotCovered => f.write_str(
+                "callback effects are not covered by the containing extern call",
             ),
         }
     }

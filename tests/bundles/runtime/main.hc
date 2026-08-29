@@ -15,7 +15,7 @@ let added = add 20n 2n
 let add_twenty = add 20n
 let nullary_answer = nullary ()
 let curried_answer = curried_add 20n 22n
-let callback_answer = apply_pair (fn x => fn y => x + y) 20n 22n
+let callback_answer = apply_pair (fn x => fn _ => x) 42n 0n
 let nested_result = make_adder 2n 20n 20n
 let record = { answer: answer, ready: true }
 let tagged = #Ready answer

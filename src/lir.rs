@@ -1042,28 +1042,33 @@ impl Lower<'_> {
                 rep: self.rep(&ty),
             });
 
-            self.stem = format!("{name}#extern");
-            self.serial = 0;
-            let mut body = Body::default();
-            let raw = self.emit(
-                &mut body,
-                decl.value.target.span(),
-                self.rep(&ty),
-                Op::Extern {
+            // Non-function imports already have the Ruddy representation and
+            // remain direct globals. Only functions need an initialized
+            // adapter in front of the raw host value.
+            if self.rep(&ty) == Rep::Fn {
+                self.stem = format!("{name}#extern");
+                self.serial = 0;
+                let mut body = Body::default();
+                let raw = self.emit(
+                    &mut body,
+                    decl.value.target.span(),
+                    self.rep(&ty),
+                    Op::Extern {
+                        symbol,
+                        name: name.clone(),
+                    },
+                );
+                let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
+                self.globals.push(Global {
                     symbol,
-                    name: name.clone(),
-                },
-            );
-            let value = self.host_to_ruddy(&decl.value.abi, &ty, raw, &mut body);
-            self.globals.push(Global {
-                symbol,
-                name,
-                body: body.seal(Terminator {
-                    span: decl.value.target.span(),
-                    kind: End::Ret(value),
-                }),
-                span: decl.name_span,
-            });
+                    name,
+                    body: body.seal(Terminator {
+                        span: decl.value.target.span(),
+                        kind: End::Ret(value),
+                    }),
+                    span: decl.name_span,
+                });
+            }
         }
         externs
     }
