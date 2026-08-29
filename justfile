@@ -127,9 +127,11 @@ test:
 build:
     cargo build --workspace
 
-# Build and install the CLI into Cargo's executable directory.
+# Build and install the CLI, then atomically replace the bundled standard
+# library under RUDDY_HOME (or ~/.ruddy when RUDDY_HOME is unset or empty).
 install:
     cargo install --locked --path "{{justfile_directory()}}/cli"
+    "{{justfile_directory()}}/scripts/install-std.sh" "{{justfile_directory()}}/std"
 
 # Line and branch coverage for the compiler library. Branch coverage is a
 # nightly-only rustc feature, hence `+nightly`.
