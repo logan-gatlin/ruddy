@@ -793,29 +793,22 @@ struct PresenceOccurrences {
 }
 
 impl PresenceOccurrences {
-    /// The narrowest written production boundary that contains every positive
-    /// occurrence. Looking at the complete set makes ownership independent of
-    /// traversal order: two siblings stay incompatible, but an occurrence at
-    /// their enclosing boundary gives both a coherent lifetime.
-    fn owner(&self) -> Option<Span> {
-        let candidate = self
-            .owners
-            .iter()
-            .copied()
-            .max_by_key(|span| span.end() - span.start)?;
+    /// The exact written production boundary shared by every positive
+    /// occurrence. Containing boundaries are deliberately not unified: an
+    /// invocation result makes a fresh choice, so its witness cannot also be
+    /// the witness of the enclosing value (or of a sibling invocation).
+    fn owner(&self) -> Result<Span, ()> {
+        let owner = self.owners.first().copied().ok_or(())?;
         self.owners
             .iter()
-            .all(|owner| contains_span(candidate, *owner))
-            .then_some(candidate)
+            .all(|candidate| *candidate == owner)
+            .then_some(owner)
+            .ok_or(())
     }
 }
 
-fn contains_span(outer: Span, inner: Span) -> bool {
-    outer.file_id == inner.file_id && outer.start <= inner.start && outer.end() >= inner.end()
-}
-
-/// Compute presence polarity and the smallest positive production boundary
-/// shared by a name. Formula uses are deliberately absent: a formula relates
+/// Compute presence polarity and every positive production boundary used by a
+/// name. Formula uses are deliberately absent: a formula relates
 /// presences established by labels but does not decide their ownership.
 fn presence_polarities(ty: &Type) -> HashMap<String, PresenceOccurrences> {
     fn note(
@@ -1168,6 +1161,12 @@ pub enum ErrorKind {
     /// one it writes somewhere other than on a label. The reader's fix is the
     /// same either way — put the name on a label — so the complaint is too.
     UnboundPresence {
+        name: String,
+    },
+    /// One producer-chosen presence was written at more than one production
+    /// boundary. Each result invocation and enclosing value owns a distinct
+    /// hidden choice, so one source variable cannot identify their witnesses.
+    IncompatiblePresenceOwnership {
         name: String,
     },
     /// A type given a different number of arguments than it takes, including a
@@ -8590,6 +8589,7 @@ impl Builder<'_> {
             });
         }
         let polarity = presence_polarities(&ty);
+        let mut ownership_errors = Vec::new();
         let variables = self
             .vars
             .iter()
@@ -8600,12 +8600,21 @@ impl Builder<'_> {
                     .0;
                 let ownership = match (sense, polarity.get(name)) {
                     (Sense::Presence, Some(occurrences))
-                        if occurrences.negative == 0
-                            && occurrences.positive > 0
-                            && occurrences.owner().is_some() =>
+                        if occurrences.negative == 0 && occurrences.positive > 0 =>
                     {
-                        PresenceOwnership::Existential {
-                            boundary: occurrences.owner().expect("checked above"),
+                        match occurrences.owner() {
+                            Ok(boundary) => PresenceOwnership::Existential { boundary },
+                            Err(()) => {
+                                ownership_errors.push(Error {
+                                    span: declared.span,
+                                    kind: ErrorKind::IncompatiblePresenceOwnership {
+                                        name: name.clone(),
+                                    },
+                                });
+                                // Lowering continues only to accumulate independent errors;
+                                // this annotation is rejected and never reaches inference.
+                                PresenceOwnership::Universal
+                            }
                         }
                     }
                     _ => PresenceOwnership::Universal,
@@ -8619,6 +8628,7 @@ impl Builder<'_> {
                 }
             })
             .collect();
+        self.errors.extend(ownership_errors);
         Annotation {
             ty,
             variables,
