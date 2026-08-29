@@ -7695,6 +7695,24 @@ fn an_extern_publishes_its_declared_scheme_and_instantiates_at_uses() {
 }
 
 #[test]
+fn a_marked_extern_callback_keeps_its_effect_type_during_inference() {
+    let (mint, _, output) = inferred(
+        "effect Fail = { abort: () -> () }\n\
+         extern install : fn(fn(()) -> () + !Fail) -> () = host.install\n\
+         let callback = fn unit => !Fail.abort unit\n\
+         let installed = install callback",
+    );
+    assert_eq!(scheme(&mint, &output, "callback"), "() -> () + !Fail");
+    assert_eq!(scheme(&mint, &output, "installed"), "()");
+    let (_, declared) = output
+        .externs
+        .iter()
+        .find(|(symbol, _)| mint.name(**symbol) == "install")
+        .expect("the marked extern scheme is published");
+    assert_eq!(declared.to_string(), "(() -> () + !Fail) -> ()");
+}
+
+#[test]
 fn an_impossible_extern_clause_is_refused_at_the_declaration() {
     let src = "extern impossible : { x when 'x: Nat } where 'x and not 'x = host.impossible";
     let (_, out, output) = infer_src(src);

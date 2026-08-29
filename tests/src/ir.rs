@@ -4,8 +4,8 @@ use indexmap::IndexMap;
 use ruddy::{
     artifact as a, inference,
     ir::{
-        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, Field, OperationSelector,
-        Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind, build,
+        Annotation, ClauseKind, DependencyImport, Effect, ErrorKind, ExternTypeKind, Field,
+        OperationSelector, Output, PatternKind, SumCase, Term, TermKind, TypeField, TypeKind, build,
         build_with_dependencies, build_with_dependency_imports,
     },
     parse,
@@ -8382,6 +8382,74 @@ fn externs_bind_terms_without_becoming_initializer_groups() {
             })
         ));
     }
+}
+
+#[test]
+fn extern_abi_retains_resolved_arity_callback_nesting_and_effects() {
+    let (_, output) = build_src(
+        "effect Log = { write: () -> () }\n\
+         extern schedule : fn((fn(Nat, String) -> Boolean + !Log), Nat) -> fn() -> String = host.schedule",
+    );
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let external = &output.program.externs.first().unwrap().1.value;
+    let ExternTypeKind::Function {
+        parameters,
+        result,
+        ..
+    } = &external.abi.tracked
+    else {
+        panic!("outer ABI function was not retained: {:#?}", external.abi);
+    };
+    assert_eq!(parameters.len(), 2);
+    let ExternTypeKind::Group(callback) = &parameters[0].tracked else {
+        panic!("callback grouping was not retained");
+    };
+    let ExternTypeKind::Function {
+        parameters: callback_parameters,
+        effects,
+        ..
+    } = &callback.tracked
+    else {
+        panic!("marked callback was not retained");
+    };
+    assert_eq!(callback_parameters.len(), 2);
+    assert_eq!(effects.effects.len(), 1, "callback effects were not resolved");
+    assert!(matches!(
+        callback_parameters[0].tracked,
+        ExternTypeKind::Ordinary(ruddy::tracking::Tracked {
+            tracked: TypeKind::Prim(Prim::Nat),
+            ..
+        })
+    ));
+    let ExternTypeKind::Function {
+        parameters: result_parameters,
+        result: callback_result,
+        ..
+    } = &result.tracked
+    else {
+        panic!("marked result function was not retained");
+    };
+    assert!(result_parameters.is_empty(), "nullary ABI gained a host argument");
+    assert!(matches!(
+        callback_result.tracked,
+        ExternTypeKind::Ordinary(ruddy::tracking::Tracked {
+            tracked: TypeKind::Prim(Prim::String),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn invalid_names_inside_an_extern_abi_are_diagnosed_once_and_shape_is_retained() {
+    let (_, output) = build_src(
+        "extern broken : fn(Missing) -> fn() -> Other + !Absent = host.broken",
+    );
+    assert_eq!(output.errors.len(), 3, "{:#?}", output.errors);
+    let abi = &output.program.externs.first().unwrap().1.value.abi;
+    let ExternTypeKind::Function { result, .. } = &abi.tracked else {
+        panic!("outer ABI shape was lost after an error");
+    };
+    assert!(matches!(result.tracked, ExternTypeKind::Function { .. }));
 }
 
 #[test]
