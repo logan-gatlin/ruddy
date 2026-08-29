@@ -7,7 +7,7 @@
 //! malformed input. Use [`try_parse`] at trust boundaries. This is an internal
 //! v1 format, not a compatibility promise.
 
-use std::{error::Error, fmt};
+use std::{collections::HashMap, error::Error, fmt};
 
 use crate::{
     inference, ir, lir,
@@ -258,6 +258,8 @@ pub enum Formula {
     False,
     Var(u32),
     Bound(u32),
+    /// Constraint owned by the package at this preorder in the scheme body.
+    Owned(u32, Box<Formula>),
     Not(Box<Formula>),
     And(Box<Formula>, Box<Formula>),
     Or(Box<Formula>, Box<Formula>),
@@ -408,6 +410,11 @@ impl PartialEq for Formula {
                 (Formula::Var(left), Formula::Var(right))
                 | (Formula::Bound(left), Formula::Bound(right))
                     if left == right => {}
+                (Formula::Owned(left_owner, left), Formula::Owned(right_owner, right))
+                    if left_owner == right_owner =>
+                {
+                    pending.push((left, right))
+                }
                 (Formula::Not(left), Formula::Not(right)) => pending.push((left, right)),
                 (Formula::And(left_a, left_b), Formula::And(right_a, right_b))
                 | (Formula::Or(left_a, left_b), Formula::Or(right_a, right_b))
@@ -597,7 +604,8 @@ fn empty_row() -> Row {
 fn drain_type(value: &mut Type, pending: &mut Vec<SemanticOwned>) {
     match value {
         Type::Package(body) => pending.push(SemanticOwned::Type(std::mem::replace(
-            body.as_mut(), Type::Undecided,
+            body.as_mut(),
+            Type::Undecided,
         ))),
         Type::Arrow(from, to, effects) => {
             pending.push(SemanticOwned::Type(std::mem::replace(
@@ -677,6 +685,7 @@ impl Clone for Formula {
     fn clone(&self) -> Self {
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Pair(u8),
         }
@@ -689,6 +698,10 @@ impl Clone for Formula {
                 Work::Formula(Formula::False) => out.push(Formula::False),
                 Work::Formula(Formula::Var(value)) => out.push(Formula::Var(*value)),
                 Work::Formula(Formula::Bound(value)) => out.push(Formula::Bound(*value)),
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
+                }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -712,6 +725,10 @@ impl Clone for Formula {
                     work.push(Work::Pair(3));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = out.pop().expect("cloned owned formula operand");
+                    out.push(Formula::Owned(owner, Box::new(inner)));
                 }
                 Work::Not => {
                     let inner = out.pop().expect("cloned formula operand");
@@ -745,7 +762,9 @@ impl Drop for Formula {
 
 fn drain_formula(value: &mut Formula, pending: &mut Vec<Formula>) {
     match value {
-        Formula::Not(inner) => pending.push(std::mem::replace(inner.as_mut(), Formula::True)),
+        Formula::Owned(_, inner) | Formula::Not(inner) => {
+            pending.push(std::mem::replace(inner.as_mut(), Formula::True))
+        }
         Formula::And(left, right)
         | Formula::Or(left, right)
         | Formula::Iff(left, right)
@@ -1917,6 +1936,7 @@ fn ty(mint: &Mint, value: &types::Ty) -> Type {
 fn formula(value: &types::Formula) -> Formula {
     enum Work<'a> {
         Formula(&'a types::Formula),
+        Owned(u32),
         Not,
         Pair(u8),
     }
@@ -1932,6 +1952,10 @@ fn formula(value: &types::Formula) -> Formula {
             }
             Work::Formula(types::Formula::Atom(types::Atom::Bound(value))) => {
                 out.push(Formula::Bound(*value))
+            }
+            Work::Formula(types::Formula::Owned(owner, inner)) => {
+                work.push(Work::Owned(*owner));
+                work.push(Work::Formula(inner));
             }
             Work::Formula(types::Formula::Not(inner)) => {
                 work.push(Work::Not);
@@ -1956,6 +1980,10 @@ fn formula(value: &types::Formula) -> Formula {
                 work.push(Work::Pair(3));
                 work.push(Work::Formula(right));
                 work.push(Work::Formula(left));
+            }
+            Work::Owned(owner) => {
+                let inner = out.pop().expect("owned formula conversion postorder");
+                out.push(Formula::Owned(owner, Box::new(inner)));
             }
             Work::Not => {
                 let inner = out.pop().expect("formula conversion postorder");
@@ -2522,7 +2550,7 @@ pub mod text {
                 return Raw(compact_formula(value));
             }
             match formula {
-                Formula::Not(inner) => depth.push((inner, at + 1)),
+                Formula::Owned(_, inner) | Formula::Not(inner) => depth.push((inner, at + 1)),
                 Formula::And(left, right)
                 | Formula::Or(left, right)
                 | Formula::Iff(left, right)
@@ -2536,6 +2564,7 @@ pub mod text {
 
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Pair(&'static str),
         }
@@ -2550,6 +2579,10 @@ pub mod text {
                 }
                 Work::Formula(Formula::Bound(value)) => {
                     out.push(L(vec![A("bound".into()), A(value.to_string())]))
+                }
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
                 }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
@@ -2574,6 +2607,10 @@ pub mod text {
                     work.push(Work::Pair("xor"));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = out.pop().expect("owned formula text postorder");
+                    out.push(L(vec![A("owned".into()), A(owner.to_string()), inner]));
                 }
                 Work::Not => {
                     let inner = out.pop().expect("formula text postorder");
@@ -2610,6 +2647,13 @@ pub mod text {
                     out.push_str("(bound ");
                     out.push_str(&value.to_string());
                     out.push(')');
+                }
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    out.push_str("(owned ");
+                    out.push_str(&owner.to_string());
+                    out.push(' ');
+                    work.push(Work::Text(")"));
+                    work.push(Work::Formula(inner));
                 }
                 Work::Formula(Formula::Not(inner)) => {
                     out.push_str("(not ");
@@ -3416,12 +3460,92 @@ pub mod text {
             {
                 self.fail("invalid existential presence positions");
             }
+            let formula = self.read_formula(self.take(&mut value));
+            let body = self.read_ty(self.take(&mut value));
+            // Package owners are exact structural preorder positions. Validate
+            // them against the decoded body rather than guessing from arrow
+            // shape or from which existential slots happen to occur nearby.
+            let mut package_count = 0u32;
+            let mut slot_owners = HashMap::new();
+            let mut tys = vec![(&body, None)];
+            while let Some((ty, owner)) = tys.pop() {
+                match ty {
+                    Type::Package(inner) => {
+                        let here = package_count;
+                        package_count += 1;
+                        tys.push((inner, Some(here)));
+                    }
+                    Type::Arrow(from, to, row) => {
+                        for (_, field) in row.labels.iter().rev() {
+                            if let Presence::Bound(index) = field.presence
+                                && existentials.contains(&index)
+                                && let Some(owner) = owner
+                                && slot_owners
+                                    .insert(index, owner)
+                                    .is_some_and(|before| before != owner)
+                            {
+                                self.fail("existential presence crosses package owners");
+                            }
+                            tys.push((&field.ty, owner));
+                        }
+                        tys.push((to, owner));
+                        tys.push((from, owner));
+                    }
+                    Type::Struct(row) | Type::Sum(row) => {
+                        for (_, field) in row.labels.iter().rev() {
+                            if let Presence::Bound(index) = field.presence
+                                && existentials.contains(&index)
+                                && let Some(owner) = owner
+                                && slot_owners
+                                    .insert(index, owner)
+                                    .is_some_and(|before| before != owner)
+                            {
+                                self.fail("existential presence crosses package owners");
+                            }
+                            tys.push((&field.ty, owner));
+                        }
+                    }
+                    Type::Named { args, .. } => tys.extend(args.iter().rev().map(|ty| (ty, owner))),
+                    _ => {}
+                }
+            }
+            let mut formulas = vec![(&formula, None)];
+            while let Some((part, claimed)) = formulas.pop() {
+                match part {
+                    Formula::Owned(owner, inner) => {
+                        if *owner >= package_count {
+                            self.fail("formula package owner is outside scheme body");
+                        }
+                        if claimed.is_some() {
+                            self.fail("nested formula package owners are not canonical");
+                        }
+                        formulas.push((inner, Some(*owner)));
+                    }
+                    Formula::Bound(index) if claimed.is_some() => {
+                        if slot_owners.get(index) != claimed.as_ref() {
+                            self.fail("formula atom does not belong to its package owner");
+                        }
+                    }
+                    Formula::Var(_) if claimed.is_some() => {
+                        self.fail("formula package owner contains an open atom");
+                    }
+                    Formula::Not(inner) => formulas.push((inner, claimed)),
+                    Formula::And(left, right)
+                    | Formula::Or(left, right)
+                    | Formula::Iff(left, right)
+                    | Formula::Xor(left, right) => {
+                        formulas.push((right, claimed));
+                        formulas.push((left, claimed));
+                    }
+                    _ => {}
+                }
+            }
             Scheme {
                 count,
                 presences,
                 existentials,
-                formula: self.read_formula(self.take(&mut value)),
-                body: self.read_ty(self.take(&mut value)),
+                formula,
+                body,
             }
         }
         fn read_ty(&self, value: S) -> Type {
@@ -3635,6 +3759,7 @@ pub mod text {
         fn read_formula(&self, value: S) -> Formula {
             enum Task {
                 Read(S),
+                Owned(u32),
                 Not,
                 Pair(fn(Box<Formula>, Box<Formula>) -> Formula),
             }
@@ -3642,6 +3767,10 @@ pub mod text {
             let mut out = Vec::new();
             while let Some(task) = tasks.pop() {
                 match task {
+                    Task::Owned(owner) => {
+                        let value = out.pop().unwrap_or(Formula::False);
+                        out.push(Formula::Owned(owner, Box::new(value)));
+                    }
                     Task::Not => {
                         let value = out.pop().unwrap_or(Formula::False);
                         out.push(Formula::Not(Box::new(value)));
@@ -3664,6 +3793,13 @@ pub mod text {
                                 "bound" => out.push(Formula::Bound(
                                     self.number(self.exact(values, 1, "formula bound").remove(0)),
                                 )),
+                                "owned" => {
+                                    let mut values = self.exact(values, 2, "owned");
+                                    let owner = self.number(self.take(&mut values));
+                                    let value = self.take(&mut values);
+                                    tasks.push(Task::Owned(owner));
+                                    tasks.push(Task::Read(value));
+                                }
                                 "not" => {
                                     let value = self.exact(values, 1, "not").remove(0);
                                     tasks.push(Task::Not);

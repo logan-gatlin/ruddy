@@ -1659,6 +1659,7 @@ fn name_at(index: u32) -> String {
 /// call sites do not already say.
 fn prec(formula: &Formula) -> u8 {
     match formula {
+        Formula::Owned(_, inner) => prec(inner),
         Formula::Iff(..) | Formula::Xor(..) => 0,
         Formula::Or(..) => 1,
         Formula::And(..) => 2,
@@ -1694,6 +1695,9 @@ impl Named<'_> {
             match part {
                 Work::Text(text) => f.write_str(text)?,
                 Work::Close => f.write_str(")")?,
+                Work::Formula(Formula::Owned(_, inner), level) => {
+                    work.push(Work::Formula(inner, level));
+                }
                 Work::Formula(formula, level) => {
                     let parens = prec(formula) < level;
                     if parens {
@@ -1706,6 +1710,7 @@ impl Named<'_> {
                         Formula::True => f.write_str("always")?,
                         Formula::False => f.write_str("never")?,
                         Formula::Atom(atom) => f.write_str(&self.spell(*atom))?,
+                        Formula::Owned(..) => unreachable!("handled before precedence"),
                         Formula::Not(inner) => {
                             f.write_str("not ")?;
                             work.push(Work::Formula(inner, 3));

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -263,6 +263,9 @@ pub enum Formula {
     /// batches that contradict each other comes to.
     False,
     Atom(Atom),
+    /// Logically transparent constraint owned by the package at this zero-based
+    /// preorder in the enclosing scheme body.
+    Owned(u32, Rc<Formula>),
     Not(Rc<Formula>),
     And(Rc<Formula>, Rc<Formula>),
     Or(Rc<Formula>, Rc<Formula>),
@@ -1033,6 +1036,7 @@ impl Scheme {
     ) -> Self {
         debug_assert!(presences <= count);
         debug_assert!(existentials.iter().all(|index| *index < presences));
+        let formula = partition_package_formula(&body, &existentials, formula);
         Self {
             count,
             presences,
@@ -1073,7 +1077,113 @@ impl Scheme {
     }
 }
 
+/// Partition independent conjuncts by the exact package which owns all their
+/// existential atoms. Package numbers are stable structural preorder; a
+/// conjunct involving a universal or multiple owners stays scheme-wide.
+fn partition_package_formula(
+    body: &Rc<Ty>,
+    existentials: &IndexSet<u32>,
+    formula: Formula,
+) -> Formula {
+    enum Work {
+        Ty(Rc<Ty>, Option<u32>),
+        Row(Row, Option<u32>),
+    }
+    let mut slot_owners = HashMap::new();
+    let mut package_count = 0u32;
+    let mut work = vec![Work::Ty(body.clone(), None)];
+    while let Some(part) = work.pop() {
+        match part {
+            Work::Ty(ty, owner) => match &*ty {
+                Ty::Package(inner) => {
+                    let here = package_count;
+                    package_count += 1;
+                    work.push(Work::Ty(inner.clone(), Some(here)));
+                }
+                Ty::Arrow(from, to, effects) => {
+                    work.push(Work::Row(effects.clone(), owner));
+                    work.push(Work::Ty(to.clone(), owner));
+                    work.push(Work::Ty(from.clone(), owner));
+                }
+                Ty::Struct(row) | Ty::Sum(row) => work.push(Work::Row(row.clone(), owner)),
+                Ty::Named { args, .. } => {
+                    work.extend(args.iter().rev().cloned().map(|ty| Work::Ty(ty, owner)))
+                }
+                _ => {}
+            },
+            Work::Row(row, owner) => {
+                for field in row.labels.values().rev() {
+                    if let Presence::Bound(index) = field.presence
+                        && existentials.contains(&index)
+                    {
+                        let owner = owner.expect("an existential slot has a package owner");
+                        if let Some(before) = slot_owners.insert(index, owner) {
+                            debug_assert_eq!(
+                                before, owner,
+                                "existential slot crossed package owners"
+                            );
+                        }
+                    }
+                    work.push(Work::Ty(field.ty.clone(), owner));
+                }
+            }
+        }
+    }
+
+    debug_assert!(
+        existentials
+            .iter()
+            .all(|index| slot_owners.contains_key(index)),
+        "every existential slot occurs in its package"
+    );
+
+    fn owned(part: Formula, owners: &HashMap<u32, u32>, existentials: &IndexSet<u32>) -> Formula {
+        let mut atoms = Vec::new();
+        part.atoms(&mut atoms);
+        let mut selected = None;
+        for atom in atoms {
+            let Atom::Bound(index) = atom else {
+                return part;
+            };
+            if !existentials.contains(&index) {
+                return part;
+            }
+            let Some(owner) = owners.get(&index).copied() else {
+                return part;
+            };
+            if selected.is_some_and(|before| before != owner) {
+                return part;
+            }
+            selected = Some(owner);
+        }
+        match selected {
+            Some(owner) => Formula::owned(owner, part),
+            None => part,
+        }
+    }
+
+    let mut pending = vec![formula];
+    let mut parts = Vec::new();
+    while let Some(part) = pending.pop() {
+        match &part {
+            Formula::Owned(_, inner) => pending.push((**inner).clone()),
+            Formula::And(left, right) => {
+                pending.push((**right).clone());
+                pending.push((**left).clone());
+            }
+            _ => parts.push(owned(part, &slot_owners, existentials)),
+        }
+    }
+    Formula::all(parts)
+}
+
 impl Formula {
+    /// Mark a constraint with its exact package owner. Ownership is metadata;
+    /// propositional operations deliberately treat this wrapper transparently.
+    pub fn owned(owner: u32, formula: Formula) -> Self {
+        Formula::Owned(owner, Rc::new(formula))
+    }
+
     /// The formula naming one solver variable.
     pub fn var(var: TyVar) -> Self {
         Formula::Atom(Atom::Var(var))
@@ -1178,7 +1288,7 @@ impl Formula {
                         out.push(*atom);
                     }
                 }
-                Formula::Not(inner) => work.push(inner),
+                Formula::Owned(_, inner) | Formula::Not(inner) => work.push(inner),
                 Formula::And(left, right)
                 | Formula::Or(left, right)
                 | Formula::Iff(left, right)
@@ -1205,6 +1315,7 @@ impl Formula {
                 Work::Formula(Formula::True) => values.push(true),
                 Work::Formula(Formula::False) => values.push(false),
                 Work::Formula(Formula::Atom(atom)) => values.push(assign(*atom)),
+                Work::Formula(Formula::Owned(_, inner)) => work.push(Work::Formula(inner)),
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -1258,6 +1369,7 @@ impl Formula {
     pub fn substitute(&self, of: &dyn Fn(Atom) -> Formula) -> Self {
         enum Work<'a> {
             Formula(&'a Formula),
+            Owned(u32),
             Not,
             Binary(u8),
         }
@@ -1269,6 +1381,10 @@ impl Formula {
                 Work::Formula(Formula::True) => values.push(Formula::True),
                 Work::Formula(Formula::False) => values.push(Formula::False),
                 Work::Formula(Formula::Atom(atom)) => values.push(of(*atom)),
+                Work::Formula(Formula::Owned(owner, inner)) => {
+                    work.push(Work::Owned(*owner));
+                    work.push(Work::Formula(inner));
+                }
                 Work::Formula(Formula::Not(inner)) => {
                     work.push(Work::Not);
                     work.push(Work::Formula(inner));
@@ -1292,6 +1408,10 @@ impl Formula {
                     work.push(Work::Binary(3));
                     work.push(Work::Formula(right));
                     work.push(Work::Formula(left));
+                }
+                Work::Owned(owner) => {
+                    let inner = values.pop().expect("a visited owned formula value");
+                    values.push(Formula::owned(owner, inner));
                 }
                 Work::Not => {
                     let inner = values.pop().expect("a visited formula value");
@@ -1349,7 +1469,7 @@ impl Drop for Formula {
     fn drop(&mut self) {
         fn take_children(formula: &mut Formula, pending: &mut Vec<Rc<Formula>>) {
             match formula {
-                Formula::Not(inner) => {
+                Formula::Owned(_, inner) | Formula::Not(inner) => {
                     pending.push(std::mem::replace(inner, Rc::new(Formula::True)));
                 }
                 Formula::And(left, right)
