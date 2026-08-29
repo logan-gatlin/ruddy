@@ -404,9 +404,12 @@ fn existential_presence_ownership_round_trips_and_is_validated() {
     })));
     scheme.formula = Formula::Owned(
         0,
-        Box::new(Formula::Or(
-            Box::new(Formula::Bound(0)),
-            Box::new(Formula::Bound(3)),
+        Box::new(Formula::Iff(
+            Box::new(Formula::Bound(1)), // a universal in this scheme
+            Box::new(Formula::Or(
+                Box::new(Formula::Bound(0)),
+                Box::new(Formula::Bound(3)),
+            )),
         )),
     );
     let printed = assert_round_trip(&artifact);
@@ -416,6 +419,7 @@ fn existential_presence_ownership_round_trips_and_is_validated() {
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 0)", 1));
     assert_malformed(&printed.replacen("(existentials 0 3)", "(existentials 0 7)", 1));
     assert_malformed(&printed.replacen("(owned 0", "(owned 1", 1));
+    assert_malformed(&printed.replacen("(bound 1)", "(bound 7)", 1));
     assert_malformed(&printed.replacen("(owned 0", "", 1).replacen(")", "", 1));
     // Presence positions share the scheme's quantifier space; accepting more
     // presence slots than total slots would let malformed bounds pass all
@@ -591,6 +595,32 @@ fn nested_existential_result_boundaries_survive_artifact_text() {
         error.message(),
         "formula package owner is outside scheme body"
     );
+}
+
+#[test]
+fn mixed_universal_input_to_existential_result_guarantee_round_trips() {
+    let artifact = built(
+        "extern relate: { input when 'u: Nat } ->\n\
+         { result when 'e: Nat } where 'u = 'e = host.relate\n",
+    );
+    let value = artifact
+        .header
+        .values
+        .iter()
+        .find(|value| value.name.ends_with("::relate"))
+        .expect("the extern is published");
+    assert_eq!(value.scheme.existentials.len(), 1);
+    assert!(
+        matches!(
+            value.scheme.formula,
+            Formula::Owned(0, ref inner) if matches!(&**inner, Formula::Iff(..))
+        ),
+        "the indivisible mixed guarantee belongs to its result package: {:#?}",
+        value.scheme.formula
+    );
+
+    let printed = assert_round_trip(&artifact);
+    assert!(printed.contains("(owned 0 (iff"), "{printed}");
 }
 
 #[test]

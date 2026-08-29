@@ -1030,10 +1030,12 @@ struct Table {
     /// its existential slots would let one match refinement leak or disappear
     /// between projections of the same value.
     local_package_instances: HashMap<(Symbol, u32), Presence>,
-    /// Guarantees are inert until their exact package node is destroyed. The
-    /// key is the instantiated package allocation, not a scheme-global owner
-    /// number, so unrelated instances cannot activate or refine one another.
-    package_guarantees: HashMap<usize, PackageGuarantee>,
+    /// Guarantees are inert until their exact package is destroyed. The key is
+    /// the package's producer-owned presence identities: scheme instantiation
+    /// mints these afresh, while cloning and substitution preserve them. Unlike
+    /// an `Rc` address this cannot alias after an allocation is released, and
+    /// the whole map dies with this inference table.
+    package_guarantees: HashMap<Vec<TyVar>, PackageGuarantee>,
     /// What the program has required of its presences so far. Grown by
     /// generation (a match's coverage), by instantiation (a constrained
     /// scheme's formula) and by lowering (an annotation's `where` clause), and
@@ -3131,7 +3133,11 @@ impl Table {
             match part {
                 Work::Ty(ty, root) => match &*ty {
                     Ty::Package(body) => {
-                        packages.push((Rc::as_ptr(&ty) as usize, !root));
+                        let key: Vec<_> =
+                            collect_owned_existentials(body, &self.abstract_existentials)
+                                .into_iter()
+                                .collect();
+                        packages.push((key, !root));
                         work.push(Work::Ty(body.clone(), false));
                     }
                     Ty::Arrow(from, to, effects) => {
@@ -3164,7 +3170,7 @@ impl Table {
         // result still has to alpha-rename its hidden witnesses on every call.
         for (key, fresh) in &packages {
             self.package_guarantees
-                .entry(*key)
+                .entry(key.clone())
                 .or_insert(PackageGuarantee {
                     formula: Formula::True,
                     fresh: *fresh,
@@ -3180,15 +3186,15 @@ impl Table {
                     pending.push((**left).clone());
                 }
                 Formula::Owned(owner, inner) => {
-                    if let Some((key, fresh)) = packages.get(*owner as usize).copied() {
+                    if let Some((key, fresh)) = packages.get(*owner as usize) {
                         self.package_guarantees
-                            .entry(key)
+                            .entry(key.clone())
                             .and_modify(|before| {
                                 before.formula = before.formula.clone().and((**inner).clone())
                             })
                             .or_insert(PackageGuarantee {
                                 formula: (**inner).clone(),
-                                fresh,
+                                fresh: *fresh,
                             });
                     }
                 }
@@ -3206,7 +3212,9 @@ impl Table {
         let Ty::Package(body) = &**package else {
             return package.clone();
         };
-        let key = Rc::as_ptr(package) as usize;
+        let key: Vec<_> = collect_owned_existentials(body, &self.abstract_existentials)
+            .into_iter()
+            .collect();
         let guarantee = self.package_guarantees.get(&key).cloned();
         let mut renames = HashMap::new();
         if guarantee.as_ref().is_some_and(|guarantee| guarantee.fresh) {

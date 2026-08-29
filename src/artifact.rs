@@ -3540,10 +3540,11 @@ pub mod text {
             }
 
             // `Owned` is a canonical wrapper around one top-level conjunct.
-            // An independently package-owned conjunct must have the wrapper;
-            // mixed/universal conjuncts must not. This rejects metadata that is
-            // locally plausible but incomplete, which would otherwise change
-            // meaning when the scheme is opened one package at a time.
+            // Its owner is determined by the existential atoms it mentions;
+            // universal atoms may occur in the same indivisible proposition and
+            // remain scoped by this scheme. This rejects incomplete metadata
+            // without rejecting an input-to-result guarantee that necessarily
+            // relates a universal input to a package-owned result.
             let mut conjuncts = vec![&formula];
             while let Some(part) = conjuncts.pop() {
                 if let Formula::And(left, right) = part {
@@ -3590,15 +3591,23 @@ pub mod text {
                         Formula::True | Formula::False | Formula::Var(_) => {}
                     }
                 }
-                let inferred = atoms.first().and_then(|first| {
-                    let owner = slot_owners.get(first).copied()?;
-                    atoms
-                        .iter()
-                        .all(|index| {
-                            existentials.contains(index) && slot_owners.get(index) == Some(&owner)
-                        })
-                        .then_some(owner)
-                });
+                let mut inferred = None;
+                for index in atoms
+                    .iter()
+                    .copied()
+                    .filter(|index| existentials.contains(index))
+                {
+                    let owner = slot_owners.get(&index).copied();
+                    match (inferred, owner) {
+                        (None, owner) => inferred = owner,
+                        (Some(before), Some(owner)) if before == owner => {}
+                        _ => {
+                            self.fail("formula existential atoms cross package owners");
+                            inferred = None;
+                            break;
+                        }
+                    }
+                }
                 if claimed != inferred {
                     self.fail("formula package ownership is incomplete or non-canonical");
                 }
