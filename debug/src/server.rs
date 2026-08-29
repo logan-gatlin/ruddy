@@ -253,6 +253,7 @@ fn document(
                 body.version.as_deref().unwrap_or("0.1.0"),
                 &body.root,
                 &body.run,
+                &body.std,
                 &body.dependencies,
                 &files,
             ) {

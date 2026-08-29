@@ -9951,6 +9951,7 @@ fn deeply_nested_imported_semantics_are_preserved_on_a_small_stack() {
                 js: None,
                 js_error: None,
                 js_panicked: false,
+                standard_library: &ruddy_debug::wire::StdConfig::Disabled,
                 dependency_declarations: &dependency_declarations,
                 dependency_aliases: &[],
                 dependencies: &[],

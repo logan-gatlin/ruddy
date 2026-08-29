@@ -33,6 +33,9 @@ const state = {
   /// Runtime configuration is not used by snapshots, but is preserved when
   /// debugger documents are loaded and saved.
   run: {},
+  /// Standard library: null uses the installed default, false disables it,
+  /// and a dependency specification selects a custom source.
+  std: null,
   /// Dependency project specs keyed by source module alias.
   dependencies: {},
   /// Which of them is on screen. The editor holds one file at a time; the
@@ -266,6 +269,7 @@ async function openDoc(name) {
   state.version = configured?.version ?? "0.1.0";
   state.root = configured?.root ?? ROOT;
   state.run = configured?.run ?? {};
+  state.std = configured?.std ?? null;
   state.dependencies = configured?.dependencies ?? {};
   state.snapshot = null;
   state.active = 0;
@@ -315,6 +319,7 @@ function sameDocumentConfiguration(cache, server, documentName) {
     (cache.version ?? "0.1.0") === (server.version ?? "0.1.0") &&
     (cache.root ?? ROOT) === (server.root ?? ROOT) &&
     JSON.stringify(cache.run ?? {}) === JSON.stringify(server.run ?? {}) &&
+    JSON.stringify(cache.std ?? null) === JSON.stringify(server.std ?? null) &&
     sameFiles(cache.files ?? [], server.files ?? []) &&
     JSON.stringify(cacheDependencies) === JSON.stringify(serverDependencies)
   );
@@ -337,6 +342,7 @@ function cacheLocally() {
           version: state.version,
           root: state.root,
           run: state.run,
+          std: state.std,
           dependencies: state.dependencies,
           at,
         }),
@@ -372,6 +378,7 @@ async function saveNow() {
         version: state.version,
         root: state.root,
         run: state.run,
+        ...(state.std === null ? {} : { std: state.std }),
         dependencies: state.dependencies,
         files: state.files,
       }),
@@ -408,6 +415,7 @@ async function compileNow() {
         root: state.root,
         document: state.doc,
         files: state.files,
+        ...(state.std === null ? {} : { std: state.std }),
         dependencies: state.dependencies,
         revision,
       }),
@@ -562,6 +570,30 @@ function wireTitlebar() {
     scheduleCompile();
     renderTitlebar();
   });
+  el("std").addEventListener("click", () => {
+    const current = state.std === null
+      ? "default"
+      : state.std === false
+        ? "off"
+        : printDependency("std", state.std)
+            .slice("std".length)
+            .replace(/^=/, "");
+    const entered = window.prompt("Standard library (default, off, folder, @bundle=folder, or https://url#branch=name)", current);
+    if (entered === null) return;
+    const value = entered.trim();
+    try {
+      if (!value || value === "default") state.std = null;
+      else if (value === "off" || value === "false") state.std = false;
+      else state.std = parseDependencies(value.startsWith("@") ? `std${value}` : `std=${value}`).std;
+    } catch (error) {
+      window.alert(error.message);
+      return;
+    }
+    cacheLocally();
+    scheduleSave();
+    scheduleCompile();
+    renderTitlebar();
+  });
   el("dependencies").addEventListener("click", () => {
     const current = Object.entries(state.dependencies).map(([alias, specification]) => printDependency(alias, specification)).join(", ");
     const entered = window.prompt("Dependencies (alias=folder or alias=https://url#branch=name; @bundle aliases, comma-separated)", current);
@@ -587,6 +619,11 @@ function renderTitlebar() {
   el("bundle").textContent = `${state.name}@${state.version}`;
   el("bundle").classList.toggle("none", state.snapshot && !state.snapshot.bundle);
   el("root").textContent = state.root;
+  el("std").textContent = state.std === null
+    ? "std: default"
+    : state.std === false
+      ? "std: off"
+      : "std: custom";
 
   const dependencies = el("dependencies");
   const dependencyCount = Object.keys(state.dependencies).length;

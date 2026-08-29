@@ -9,7 +9,7 @@ use ruddy_debug::{
     stage::REGISTRY,
     wire::{
         CompileRequest, DependencyDetail, DependencySpec, FileSpec, Loc, Node, Snapshot, Stage,
-        Status, View,
+        Status, StdConfig, View,
     },
 };
 
@@ -50,6 +50,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            std: StdConfig::Disabled,
             dependencies: IndexMap::new(),
             revision: 3,
         },
@@ -80,6 +81,8 @@ fn compile_requests_without_dependencies_remain_compatible() {
         serde_json::from_str(r#"{"files":[{"path":"main.hc","source":""}],"revision":4}"#).unwrap();
     assert_eq!(request.name, "demo");
     assert_eq!(request.version, "0.1.0");
+    assert_eq!(request.std, StdConfig::Default);
+    assert!(!serde_json::to_string(&request).unwrap().contains("\"std\""));
     assert!(request.dependencies.is_empty());
     assert_eq!(request.revision, 4);
 
@@ -106,6 +109,21 @@ fn compile_requests_without_dependencies_remain_compatible() {
                 && detail.branch.as_deref() == Some("next")
     ));
 
+    let disabled: CompileRequest = serde_json::from_str(r#"{"files":[],"std":false}"#).unwrap();
+    assert_eq!(disabled.std, StdConfig::Disabled);
+    let custom: CompileRequest =
+        serde_json::from_str(r#"{"files":[],"std":"../std-next"}"#).unwrap();
+    assert_eq!(
+        custom.std,
+        StdConfig::Dependency(DependencySpec::from("../std-next"))
+    );
+    assert!(
+        serde_json::from_str::<CompileRequest>(r#"{"files":[],"std":true}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("std = true")
+    );
+
     let old = serde_json::from_str::<CompileRequest>(
         r#"{"files":[],"dependencies":{"http_core":{"package":"http-core","path":"../http-core"}}}"#,
     )
@@ -127,6 +145,7 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
                 path: ROOT.to_string(),
                 source: compiled("let main = 0n\n"),
             }],
+            std: StdConfig::Disabled,
             dependencies,
             revision: 9,
         },
@@ -155,6 +174,139 @@ fn dependency_paths_without_a_scratch_root_are_recoverable() {
 }
 
 #[test]
+fn custom_standard_library_is_source_visible_rendered_and_sandboxed() {
+    let outer = tempfile::tempdir().unwrap();
+    let scratch = outer.path().join("scratch");
+    let app = scratch.join("app");
+    let standard = scratch.join("std-next");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&standard).unwrap();
+    fs::write(standard.join("main.hc"), "let answer = 42n\n").unwrap();
+    fs::write(
+        standard.join("Ruddy.toml"),
+        "name = \"std\"\nversion = \"2.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+    )
+    .unwrap();
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::answer\n".into(),
+        }],
+        std: StdConfig::Dependency(DependencySpec::from("../std-next")),
+        dependencies: IndexMap::new(),
+        revision: 1,
+    };
+    let built = compile_at(&request, 1, &scratch);
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    let stage = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .unwrap();
+    assert_eq!(stage.summary, "1 declared · 1 built");
+    assert_eq!(stage.nodes[0].children[0].text, "std@2.0.0");
+    assert!(
+        stage.nodes[0].children[0]
+            .fields
+            .iter()
+            .any(|field| field.name == "source" && field.value == "path ../std-next")
+    );
+
+    let outside = outer.path().join("outside-std");
+    fs::rename(&standard, &outside).unwrap();
+    let escaped = CompileRequest {
+        std: StdConfig::Dependency(DependencySpec::from("../../outside-std")),
+        ..request
+    };
+    let failed = compile_at(&escaped, 2, &scratch);
+    assert!(failed.diagnostics.iter().any(|diagnostic| {
+        diagnostic.stage == "dependencies" && diagnostic.message.contains("escapes sandbox")
+    }));
+}
+
+#[test]
+fn installed_standard_library_is_the_only_trusted_external_local_root() {
+    let outer = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "snapshot::installed_standard_library_child",
+        ])
+        .env("RUDDY_HOME", outer.path().join("home"))
+        .env("RUDDY_TEST_STD_SCRATCH", outer.path().join("scratch"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with a dedicated installed standard library"]
+fn installed_standard_library_child() {
+    let home = std::path::PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap());
+    let scratch = std::path::PathBuf::from(std::env::var_os("RUDDY_TEST_STD_SCRATCH").unwrap());
+    let app = scratch.join("app");
+    let standard = home.join("std");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&standard).unwrap();
+    fs::write(standard.join("main.hc"), "let installed = 1n\n").unwrap();
+    fs::write(
+        standard.join("Ruddy.toml"),
+        "name = \"std\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+    )
+    .unwrap();
+    let request = CompileRequest {
+        name: "app".into(),
+        version: "1.0.0".into(),
+        root: ROOT.into(),
+        document: "app".into(),
+        files: vec![FileSpec {
+            path: ROOT.into(),
+            source: "let main = std::installed\n".into(),
+        }],
+        std: StdConfig::Default,
+        dependencies: IndexMap::new(),
+        revision: 1,
+    };
+    let built = compile_at(&request, 1, &scratch);
+    assert!(built.diagnostics.is_empty(), "{:#?}", built.diagnostics);
+    let dependencies = built
+        .stages
+        .iter()
+        .find(|stage| stage.id == "dependencies")
+        .unwrap();
+    assert_eq!(dependencies.nodes[0].children[0].text, "std@0.1.0");
+    assert!(
+        dependencies.nodes[0].children[0]
+            .fields
+            .iter()
+            .any(|field| field.name == "source" && field.value == "installed default")
+    );
+
+    // Trust is attached to the Default setting, not merely to the path: the
+    // same external tree named as a custom dependency remains sandboxed.
+    let custom = CompileRequest {
+        std: StdConfig::Dependency(DependencySpec::Path(standard)),
+        ..request
+    };
+    let rejected = compile_at(&custom, 2, &scratch);
+    assert!(rejected.diagnostics.iter().any(|diagnostic| {
+        diagnostic.stage == "dependencies"
+            && (diagnostic.message.contains("absolute dependency paths")
+                || diagnostic.message.contains("escapes sandbox"))
+    }));
+}
+
+#[test]
 fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     let scratch = tempfile::tempdir().unwrap();
     let app = scratch.path().join("app");
@@ -164,7 +316,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
     fs::write(
         base.join("Ruddy.toml"),
-        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"base\"\nversion = \"2.3.4\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     let mut dependencies = IndexMap::new();
@@ -178,6 +330,7 @@ fn saved_dependency_projects_supply_artifact_identity_and_gate_lir() {
             path: ROOT.to_string(),
             source: "let app = base::base\n".to_string(),
         }],
+        std: StdConfig::Disabled,
         dependencies,
         revision: 1,
     };
@@ -259,7 +412,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
         fs::write(
             path.join("Ruddy.toml"),
             format!(
-                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\n[dependencies]\n"
+                "name = \"lib\"\nversion = \"{version}\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n"
             ),
         )
         .unwrap();
@@ -288,6 +441,7 @@ fn dependencies_tab_correlates_same_bundle_versions_by_request_alias() {
             path: ROOT.into(),
             source: "let old_one = old::one\nlet new_two = new::two\n".into(),
         }],
+        std: StdConfig::Disabled,
         dependencies,
         revision: 1,
     };
@@ -329,13 +483,13 @@ fn transitive_detailed_dependency_manifests_are_validated_and_compiled() {
     }
     fs::write(
         scratch.path().join("shared/Ruddy.toml"),
-        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"shared-package\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(scratch.path().join("shared/main.hc"), "let value = 1n\n").unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies.shared]\nbundle = \"shared-package\"\npath = \"../shared\"\n",
     )
     .unwrap();
     fs::write(
@@ -376,7 +530,7 @@ fn failed_graph_validation_is_reported_for_the_dependency_build() {
     fs::create_dir_all(scratch.path().join("base")).unwrap();
     fs::write(
         scratch.path().join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\nmissing = \"../../outside\"\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\nmissing = \"../../outside\"\n",
     )
     .unwrap();
     fs::write(scratch.path().join("base/main.hc"), "let base = 0n\n").unwrap();
@@ -411,7 +565,7 @@ fn dependency_roots_cannot_be_absolute_or_escape_the_scratch_folder() {
     ] {
         fs::write(
             scratch.join("base/Ruddy.toml"),
-            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\n[dependencies]\n"),
+            format!("name = \"base\"\nversion = \"1.0.0\"\nroot = {root:?}\nstd = false\n[dependencies]\n"),
         )
         .unwrap();
         let snapshot = compile_at(
@@ -439,7 +593,8 @@ fn symlinked_dependency_manifests_are_confined_to_the_scratch_folder() {
     fs::create_dir_all(scratch.join("app")).unwrap();
     fs::create_dir_all(&base).unwrap();
     fs::write(base.join("main.hc"), "let base = 0n\n").unwrap();
-    let manifest = "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n";
+    let manifest =
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n";
     let outside = outer.path().join("outside.toml");
     fs::write(&outside, manifest).unwrap();
     std::os::unix::fs::symlink(&outside, base.join("Ruddy.toml")).unwrap();
@@ -484,7 +639,7 @@ fn symlinked_dependency_modules_cannot_escape_the_scratch_folder() {
     fs::create_dir_all(scratch.join("base")).unwrap();
     fs::write(
         scratch.join("base/Ruddy.toml"),
-        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+        "name = \"base\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
     )
     .unwrap();
     fs::write(scratch.join("base/main.hc"), "module Escape\n").unwrap();
@@ -519,7 +674,7 @@ fn types_stage_walks_deep_imported_aliases_on_a_small_stack() {
             fs::create_dir_all(scratch.path().join("dep")).unwrap();
             fs::write(
                 scratch.path().join("dep/Ruddy.toml"),
-                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+                "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
             )
             .unwrap();
             let mut source = String::new();
@@ -573,6 +728,7 @@ fn dependency_request(dependencies: IndexMap<String, String>) -> CompileRequest 
             path: ROOT.to_string(),
             source: "let app = 0n\n".to_string(),
         }],
+        std: StdConfig::Disabled,
         dependencies,
         revision: 1,
     }
@@ -1612,6 +1768,7 @@ fn a_bad_bundle_is_reported_rather_than_fatal() {
                     path: ROOT.to_string(),
                     source: "let x = ()".to_string(),
                 }],
+                std: StdConfig::Disabled,
                 dependencies: IndexMap::new(),
                 revision: 3,
             },

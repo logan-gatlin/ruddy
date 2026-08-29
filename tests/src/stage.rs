@@ -935,6 +935,7 @@ fn artifact_stage_renders_one_dependency() {
         js: None,
         js_error: None,
         js_panicked: false,
+        standard_library: &ruddy_debug::wire::StdConfig::Disabled,
         dependency_declarations: &declarations,
         dependency_aliases: &["base".to_string()],
         dependencies: &artifact.header.dependencies,
@@ -1368,6 +1369,7 @@ fn bundle(files: &[(&str, &str)]) -> Snapshot {
                     source: (*source).to_string(),
                 })
                 .collect(),
+            std: ruddy_debug::wire::StdConfig::Disabled,
             dependencies: IndexMap::new(),
             revision: 0,
         },

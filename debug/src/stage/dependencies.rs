@@ -2,7 +2,7 @@
 
 use crate::{
     stage::{Cx, Ids, Spec},
-    wire::{DependencySpec, Node, Stage, Status},
+    wire::{DependencySpec, Node, Stage, Status, StdConfig},
 };
 
 fn source(specification: &DependencySpec) -> String {
@@ -27,51 +27,84 @@ fn source(specification: &DependencySpec) -> String {
     }
 }
 
+fn project(
+    ids: &mut Ids,
+    cx: &Cx,
+    alias: &str,
+    source_text: String,
+    declared_path: Option<String>,
+) -> Node {
+    // The three slices are produced in preserved direct-request order. Alias
+    // position, unlike bundle name, distinguishes different requested roots.
+    let position = cx
+        .dependency_aliases
+        .iter()
+        .position(|resolved| resolved == alias);
+    let built = position.and_then(|index| cx.dependencies.get(index));
+    let interface = position.and_then(|index| cx.dependency_interfaces.get(index));
+    let mut node = Node::new(
+        ids.next(),
+        "project",
+        built.map_or_else(
+            || alias.to_string(),
+            |dependency| format!("{}@{}", dependency.name, dependency.version),
+        ),
+    )
+    .field("source alias", alias)
+    .field("source", source_text)
+    .field("status", if built.is_some() { "built" } else { "failed" })
+    .field(
+        "artifact",
+        if built.is_some() { "in memory" } else { "none" },
+    );
+    if let Some(path) = declared_path {
+        node = node.field("declared path", path);
+    }
+    if let Some(interface) = interface {
+        node = node
+            .field("imported values", interface.header.values.len().to_string())
+            .field("imported types", interface.header.types.len().to_string())
+            .field(
+                "imported effects",
+                interface.header.effects.len().to_string(),
+            );
+    }
+    node
+}
+
 pub fn build(spec: &Spec, cx: &Cx) -> Stage {
     let mut ids = Ids::default();
-    let children: Vec<Node> = cx
-        .dependency_declarations
-        .iter()
-        .map(|(alias, specification)| {
-            // The three slices are produced in preserved direct-request order.
-            // Alias position, unlike bundle name, distinguishes two requests
-            // for different versions of the same bundle.
-            let position = cx
-                .dependency_aliases
-                .iter()
-                .position(|resolved| resolved == alias);
-            let built = position.and_then(|index| cx.dependencies.get(index));
-            let interface = position.and_then(|index| cx.dependency_interfaces.get(index));
-            let mut node = Node::new(
-                ids.next(),
-                "project",
-                built.map_or_else(
-                    || alias.clone(),
-                    |dependency| format!("{}@{}", dependency.name, dependency.version),
-                ),
-            )
-            .field("source alias", alias)
-            .field("source", source(specification))
-            .field("status", if built.is_some() { "built" } else { "failed" })
-            .field(
-                "artifact",
-                if built.is_some() { "in memory" } else { "none" },
-            );
-            if let Some(path) = specification.path() {
-                node = node.field("declared path", path.display().to_string());
-            }
-            if let Some(interface) = interface {
-                node = node
-                    .field("imported values", interface.header.values.len().to_string())
-                    .field("imported types", interface.header.types.len().to_string())
-                    .field(
-                        "imported effects",
-                        interface.header.effects.len().to_string(),
-                    );
-            }
-            node
-        })
-        .collect();
+    let mut children = Vec::new();
+    match cx.standard_library {
+        StdConfig::Default => children.push(project(
+            &mut ids,
+            cx,
+            "std",
+            "installed default".to_string(),
+            None,
+        )),
+        StdConfig::Disabled => {}
+        StdConfig::Dependency(specification) => children.push(project(
+            &mut ids,
+            cx,
+            "std",
+            source(specification),
+            specification.path().map(|path| path.display().to_string()),
+        )),
+    }
+    children.extend(
+        cx.dependency_declarations
+            .iter()
+            .map(|(alias, specification)| {
+                project(
+                    &mut ids,
+                    cx,
+                    alias,
+                    source(specification),
+                    specification.path().map(|path| path.display().to_string()),
+                )
+            }),
+    );
     let root = Node::new(ids.next(), "active project", "browser source")
         .field(
             "status",
@@ -93,7 +126,7 @@ pub fn build(spec: &Spec, cx: &Cx) -> Stage {
             },
             format!(
                 "{} declared · {} built",
-                cx.dependency_declarations.len(),
+                cx.dependency_declarations.len() + usize::from(!cx.standard_library.is_disabled()),
                 cx.dependencies.len()
             ),
         )

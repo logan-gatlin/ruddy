@@ -60,6 +60,8 @@ pub struct Cx<'a> {
     pub js_error: Option<&'a str>,
     /// JavaScript generation ran but panicked, rather than being skipped.
     pub js_panicked: bool,
+    /// Automatic standard-library configuration for the active project.
+    pub standard_library: &'a crate::wire::StdConfig,
     /// Direct dependency artifacts successfully resolved for the active project.
     pub dependency_declarations: &'a indexmap::IndexMap<String, crate::wire::DependencySpec>,
     /// Aliases for successfully resolved direct dependencies, in request order.
