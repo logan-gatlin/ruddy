@@ -66,6 +66,241 @@ fn shared_std_configuration_accepts_only_false_or_dependency_syntax() {
 }
 
 #[test]
+fn std_manifest_forms_are_strict_and_contextual() {
+    let directory = project();
+    for (setting, expected) in [
+        ("1", "invalid type"),
+        ("[]", "invalid type"),
+        ("{}", "either `path` or `git`"),
+        (
+            "{ path = \"std\", git = \"https://example.test/std\" }",
+            "both `path` and `git`",
+        ),
+        (
+            "{ path = \"std\", unknown = true }",
+            "unknown field `unknown`",
+        ),
+        ("{ path = \"std\", bundle = 1 }", "invalid type"),
+    ] {
+        fs::write(
+            directory.path().join("Ruddy.toml"),
+            format!(
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = {setting}\n[dependencies]\n"
+            ),
+        )
+        .unwrap();
+        let found = error(&directory);
+        assert!(found.contains(expected), "`{expected}` in:\n{found}");
+        assert!(!directory.path().join("Ruddy.lock").exists());
+    }
+}
+
+#[test]
+fn automatic_std_environment_behavior_is_isolated() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("home");
+
+    for mode in ["default", "custom", "disabled"] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "cli::automatic_std_environment_child",
+            ])
+            .env("RUDDY_TEST_STD_MODE", mode)
+            .env("RUDDY_TEST_STD_ROOT", parent.path())
+            .env_remove("HOME")
+            .env_remove("RUDDY_HOME");
+        if mode == "default" {
+            command.env("HOME", &home);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{mode} child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "run in isolation with controlled standard-library environment variables"]
+fn automatic_std_environment_child() {
+    let mode = std::env::var("RUDDY_TEST_STD_MODE").unwrap();
+    let root = PathBuf::from(std::env::var_os("RUDDY_TEST_STD_ROOT").unwrap()).join(&mode);
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("main.hc"), "let main = 0n\n").unwrap();
+
+    match mode.as_str() {
+        "default" => {
+            let standard = ruddy_cli::ruddy_home().unwrap().join("std");
+            write_project(&standard, "std", "1.0.0", &[]);
+            fs::write(
+                root.join("Ruddy.toml"),
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+            )
+            .unwrap();
+
+            let graph = ruddy_cli::compile_graph(&root).unwrap();
+            assert_eq!(
+                graph
+                    .projects
+                    .iter()
+                    .map(|project| project.artifact.header.identity.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["std", "app"]
+            );
+            let artifact = build_project(&root).unwrap();
+            assert_eq!(artifact, root.join("build/app.artifact"));
+            assert!(!standard.join("build").exists());
+
+            fs::remove_file(standard.join("Ruddy.toml")).unwrap();
+            let found = compile(&root).unwrap_err().to_string();
+            assert!(
+                found.contains("help: install the Ruddy standard library"),
+                "{found}"
+            );
+            assert!(found.contains("configure `std`"), "{found}");
+            assert!(found.contains("`std = false`"), "{found}");
+        }
+        "custom" => {
+            write_project(&root.join("standard"), "std", "2.0.0", &[]);
+            fs::write(
+                root.join("Ruddy.toml"),
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"standard\"\n[dependencies]\n",
+            )
+            .unwrap();
+            assert_eq!(compile(&root).unwrap().header.identity.name, "app");
+        }
+        "disabled" => {
+            fs::write(
+                root.join("Ruddy.toml"),
+                "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+            )
+            .unwrap();
+            assert_eq!(compile(&root).unwrap().header.identity.name, "app");
+        }
+        _ => panic!("unexpected mode {mode}"),
+    }
+}
+
+#[test]
+fn automatic_std_is_independent_transitive_deduplicated_and_cycle_checked() {
+    let parent = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "cli::automatic_std_graph_child"])
+        .env("RUDDY_TEST_STD_ROOT", parent.path())
+        .env("RUDDY_HOME", parent.path().join("ruddy-home"))
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "run in isolation with a dedicated default standard library"]
+fn automatic_std_graph_child() {
+    let root = PathBuf::from(std::env::var_os("RUDDY_TEST_STD_ROOT").unwrap());
+    let standard = PathBuf::from(std::env::var_os("RUDDY_HOME").unwrap()).join("std");
+    write_project(&standard, "std", "1.0.0", &[]);
+
+    let dedup = root.join("dedup");
+    write_project(&dedup.join("dep"), "dep", "1.0.0", &[]);
+    fs::write(
+        dedup.join("dep/Ruddy.toml"),
+        "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::create_dir_all(&dedup).unwrap();
+    fs::write(dedup.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(
+        dedup.join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\ndep = \"dep\"\n",
+    )
+    .unwrap();
+    let graph = ruddy_cli::compile_graph(&dedup).unwrap();
+    assert_eq!(
+        graph
+            .projects
+            .iter()
+            .map(|project| project.artifact.header.identity.name.as_str())
+            .collect::<Vec<_>>(),
+        ["std", "dep", "app"]
+    );
+    assert_eq!(
+        graph.projects[1].artifact.header.dependencies[0].name,
+        "std"
+    );
+    assert_eq!(
+        graph.projects[2]
+            .artifact
+            .header
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.name.as_str())
+            .collect::<Vec<_>>(),
+        ["std", "dep"]
+    );
+
+    let versions = root.join("versions");
+    write_project(&versions.join("std2"), "std", "2.0.0", &[]);
+    write_project(&versions.join("dep"), "dep", "1.0.0", &[]);
+    fs::write(
+        versions.join("dep/Ruddy.toml"),
+        "name = \"dep\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = \"../std2\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(versions.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(
+        versions.join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\ndep = \"dep\"\n",
+    )
+    .unwrap();
+    let graph = ruddy_cli::compile_graph(&versions).unwrap();
+    let std_versions = graph
+        .projects
+        .iter()
+        .filter(|project| project.artifact.header.identity.name == "std")
+        .map(|project| project.artifact.header.identity.version.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(std_versions, ["1.0.0", "2.0.0"]);
+
+    fs::write(
+        versions.join("std2/Ruddy.toml"),
+        "name = \"std\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\n",
+    )
+    .unwrap();
+    let found = compile(&versions).unwrap_err().to_string();
+    assert!(found.contains("both declare bundle std@1.0.0"), "{found}");
+
+    let cycle = root.join("cycle");
+    fs::create_dir_all(&cycle).unwrap();
+    fs::write(cycle.join("main.hc"), "let main = 0n\n").unwrap();
+    fs::write(
+        cycle.join("Ruddy.toml"),
+        "name = \"app\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\n[dependencies]\n",
+    )
+    .unwrap();
+    fs::write(
+        standard.join("Ruddy.toml"),
+        format!(
+            "name = \"std\"\nversion = \"1.0.0\"\nroot = \"main.hc\"\nstd = false\n[dependencies]\napp = {{ path = {:?} }}\n",
+            cycle
+        ),
+    )
+    .unwrap();
+    let found = compile(&cycle).unwrap_err().to_string();
+    assert!(found.contains("dependency cycle"), "{found}");
+}
+
+#[test]
 fn configured_std_is_injected_first_and_is_source_visible() {
     let directory = project();
     write_project(
@@ -1191,9 +1426,15 @@ fn new_scaffolds_a_compilable_project_without_overwriting() {
     let destination = parent.path().join("nested/my_app");
 
     new_project(&destination).expect("create the project");
+    let scaffold_manifest = fs::read_to_string(destination.join("Ruddy.toml")).unwrap();
     assert_eq!(
-        fs::read_to_string(destination.join("Ruddy.toml")).unwrap(),
+        scaffold_manifest,
         "name = \"my_app\"\nversion = \"0.1.0\"\nroot = \"main.hc\"\n\n[dependencies]\n"
+    );
+    assert!(
+        !scaffold_manifest
+            .lines()
+            .any(|line| line.starts_with("std ="))
     );
     assert_eq!(
         fs::read_to_string(destination.join("main.hc")).unwrap(),
