@@ -193,6 +193,33 @@ fn mixed_input_to_result_guarantees_activate_at_each_call() {
 }
 
 #[test]
+fn package_guarantee_identity_survives_allocator_churn_without_crossing_instances() {
+    let mut source = String::from(
+        "extern follows: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where (not 'u) or 'e = host.follows\n\
+         extern excludes: { input when 'u: Nat } -> { output when 'e: Nat }\n\
+         where 'u or (not 'e) = host.excludes\n\
+         let needs_output: { output: Nat } -> Nat = fn value => value.output\n\
+         let needs_no_output: { \\output, .. } -> Nat = fn _ => 0n\n",
+    );
+    // Each application creates and promptly destroys an instantiated package
+    // allocation. Address-keyed side metadata could retain and later attach a
+    // stale guarantee when the allocator reused that address.
+    for index in 0..64 {
+        if index % 2 == 0 {
+            source.push_str(&format!(
+                "let good{index} = needs_output (follows {{ input: {index}n }})\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "let good{index} = needs_no_output (excludes {{}})\n"
+            ));
+        }
+    }
+    inferred(&source);
+}
+
+#[test]
 fn negative_and_erased_alias_arguments_do_not_publish_anonymous_existentials() {
     let (mint, _, output) = inferred(
         "type Contra 'a = 'a -> Nat\n\

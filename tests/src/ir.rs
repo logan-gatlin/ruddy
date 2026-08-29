@@ -5766,6 +5766,63 @@ fn imported_schemes_preserve_and_sanitize_existential_ownership() {
     );
 }
 
+#[test]
+fn canonical_bundle_import_preserves_mixed_input_result_guarantee() {
+    let mut dependency = prelude_artifact("dep");
+    dependency.header.values[0].scheme = a::Scheme {
+        count: 2,
+        presences: 2,
+        existentials: vec![1],
+        formula: a::Formula::Owned(
+            0,
+            Box::new(a::Formula::Iff(
+                Box::new(a::Formula::Bound(0)),
+                Box::new(a::Formula::Bound(1)),
+            )),
+        ),
+        body: a::Type::Arrow(
+            Box::new(artifact_struct(vec![(
+                "input".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(0),
+                    ty: a::Type::Nat,
+                },
+            )])),
+            Box::new(a::Type::Package(Box::new(artifact_struct(vec![(
+                "result".into(),
+                a::RowField {
+                    presence: a::Presence::Bound(1),
+                    ty: a::Type::Nat,
+                },
+            )])))),
+            a::Row {
+                labels: Vec::new(),
+                rest: a::Rest::Closed,
+            },
+        ),
+    };
+
+    // Exercise the complete bundle disk boundary before importing it. The
+    // universal atom remains in scope even though existential atoms determine
+    // which result package owns the indivisible proposition.
+    let text = dependency.print();
+    dependency = a::Artifact::try_parse(&text).expect("canonical dependency parses");
+    let parsed = parse::parse(lex("let value = dep::prelude::shared", FileID::GENERATED).tokens);
+    let mut mint = dummy_mint();
+    let out = build_with_dependencies(&mut mint, parsed.stmts, &[dependency]);
+    assert!(out.errors.is_empty(), "{:#?}", out.errors);
+    let scheme = out
+        .program
+        .external_schemes
+        .values()
+        .next()
+        .expect("the imported value scheme exists");
+    assert!(scheme.is_existential(1));
+    assert!(
+        matches!(scheme.formula(), ruddy::types::Formula::Owned(0, inner) if matches!(&**inner, ruddy::types::Formula::Iff(..)))
+    );
+}
+
 fn prelude_artifact(bundle: &str) -> a::Artifact {
     let qualified = |name: &str| format!("{bundle}@1.0.0::prelude::{name}");
     a::Artifact {
