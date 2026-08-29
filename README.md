@@ -88,7 +88,7 @@ Ruddy `extern` declarations are resolved by walking their dotted target from `gl
 
 Ruddy `Nat`, `Int`, and `Real` values use JavaScript `Number`; integers beyond 2^53 can therefore lose precision. Natural subtraction saturates at zero, integer division truncates toward zero, and real division uses ordinary JavaScript division.
 
-Compiler integrations can invoke the backend directly with `ruddy_js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation returns the module source or a validation error and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
+Compiler integrations can invoke the backend directly with `ruddy::backend::js::generate(&artifact)`. The argument must be the final linked [`ruddy::artifact::Artifact`]; generation returns the module source or a validation error and performs no filesystem I/O. The debugger always shows this same output in its **JavaScript** phase, regardless of the manifest target.
 
 Switching a project back to `"lib"` leaves an existing JavaScript file in place until `ruddy clean` removes the build directory.
 

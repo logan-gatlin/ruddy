@@ -1,9 +1,9 @@
 //! Deterministic JavaScript generation for linked Ruddy artifacts.
 //!
-//! This crate deliberately performs no I/O. Drivers compile and link an artifact,
+//! This backend deliberately performs no I/O. Drivers compile and link an artifact,
 //! call [`generate`], and decide where (or whether) to install the resulting ESM.
 
-use ruddy::artifact::{
+use crate::artifact::{
     Artifact, Block, Callee, End, FieldKey, Instr, Literal, Op, PrimCase, Rep, TagCase,
 };
 use std::{

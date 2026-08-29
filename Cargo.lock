@@ -524,7 +524,6 @@ dependencies = [
  "gix",
  "indexmap",
  "ruddy",
- "ruddy-js",
  "serde",
  "toml",
  "windows-sys 0.61.2",
@@ -2996,18 +2995,10 @@ dependencies = [
  "cli",
  "indexmap",
  "ruddy",
- "ruddy-js",
  "serde",
  "serde_json",
  "tiny_http",
  "toml",
-]
-
-[[package]]
-name = "ruddy-js"
-version = "0.1.0"
-dependencies = [
- "ruddy",
 ]
 
 [[package]]
@@ -3020,7 +3011,6 @@ dependencies = [
  "regex",
  "ruddy",
  "ruddy-debug",
- "ruddy-js",
  "serde_json",
  "tempfile",
  "toml",

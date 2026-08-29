@@ -430,7 +430,7 @@ fn compile_inner(req: &CompileRequest, build: u64, scratch: Option<&Path>) -> Sn
     let mut js_panicked = false;
     let js = linked.as_ref().and_then(|linked| {
         let started = Instant::now();
-        let out = guard("js", &mut panicked, || ruddy_js::generate(linked));
+        let out = guard("js", &mut panicked, || ruddy::backend::js::generate(linked));
         js_panicked = out.is_none();
         micros.js = started.elapsed().as_micros() as u64;
         match out {
