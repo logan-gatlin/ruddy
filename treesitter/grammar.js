@@ -151,9 +151,46 @@ module.exports = grammar({
       'extern',
       field('name', $.identifier),
       ':',
-      field('type', $.annotation),
+      field('type', $.extern_annotation),
       '=',
       field('target', $.foreign_path),
+    ),
+
+    /** The extern-only ABI type plus its ordinary outer `where` clause. */
+    extern_annotation: $ => seq(
+      field('type', $._extern_type),
+      optional(field('clause', $.where_clause)),
+    ),
+
+    _extern_type: $ => choice(
+      $.extern_function_type,
+      $.parenthesized_extern_function_type,
+      $._type,
+    ),
+
+    /** `fn(A, B) -> R [+ effects]` — one n-ary foreign-call boundary. */
+    extern_function_type: $ => prec.right(seq(
+      'fn',
+      '(',
+      optional(seq(
+        field('parameter', $._extern_type),
+        repeat(seq(',', field('parameter', $._extern_type))),
+        optional(','),
+      )),
+      ')',
+      '->',
+      field('result', $._extern_type),
+      optional(field('effects', $.effect_row)),
+    )),
+
+    /** Transparent grouping is admitted only around a marked ABI function. */
+    parenthesized_extern_function_type: $ => seq(
+      '(',
+      field('type', choice(
+        $.extern_function_type,
+        $.parenthesized_extern_function_type,
+      )),
+      ')',
     ),
 
     /** `console.log` — a dotted target, not a Ruddy path or projection. */

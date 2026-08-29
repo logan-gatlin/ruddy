@@ -212,7 +212,7 @@ extern log : String -> () = console.log
 (source_file
   (extern_definition
     name: (identifier)
-    type: (annotation
+    type: (extern_annotation
       type: (function_type
         from: (identifier)
         to: (unit)))

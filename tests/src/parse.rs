@@ -4,8 +4,8 @@ use std::fmt::{self, Write};
 
 use ruddy::{
     parse::{
-        ErrorKind, ExprKind, ForeignPath, Path, PatternKind, Place, StmtKind, SumCase, Type,
-        TypeField, TypeKind, parse,
+        ErrorKind, ExprKind, ExternTypeKind, ForeignPath, Path, PatternKind, Place, StmtKind,
+        SumCase, Type, TypeField, TypeKind, parse,
     },
     token::lex,
     tracking::FileID,
@@ -2344,7 +2344,10 @@ fn an_extern_declares_a_dotted_foreign_target_of_any_type() {
     let source = "extern answer : Nat = host.answer";
     assert_eq!(parse_one(source), source);
     let output = parse(lex(source, FileID::GENERATED).tokens);
-    let StmtKind::Extern { name, ty, target } = &output.stmts[0].tracked else {
+    let StmtKind::Extern {
+        name, ty, target, ..
+    } = &output.stmts[0].tracked
+    else {
         panic!("extern did not parse: {:#?}", output.stmts);
     };
     assert_eq!(name.tracked, "answer");
@@ -2369,4 +2372,88 @@ fn an_extern_declares_a_dotted_foreign_target_of_any_type() {
             "{source:?} parsed without an error"
         );
     }
+}
+
+#[test]
+fn extern_fn_abi_desugars_to_curried_arrows_and_retains_arity() {
+    let source = "extern add : fn(Nat, Nat,) -> Nat + !IO = host.add";
+    let output = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
+        panic!("extern did not parse: {:#?}", output.stmts);
+    };
+    let ExternTypeKind::Function {
+        parameters,
+        result,
+        effects,
+    } = &abi.tracked
+    else {
+        panic!("marked ABI was not retained: {abi:#?}");
+    };
+    assert_eq!(parameters.len(), 2);
+    assert!(matches!(result.tracked, ExternTypeKind::Ordinary(_)));
+    assert!(effects.is_some());
+    let TypeKind::Arrow {
+        to: second,
+        effects: outer_effects,
+        ..
+    } = &ty.ty.tracked
+    else {
+        panic!("marked ABI did not desugar to an arrow: {:#?}", ty.ty);
+    };
+    assert!(outer_effects.is_none(), "partial application must be pure");
+    assert!(matches!(
+        second.tracked,
+        TypeKind::Arrow {
+            effects: Some(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn extern_fn_abi_supports_nullary_nested_grouped_and_where_forms() {
+    let source =
+        "extern build : fn() -> (fn(Nat, String) -> Nat) + !Outer where 'a = 'a = host.build";
+    let output = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(output.errors.is_empty(), "{:#?}", output.errors);
+    let StmtKind::Extern { ty, abi, .. } = &output.stmts[0].tracked else {
+        panic!("extern did not parse: {:#?}", output.stmts);
+    };
+    assert!(ty.clause.is_some());
+    let TypeKind::Arrow { from, .. } = &ty.ty.tracked else {
+        panic!("nullary ABI did not desugar to a unit arrow");
+    };
+    assert!(matches!(from.tracked, TypeKind::Unit));
+    let ExternTypeKind::Function {
+        parameters, result, ..
+    } = &abi.tracked
+    else {
+        panic!("marked ABI was not retained");
+    };
+    assert!(parameters.is_empty());
+    assert!(matches!(result.tracked, ExternTypeKind::Group(_)));
+}
+
+#[test]
+fn fn_abi_syntax_is_extern_only_and_directly_nested() {
+    for source in [
+        "let f : fn(Nat) -> Nat = value",
+        "type F = fn(Nat) -> Nat",
+        "extern bad : { callback: fn(Nat) -> Nat } = host.bad",
+        "extern bad : fn(Nat -> fn(String) -> Nat) -> Nat = host.bad",
+    ] {
+        let output = parse(lex(source, FileID::GENERATED).tokens);
+        assert!(
+            !output.errors.is_empty(),
+            "{source:?} parsed without an error"
+        );
+    }
+
+    let source =
+        "extern bad : fn(Nat,, String) -> Nat = host.bad\nextern good : fn(Nat) -> Nat = host.good";
+    let output = parse(lex(source, FileID::GENERATED).tokens);
+    assert!(!output.errors.is_empty());
+    assert_eq!(output.stmts.len(), 1, "recovery skipped the next extern");
+    assert!(matches!(output.stmts[0].tracked, StmtKind::Extern { .. }));
 }
